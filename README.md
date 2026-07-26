@@ -63,9 +63,10 @@ macOS 13 Ventura is the recommended guest release for bring-up.
    with `options kvm ignore_msrs=1` (reboot or reload the module after).
 
 2. **Generate OpenCore, OVMF, and a guest disk with [OSX-KVM](https://github.com/kholia/OSX-KVM).**
-   Follow that project’s docs to fetch recovery media, build OpenCore, and install macOS under
-   QEMU+KVM. The point of this step is only to produce a **working, post-Setup-Assistant guest**
-   plus the usual OpenCore/OVMF pieces — not to stay on OSX-KVM’s long-term launcher.
+   **macOS 13 is recommended**.Follow that project’s docs to fetch recovery media, build OpenCore,
+   and install macOS under QEMU+KVM. The point of this step is only to produce a
+   **working, post-Setup-Assistant guest** plus the usual OpenCore/OVMF pieces — not to stay on
+   OSX-KVM’s long-term launcher.
 
 3. **Drop the artifacts where this repo expects them** (paths are the defaults in `vm/boot-x86.sh`;
    override with env if you prefer):
