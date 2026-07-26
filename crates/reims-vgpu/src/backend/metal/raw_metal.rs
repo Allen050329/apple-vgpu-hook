@@ -1,0 +1,955 @@
+//! Narrow raw `msg_send` for Metal APIs missing from metal-0.33.
+
+use foreign_types::ForeignType;
+use metal::{
+    BufferRef, ComputeCommandEncoderRef, ComputePipelineState, DeviceRef, FunctionRef,
+    IndirectCommandBufferRef, IndirectComputeCommandRef, IndirectRenderCommandRef, MTLIndexType,
+    MTLPixelFormat, MTLPrimitiveType, MTLRegion, MTLSize, MTLTextureType, NSInteger, NSRange,
+    NSUInteger, RenderPipelineDescriptorRef, Texture, TextureRef,
+};
+use objc::runtime::{Object, BOOL, NO, YES};
+use objc::{class, msg_send, sel, sel_impl};
+
+// SDK MTLTessellation* enums (not fully exposed by metal-0.33).
+pub const MTL_TESSELLATION_PARTITION_POW2: NSUInteger = 0;
+pub const MTL_TESSELLATION_PARTITION_INTEGER: NSUInteger = 1;
+pub const MTL_TESSELLATION_FACTOR_STEP_CONSTANT: NSUInteger = 0;
+pub const MTL_TESSELLATION_FACTOR_FORMAT_HALF: NSUInteger = 0;
+pub const MTL_WINDING_CLOCKWISE: NSUInteger = 0;
+pub const MTL_TESSELLATION_CONTROL_POINT_INDEX_NONE: NSUInteger = 0;
+pub const MTL_TESSELLATION_CONTROL_POINT_INDEX_UINT16: NSUInteger = 1;
+pub const MTL_TESSELLATION_CONTROL_POINT_INDEX_UINT32: NSUInteger = 2;
+
+/// Configure tessellation fields on `MTLRenderPipelineDescriptor` for ICB
+/// `drawPatches` / `drawIndexedPatches` (metal-0.33 leaves these as TODOs).
+pub fn configure_tessellation_pipeline(
+    desc: &RenderPipelineDescriptorRef,
+    max_factor: NSUInteger,
+    control_point_index_type: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![desc, setMaxTessellationFactor: max_factor];
+        let _: () = msg_send![
+            desc,
+            setTessellationFactorFormat: MTL_TESSELLATION_FACTOR_FORMAT_HALF
+        ];
+        let _: () = msg_send![
+            desc,
+            setTessellationPartitionMode: MTL_TESSELLATION_PARTITION_INTEGER
+        ];
+        let _: () = msg_send![
+            desc,
+            setTessellationFactorStepFunction: MTL_TESSELLATION_FACTOR_STEP_CONSTANT
+        ];
+        let _: () = msg_send![
+            desc,
+            setTessellationOutputWindingOrder: MTL_WINDING_CLOCKWISE
+        ];
+        let _: () = msg_send![
+            desc,
+            setTessellationControlPointIndexType: control_point_index_type
+        ];
+        let _: () = msg_send![desc, setTessellationFactorScaleEnabled: NO];
+    }
+}
+
+/// ICB `drawPatches:…` with optional (null) patch index buffer.
+/// metal-rs requires `&BufferRef`; SDK allows `nullable` for patchIndexBuffer.
+#[allow(clippy::too_many_arguments)]
+pub fn icb_draw_patches(
+    cmd: &IndirectRenderCommandRef,
+    number_of_patch_control_points: NSUInteger,
+    patch_start: NSUInteger,
+    patch_count: NSUInteger,
+    patch_index_buffer: Option<&BufferRef>,
+    patch_index_buffer_offset: NSUInteger,
+    instance_count: NSUInteger,
+    base_instance: NSUInteger,
+    tessellation_factor_buffer: &BufferRef,
+    tessellation_factor_buffer_offset: NSUInteger,
+    tessellation_factor_buffer_instance_stride: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            drawPatches: number_of_patch_control_points
+            patchStart: patch_start
+            patchCount: patch_count
+            patchIndexBuffer: patch_index_buffer
+            patchIndexBufferOffset: patch_index_buffer_offset
+            instanceCount: instance_count
+            baseInstance: base_instance
+            tessellationFactorBuffer: tessellation_factor_buffer
+            tessellationFactorBufferOffset: tessellation_factor_buffer_offset
+            tessellationFactorBufferInstanceStride: tessellation_factor_buffer_instance_stride
+        ];
+    }
+}
+
+/// ICB `drawIndexedPatches:…` with optional (null) patch index buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn icb_draw_indexed_patches(
+    cmd: &IndirectRenderCommandRef,
+    number_of_patch_control_points: NSUInteger,
+    patch_start: NSUInteger,
+    patch_count: NSUInteger,
+    patch_index_buffer: Option<&BufferRef>,
+    patch_index_buffer_offset: NSUInteger,
+    control_point_index_buffer: &BufferRef,
+    control_point_index_buffer_offset: NSUInteger,
+    instance_count: NSUInteger,
+    base_instance: NSUInteger,
+    tessellation_factor_buffer: &BufferRef,
+    tessellation_factor_buffer_offset: NSUInteger,
+    tessellation_factor_buffer_instance_stride: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            drawIndexedPatches: number_of_patch_control_points
+            patchStart: patch_start
+            patchCount: patch_count
+            patchIndexBuffer: patch_index_buffer
+            patchIndexBufferOffset: patch_index_buffer_offset
+            controlPointIndexBuffer: control_point_index_buffer
+            controlPointIndexBufferOffset: control_point_index_buffer_offset
+            instanceCount: instance_count
+            baseInstance: base_instance
+            tessellationFactorBuffer: tessellation_factor_buffer
+            tessellationFactorBufferOffset: tessellation_factor_buffer_offset
+            tessellationFactorBufferInstanceStride: tessellation_factor_buffer_instance_stride
+        ];
+    }
+}
+
+/// `setSupportIndirectCommandBuffers:` on `MTLMeshRenderPipelineDescriptor`
+/// (metal-0.33 exposes this only on classic `MTLRenderPipelineDescriptor`).
+pub fn mesh_pipeline_set_support_indirect_command_buffers(
+    desc: &metal::MeshRenderPipelineDescriptorRef,
+    support: bool,
+) {
+    unsafe {
+        let v: BOOL = if support { YES } else { NO };
+        let _: () = msg_send![desc, setSupportIndirectCommandBuffers: v];
+    }
+}
+
+/// Mesh / object bind counts on `MTLIndirectCommandBufferDescriptor` (macOS 14+).
+pub fn set_max_mesh_buffer_bind_count(
+    desc: &metal::IndirectCommandBufferDescriptorRef,
+    count: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![desc, setMaxMeshBufferBindCount: count];
+    }
+}
+
+pub fn set_max_object_buffer_bind_count(
+    desc: &metal::IndirectCommandBufferDescriptorRef,
+    count: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![desc, setMaxObjectBufferBindCount: count];
+    }
+}
+
+/// ICB `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+/// (metal-0.33 has no IndirectRenderCommand mesh entry points).
+pub fn icb_draw_mesh_threads(
+    cmd: &IndirectRenderCommandRef,
+    threads_per_grid: MTLSize,
+    threads_per_object_threadgroup: MTLSize,
+    threads_per_mesh_threadgroup: MTLSize,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            drawMeshThreads: threads_per_grid
+            threadsPerObjectThreadgroup: threads_per_object_threadgroup
+            threadsPerMeshThreadgroup: threads_per_mesh_threadgroup
+        ];
+    }
+}
+
+/// ICB `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+pub fn icb_draw_mesh_threadgroups(
+    cmd: &IndirectRenderCommandRef,
+    threadgroups_per_grid: MTLSize,
+    threads_per_object_threadgroup: MTLSize,
+    threads_per_mesh_threadgroup: MTLSize,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            drawMeshThreadgroups: threadgroups_per_grid
+            threadsPerObjectThreadgroup: threads_per_object_threadgroup
+            threadsPerMeshThreadgroup: threads_per_mesh_threadgroup
+        ];
+    }
+}
+
+/// ICB `setMeshBuffer:offset:atIndex:` (mesh stage binds).
+pub fn icb_set_mesh_buffer(
+    cmd: &IndirectRenderCommandRef,
+    buffer: Option<&BufferRef>,
+    offset: NSUInteger,
+    index: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            setMeshBuffer: buffer
+            offset: offset
+            atIndex: index
+        ];
+    }
+}
+
+/// ICB `setObjectBuffer:offset:atIndex:` (object stage binds).
+pub fn icb_set_object_buffer(
+    cmd: &IndirectRenderCommandRef,
+    buffer: Option<&BufferRef>,
+    offset: NSUInteger,
+    index: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            setObjectBuffer: buffer
+            offset: offset
+            atIndex: index
+        ];
+    }
+}
+
+/// SDK `MTLFunctionType` values not fully exposed by metal-0.33.
+pub const MTL_FUNCTION_TYPE_VERTEX: NSUInteger = 1;
+pub const MTL_FUNCTION_TYPE_FRAGMENT: NSUInteger = 2;
+pub const MTL_FUNCTION_TYPE_KERNEL: NSUInteger = 3;
+/// macOS 13+ mesh shader function.
+pub const MTL_FUNCTION_TYPE_MESH: NSUInteger = 7;
+/// macOS 13+ object shader function.
+pub const MTL_FUNCTION_TYPE_OBJECT: NSUInteger = 8;
+
+/// `functionType` on `MTLFunction` (raw NSUInteger; metal-0.33 omits Mesh/Object).
+pub fn function_type(function: &FunctionRef) -> NSUInteger {
+    unsafe { msg_send![function, functionType] }
+}
+
+/// ICB `setObjectThreadgroupMemoryLength:atIndex:`.
+pub fn icb_set_object_threadgroup_memory_length(
+    cmd: &IndirectRenderCommandRef,
+    length: NSUInteger,
+    index: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            setObjectThreadgroupMemoryLength: length
+            atIndex: index
+        ];
+    }
+}
+
+/// `setMaxObjectThreadgroupMemoryBindCount:` on ICB descriptor.
+pub fn set_max_object_threadgroup_memory_bind_count(
+    desc: &metal::IndirectCommandBufferDescriptorRef,
+    count: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![desc, setMaxObjectThreadgroupMemoryBindCount: count];
+    }
+}
+
+/// MTLTextureSwizzleChannels (C struct).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MtlTextureSwizzleChannels {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+pub const SWIZZLE_ZERO: u8 = 0;
+pub const SWIZZLE_ONE: u8 = 1;
+pub const SWIZZLE_RED: u8 = 2;
+pub const SWIZZLE_GREEN: u8 = 3;
+pub const SWIZZLE_BLUE: u8 = 4;
+pub const SWIZZLE_ALPHA: u8 = 5;
+
+pub fn swizzle_selector(selector: u8) -> Option<u8> {
+    match selector {
+        SWIZZLE_ZERO | SWIZZLE_ONE | SWIZZLE_RED | SWIZZLE_GREEN | SWIZZLE_BLUE | SWIZZLE_ALPHA => {
+            Some(selector)
+        }
+        _ => None,
+    }
+}
+
+pub fn texture_swizzle_channels(swizzle: [u8; 4]) -> Option<MtlTextureSwizzleChannels> {
+    Some(MtlTextureSwizzleChannels {
+        red: swizzle_selector(swizzle[0])?,
+        green: swizzle_selector(swizzle[1])?,
+        blue: swizzle_selector(swizzle[2])?,
+        alpha: swizzle_selector(swizzle[3])?,
+    })
+}
+
+pub fn new_texture_view_swizzled(
+    texture: &TextureRef,
+    pixel_format: MTLPixelFormat,
+    swizzle: MtlTextureSwizzleChannels,
+) -> Option<Texture> {
+    unsafe {
+        let levels = NSRange::new(0, 1);
+        let slices = NSRange::new(0, 1);
+        let ptr: *mut Object = msg_send![texture,
+            newTextureViewWithPixelFormat: pixel_format
+            textureType: MTLTextureType::D2
+            levels: levels
+            slices: slices
+            swizzle: swizzle
+        ];
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Texture::from_ptr(ptr as *mut _) })
+        }
+    }
+}
+
+pub fn set_buffer_with_attribute_stride(
+    encoder: &ComputeCommandEncoderRef,
+    buffer: &BufferRef,
+    offset: NSUInteger,
+    attribute_stride: NSUInteger,
+    index: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![encoder,
+            setBuffer: buffer
+            offset: offset
+            attributeStride: attribute_stride
+            atIndex: index
+        ];
+    }
+}
+
+pub fn set_stage_in_region(encoder: &ComputeCommandEncoderRef, region: MTLRegion) {
+    unsafe {
+        let _: () = msg_send![encoder, setStageInRegion: region];
+    }
+}
+
+pub fn set_stage_in_region_indirect(
+    encoder: &ComputeCommandEncoderRef,
+    buffer: &BufferRef,
+    offset: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![encoder,
+            setStageInRegionWithIndirectBuffer: buffer
+            indirectBufferOffset: offset
+        ];
+    }
+}
+
+pub fn set_imageblock_width_height(
+    encoder: &ComputeCommandEncoderRef,
+    width: NSUInteger,
+    height: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![encoder,
+            setImageblockWidth: width
+            height: height
+        ];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compute encoder control-flow + ICB SPI
+//
+// These selectors are present on Apple Silicon MTLComputeCommandEncoder
+// (AGX*FamilyComputeContext) but are not in the public Metal.framework headers
+// that metal-0.33 wraps. Verified by runtime respondsToSelector + smoke encode.
+// Wire contract: Reims VGPU compute 0xdc..0xe2 / 0xe4..0xe5 (compute-surface-manifest).
+//
+// Condition `comparison` is the Reims VGPU/MetalSerializer enum passed through as-is
+// (NOT MTLCompareFunction): host probe shows Equal=0 (buffer==reference),
+// Less=1, Always=7 among others. Product must not remap wire values.
+// ---------------------------------------------------------------------------
+
+/// `encodeStartDoWhile` (wire 0xdc) — empty start of do-while; condition is on end.
+pub fn encode_start_do_while(encoder: &ComputeCommandEncoderRef) {
+    unsafe {
+        let _: () = msg_send![encoder, encodeStartDoWhile];
+    }
+}
+
+/// `encodeEndDoWhile:offset:comparison:referenceValue:` (wire 0xdd). Returns Metal BOOL.
+pub fn encode_end_do_while(
+    encoder: &ComputeCommandEncoderRef,
+    buffer: &BufferRef,
+    offset: NSUInteger,
+    comparison: NSUInteger,
+    reference_value: u32,
+) -> bool {
+    unsafe {
+        let ok: BOOL = msg_send![encoder,
+            encodeEndDoWhile: buffer
+            offset: offset
+            comparison: comparison
+            referenceValue: reference_value
+        ];
+        ok == YES
+    }
+}
+
+/// `encodeStartWhile:offset:comparison:referenceValue:` (wire 0xde).
+pub fn encode_start_while(
+    encoder: &ComputeCommandEncoderRef,
+    buffer: &BufferRef,
+    offset: NSUInteger,
+    comparison: NSUInteger,
+    reference_value: u32,
+) {
+    unsafe {
+        let _: () = msg_send![encoder,
+            encodeStartWhile: buffer
+            offset: offset
+            comparison: comparison
+            referenceValue: reference_value
+        ];
+    }
+}
+
+/// `encodeEndWhile` (wire 0xdf).
+pub fn encode_end_while(encoder: &ComputeCommandEncoderRef) -> bool {
+    unsafe {
+        let ok: BOOL = msg_send![encoder, encodeEndWhile];
+        ok == YES
+    }
+}
+
+/// `encodeStartIf:offset:comparison:referenceValue:` (wire 0xe0).
+pub fn encode_start_if(
+    encoder: &ComputeCommandEncoderRef,
+    buffer: &BufferRef,
+    offset: NSUInteger,
+    comparison: NSUInteger,
+    reference_value: u32,
+) {
+    unsafe {
+        let _: () = msg_send![encoder,
+            encodeStartIf: buffer
+            offset: offset
+            comparison: comparison
+            referenceValue: reference_value
+        ];
+    }
+}
+
+/// `encodeStartElse` (wire 0xe1).
+pub fn encode_start_else(encoder: &ComputeCommandEncoderRef) {
+    unsafe {
+        let _: () = msg_send![encoder, encodeStartElse];
+    }
+}
+
+/// `encodeEndIf` (wire 0xe2).
+pub fn encode_end_if(encoder: &ComputeCommandEncoderRef) -> bool {
+    unsafe {
+        let ok: BOOL = msg_send![encoder, encodeEndIf];
+        ok == YES
+    }
+}
+
+/// `executeCommandsInBuffer:withRange:` on a compute encoder (wire 0xe4).
+pub fn execute_commands_in_buffer(
+    encoder: &ComputeCommandEncoderRef,
+    icb: &IndirectCommandBufferRef,
+    location: NSUInteger,
+    length: NSUInteger,
+) {
+    unsafe {
+        let range = NSRange { location, length };
+        let _: () = msg_send![encoder,
+            executeCommandsInBuffer: icb
+            withRange: range
+        ];
+    }
+}
+
+/// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:` (wire 0xe5).
+pub fn execute_commands_in_buffer_indirect(
+    encoder: &ComputeCommandEncoderRef,
+    icb: &IndirectCommandBufferRef,
+    indirect: &BufferRef,
+    offset: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![encoder,
+            executeCommandsInBuffer: icb
+            indirectBuffer: indirect
+            indirectBufferOffset: offset
+        ];
+    }
+}
+
+pub fn set_line_width(encoder: &Object, width: f32) -> bool {
+    unsafe {
+        let sel = sel!(setLineWidth:);
+        let responds: BOOL = msg_send![encoder, respondsToSelector: sel];
+        if responds == NO {
+            return false;
+        }
+        let _: () = msg_send![encoder, setLineWidth: width];
+        true
+    }
+}
+
+/// A Metal compute-pipeline reflection call that returned no pipeline state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetalPipelineDecline {
+    pub detail: String,
+}
+
+impl crate::observe::Decline for MetalPipelineDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self { .. } => "metal_compute_reflection_pipeline_create",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![(
+            "detail",
+            self.detail.split_whitespace().collect::<Vec<_>>().join("_"),
+        )]
+    }
+}
+
+impl std::fmt::Display for MetalPipelineDecline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::observe::Decline as _;
+        write!(f, "reason={}", self.slug())?;
+        for (key, value) in self.fields() {
+            write!(f, " {key}={value}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MetalPipelineDecline {}
+
+/// `newComputePipelineStateWithFunction:options:reflection:error:` for BindingInfo reflection.
+pub fn new_compute_pso_with_function_reflection(
+    device: &DeviceRef,
+    function: &FunctionRef,
+    options: NSUInteger,
+) -> Result<(ComputePipelineState, *mut Object), MetalPipelineDecline> {
+    use std::ptr;
+    unsafe {
+        let mut err: *mut Object = ptr::null_mut();
+        let mut reflection: *mut Object = ptr::null_mut();
+        let pso: *mut Object = msg_send![device,
+            newComputePipelineStateWithFunction: function
+            options: options
+            reflection: &mut reflection
+            error: &mut err
+        ];
+        if pso.is_null() {
+            let msg = if !err.is_null() {
+                let desc: *mut Object = msg_send![err, localizedDescription];
+                let cstr: *const i8 = msg_send![desc, UTF8String];
+                if cstr.is_null() {
+                    "(no detail)".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(cstr)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            } else {
+                "(no detail)".to_string()
+            };
+            return Err(MetalPipelineDecline { detail: msg });
+        }
+        if !reflection.is_null() {
+            let _: *mut Object = msg_send![reflection, retain];
+        }
+        Ok((ComputePipelineState::from_ptr(pso as *mut _), reflection))
+    }
+}
+
+/// Iterate `bindings` array on a reflection object (MTLBinding protocol).
+pub struct BindingInfo {
+    pub used: bool,
+    pub type_: NSUInteger,
+    pub access: NSUInteger,
+    pub index: NSUInteger,
+    pub array_length: NSUInteger,
+}
+
+pub const BINDING_TYPE_BUFFER: NSUInteger = 0;
+pub const BINDING_TYPE_TEXTURE: NSUInteger = 2;
+pub const BINDING_TYPE_SAMPLER: NSUInteger = 3;
+pub const BINDING_ACCESS_READ_ONLY: NSUInteger = 0;
+pub const BINDING_ACCESS_READ_WRITE: NSUInteger = 1;
+pub const BINDING_ACCESS_WRITE_ONLY: NSUInteger = 2;
+
+/// `MTLDataType` values used in AB struct reflection (SDK).
+pub const MTL_DATA_TYPE_TEXTURE: NSUInteger = 58;
+pub const MTL_DATA_TYPE_SAMPLER: NSUInteger = 59;
+
+/// One texture field inside a kernel argument-buffer struct.
+#[derive(Clone, Debug)]
+pub struct AbTextureMember {
+    pub argument_index: NSUInteger,
+    /// `BINDING_ACCESS_*` from the texture reference type.
+    pub access: NSUInteger,
+}
+
+/// One sampler field inside a kernel argument-buffer struct.
+#[derive(Clone, Debug)]
+pub struct AbSamplerMember {
+    pub argument_index: NSUInteger,
+}
+
+/// Layout of a kernel buffer that is an argument buffer holding textures/samplers.
+#[derive(Clone, Debug)]
+pub struct AbBufferLayout {
+    pub buffer_index: NSUInteger,
+    pub textures: Vec<AbTextureMember>,
+    pub samplers: Vec<AbSamplerMember>,
+}
+
+/// Reflect argument-buffer texture/sampler members from a compute function's
+/// BindingInfo (pipeline option `1`). Returns the first buffer binding that
+/// contains texture or sampler struct members (the ICB-capable texture path).
+pub fn reflect_argument_buffer_layout(
+    device: &DeviceRef,
+    function: &FunctionRef,
+) -> Result<Option<AbBufferLayout>, MetalPipelineDecline> {
+    // MTLPipelineOptionBindingInfo = 1
+    const OPT_BINDING_INFO: NSUInteger = 1;
+    let (_pso, reflection) =
+        new_compute_pso_with_function_reflection(device, function, OPT_BINDING_INFO)?;
+    let layout = unsafe { walk_ab_layout(reflection) };
+    unsafe {
+        if !reflection.is_null() {
+            let _: () = msg_send![reflection, release];
+        }
+    }
+    Ok(layout)
+}
+
+unsafe fn walk_ab_layout(reflection: *mut Object) -> Option<AbBufferLayout> {
+    if reflection.is_null() {
+        return None;
+    }
+    let bindings: *mut Object = msg_send![reflection, bindings];
+    if bindings.is_null() {
+        return None;
+    }
+    let count: NSUInteger = msg_send![bindings, count];
+    for i in 0..count {
+        let b: *mut Object = msg_send![bindings, objectAtIndex: i];
+        if b.is_null() {
+            continue;
+        }
+        let type_: NSUInteger = msg_send![b, type];
+        if type_ != BINDING_TYPE_BUFFER {
+            continue;
+        }
+        let index: NSUInteger = msg_send![b, index];
+        // MTLBufferBinding.bufferStructType
+        let struct_type: *mut Object = msg_send![b, bufferStructType];
+        if struct_type.is_null() {
+            continue;
+        }
+        let members: *mut Object = msg_send![struct_type, members];
+        if members.is_null() {
+            continue;
+        }
+        let mcount: NSUInteger = msg_send![members, count];
+        let mut textures = Vec::new();
+        let mut samplers = Vec::new();
+        for j in 0..mcount {
+            let m: *mut Object = msg_send![members, objectAtIndex: j];
+            if m.is_null() {
+                continue;
+            }
+            let data_type: NSUInteger = msg_send![m, dataType];
+            let arg_index: NSUInteger = msg_send![m, argumentIndex];
+            if data_type == MTL_DATA_TYPE_TEXTURE {
+                // textureReferenceType → access
+                let tr: *mut Object = msg_send![m, textureReferenceType];
+                let access: NSUInteger = if !tr.is_null() {
+                    msg_send![tr, access]
+                } else {
+                    BINDING_ACCESS_READ_WRITE
+                };
+                textures.push(AbTextureMember {
+                    argument_index: arg_index,
+                    access,
+                });
+            } else if data_type == MTL_DATA_TYPE_SAMPLER {
+                samplers.push(AbSamplerMember {
+                    argument_index: arg_index,
+                });
+            }
+        }
+        if !textures.is_empty() || !samplers.is_empty() {
+            textures.sort_by_key(|t| t.argument_index);
+            samplers.sort_by_key(|s| s.argument_index);
+            return Some(AbBufferLayout {
+                buffer_index: index,
+                textures,
+                samplers,
+            });
+        }
+    }
+    None
+}
+
+pub fn reflection_bindings(reflection: *mut Object) -> Vec<BindingInfo> {
+    if reflection.is_null() {
+        return Vec::new();
+    }
+    unsafe {
+        let bindings: *mut Object = msg_send![reflection, bindings];
+        if bindings.is_null() {
+            return Vec::new();
+        }
+        let count: NSUInteger = msg_send![bindings, count];
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let b: *mut Object = msg_send![bindings, objectAtIndex: i];
+            if b.is_null() {
+                continue;
+            }
+            let used: BOOL = msg_send![b, isUsed];
+            let type_: NSUInteger = msg_send![b, type];
+            let access: NSUInteger = msg_send![b, access];
+            let index: NSUInteger = msg_send![b, index];
+            // arrayLength exists on MTLTextureBinding; for others default 1.
+            let array_length: NSUInteger = if type_ == BINDING_TYPE_TEXTURE {
+                let al: NSUInteger = msg_send![b, arrayLength];
+                if al == 0 {
+                    1
+                } else {
+                    al
+                }
+            } else {
+                1
+            };
+            out.push(BindingInfo {
+                used: used == YES,
+                type_,
+                access,
+                index,
+                array_length,
+            });
+        }
+        out
+    }
+}
+
+pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> u32 {
+    if reflection.is_null() {
+        return 0;
+    }
+    unsafe {
+        let bindings: *mut Object = if vertex {
+            msg_send![reflection, vertexBindings]
+        } else {
+            msg_send![reflection, fragmentBindings]
+        };
+        if bindings.is_null() {
+            return 0;
+        }
+        let count: NSUInteger = msg_send![bindings, count];
+        let mut mask = 0u32;
+        for i in 0..count {
+            let b: *mut Object = msg_send![bindings, objectAtIndex: i];
+            if b.is_null() {
+                continue;
+            }
+            let used: BOOL = msg_send![b, isUsed];
+            if used == NO {
+                continue;
+            }
+            let type_: NSUInteger = msg_send![b, type];
+            if type_ != BINDING_TYPE_SAMPLER {
+                continue;
+            }
+            let index: NSUInteger = msg_send![b, index];
+            if index < 16 {
+                mask |= 1u32 << index;
+            }
+        }
+        mask
+    }
+}
+
+// Silence unused import of class! in some builds.
+#[allow(dead_code)]
+fn _touch_class() {
+    let _: *mut Object = unsafe { msg_send![class!(NSObject), class] };
+}
+
+/// Helper: MTLSize constructor.
+pub fn mtl_size(x: u64, y: u64, z: u64) -> MTLSize {
+    MTLSize {
+        width: x,
+        height: y,
+        depth: z,
+    }
+}
+
+/// `setMaxKernelThreadgroupMemoryBindCount:` on `MTLIndirectCommandBufferDescriptor`
+/// (macOS 14+; not exposed by metal-0.33).
+pub fn set_max_kernel_threadgroup_memory_bind_count(
+    desc: &metal::IndirectCommandBufferDescriptorRef,
+    count: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![desc, setMaxKernelThreadgroupMemoryBindCount: count];
+    }
+}
+
+/// `setCommandTypes:` with raw SDK bits.
+///
+/// metal-0.33's `MTLIndirectCommandType` bitflags omit mesh (1<<7 / 1<<8) and
+/// mis-shift ConcurrentDispatch; `from_bits_truncate` drops unknown bits. Pass
+/// the wire/SDK `u64` through so mesh ICB create works.
+pub fn icb_descriptor_set_command_types(
+    desc: &metal::IndirectCommandBufferDescriptorRef,
+    command_types: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![desc, setCommandTypes: command_types];
+    }
+}
+
+/// `setKernelBuffer:offset:attributeStride:atIndex:` on `MTLIndirectComputeCommand`
+/// (not exposed by metal-0.33).
+pub fn icb_set_kernel_buffer_attribute_stride(
+    cmd: &IndirectComputeCommandRef,
+    buffer: Option<&BufferRef>,
+    offset: NSUInteger,
+    attribute_stride: NSUInteger,
+    index: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            setKernelBuffer: buffer
+            offset: offset
+            attributeStride: attribute_stride
+            atIndex: index
+        ];
+    }
+}
+
+/// `setVertexBuffer:offset:attributeStride:atIndex:` on `MTLIndirectRenderCommand`
+/// (not exposed by metal-0.33).
+pub fn icb_set_vertex_buffer_attribute_stride(
+    cmd: &IndirectRenderCommandRef,
+    buffer: Option<&BufferRef>,
+    offset: NSUInteger,
+    attribute_stride: NSUInteger,
+    index: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            setVertexBuffer: buffer
+            offset: offset
+            attributeStride: attribute_stride
+            atIndex: index
+        ];
+    }
+}
+
+/// `drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:`
+/// on `MTLIndirectRenderCommand`.
+///
+/// SDK types `baseVertex` as **`NSInteger`** (signed). metal-0.33 incorrectly
+/// types it as `NSUInteger`, which cannot represent negative wire values.
+/// Pass signed `base_vertex` bit-identical to the guest u64 store.
+#[allow(clippy::too_many_arguments)]
+pub fn icb_draw_indexed_primitives(
+    cmd: &IndirectRenderCommandRef,
+    primitive_type: MTLPrimitiveType,
+    index_count: NSUInteger,
+    index_type: MTLIndexType,
+    index_buffer: &BufferRef,
+    index_buffer_offset: NSUInteger,
+    instance_count: NSUInteger,
+    base_vertex: NSInteger,
+    base_instance: NSUInteger,
+) {
+    unsafe {
+        let _: () = msg_send![
+            cmd,
+            drawIndexedPrimitives: primitive_type
+            indexCount: index_count
+            indexType: index_type
+            indexBuffer: index_buffer
+            indexBufferOffset: index_buffer_offset
+            instanceCount: instance_count
+            baseVertex: base_vertex
+            baseInstance: base_instance
+        ];
+    }
+}
+
+pub fn command_buffer_error_description(command_buffer: &metal::CommandBufferRef) -> String {
+    unsafe {
+        let err: *mut Object = msg_send![command_buffer, error];
+        if err.is_null() {
+            return "(no detail)".to_string();
+        }
+        let desc: *mut Object = msg_send![err, localizedDescription];
+        if desc.is_null() {
+            return "(no detail)".to_string();
+        }
+        let cstr: *const i8 = msg_send![desc, UTF8String];
+        if cstr.is_null() {
+            "(no detail)".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(cstr)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::Decline as _;
+
+    #[test]
+    fn metal_pipeline_decline_is_registered_shape_and_log_safe() {
+        let decline = MetalPipelineDecline {
+            detail: "driver detail with spaces".into(),
+        };
+        assert_eq!(decline.slug(), "metal_compute_reflection_pipeline_create");
+        assert_eq!(
+            decline.fields(),
+            vec![("detail", "driver_detail_with_spaces".into())]
+        );
+    }
+
+    #[test]
+    fn argument_buffer_reflection_preserves_pipeline_failure_in_its_api() {
+        let _reflect: fn(
+            &DeviceRef,
+            &FunctionRef,
+        ) -> Result<Option<AbBufferLayout>, MetalPipelineDecline> = reflect_argument_buffer_layout;
+    }
+}

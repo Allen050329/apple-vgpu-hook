@@ -1,0 +1,568 @@
+//! Host GPU memory-topology classification and allocation policy.
+//!
+//! The engine supports **two** memory topologies as first-class targets:
+//!
+//! | Topology | Examples | Property that matters |
+//! |---|---|---|
+//! | [`MemoryTopology::Unified`] | Apple M-series, Intel/AMD iGPU, llvmpipe | GPU-local memory *is* cached CPU memory, so a staging hop is pure waste |
+//! | [`MemoryTopology::Discrete`] | RTX 5080, GTX 750 Ti, Arc, RX 7900 | GPU-local memory is across PCIe, so bulk transfer must be a DMA, not a CPU map |
+//!
+//! ## The classification rule
+//!
+//! A device is `Unified` when **either** structural signal holds:
+//!
+//! * **A — no separate host heap:** every advertised memory heap is
+//!   `DEVICE_LOCAL`. A discrete GPU always advertises the system-RAM heap
+//!   without `DEVICE_LOCAL`; a single-pool device has no reason to.
+//! * **B — cached direct access:** some memory type carries
+//!   `DEVICE_LOCAL | HOST_VISIBLE | HOST_CACHED`. A PCIe BAR window into VRAM
+//!   is mapped write-combining and is advertised `HOST_COHERENT` *without*
+//!   `HOST_CACHED` (this is what distinguishes a resizable-BAR discrete GPU,
+//!   which does expose a whole-VRAM host-visible type, from a real UMA part).
+//!
+//! Signal B exists so an AMD APU that advertises its GTT heap without
+//! `DEVICE_LOCAL` is not mistaken for a discrete part.
+//!
+//! ## Misclassification is a performance bug, never a correctness bug
+//!
+//! Topology selects a *preference order* only. [`select_memory_type`] always
+//! falls back to the required flags alone, so a device classified the wrong way
+//! still allocates valid memory — it just pays a copy it did not need (or skips
+//! one it wanted). Nothing in the engine may branch on topology in a way that
+//! changes what the guest observes; that invariant is asserted by the tests at
+//! the bottom of this file.
+
+use ash::vk;
+
+/// How host and device memory relate on the bound physical device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryTopology {
+    /// One physical pool shared by CPU and GPU (Apple M-series, Intel/AMD iGPU).
+    Unified,
+    /// Device memory is separate from system RAM and reached over a bus.
+    Discrete,
+}
+
+impl MemoryTopology {
+    /// Stable slug for logs, proxy lines, and the matrix cell name.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::Discrete => "discrete",
+        }
+    }
+
+    /// True when a CPU-visible mapping of device memory is cheap enough that a
+    /// staging hop is pure overhead.
+    pub fn maps_device_memory_cheaply(self) -> bool {
+        self == Self::Unified
+    }
+}
+
+/// What a piece of memory is *for*. The engine asks for a class; this module
+/// turns the class into flags. No call site spells `MemoryPropertyFlags`
+/// directly, so a topology decision is made in exactly one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryClass {
+    /// CPU writes once, GPU reads: vertex/index/uniform/staging uploads.
+    Upload,
+    /// GPU writes, CPU reads: present capture and target readback.
+    Readback,
+    /// GPU-only working set: render targets, sampled textures, scratch buffers.
+    DeviceLocal,
+    /// GPU-side working memory that *wants* to be device-local but must never
+    /// fail to allocate — the dmabuf export images and window scratch, where a
+    /// host-memory placement is slower but still correct. Distinct from
+    /// [`MemoryClass::DeviceLocal`], which is a hard requirement.
+    DeviceLocalPreferred,
+    /// Backing for `VK_EXT_external_memory_host` guest-page imports. The GPU
+    /// writes must be immediately visible to the guest CPU that owns the pages,
+    /// so `HOST_COHERENT` is required, not preferred.
+    HostImport,
+}
+
+/// A memory-type query: the flags that MUST be present, plus a ranked list of
+/// bonus flag sets, best first. [`select_memory_type`] takes the first
+/// candidate matching the highest-ranked bonus it can satisfy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRequest {
+    pub required: vk::MemoryPropertyFlags,
+    /// Best-first. An empty list means "required flags only".
+    pub preferred: Vec<vk::MemoryPropertyFlags>,
+}
+
+impl MemoryTopology {
+    /// Flags to request for a [`MemoryClass`] on this topology.
+    ///
+    /// The only topology-dependent choices:
+    ///
+    /// * `Upload` on `Unified` prefers `DEVICE_LOCAL` — the same DRAM, so the
+    ///   GPU reads the CPU's writes with no transfer at all. On `Discrete` a
+    ///   `DEVICE_LOCAL|HOST_VISIBLE` type is a scarce BAR window (256 MiB
+    ///   without resizable BAR); spending it on bulk uploads starves the paths
+    ///   that genuinely need it, so plain host memory + a DMA copy is correct.
+    /// * `Readback` on `Unified` prefers `DEVICE_LOCAL|HOST_CACHED` — the
+    ///   render target's own pool, so the copy is a same-pool blit and the CPU
+    ///   read is cached. On `Discrete` the buffer must live in system RAM
+    ///   (`HOST_CACHED`); reading a BAR window from the CPU is uncached and
+    ///   catastrophically slow.
+    pub fn request(self, class: MemoryClass) -> MemoryRequest {
+        use vk::MemoryPropertyFlags as F;
+        let host = F::HOST_VISIBLE | F::HOST_COHERENT;
+        match (class, self) {
+            (MemoryClass::Upload, Self::Unified) => MemoryRequest {
+                required: host,
+                preferred: vec![F::DEVICE_LOCAL],
+            },
+            (MemoryClass::Upload, Self::Discrete) => MemoryRequest {
+                required: host,
+                preferred: Vec::new(),
+            },
+            (MemoryClass::Readback, Self::Unified) => MemoryRequest {
+                required: host,
+                preferred: vec![F::DEVICE_LOCAL | F::HOST_CACHED, F::HOST_CACHED],
+            },
+            (MemoryClass::Readback, Self::Discrete) => MemoryRequest {
+                required: host,
+                preferred: vec![F::HOST_CACHED],
+            },
+            (MemoryClass::DeviceLocal, _) => MemoryRequest {
+                required: F::DEVICE_LOCAL,
+                preferred: Vec::new(),
+            },
+            (MemoryClass::DeviceLocalPreferred, _) => MemoryRequest {
+                required: F::empty(),
+                preferred: vec![F::DEVICE_LOCAL],
+            },
+            (MemoryClass::HostImport, _) => MemoryRequest {
+                required: host,
+                preferred: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Summary of the bound device's memory layout: the topology plus the sizes the
+/// VRAM proxy reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryProfile {
+    pub topology: MemoryTopology,
+    /// Bytes in the largest `DEVICE_LOCAL` heap.
+    pub device_local_bytes: u64,
+    /// Bytes in the largest heap reachable through a `DEVICE_LOCAL|HOST_VISIBLE`
+    /// memory type — 0 when the CPU cannot address device memory at all.
+    pub host_visible_device_local_bytes: u64,
+    /// Which structural signal decided the classification (for the one-shot
+    /// selection log line; a misclassification report must say *why*).
+    pub signal: TopologySignal,
+}
+
+/// Which rule fired in [`classify_memory`]. Recorded so a wrong call on an
+/// unfamiliar driver can be diagnosed from one log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TopologySignal {
+    /// Signal A: every heap is `DEVICE_LOCAL`.
+    NoHostOnlyHeap,
+    /// Signal B: a `DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED` type exists.
+    CachedDeviceLocal,
+    /// Neither signal fired.
+    SeparateHostHeap,
+}
+
+impl TopologySignal {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NoHostOnlyHeap => "no_host_only_heap",
+            Self::CachedDeviceLocal => "cached_device_local",
+            Self::SeparateHostHeap => "separate_host_heap",
+        }
+    }
+}
+
+/// Classify a device's memory layout. Pure over
+/// `VkPhysicalDeviceMemoryProperties`, so every row of the support matrix is
+/// testable without that GPU present.
+pub fn classify_memory(props: &vk::PhysicalDeviceMemoryProperties) -> MemoryProfile {
+    use vk::MemoryPropertyFlags as F;
+    let heaps = &props.memory_heaps[..props.memory_heap_count as usize];
+    let types = &props.memory_types[..props.memory_type_count as usize];
+
+    // Signal A — no heap lacks DEVICE_LOCAL. An empty heap list cannot be
+    // unified by omission, so require at least one heap.
+    let no_host_only_heap = !heaps.is_empty()
+        && heaps
+            .iter()
+            .all(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL));
+
+    // Signal B — the CPU can *cache* a device-local mapping. A PCIe BAR window
+    // is write-combining and never advertises HOST_CACHED.
+    let cached_device_local = types.iter().any(|t| {
+        t.property_flags
+            .contains(F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_CACHED)
+    });
+
+    let (topology, signal) = if no_host_only_heap {
+        (MemoryTopology::Unified, TopologySignal::NoHostOnlyHeap)
+    } else if cached_device_local {
+        (MemoryTopology::Unified, TopologySignal::CachedDeviceLocal)
+    } else {
+        (MemoryTopology::Discrete, TopologySignal::SeparateHostHeap)
+    };
+
+    let heap_bytes = |idx: u32| heaps.get(idx as usize).map_or(0, |h| h.size);
+    let device_local_bytes = heaps
+        .iter()
+        .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .map(|h| h.size)
+        .max()
+        .unwrap_or(0);
+    let host_visible_device_local_bytes = types
+        .iter()
+        .filter(|t| t.property_flags.contains(F::DEVICE_LOCAL | F::HOST_VISIBLE))
+        .map(|t| heap_bytes(t.heap_index))
+        .max()
+        .unwrap_or(0);
+
+    MemoryProfile {
+        topology,
+        device_local_bytes,
+        host_visible_device_local_bytes,
+        signal,
+    }
+}
+
+/// Pick a memory type index satisfying `req` within `type_bits`.
+///
+/// Tries each `preferred` set best-first, then the required flags alone. The
+/// required-only fallback is what makes a topology misclassification a
+/// performance bug rather than an allocation failure.
+pub fn select_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    req: &MemoryRequest,
+) -> Option<u32> {
+    let carries = |index: u32, flags: vk::MemoryPropertyFlags| {
+        (type_bits & (1u32 << index)) != 0
+            && props.memory_types[index as usize]
+                .property_flags
+                .contains(flags)
+    };
+    let find = |flags: vk::MemoryPropertyFlags| {
+        (0..props.memory_type_count).find(|&index| carries(index, flags))
+    };
+    req.preferred
+        .iter()
+        .find_map(|bonus| find(req.required | *bonus))
+        .or_else(|| find(req.required))
+}
+
+#[cfg(test)]
+pub(crate) mod fixtures {
+    //! Synthetic `VkPhysicalDeviceMemoryProperties` for every device family in
+    //! the support matrix, so both memory rows are covered by unit tests on any
+    //! machine. The Apple layout is transcribed from a live `vulkaninfo` on the
+    //! M3 Max dev host; the rest follow each driver's documented layout.
+    use ash::vk;
+
+    const GIB: u64 = 1 << 30;
+
+    pub fn build(
+        heaps: &[(u64, vk::MemoryHeapFlags)],
+        types: &[(u32, vk::MemoryPropertyFlags)],
+    ) -> vk::PhysicalDeviceMemoryProperties {
+        let mut p = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: heaps.len() as u32,
+            memory_type_count: types.len() as u32,
+            ..Default::default()
+        };
+        for (i, (size, flags)) in heaps.iter().enumerate() {
+            p.memory_heaps[i] = vk::MemoryHeap {
+                size: *size,
+                flags: *flags,
+            };
+        }
+        for (i, (heap, flags)) in types.iter().enumerate() {
+            p.memory_types[i] = vk::MemoryType {
+                heap_index: *heap,
+                property_flags: *flags,
+            };
+        }
+        p
+    }
+
+    /// Apple M3 Max / MoltenVK 1.4.1 — transcribed from `vulkaninfo` on the
+    /// arm64 dev host: one 64 GiB DEVICE_LOCAL heap, three types.
+    pub fn apple_m3_max() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[(64 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL)],
+            &[
+                (0, F::DEVICE_LOCAL),
+                (
+                    0,
+                    F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
+                ),
+                (0, F::DEVICE_LOCAL | F::LAZILY_ALLOCATED),
+            ],
+        )
+    }
+
+    /// Intel integrated (Mesa ANV): one DEVICE_LOCAL heap over system RAM.
+    pub fn intel_igpu() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[(16 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL)],
+            &[
+                (0, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
+                (
+                    0,
+                    F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
+                ),
+            ],
+        )
+    }
+
+    /// AMD APU (RADV) advertising its GTT heap WITHOUT `DEVICE_LOCAL`. Signal A
+    /// misses here; signal B is what keeps it out of the discrete row.
+    pub fn amd_apu_host_heap() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[
+                (2 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL),
+                (14 * GIB, vk::MemoryHeapFlags::empty()),
+            ],
+            &[
+                (0, F::DEVICE_LOCAL),
+                (1, F::HOST_VISIBLE | F::HOST_COHERENT),
+                (
+                    0,
+                    F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
+                ),
+            ],
+        )
+    }
+
+    /// NVIDIA discrete without resizable BAR: a 256 MiB host-visible window into
+    /// 16 GiB of VRAM, plus the system-RAM heap.
+    pub fn nvidia_discrete() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[
+                (16 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL),
+                (64 * GIB, vk::MemoryHeapFlags::empty()),
+                (256 * 1024 * 1024, vk::MemoryHeapFlags::DEVICE_LOCAL),
+            ],
+            &[
+                (0, F::DEVICE_LOCAL),
+                (1, F::HOST_VISIBLE | F::HOST_COHERENT),
+                (1, F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED),
+                (2, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
+            ],
+        )
+    }
+
+    /// NVIDIA discrete WITH resizable BAR: the whole 16 GiB of VRAM is
+    /// host-visible, but write-combining — never `HOST_CACHED`. This is the
+    /// fixture that would break a naive "has DEVICE_LOCAL|HOST_VISIBLE ⇒ UMA"
+    /// rule.
+    pub fn nvidia_discrete_rebar() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[
+                (16 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL),
+                (64 * GIB, vk::MemoryHeapFlags::empty()),
+            ],
+            &[
+                (0, F::DEVICE_LOCAL),
+                (1, F::HOST_VISIBLE | F::HOST_COHERENT),
+                (1, F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED),
+                (0, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
+            ],
+        )
+    }
+
+    /// Software rasterizer (llvmpipe): one heap, plain host memory.
+    pub fn llvmpipe() -> vk::PhysicalDeviceMemoryProperties {
+        use vk::MemoryPropertyFlags as F;
+        build(
+            &[(8 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL)],
+            &[(
+                0,
+                F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
+            )],
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+
+    /// Every unified-memory device in the matrix classifies unified, and the
+    /// signal that fired is recorded.
+    #[test]
+    fn unified_devices_classify_unified() {
+        for (name, props, signal) in [
+            ("apple", apple_m3_max(), TopologySignal::NoHostOnlyHeap),
+            ("intel", intel_igpu(), TopologySignal::NoHostOnlyHeap),
+            (
+                "amd-apu",
+                amd_apu_host_heap(),
+                TopologySignal::CachedDeviceLocal,
+            ),
+            ("llvmpipe", llvmpipe(), TopologySignal::NoHostOnlyHeap),
+        ] {
+            let profile = classify_memory(&props);
+            assert_eq!(
+                profile.topology,
+                MemoryTopology::Unified,
+                "{name} must classify unified"
+            );
+            assert_eq!(profile.signal, signal, "{name} signal");
+        }
+    }
+
+    /// Both discrete shapes classify discrete — including resizable BAR, where
+    /// the whole of VRAM IS host-visible. That case is the reason the rule keys
+    /// on `HOST_CACHED` rather than on `DEVICE_LOCAL|HOST_VISIBLE`.
+    #[test]
+    fn discrete_devices_classify_discrete_including_rebar() {
+        for (name, props) in [
+            ("nvidia", nvidia_discrete()),
+            ("nvidia-rebar", nvidia_discrete_rebar()),
+        ] {
+            let profile = classify_memory(&props);
+            assert_eq!(
+                profile.topology,
+                MemoryTopology::Discrete,
+                "{name} must classify discrete"
+            );
+            assert_eq!(profile.signal, TopologySignal::SeparateHostHeap);
+        }
+    }
+
+    /// The reported sizes back the VRAM proxy: device-local bytes is the largest
+    /// device-local heap, and the host-visible-device-local figure exposes how
+    /// small a non-resizable BAR window really is.
+    #[test]
+    fn profile_reports_heap_sizes() {
+        let apple = classify_memory(&apple_m3_max());
+        assert_eq!(apple.device_local_bytes, 64 << 30);
+        assert_eq!(apple.host_visible_device_local_bytes, 64 << 30);
+
+        let nv = classify_memory(&nvidia_discrete());
+        assert_eq!(nv.device_local_bytes, 16 << 30);
+        assert_eq!(nv.host_visible_device_local_bytes, 256 << 20);
+
+        let rebar = classify_memory(&nvidia_discrete_rebar());
+        assert_eq!(rebar.host_visible_device_local_bytes, 16 << 30);
+    }
+
+    /// An empty/absent memory layout must not be called unified by omission.
+    #[test]
+    fn empty_properties_are_not_unified() {
+        let empty = vk::PhysicalDeviceMemoryProperties::default();
+        let profile = classify_memory(&empty);
+        assert_eq!(profile.topology, MemoryTopology::Discrete);
+        assert_eq!(profile.device_local_bytes, 0);
+    }
+
+    /// Readback prefers cached memory on BOTH topologies — an uncached CPU read
+    /// of a present frame is the difference between a copy and a stall.
+    #[test]
+    fn readback_prefers_cached_on_every_topology() {
+        use vk::MemoryPropertyFlags as F;
+        for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
+            let req = topology.request(MemoryClass::Readback);
+            assert!(req.required.contains(F::HOST_VISIBLE | F::HOST_COHERENT));
+            assert!(
+                req.preferred.iter().any(|p| p.contains(F::HOST_CACHED)),
+                "{topology:?} readback must prefer HOST_CACHED"
+            );
+        }
+    }
+
+    /// Discrete uploads must NOT prefer the scarce device-local BAR window;
+    /// unified uploads should, since it is the same DRAM.
+    #[test]
+    fn upload_preference_follows_topology() {
+        use vk::MemoryPropertyFlags as F;
+        assert!(MemoryTopology::Unified
+            .request(MemoryClass::Upload)
+            .preferred
+            .contains(&F::DEVICE_LOCAL));
+        assert!(MemoryTopology::Discrete
+            .request(MemoryClass::Upload)
+            .preferred
+            .is_empty());
+    }
+
+    /// Selection walks the preference list best-first on a unified device: the
+    /// device-local cached type wins over the plain cached one.
+    #[test]
+    fn selection_takes_best_preference_first() {
+        let props = apple_m3_max();
+        let req = MemoryTopology::Unified.request(MemoryClass::Readback);
+        assert_eq!(select_memory_type(&props, !0, &req), Some(1));
+    }
+
+    /// On a discrete device, readback lands in the HOST_CACHED system-RAM type
+    /// (index 2), never in the write-combining BAR window (index 3).
+    #[test]
+    fn discrete_readback_avoids_the_bar_window() {
+        let props = nvidia_discrete_rebar();
+        let req = MemoryTopology::Discrete.request(MemoryClass::Readback);
+        assert_eq!(select_memory_type(&props, !0, &req), Some(2));
+    }
+
+    /// THE load-bearing invariant: a topology misclassification never fails an
+    /// allocation. Requesting either topology's flags against either device's
+    /// memory layout always resolves to some valid type.
+    #[test]
+    fn misclassification_degrades_to_a_valid_type_never_a_failure() {
+        let devices = [
+            ("apple", apple_m3_max()),
+            ("intel", intel_igpu()),
+            ("amd-apu", amd_apu_host_heap()),
+            ("nvidia", nvidia_discrete()),
+            ("nvidia-rebar", nvidia_discrete_rebar()),
+            ("llvmpipe", llvmpipe()),
+        ];
+        let classes = [
+            MemoryClass::Upload,
+            MemoryClass::Readback,
+            MemoryClass::DeviceLocal,
+            MemoryClass::HostImport,
+        ];
+        for (name, props) in &devices {
+            for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
+                for class in classes {
+                    let req = topology.request(class);
+                    let picked = select_memory_type(props, !0, &req);
+                    assert!(
+                        picked.is_some(),
+                        "{name} under {topology:?} must resolve {class:?}"
+                    );
+                    let flags = props.memory_types[picked.unwrap() as usize].property_flags;
+                    assert!(
+                        flags.contains(req.required),
+                        "{name}/{topology:?}/{class:?} must satisfy required flags"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `type_bits` is honored: a driver that forbids a type for this resource
+    /// must never have it selected, even when it is the best preference match.
+    #[test]
+    fn type_bits_mask_is_respected() {
+        let props = apple_m3_max();
+        let req = MemoryTopology::Unified.request(MemoryClass::Readback);
+        // Mask out type 1 (the only host-visible type) → no candidate at all.
+        assert_eq!(select_memory_type(&props, 0b101, &req), None);
+        // Allow it again and it is chosen.
+        assert_eq!(select_memory_type(&props, 0b010, &req), Some(1));
+    }
+}

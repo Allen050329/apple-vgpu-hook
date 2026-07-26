@@ -1,0 +1,9478 @@
+use super::*;
+use crate::contract::endian::{st16, st32, st64};
+use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+use crate::runtime::decode::resource::{
+    compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
+    render_icb_layout, ICB_DESC_FLAGS, ICB_DESC_LAYOUT, ICB_DESC_LEN, ICB_DESC_MAX_COMMAND_COUNT,
+    ICB_DESC_MAX_FRAGMENT_BINDS, ICB_DESC_MAX_KERNEL_BINDS, ICB_DESC_MAX_VERTEX_BINDS,
+    ICB_DESC_OPTIONS, ICB_FLAG_INHERIT_BUFFERS, ICB_LAYOUT_LEN,
+    MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
+    OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, OBJECT_TYPE_TYPE7, PIPELINE_TAG_FRAGMENT_FUNC,
+    PIPELINE_TAG_VERTEX_FUNC, RESOURCE_PAGE_SHIFT, TYPE7_OBJECT_ICB, TYPE7_OBJECT_RENDER_PIPELINE,
+};
+/// Compute-pipeline descriptor constants, used only by the Metal-arm
+/// execute tests below. Kept in their own gated `use` so the Vulkan arm
+/// does not carry unused imports.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::decode::resource::{
+    OBJECT_TYPE_FUNCTION, PIPELINE_TAG_KERNEL_FUNC, TYPE7_FIRST_TLVS, TYPE7_OBJECT_COMPUTE_PIPELINE,
+};
+use crate::runtime::gva_mem;
+use crate::runtime::host::FakeHost;
+use std::sync::Mutex;
+
+/// The ICB reason survives the hop onto the compute rail.
+///
+/// This is the defect the `From` impl closes. The boundary in
+/// `compute_session.rs` used to rewrite `BadDescriptor` **and** `Args` — 93
+/// of this file's 153 checks between them — as the single literal
+/// `icb_resolve_bad_descriptor_or_args`, so `/tmp/reims-vgpu-fail.log` named the
+/// boundary that gave up rather than the check that refused.
+#[test]
+fn an_icb_refusal_keeps_its_slug_on_the_compute_rail() {
+    use crate::observe::{Decline, Refusal};
+    use crate::runtime::compute_exec::ComputeStatus;
+    for e in [
+        IcbStatus::Missing("icb_desc_no_list_entry"),
+        IcbStatus::BadDescriptor("icb_desc_wrong_type"),
+        IcbStatus::Args("icb_drs_unknown_command_type"),
+        IcbStatus::MetalFailed("icb_pso_pipeline_state"),
+        IcbStatus::NoMetal("icb_frc_no_metal"),
+    ] {
+        assert_eq!(
+            ComputeStatus::from(e).refusal(),
+            Some(e.slug()),
+            "{e:?} lost its reason crossing onto the compute rail"
+        );
+    }
+}
+
+/// The `0x1d1` backing-info decoder names which of its two checks refused.
+///
+/// `exec.rs` used to fold both into a bare `icb_backing_fail` counter, so an
+/// ICB whose command memory never bound was indistinguishable from one whose
+/// record was truncated. These are the two slugs that counter now carries.
+#[test]
+fn icb_backing_info_names_its_two_refusals() {
+    use crate::observe::Decline;
+    let short = decode_icb_host_resource_info(&[0u8; 4]).unwrap_err();
+    assert_eq!(short.slug(), "icb_host_resource_info_short");
+
+    // Well-formed length, but the payload names ICB ref 0.
+    let zero_ref =
+        decode_icb_host_resource_info(&[0u8; INFO_OP_ICB_HOST_RESOURCE_PAYLOAD_LEN]).unwrap_err();
+    assert_eq!(zero_ref.slug(), "icb_host_resource_info_ref_zero");
+}
+
+/// The render rail has no reason-carrying status, so the line it emits is
+/// the only place an ICB check is named there. Pin its shape: the slug is
+/// the reason, and the variant survives as `class=` so a reader can still
+/// group 153 checks into five kinds.
+#[test]
+fn an_icb_decline_renders_its_check_and_its_class() {
+    let line =
+        crate::observe::Emit::decline("render_icb", &IcbStatus::Args("icb_frc_index_span_zero"))
+            .render();
+    assert_eq!(line, "render_icb reason=icb_frc_index_span_zero class=args");
+}
+
+/// Process-global ICB cache is shared across tests — serialize metal ICB tests.
+///
+/// Taken with `unwrap_or_else(|e| e.into_inner())`, never a bare `unwrap`:
+/// the guard only orders access to a process-global cache, so a poisoned
+/// lock carries no unsound state. A bare `unwrap` turns the *first* failing
+/// test into a cascade — when the `compute_mul3add1.mtlb` fixture went
+/// missing, 3 real failures poisoned this lock and reported as 43, burying
+/// the one root cause under 40 `PoisonError`s.
+static ICB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = 4 + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+    assert!(state.set_object_list(1, 0, 32));
+}
+
+fn make_icb_desc_bytes(max_cmds: u32, max_kernel: u16, inherit_buffers: bool) -> Vec<u8> {
+    make_icb_desc_bytes_tg(
+        max_cmds,
+        max_kernel,
+        0,
+        if inherit_buffers {
+            ICB_FLAG_INHERIT_BUFFERS
+        } else {
+            0
+        },
+    )
+}
+
+fn make_icb_desc_bytes_tg(
+    max_cmds: u32,
+    max_kernel: u16,
+    max_kernel_tg: u16,
+    flags: u16,
+) -> Vec<u8> {
+    use crate::runtime::decode::resource::{compute_icb_layout, ICB_DESC_MAX_KERNEL_TG_BINDS};
+    let mut b = vec![0u8; ICB_DESC_LEN];
+    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[4..], ICB_DESC_LEN as u32);
+    st32(&mut b[8..], MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
+    b[ICB_DESC_MAX_VERTEX_BINDS] = 0;
+    b[ICB_DESC_MAX_FRAGMENT_BINDS] = 0;
+    b[ICB_DESC_MAX_KERNEL_BINDS] = max_kernel as u8;
+    b[ICB_DESC_MAX_KERNEL_TG_BINDS] = max_kernel_tg as u8;
+    st16(&mut b[ICB_DESC_FLAGS..], flags);
+    let layout = compute_icb_layout(max_kernel, max_kernel_tg);
+    b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    st32(&mut b[ICB_DESC_MAX_COMMAND_COUNT..], max_cmds);
+    st32(&mut b[ICB_DESC_OPTIONS..], 0);
+    b
+}
+
+/// Render ICB create body (Draw and/or DrawIndexed commandTypes).
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_render_icb_desc_bytes(
+    max_cmds: u32,
+    max_vertex: u16,
+    max_fragment: u16,
+    command_types: u32,
+) -> Vec<u8> {
+    make_render_icb_desc_bytes_ex(max_cmds, max_vertex, max_fragment, 0, 0, command_types, 0)
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_render_icb_desc_bytes_flags(
+    max_cmds: u32,
+    max_vertex: u16,
+    max_fragment: u16,
+    command_types: u32,
+    flags: u16,
+) -> Vec<u8> {
+    make_render_icb_desc_bytes_ex(
+        max_cmds,
+        max_vertex,
+        max_fragment,
+        0,
+        0,
+        command_types,
+        flags,
+    )
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_render_icb_desc_bytes_ex(
+    max_cmds: u32,
+    max_vertex: u16,
+    max_fragment: u16,
+    max_object: u16,
+    max_mesh: u16,
+    command_types: u32,
+    flags: u16,
+) -> Vec<u8> {
+    use crate::runtime::decode::resource::{
+        render_icb_layout_ex, ICB_DESC_MAX_MESH_BINDS, ICB_DESC_MAX_OBJECT_BINDS,
+        ICB_FLAG_INHERIT_PIPELINE_STATE,
+    };
+    let mut b = vec![0u8; ICB_DESC_LEN];
+    st32(&mut b[0..], TYPE7_OBJECT_ICB);
+    st32(&mut b[4..], ICB_DESC_LEN as u32);
+    st32(&mut b[8..], command_types);
+    b[ICB_DESC_MAX_VERTEX_BINDS] = max_vertex as u8;
+    b[ICB_DESC_MAX_FRAGMENT_BINDS] = max_fragment as u8;
+    b[ICB_DESC_MAX_KERNEL_BINDS] = 0;
+    b[ICB_DESC_MAX_OBJECT_BINDS] = max_object as u8;
+    b[ICB_DESC_MAX_MESH_BINDS] = max_mesh as u8;
+    st16(&mut b[ICB_DESC_FLAGS..], flags);
+    let layout = render_icb_layout_ex(
+        max_vertex,
+        max_fragment,
+        max_object,
+        max_mesh,
+        0,
+        command_types,
+    );
+    b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    st32(&mut b[ICB_DESC_MAX_COMMAND_COUNT..], max_cmds);
+    st32(&mut b[ICB_DESC_OPTIONS..], 0);
+    let _ = ICB_FLAG_INHERIT_PIPELINE_STATE;
+    b
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
+    use std::path::PathBuf;
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let vtx = std::fs::read(base.join("oracle_draw_vtx.mtlb")).expect("oracle_draw_vtx.mtlb");
+    let frag = std::fs::read(base.join("oracle_draw_frag.mtlb")).expect("oracle_draw_frag.mtlb");
+    (vtx, frag)
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
+    use std::path::PathBuf;
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let vtx = std::fs::read(base.join("render_stagein_vtx.mtlb")).expect("render_stagein_vtx.mtlb");
+    let frag =
+        std::fs::read(base.join("render_stagein_frag.mtlb")).expect("render_stagein_frag.mtlb");
+    (vtx, frag)
+}
+
+/// Type-7 render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
+///
+/// Layout matches `parse_vertex_block` / color-attachment section (offset from
+/// header end via tag `0x08`).
+fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, PIPELINE_TAG_COLOR_ATTACH_OFFSET,
+        VERTEX_ATTR_TAG_BUFFER_INDEX, VERTEX_ATTR_TAG_FORMAT, VERTEX_ATTR_TAG_LOCATION,
+        VERTEX_ATTR_TAG_OFFSET, VERTEX_DESC_TAG_ATTRIBUTES, VERTEX_DESC_TAG_LAYOUTS,
+        VERTEX_LAYOUT_TAG_BUFFER_INDEX, VERTEX_LAYOUT_TAG_STRIDE,
+    };
+
+    // first_tlv_end = 16 + 1 + 3*6 = 35
+    let first_tlv_end = 35usize;
+    let bo = first_tlv_end;
+    // root entry 13 B → layout at bo+13=48, attr at bo+34=69
+    let layout_rel = 13u32;
+    let attr_rel = 34u32;
+    let layout_section = bo + layout_rel as usize; // 48
+    let attr_section = bo + attr_rel as usize; // 69
+                                               // attr section: 4+4+25 = 33 → ends 102
+    let color_abs = 102usize;
+    let color_off_from_header = (color_abs - 16) as u32; // 86
+
+    let mut b = vec![0u8; 117];
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], 117);
+    st32(&mut b[8..], 6); // object id
+                          // First TLVs
+    b[16] = 3;
+    b[17] = PIPELINE_TAG_VERTEX_FUNC;
+    b[18] = 4;
+    st32(&mut b[19..], vert_ref);
+    b[23] = PIPELINE_TAG_FRAGMENT_FUNC;
+    b[24] = 4;
+    st32(&mut b[25..], frag_ref);
+    b[29] = PIPELINE_TAG_COLOR_ATTACH_OFFSET;
+    b[30] = 4;
+    st32(&mut b[31..], color_off_from_header);
+
+    // Vertex block root at bo
+    b[bo] = 2;
+    b[bo + 1] = VERTEX_DESC_TAG_ATTRIBUTES;
+    b[bo + 2] = 4;
+    st32(&mut b[bo + 3..], attr_rel);
+    b[bo + 7] = VERTEX_DESC_TAG_LAYOUTS;
+    b[bo + 8] = 4;
+    st32(&mut b[bo + 9..], layout_rel);
+
+    // Layout section
+    st32(&mut b[layout_section..], 1);
+    st32(&mut b[layout_section + 4..], 8); // entry_rel
+    let le = layout_section + 8;
+    b[le] = 2;
+    b[le + 1] = VERTEX_LAYOUT_TAG_BUFFER_INDEX;
+    b[le + 2] = 4;
+    st32(&mut b[le + 3..], 0);
+    b[le + 7] = VERTEX_LAYOUT_TAG_STRIDE;
+    b[le + 8] = 4;
+    st32(&mut b[le + 9..], 16);
+
+    // Attr section
+    st32(&mut b[attr_section..], 1);
+    st32(&mut b[attr_section + 4..], 8);
+    let ae = attr_section + 8;
+    b[ae] = 4;
+    b[ae + 1] = VERTEX_ATTR_TAG_LOCATION;
+    b[ae + 2] = 4;
+    st32(&mut b[ae + 3..], 0);
+    b[ae + 7] = VERTEX_ATTR_TAG_FORMAT;
+    b[ae + 8] = 4;
+    st32(&mut b[ae + 9..], 31); // MTLVertexFormatFloat4
+    b[ae + 13] = VERTEX_ATTR_TAG_OFFSET;
+    b[ae + 14] = 4;
+    st32(&mut b[ae + 15..], 0);
+    b[ae + 19] = VERTEX_ATTR_TAG_BUFFER_INDEX;
+    b[ae + 20] = 4;
+    st32(&mut b[ae + 21..], 0);
+
+    // Color attachments
+    st32(&mut b[color_abs..], 1);
+    st32(&mut b[color_abs + 4..], 8);
+    let ce = color_abs + 8;
+    b[ce] = 1;
+    b[ce + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+    b[ce + 2] = 4;
+    st32(&mut b[ce + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+
+    b
+}
+
+/// Compact type-7 mesh pipeline (host SPI shape): tag `0x14` section offset
+/// + optional object `0x01` + mesh `0x02` + fragment `0x03`.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_mesh_render_pipeline_desc(
+    object_ref: Option<u32>,
+    mesh_ref: u32,
+    frag_ref: u32,
+) -> Vec<u8> {
+    use crate::runtime::decode::resource::{
+        PIPELINE_TAG_MESH_FRAGMENT_FUNC, PIPELINE_TAG_MESH_FUNC, PIPELINE_TAG_MESH_SECTION_OFFSET,
+        PIPELINE_TAG_OBJECT_FUNC, TYPE7_OBJECT_RENDER_PIPELINE,
+    };
+    let mut fields = Vec::new();
+    // Section offset filled after we know field payload size (matches SPI:
+    // offset from header end to trailing color/rest region).
+    fields.push((PIPELINE_TAG_MESH_SECTION_OFFSET, 0u32));
+    if let Some(oref) = object_ref {
+        fields.push((PIPELINE_TAG_OBJECT_FUNC, oref));
+    }
+    fields.push((PIPELINE_TAG_MESH_FUNC, mesh_ref));
+    fields.push((PIPELINE_TAG_MESH_FRAGMENT_FUNC, frag_ref));
+    let n = fields.len();
+    // header 16 + fieldCount 1 + n * (tag+len+u32=6)
+    let first_tlv_len = 1 + n * 6;
+    let mut b = vec![0u8; 16 + first_tlv_len];
+    let blen = b.len() as u32;
+    st32(&mut b[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut b[4..], blen);
+    st32(&mut b[8..], 6);
+    b[16] = n as u8;
+    // Mesh section offset = first-subrecord size (no color block in fixture).
+    fields[0].1 = first_tlv_len as u32;
+    let mut p = 17;
+    for (tag, val) in fields {
+        b[p] = tag;
+        b[p + 1] = 4;
+        st32(&mut b[p + 2..], val);
+        p += 6;
+    }
+    b
+}
+
+fn put_type1_buffer(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    obj_ref: u32,
+    handle: u32,
+    bytes: &[u8],
+) {
+    let gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(host, &state.tasks[1], gva, bytes, PAGE_SHIFT_ARM64E).is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], bytes.len() as u64);
+    st64(&mut bdesc[8..], handle as u64);
+    // Descriptors must sit past the object-list region (32×12 = 0x180).
+    let bdesc_gva = 0x200u64 + (obj_ref as u64) * 0x20;
+    assert!(
+        gva_mem::write_task_gva(host, &state.tasks[1], bdesc_gva, &bdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(host, state, obj_ref, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+}
+
+fn put_list_entry(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    ref_: u32,
+    otype: u8,
+    len: u32,
+    gva: u64,
+) {
+    let off = list_object_entry_offset(ref_, 32).unwrap();
+    let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let packed = (otype as u32) | (len << 8);
+    st32(&mut le[0..], packed);
+    le[4..12].copy_from_slice(&gva.to_le_bytes());
+    assert!(gva_mem::write_task_gva(host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok());
+}
+
+#[test]
+fn load_icb_from_object_list() {
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+    let desc = make_icb_desc_bytes(8, 4, true);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        gva,
+    );
+    let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
+    assert_eq!(icb.max_command_count, 8);
+    assert_eq!(icb.max_kernel_buffer_bind_count, 4);
+    assert!(icb.inherit_buffers);
+    assert_eq!(icb.command_types, MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
+}
+
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn materialize_and_execute_empty_range() {
+    use crate::backend::metal::raw_metal::execute_commands_in_buffer;
+    use crate::backend::metal::runtime::{system_device, thread_queue};
+    use metal::MTLDispatchType;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+    let desc = make_icb_desc_bytes(8, 4, true);
+    let gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        gva,
+    );
+    let (d, icb) = resolve_metal_icb(&state, &host, 1, 9).expect("materialize");
+    assert_eq!(d.max_command_count, 8);
+    assert_eq!(icb.size(), 8);
+
+    let device = system_device().unwrap();
+    let queue = thread_queue(device);
+    let cb = queue.new_command_buffer().to_owned();
+    let enc = cb.compute_command_encoder_with_dispatch_type(MTLDispatchType::Serial);
+    execute_commands_in_buffer(enc, icb.as_ref(), 0, 0);
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+}
+
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_and_execute_mul3add1_writeback() {
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb_paths =
+        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
+    let mtlb = mtlb_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .expect("compute_mul3add1.mtlb fixture");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // ICB object ref 9: 1 command, maxKernel=1, no inherit (explicit fills).
+    let icb_desc = make_icb_desc_bytes(1, 1, false);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    // Function + pipeline + data buffer (mul3add1).
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    let fdesc_gva = 0x100u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fdesc_gva,
+        &fdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, fdesc_gva);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc_gva = 0x140u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, pdesc_gva);
+
+    let data = [1u32, 2, 3, 4];
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        buf_gva,
+        &data_bytes,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 16);
+    st32(&mut bdesc[8..], 3);
+    let bdesc_gva = 0x180u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        bdesc_gva,
+        &bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+
+    // Host fill of command slot 0 (no stream fill opcode yet).
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+            }],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 4,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill");
+
+    // Cache hit on re-resolve (same size / command count).
+    let (d_a, icb_a) = resolve_metal_icb(&state, &host, 1, 9).unwrap();
+    let (d_b, icb_b) = resolve_metal_icb(&state, &host, 1, 9).unwrap();
+    assert_eq!(d_a.max_command_count, d_b.max_command_count);
+    assert_eq!(icb_a.size(), icb_b.size());
+    assert_eq!(icb_a.size(), 1);
+
+    // Product execute 0xe4 range [0,1] on a compute session + writeback.
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(
+            &mut state,
+            &mut host,
+            1,
+            &cmd,
+            &crate::runtime::compute_exec::ComputeAccum::default()
+        ),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        out,
+        vec![4, 7, 10, 13],
+        "ICB fill+execute mul3add1 writeback"
+    );
+}
+
+#[test]
+fn decode_encode_render_draw_slot_roundtrip() {
+    use crate::runtime::decode::resource::render_only_icb_layout;
+    let layout = render_only_icb_layout(2);
+    assert_eq!(layout.pipeline_state_offset, 0x60);
+    assert_eq!(layout.vertex_buffer_bind_offset, 0x64);
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 42,
+        buffers: vec![IcbRenderBufferBind {
+            index: 0,
+            buffer_ref: 7,
+            offset: 0,
+            wire_va: 0,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+            is_fragment: false,
+            stage: IcbRenderBindStage::default(),
+        }],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).unwrap();
+    assert_eq!(slot.len(), layout.command_size as usize);
+    let decoded = decode_render_command_slot(&layout, &slot, 2, 0)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.pipeline_ref, 42);
+    assert_eq!(decoded.buffers.len(), 1);
+    assert_eq!(decoded.buffers[0].buffer_ref, 7);
+    match decoded.draw {
+        IcbRenderDraw::Primitives {
+            primitive_type,
+            vertex_count,
+            ..
+        } => {
+            assert_eq!(primitive_type, 3);
+            assert_eq!(vertex_count, 3);
+        }
+        IcbRenderDraw::Indexed { .. }
+        | IcbRenderDraw::Patches { .. }
+        | IcbRenderDraw::IndexedPatches { .. }
+        | IcbRenderDraw::MeshThreads { .. }
+        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Primitives"),
+    }
+}
+
+#[test]
+fn decode_encode_render_draw_indexed_slot_roundtrip() {
+    use crate::runtime::decode::resource::render_draw_indexed_icb_layout;
+    let layout = render_draw_indexed_icb_layout(1);
+    assert_eq!(layout.command_arguments_offset + 0x38, layout.command_size);
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 11,
+        buffers: vec![
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 8,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::default(),
+            },
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            },
+        ],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Indexed {
+            primitive_type: 3,
+            index_type: 0, // UInt16
+            index_buffer_ref: 12,
+            index_count: 3,
+            index_buffer_offset: 0,
+            index_wire_va: 0,
+            instance_count: 1,
+            base_vertex: 0,
+            base_instance: 0,
+        },
+    };
+    // layout from render_draw_indexed_icb_layout(1) has max_fragment=0;
+    // use full layout so fragment bind encode/decode round-trips.
+    let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let slot = encode_render_command_slot(&layout, &fill).unwrap();
+    assert_eq!(slot.len(), layout.command_size as usize);
+    let type_off = layout.command_type_offset as usize;
+    assert_eq!(ld32(&slot[type_off..]), ICB_CMD_TYPE_DRAW_INDEXED);
+    let decoded = decode_render_command_slot(&layout, &slot, 1, 1)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.pipeline_ref, 11);
+    assert_eq!(decoded.buffers.len(), 2);
+    assert!(decoded
+        .buffers
+        .iter()
+        .any(|b| !b.is_fragment && b.buffer_ref == 8));
+    assert!(decoded
+        .buffers
+        .iter()
+        .any(|b| b.is_fragment && b.buffer_ref == 13));
+    match decoded.draw {
+        IcbRenderDraw::Indexed {
+            primitive_type,
+            index_type,
+            index_buffer_ref,
+            index_count,
+            instance_count,
+            base_vertex,
+            base_instance,
+            ..
+        } => {
+            assert_eq!(primitive_type, 3);
+            assert_eq!(index_type, 0);
+            assert_eq!(index_buffer_ref, 12);
+            assert_eq!(index_count, 3);
+            assert_eq!(instance_count, 1);
+            assert_eq!(base_vertex, 0);
+            assert_eq!(base_instance, 0);
+        }
+        IcbRenderDraw::Primitives { .. }
+        | IcbRenderDraw::Patches { .. }
+        | IcbRenderDraw::IndexedPatches { .. }
+        | IcbRenderDraw::MeshThreads { .. }
+        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Indexed"),
+    }
+}
+
+/// DrawPatches / DrawIndexedPatches encode↔decode (host RE wire types 4 / 8).
+#[test]
+fn decode_encode_draw_patches_slot_roundtrip() {
+    use crate::runtime::decode::resource::{
+        render_draw_indexed_patches_icb_layout, render_draw_patches_icb_layout,
+    };
+    let layout = render_draw_patches_icb_layout(1);
+    assert!(layout.command_size >= layout.command_arguments_offset + ICB_DRAW_PATCHES_ARGS_LEN);
+    assert_eq!(layout.tessellation_factor_offset, 0x40);
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 9,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Patches {
+            number_of_patch_control_points: 3,
+            patch_start: 0,
+            patch_count: 2,
+            patch_index_buffer_ref: 11,
+            patch_index_buffer_offset: 0,
+            patch_index_wire_va: 0,
+            instance_count: 1,
+            base_instance: 0,
+            tessellation_factor: IcbTessellationFactor {
+                buffer_ref: 12,
+                offset: 0,
+                wire_va: 0,
+                instance_stride: 0,
+            },
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).unwrap();
+    let type_off = layout.command_type_offset as usize;
+    assert_eq!(ld32(&slot[type_off..]), ICB_CMD_TYPE_DRAW_PATCHES);
+    let tess_off = layout.tessellation_factor_offset as usize;
+    assert_eq!(ld32(&slot[tess_off..]), 12);
+    let decoded = decode_render_command_slot(&layout, &slot, 1, 0)
+        .unwrap()
+        .expect("filled");
+    match decoded.draw {
+        IcbRenderDraw::Patches {
+            number_of_patch_control_points,
+            patch_count,
+            patch_index_buffer_ref,
+            tessellation_factor,
+            ..
+        } => {
+            assert_eq!(number_of_patch_control_points, 3);
+            assert_eq!(patch_count, 2);
+            assert_eq!(patch_index_buffer_ref, 11);
+            assert_eq!(tessellation_factor.buffer_ref, 12);
+        }
+        _ => panic!("expected Patches"),
+    }
+
+    let ilayout = render_draw_indexed_patches_icb_layout(1);
+    assert!(
+        ilayout.command_size
+            >= ilayout.command_arguments_offset + ICB_DRAW_INDEXED_PATCHES_ARGS_LEN
+    );
+    let ifill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 9,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::IndexedPatches {
+            number_of_patch_control_points: 4,
+            patch_start: 1,
+            patch_count: 1,
+            patch_index_buffer_ref: 11,
+            patch_index_buffer_offset: 0,
+            patch_index_wire_va: 0,
+            control_point_index_buffer_ref: 13,
+            control_point_index_buffer_offset: 0,
+            control_point_index_wire_va: 0,
+            instance_count: 1,
+            base_instance: 0,
+            tessellation_factor: IcbTessellationFactor {
+                buffer_ref: 12,
+                offset: 0,
+                wire_va: 0,
+                instance_stride: 16,
+            },
+        },
+    };
+    let islot = encode_render_command_slot(&ilayout, &ifill).unwrap();
+    assert_eq!(
+        ld32(&islot[ilayout.command_type_offset as usize..]),
+        ICB_CMD_TYPE_DRAW_INDEXED_PATCHES
+    );
+    let idec = decode_render_command_slot(&ilayout, &islot, 1, 0)
+        .unwrap()
+        .expect("filled");
+    match idec.draw {
+        IcbRenderDraw::IndexedPatches {
+            control_point_index_buffer_ref,
+            tessellation_factor,
+            number_of_patch_control_points,
+            ..
+        } => {
+            assert_eq!(number_of_patch_control_points, 4);
+            assert_eq!(control_point_index_buffer_ref, 13);
+            assert_eq!(tessellation_factor.instance_stride, 16);
+        }
+        _ => panic!("expected IndexedPatches"),
+    }
+}
+
+/// Pixel-level ICB DrawPatches oracle: triangle patch + constant tess
+/// factors 1.0 → solid BGRA fill (full-screen control points).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_draw_patches_tessellation_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_PATCHES;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let vert_mtlb =
+        std::fs::read(base.join("icb_tess_vtx.metallib")).expect("icb_tess_vtx.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_tess_frag.metallib")).expect("icb_tess_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    // Vertex-input Float4 @ buffer0 stride 16 (step defaults to PerPatchControlPoint).
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    // Full-screen clip-space triangle as 3 control points.
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let cp_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+
+    // MTLTriangleTessellationFactorsHalf: edge[3] + inside, half 1.0 = 0x3c00.
+    let tess_bytes: [u8; 8] = [
+        0x00, 0x3c, // edge0
+        0x00, 0x3c, // edge1
+        0x00, 0x3c, // edge2
+        0x00, 0x3c, // inside
+    ];
+    put_type1_buffer(&mut host, &mut state, 12, 5, &tess_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 11,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Patches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 1,
+                patch_index_buffer_ref: 0, // null — sequential control points
+                patch_index_buffer_offset: 0,
+                patch_index_wire_va: 0,
+                instance_count: 1,
+                base_instance: 0,
+                tessellation_factor: IcbTessellationFactor {
+                    buffer_ref: 12,
+                    offset: 0,
+                    wire_va: 0,
+                    instance_stride: 0,
+                },
+            },
+        },
+    )
+    .expect("fill DrawPatches tessellation");
+
+    let mapping_id = 9u32;
+    let pfn = 0x38u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "DrawPatches tessellation ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    // float4(0.4, 0.267, 0.133, 1) → BGRA ≈ 34,68,102,255
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawPatches tessellation)"
+        );
+    }
+}
+
+/// Pixel-level ICB DrawIndexedPatches: dummy control point at index 0,
+/// real triangle at indices [1,2,3] → same solid BGRA as DrawPatches.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_draw_indexed_patches_tessellation_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let vert_mtlb =
+        std::fs::read(base.join("icb_tess_vtx.metallib")).expect("icb_tess_vtx.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_tess_frag.metallib")).expect("icb_tess_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    // Control points: dummy at 0, real full-screen triangle at 1,2,3.
+    let cps: [[f32; 4]; 4] = [
+        [0.0, 0.0, 0.0, 1.0],
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let cp_bytes: Vec<u8> = cps
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+
+    // UInt16 control-point indices [1,2,3].
+    let indices: [u16; 3] = [1, 2, 3];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &index_bytes);
+
+    let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
+    put_type1_buffer(&mut host, &mut state, 12, 6, &tess_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 11,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::IndexedPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 1,
+                patch_index_buffer_ref: 0,
+                patch_index_buffer_offset: 0,
+                patch_index_wire_va: 0,
+                control_point_index_buffer_ref: 13,
+                control_point_index_buffer_offset: 0,
+                control_point_index_wire_va: 0,
+                instance_count: 1,
+                base_instance: 0,
+                tessellation_factor: IcbTessellationFactor {
+                    buffer_ref: 12,
+                    offset: 0,
+                    wire_va: 0,
+                    instance_stride: 0,
+                },
+            },
+        },
+    )
+    .expect("fill DrawIndexedPatches tessellation");
+
+    let mapping_id = 9u32;
+    let pfn = 0x39u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "DrawIndexedPatches tessellation ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawIndexedPatches tessellation)"
+        );
+    }
+}
+
+/// Unknown wire command types still fail closed.
+#[test]
+fn unknown_icb_command_types_fail_closed() {
+    let layout = render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW);
+    let mut slot = vec![0u8; layout.command_size as usize];
+    // Not a known draw/patch/mesh/dispatch type.
+    st32(&mut slot[layout.command_type_offset as usize..], 0x55);
+    st32(&mut slot[layout.pipeline_state_offset as usize..], 1);
+    let err = decode_render_command_slot(&layout, &slot, 0, 0).unwrap_err();
+    // The slug, not just the class: `Args` speaks for 84 checks in this
+    // file, so asserting the class alone would pass on the wrong refusal.
+    assert_eq!(
+        crate::observe::Decline::slug(&err),
+        "icb_drs_unknown_command_type"
+    );
+}
+
+/// Mesh/object buffer binds share the 0x14 ref/va/gpuva pack at layout
+/// objectBufferBindOffset / meshBufferBindOffset.
+#[test]
+fn decode_encode_mesh_object_buffer_binds() {
+    use crate::runtime::decode::resource::{
+        render_draw_mesh_threads_icb_layout_with_binds, ICB_BUFFER_BIND_STRIDE,
+        ICB_CMD_TYPE_DRAW_MESH_THREADS,
+    };
+
+    let layout = render_draw_mesh_threads_icb_layout_with_binds(1, 2);
+    assert_eq!(
+        layout.mesh_buffer_bind_offset,
+        layout.object_buffer_bind_offset + ICB_BUFFER_BIND_STRIDE as u32
+    );
+    assert_eq!(
+        layout.kernel_buffer_bind_offset,
+        layout.mesh_buffer_bind_offset + 2 * ICB_BUFFER_BIND_STRIDE as u32
+    );
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 9,
+        buffers: vec![
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 101,
+                offset: 0,
+                wire_va: 0x4000,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Object,
+            },
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 202,
+                offset: 0,
+                wire_va: 0x5000,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Mesh,
+            },
+            IcbRenderBufferBind {
+                index: 1,
+                buffer_ref: 203,
+                offset: 0,
+                wire_va: 0x5008,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Mesh,
+            },
+        ],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreads {
+            threads_x: 1,
+            threads_y: 1,
+            threads_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh binds");
+    assert_eq!(
+        ld32(&slot[layout.command_type_offset as usize..]),
+        ICB_CMD_TYPE_DRAW_MESH_THREADS
+    );
+    // Object bind 0
+    let o0 = layout.object_buffer_bind_offset as usize;
+    assert_eq!(ld32(&slot[o0..]), 101);
+    assert_eq!(ld64(&slot[o0 + 4..]), 0x4000);
+    assert_eq!(ld64(&slot[o0 + 0xc..]), 0x4000);
+    // Mesh binds 0,1
+    let m0 = layout.mesh_buffer_bind_offset as usize;
+    assert_eq!(ld32(&slot[m0..]), 202);
+    assert_eq!(ld64(&slot[m0 + 4..]), 0x5000);
+    let m1 = m0 + ICB_BUFFER_BIND_STRIDE;
+    assert_eq!(ld32(&slot[m1..]), 203);
+    assert_eq!(ld64(&slot[m1 + 4..]), 0x5008);
+
+    let decoded = decode_render_command_slot(&layout, &slot, 0, 0)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.buffers.len(), 3);
+    let obj = decoded
+        .buffers
+        .iter()
+        .find(|b| b.effective_stage() == IcbRenderBindStage::Object)
+        .expect("object bind");
+    assert_eq!(obj.buffer_ref, 101);
+    assert_eq!(obj.wire_va, 0x4000);
+    let mesh_refs: Vec<_> = decoded
+        .buffers
+        .iter()
+        .filter(|b| b.effective_stage() == IcbRenderBindStage::Mesh)
+        .map(|b| (b.index, b.buffer_ref, b.wire_va))
+        .collect();
+    assert_eq!(mesh_refs, vec![(0, 202, 0x5000), (1, 203, 0x5008)]);
+}
+
+/// Mesh wire encode↔decode (command types 0x80 / 0x100, args 0x48).
+#[test]
+fn decode_encode_draw_mesh_slot_roundtrip() {
+    use crate::runtime::decode::resource::{
+        render_draw_mesh_threadgroups_icb_layout, render_draw_mesh_threads_icb_layout,
+        ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS, ICB_CMD_TYPE_DRAW_MESH_THREADS,
+        ICB_DRAW_MESH_ARGS_LEN,
+    };
+
+    let layout = render_draw_mesh_threads_icb_layout(0);
+    assert_eq!(
+        layout.command_arguments_offset + ICB_DRAW_MESH_ARGS_LEN,
+        layout.command_size
+    );
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreads {
+            threads_x: 8,
+            threads_y: 1,
+            threads_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 4,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh threads");
+    assert_eq!(
+        ld32(&slot[layout.command_type_offset as usize..]),
+        ICB_CMD_TYPE_DRAW_MESH_THREADS
+    );
+    let decoded = decode_render_command_slot(&layout, &slot, 0, 0)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.pipeline_ref, 6);
+    match decoded.draw {
+        IcbRenderDraw::MeshThreads {
+            threads_x,
+            mesh_tg_x,
+            object_tg_x,
+            ..
+        } => {
+            assert_eq!(threads_x, 8);
+            assert_eq!(mesh_tg_x, 4);
+            assert_eq!(object_tg_x, 1);
+        }
+        _ => panic!("expected MeshThreads"),
+    }
+
+    let layout_tg = render_draw_mesh_threadgroups_icb_layout();
+    let fill_tg = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 7,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x: 2,
+            threadgroups_y: 3,
+            threadgroups_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 32,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot_tg =
+        encode_render_command_slot(&layout_tg, &fill_tg).expect("encode mesh threadgroups");
+    assert_eq!(
+        ld32(&slot_tg[layout_tg.command_type_offset as usize..]),
+        ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS
+    );
+    let d2 = decode_render_command_slot(&layout_tg, &slot_tg, 0, 0)
+        .unwrap()
+        .expect("filled");
+    match d2.draw {
+        IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x,
+            threadgroups_y,
+            mesh_tg_x,
+            ..
+        } => {
+            assert_eq!(threadgroups_x, 2);
+            assert_eq!(threadgroups_y, 3);
+            assert_eq!(mesh_tg_x, 32);
+        }
+        _ => panic!("expected MeshThreadgroups"),
+    }
+}
+
+/// Pixel-level ICB drawMeshThreads: mesh emits full-screen triangle,
+/// fragment solid BGRA matching tess/draw oracles.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_draw_mesh_threads_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mesh_mtlb = std::fs::read(base.join("icb_mesh.metallib")).expect("icb_mesh.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    // Mesh function lives in the type-7 "vertex" function slot (no guest
+    // mesh-pipeline descriptor yet — host-fill only path).
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    // No vertex attributes needed for mesh; reuse stage-in desc helper with empty attrs.
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreads {
+                threads_x: 1,
+                threads_y: 1,
+                threads_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill DrawMeshThreads");
+
+    let mapping_id = 9u32;
+    let pfn = 0x3au32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "DrawMeshThreads ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    // float4(0.4, 0.267, 0.133, 1) → BGRA ≈ 34,68,102,255
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawMeshThreads)"
+        );
+    }
+}
+
+/// Pixel-level ICB drawMeshThreadgroups (same solid BGRA).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_draw_mesh_threadgroups_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mesh_mtlb = std::fs::read(base.join("icb_mesh.metallib")).expect("icb_mesh.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill DrawMeshThreadgroups");
+
+    let mapping_id = 9u32;
+    let pfn = 0x3bu32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "DrawMeshThreadgroups ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawMeshThreadgroups)"
+        );
+    }
+}
+
+/// Wire `baseVertex@0x28` is a signed value stored as u64 bits (two's complement).
+#[test]
+fn decode_encode_signed_base_vertex() {
+    let layout = render_icb_layout(1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 11,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Indexed {
+            primitive_type: 3,
+            index_type: 0,
+            index_buffer_ref: 12,
+            index_count: 3,
+            index_buffer_offset: 0,
+            index_wire_va: 0,
+            instance_count: 1,
+            base_vertex: -1,
+            base_instance: 0,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).unwrap();
+    let args = layout.command_arguments_offset as usize;
+    // Bit pattern of i64(-1) is u64::MAX.
+    assert_eq!(ld64(&slot[args + 0x28..]), u64::MAX);
+    let decoded = decode_render_command_slot(&layout, &slot, 1, 0)
+        .unwrap()
+        .expect("filled");
+    match decoded.draw {
+        IcbRenderDraw::Indexed { base_vertex, .. } => {
+            assert_eq!(base_vertex, -1);
+        }
+        IcbRenderDraw::Primitives { .. }
+        | IcbRenderDraw::Patches { .. }
+        | IcbRenderDraw::IndexedPatches { .. }
+        | IcbRenderDraw::MeshThreads { .. }
+        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Indexed"),
+    }
+
+    let fill2 = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 11,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Indexed {
+            primitive_type: 3,
+            index_type: 0,
+            index_buffer_ref: 12,
+            index_count: 3,
+            index_buffer_offset: 0,
+            index_wire_va: 0,
+            instance_count: 1,
+            base_vertex: -42,
+            base_instance: 7,
+        },
+    };
+    let slot2 = encode_render_command_slot(&layout, &fill2).unwrap();
+    let d2 = decode_render_command_slot(&layout, &slot2, 1, 0)
+        .unwrap()
+        .expect("filled");
+    match d2.draw {
+        IcbRenderDraw::Indexed {
+            base_vertex,
+            base_instance,
+            ..
+        } => {
+            assert_eq!(base_vertex, -42);
+            assert_eq!(base_instance, 7);
+        }
+        IcbRenderDraw::Primitives { .. }
+        | IcbRenderDraw::Patches { .. }
+        | IcbRenderDraw::IndexedPatches { .. }
+        | IcbRenderDraw::MeshThreads { .. }
+        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Indexed"),
+    }
+}
+
+/// DrawIndexed with `baseVertex = -1`: indices `[1,2,3]` + offset → verts 0,1,2
+/// of a stage_in clip-space triangle (same solid as baseVertex 0 / indices 0,1,2).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_negative_base_vertex_stagein_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    // Clip-space full-cover triangle at vertex indices 0,1,2.
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let pos_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+
+    // indices [1,2,3] + baseVertex(-1) → vertex_id 0,1,2.
+    let indices: [u16; 3] = [1, 2, 3];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 12, 5, &index_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 6, &color_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 11,
+                    offset: 0,
+                    wire_va: 0,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: false,
+                    stage: IcbRenderBindStage::default(),
+                },
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 13,
+                    offset: 0,
+                    wire_va: 0,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: true,
+                    stage: IcbRenderBindStage::default(),
+                },
+            ],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 0,
+                index_wire_va: 0,
+                instance_count: 1,
+                base_vertex: -1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill DrawIndexed baseVertex=-1");
+
+    let mapping_id = 9u32;
+    let pfn = 0x37u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "negative baseVertex stage_in DrawIndexed"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (baseVertex=-1)"
+        );
+    }
+}
+
+#[test]
+fn decode_encode_command_slot_roundtrip() {
+    let layout = compute_only_icb_layout(1);
+    let fill = IcbComputeFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![IcbKernelBufferBind {
+            index: 0,
+            buffer_ref: 7,
+            offset: 0,
+            wire_va: 0,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+        }],
+        threadgroup_memory: vec![],
+        barrier: false,
+        dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+            grid_x: 1,
+            grid_y: 1,
+            grid_z: 1,
+            tg_x: 4,
+            tg_y: 1,
+            tg_z: 1,
+        },
+    };
+    let slot = encode_compute_command_slot(&layout, &fill).unwrap();
+    assert_eq!(slot.len(), layout.command_size as usize);
+    let decoded = decode_compute_command_slot(&layout, &slot, 1)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.pipeline_ref, 6);
+    assert_eq!(decoded.buffers.len(), 1);
+    assert_eq!(decoded.buffers[0].buffer_ref, 7);
+    match decoded.dispatch {
+        IcbFillDispatch::ConcurrentThreadgroups { grid_x, tg_x, .. } => {
+            assert_eq!(grid_x, 1);
+            assert_eq!(tg_x, 4);
+        }
+        _ => panic!("expected threadgroups"),
+    }
+    // Empty slot
+    let empty = vec![0u8; layout.command_size as usize];
+    assert!(decode_compute_command_slot(&layout, &empty, 1)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn buffer_backed_fill_execute_mul3add1() {
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb_paths =
+        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
+    let mtlb = mtlb_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .expect("compute_mul3add1.mtlb fixture");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_icb_desc_bytes(1, 1, false);
+    let layout = compute_only_icb_layout(1);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    let fdesc_gva = 0x100u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fdesc_gva,
+        &fdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, fdesc_gva);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc_gva = 0x140u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, pdesc_gva);
+
+    let data = [1u32, 2, 3, 4];
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        buf_gva,
+        &data_bytes,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 16);
+    st32(&mut bdesc[8..], 3);
+    let bdesc_gva = 0x180u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        bdesc_gva,
+        &bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+
+    // Guest-style fill: command slot in a type-1 backing buffer (handle 4).
+    let slot = encode_compute_command_slot(
+        &layout,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+            }],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 4,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .unwrap();
+    let cmd_handle = 4u32;
+    let cmd_mem_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_mem_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    let cmd_bdesc_gva = 0x1c0u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_bdesc_gva,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, cmd_bdesc_gva);
+
+    // Auto-bind via type-1 buffer_ref (sync path / 0x1d1 payload).
+    let mem = associate_icb_backing_buffer_ref(&state, &host, 1, 9, 10).expect("associate");
+    assert_eq!(mem.gva, cmd_mem_gva);
+    assert_eq!(mem.byte_len, layout.command_size as u64);
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(
+            &mut state,
+            &mut host,
+            1,
+            &cmd,
+            &crate::runtime::compute_exec::ComputeAccum::default()
+        ),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        out,
+        vec![4, 7, 10, 13],
+        "type-1 associated ICB fill+execute mul3add1"
+    );
+}
+
+#[test]
+fn icb_host_resource_info_decode_and_apply() {
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    // Payload-only form
+    let mut p = [0u8; 16];
+    st32(&mut p[0..], 9);
+    st32(&mut p[4..], 10);
+    st64(&mut p[8..], 0x4000);
+    let info = decode_icb_host_resource_info(&p).unwrap();
+    assert_eq!(info.icb_ref, 9);
+    assert_eq!(info.buffer_ref, 10);
+    assert_eq!(info.gpu_address, 0x4000);
+    // Full record form
+    let mut rec = [0u8; 24];
+    st32(&mut rec[0..], INFO_OP_ICB_HOST_RESOURCE);
+    st32(&mut rec[4..], INFO_OP_ICB_HOST_RESOURCE_RECORD_LEN);
+    rec[8..24].copy_from_slice(&p);
+    let info2 = decode_icb_host_resource_info(&rec).unwrap();
+    assert_eq!(info2, info);
+}
+
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn apply_0x1d1_auto_binds_backing() {
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = compute_only_icb_layout(1);
+    let icb_desc = make_icb_desc_bytes(1, 1, false);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let slot = encode_compute_command_slot(
+        &layout,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 1,
+            buffers: vec![],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 1,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .unwrap();
+    let handle = 5u32;
+    let cmd_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], slot.len() as u64);
+    st64(&mut bdesc[8..], handle as u64);
+    let bdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        bdesc_gva,
+        &bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 11, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+
+    let mem = apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 11,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1 apply");
+    assert_eq!(mem.gva, cmd_gva);
+    assert_eq!(mem.byte_len, layout.command_size as u64);
+}
+
+/// Product DrawIndexed ICB fill + execute: oracle fullscreen triangle via
+/// indices [0,1,2], fragment constant color → solid BGRA writeback.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_draw_indexed_execute_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // ICB: DrawIndexed, maxFragment=1 for color constant at fragment buffer 0.
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    // Vertex function (ref 2) + fragment function (ref 3).
+    // Descriptor GVAs stay past object-list region (32×12 = 0x180).
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    let vfdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vfdesc_gva,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    let ffdesc_gva = 0x220u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        ffdesc_gva,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+
+    // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc_gva = 0x240u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+
+    // Index buffer (ref 12, handle 4): UInt16 [0,1,2].
+    let indices: [u16; 3] = [0, 1, 2];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+
+    // Fragment color buffer (ref 13, handle 5): RGBA float4 for sid=7.
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    // Mapping for color writeback (4×4 BGRA).
+    let mapping_id = 9u32;
+    let pfn = 0x30u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 0,
+                index_wire_va: 0,
+                instance_count: 1,
+                base_vertex: 0,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill_render DrawIndexed");
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        color_texture_ref: 0,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok
+    );
+
+    // BGRA writeback: B=0x22 G=0x44 R=0x67 A=0xff (oracle sid=7).
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (ICB DrawIndexed oracle)"
+        );
+    }
+}
+
+/// Buffer-backed DrawIndexed: encode slot → 0x1d1 associate → execute re-fill.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn buffer_backed_render_draw_indexed_fill_execute() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let max_v = 0u16;
+    let max_f = 1u16;
+    let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    let vfdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vfdesc_gva,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    let ffdesc_gva = 0x220u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        ffdesc_gva,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc_gva = 0x240u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+
+    let indices: [u16; 3] = [0, 1, 2];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 0,
+                index_wire_va: 0,
+                instance_count: 1,
+                base_vertex: 0,
+                base_instance: 0,
+            },
+        },
+    )
+    .unwrap();
+
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    let cmd_bdesc_gva = 0x1a0u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_bdesc_gva,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, cmd_bdesc_gva);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    let mapping_id = 9u32;
+    let pfn = 0x31u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    // Execute path re-fills from command memory (DrawIndexed + fragment bind).
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        color_texture_ref: 0,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (buffer-backed DrawIndexed)"
+        );
+    }
+}
+
+/// Wire-backed E2E: DrawPatches tessellation.
+///
+/// Guest path only — no `fill_render_command` host API:
+/// encode slot → type-1 command memory → `0x1d1` associate → execute
+/// re-fills via `fill_icb_from_command_memory` → solid BGRA.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_draw_patches_tessellation_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        render_draw_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_PATCHES,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let vert_mtlb =
+        std::fs::read(base.join("icb_tess_vtx.metallib")).expect("icb_tess_vtx.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_tess_frag.metallib")).expect("icb_tess_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_patches_icb_layout(1);
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let cp_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+
+    let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
+    put_type1_buffer(&mut host, &mut state, 12, 5, &tess_bytes);
+
+    // Absolute wire VAs for control-point bind + tess factor (base+0).
+    let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
+    let tess_wire = (5u64) << RESOURCE_PAGE_SHIFT;
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 11,
+                offset: 0,
+                wire_va: cp_wire,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Vertex,
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Patches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 1,
+                patch_index_buffer_ref: 0,
+                patch_index_buffer_offset: 0,
+                patch_index_wire_va: 0,
+                instance_count: 1,
+                base_instance: 0,
+                tessellation_factor: IcbTessellationFactor {
+                    buffer_ref: 12,
+                    offset: 0,
+                    wire_va: tess_wire,
+                    instance_stride: 0,
+                },
+            },
+        },
+    )
+    .expect("encode DrawPatches slot");
+
+    // Command memory only — never call fill_render_command.
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1 associate command memory");
+
+    // Explicit re-fill (what execute does) — proves decode+resolve path.
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory DrawPatches");
+
+    let mapping_id = 9u32;
+    let pfn = 0x3cu32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed DrawPatches execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed DrawPatches)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: DrawIndexedPatches tessellation (not via
+/// host fill API or DrawPatches-only path).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_draw_indexed_patches_tessellation_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        render_draw_indexed_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES,
+        OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let vert_mtlb =
+        std::fs::read(base.join("icb_tess_vtx.metallib")).expect("icb_tess_vtx.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_tess_frag.metallib")).expect("icb_tess_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_indexed_patches_icb_layout(1);
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    // Control points: dummy at 0, real triangle at 1,2,3.
+    let cps: [[f32; 4]; 4] = [
+        [0.0, 0.0, 0.0, 1.0],
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let cp_bytes: Vec<u8> = cps
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &cp_bytes);
+
+    let indices: [u16; 3] = [1, 2, 3];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &index_bytes);
+
+    let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
+    put_type1_buffer(&mut host, &mut state, 12, 6, &tess_bytes);
+
+    let cp_wire = (4u64) << RESOURCE_PAGE_SHIFT;
+    let index_wire = (5u64) << RESOURCE_PAGE_SHIFT;
+    let tess_wire = (6u64) << RESOURCE_PAGE_SHIFT;
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 11,
+                offset: 0,
+                wire_va: cp_wire,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Vertex,
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::IndexedPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 1,
+                patch_index_buffer_ref: 0,
+                patch_index_buffer_offset: 0,
+                patch_index_wire_va: 0,
+                control_point_index_buffer_ref: 13,
+                control_point_index_buffer_offset: 0,
+                control_point_index_wire_va: index_wire,
+                instance_count: 1,
+                base_instance: 0,
+                tessellation_factor: IcbTessellationFactor {
+                    buffer_ref: 12,
+                    offset: 0,
+                    wire_va: tess_wire,
+                    instance_stride: 0,
+                },
+            },
+        },
+    )
+    .expect("encode DrawIndexedPatches slot");
+
+    let cmd_handle = 7u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1 associate command memory");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory DrawIndexedPatches");
+
+    let mapping_id = 9u32;
+    let pfn = 0x48u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed DrawIndexedPatches execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed DrawIndexedPatches)"
+        );
+    }
+}
+
+/// Object+mesh host fill: dual-function metallib (object type 8 + mesh type 7)
+/// → drawMeshThreadgroups → solid BGRA (object sets mesh grid via payload).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_object_mesh_threadgroups_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_mesh.metallib")).expect("icb_object_mesh.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // maxObjectTG=1 so create body + materialize allow object TG memory binds.
+    let icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
+    // Patch max_object_tg create byte + layout with 1 object TG slot.
+    {
+        use crate::runtime::decode::resource::{
+            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
+            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
+        };
+        let mut b = icb_desc.clone();
+        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
+        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
+        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+            .copy_from_slice(&encode_icb_command_layout(&layout));
+        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            icb_gva,
+            &b,
+            PAGE_SHIFT_ARM64E
+        )
+        .is_ok());
+        put_list_entry(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_TYPE7,
+            ICB_DESC_LEN as u32,
+            icb_gva,
+        );
+    }
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            // length 0 = clear; exercise API path with empty vec is fine.
+            // Non-zero object TG mem optional for this payload-only shader.
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill object+mesh threadgroups");
+
+    let mapping_id = 9u32;
+    let pfn = 0x3eu32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "object+mesh ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (object+mesh)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: dual-export object+mesh metallib in classic
+/// type-7 vertex slot (no mesh SPI tag 0x14) through command memory.
+/// Not claimed via mesh SPI separate-ref E2E.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_dual_export_object_mesh_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
+        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_mesh.metallib")).expect("icb_object_mesh.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_mesh_threadgroups_icb_layout();
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    // Dual-export object+mesh in classic "vertex" function slot only.
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    // Classic type-7 shape: tag 0x01/0x02 only (no mesh SPI 0x14).
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    let decoded = decode_render_pipeline_descriptor(&pdesc).expect("classic pipeline");
+    assert_eq!(decoded.vertex_func_ref, 2);
+    assert_eq!(decoded.fragment_func_ref, 3);
+    assert_eq!(decoded.object_func_ref, 0);
+    assert_eq!(decoded.mesh_func_ref, 0);
+    assert!(!decoded.has_color_attachment_offset || decoded.color_attachment_offset != 0);
+    // Mesh SPI shape uses tag 0x14; classic stagein has tag 0x08.
+    // object/mesh refs must stay zero so fill uses dual-export scan of vertex metallib.
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x: 1,
+            threadgroups_y: 1,
+            threadgroups_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode dual-export slot");
+
+    let cmd_handle = 5u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory dual-export object+mesh");
+
+    let mapping_id = 9u32;
+    let pfn = 0x4bu32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed dual-export object+mesh execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed dual-export object+mesh)"
+        );
+    }
+}
+
+/// Separate object + mesh + fragment function refs via mesh SPI type-7
+/// tags 0x01 / 0x02 / 0x03 under section tag 0x14 (not dual-export).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_separate_object_mesh_func_refs_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        decode_render_pipeline_descriptor, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let obj_mtlb =
+        std::fs::read(base.join("icb_object_stage.metallib")).expect("icb_object_stage.metallib");
+    let mesh_mtlb = std::fs::read(base.join("icb_mesh_with_payload.metallib"))
+        .expect("icb_mesh_with_payload.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
+    {
+        use crate::runtime::decode::resource::{
+            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
+            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
+        };
+        let mut b = icb_desc.clone();
+        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
+        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
+        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+            .copy_from_slice(&encode_icb_command_layout(&layout));
+        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            icb_gva,
+            &b,
+            PAGE_SHIFT_ARM64E
+        )
+        .is_ok());
+        put_list_entry(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_TYPE7,
+            ICB_DESC_LEN as u32,
+            icb_gva,
+        );
+    }
+
+    // Object function ref 2, mesh ref 4, fragment ref 3 — three distinct objects.
+    let oblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        oblob_gva,
+        &obj_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ofdesc = vec![0u8; 32];
+    st64(&mut ofdesc[0..], oblob_gva);
+    st32(&mut ofdesc[8..], obj_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &ofdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let mblob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x260,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 32, 0x260);
+
+    let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
+    let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh pipeline decode");
+    assert_eq!(decoded.object_func_ref, 2);
+    assert_eq!(decoded.mesh_func_ref, 4);
+    assert_eq!(decoded.fragment_func_ref, 3);
+    assert_eq!(decoded.vertex_func_ref, 0);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x280, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x280,
+    );
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill separate object+mesh+frag refs");
+
+    let mapping_id = 9u32;
+    let pfn = 0x3fu32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "separate object/mesh func-ref ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (separate object/mesh refs)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: mesh SPI pipeline shape (tag 0x14 + object/
+/// mesh/frag refs 0x01/0x02/0x03) through command memory — not dual-export
+/// and not host `fill_render_command` API.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_mesh_spi_pipeline_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
+        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let obj_mtlb =
+        std::fs::read(base.join("icb_object_stage.metallib")).expect("icb_object_stage.metallib");
+    let mesh_mtlb = std::fs::read(base.join("icb_mesh_with_payload.metallib"))
+        .expect("icb_mesh_with_payload.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_mesh_threadgroups_icb_layout();
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    // Three distinct function objects: object=2, frag=3, mesh=4.
+    let oblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        oblob_gva,
+        &obj_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ofdesc = vec![0u8; 32];
+    st64(&mut ofdesc[0..], oblob_gva);
+    st32(&mut ofdesc[8..], obj_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &ofdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let mblob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x260,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 32, 0x260);
+
+    let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
+    let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh SPI pipeline");
+    assert_eq!(decoded.object_func_ref, 2);
+    assert_eq!(decoded.mesh_func_ref, 4);
+    assert_eq!(decoded.fragment_func_ref, 3);
+    assert_eq!(decoded.vertex_func_ref, 0);
+    assert!(decoded.has_color_attachment_offset); // tag 0x14 shape
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x280, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x280,
+    );
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x: 1,
+            threadgroups_y: 1,
+            threadgroups_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh SPI slot");
+
+    let cmd_handle = 5u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory mesh SPI pipeline");
+
+    let mapping_id = 9u32;
+    let pfn = 0x47u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed mesh SPI pipeline execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed mesh SPI pipeline)"
+        );
+    }
+}
+
+/// Pixel: setMeshBuffer — mesh stage reads scale from buffer(0).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_mesh_buffer_bind_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mesh_mtlb =
+        std::fs::read(base.join("icb_mesh_buf.metallib")).expect("icb_mesh_buf.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // max_mesh=1 so create/layout allow mesh buffer bind table.
+    let icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    // scale = 1.0f LE (handle must be a setup_task-mapped page pfn).
+    let scale_bytes = 1.0f32.to_le_bytes();
+    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Mesh,
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreads {
+                threads_x: 1,
+                threads_y: 1,
+                threads_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill mesh buffer bind");
+
+    let mapping_id = 9u32;
+    let pfn = 0x40u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "mesh buffer bind ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (mesh buffer bind)"
+        );
+    }
+}
+
+/// Pixel: setObjectBuffer — object stage reads scale from buffer(0) → payload.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_object_buffer_bind_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_buf.metallib")).expect("icb_object_buf.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // max_object=1 for object buffer bind table.
+    let icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let scale_bytes = 1.0f32.to_le_bytes();
+    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Object,
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill object buffer bind");
+
+    let mapping_id = 9u32;
+    let pfn = 0x41u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "object buffer bind ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (object buffer bind)"
+        );
+    }
+}
+
+/// Wire-backed E2E: encode mesh buffer bind + MeshThreads → command memory
+/// → 0x1d1 → fill_icb_from_command_memory → execute (setMeshBuffer path).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_mesh_buffer_bind_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        encode_icb_command_layout, render_draw_mesh_threads_icb_layout_with_binds, ICB_DESC_LAYOUT,
+        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mesh_mtlb =
+        std::fs::read(base.join("icb_mesh_buf.metallib")).expect("icb_mesh_buf.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let mut icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
+    let layout = render_draw_mesh_threads_icb_layout_with_binds(0, 1);
+    icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let scale_bytes = 1.0f32.to_le_bytes();
+    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+    let scale_gva = 4u64 << RESOURCE_PAGE_SHIFT;
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![IcbRenderBufferBind {
+            index: 0,
+            buffer_ref: 7,
+            offset: 0,
+            wire_va: scale_gva,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+            is_fragment: false,
+            stage: IcbRenderBindStage::Mesh,
+        }],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreads {
+            threads_x: 1,
+            threads_y: 1,
+            threads_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh bind slot");
+
+    let cmd_handle = 5u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory mesh buffer bind");
+
+    let mapping_id = 9u32;
+    let pfn = 0x42u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed mesh buffer bind execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed mesh buffer bind)"
+        );
+    }
+}
+
+/// Wire-backed E2E: encode object buffer bind + MeshThreadgroups → command
+/// memory → 0x1d1 → fill_icb_from_command_memory → execute (setObjectBuffer).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_object_buffer_bind_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
+        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_buf.metallib")).expect("icb_object_buf.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let mut icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
+    let layout = render_draw_mesh_threadgroups_icb_layout_ex(1, 0, 0);
+    icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let scale_bytes = 1.0f32.to_le_bytes();
+    put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
+    let scale_gva = 4u64 << RESOURCE_PAGE_SHIFT;
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![IcbRenderBufferBind {
+            index: 0,
+            buffer_ref: 7,
+            offset: 0,
+            wire_va: scale_gva,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+            is_fragment: false,
+            stage: IcbRenderBindStage::Object,
+        }],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x: 1,
+            threadgroups_y: 1,
+            threadgroups_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode object bind slot");
+
+    let cmd_handle = 5u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory object buffer bind");
+
+    let mapping_id = 9u32;
+    let pfn = 0x43u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed object buffer bind execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed object buffer bind)"
+        );
+    }
+}
+
+/// Wire encode↔decode of object TG memory lengths + MeshThreadgroups.
+#[test]
+fn decode_encode_object_tg_memory_mesh_slot() {
+    use crate::runtime::decode::resource::{
+        render_draw_mesh_threadgroups_icb_layout_ex, ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS,
+        ICB_TG_MEMORY_STRIDE,
+    };
+
+    let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 2);
+    assert_eq!(
+        layout.threadgroup_memory_length_offset,
+        layout.object_threadgroup_memory_length_offset + 2 * ICB_TG_MEMORY_STRIDE as u32
+    );
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![],
+        object_threadgroup_memory: vec![
+            IcbThreadgroupMemory {
+                index: 0,
+                length: 16,
+            },
+            IcbThreadgroupMemory {
+                index: 1,
+                length: 32,
+            },
+        ],
+        draw: IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x: 1,
+            threadgroups_y: 1,
+            threadgroups_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode");
+    assert_eq!(
+        ld32(&slot[layout.command_type_offset as usize..]),
+        ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS
+    );
+    let base = layout.object_threadgroup_memory_length_offset as usize;
+    assert_eq!(ld64(&slot[base..]), 16);
+    assert_eq!(ld64(&slot[base + ICB_TG_MEMORY_STRIDE..]), 32);
+    let decoded = decode_render_command_slot(&layout, &slot, 0, 0)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.object_threadgroup_memory.len(), 2);
+    assert_eq!(decoded.object_threadgroup_memory[0].length, 16);
+    assert_eq!(decoded.object_threadgroup_memory[1].index, 1);
+    assert_eq!(decoded.object_threadgroup_memory[1].length, 32);
+}
+
+/// Dedicated: non-multiple-of-16 object TG length is fail-closed (Args).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_object_tg_memory_bad_length_rejected() {
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_tg.metallib")).expect("icb_object_tg.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    {
+        use crate::runtime::decode::resource::{
+            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
+            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
+        };
+        let mut b = make_render_icb_desc_bytes_ex(
+            1,
+            0,
+            0,
+            0,
+            0,
+            MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
+            0,
+        );
+        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
+        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
+        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+            .copy_from_slice(&encode_icb_command_layout(&layout));
+        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            icb_gva,
+            &b,
+            PAGE_SHIFT_ARM64E
+        )
+        .is_ok());
+        put_list_entry(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_TYPE7,
+            ICB_DESC_LEN as u32,
+            icb_gva,
+        );
+    }
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let err = fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![IcbThreadgroupMemory {
+                index: 0,
+                length: 8, // not multiple of 16
+            }],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    );
+    assert_eq!(
+        err,
+        Err(IcbStatus::Args("icb_frc_object_tg_length_alignment")),
+        "length 8 must fail closed, and name the alignment check"
+    );
+}
+
+/// Dedicated host-fill: object TG length 16 used by object shader → solid BGRA.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_object_tg_memory_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_tg.metallib")).expect("icb_object_tg.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    {
+        use crate::runtime::decode::resource::{
+            encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex,
+            ICB_DESC_LAYOUT, ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN,
+        };
+        let mut b = make_render_icb_desc_bytes_ex(
+            1,
+            0,
+            0,
+            0,
+            0,
+            MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
+            0,
+        );
+        b[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
+        let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
+        b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+            .copy_from_slice(&encode_icb_command_layout(&layout));
+        let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+        assert!(gva_mem::write_task_gva(
+            &mut host,
+            &state.tasks[1],
+            icb_gva,
+            &b,
+            PAGE_SHIFT_ARM64E
+        )
+        .is_ok());
+        put_list_entry(
+            &mut host,
+            &state,
+            9,
+            OBJECT_TYPE_TYPE7,
+            ICB_DESC_LEN as u32,
+            icb_gva,
+        );
+    }
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![IcbThreadgroupMemory {
+                index: 0,
+                length: 16,
+            }],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("fill object TG memory");
+
+    let mapping_id = 9u32;
+    let pfn = 0x45u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "object TG memory ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (object TG memory)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: object TG length 16 through command memory.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_object_tg_memory_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
+        ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
+        OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let om_mtlb =
+        std::fs::read(base.join("icb_object_tg.metallib")).expect("icb_object_tg.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_mesh_threadgroups_icb_layout_ex(0, 0, 1);
+    let mut icb_desc =
+        make_render_icb_desc_bytes_ex(1, 0, 0, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
+    icb_desc[ICB_DESC_MAX_OBJECT_TG_BINDS] = 1;
+    icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
+        .copy_from_slice(&encode_icb_command_layout(&layout));
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &om_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![],
+        object_threadgroup_memory: vec![IcbThreadgroupMemory {
+            index: 0,
+            length: 16,
+        }],
+        draw: IcbRenderDraw::MeshThreadgroups {
+            threadgroups_x: 1,
+            threadgroups_y: 1,
+            threadgroups_z: 1,
+            object_tg_x: 1,
+            object_tg_y: 1,
+            object_tg_z: 1,
+            mesh_tg_x: 1,
+            mesh_tg_y: 1,
+            mesh_tg_z: 1,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode object TG slot");
+
+    let cmd_handle = 5u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory object TG");
+
+    let mapping_id = 9u32;
+    let pfn = 0x46u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed object TG execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed object TG)"
+        );
+    }
+}
+
+/// Wire-backed E2E: drawMeshThreads.
+///
+/// Same guest path as patches: encode slot into type-1 command memory,
+/// `0x1d1` bind, execute re-fills from wire (no host `fill_render_command`).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_mesh_threads_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        render_draw_mesh_threads_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADS,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mesh_mtlb = std::fs::read(base.join("icb_mesh.metallib")).expect("icb_mesh.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_mesh_threads_icb_layout(0);
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreads {
+                threads_x: 1,
+                threads_y: 1,
+                threads_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("encode MeshThreads slot");
+
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory MeshThreads");
+
+    let mapping_id = 9u32;
+    let pfn = 0x3du32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed MeshThreads execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed MeshThreads)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: drawMeshThreadgroups (no object buffer binds).
+///
+/// Separate from object-buffer E2E so MeshThreadgroups command-memory path
+/// cannot regress silently when that other test is simplified.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_mesh_threadgroups_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        render_draw_mesh_threadgroups_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mesh_mtlb = std::fs::read(base.join("icb_mesh.metallib")).expect("icb_mesh.metallib");
+    let frag_mtlb =
+        std::fs::read(base.join("icb_mesh_frag.metallib")).expect("icb_mesh_frag.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_draw_mesh_threadgroups_icb_layout();
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        mblob_gva,
+        &mesh_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut mfdesc = vec![0u8; 32];
+    st64(&mut mfdesc[0..], mblob_gva);
+    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &mfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::MeshThreadgroups {
+                threadgroups_x: 1,
+                threadgroups_y: 1,
+                threadgroups_z: 1,
+                object_tg_x: 1,
+                object_tg_y: 1,
+                object_tg_z: 1,
+                mesh_tg_x: 1,
+                mesh_tg_y: 1,
+                mesh_tg_z: 1,
+            },
+        },
+    )
+    .expect("encode MeshThreadgroups slot");
+
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory MeshThreadgroups");
+
+    let mapping_id = 9u32;
+    let pfn = 0x44u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed MeshThreadgroups execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed MeshThreadgroups)"
+        );
+    }
+}
+
+/// inheritBuffers=true: ICB slot records only draw+PSO; fragment color
+/// comes from the parent encoder (stream bind path).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn inherit_buffers_encoder_fragment_color() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::render::Stage;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, BufferBind, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // inheritBuffers bit1; maxFragment still advertises encoder bind capacity.
+    let icb_desc = make_render_icb_desc_bytes_flags(
+        1,
+        0,
+        1,
+        MTL_INDIRECT_CMD_DRAW_INDEXED,
+        ICB_FLAG_INHERIT_BUFFERS,
+    );
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    let vfdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vfdesc_gva,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    let ffdesc_gva = 0x220u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        ffdesc_gva,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc_gva = 0x240u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+
+    let indices: [u16; 3] = [0, 1, 2];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    // Fill: pipeline + draw only — no fragment buffer in the ICB slot.
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 0,
+                index_wire_va: 0,
+                instance_count: 1,
+                base_vertex: 0,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill inherit draw");
+
+    let mapping_id = 9u32;
+    let pfn = 0x32u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    // Stream-style fragment bind on the encode request (parent encoder).
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        color_texture_ref: 0,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        fragment_buffers: vec![BufferBind {
+            stage: Stage::Fragment,
+            index: 0,
+            buffer_ref: 13,
+            offset: 0,
+        }],
+        viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "inheritBuffers encoder fragment path"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (inheritBuffers encoder)"
+        );
+    }
+}
+
+/// inheritPipelineState=true: ICB slot records only buffers+draw; PSO
+/// comes from the parent render encoder (stream pipeline bind path).
+/// Mirrors `inherit_pipeline_encoder_kernel_mul3add1` for compute.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn inherit_pipeline_encoder_fragment_color() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // inheritPipelineState bit0; maxFragment for fragment color in ICB slot.
+    let icb_desc = make_render_icb_desc_bytes_flags(
+        1,
+        0,
+        1,
+        MTL_INDIRECT_CMD_DRAW_INDEXED,
+        ICB_FLAG_INHERIT_PIPELINE_STATE,
+    );
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    let vfdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vfdesc_gva,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    let ffdesc_gva = 0x220u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        ffdesc_gva,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc_gva = 0x240u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+
+    let indices: [u16; 3] = [0, 1, 2];
+    let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    // Fill: buffers + draw only — pipeline_ref 0 (inherited from parent).
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 0,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 0,
+                index_wire_va: 0,
+                instance_count: 1,
+                base_vertex: 0,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill inheritPipeline draw");
+
+    let mapping_id = 9u32;
+    let pfn = 0x34u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    // Stream-style pipeline on the encode request (parent encoder).
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        color_texture_ref: 0,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "inheritPipelineState encoder fragment path"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (inheritPipelineState encoder)"
+        );
+    }
+}
+
+#[test]
+fn stagein_pipeline_fixture_decodes_vertex_attrs() {
+    use crate::runtime::decode::resource::decode_render_pipeline_descriptor;
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    let rp = decode_render_pipeline_descriptor(&pdesc).expect("stagein pipeline");
+    assert_eq!(rp.vertex_func_ref, 2);
+    assert_eq!(rp.fragment_func_ref, 3);
+    assert_eq!(rp.vertex_attributes.len(), 1);
+    let a = &rp.vertex_attributes[0];
+    assert_eq!(a.location, 0);
+    assert_eq!(a.format, 31); // Float4
+    assert_eq!(a.offset, 0);
+    assert_eq!(a.buffer_index, 0);
+    assert_eq!(a.stride, 16);
+}
+
+/// ICB Draw with `[[stage_in]]` vertex descriptor: position buffer +
+/// fragment color → solid BGRA (render_stagein fixtures).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_stagein_draw_execute_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // Draw (not indexed): max_vertex=1 for position buffer bind.
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    let vfdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vfdesc_gva,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    let ffdesc_gva = 0x220u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        ffdesc_gva,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    let pdesc_gva = 0x240u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        pdesc_gva,
+    );
+
+    // Fullscreen triangle positions (clip space), stride 16 Float4.
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let pos_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 11,
+                    offset: 0,
+                    wire_va: 0,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: false,
+                    stage: IcbRenderBindStage::default(),
+                },
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 13,
+                    offset: 0,
+                    wire_va: 0,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: true,
+                    stage: IcbRenderBindStage::default(),
+                },
+            ],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill_render stage_in Draw");
+
+    let mapping_id = 9u32;
+    let pfn = 0x33u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        color_texture_ref: 0,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        first_vertex: 0,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "stage_in ICB execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (ICB stage_in)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: classic Draw (`0x1`) with stage_in vertex
+/// buffer + fragment color — not DrawIndexed and not host fill API.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_draw_primitives_stagein_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let pos_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
+    let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 11,
+                    offset: 0,
+                    wire_va: pos_wire,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: false,
+                    stage: IcbRenderBindStage::Vertex,
+                },
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 13,
+                    offset: 0,
+                    wire_va: color_wire,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: true,
+                    stage: IcbRenderBindStage::Fragment,
+                },
+            ],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("encode Draw primitives slot");
+
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory Draw primitives");
+
+    let mapping_id = 9u32;
+    let pfn = 0x49u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed Draw primitives execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed Draw stage_in)"
+        );
+    }
+}
+
+#[test]
+fn decode_encode_attribute_stride_table() {
+    use crate::runtime::decode::resource::{
+        compute_icb_layout, icb_layout_attribute_stride_slot_count, render_icb_layout,
+        ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
+    };
+    // Compute: max_kernel=2 → 2 stride slots after binds.
+    let layout = compute_icb_layout(2, 0);
+    assert_eq!(icb_layout_attribute_stride_slot_count(&layout), 2);
+    let fill = IcbComputeFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![
+            IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 32,
+                has_attribute_stride: true,
+            },
+            IcbKernelBufferBind {
+                index: 1,
+                buffer_ref: 8,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 64,
+                has_attribute_stride: true,
+            },
+        ],
+        threadgroup_memory: vec![],
+        barrier: false,
+        dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+            grid_x: 1,
+            grid_y: 1,
+            grid_z: 1,
+            tg_x: 1,
+            tg_y: 1,
+            tg_z: 1,
+        },
+    };
+    let slot = encode_compute_command_slot(&layout, &fill).unwrap();
+    let so = layout.attribute_stride_offset as usize;
+    assert_eq!(ld64(&slot[so..]), 32);
+    assert_eq!(ld64(&slot[so + ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE..]), 64);
+    let decoded = decode_compute_command_slot(&layout, &slot, 2)
+        .unwrap()
+        .expect("filled");
+    assert_eq!(decoded.buffers.len(), 2);
+    assert!(decoded.buffers[0].has_attribute_stride);
+    assert_eq!(decoded.buffers[0].attribute_stride, 32);
+    assert_eq!(decoded.buffers[1].attribute_stride, 64);
+
+    // Render: max_vertex=1 → 1 stride slot; fragment bind has no stride.
+    let rlayout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
+    assert_eq!(icb_layout_attribute_stride_slot_count(&rlayout), 1);
+    let rfill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 11,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 16,
+                has_attribute_stride: true,
+                is_fragment: false,
+                stage: IcbRenderBindStage::default(),
+            },
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            },
+        ],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        },
+    };
+    let rslot = encode_render_command_slot(&rlayout, &rfill).unwrap();
+    assert_eq!(ld64(&rslot[rlayout.attribute_stride_offset as usize..]), 16);
+    let rdec = decode_render_command_slot(&rlayout, &rslot, 1, 1)
+        .unwrap()
+        .expect("render filled");
+    let vbind = rdec.buffers.iter().find(|b| !b.is_fragment).unwrap();
+    assert!(vbind.has_attribute_stride);
+    assert_eq!(vbind.attribute_stride, 16);
+    let fbind = rdec.buffers.iter().find(|b| b.is_fragment).unwrap();
+    assert!(!fbind.has_attribute_stride);
+}
+
+/// Host fill with attributeStride on vertex bind — stage_in Draw still solid.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_attribute_stride_stagein_execute() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    // Tight Float4 positions (stride 16) — attributeStride matches layout stride.
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let pos_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 11,
+                    offset: 0,
+                    wire_va: 0,
+                    attribute_stride: 16,
+                    has_attribute_stride: true,
+                    is_fragment: false,
+                    stage: IcbRenderBindStage::default(),
+                },
+                IcbRenderBufferBind {
+                    index: 0,
+                    buffer_ref: 13,
+                    offset: 0,
+                    wire_va: 0,
+                    attribute_stride: 0,
+                    has_attribute_stride: false,
+                    is_fragment: true,
+                    stage: IcbRenderBindStage::default(),
+                },
+            ],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Primitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill with attributeStride");
+
+    let mapping_id = 9u32;
+    let pfn = 0x36u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (attributeStride stage_in)"
+        );
+    }
+}
+
+/// Dedicated wire-backed E2E: vertex attributeStride=16 through command
+/// memory (not host fill API). Proves stride table encode → decode →
+/// setVertexBuffer:offset:attributeStride:.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn wire_backed_attribute_stride_stagein_e2e() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::decode::resource::{
+        render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
+    };
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_stagein_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
+    assert!(icb_layout_attribute_stride_slot_count(&layout) >= 1);
+    let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let pdesc = make_stagein_render_pipeline_desc(2, 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(
+        &mut host,
+        &state,
+        6,
+        OBJECT_TYPE_TYPE7,
+        pdesc.len() as u32,
+        0x240,
+    );
+
+    let tri: [[f32; 4]; 3] = [
+        [-1.0, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let pos_bytes: Vec<u8> = tri
+        .iter()
+        .flat_map(|v| v.iter().flat_map(|f| f.to_le_bytes()))
+        .collect();
+    put_type1_buffer(&mut host, &mut state, 11, 4, &pos_bytes);
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
+
+    let pos_wire = (4u64) << RESOURCE_PAGE_SHIFT;
+    let color_wire = (5u64) << RESOURCE_PAGE_SHIFT;
+
+    let fill = IcbRenderFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 11,
+                offset: 0,
+                wire_va: pos_wire,
+                attribute_stride: 16,
+                has_attribute_stride: true,
+                is_fragment: false,
+                stage: IcbRenderBindStage::Vertex,
+            },
+            IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: color_wire,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::Fragment,
+            },
+        ],
+        object_threadgroup_memory: vec![],
+        draw: IcbRenderDraw::Primitives {
+            primitive_type: 3,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        },
+    };
+    let slot = encode_render_command_slot(&layout, &fill).expect("encode attributeStride slot");
+    // Wire carries non-zero stride at attributeStrideOffset.
+    assert_eq!(
+        ld64(&slot[layout.attribute_stride_offset as usize..]),
+        16,
+        "attribute stride table on wire"
+    );
+
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
+        .expect("fill_icb_from_command_memory attributeStride");
+
+    let mapping_id = 9u32;
+    let pfn = 0x4au32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok,
+        "wire-backed attributeStride execute"
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed attributeStride)"
+        );
+    }
+}
+
+#[test]
+fn decode_encode_barrier_and_threadgroup_memory() {
+    use crate::runtime::decode::resource::{compute_icb_layout, icb_layout_kernel_tg_slot_count};
+    let layout = compute_icb_layout(1, 2);
+    assert_eq!(icb_layout_kernel_tg_slot_count(&layout), 2);
+    assert_eq!(layout.barrier_offset, 4);
+    let fill = IcbComputeFill {
+        command_index: 0,
+        pipeline_ref: 6,
+        buffers: vec![],
+        threadgroup_memory: vec![
+            IcbThreadgroupMemory {
+                index: 0,
+                length: 64, // multiple of 16
+            },
+            IcbThreadgroupMemory {
+                index: 1,
+                length: 128,
+            },
+        ],
+        barrier: true,
+        dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+            grid_x: 1,
+            grid_y: 1,
+            grid_z: 1,
+            tg_x: 1,
+            tg_y: 1,
+            tg_z: 1,
+        },
+    };
+    let slot = encode_compute_command_slot(&layout, &fill).unwrap();
+    assert_eq!(ld32(&slot[layout.barrier_offset as usize..]), 1);
+    let tg0 = layout.threadgroup_memory_length_offset as usize;
+    assert_eq!(ld64(&slot[tg0..]), 64);
+    assert_eq!(ld64(&slot[tg0 + 8..]), 128);
+    let decoded = decode_compute_command_slot(&layout, &slot, 1)
+        .unwrap()
+        .expect("filled");
+    assert!(decoded.barrier);
+    assert_eq!(decoded.threadgroup_memory.len(), 2);
+    assert_eq!(decoded.threadgroup_memory[0].length, 64);
+    assert_eq!(decoded.threadgroup_memory[1].index, 1);
+    assert_eq!(decoded.threadgroup_memory[1].length, 128);
+}
+
+/// Host fill + execute with barrier + threadgroup memory lengths (no shader
+/// dependency — mul3add1 ignores TG mem; verifies Metal accepts the record).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_compute_barrier_and_tg_memory_execute() {
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use crate::runtime::decode::resource::compute_icb_layout;
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb_paths =
+        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
+    let mtlb = mtlb_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .expect("compute_mul3add1.mtlb fixture");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_icb_desc_bytes_tg(1, 1, 1, 0);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+
+    let data = [1u32, 2, 3, 4];
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        buf_gva,
+        &data_bytes,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 16);
+    st32(&mut bdesc[8..], 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+
+    let layout = compute_icb_layout(1, 1);
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+            }],
+            threadgroup_memory: vec![IcbThreadgroupMemory {
+                index: 0,
+                length: 16,
+            }],
+            barrier: true,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 4,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill with barrier+tg");
+    let _ = layout;
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(
+            &mut state,
+            &mut host,
+            1,
+            &cmd,
+            &crate::runtime::compute_exec::ComputeAccum::default()
+        ),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(out, vec![4, 7, 10, 13], "barrier+tg fill still mul3add1");
+}
+
+/// inheritBuffers=true: ICB slot records only PSO+dispatch; kernel buffer
+/// comes from the parent compute encoder (stream `ComputeAccum`).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn inherit_buffers_encoder_kernel_mul3add1() {
+    use crate::runtime::compute_exec::{ComputeAccum, ComputeBufferBind};
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb_paths =
+        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
+    let mtlb = mtlb_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .expect("compute_mul3add1.mtlb fixture");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // inheritBuffers; maxKernel still advertises encoder bind capacity.
+    let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_BUFFERS);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+
+    let data = [1u32, 2, 3, 4];
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        buf_gva,
+        &data_bytes,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 16);
+    st32(&mut bdesc[8..], 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+
+    // Fill: pipeline + dispatch only — no kernel buffer in the ICB slot.
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 4,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill inheritBuffers dispatch");
+
+    // Stream-style kernel bind on the parent encoder.
+    let mut acc = ComputeAccum::default();
+    acc.buffers.push(ComputeBufferBind {
+        index: 0,
+        buffer_ref: 7,
+        offset: 0,
+        attribute_stride: 0,
+        has_attribute_stride: false,
+    });
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
+        crate::runtime::compute_exec::ComputeStatus::Ok,
+        "inheritBuffers encoder kernel path"
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        out,
+        vec![4, 7, 10, 13],
+        "inheritBuffers encoder mul3add1 writeback"
+    );
+}
+
+/// inheritPipelineState=true: ICB slot records only buffers+dispatch; PSO
+/// comes from the parent compute encoder.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn inherit_pipeline_encoder_kernel_mul3add1() {
+    use crate::runtime::compute_exec::ComputeAccum;
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb_paths =
+        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
+    let mtlb = mtlb_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .expect("compute_mul3add1.mtlb fixture");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_PIPELINE_STATE);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+
+    let data = [1u32, 2, 3, 4];
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        buf_gva,
+        &data_bytes,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 16);
+    st32(&mut bdesc[8..], 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+
+    // Fill: buffers + dispatch only — pipeline_ref 0 (inherited).
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 0,
+            buffers: vec![IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+            }],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 4,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill inheritPipeline dispatch");
+
+    let mut acc = ComputeAccum::default();
+    acc.set_pipeline(6);
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
+        crate::runtime::compute_exec::ComputeStatus::Ok,
+        "inheritPipelineState encoder path"
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        out,
+        vec![4, 7, 10, 13],
+        "inheritPipelineState encoder mul3add1 writeback"
+    );
+}
+
+/// Install a type-2 linear texture (single level) and write seed texels.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn put_type2_texture(
+    host: &mut FakeHost,
+    state: &mut DeviceState,
+    obj_ref: u32,
+    handle: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u16,
+    seed: &[u8],
+) {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_TEXTURE, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_DATA_OFFSET, TEXTURE_DESC_HEIGHT,
+        TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
+        TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
+    };
+    let bpp = crate::contract::pixel_format::bytes_per_pixel(pixel_format).unwrap_or(4);
+    let row_stride = width * bpp;
+    let size = (row_stride as u64) * (height as u64);
+    let mut desc = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    st64(&mut desc[0..], size.max(0x1000));
+    st32(&mut desc[8..], handle);
+    st16(&mut desc[TEXTURE_DESC_MIPMAP_LEVEL_COUNT..], 1);
+    st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], 0);
+    st32(&mut desc[TEXTURE_DESC_USED_SIZE..], size as u32);
+    st32(&mut desc[TEXTURE_DESC_ROW_STRIDE..], row_stride);
+    st32(&mut desc[TEXTURE_DESC_WIDTH..], width);
+    st32(&mut desc[TEXTURE_DESC_HEIGHT..], height);
+    st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], pixel_format);
+    // Descriptor GVAs stay below the first resource page (handle<<14).
+    let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
+    assert!(
+        gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
+    );
+    put_list_entry(
+        host,
+        state,
+        obj_ref,
+        OBJECT_TYPE_TEXTURE,
+        TEXTURE_DESC_BASE_LEN as u32,
+        desc_gva,
+    );
+    let data_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
+    let mut page = vec![0u8; size as usize];
+    let n = seed.len().min(page.len());
+    page[..n].copy_from_slice(&seed[..n]);
+    assert!(
+        gva_mem::write_task_gva(host, &state.tasks[1], data_gva, &page, PAGE_SHIFT_ARM64E).is_ok()
+    );
+}
+
+/// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, normalized: bool) {
+    use crate::runtime::decode::resource::{
+        SAMPLER_DESC_DECLARED_LEN, SAMPLER_DESC_ID, SAMPLER_DESC_LEN, SAMPLER_DESC_LOD_MAX,
+        SAMPLER_DESC_STATE_BITS, SAMPLER_DESC_TAG, SAMPLER_DESC_WORD16, SAMPLER_DESC_WORD20,
+        TYPE7_OBJECT_SAMPLER,
+    };
+    let mut desc = vec![0u8; SAMPLER_DESC_LEN];
+    st32(&mut desc[SAMPLER_DESC_TAG..], TYPE7_OBJECT_SAMPLER);
+    st32(
+        &mut desc[SAMPLER_DESC_DECLARED_LEN..],
+        SAMPLER_DESC_LEN as u32,
+    );
+    st32(&mut desc[SAMPLER_DESC_ID..], obj_ref);
+    // Address modes ClampToEdge=0 at bits 8/12/16; filters nearest=0.
+    // Normalized coords bit 31 when requested.
+    let mut bits = 0u32;
+    if normalized {
+        bits |= 0x8000_0000;
+    }
+    st32(&mut desc[SAMPLER_DESC_STATE_BITS..], bits);
+    st32(&mut desc[SAMPLER_DESC_WORD16..], 0);
+    st32(&mut desc[SAMPLER_DESC_WORD20..], 0f32.to_bits()); // lod min
+    st32(&mut desc[SAMPLER_DESC_LOD_MAX..], f32::MAX.to_bits());
+    let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
+    assert!(
+        gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
+    );
+    put_list_entry(
+        host,
+        state,
+        obj_ref,
+        OBJECT_TYPE_TYPE7,
+        SAMPLER_DESC_LEN as u32,
+        desc_gva,
+    );
+}
+
+/// Textures/samplers always bind on the parent compute encoder at ICB
+/// execute (classic `MTLIndirectComputeCommand` has no setTexture/setSampler).
+///
+/// Metal on this stack rejects `supportIndirectCommandBuffers` for kernels
+/// that declare direct `texture`/`sampler` arguments — those need argument
+/// buffers. Product still applies stream texture/sampler state before
+/// `executeCommandsInBuffer`. This oracle uses ICB-capable mul3add1 for the
+/// dispatch while staging a storage texture + sampler on the encoder:
+/// buffer writeback proves execute; texture writeback preserves seed
+/// (kernel does not touch the texture).
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn icb_parent_encoder_texture_and_sampler_binds() {
+    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
+    use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb_paths =
+        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
+    let mtlb = mtlb_paths
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .expect("compute_mul3add1.mtlb");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_icb_desc_bytes(1, 1, false);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+
+    let data = [1u32, 2, 3, 4];
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        buf_gva,
+        &data_bytes,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut bdesc = vec![0u8; 16];
+    st64(&mut bdesc[0..], 16);
+    st32(&mut bdesc[8..], 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+
+    const W: u32 = 2;
+    const H: u32 = 2;
+    let seed = vec![0xCDu8; (W * H * 4) as usize];
+    put_type2_texture(
+        &mut host,
+        &mut state,
+        11,
+        4,
+        W,
+        H,
+        MTL_FORMAT_RGBA8_UNORM,
+        &seed,
+    );
+    put_type7_sampler(&mut host, &state, 14, true);
+
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbKernelBufferBind {
+                index: 0,
+                buffer_ref: 7,
+                offset: 0,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+            }],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: 4,
+                tg_y: 1,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill mul3add1 ICB");
+
+    // Stream binds texture + sampler on the parent encoder (always, not inherit flags).
+    let mut acc = ComputeAccum::default();
+    acc.set_pipeline(6);
+    acc.textures.push(ComputeTextureBind {
+        index: 0,
+        texture_ref: 11,
+    });
+    acc.samplers.push(ComputeSamplerBind {
+        index: 0,
+        sampler_ref: 14,
+        lod_min_bits: 0,
+        lod_max_bits: 0,
+        has_lod_clamp: false,
+    });
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
+        crate::runtime::compute_exec::ComputeStatus::Ok,
+        "ICB execute with parent-encoder texture+sampler"
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let mut back = [0u8; 16];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        buf_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let out: Vec<u32> = back
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        out,
+        vec![4, 7, 10, 13],
+        "mul3add1 still correct with encoder tex/samp"
+    );
+
+    // Storage writeback path: kernel unused the texture — seed preserved via flush.
+    let tex_gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    let mut tex_back = vec![0u8; seed.len()];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        tex_gva,
+        &mut tex_back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    assert_eq!(
+        tex_back, seed,
+        "encoder storage texture writeback preserves seed"
+    );
+}
+
+/// Real texture-using ICB kernel via **argument buffers**: AB holds
+/// `texture2d<uint, write>`; stream texture is packaged into the AB, bound
+/// as kernel buffer 0 on the ICB command, and `useResource`d on the parent
+/// encoder. Oracle: xyplane-v1 `[x,y,5,255]`.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn icb_argument_buffer_storage_texture_xyplane() {
+    use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UINT;
+    use crate::runtime::compute_exec::{ComputeAccum, ComputeTextureBind};
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/icb_ab_storage_xyplane.metallib"),
+    )
+    .expect("icb_ab_storage_xyplane.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    // maxKernel=1 for the AB buffer slot; no inheritBuffers — AB recorded on ICB.
+    let icb_desc = make_icb_desc_bytes(1, 1, false);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+
+    const W: u32 = 4;
+    const H: u32 = 4;
+    let seed = vec![0x00u8; (W * H * 4) as usize];
+    put_type2_texture(
+        &mut host,
+        &mut state,
+        11,
+        4,
+        W,
+        H,
+        MTL_FORMAT_RGBA8_UINT,
+        &seed,
+    );
+
+    // Fill: pipeline + dispatch only (AB buffer patched at execute).
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: W,
+                tg_y: H,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill AB storage ICB");
+
+    let mut acc = ComputeAccum::default();
+    acc.set_pipeline(6);
+    acc.textures.push(ComputeTextureBind {
+        index: 0,
+        texture_ref: 11,
+    });
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
+        crate::runtime::compute_exec::ComputeStatus::Ok,
+        "AB storage texture ICB execute"
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let data_gva = 4u64 << RESOURCE_PAGE_SHIFT;
+    let mut back = vec![0u8; (W * H * 4) as usize];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        data_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    for y in 0..H {
+        for x in 0..W {
+            let i = ((y * W + x) * 4) as usize;
+            assert_eq!(
+                &back[i..i + 4],
+                &[x as u8, y as u8, 5, 255],
+                "AB storage texel ({x},{y})"
+            );
+        }
+    }
+}
+
+/// Sampled + storage textures + sampler in one argument buffer under ICB.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn icb_argument_buffer_sample_and_write() {
+    use crate::contract::pixel_format::{MTL_FORMAT_RGBA8_UINT, MTL_FORMAT_RGBA8_UNORM};
+    use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
+    use crate::runtime::compute_session::ComputeSession;
+    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+    use std::path::PathBuf;
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/icb_ab_sample_xyplane.metallib"),
+    )
+    .expect("icb_ab_sample_xyplane.metallib");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_icb_desc_bytes(1, 1, false);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        blob_gva,
+        &mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], mtlb.len() as u32);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+
+    const W: u32 = 4;
+    const H: u32 = 4;
+    let mut input = vec![0u8; (W * H * 4) as usize];
+    for y in 0..H {
+        for x in 0..W {
+            let i = ((y * W + x) * 4) as usize;
+            input[i] = x as u8;
+            input[i + 1] = y as u8;
+            input[i + 2] = 5;
+            input[i + 3] = 255;
+        }
+    }
+    put_type2_texture(
+        &mut host,
+        &mut state,
+        11,
+        4,
+        W,
+        H,
+        MTL_FORMAT_RGBA8_UNORM,
+        &input,
+    );
+    let out_seed = vec![0x11u8; (W * H * 4) as usize];
+    put_type2_texture(
+        &mut host,
+        &mut state,
+        12,
+        5,
+        W,
+        H,
+        MTL_FORMAT_RGBA8_UINT,
+        &out_seed,
+    );
+    put_type7_sampler(&mut host, &state, 14, true);
+
+    fill_compute_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbComputeFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![],
+            threadgroup_memory: vec![],
+            barrier: false,
+            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
+                grid_x: 1,
+                grid_y: 1,
+                grid_z: 1,
+                tg_x: W,
+                tg_y: H,
+                tg_z: 1,
+            },
+        },
+    )
+    .expect("fill AB sample ICB");
+
+    let mut acc = ComputeAccum::default();
+    acc.set_pipeline(6);
+    // Order matches AB members: id(0)=in, id(1)=out, id(2)=sampler.
+    acc.textures.push(ComputeTextureBind {
+        index: 0,
+        texture_ref: 11,
+    });
+    acc.textures.push(ComputeTextureBind {
+        index: 1,
+        texture_ref: 12,
+    });
+    acc.samplers.push(ComputeSamplerBind {
+        index: 0,
+        sampler_ref: 14,
+        lod_min_bits: 0,
+        lod_max_bits: 0,
+        has_lod_clamp: false,
+    });
+
+    let mut session = ComputeSession::open(0).expect("session");
+    let mut cmd = ComputeCommand::default();
+    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.indirect_command_buffer_ref = 9;
+    cmd.indirect_command_range_location = 0;
+    cmd.indirect_command_range_length = 1;
+    assert_eq!(
+        session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
+        crate::runtime::compute_exec::ComputeStatus::Ok,
+        "AB sample+write ICB execute"
+    );
+    assert_eq!(
+        session.finish(&mut host, &mut state, 1),
+        crate::runtime::compute_exec::ComputeStatus::Ok
+    );
+
+    let out_gva = 5u64 << RESOURCE_PAGE_SHIFT;
+    let mut back = vec![0u8; (W * H * 4) as usize];
+    assert!(gva_mem::read_task_gva(
+        &host,
+        &state.tasks[1],
+        out_gva,
+        &mut back,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    for y in 0..H {
+        for x in 0..W {
+            let i = ((y * W + x) * 4) as usize;
+            assert_eq!(
+                &back[i..i + 4],
+                &[x as u8, y as u8, 5, 255],
+                "AB sample out texel ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn resolve_bind_offset_from_wire_va() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+    // 32 B buffer at handle 4: 16 B pad + 16 B color payload.
+    let mut bytes = vec![0u8; 32];
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    bytes[16..32].copy_from_slice(&color_bytes);
+    put_type1_buffer(&mut host, &state, 13, 4, &bytes);
+    let base = (4u64) << RESOURCE_PAGE_SHIFT;
+    assert_eq!(
+        offset_from_wire_va(&state, &host, 1, 13, base + 16).unwrap(),
+        16
+    );
+    assert_eq!(offset_from_wire_va(&state, &host, 1, 13, 0).unwrap(), 0);
+    assert!(offset_from_wire_va(&state, &host, 1, 13, base - 1).is_err());
+    assert!(offset_from_wire_va(&state, &host, 1, 13, base + 32).is_err());
+}
+
+/// Host fill with non-zero fragment bind offset into a padded type-1 buffer.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render_nonzero_bind_offset_oracle() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    let vfdesc_gva = 0x200u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vfdesc_gva,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    let ffdesc_gva = 0x220u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        ffdesc_gva,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc_gva = 0x240u64;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        pdesc_gva,
+        &pdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+
+    let indices: [u16; 3] = [0, 1, 2];
+    // Index buffer: 4 B pad + 6 B indices (offset 4).
+    let mut index_bytes = vec![0u8; 4];
+    index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
+    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    let index_base = (4u64) << RESOURCE_PAGE_SHIFT;
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    // Color buffer: 16 B pad + float4 (offset 16).
+    let mut color_buf = vec![0xAAu8; 16];
+    color_buf.extend_from_slice(&color_bytes);
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_buf);
+    let color_base = (5u64) << RESOURCE_PAGE_SHIFT;
+
+    fill_render_command(
+        &state,
+        &host,
+        1,
+        9,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 16,
+                wire_va: 0,
+                attribute_stride: 0,
+                has_attribute_stride: false, // host fill uses offset directly
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 4,
+                index_wire_va: 0,
+                instance_count: 1,
+                base_vertex: 0,
+                base_instance: 0,
+            },
+        },
+    )
+    .expect("fill with non-zero offsets");
+
+    let mapping_id = 9u32;
+    let pfn = 0x34u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (nonzero bind offset)"
+        );
+    }
+    let _ = (index_base, color_base);
+}
+
+/// Buffer-backed fill: wire VA = type-1 base+offset → resolve → execute.
+#[test]
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn buffer_backed_nonzero_wire_va_offset() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write;
+    use crate::runtime::metal_draw::{
+        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
+    };
+
+    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+
+    let (vert_mtlb, frag_mtlb) = load_oracle_mtlb();
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+
+    let max_v = 0u16;
+    let max_f = 1u16;
+    let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
+    let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        icb_gva,
+        &icb_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(
+        &mut host,
+        &state,
+        9,
+        OBJECT_TYPE_TYPE7,
+        ICB_DESC_LEN as u32,
+        icb_gva,
+    );
+
+    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        vblob_gva,
+        &vert_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut vfdesc = vec![0u8; 32];
+    st64(&mut vfdesc[0..], vblob_gva);
+    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x200,
+        &vfdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+
+    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        fblob_gva,
+        &frag_mtlb,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut ffdesc = vec![0u8; 32];
+    st64(&mut ffdesc[0..], fblob_gva);
+    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x220,
+        &ffdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    assert!(
+        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
+            .is_ok()
+    );
+    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, 0x240);
+
+    let indices: [u16; 3] = [0, 1, 2];
+    let mut index_bytes = vec![0u8; 8]; // pad 8
+    index_bytes.extend(indices.iter().flat_map(|v| v.to_le_bytes()));
+    put_type1_buffer(&mut host, &mut state, 12, 4, &index_bytes);
+    let index_wire = ((4u64) << RESOURCE_PAGE_SHIFT) + 8;
+
+    let sid = 7u8;
+    let r = (0x60u32 + sid as u32) as f32 / 255.0;
+    let color = [r, 0x44 as f32 / 255.0, 0x22 as f32 / 255.0, 1.0f32];
+    let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let mut color_buf = vec![0u8; 24]; // pad 24
+    color_buf.extend_from_slice(&color_bytes);
+    put_type1_buffer(&mut host, &mut state, 13, 5, &color_buf);
+    let color_wire = ((5u64) << RESOURCE_PAGE_SHIFT) + 24;
+
+    let slot = encode_render_command_slot(
+        &layout,
+        &IcbRenderFill {
+            command_index: 0,
+            pipeline_ref: 6,
+            buffers: vec![IcbRenderBufferBind {
+                index: 0,
+                buffer_ref: 13,
+                offset: 0,
+                wire_va: color_wire,
+                attribute_stride: 0,
+                has_attribute_stride: false,
+                is_fragment: true,
+                stage: IcbRenderBindStage::default(),
+            }],
+            object_threadgroup_memory: vec![],
+            draw: IcbRenderDraw::Indexed {
+                primitive_type: 3,
+                index_type: 0,
+                index_buffer_ref: 12,
+                index_count: 3,
+                index_buffer_offset: 0,
+                index_wire_va: index_wire,
+                instance_count: 1,
+                base_vertex: 0,
+                base_instance: 0,
+            },
+        },
+    )
+    .unwrap();
+
+    // Decode + resolve without host fill API.
+    let mut decoded = decode_render_command_slot(&layout, &slot, max_v, max_f)
+        .unwrap()
+        .expect("slot");
+    assert_eq!(decoded.buffers[0].wire_va, color_wire);
+    match decoded.draw {
+        IcbRenderDraw::Indexed { index_wire_va, .. } => {
+            assert_eq!(index_wire_va, index_wire);
+        }
+        _ => panic!("indexed"),
+    }
+    resolve_render_fill_offsets(&state, &host, 1, &mut decoded).unwrap();
+    assert_eq!(decoded.buffers[0].offset, 24);
+    match decoded.draw {
+        IcbRenderDraw::Indexed {
+            index_buffer_offset,
+            ..
+        } => assert_eq!(index_buffer_offset, 8),
+        _ => panic!("indexed"),
+    }
+
+    let cmd_handle = 6u32;
+    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        cmd_gva,
+        &slot,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        0x1a0,
+        &cmd_bdesc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+
+    apply_icb_host_resource_info(
+        &state,
+        &host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1");
+
+    let mapping_id = 9u32;
+    let pfn = 0x35u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0);
+    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let req = DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    };
+    assert_eq!(
+        encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
+        EncodeStatus::Ok
+    );
+
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire_va offset)"
+        );
+    }
+}

@@ -1,0 +1,1102 @@
+//! Host surface cache for Linux/Vulkan discrete-GPU present (kb tahoe-x86 §8.5).
+//!
+//! On Apple Metal hosts, GPU Stores land in guest IOSurface pages (unified
+//! memory). On this Linux product rail guest type-4 pages are **not** filled by
+//! the host GPU until encode writeback; historical product painted from a
+//! **host render-cache** keyed by surface_id. This module is that cache.
+//!
+//! Namespace split (2026-07-13 live x86):
+//! - [`store`] / [`get`] — **type-4 surface_id / mapping_id** only (`host_surfaces`)
+//! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by object ref
+//! - [`store_gva`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
+//!
+//! Never put texture_ref into `host_surfaces`: list ids collide with mids and
+//! recycled refs return stale full-frame blacks as multi-bind samples.
+//!
+//! Write paths (clear Store, metal2vulkan encode writeback) call the matching
+//! store; [`crate::runtime::scanout::capture_present_frame`] prefers surface_id
+//! cache content when present so scanout matches what the host executed.
+
+use crate::contract::pixel_format::RGBA8_BPP;
+use crate::model::{DeviceState, HostSurface, MAX_SCANOUT_DIM};
+
+fn store_into(
+    map: &mut std::collections::BTreeMap<u32, HostSurface>,
+    id: u32,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+    log_tag: &str,
+) {
+    if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
+        return;
+    }
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if bgra.len() < need {
+        return;
+    }
+    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&bgra[..need]);
+    let entry = map.entry(id).or_default();
+    // Measure geom clobber: smaller store replacing a larger encode under the
+    // same key (sky 1920×1152 → 64×64 atlas) — proxy only, no product branch.
+    if entry.width >= 1280
+        && entry.height >= 720
+        && (width < entry.width || height < entry.height)
+        && !entry.bgra.is_empty()
+    {
+        crate::observe::off(format!(
+            "host_cache_geom_clobber tag={log_tag} id={id} was={}x{} now={width}x{height}",
+            entry.width, entry.height
+        ));
+    }
+    entry.host_gen = entry.host_gen.wrapping_add(1);
+    if entry.host_gen == 0 {
+        entry.host_gen = 1;
+    }
+    entry.width = width;
+    entry.height = height;
+    entry.bgra = bgra;
+    if width >= 1280 && height >= 720 {
+        // surface path keeps historical `mid=` key for greps; tex uses `tex=`.
+        let id_field = if log_tag == "tex" {
+            format!("tex={id}")
+        } else {
+            format!("mid={id}")
+        };
+        crate::observe::off(format!(
+            "host_cache_store {id_field} {width}x{height} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
+            entry.host_gen, px0[0], px0[1], px0[2], px0[3]
+        ));
+    }
+}
+
+fn get_from(
+    map: &std::collections::BTreeMap<u32, HostSurface>,
+    id: u32,
+    width: u32,
+    height: u32,
+) -> Option<&[u8]> {
+    get_from_with_gen(map, id, width, height).map(|(bgra, _)| bgra)
+}
+
+fn get_from_with_gen(
+    map: &std::collections::BTreeMap<u32, HostSurface>,
+    id: u32,
+    width: u32,
+    height: u32,
+) -> Option<(&[u8], u32)> {
+    let e = map.get(&id)?;
+    if e.width != width || e.height != height || e.bgra.is_empty() {
+        return None;
+    }
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if e.bgra.len() < need {
+        return None;
+    }
+    Some((&e.bgra[..need], e.host_gen))
+}
+
+/// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
+pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
+    store_into(
+        &mut state.host_surfaces,
+        surface_id,
+        width,
+        height,
+        bgra,
+        "surface",
+    );
+}
+
+/// Borrow host-cache frame when geom matches request (surface_id namespace).
+pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
+    get_from(&state.host_surfaces, surface_id, width, height)
+}
+
+/// Type-2/3 encode cache by texture object ref (not surface_id).
+pub fn store_texture(
+    state: &mut DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+) {
+    store_into(
+        &mut state.host_texture_surfaces,
+        texture_ref,
+        width,
+        height,
+        bgra,
+        "tex",
+    );
+}
+
+pub fn get_texture(
+    state: &DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Option<&[u8]> {
+    get_from(&state.host_texture_surfaces, texture_ref, width, height)
+}
+
+/// Borrow a texture-ref encode plus its producer generation.
+///
+/// This is diagnostic provenance for the linear-sample loss proxy; selection
+/// semantics are identical to [`get_texture`].
+pub fn get_texture_with_gen(
+    state: &DeviceState,
+    texture_ref: u32,
+    width: u32,
+    height: u32,
+) -> Option<(&[u8], u32)> {
+    get_from_with_gen(&state.host_texture_surfaces, texture_ref, width, height)
+}
+
+/// Any size under texture_ref (sample path when descriptor geom unknown).
+pub fn get_texture_any(state: &DeviceState, texture_ref: u32) -> Option<(u32, u32, &[u8])> {
+    let e = state.host_texture_surfaces.get(&texture_ref)?;
+    if e.width == 0 || e.height == 0 || e.bgra.is_empty() {
+        return None;
+    }
+    let need = (e.height as usize)
+        .saturating_mul(e.width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if e.bgra.len() < need {
+        return None;
+    }
+    Some((e.width, e.height, &e.bgra[..need]))
+}
+
+pub fn evict_texture(state: &mut DeviceState, texture_ref: u32) {
+    state.host_texture_surfaces.remove(&texture_ref);
+}
+
+/// Store tight raw compute content for a type-2/3 texture object.
+///
+/// This is the discrete GPU-private body. It deliberately survives
+/// MapMemory2/UnmapMemory; the guest GVA pages are only a pageable alias.
+#[allow(clippy::too_many_arguments)]
+pub fn store_linear_texture(
+    state: &mut DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+    row_stride: u64,
+    bytes: &[u8],
+) -> bool {
+    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(pixel_format) else {
+        return false;
+    };
+    let Some(need) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize))
+    else {
+        return false;
+    };
+    if texture_ref == 0
+        || gva == 0
+        || width == 0
+        || height == 0
+        || row_stride < (width as u64).saturating_mul(bpp as u64)
+        || bytes.len() < need
+    {
+        return false;
+    }
+    let entry = state
+        .host_linear_textures
+        .entry((task_id, texture_ref))
+        .or_default();
+    entry.host_gen = entry.host_gen.wrapping_add(1);
+    if entry.host_gen == 0 {
+        entry.host_gen = 1;
+    }
+    entry.gva = gva;
+    entry.pixel_format = pixel_format;
+    entry.width = width;
+    entry.height = height;
+    entry.row_stride = row_stride;
+    entry.bytes.clear();
+    entry.bytes.extend_from_slice(&bytes[..need]);
+    entry.resident_gen = 0;
+    true
+}
+
+/// Deferred linear writeback: the engine's pinned resident storage image at
+/// `generation` becomes the authoritative content for this (task, ref) window;
+/// no bytes are stored. Same validation as [`store_linear_texture`].
+#[allow(clippy::too_many_arguments)]
+pub fn note_linear_texture_resident(
+    state: &mut DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+    row_stride: u64,
+    generation: u32,
+) -> bool {
+    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(pixel_format) else {
+        return false;
+    };
+    if texture_ref == 0
+        || gva == 0
+        || width == 0
+        || height == 0
+        || generation == 0
+        || row_stride < (width as u64).saturating_mul(bpp as u64)
+    {
+        return false;
+    }
+    let entry = state
+        .host_linear_textures
+        .entry((task_id, texture_ref))
+        .or_default();
+    entry.host_gen = generation;
+    entry.gva = gva;
+    entry.pixel_format = pixel_format;
+    entry.width = width;
+    entry.height = height;
+    entry.row_stride = row_stride;
+    entry.bytes.clear();
+    entry.resident_gen = generation;
+    true
+}
+
+/// Resident generation of a linear window when the current descriptor still
+/// matches and the entry is resident-authoritative (deferred writeback).
+#[allow(clippy::too_many_arguments)]
+pub fn linear_texture_resident_gen(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+    row_stride: u64,
+) -> Option<u32> {
+    let entry = state.host_linear_textures.get(&(task_id, texture_ref))?;
+    if entry.resident_gen == 0
+        || entry.gva != gva
+        || entry.pixel_format != pixel_format
+        || entry.width != width
+        || entry.height != height
+        || entry.row_stride != row_stride
+    {
+        return None;
+    }
+    Some(entry.resident_gen)
+}
+
+/// Land flushed resident bytes into the entry (tight rows), clearing the
+/// resident-authoritative marker. No-op when the entry is gone or its
+/// descriptor changed since the defer.
+pub fn materialize_linear_resident(
+    state: &mut DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    generation: u32,
+    bytes: &[u8],
+) -> bool {
+    let Some(entry) = state.host_linear_textures.get_mut(&(task_id, texture_ref)) else {
+        return false;
+    };
+    if entry.resident_gen != generation {
+        return false;
+    }
+    let Some(bpp) = crate::contract::pixel_format::bytes_per_pixel(entry.pixel_format) else {
+        return false;
+    };
+    let Some(need) = (entry.width as usize)
+        .checked_mul(entry.height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize))
+    else {
+        return false;
+    };
+    if bytes.len() < need {
+        return false;
+    }
+    entry.bytes.clear();
+    entry.bytes.extend_from_slice(&bytes[..need]);
+    entry.resident_gen = 0;
+    true
+}
+
+/// Borrow a raw compute encode only when the current descriptor still matches.
+#[allow(clippy::too_many_arguments)]
+pub fn get_linear_texture(
+    state: &DeviceState,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+    row_stride: u64,
+) -> Option<&[u8]> {
+    let entry = state.host_linear_textures.get(&(task_id, texture_ref))?;
+    if entry.gva != gva
+        || entry.pixel_format != pixel_format
+        || entry.width != width
+        || entry.height != height
+        || entry.row_stride != row_stride
+    {
+        return None;
+    }
+    let bpp = crate::contract::pixel_format::bytes_per_pixel(pixel_format)? as usize;
+    let need = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(bpp)?;
+    (entry.bytes.len() >= need).then(|| &entry.bytes[..need])
+}
+
+/// True when [`mirror_linear_color_cache`] would republish this format into
+/// the BGRA render-sample caches. Deferred linear writebacks are gated on
+/// `!linear_mirrorable` so render-side consumers never lose the mirror.
+pub fn linear_mirrorable(pixel_format: u16) -> bool {
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_RGBA8_UNORM_SRGB,
+    };
+    matches!(
+        pixel_format,
+        MTL_FORMAT_RGBA8_UNORM
+            | MTL_FORMAT_RGBA8_UNORM_SRGB
+            | MTL_FORMAT_BGRA8_UNORM
+            | MTL_FORMAT_BGRA8_UNORM_SRGB
+    )
+}
+
+/// Mirror normalized 8-bit compute output into the established BGRA sample
+/// caches so a later render view over the same object/GVA observes the encode.
+pub fn mirror_linear_color_cache(
+    state: &mut DeviceState,
+    texture_ref: u32,
+    gva: u64,
+    pixel_format: u16,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) {
+    use crate::contract::pixel_format::{
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_BGRA8_UNORM_SRGB, MTL_FORMAT_RGBA8_UNORM,
+        MTL_FORMAT_RGBA8_UNORM_SRGB,
+    };
+    let Some(need) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+    else {
+        return;
+    };
+    if bytes.len() < need {
+        return;
+    }
+    let mut bgra = bytes[..need].to_vec();
+    match pixel_format {
+        MTL_FORMAT_RGBA8_UNORM | MTL_FORMAT_RGBA8_UNORM_SRGB => {
+            for px in bgra.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        MTL_FORMAT_BGRA8_UNORM | MTL_FORMAT_BGRA8_UNORM_SRGB => {}
+        _ => return,
+    }
+    store_texture(state, texture_ref, width, height, bgra.clone());
+    store_gva(state, gva, width, height, bgra);
+}
+
+/// Type-2/3 encode cache by target GVA.
+///
+/// On discrete hosts this is the **GPU-private** texture content for that VA.
+/// Guest MapMemory2 unmap/remap changes PFNs under the same GVA but does **not**
+/// destroy the encode — see [`note_unmap_retain_gva`] (Unmap retains; Map notify-only).
+pub fn store_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32, bgra: Vec<u8>) {
+    store_gva_owned(state, gva, width, height, bgra, 0, 0, 0);
+}
+
+/// Store a GVA encode with the decoded object identity that produced it.
+/// Type-2/type-3 wrappers are the same linear texture storage family when the
+/// GVA and geometry match; unrelated nonzero object-type transitions still
+/// identify a different resource class.
+#[allow(clippy::too_many_arguments)]
+pub fn store_gva_owned(
+    state: &mut DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+    task_id: u32,
+    texture_ref: u32,
+    object_type: u8,
+) {
+    if gva == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM
+    {
+        return;
+    }
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if bgra.len() < need {
+        return;
+    }
+    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&bgra[..need]);
+    let entry = state.host_gva_surfaces.entry(gva).or_default();
+    entry.host_gen = entry.host_gen.wrapping_add(1);
+    if entry.host_gen == 0 {
+        entry.host_gen = 1;
+    }
+    entry.width = width;
+    entry.height = height;
+    entry.bgra = bgra;
+    entry.producer_task_id = task_id;
+    entry.producer_texture_ref = texture_ref;
+    entry.producer_object_type = object_type;
+    if width >= 1280 && height >= 720 {
+        crate::observe::off(format!(
+            "host_cache_store tag=gva gva={gva:#x} {width}x{height} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
+            entry.host_gen, px0[0], px0[1], px0[2], px0[3]
+        ));
+    }
+}
+
+pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
+    get_gva_with_gen(state, gva, width, height).map(|(bgra, _)| bgra)
+}
+
+/// Borrow a GVA encode plus its producer generation.
+///
+/// This is diagnostic provenance for the linear-sample loss proxy; selection
+/// semantics are identical to [`get_gva`].
+pub fn get_gva_with_gen(
+    state: &DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+) -> Option<(&[u8], u32)> {
+    let e = state.host_gva_surfaces.get(&gva)?;
+    if e.width != width || e.height != height || e.bgra.is_empty() {
+        return None;
+    }
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if e.bgra.len() < need {
+        return None;
+    }
+    Some((&e.bgra[..need], e.host_gen))
+}
+
+/// Borrow a GVA encode plus its decoded producer identity.
+pub fn get_gva_with_owner(
+    state: &DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+) -> Option<(&[u8], u32, u32, u32, u8)> {
+    let e = state.host_gva_surfaces.get(&gva)?;
+    if e.width != width || e.height != height || e.bgra.is_empty() {
+        return None;
+    }
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if e.bgra.len() < need {
+        return None;
+    }
+    Some((
+        &e.bgra[..need],
+        e.host_gen,
+        e.producer_task_id,
+        e.producer_texture_ref,
+        e.producer_object_type,
+    ))
+}
+
+/// Peek GVA encode without geom filter (tests / diagnostics).
+pub fn get_gva_any(state: &DeviceState, gva: u64) -> Option<(u32, u32, &[u8])> {
+    let e = state.host_gva_surfaces.get(&gva)?;
+    if e.width == 0 || e.height == 0 || e.bgra.is_empty() {
+        return None;
+    }
+    let need = (e.height as usize)
+        .saturating_mul(e.width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    if e.bgra.len() < need {
+        return None;
+    }
+    Some((e.width, e.height, &e.bgra[..need]))
+}
+
+/// UnmapMemory of a guest GVA must **not** drop discrete encode content.
+///
+/// Live x86 wallpaper class (serial-20260714-022033): full sky store to
+/// `gva=0x2c22000` (rgb_nz=full) → UnmapMemory → MapMemory2 same VA, **new PFNs**
+/// → sample sees zero guest pages + empty host_cache → pipe stores black wipe.
+/// On unified Apple hosts Unmap tears down GPU VA; on this discrete rail the
+/// host_cache **is** the texture body — retain across unmap/remap of the same VA.
+///
+/// Measure-only: UnmapMemory retains any GVA encode (no size gate — RE is PT-only).
+pub fn note_unmap_retain_gva(state: &DeviceState, gva: u64) {
+    if gva == 0 {
+        return;
+    }
+    if let Some(e) = state.host_gva_surfaces.get(&gva) {
+        if e.bgra.is_empty() {
+            return;
+        }
+        let need = (e.height as usize)
+            .saturating_mul(e.width as usize)
+            .saturating_mul(RGBA8_BPP as usize);
+        let slice = &e.bgra[..need.min(e.bgra.len())];
+        let (rgb_nz, max_rgb, _) = crate::observe::bgra_rgb_stats(slice);
+        crate::observe::off(format!(
+            "host_cache_gva_retain_on_unmap gva={gva:#x} {}x{} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb}",
+            e.width, e.height, e.host_gen
+        ));
+    }
+}
+
+/// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
+pub fn evict_gva(state: &mut DeviceState, gva: u64) {
+    if let Some(e) = state.host_gva_surfaces.remove(&gva) {
+        if !e.bgra.is_empty() {
+            crate::observe::off(format!(
+                "host_cache_evict tag=gva gva={gva:#x} {}x{} host_gen={}",
+                e.width, e.height, e.host_gen
+            ));
+        }
+    }
+}
+
+/// Drop host-cache entry (unmap / delete surface).
+pub fn evict(state: &mut DeviceState, surface_id: u32) {
+    if let Some(e) = state.host_surfaces.remove(&surface_id) {
+        if e.width >= 1280 && e.height >= 720 {
+            crate::observe::off(format!(
+                "host_cache_evict mid={surface_id} {}x{} host_gen={}",
+                e.width, e.height, e.host_gen
+            ));
+        }
+    }
+}
+
+/// Outcome of [`flush_surface_id_to_guest_pages`] (Synchronize / pageoff).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncFlushResult {
+    /// No type-4 host_cache entry for this object_id.
+    NoHostCache,
+    /// Mapping missing or has no page table entries.
+    NoMapping,
+    /// host_cache geom does not match latched mapping geom.
+    GeomMismatch,
+    /// `write_bgra8` failed (window/span/GPA).
+    WriteFail,
+    /// Host render-cache pushed into guest mapping pages.
+    WroteGuest {
+        width: u32,
+        height: u32,
+        host_gen: u32,
+    },
+}
+
+/// RE `CmdSynchronizeResources` (guest `synchronizeForUnwire` before pageoff):
+/// push type-4 **host render-cache** into **guest mapping pages** for `surface_id`.
+///
+/// Discrete rail can hold executed content only in `host_surfaces` while guest
+/// IOSurface pages lag; pageoff expects guest-visible bytes. Unified path that
+/// already writeback_guest on Store is a no-op here (`NoHostCache` or rewrite
+/// same bytes). Does **not** invent pages; requires mapped `page_entries`.
+///
+/// Type-2/3 GVA cache is **not** flushed here (keyed by GVA, not object_id);
+/// see [`flush_gva_host_cache_on_map`].
+pub fn flush_surface_id_to_guest_pages<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
+    state: &mut DeviceState,
+    host: &mut M,
+    surface_id: u32,
+) -> SyncFlushResult {
+    if surface_id == 0 {
+        return SyncFlushResult::NoHostCache;
+    }
+    let Some(cached) = state.host_surfaces.get(&surface_id).cloned() else {
+        return SyncFlushResult::NoHostCache;
+    };
+    if cached.bgra.is_empty() || cached.width == 0 || cached.height == 0 {
+        return SyncFlushResult::NoHostCache;
+    }
+    let Some(m) = state.mappings.get(&surface_id) else {
+        return SyncFlushResult::NoMapping;
+    };
+    if !m.mapped || m.page_entries.is_empty() {
+        return SyncFlushResult::NoMapping;
+    }
+    if m.has_geom && (m.width != cached.width || m.height != cached.height) {
+        return SyncFlushResult::GeomMismatch;
+    }
+    let w = cached.width;
+    let h = cached.height;
+    let stride = w.saturating_mul(RGBA8_BPP);
+    let host_gen = cached.host_gen;
+    let bgra = cached.bgra;
+    if !crate::runtime::mapping_write::write_bgra8(state, host, surface_id, &bgra, stride, w, h) {
+        return SyncFlushResult::WriteFail;
+    }
+    SyncFlushResult::WroteGuest {
+        width: w,
+        height: h,
+        host_gen,
+    }
+}
+
+/// Outcome of [`flush_gva_host_cache_on_map`] (MapMemory2 remount).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GvaMapFlushStats {
+    /// Host GVA cache entries written into guest pages.
+    pub wrote: u32,
+    /// Walker failed for cache entry base GVA.
+    pub walk_fail: u32,
+    /// No host_gva entry whose base falls in the Map range.
+    pub no_cache: u32,
+}
+
+/// RE MapMemory2 / UnmapMemory order:
+/// - **Unmap notify:** guest has **already** `PageTable::deallocate` — walker fails;
+///   host cannot flush via GVA (too late). Retain [`host_gva_surfaces`] for sample.
+/// - **Map notify:** guest has **already** installed leaf PPNs — walker works;
+///   new PFNs are empty until host re-writes encode.
+///
+/// Discrete type-2/3 encode lives in `host_gva_surfaces` (keyed by allocation
+/// base GVA). After remount, push that BGRA cache into the new guest pages so
+/// guest RAM matches host-executed content. This is **not** inventing PFNs
+/// (guest already wrote PTEs) and **not** inventing geometry (cache w/h).
+///
+/// `map_gva`/`map_len` are the MapMemory2 wire range; any cache key `k` with
+/// `map_gva <= k < map_gva+map_len` is flushed (allocation bases fall in map).
+pub fn flush_gva_host_cache_on_map<
+    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
+>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    map_gva: u64,
+    map_len: u64,
+) -> GvaMapFlushStats {
+    let mut stats = GvaMapFlushStats::default();
+    if map_gva == 0 || map_len == 0 {
+        return stats;
+    }
+    let map_end = map_gva.saturating_add(map_len);
+    let keys: Vec<u64> = state
+        .host_gva_surfaces
+        .keys()
+        .copied()
+        .filter(|&k| k != 0 && k >= map_gva && k < map_end)
+        .collect();
+    if keys.is_empty() {
+        stats.no_cache = 1;
+        return stats;
+    }
+    let _page_shift = state.page_shift;
+    for gva in keys {
+        let Some(e) = state.host_gva_surfaces.get(&gva).cloned() else {
+            continue;
+        };
+        if e.bgra.is_empty() || e.width == 0 || e.height == 0 {
+            continue;
+        }
+        let w = e.width;
+        let h = e.height;
+        let bpr = w.saturating_mul(RGBA8_BPP);
+        let span = (h as u64).saturating_mul(bpr as u64);
+        // Texture must fit in the mapped range from its base.
+        if gva.saturating_add(span) > map_end {
+            stats.walk_fail = stats.walk_fail.saturating_add(1);
+            continue;
+        }
+        let row_len = bpr as usize;
+        let mut ok = true;
+        for y in 0..h as usize {
+            let so = y.saturating_mul(row_len);
+            if so + row_len > e.bgra.len() {
+                ok = false;
+                break;
+            }
+            let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
+            if crate::runtime::gva_mem::write_task_gva_product(
+                state,
+                host,
+                task_id,
+                row_gva,
+                &e.bgra[so..so + row_len],
+            )
+            .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            stats.wrote = stats.wrote.saturating_add(1);
+            crate::observe::fail(format!(
+                "gva_map_flush ok gva={gva:#x} {w}x{h} task={task_id} host_gen={} map={map_gva:#x}+{map_len:#x}",
+                e.host_gen
+            ));
+        } else {
+            stats.walk_fail = stats.walk_fail.saturating_add(1);
+            crate::observe::fail(format!(
+                "gva_map_flush fail gva={gva:#x} {w}x{h} task={task_id} map={map_gva:#x}+{map_len:#x}"
+            ));
+        }
+    }
+    stats
+}
+
+/// Empty cache for tests.
+pub fn clear_all(state: &mut DeviceState) {
+    state.host_surfaces.clear();
+    state.host_texture_surfaces.clear();
+    state.host_gva_surfaces.clear();
+    state.host_linear_textures.clear();
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+
+    /// Deferred linear residency lifecycle: note marks the entry
+    /// resident-authoritative with empty bytes, the resident getter validates
+    /// the descriptor exactly, materialize lands bytes and clears the marker,
+    /// and a plain bytes store also clears it.
+    #[test]
+    fn linear_resident_note_materialize_and_store_clear() {
+        use crate::contract::pixel_format::{MTL_FORMAT_RGBA16_FLOAT, MTL_FORMAT_RGBA8_UNORM};
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (task, r, gva, w, h, stride) = (6u32, 21u32, 0x30_2000u64, 4u32, 2u32, 32u64);
+        assert!(note_linear_texture_resident(
+            &mut st,
+            task,
+            r,
+            gva,
+            MTL_FORMAT_RGBA16_FLOAT,
+            w,
+            h,
+            stride,
+            2,
+        ));
+        assert_eq!(
+            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
+            Some(2)
+        );
+        // Bytes consumers see nothing while resident-authoritative.
+        assert!(
+            get_linear_texture(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride).is_none()
+        );
+        // Any descriptor drift invalidates the resident claim.
+        assert_eq!(
+            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA8_UNORM, w, h, stride),
+            None
+        );
+        assert_eq!(
+            linear_texture_resident_gen(
+                &st,
+                task,
+                r,
+                gva + 0x1000,
+                MTL_FORMAT_RGBA16_FLOAT,
+                w,
+                h,
+                stride
+            ),
+            None
+        );
+        // Materialize with the wrong generation is refused; the right one
+        // lands bytes and clears the marker.
+        let flushed = vec![0xabu8; (w * h * 8) as usize];
+        assert!(!materialize_linear_resident(&mut st, task, r, 9, &flushed));
+        assert!(materialize_linear_resident(&mut st, task, r, 2, &flushed));
+        assert_eq!(
+            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
+            None
+        );
+        let got = get_linear_texture(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride)
+            .expect("materialized bytes");
+        assert!(got.iter().all(|&b| b == 0xab));
+        // A later resident note supersedes; a plain store clears again.
+        assert!(note_linear_texture_resident(
+            &mut st,
+            task,
+            r,
+            gva,
+            MTL_FORMAT_RGBA16_FLOAT,
+            w,
+            h,
+            stride,
+            3,
+        ));
+        let px = vec![0x5au8; (w * h * 8) as usize];
+        assert!(store_linear_texture(
+            &mut st,
+            task,
+            r,
+            gva,
+            MTL_FORMAT_RGBA16_FLOAT,
+            w,
+            h,
+            stride,
+            &px,
+        ));
+        assert_eq!(
+            linear_texture_resident_gen(&st, task, r, gva, MTL_FORMAT_RGBA16_FLOAT, w, h, stride),
+            None
+        );
+    }
+
+    /// Task/object deletion of a resident-authoritative entry queues the
+    /// engine unpin key (the runtime drains `retired_linear_residents`).
+    #[test]
+    fn linear_resident_retires_on_task_and_object_delete() {
+        use crate::contract::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        st.define_task(6, 0x1000, 1);
+        assert!(note_linear_texture_resident(
+            &mut st,
+            6,
+            21,
+            0x30_2000,
+            MTL_FORMAT_RGBA16_FLOAT,
+            4,
+            2,
+            32,
+            2,
+        ));
+        // A pending guest-flush obligation dies with the entry (boot-16 rule:
+        // never write guest pages at a lifetime boundary).
+        let obligation_key = crate::model::ComputeStorageResidencyKey::linear(
+            6,
+            21,
+            0x30_2000,
+            32,
+            64,
+            4,
+            2,
+            MTL_FORMAT_RGBA16_FLOAT,
+        );
+        st.linear_deferred_flush
+            .insert(obligation_key, (2, std::collections::HashSet::new()));
+        assert!(st.delete_task(6));
+        assert_eq!(st.retired_linear_residents.len(), 1);
+        let key = st.retired_linear_residents[0];
+        assert!(key.is_linear());
+        assert_eq!(key.map_generation, 6);
+        assert_eq!(key.texture_ref, 21);
+        assert_eq!(key.surface_offset, 0x30_2000);
+        crate::runtime::storage_flush::retire_linear_residents(&mut st);
+        assert!(st.retired_linear_residents.is_empty());
+        assert!(
+            st.linear_deferred_flush.is_empty(),
+            "retire must drop the guest-flush obligation"
+        );
+
+        st.define_task(6, 0x1000, 1);
+        st.insert_object(6, 21, crate::model::ObjectEntry::default());
+        assert!(note_linear_texture_resident(
+            &mut st,
+            6,
+            21,
+            0x30_2000,
+            MTL_FORMAT_RGBA16_FLOAT,
+            4,
+            2,
+            32,
+            5,
+        ));
+        assert!(st.delete_object(6, 21));
+        assert_eq!(st.retired_linear_residents.len(), 1);
+        assert_eq!(st.retired_linear_residents[0].texture_ref, 21);
+        // Non-resident entries retire nothing.
+        st.retired_linear_residents.clear();
+        let px = vec![0u8; 4 * 2 * 8];
+        st.insert_object(6, 22, crate::model::ObjectEntry::default());
+        assert!(store_linear_texture(
+            &mut st,
+            6,
+            22,
+            0x40_0000,
+            MTL_FORMAT_RGBA16_FLOAT,
+            4,
+            2,
+            32,
+            &px,
+        ));
+        assert!(st.delete_object(6, 22));
+        assert!(st.retired_linear_residents.is_empty());
+    }
+
+    #[test]
+    fn store_and_get_roundtrip() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let w = 4u32;
+        let h = 2u32;
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        px[0] = 0x11;
+        px[1] = 0x22;
+        px[2] = 0x33;
+        px[3] = 0xff;
+        store(&mut st, 7, w, h, px);
+        let got = get(&st, 7, w, h).expect("cached");
+        assert_eq!(got[0], 0x11);
+        assert_eq!(got[3], 0xff);
+        assert!(get(&st, 7, 8, 8).is_none());
+        evict(&mut st, 7);
+        assert!(get(&st, 7, w, h).is_none());
+        let _ = HostSurface::default();
+    }
+
+    #[test]
+    fn texture_and_surface_namespaces_are_separate() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let w = 2u32;
+        let h = 2u32;
+        let mut surface = vec![0u8; 16];
+        surface[0] = 1;
+        let mut tex = vec![0u8; 16];
+        tex[0] = 2;
+        store(&mut st, 5, w, h, surface);
+        store_texture(&mut st, 5, w, h, tex);
+        assert_eq!(get(&st, 5, w, h).unwrap()[0], 1);
+        assert_eq!(get_texture(&st, 5, w, h).unwrap()[0], 2);
+    }
+
+    #[test]
+    fn gva_cache_roundtrip() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let gva = 0x2c48000u64;
+        let mut px = vec![0u8; 16];
+        px[0] = 0xaa;
+        store_gva(&mut st, gva, 2, 2, px);
+        assert_eq!(get_gva(&st, gva, 2, 2).unwrap()[0], 0xaa);
+        let (got, generation) = get_gva_with_gen(&st, gva, 2, 2).unwrap();
+        assert_eq!(got[0], 0xaa);
+        assert_eq!(generation, 1);
+        assert!(get_gva_with_gen(&st, gva, 4, 1).is_none());
+
+        let mut replacement = vec![0u8; 16];
+        replacement[0] = 0xbb;
+        store_gva(&mut st, gva, 2, 2, replacement);
+        let (got, generation) = get_gva_with_gen(&st, gva, 2, 2).unwrap();
+        assert_eq!(got[0], 0xbb);
+        assert_eq!(generation, 2);
+
+        let mut owned = vec![0u8; 16];
+        owned[0] = 0xcc;
+        store_gva_owned(&mut st, gva, 2, 2, owned, 1, 110, 2);
+        let (got, generation, task, texture_ref, object_type) =
+            get_gva_with_owner(&st, gva, 2, 2).unwrap();
+        assert_eq!(got[0], 0xcc);
+        assert_eq!(generation, 3);
+        assert_eq!((task, texture_ref, object_type), (1, 110, 2));
+        evict_gva(&mut st, gva);
+        assert!(get_gva(&st, gva, 2, 2).is_none());
+    }
+
+    /// Unmap must not drop GVA encode for any geom (PT-only RE; no size heuristic).
+    #[test]
+    fn unmap_retains_gva_encode_any_size() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let gva = 0x2c22000u64;
+        // Small layer — same retain path as wallpaper (no W×H gate).
+        let w = 64u32;
+        let h = 48u32;
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for chunk in px.chunks_exact_mut(4) {
+            chunk[0] = 185;
+            chunk[1] = 126;
+            chunk[2] = 81;
+            chunk[3] = 255;
+        }
+        store_gva(&mut st, gva, w, h, px);
+        assert!(get_gva(&st, gva, w, h).is_some());
+        note_unmap_retain_gva(&st, gva);
+        let (gw, gh, got) = get_gva_any(&st, gva).expect("retained after unmap");
+        assert_eq!((gw, gh), (w, h));
+        assert_eq!(got[0], 185);
+        assert_eq!(got[2], 81);
+    }
+
+    /// Regression guard for the host-surface cache-hit validator
+    /// (`get_from_with_gen` / `get_from`). This decides whether cached pixels
+    /// are served straight to scanout/present, so every guard clause is
+    /// load-bearing: serving a differently-sized or truncated entry paints the
+    /// wrong or a torn surface (residue / framebuffer corruption). Lock:
+    ///  - absent id -> None;
+    ///  - width OR height mismatch -> None (never resize-serve a stale frame);
+    ///  - empty or short-of-`need` bytes -> None (no partial garbage);
+    ///  - exact geom + sufficient bytes -> exactly `need` bytes (over-allocated
+    ///    entries are truncated to the requested extent) plus the entry host_gen;
+    ///  - `get_from` returns the same bytes, dropping only the generation.
+    #[test]
+    fn host_surface_cache_hit_validates_geom_and_truncates_to_need() {
+        use crate::contract::pixel_format::RGBA8_BPP;
+        let (id, w, h) = (7u32, 4u32, 2u32);
+        let need = (w * h * RGBA8_BPP) as usize; // 32
+        let mut map: std::collections::BTreeMap<u32, HostSurface> = Default::default();
+
+        // Absent id.
+        assert_eq!(get_from_with_gen(&map, id, w, h), None);
+
+        // Store an over-allocated (need + slop) buffer with a distinct host_gen.
+        let mut bgra = vec![0xABu8; need + 16];
+        bgra[need] = 0xCD; // a byte past `need` must never be returned
+        map.insert(
+            id,
+            HostSurface {
+                width: w,
+                height: h,
+                bgra,
+                host_gen: 9,
+                ..Default::default()
+            },
+        );
+
+        // Geometry mismatch on either axis must miss (no resize-serve).
+        assert_eq!(get_from_with_gen(&map, id, w + 1, h), None);
+        assert_eq!(get_from_with_gen(&map, id, w, h + 1), None);
+
+        // Exact hit: exactly `need` bytes (slop truncated) + the entry host_gen.
+        let (bytes, gen) = get_from_with_gen(&map, id, w, h).expect("exact geom must hit");
+        assert_eq!(bytes.len(), need, "must truncate to width*height*BPP");
+        assert_eq!(gen, 9, "must report the entry host_gen");
+        assert!(bytes.iter().all(|&b| b == 0xAB), "no slop byte leaks in");
+
+        // get_from is the same content, generation dropped.
+        assert_eq!(get_from(&map, id, w, h), Some(bytes));
+
+        // Empty bytes -> None even with matching geometry.
+        map.get_mut(&id).unwrap().bgra.clear();
+        assert_eq!(
+            get_from_with_gen(&map, id, w, h),
+            None,
+            "empty entry misses"
+        );
+
+        // Non-empty but short of `need` -> None (truncated store, no partial serve).
+        map.get_mut(&id).unwrap().bgra = vec![0xABu8; need - 1];
+        assert_eq!(
+            get_from_with_gen(&map, id, w, h),
+            None,
+            "under-`need` bytes must not be served",
+        );
+    }
+}

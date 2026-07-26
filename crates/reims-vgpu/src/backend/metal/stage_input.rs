@@ -1,0 +1,328 @@
+//! Compute stage-input descriptor construction.
+
+use crate::backend::metal::abi::{
+    ReimsVgpuComputeStageInputDescriptor, ReimsVgpuComputeStageInputLayout,
+    REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES, REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS,
+    REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC,
+};
+use crate::backend::metal::constants::{
+    MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5, MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC,
+    REIMS_VGPU_METAL_MAX_ATTRS, REIMS_VGPU_METAL_MAX_BUFFERS,
+};
+use crate::backend::metal::util::{set_err, ErrOut, Status};
+use metal::{MTLAttributeFormat, MTLIndexType, MTLStepFunction, StageInputOutputDescriptor};
+
+// Apple Metal.framework MTLStepFunction raw values (MTLStageInputOutputDescriptor.h).
+// Do not use metal-0.33's MTLStepFunction as u32 for X/Y Indexed — that crate
+// swaps ThreadPositionInGridY (6) with ThreadPositionInGridXIndexed (7).
+const MTL_STEP_THREAD_POS_IN_GRID_X: u32 = 5;
+const MTL_STEP_THREAD_POS_IN_GRID_Y: u32 = 6;
+const MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED: u32 = 7;
+const MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED: u32 = 8;
+
+pub fn step_supported(step_function: u32) -> bool {
+    matches!(
+        step_function,
+        MTL_STEP_THREAD_POS_IN_GRID_X
+            | MTL_STEP_THREAD_POS_IN_GRID_Y
+            | MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED
+            | MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED
+    )
+}
+
+pub fn step_indexed(step_function: u32) -> bool {
+    matches!(
+        step_function,
+        MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED | MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED
+    )
+}
+
+fn step_function_to_metal(step_function: u32) -> Option<MTLStepFunction> {
+    match step_function {
+        MTL_STEP_THREAD_POS_IN_GRID_X => Some(MTLStepFunction::ThreadPositionInGridX),
+        MTL_STEP_THREAD_POS_IN_GRID_Y => Some(MTLStepFunction::ThreadPositionInGridY),
+        MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED => {
+            // metal-0.33 enum discriminant is wrong; set via raw later if needed.
+            Some(MTLStepFunction::ThreadPositionInGridXIndexed)
+        }
+        MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED => {
+            Some(MTLStepFunction::ThreadPositionInGridYIndexed)
+        }
+        _ => None,
+    }
+}
+
+pub fn has_indexed_layout(stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>) -> bool {
+    let Some(stage_input) = stage_input else {
+        return false;
+    };
+    let layout_count =
+        (stage_input.layout_count as usize).min(REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS);
+    for i in 0..layout_count {
+        if step_indexed(stage_input.layouts[i].step_function) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn layout_for_buffer(
+    stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>,
+    binding: u32,
+) -> (Option<ReimsVgpuComputeStageInputLayout>, bool) {
+    let Some(stage_input) = stage_input else {
+        return (None, false);
+    };
+    let layout_count =
+        (stage_input.layout_count as usize).min(REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS);
+    let mut layout = None;
+    for i in 0..layout_count {
+        if stage_input.layouts[i].buffer_index == binding {
+            layout = Some(stage_input.layouts[i]);
+            break;
+        }
+    }
+    let attr_count =
+        (stage_input.attribute_count as usize).min(REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES);
+    let mut has_attribute = false;
+    for i in 0..attr_count {
+        if stage_input.attributes[i].buffer_index == binding {
+            has_attribute = true;
+            break;
+        }
+    }
+    (layout, has_attribute)
+}
+
+pub fn make_compute_stage_input_descriptor(
+    stage_input: &ReimsVgpuComputeStageInputDescriptor,
+    err: ErrOut<'_>,
+) -> Result<StageInputOutputDescriptor, Status> {
+    if stage_input.attribute_count as usize > REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES {
+        set_err(err, "invalid compute stageInputDescriptor entry count");
+        return Err(Status::args("metal_stage_input_attribute_count_exceeded")
+            .field("attributes", stage_input.attribute_count)
+            .field("limit", REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES));
+    }
+    if stage_input.layout_count as usize > REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS {
+        set_err(err, "invalid compute stageInputDescriptor entry count");
+        return Err(Status::args("metal_stage_input_layout_count_exceeded")
+            .field("layouts", stage_input.layout_count)
+            .field("limit", REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS));
+    }
+
+    let descriptor = StageInputOutputDescriptor::new().to_owned();
+    let mut layout_seen = [false; REIMS_VGPU_METAL_MAX_BUFFERS];
+    let mut has_indexed = false;
+
+    for i in 0..stage_input.layout_count as usize {
+        let layout = &stage_input.layouts[i];
+        if layout.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+            set_err(
+                err,
+                format!(
+                    "compute stageInputDescriptor layout buffer {} out of range",
+                    layout.buffer_index
+                ),
+            );
+            return Err(Status::args("metal_stage_input_layout_buffer_out_of_range")
+                .field("buffer", layout.buffer_index)
+                .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS));
+        }
+        if layout_seen[layout.buffer_index as usize] {
+            set_err(
+                err,
+                format!(
+                    "duplicate compute stageInputDescriptor layout buffer {}",
+                    layout.buffer_index
+                ),
+            );
+            return Err(Status::args("metal_stage_input_layout_buffer_duplicate")
+                .field("buffer", layout.buffer_index));
+        }
+        if !step_supported(layout.step_function) {
+            set_err(
+                err,
+                format!(
+                    "unsupported compute stageInputDescriptor step function {}",
+                    layout.step_function
+                ),
+            );
+            return Err(Status::args("metal_stage_input_step_function_unsupported")
+                .field("step", layout.step_function));
+        }
+        if step_indexed(layout.step_function) {
+            has_indexed = true;
+        }
+        let metal_layout = descriptor
+            .layouts()
+            .and_then(|a| a.object_at(layout.buffer_index as u64))
+            .ok_or_else(|| {
+                set_err(err, "compute stageInputDescriptor layouts unavailable");
+                Status::execute("metal_stage_input_layouts_unavailable")
+                    .field("buffer", layout.buffer_index)
+            })?;
+        let stride = if layout.stride == REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC {
+            MTL_BUFFER_LAYOUT_STRIDE_DYNAMIC
+        } else {
+            layout.stride
+        };
+        metal_layout.set_stride(stride);
+        metal_layout.set_step_function(unsafe { std::mem::transmute(layout.step_function as u64) });
+        metal_layout.set_step_rate(layout.step_rate as u64);
+        layout_seen[layout.buffer_index as usize] = true;
+    }
+
+    if has_indexed {
+        if stage_input.index_type != MTLIndexType::UInt16 as u32
+            && stage_input.index_type != MTLIndexType::UInt32 as u32
+        {
+            set_err(
+                err,
+                format!(
+                    "unsupported compute stageInputDescriptor index type {}",
+                    stage_input.index_type
+                ),
+            );
+            return Err(Status::args("metal_stage_input_index_type_unsupported")
+                .field("index_type", stage_input.index_type));
+        }
+        if stage_input.index_buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+            set_err(
+                err,
+                format!(
+                    "compute stageInputDescriptor index buffer {} out of range",
+                    stage_input.index_buffer_index
+                ),
+            );
+            return Err(Status::args("metal_stage_input_index_buffer_out_of_range")
+                .field("buffer", stage_input.index_buffer_index)
+                .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS));
+        }
+        descriptor.set_index_type(unsafe { std::mem::transmute(stage_input.index_type as u64) });
+        descriptor.set_index_buffer_index(stage_input.index_buffer_index as u64);
+    }
+
+    let mut attribute_seen = [false; REIMS_VGPU_METAL_MAX_ATTRS];
+    for i in 0..stage_input.attribute_count as usize {
+        let attr = &stage_input.attributes[i];
+        if attr.location as usize >= REIMS_VGPU_METAL_MAX_ATTRS {
+            set_err(
+                err,
+                format!(
+                    "compute stageInputDescriptor attribute {} out of range",
+                    attr.location
+                ),
+            );
+            return Err(Status::args("metal_stage_input_attribute_out_of_range")
+                .field("location", attr.location)
+                .field("limit", REIMS_VGPU_METAL_MAX_ATTRS));
+        }
+        if attribute_seen[attr.location as usize] {
+            set_err(
+                err,
+                format!(
+                    "duplicate compute stageInputDescriptor attribute {}",
+                    attr.location
+                ),
+            );
+            return Err(Status::args("metal_stage_input_attribute_duplicate")
+                .field("location", attr.location));
+        }
+        if attr.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+            set_err(
+                err,
+                format!(
+                    "compute stageInputDescriptor attribute {} references missing buffer {}",
+                    attr.location, attr.buffer_index
+                ),
+            );
+            return Err(
+                Status::args("metal_stage_input_attribute_buffer_out_of_range")
+                    .field("location", attr.location)
+                    .field("buffer", attr.buffer_index)
+                    .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS),
+            );
+        }
+        if !layout_seen[attr.buffer_index as usize] {
+            set_err(
+                err,
+                format!(
+                    "compute stageInputDescriptor attribute {} references missing buffer {}",
+                    attr.location, attr.buffer_index
+                ),
+            );
+            return Err(Status::args("metal_stage_input_attribute_layout_missing")
+                .field("location", attr.location)
+                .field("buffer", attr.buffer_index));
+        }
+        if attr.format == MTLAttributeFormat::Invalid as u32
+            || attr.format > MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5
+        {
+            set_err(
+                err,
+                format!(
+                    "unsupported compute stageInputDescriptor attribute format {}",
+                    attr.format
+                ),
+            );
+            return Err(
+                Status::args("metal_stage_input_attribute_format_unsupported")
+                    .field("location", attr.location)
+                    .field("format", attr.format),
+            );
+        }
+        let metal_attr = descriptor
+            .attributes()
+            .and_then(|a| a.object_at(attr.location as u64))
+            .ok_or_else(|| {
+                set_err(err, "compute stageInputDescriptor attributes unavailable");
+                Status::execute("metal_stage_input_attributes_unavailable")
+                    .field("location", attr.location)
+            })?;
+        metal_attr.set_format(unsafe { std::mem::transmute(attr.format as u64) });
+        metal_attr.set_offset(attr.offset as u64);
+        metal_attr.set_buffer_index(attr.buffer_index as u64);
+        attribute_seen[attr.location as usize] = true;
+    }
+
+    Ok(descriptor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::Emit;
+
+    fn empty_descriptor() -> ReimsVgpuComputeStageInputDescriptor {
+        // All fields are integers or fixed arrays of integer-only C structs.
+        unsafe { std::mem::zeroed() }
+    }
+
+    fn refused_line(stage: &ReimsVgpuComputeStageInputDescriptor) -> String {
+        let status = match make_compute_stage_input_descriptor(stage, (std::ptr::null_mut(), 0)) {
+            Ok(_) => panic!("invalid stage-input descriptor unexpectedly succeeded"),
+            Err(status) => status,
+        };
+        Emit::refusal("metal_stage_input_test", &status)
+            .expect("invalid stage input must carry a refusal")
+            .render()
+    }
+
+    #[test]
+    fn stage_input_attribute_and_layout_caps_have_distinct_reasons() {
+        let mut attributes = empty_descriptor();
+        attributes.attribute_count = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES as u32 + 1;
+        assert_eq!(
+            refused_line(&attributes),
+            "metal_stage_input_test reason=metal_stage_input_attribute_count_exceeded class=args attributes=17 limit=16"
+        );
+
+        let mut layouts = empty_descriptor();
+        layouts.layout_count = REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS as u32 + 1;
+        assert_eq!(
+            refused_line(&layouts),
+            "metal_stage_input_test reason=metal_stage_input_layout_count_exceeded class=args layouts=17 limit=16"
+        );
+    }
+}

@@ -1,0 +1,2187 @@
+//! Render encode path: PSO cache, stage-in, textured, fixed-function state.
+
+use crate::backend::metal::abi::*;
+use crate::backend::metal::cache::{
+    depth_stencil_insert, depth_stencil_lookup, render_pso_insert, render_pso_lookup, RenderPsoKey,
+};
+use crate::backend::metal::constants::*;
+use crate::backend::metal::format::{mtl_pixel_format_bpp, pixel_format_from_u32};
+use crate::backend::metal::function::load_only_function;
+use crate::backend::metal::hash::{hash_bytes, hash_u64};
+use crate::backend::metal::raw_metal::{
+    command_buffer_error_description, render_reflection_sampler_mask, set_line_width,
+};
+use crate::backend::metal::runtime::{
+    new_buffer_from_host, system_device, take_native_color_format, thread_queue,
+};
+use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
+use crate::backend::metal::util::{
+    bytes_of, clear_err, f32_from_bits, image_len, rgba_len, sampler_index, set_err, texture_index,
+    valid_buffer_binding, ErrOut, Status,
+};
+use foreign_types::ForeignType;
+use metal::*;
+use std::ptr;
+
+struct AttrBufferSlot {
+    data: *const u8,
+    len: usize,
+    stride: u32,
+    step_function: u32,
+    step_rate: u32,
+    index: u64,
+    buffer: Buffer,
+}
+
+fn apply_blend(
+    color: &RenderPipelineColorAttachmentDescriptorRef,
+    blend: Option<&ReimsVgpuBlendState>,
+    err: ErrOut<'_>,
+) -> Status {
+    let Some(blend) = blend.filter(|b| b.enable != 0) else {
+        return Status::OK;
+    };
+    let max_factor = MTLBlendFactor::OneMinusBlendAlpha as u32;
+    let max_op = MTLBlendOperation::Max as u32;
+    if blend.src_rgb > max_factor {
+        set_err(err, "unsupported Metal blend state");
+        return Status::args("metal_render_blend_src_rgb_unsupported")
+            .field("value", blend.src_rgb)
+            .field("limit", max_factor);
+    }
+    if blend.dst_rgb > max_factor {
+        set_err(err, "unsupported Metal blend state");
+        return Status::args("metal_render_blend_dst_rgb_unsupported")
+            .field("value", blend.dst_rgb)
+            .field("limit", max_factor);
+    }
+    if blend.src_alpha > max_factor {
+        set_err(err, "unsupported Metal blend state");
+        return Status::args("metal_render_blend_src_alpha_unsupported")
+            .field("value", blend.src_alpha)
+            .field("limit", max_factor);
+    }
+    if blend.dst_alpha > max_factor {
+        set_err(err, "unsupported Metal blend state");
+        return Status::args("metal_render_blend_dst_alpha_unsupported")
+            .field("value", blend.dst_alpha)
+            .field("limit", max_factor);
+    }
+    if blend.op_rgb > max_op {
+        set_err(err, "unsupported Metal blend state");
+        return Status::args("metal_render_blend_rgb_operation_unsupported")
+            .field("value", blend.op_rgb)
+            .field("limit", max_op);
+    }
+    if blend.op_alpha > max_op {
+        set_err(err, "unsupported Metal blend state");
+        return Status::args("metal_render_blend_alpha_operation_unsupported")
+            .field("value", blend.op_alpha)
+            .field("limit", max_op);
+    }
+    color.set_blending_enabled(true);
+    color.set_source_rgb_blend_factor(unsafe { std::mem::transmute(blend.src_rgb as u64) });
+    color.set_destination_rgb_blend_factor(unsafe { std::mem::transmute(blend.dst_rgb as u64) });
+    color.set_rgb_blend_operation(unsafe { std::mem::transmute(blend.op_rgb as u64) });
+    color.set_source_alpha_blend_factor(unsafe { std::mem::transmute(blend.src_alpha as u64) });
+    color
+        .set_destination_alpha_blend_factor(unsafe { std::mem::transmute(blend.dst_alpha as u64) });
+    color.set_alpha_blend_operation(unsafe { std::mem::transmute(blend.op_alpha as u64) });
+    Status::OK
+}
+
+fn apply_blend_color(encoder: &RenderCommandEncoderRef, blend: Option<&ReimsVgpuBlendState>) {
+    if let Some(blend) = blend {
+        if blend.enable != 0 && blend.has_blend_color != 0 {
+            encoder.set_blend_color(
+                blend.blend_color[0],
+                blend.blend_color[1],
+                blend.blend_color[2],
+                blend.blend_color[3],
+            );
+        }
+    }
+}
+
+fn apply_raster_state(
+    encoder: &RenderCommandEncoderRef,
+    raster: Option<&ReimsVgpuRasterState>,
+    err: ErrOut<'_>,
+) -> Status {
+    let Some(raster) = raster else {
+        return Status::OK;
+    };
+    if raster.has_cull_mode != 0 && raster.cull_mode > MTLCullMode::Back as u32 {
+        set_err(err, "unsupported Metal raster state");
+        return Status::args("metal_render_cull_mode_unsupported")
+            .field("cull_mode", raster.cull_mode);
+    }
+    if raster.has_depth_clip_mode != 0 && raster.depth_clip_mode > MTLDepthClipMode::Clamp as u32 {
+        set_err(err, "unsupported Metal raster state");
+        return Status::args("metal_render_depth_clip_mode_unsupported")
+            .field("depth_clip_mode", raster.depth_clip_mode);
+    }
+    if raster.has_front_facing_winding != 0
+        && raster.front_facing_winding > MTLWinding::CounterClockwise as u32
+    {
+        set_err(err, "unsupported Metal raster state");
+        return Status::args("metal_render_winding_unsupported")
+            .field("winding", raster.front_facing_winding);
+    }
+    if raster.has_triangle_fill_mode != 0
+        && raster.triangle_fill_mode > MTLTriangleFillMode::Lines as u32
+    {
+        set_err(err, "unsupported Metal raster state");
+        return Status::args("metal_render_fill_mode_unsupported")
+            .field("fill_mode", raster.triangle_fill_mode);
+    }
+    if raster.has_cull_mode != 0 {
+        encoder.set_cull_mode(unsafe { std::mem::transmute(raster.cull_mode as u64) });
+    }
+    if raster.has_depth_clip_mode != 0 {
+        encoder.set_depth_clip_mode(unsafe { std::mem::transmute(raster.depth_clip_mode as u64) });
+    }
+    if raster.has_front_facing_winding != 0 {
+        encoder.set_front_facing_winding(unsafe {
+            std::mem::transmute(raster.front_facing_winding as u64)
+        });
+    }
+    if raster.has_triangle_fill_mode != 0 {
+        encoder.set_triangle_fill_mode(unsafe {
+            std::mem::transmute(raster.triangle_fill_mode as u64)
+        });
+    }
+    if raster.has_line_width != 0 {
+        // RenderCommandEncoder is a Message object.
+        let ok = unsafe {
+            set_line_width(
+                &*(encoder as *const RenderCommandEncoderRef as *const objc::runtime::Object),
+                raster.line_width,
+            )
+        };
+        if !ok {
+            set_err(err, "Metal encoder lacks setLineWidth:");
+            return Status::execute("metal_render_line_width_api_unavailable");
+        }
+    }
+    Status::OK
+}
+
+fn apply_depth_bias(
+    encoder: &RenderCommandEncoderRef,
+    depth_bias: Option<&ReimsVgpuDepthBiasState>,
+) {
+    if let Some(db) = depth_bias {
+        encoder.set_depth_bias(db.depth_bias, db.slope_scale, db.clamp);
+    }
+}
+
+fn stencil_face_valid(face: &ReimsVgpuDepthStencilFaceState) -> bool {
+    face.compare_function <= MTLCompareFunction::Always as u32
+        && face.stencil_failure_operation <= MTLStencilOperation::DecrementWrap as u32
+        && face.depth_failure_operation <= MTLStencilOperation::DecrementWrap as u32
+        && face.depth_stencil_pass_operation <= MTLStencilOperation::DecrementWrap as u32
+}
+
+fn apply_stencil_face(dst: &StencilDescriptorRef, src: &ReimsVgpuDepthStencilFaceState) {
+    dst.set_stencil_compare_function(unsafe { std::mem::transmute(src.compare_function as u64) });
+    dst.set_stencil_failure_operation(unsafe {
+        std::mem::transmute(src.stencil_failure_operation as u64)
+    });
+    dst.set_depth_failure_operation(unsafe {
+        std::mem::transmute(src.depth_failure_operation as u64)
+    });
+    dst.set_depth_stencil_pass_operation(unsafe {
+        std::mem::transmute(src.depth_stencil_pass_operation as u64)
+    });
+    dst.set_read_mask(src.read_mask);
+    dst.set_write_mask(src.write_mask);
+}
+
+fn apply_depth_stencil_state(
+    device: &Device,
+    encoder: &RenderCommandEncoderRef,
+    depth_stencil: Option<&ReimsVgpuDepthStencilState>,
+    stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
+    err: ErrOut<'_>,
+) -> Status {
+    if let Some(ds) = depth_stencil {
+        if ds.depth_compare_function > MTLCompareFunction::Always as u32 {
+            set_err(err, "unsupported Metal depth-stencil enum value");
+            return Status::args("metal_render_depth_compare_unsupported")
+                .field("compare", ds.depth_compare_function);
+        }
+        if !stencil_face_valid(&ds.front_face) {
+            set_err(err, "unsupported Metal depth-stencil enum value");
+            return Status::args("metal_render_front_stencil_state_unsupported")
+                .field("compare", ds.front_face.compare_function)
+                .field("stencil_fail", ds.front_face.stencil_failure_operation)
+                .field("depth_fail", ds.front_face.depth_failure_operation)
+                .field("pass", ds.front_face.depth_stencil_pass_operation);
+        }
+        if !stencil_face_valid(&ds.back_face) {
+            set_err(err, "unsupported Metal depth-stencil enum value");
+            return Status::args("metal_render_back_stencil_state_unsupported")
+                .field("compare", ds.back_face.compare_function)
+                .field("stencil_fail", ds.back_face.stencil_failure_operation)
+                .field("depth_fail", ds.back_face.depth_failure_operation)
+                .field("pass", ds.back_face.depth_stencil_pass_operation);
+        }
+        let ds_key = hash_bytes(bytes_of(ds));
+        let state = if let Some(hit) = depth_stencil_lookup(ds_key, ds) {
+            hit
+        } else {
+            let descriptor = DepthStencilDescriptor::new();
+            descriptor.set_depth_compare_function(unsafe {
+                std::mem::transmute(ds.depth_compare_function as u64)
+            });
+            descriptor.set_depth_write_enabled(ds.depth_write_enabled != 0);
+            if ds.front_stencil_enabled != 0 {
+                let face = StencilDescriptor::new();
+                apply_stencil_face(&face, &ds.front_face);
+                descriptor.set_front_face_stencil(Some(&face));
+            }
+            if ds.back_stencil_enabled != 0 {
+                let face = StencilDescriptor::new();
+                apply_stencil_face(&face, &ds.back_face);
+                descriptor.set_back_face_stencil(Some(&face));
+            }
+            let state = device.new_depth_stencil_state(&descriptor);
+            depth_stencil_insert(ds_key, *ds, state)
+        };
+        encoder.set_depth_stencil_state(&state);
+    }
+    if let Some(sr) = stencil_reference {
+        encoder.set_stencil_front_back_reference_value(sr.front, sr.back);
+    }
+    Status::OK
+}
+
+fn apply_viewports(
+    encoder: &RenderCommandEncoderRef,
+    viewports: &[ReimsVgpuViewport],
+    target_width: u32,
+    target_height: u32,
+) {
+    if viewports.is_empty() {
+        encoder.set_viewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: target_width as f64,
+            height: target_height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        return;
+    }
+    let mut mtl: Vec<MTLViewport> = Vec::with_capacity(viewports.len());
+    for v in viewports {
+        mtl.push(MTLViewport {
+            originX: v.x as f64,
+            originY: v.y as f64,
+            width: v.width as f64,
+            height: v.height as f64,
+            znear: v.znear as f64,
+            zfar: v.zfar as f64,
+        });
+    }
+    encoder.set_viewports(&mtl);
+}
+
+fn apply_scissors(
+    encoder: &RenderCommandEncoderRef,
+    scissors: &[ReimsVgpuScissor],
+    target_width: u32,
+    target_height: u32,
+) {
+    if scissors.is_empty() {
+        encoder.set_scissor_rect(MTLScissorRect {
+            x: 0,
+            y: 0,
+            width: target_width as u64,
+            height: target_height as u64,
+        });
+        return;
+    }
+    let mut mtl: Vec<MTLScissorRect> = Vec::with_capacity(scissors.len());
+    for s in scissors {
+        mtl.push(MTLScissorRect {
+            x: s.x as u64,
+            y: s.y as u64,
+            width: s.width as u64,
+            height: s.height as u64,
+        });
+    }
+    encoder.set_scissor_rects(&mtl);
+}
+
+fn find_or_add_attr_slot(
+    device: &Device,
+    slots: &mut Vec<AttrBufferSlot>,
+    attr: &ReimsVgpuVertexAttr,
+    err: ErrOut<'_>,
+) -> Result<Option<u64>, Status> {
+    // Layout-only attrs (no host bytes yet) still drive the vertex descriptor;
+    // buffer data may arrive via regular setVertexBuffer binds.
+    if attr.data.is_null() || attr.len == 0 {
+        return Ok(None);
+    }
+    if attr.stride == 0 {
+        set_err(err, "invalid vertex attribute buffer");
+        return Err(Status::args("metal_render_vertex_attribute_stride_zero")
+            .field("location", attr.location)
+            .field("buffer", attr.buffer_index));
+    }
+    let step_function = if attr.has_step_function != 0 {
+        attr.step_function
+    } else {
+        MTLVertexStepFunction::PerVertex as u32
+    };
+    let step_rate = if attr.has_step_rate != 0 {
+        attr.step_rate
+    } else {
+        1
+    };
+    if step_function > MTLVertexStepFunction::PerInstance as u32 {
+        set_err(err, "unsupported vertex attribute step state");
+        return Err(
+            Status::args("metal_render_vertex_step_function_unsupported")
+                .field("location", attr.location)
+                .field("step", step_function),
+        );
+    }
+    if step_rate == 0 {
+        set_err(err, "unsupported vertex attribute step state");
+        return Err(
+            Status::args("metal_render_vertex_step_rate_zero").field("location", attr.location)
+        );
+    }
+    for s in slots.iter() {
+        if s.index == attr.buffer_index as u64
+            && s.data == attr.data
+            && s.len == attr.len
+            && s.stride == attr.stride
+            && s.step_function == step_function
+            && s.step_rate == step_rate
+        {
+            return Ok(Some(s.index));
+        }
+        if s.index == attr.buffer_index as u64 {
+            set_err(
+                err,
+                format!(
+                    "conflicting vertex attribute buffer index {}",
+                    attr.buffer_index
+                ),
+            );
+            return Err(Status::args("metal_render_vertex_buffer_index_conflict")
+                .field("buffer", attr.buffer_index));
+        }
+    }
+    if slots.len() >= REIMS_VGPU_METAL_MAX_BUFFERS {
+        set_err(err, "too many vertex attribute buffers");
+        return Err(Status::args("metal_render_vertex_buffer_count_exceeded")
+            .field("count", slots.len())
+            .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS));
+    }
+    let buffer = match new_buffer_from_host(device, attr.data, attr.len) {
+        Some(b) => b,
+        None => {
+            set_err(err, "failed to create vertex attribute buffer");
+            return Err(Status::execute("metal_render_vertex_buffer_create_failed")
+                .field("buffer", attr.buffer_index)
+                .field("len", attr.len));
+        }
+    };
+    let index = attr.buffer_index as u64;
+    slots.push(AttrBufferSlot {
+        data: attr.data,
+        len: attr.len,
+        stride: attr.stride,
+        step_function,
+        step_rate,
+        index,
+        buffer,
+    });
+    Ok(Some(index))
+}
+
+fn make_vertex_descriptor(
+    device: &Device,
+    attrs: &[ReimsVgpuVertexAttr],
+    err: ErrOut<'_>,
+) -> Result<(Option<VertexDescriptor>, Vec<AttrBufferSlot>), Status> {
+    if attrs.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    if attrs.len() > REIMS_VGPU_METAL_MAX_ATTRS {
+        set_err(err, "invalid vertex attribute list");
+        return Err(Status::args("metal_render_vertex_attribute_count_exceeded")
+            .field("count", attrs.len())
+            .field("limit", REIMS_VGPU_METAL_MAX_ATTRS));
+    }
+    let descriptor = VertexDescriptor::new().to_owned();
+    let mut slots = Vec::new();
+    let mut any_layout = false;
+    for attr in attrs {
+        if attr.format == 0 || attr.stride == 0 {
+            continue;
+        }
+        if attr.location as usize >= REIMS_VGPU_METAL_MAX_ATTRS {
+            set_err(
+                err,
+                format!("vertex attribute location {} out of range", attr.location),
+            );
+            return Err(
+                Status::args("metal_render_vertex_attribute_location_out_of_range")
+                    .field("location", attr.location)
+                    .field("limit", REIMS_VGPU_METAL_MAX_ATTRS),
+            );
+        }
+        if attr.buffer_index as usize >= REIMS_VGPU_METAL_MAX_BUFFERS {
+            set_err(
+                err,
+                format!(
+                    "vertex attribute buffer index {} out of range",
+                    attr.buffer_index
+                ),
+            );
+            return Err(
+                Status::args("metal_render_vertex_attribute_buffer_out_of_range")
+                    .field("buffer", attr.buffer_index)
+                    .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS),
+            );
+        }
+        // Optional host bytes → Metal buffer slot for encode-time bind.
+        find_or_add_attr_slot(device, &mut slots, attr, err)?;
+        if let Some(a) = descriptor.attributes().object_at(attr.location as u64) {
+            a.set_format(unsafe { std::mem::transmute(attr.format as u64) });
+            a.set_offset(attr.offset as u64);
+            a.set_buffer_index(attr.buffer_index as u64);
+        }
+        if let Some(layout) = descriptor.layouts().object_at(attr.buffer_index as u64) {
+            layout.set_stride(attr.stride as u64);
+            let step = if attr.has_step_function != 0 {
+                attr.step_function
+            } else {
+                MTLVertexStepFunction::PerVertex as u32
+            };
+            layout.set_step_function(unsafe { std::mem::transmute(step as u64) });
+            let rate = if attr.has_step_rate != 0 {
+                attr.step_rate
+            } else {
+                1
+            };
+            layout.set_step_rate(rate as u64);
+        }
+        any_layout = true;
+    }
+    if any_layout {
+        Ok((Some(descriptor), slots))
+    } else {
+        Ok((None, slots))
+    }
+}
+
+/// Color RT slot + format + optional per-slot blend for PSO keying.
+pub struct ColorRtKey {
+    pub slot: u32,
+    pub pixel_format: u32,
+    pub blend: Option<ReimsVgpuBlendState>,
+}
+
+fn fill_render_pso_key(
+    vert_hash: u64,
+    vert_len: usize,
+    frag_hash: u64,
+    frag_len: usize,
+    attrs: &[ReimsVgpuVertexAttr],
+    blend: Option<&ReimsVgpuBlendState>,
+    color_rts: &[ColorRtKey],
+    depth_pixel_format: u32,
+    stencil_pixel_format: u32,
+) -> RenderPsoKey {
+    use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    let mut key = RenderPsoKey::default();
+    key.vert_hash = vert_hash;
+    key.frag_hash = frag_hash;
+    key.vert_len = vert_len;
+    key.frag_len = frag_len;
+    key.attr_count = attrs.len() as u32;
+    for (i, attr) in attrs.iter().enumerate().take(REIMS_VGPU_METAL_MAX_ATTRS) {
+        key.attr_location[i] = attr.location;
+        key.attr_format[i] = attr.format;
+        key.attr_offset[i] = attr.offset;
+        key.attr_buffer_index[i] = attr.buffer_index;
+        key.attr_stride[i] = attr.stride;
+        key.attr_has_step_function[i] = if attr.has_step_function != 0 { 1 } else { 0 };
+        key.attr_step_function[i] = attr.step_function;
+        key.attr_has_step_rate[i] = if attr.has_step_rate != 0 { 1 } else { 0 };
+        key.attr_step_rate[i] = attr.step_rate;
+    }
+    // Global blend (stream blend color path / color0 fallback).
+    if let Some(blend) = blend {
+        if blend.enable != 0 {
+            key.blend_enable = 1;
+            key.blend_src_rgb = blend.src_rgb;
+            key.blend_dst_rgb = blend.dst_rgb;
+            key.blend_op_rgb = blend.op_rgb;
+            key.blend_src_alpha = blend.src_alpha;
+            key.blend_dst_alpha = blend.dst_alpha;
+            key.blend_op_alpha = blend.op_alpha;
+        }
+    }
+    key.color_count = color_rts.len().min(REIMS_VGPU_METAL_MAX_COLOR_RTS) as u32;
+    for (i, rt) in color_rts
+        .iter()
+        .take(REIMS_VGPU_METAL_MAX_COLOR_RTS)
+        .enumerate()
+    {
+        key.color_slot[i] = rt.slot as u8;
+        key.color_formats[i] = rt.pixel_format;
+        if let Some(b) = rt.blend.as_ref().filter(|b| b.enable != 0) {
+            key.color_blend_enable[i] = 1;
+            key.color_blend_src_rgb[i] = b.src_rgb;
+            key.color_blend_dst_rgb[i] = b.dst_rgb;
+            key.color_blend_op_rgb[i] = b.op_rgb;
+            key.color_blend_src_alpha[i] = b.src_alpha;
+            key.color_blend_dst_alpha[i] = b.dst_alpha;
+            key.color_blend_op_alpha[i] = b.op_alpha;
+        } else if key.blend_enable != 0 && rt.slot == 0 {
+            key.color_blend_enable[i] = 1;
+            key.color_blend_src_rgb[i] = key.blend_src_rgb;
+            key.color_blend_dst_rgb[i] = key.blend_dst_rgb;
+            key.color_blend_op_rgb[i] = key.blend_op_rgb;
+            key.color_blend_src_alpha[i] = key.blend_src_alpha;
+            key.color_blend_dst_alpha[i] = key.blend_dst_alpha;
+            key.color_blend_op_alpha[i] = key.blend_op_alpha;
+        }
+    }
+    key.depth_pixel_format = depth_pixel_format;
+    key.stencil_pixel_format = stencil_pixel_format;
+
+    let mut h = 0xcbf29ce484222325u64;
+    h = hash_u64(h, vert_hash);
+    h = hash_u64(h, frag_hash);
+    h = hash_u64(h, vert_len as u64);
+    h = hash_u64(h, frag_len as u64);
+    h = hash_u64(h, key.attr_count as u64);
+    for i in 0..key.attr_count as usize {
+        h = hash_u64(h, key.attr_location[i] as u64);
+        h = hash_u64(h, key.attr_format[i] as u64);
+        h = hash_u64(h, key.attr_offset[i] as u64);
+        h = hash_u64(h, key.attr_buffer_index[i] as u64);
+        h = hash_u64(h, key.attr_stride[i] as u64);
+        h = hash_u64(h, key.attr_step_function[i] as u64);
+        h = hash_u64(h, key.attr_step_rate[i] as u64);
+        h = hash_u64(h, key.attr_has_step_function[i] as u64);
+        h = hash_u64(h, key.attr_has_step_rate[i] as u64);
+    }
+    h = hash_u64(h, key.blend_enable as u64);
+    h = hash_u64(h, key.blend_src_rgb as u64);
+    h = hash_u64(h, key.blend_dst_rgb as u64);
+    h = hash_u64(h, key.blend_op_rgb as u64);
+    h = hash_u64(h, key.blend_src_alpha as u64);
+    h = hash_u64(h, key.blend_dst_alpha as u64);
+    h = hash_u64(h, key.blend_op_alpha as u64);
+    h = hash_u64(h, key.color_count as u64);
+    for i in 0..key.color_count as usize {
+        h = hash_u64(h, key.color_slot[i] as u64);
+        h = hash_u64(h, key.color_formats[i] as u64);
+        h = hash_u64(h, key.color_blend_enable[i] as u64);
+        h = hash_u64(h, key.color_blend_src_rgb[i] as u64);
+        h = hash_u64(h, key.color_blend_dst_rgb[i] as u64);
+        h = hash_u64(h, key.color_blend_op_rgb[i] as u64);
+        h = hash_u64(h, key.color_blend_src_alpha[i] as u64);
+        h = hash_u64(h, key.color_blend_dst_alpha[i] as u64);
+        h = hash_u64(h, key.color_blend_op_alpha[i] as u64);
+    }
+    h = hash_u64(h, key.depth_pixel_format as u64);
+    h = hash_u64(h, key.stencil_pixel_format as u64);
+    key.key_hash = h;
+    key
+}
+
+fn get_render_pipeline_state(
+    device: &Device,
+    vertex: &Function,
+    fragment: &Function,
+    vertex_descriptor: Option<&VertexDescriptor>,
+    key: &RenderPsoKey,
+    blend: Option<&ReimsVgpuBlendState>,
+    err: ErrOut<'_>,
+) -> Result<(RenderPipelineState, u32, u32), Status> {
+    if let Some(hit) = render_pso_lookup(key) {
+        return Ok(hit);
+    }
+
+    let pipeline_descriptor = RenderPipelineDescriptor::new();
+    pipeline_descriptor.set_vertex_function(Some(vertex));
+    pipeline_descriptor.set_fragment_function(Some(fragment));
+    if let Some(vd) = vertex_descriptor {
+        pipeline_descriptor.set_vertex_descriptor(Some(vd));
+    }
+    for i in 0..key.color_count as usize {
+        let slot = key.color_slot[i] as u64;
+        if let Some(color) = pipeline_descriptor.color_attachments().object_at(slot) {
+            color.set_pixel_format(pixel_format_from_u32(key.color_formats[i]));
+            let slot_blend = if key.color_blend_enable[i] != 0 {
+                Some(ReimsVgpuBlendState {
+                    enable: 1,
+                    src_rgb: key.color_blend_src_rgb[i],
+                    dst_rgb: key.color_blend_dst_rgb[i],
+                    op_rgb: key.color_blend_op_rgb[i],
+                    src_alpha: key.color_blend_src_alpha[i],
+                    dst_alpha: key.color_blend_dst_alpha[i],
+                    op_alpha: key.color_blend_op_alpha[i],
+                    has_blend_color: 0,
+                    blend_color: [0.0; 4],
+                })
+            } else {
+                None
+            };
+            let rc = apply_blend(color, slot_blend.as_ref(), err);
+            if !rc.is_ok() {
+                return Err(rc);
+            }
+        }
+    }
+    if key.depth_pixel_format != 0 {
+        pipeline_descriptor
+            .set_depth_attachment_pixel_format(pixel_format_from_u32(key.depth_pixel_format));
+    }
+    if key.stencil_pixel_format != 0 {
+        pipeline_descriptor
+            .set_stencil_attachment_pixel_format(pixel_format_from_u32(key.stencil_pixel_format));
+    }
+
+    let (pso, reflection) = device
+        .new_render_pipeline_state_with_reflection(
+            &pipeline_descriptor,
+            MTLPipelineOption::ArgumentInfo,
+        )
+        .map_err(|e| {
+            set_err(err, format!("render PSO failed: {e}"));
+            Status::execute("metal_render_pso_create_failed").field("key_hash", key.key_hash)
+        })?;
+
+    let reflection_ptr = unsafe { reflection.as_ptr() as *mut objc::runtime::Object };
+    let vert_mask = render_reflection_sampler_mask(reflection_ptr, true);
+    let frag_mask = render_reflection_sampler_mask(reflection_ptr, false);
+
+    Ok(render_pso_insert(
+        key.clone_key(),
+        pso,
+        vert_mask,
+        frag_mask,
+    ))
+}
+
+// RenderPsoKey is not Clone by default with arrays — add helper.
+trait RenderPsoKeyClone {
+    fn clone_key(&self) -> RenderPsoKey;
+}
+
+impl RenderPsoKeyClone for RenderPsoKey {
+    fn clone_key(&self) -> RenderPsoKey {
+        RenderPsoKey {
+            key_hash: self.key_hash,
+            vert_hash: self.vert_hash,
+            frag_hash: self.frag_hash,
+            vert_len: self.vert_len,
+            frag_len: self.frag_len,
+            attr_count: self.attr_count,
+            attr_location: self.attr_location,
+            attr_format: self.attr_format,
+            attr_offset: self.attr_offset,
+            attr_buffer_index: self.attr_buffer_index,
+            attr_stride: self.attr_stride,
+            attr_step_function: self.attr_step_function,
+            attr_step_rate: self.attr_step_rate,
+            attr_has_step_function: self.attr_has_step_function,
+            attr_has_step_rate: self.attr_has_step_rate,
+            blend_enable: self.blend_enable,
+            blend_src_rgb: self.blend_src_rgb,
+            blend_dst_rgb: self.blend_dst_rgb,
+            blend_op_rgb: self.blend_op_rgb,
+            blend_src_alpha: self.blend_src_alpha,
+            blend_dst_alpha: self.blend_dst_alpha,
+            blend_op_alpha: self.blend_op_alpha,
+            color_count: self.color_count,
+            color_formats: self.color_formats,
+            color_slot: self.color_slot,
+            color_blend_enable: self.color_blend_enable,
+            color_blend_src_rgb: self.color_blend_src_rgb,
+            color_blend_dst_rgb: self.color_blend_dst_rgb,
+            color_blend_op_rgb: self.color_blend_op_rgb,
+            color_blend_src_alpha: self.color_blend_src_alpha,
+            color_blend_dst_alpha: self.color_blend_dst_alpha,
+            color_blend_op_alpha: self.color_blend_op_alpha,
+            depth_pixel_format: self.depth_pixel_format,
+            stencil_pixel_format: self.stencil_pixel_format,
+        }
+    }
+}
+
+fn bind_storage_buffers(
+    device: &Device,
+    encoder: &RenderCommandEncoderRef,
+    retained: &mut Vec<Buffer>,
+    buffers: &[ReimsVgpuBuffer],
+    fragment_stage: bool,
+    err: ErrOut<'_>,
+) -> Status {
+    if buffers.is_empty() {
+        return Status::OK;
+    }
+    for buffer in buffers {
+        if !valid_buffer_binding(buffer.binding) {
+            set_err(
+                err,
+                format!(
+                    "invalid {} buffer binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    buffer.binding
+                ),
+            );
+            return Status::args("metal_render_buffer_binding_out_of_range")
+                .field("fragment", fragment_stage)
+                .field("binding", buffer.binding)
+                .field("limit", REIMS_VGPU_METAL_MAX_BUFFERS);
+        }
+        if buffer.data.is_null() {
+            set_err(
+                err,
+                format!(
+                    "invalid {} buffer binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    buffer.binding
+                ),
+            );
+            return Status::args("metal_render_buffer_data_missing")
+                .field("fragment", fragment_stage)
+                .field("binding", buffer.binding);
+        }
+        if buffer.len == 0 {
+            set_err(
+                err,
+                format!(
+                    "invalid {} buffer binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    buffer.binding
+                ),
+            );
+            return Status::args("metal_render_buffer_length_zero")
+                .field("fragment", fragment_stage)
+                .field("binding", buffer.binding);
+        }
+        let mtl_buffer = match new_buffer_from_host(device, buffer.data, buffer.len) {
+            Some(b) => b,
+            None => {
+                set_err(
+                    err,
+                    format!(
+                        "failed to create {} buffer",
+                        if fragment_stage { "fragment" } else { "vertex" }
+                    ),
+                );
+                return Status::execute("metal_render_buffer_create_failed")
+                    .field("fragment", fragment_stage)
+                    .field("binding", buffer.binding)
+                    .field("len", buffer.len);
+            }
+        };
+        if fragment_stage {
+            encoder.set_fragment_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
+        } else {
+            encoder.set_vertex_buffer(buffer.binding as u64, Some(&mtl_buffer), 0);
+        }
+        retained.push(mtl_buffer);
+    }
+    Status::OK
+}
+
+fn bind_sampled_images(
+    device: &Device,
+    encoder: &RenderCommandEncoderRef,
+    retained: &mut Vec<Texture>,
+    images: &[ReimsVgpuSampledImage],
+    fragment_stage: bool,
+    err: ErrOut<'_>,
+) -> Status {
+    if images.is_empty() {
+        return Status::OK;
+    }
+    for image in images {
+        let Some(texture_index) = texture_index(image.binding) else {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Status::args("metal_render_sampled_binding_invalid")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding);
+        };
+        if image.width == 0 {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Status::args("metal_render_sampled_width_zero")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding);
+        }
+        if image.height == 0 {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampled image binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    image.binding
+                ),
+            );
+            return Status::args("metal_render_sampled_height_zero")
+                .field("fragment", fragment_stage)
+                .field("binding", image.binding);
+        }
+
+        let (pixel_format, bytes, bytes_per_row) = if image.pixel_format != 0 {
+            let Some(bpp) = mtl_pixel_format_bpp(image.pixel_format) else {
+                set_err(
+                    err,
+                    format!(
+                        "invalid native {} sampled image binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_format_unsupported")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("format", image.pixel_format);
+            };
+            if image.data.is_null() {
+                set_err(
+                    err,
+                    format!(
+                        "invalid native {} sampled image binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_data_missing")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding);
+            }
+            if image.data_len == 0 {
+                set_err(
+                    err,
+                    format!(
+                        "invalid native {} sampled image binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_data_empty")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding);
+            }
+            let bpr = if image.bytes_per_row != 0 {
+                image.bytes_per_row as u64
+            } else {
+                image.width as u64 * bpp as u64
+            };
+            let need = bpr.checked_mul(image.height as u64);
+            let Some(need) = need else {
+                set_err(
+                    err,
+                    format!(
+                        "native {} sampled image too short binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_span_overflow")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("bytes_per_row", bpr)
+                    .field("height", image.height);
+            };
+            if image.data_len < need as usize {
+                set_err(
+                    err,
+                    format!(
+                        "native {} sampled image too short binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_native_data_too_short")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("len", image.data_len)
+                    .field("required", need);
+            }
+            (pixel_format_from_u32(image.pixel_format), image.data, bpr)
+        } else {
+            let Some(expected_len) = rgba_len(image.width, image.height) else {
+                set_err(
+                    err,
+                    format!(
+                        "invalid {} sampled image binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_rgba_geometry_invalid")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("width", image.width)
+                    .field("height", image.height);
+            };
+            if image.rgba8.is_null() {
+                set_err(
+                    err,
+                    format!(
+                        "invalid {} sampled image binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_rgba_data_missing")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding);
+            }
+            if image.len < expected_len {
+                set_err(
+                    err,
+                    format!(
+                        "invalid {} sampled image binding {}",
+                        if fragment_stage { "fragment" } else { "vertex" },
+                        image.binding
+                    ),
+                );
+                return Status::args("metal_render_sampled_rgba_data_too_short")
+                    .field("fragment", fragment_stage)
+                    .field("binding", image.binding)
+                    .field("len", image.len)
+                    .field("required", expected_len);
+            }
+            (
+                MTLPixelFormat::RGBA8Unorm,
+                image.rgba8,
+                image.width as u64 * 4,
+            )
+        };
+
+        let descriptor = TextureDescriptor::new();
+        descriptor.set_texture_type(MTLTextureType::D2);
+        descriptor.set_pixel_format(pixel_format);
+        descriptor.set_width(image.width as u64);
+        descriptor.set_height(image.height as u64);
+        descriptor.set_storage_mode(MTLStorageMode::Shared);
+        descriptor.set_usage(MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&descriptor);
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: image.width as u64,
+                height: image.height as u64,
+                depth: 1,
+            },
+        };
+        unsafe {
+            texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
+        }
+        if fragment_stage {
+            encoder.set_fragment_texture(texture_index as u64, Some(&texture));
+        } else {
+            encoder.set_vertex_texture(texture_index as u64, Some(&texture));
+        }
+        retained.push(texture);
+    }
+    Status::OK
+}
+
+fn bind_samplers(
+    device: &Device,
+    encoder: &RenderCommandEncoderRef,
+    sampler_mask: u32,
+    samplers: &[ReimsVgpuSampler],
+    fragment_stage: bool,
+    err: ErrOut<'_>,
+) -> Status {
+    let mut seen = [false; REIMS_VGPU_METAL_MAX_SAMPLERS];
+    for s in samplers {
+        let Some(index) = sampler_index(s.binding) else {
+            set_err(
+                err,
+                format!(
+                    "invalid {} sampler binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    s.binding
+                ),
+            );
+            return Status::args("metal_render_sampler_binding_invalid")
+                .field("fragment", fragment_stage)
+                .field("binding", s.binding);
+        };
+        if seen[index] {
+            set_err(
+                err,
+                format!(
+                    "duplicate {} sampler binding {}",
+                    if fragment_stage { "fragment" } else { "vertex" },
+                    s.binding
+                ),
+            );
+            return Status::args("metal_render_sampler_binding_duplicate")
+                .field("fragment", fragment_stage)
+                .field("binding", s.binding);
+        }
+        let sampler = match make_explicit_sampler(device, s, err) {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        seen[index] = true;
+        if s.has_lod_clamp != 0 {
+            let lod = f32_from_bits(s.clamp_lod_min_bits)..f32_from_bits(s.clamp_lod_max_bits);
+            if fragment_stage {
+                encoder.set_fragment_sampler_state_with_lod(index as u64, Some(&sampler), lod);
+            } else {
+                encoder.set_vertex_sampler_state_with_lod(index as u64, Some(&sampler), lod);
+            }
+        } else if fragment_stage {
+            encoder.set_fragment_sampler_state(index as u64, Some(&sampler));
+        } else {
+            encoder.set_vertex_sampler_state(index as u64, Some(&sampler));
+        }
+    }
+
+    for index in 0..REIMS_VGPU_METAL_MAX_SAMPLERS {
+        if (sampler_mask & (1u32 << index)) == 0 || seen[index] {
+            continue;
+        }
+        let sampler = make_default_sampler(device);
+        seen[index] = true;
+        if fragment_stage {
+            encoder.set_fragment_sampler_state(index as u64, Some(&sampler));
+        } else {
+            encoder.set_vertex_sampler_state(index as u64, Some(&sampler));
+        }
+    }
+    Status::OK
+}
+
+fn validate_depth_attachment(
+    depth: Option<&ReimsVgpuDepthAttachment>,
+    width: u32,
+    height: u32,
+    err: ErrOut<'_>,
+) -> Result<usize, Status> {
+    let Some(depth) = depth else {
+        return Ok(0);
+    };
+    if depth.pixel_format != REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT {
+        set_err(
+            err,
+            format!(
+                "unsupported depth attachment pixel format {}",
+                depth.pixel_format
+            ),
+        );
+        return Err(Status::args("metal_render_depth_format_unsupported")
+            .field("format", depth.pixel_format));
+    }
+    if depth.load_action > REIMS_VGPU_MTL_LOAD_ACTION_CLEAR {
+        set_err(
+            err,
+            format!(
+                "unsupported depth attachment load action {}",
+                depth.load_action
+            ),
+        );
+        return Err(Status::args("metal_render_depth_load_action_unsupported")
+            .field("load_action", depth.load_action));
+    }
+    if depth.store_action != REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE
+        && depth.store_action != REIMS_VGPU_MTL_STORE_ACTION_STORE
+    {
+        set_err(
+            err,
+            format!(
+                "unsupported depth attachment store action {}",
+                depth.store_action
+            ),
+        );
+        return Err(Status::args("metal_render_depth_store_action_unsupported")
+            .field("store_action", depth.store_action));
+    }
+    let Some(depth_len) = image_len(width, height, std::mem::size_of::<f32>()) else {
+        set_err(err, "invalid depth attachment dimensions");
+        return Err(Status::args("metal_render_depth_geometry_invalid")
+            .field("width", width)
+            .field("height", height));
+    };
+    if !depth.data.is_null() {
+        if depth.len != depth_len {
+            set_err(err, "invalid depth attachment data length");
+            return Err(Status::args("metal_render_depth_data_length_mismatch")
+                .field("len", depth.len)
+                .field("expected", depth_len));
+        }
+    } else if depth.len != 0 {
+        set_err(err, "depth attachment length without data");
+        return Err(Status::args("metal_render_depth_length_without_data").field("len", depth.len));
+    }
+    if (depth.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD
+        || depth.store_action == REIMS_VGPU_MTL_STORE_ACTION_STORE)
+        && depth.data.is_null()
+    {
+        set_err(err, "depth attachment load/store requires data");
+        return Err(Status::args("metal_render_depth_data_required")
+            .field("load_action", depth.load_action)
+            .field("store_action", depth.store_action));
+    }
+    Ok(depth_len)
+}
+
+fn validate_stencil_attachment(
+    stencil: Option<&ReimsVgpuStencilAttachment>,
+    width: u32,
+    height: u32,
+    err: ErrOut<'_>,
+) -> Result<usize, Status> {
+    let Some(stencil) = stencil else {
+        return Ok(0);
+    };
+    if stencil.pixel_format != REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8 {
+        set_err(
+            err,
+            format!(
+                "unsupported stencil attachment pixel format {}",
+                stencil.pixel_format
+            ),
+        );
+        return Err(Status::args("metal_render_stencil_format_unsupported")
+            .field("format", stencil.pixel_format));
+    }
+    if stencil.load_action > REIMS_VGPU_MTL_LOAD_ACTION_CLEAR {
+        set_err(
+            err,
+            format!(
+                "unsupported stencil attachment load action {}",
+                stencil.load_action
+            ),
+        );
+        return Err(Status::args("metal_render_stencil_load_action_unsupported")
+            .field("load_action", stencil.load_action));
+    }
+    if stencil.store_action != REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE
+        && stencil.store_action != REIMS_VGPU_MTL_STORE_ACTION_STORE
+    {
+        set_err(
+            err,
+            format!(
+                "unsupported stencil attachment store action {}",
+                stencil.store_action
+            ),
+        );
+        return Err(
+            Status::args("metal_render_stencil_store_action_unsupported")
+                .field("store_action", stencil.store_action),
+        );
+    }
+    let Some(stencil_len) = image_len(width, height, 1) else {
+        set_err(err, "invalid stencil attachment dimensions");
+        return Err(Status::args("metal_render_stencil_geometry_invalid")
+            .field("width", width)
+            .field("height", height));
+    };
+    if !stencil.data.is_null() {
+        if stencil.len != stencil_len {
+            set_err(err, "invalid stencil attachment data length");
+            return Err(Status::args("metal_render_stencil_data_length_mismatch")
+                .field("len", stencil.len)
+                .field("expected", stencil_len));
+        }
+    } else if stencil.len != 0 {
+        set_err(err, "stencil attachment len without data");
+        return Err(
+            Status::args("metal_render_stencil_length_without_data").field("len", stencil.len)
+        );
+    }
+    if (stencil.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD
+        || stencil.store_action == REIMS_VGPU_MTL_STORE_ACTION_STORE)
+        && stencil.data.is_null()
+    {
+        set_err(err, "stencil attachment load/store requires data");
+        return Err(Status::args("metal_render_stencil_data_required")
+            .field("load_action", stencil.load_action)
+            .field("store_action", stencil.store_action));
+    }
+    Ok(stencil_len)
+}
+
+fn configure_depth_attachment(
+    device: &Device,
+    pass: &RenderPassDescriptorRef,
+    retained: &mut Vec<Texture>,
+    depth: Option<&ReimsVgpuDepthAttachment>,
+    width: u32,
+    height: u32,
+) -> Option<Texture> {
+    let Some(depth) = depth else {
+        return None;
+    };
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(pixel_format_from_u32(depth.pixel_format));
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&descriptor);
+    if depth.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD {
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+        };
+        unsafe {
+            texture.replace_region(
+                region,
+                0,
+                depth.data as *const _,
+                (width as u64) * (std::mem::size_of::<f32>() as u64),
+            );
+        }
+    }
+    retained.push(texture.clone());
+    if let Some(att) = pass.depth_attachment() {
+        att.set_texture(Some(&texture));
+        att.set_load_action(unsafe { std::mem::transmute(depth.load_action as u64) });
+        att.set_clear_depth(depth.clear_depth);
+        att.set_store_action(unsafe { std::mem::transmute(depth.store_action as u64) });
+    }
+    Some(texture)
+}
+
+fn configure_stencil_attachment(
+    device: &Device,
+    pass: &RenderPassDescriptorRef,
+    retained: &mut Vec<Texture>,
+    stencil: Option<&ReimsVgpuStencilAttachment>,
+    width: u32,
+    height: u32,
+) -> Option<Texture> {
+    let Some(stencil) = stencil else {
+        return None;
+    };
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(pixel_format_from_u32(stencil.pixel_format));
+    descriptor.set_width(width as u64);
+    descriptor.set_height(height as u64);
+    descriptor.set_storage_mode(MTLStorageMode::Shared);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&descriptor);
+    if stencil.load_action == REIMS_VGPU_MTL_LOAD_ACTION_LOAD {
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+        };
+        unsafe {
+            texture.replace_region(region, 0, stencil.data as *const _, width as u64);
+        }
+    }
+    retained.push(texture.clone());
+    if let Some(att) = pass.stencil_attachment() {
+        att.set_texture(Some(&texture));
+        att.set_load_action(unsafe { std::mem::transmute(stencil.load_action as u64) });
+        att.set_clear_stencil(stencil.clear_stencil);
+        att.set_store_action(unsafe { std::mem::transmute(stencil.store_action as u64) });
+    }
+    Some(texture)
+}
+
+/// One color render target for MRT encode (host RGBA8 seed/readback by default).
+pub struct ColorRt<'a> {
+    /// Metal color attachment index (`[[color(n)]]`).
+    pub slot: u32,
+    /// MTL pixel format; 0 = RGBA8Unorm (product writeback path).
+    pub pixel_format: u32,
+    pub seed_rgba8: Option<&'a [u8]>,
+    pub out_rgba8: Option<&'a mut [u8]>,
+    pub clear_r: f64,
+    pub clear_g: f64,
+    pub clear_b: f64,
+    pub clear_a: f64,
+    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). With a guest-backed
+    /// attachment (`guest_tex`) this is honored verbatim — Metal Load reads
+    /// the guest surface bytes, exactly the Apple unified-memory semantics.
+    /// For ephemeral host RTs (GVA linear targets), Load requires a CPU seed
+    /// (archive `reims_vgpu_backend_metal`: NULL seed → Clear invent).
+    pub load_action: u32,
+    /// Per-slot blend from pipeline color-attachment section (overrides global for this RT).
+    pub blend: Option<ReimsVgpuBlendState>,
+    /// Guest-memory-backed attachment (unified memory): the texture aliases
+    /// the mapping's guest pages, so Load/Store need no seed/readback and the
+    /// Store result is guest-visible when the command buffer completes.
+    pub guest_tex: Option<Texture>,
+}
+
+/// Resolve Metal loadAction for an **ephemeral host RT** color attachment
+/// (GVA linear targets). Archive `reims_vgpu_backend_metal` (fresh Shared RT every
+/// job): `loadAction = target_rgba8 ? Load : Clear` — guest Load without a
+/// CPU seed Clear-invents. Guest-backed attachments bypass this entirely.
+pub(crate) fn color_rt_load_action(guest_load: u32, has_seed: bool) -> u32 {
+    use crate::backend::metal::abi::{
+        REIMS_VGPU_MTL_LOAD_ACTION_CLEAR, REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
+        REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
+    };
+    match guest_load {
+        x if x == REIMS_VGPU_MTL_LOAD_ACTION_CLEAR => REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+        x if x == REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE => REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
+        x if x == REIMS_VGPU_MTL_LOAD_ACTION_LOAD && has_seed => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
+        _ if has_seed => REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
+        _ => REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+    }
+}
+
+#[cfg(test)]
+mod load_action_tests {
+    use super::color_rt_load_action;
+    use crate::backend::metal::abi::{
+        REIMS_VGPU_MTL_LOAD_ACTION_CLEAR, REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
+        REIMS_VGPU_MTL_LOAD_ACTION_LOAD,
+    };
+
+    /// Archive: Load + CPU seed on fresh RT → Load.
+    #[test]
+    fn load_with_seed_loads() {
+        assert_eq!(
+            color_rt_load_action(REIMS_VGPU_MTL_LOAD_ACTION_LOAD, true),
+            REIMS_VGPU_MTL_LOAD_ACTION_LOAD
+        );
+    }
+
+    /// Archive NULL seed on fresh RT → Clear invent.
+    #[test]
+    fn load_without_seed_fresh_rt_clear_invents() {
+        assert_eq!(
+            color_rt_load_action(REIMS_VGPU_MTL_LOAD_ACTION_LOAD, false),
+            REIMS_VGPU_MTL_LOAD_ACTION_CLEAR
+        );
+    }
+
+    #[test]
+    fn clear_and_dontcare_preserved() {
+        assert_eq!(
+            color_rt_load_action(REIMS_VGPU_MTL_LOAD_ACTION_CLEAR, false),
+            REIMS_VGPU_MTL_LOAD_ACTION_CLEAR
+        );
+        assert_eq!(
+            color_rt_load_action(REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE, true),
+            REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_decline_tests {
+    use super::*;
+    use crate::observe::Emit;
+
+    fn line(status: Status) -> String {
+        Emit::refusal("metal_attachment_test", &status)
+            .expect("invalid attachment must carry a refusal")
+            .render()
+    }
+
+    #[test]
+    fn depth_and_stencil_rejections_name_the_attachment_and_check() {
+        let depth = ReimsVgpuDepthAttachment {
+            pixel_format: 0xfeed,
+            load_action: REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+            store_action: REIMS_VGPU_MTL_STORE_ACTION_STORE,
+            clear_depth: 1.0,
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let depth_status = validate_depth_attachment(Some(&depth), 4, 4, (std::ptr::null_mut(), 0))
+            .expect_err("unsupported depth format must fail");
+        assert_eq!(
+            line(depth_status),
+            "metal_attachment_test reason=metal_render_depth_format_unsupported class=args format=65261"
+        );
+
+        let stencil = ReimsVgpuStencilAttachment {
+            pixel_format: REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8,
+            load_action: REIMS_VGPU_MTL_LOAD_ACTION_CLEAR,
+            store_action: u32::MAX,
+            clear_stencil: 0,
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let stencil_status =
+            validate_stencil_attachment(Some(&stencil), 4, 4, (std::ptr::null_mut(), 0))
+                .expect_err("unsupported stencil store action must fail");
+        assert_eq!(
+            line(stencil_status),
+            "metal_attachment_test reason=metal_render_stencil_store_action_unsupported class=args store_action=4294967295"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_core(
+    vert_mtlb: &[u8],
+    frag_mtlb: &[u8],
+    width: u32,
+    height: u32,
+    vertex_count: usize,
+    first_vertex: usize,
+    instance_count: usize,
+    base_instance: usize,
+    primitive_type: u32,
+    primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
+    indexed: Option<&ReimsVgpuIndexedDraw>,
+    attrs: &[ReimsVgpuVertexAttr],
+    buffers: &[ReimsVgpuBuffer],
+    frag_buffers: &[ReimsVgpuBuffer],
+    vertex_images: &[ReimsVgpuSampledImage],
+    vertex_samplers: &[ReimsVgpuSampler],
+    images: &[ReimsVgpuSampledImage],
+    samplers: &[ReimsVgpuSampler],
+    viewports: &[ReimsVgpuViewport],
+    scissors: &[ReimsVgpuScissor],
+    raster: Option<&ReimsVgpuRasterState>,
+    depth_bias: Option<&ReimsVgpuDepthBiasState>,
+    depth_stencil: Option<&ReimsVgpuDepthStencilState>,
+    stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
+    depth_attachment: Option<&mut ReimsVgpuDepthAttachment>,
+    stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
+    blend: Option<&ReimsVgpuBlendState>,
+    mut color_pixel_format: u32,
+    target_rgba8: Option<&[u8]>,
+    out_rgba: Option<&mut [u8]>,
+    err: ErrOut<'_>,
+) -> Status {
+    if color_pixel_format == 0 {
+        let tl = take_native_color_format();
+        if tl != 0 {
+            color_pixel_format = tl;
+        }
+    }
+    let mut single = ColorRt {
+        slot: 0,
+        pixel_format: color_pixel_format,
+        seed_rgba8: target_rgba8,
+        out_rgba8: out_rgba,
+        clear_r: 0.0,
+        clear_g: 0.0,
+        clear_b: 0.0,
+        clear_a: 0.0,
+        // Single-RT helper: Load when seeded, else Clear (legacy callers).
+        load_action: if target_rgba8.is_some() {
+            crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD
+        } else {
+            crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_CLEAR
+        },
+        blend: blend.copied(),
+        guest_tex: None,
+    };
+    render_core_mrt(
+        vert_mtlb,
+        frag_mtlb,
+        width,
+        height,
+        vertex_count,
+        first_vertex,
+        instance_count,
+        base_instance,
+        primitive_type,
+        primitive_indirect,
+        indexed,
+        attrs,
+        buffers,
+        frag_buffers,
+        vertex_images,
+        vertex_samplers,
+        images,
+        samplers,
+        viewports,
+        scissors,
+        raster,
+        depth_bias,
+        depth_stencil,
+        stencil_reference,
+        depth_attachment,
+        stencil_attachment,
+        blend,
+        std::slice::from_mut(&mut single),
+        err,
+    )
+}
+
+/// Multi-render-target encode: one Metal pass with color attachments at given slots.
+#[allow(clippy::too_many_arguments)]
+pub fn render_core_mrt(
+    vert_mtlb: &[u8],
+    frag_mtlb: &[u8],
+    width: u32,
+    height: u32,
+    vertex_count: usize,
+    first_vertex: usize,
+    instance_count: usize,
+    base_instance: usize,
+    primitive_type: u32,
+    primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
+    indexed: Option<&ReimsVgpuIndexedDraw>,
+    attrs: &[ReimsVgpuVertexAttr],
+    buffers: &[ReimsVgpuBuffer],
+    frag_buffers: &[ReimsVgpuBuffer],
+    vertex_images: &[ReimsVgpuSampledImage],
+    vertex_samplers: &[ReimsVgpuSampler],
+    images: &[ReimsVgpuSampledImage],
+    samplers: &[ReimsVgpuSampler],
+    viewports: &[ReimsVgpuViewport],
+    scissors: &[ReimsVgpuScissor],
+    raster: Option<&ReimsVgpuRasterState>,
+    depth_bias: Option<&ReimsVgpuDepthBiasState>,
+    depth_stencil: Option<&ReimsVgpuDepthStencilState>,
+    stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
+    depth_attachment: Option<&mut ReimsVgpuDepthAttachment>,
+    stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
+    blend: Option<&ReimsVgpuBlendState>,
+    colors: &mut [ColorRt<'_>],
+    err: ErrOut<'_>,
+) -> Status {
+    use crate::backend::metal::constants::REIMS_VGPU_METAL_MAX_COLOR_RTS;
+    let indexed_indirect = indexed.map(|i| !i.indirect.is_null()).unwrap_or(false);
+    if colors.is_empty() {
+        set_err(err, "invalid color render target count");
+        return Status::args("metal_render_color_targets_empty");
+    }
+    if colors.len() > REIMS_VGPU_METAL_MAX_COLOR_RTS {
+        set_err(err, "invalid color render target count");
+        return Status::args("metal_render_color_target_count_exceeded")
+            .field("count", colors.len())
+            .field("limit", REIMS_VGPU_METAL_MAX_COLOR_RTS);
+    }
+    // Resolve per-RT format + bpp; require uniform dimensions (Metal pass rule).
+    let mut color_meta: Vec<(u32, u32, usize, MTLPixelFormat)> = Vec::with_capacity(colors.len());
+    // (slot, fmt_u32, bpp, mtl_fmt)
+    for c in colors.iter() {
+        if c.slot as usize >= REIMS_VGPU_METAL_MAX_COLOR_RTS {
+            set_err(
+                err,
+                format!("color attachment slot {} out of range", c.slot),
+            );
+            return Status::args("metal_render_color_slot_out_of_range")
+                .field("slot", c.slot)
+                .field("limit", REIMS_VGPU_METAL_MAX_COLOR_RTS);
+        }
+        let mut fmt = c.pixel_format;
+        if fmt == 0 {
+            fmt = MTLPixelFormat::RGBA8Unorm as u32;
+        }
+        let Some(bpp) = mtl_pixel_format_bpp(fmt) else {
+            set_err(err, format!("unsupported render color pixel format {fmt}"));
+            return Status::args("metal_render_color_format_unsupported")
+                .field("slot", c.slot)
+                .field("format", fmt);
+        };
+        if width == 0 {
+            set_err(err, "invalid render dimensions");
+            return Status::args("metal_render_color_width_zero").field("slot", c.slot);
+        }
+        if height == 0 {
+            set_err(err, "invalid render dimensions");
+            return Status::args("metal_render_color_height_zero").field("slot", c.slot);
+        }
+        let Some(need) = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(bpp))
+        else {
+            set_err(err, "invalid render dimensions");
+            return Status::args("metal_render_color_span_overflow")
+                .field("slot", c.slot)
+                .field("width", width)
+                .field("height", height)
+                .field("bpp", bpp);
+        };
+        if let Some(seed) = c.seed_rgba8 {
+            if seed.len() != need {
+                set_err(err, "invalid color RT seed length");
+                return Status::args("metal_render_color_seed_length_mismatch")
+                    .field("slot", c.slot)
+                    .field("len", seed.len())
+                    .field("expected", need);
+            }
+        }
+        if let Some(out) = c.out_rgba8.as_ref() {
+            if !out.is_empty() && out.len() != need {
+                set_err(err, "invalid color RT out length");
+                return Status::args("metal_render_color_output_length_mismatch")
+                    .field("slot", c.slot)
+                    .field("len", out.len())
+                    .field("expected", need);
+            }
+        }
+        color_meta.push((c.slot, fmt, bpp, pixel_format_from_u32(fmt)));
+    }
+    // First RT bpp for legacy paths that still reference a single bpp (draw gates).
+    let color_bpp = color_meta[0].2;
+    let _ = color_bpp;
+
+    if primitive_indirect.is_none() && !indexed_indirect && vertex_count == 0 {
+        set_err(err, "invalid render dimensions or draw count");
+        return Status::args("metal_render_vertex_count_zero");
+    }
+    if primitive_indirect.is_none() && !indexed_indirect && instance_count == 0 {
+        set_err(err, "invalid render dimensions or draw count");
+        return Status::args("metal_render_instance_count_zero");
+    }
+    if primitive_indirect.is_some() && indexed.is_some() {
+        set_err(
+            err,
+            "primitive indirect and indexed draw are mutually exclusive",
+        );
+        return Status::args("metal_render_indirect_and_indexed_conflict");
+    }
+    if primitive_type > MTLPrimitiveType::TriangleStrip as u32 {
+        set_err(err, "unsupported Metal primitive type");
+        return Status::args("metal_render_primitive_type_unsupported")
+            .field("primitive_type", primitive_type);
+    }
+    if viewports.len() > REIMS_VGPU_BACKEND_MAX_VIEWPORTS {
+        set_err(err, "invalid viewport array state");
+        return Status::args("metal_render_viewport_count_exceeded")
+            .field("count", viewports.len())
+            .field("limit", REIMS_VGPU_BACKEND_MAX_VIEWPORTS);
+    }
+    if scissors.len() > REIMS_VGPU_BACKEND_MAX_SCISSORS {
+        set_err(err, "invalid scissor array state");
+        return Status::args("metal_render_scissor_count_exceeded")
+            .field("count", scissors.len())
+            .field("limit", REIMS_VGPU_BACKEND_MAX_SCISSORS);
+    }
+
+    let Some(device) = system_device() else {
+        set_err(err, "MTLCreateSystemDefaultDevice returned nil");
+        return Status::execute("metal_render_device_unavailable");
+    };
+
+    let vertex = match load_only_function(device, vert_mtlb, "vertex", err) {
+        Ok(f) => f,
+        Err(st) => return st,
+    };
+    let fragment = match load_only_function(device, frag_mtlb, "fragment", err) {
+        Ok(f) => f,
+        Err(st) => return st,
+    };
+
+    let (vertex_descriptor, attr_slots) = match make_vertex_descriptor(device, attrs, err) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
+
+    let depth_len = match validate_depth_attachment(depth_attachment.as_deref(), width, height, err)
+    {
+        Ok(n) => n,
+        Err(st) => return st,
+    };
+    let stencil_len =
+        match validate_stencil_attachment(stencil_attachment.as_deref(), width, height, err) {
+            Ok(n) => n,
+            Err(st) => return st,
+        };
+    let _ = (depth_len, stencil_len);
+
+    let color_rt_keys: Vec<ColorRtKey> = colors
+        .iter()
+        .zip(color_meta.iter())
+        .map(|(c, &(slot, fmt, _, _))| ColorRtKey {
+            slot,
+            pixel_format: fmt,
+            blend: c.blend.or_else(|| {
+                if slot == 0 {
+                    blend.copied()
+                } else {
+                    blend.filter(|b| b.enable != 0).copied()
+                }
+            }),
+        })
+        .collect();
+    let pso_key = fill_render_pso_key(
+        hash_bytes(vert_mtlb),
+        vert_mtlb.len(),
+        hash_bytes(frag_mtlb),
+        frag_mtlb.len(),
+        attrs,
+        blend,
+        &color_rt_keys,
+        depth_attachment
+            .as_ref()
+            .map(|d| d.pixel_format)
+            .unwrap_or(0),
+        stencil_attachment
+            .as_ref()
+            .map(|s| s.pixel_format)
+            .unwrap_or(0),
+    );
+    let (pso, vert_sampler_mask, frag_sampler_mask) = match get_render_pipeline_state(
+        device,
+        &vertex,
+        &fragment,
+        vertex_descriptor.as_ref(),
+        &pso_key,
+        blend,
+        err,
+    ) {
+        Ok(v) => v,
+        Err(st) => return st,
+    };
+
+    let mut retained_tex: Vec<Texture> = Vec::new();
+    // (slot, tex, bpp, guest_backed)
+    let mut color_textures: Vec<(u32, Texture, usize, bool)> = Vec::new();
+    for (i, c) in colors.iter().enumerate() {
+        let (slot, _fmt_u32, bpp, mtl_fmt) = color_meta[i];
+        let (target, guest_backed) = if let Some(g) = &c.guest_tex {
+            // Unified memory: the attachment IS the guest surface. No host
+            // copy exists, so no seed upload and no readback.
+            (g.clone(), true)
+        } else {
+            let target_descriptor = TextureDescriptor::new();
+            target_descriptor.set_texture_type(MTLTextureType::D2);
+            target_descriptor.set_pixel_format(mtl_fmt);
+            target_descriptor.set_width(width as u64);
+            target_descriptor.set_height(height as u64);
+            target_descriptor.set_storage_mode(MTLStorageMode::Shared);
+            target_descriptor
+                .set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+            let target = device.new_texture(&target_descriptor);
+            // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
+            // (fresh RT every job; NULL seed → Clear invent below).
+            if let Some(seed) = c.seed_rgba8 {
+                let region = MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: width as u64,
+                        height: height as u64,
+                        depth: 1,
+                    },
+                };
+                unsafe {
+                    target.replace_region(
+                        region,
+                        0,
+                        seed.as_ptr() as *const _,
+                        (width as u64) * (bpp as u64),
+                    );
+                }
+            }
+            (target, false)
+        };
+        retained_tex.push(target.clone());
+        color_textures.push((slot, target, bpp, guest_backed));
+    }
+    let mut retained_buf: Vec<Buffer> = Vec::new();
+
+    let pass = RenderPassDescriptor::new();
+    for (i, c) in colors.iter().enumerate() {
+        let (slot, target, _, guest_backed) = &color_textures[i];
+        if let Some(ca) = pass.color_attachments().object_at(*slot as u64) {
+            ca.set_texture(Some(target));
+            // Guest-backed attachment: honor the guest loadAction verbatim —
+            // Metal Load reads the guest surface bytes (unified memory).
+            // Ephemeral host RT: archive Load+seed / Clear invent.
+            let resolved = if *guest_backed {
+                c.load_action
+            } else {
+                color_rt_load_action(c.load_action, c.seed_rgba8.is_some())
+            };
+            let mtl_load = match resolved {
+                x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD => {
+                    MTLLoadAction::Load
+                }
+                x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE => {
+                    MTLLoadAction::DontCare
+                }
+                _ => MTLLoadAction::Clear,
+            };
+            ca.set_load_action(mtl_load);
+            ca.set_clear_color(MTLClearColor::new(
+                c.clear_r, c.clear_g, c.clear_b, c.clear_a,
+            ));
+            ca.set_store_action(MTLStoreAction::Store);
+        }
+    }
+
+    let depth_texture = configure_depth_attachment(
+        device,
+        &pass,
+        &mut retained_tex,
+        depth_attachment.as_deref(),
+        width,
+        height,
+    );
+    let stencil_texture = configure_stencil_attachment(
+        device,
+        &pass,
+        &mut retained_tex,
+        stencil_attachment.as_deref(),
+        width,
+        height,
+    );
+
+    let queue = thread_queue(device);
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let encoder = command_buffer.new_render_command_encoder(&pass);
+    encoder.set_render_pipeline_state(&pso);
+    apply_blend_color(encoder, blend);
+    let rc = apply_raster_state(encoder, raster, err);
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    apply_depth_bias(encoder, depth_bias);
+    let rc = apply_depth_stencil_state(device, encoder, depth_stencil, stencil_reference, err);
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    apply_viewports(encoder, viewports, width, height);
+    apply_scissors(encoder, scissors, width, height);
+
+    for slot in &attr_slots {
+        encoder.set_vertex_buffer(slot.index, Some(&slot.buffer), 0);
+    }
+    let rc = bind_storage_buffers(device, encoder, &mut retained_buf, buffers, false, err);
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    let rc = bind_storage_buffers(device, encoder, &mut retained_buf, frag_buffers, true, err);
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    let rc = bind_sampled_images(
+        device,
+        encoder,
+        &mut retained_tex,
+        vertex_images,
+        false,
+        err,
+    );
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    let rc = bind_samplers(
+        device,
+        encoder,
+        vert_sampler_mask,
+        vertex_samplers,
+        false,
+        err,
+    );
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    let rc = bind_sampled_images(device, encoder, &mut retained_tex, images, true, err);
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+    let rc = bind_samplers(device, encoder, frag_sampler_mask, samplers, true, err);
+    if !rc.is_ok() {
+        encoder.end_encoding();
+        return rc;
+    }
+
+    let prim: MTLPrimitiveType = unsafe { std::mem::transmute(primitive_type as u64) };
+
+    if let Some(pi) = primitive_indirect {
+        let need = std::mem::size_of::<ReimsVgpuPrimitiveIndirectArguments>();
+        if pi.arguments.is_null() {
+            set_err(err, "invalid primitive indirect draw");
+            encoder.end_encoding();
+            return Status::args("metal_render_primitive_indirect_arguments_missing");
+        }
+        if pi.arguments_len < need {
+            set_err(err, "invalid primitive indirect draw");
+            encoder.end_encoding();
+            return Status::args("metal_render_primitive_indirect_arguments_too_short")
+                .field("len", pi.arguments_len)
+                .field("required", need);
+        }
+        let indirect = device.new_buffer_with_data(
+            pi.arguments as *const _,
+            pi.arguments_len as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        retained_buf.push(indirect.clone());
+        encoder.draw_primitives_indirect(prim, &indirect, 0);
+    } else if let Some(ix) = indexed {
+        let index_type_ok = ix.index_type == MTLIndexType::UInt16 as u32
+            || ix.index_type == MTLIndexType::UInt32 as u32;
+        if ix.indices.is_null() {
+            set_err(err, "invalid indexed draw");
+            encoder.end_encoding();
+            return Status::args("metal_render_index_data_missing");
+        }
+        if ix.indices_len == 0 {
+            set_err(err, "invalid indexed draw");
+            encoder.end_encoding();
+            return Status::args("metal_render_index_data_empty");
+        }
+        if !indexed_indirect && ix.index_count == 0 {
+            set_err(err, "invalid indexed draw");
+            encoder.end_encoding();
+            return Status::args("metal_render_index_count_zero");
+        }
+        if !index_type_ok {
+            set_err(err, "invalid indexed draw");
+            encoder.end_encoding();
+            return Status::args("metal_render_index_type_unsupported")
+                .field("index_type", ix.index_type);
+        }
+        let base_vertex = ix.base_vertex;
+        let index_size: usize = if ix.index_type == MTLIndexType::UInt16 as u32 {
+            2
+        } else {
+            4
+        };
+        if indexed_indirect {
+            let ind = unsafe { &*ix.indirect };
+            let need = std::mem::size_of::<ReimsVgpuIndexedIndirectArguments>();
+            if ind.arguments.is_null() {
+                set_err(err, "invalid indexed indirect draw");
+                encoder.end_encoding();
+                return Status::args("metal_render_indexed_indirect_arguments_missing");
+            }
+            if ind.arguments_len < need {
+                set_err(err, "invalid indexed indirect draw");
+                encoder.end_encoding();
+                return Status::args("metal_render_indexed_indirect_arguments_too_short")
+                    .field("len", ind.arguments_len)
+                    .field("required", need);
+            }
+            let mut args = ReimsVgpuIndexedIndirectArguments {
+                index_count: 0,
+                instance_count: 0,
+                index_start: 0,
+                base_vertex: 0,
+                base_instance: 0,
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    ind.arguments as *const u8,
+                    &mut args as *mut _ as *mut u8,
+                    need,
+                );
+            }
+            let Some(index_end) =
+                (args.index_start as usize).checked_add(args.index_count as usize)
+            else {
+                set_err(err, "indexed indirect index buffer too short");
+                encoder.end_encoding();
+                return Status::args("metal_render_indexed_indirect_range_overflow")
+                    .field("index_start", args.index_start)
+                    .field("index_count", args.index_count);
+            };
+            let Some(index_bytes) = index_end.checked_mul(index_size) else {
+                set_err(err, "indexed indirect index buffer too short");
+                encoder.end_encoding();
+                return Status::args("metal_render_indexed_indirect_byte_count_overflow")
+                    .field("index_end", index_end)
+                    .field("index_size", index_size);
+            };
+            if ix.indices_len < index_bytes {
+                set_err(err, "indexed indirect index buffer too short");
+                encoder.end_encoding();
+                return Status::args("metal_render_indexed_indirect_buffer_too_short")
+                    .field("index_start", args.index_start)
+                    .field("index_count", args.index_count)
+                    .field("index_size", index_size)
+                    .field("indices_len", ix.indices_len);
+            }
+        } else {
+            if ix.index_count > usize::MAX / index_size {
+                set_err(err, "indexed draw byte count overflows");
+                encoder.end_encoding();
+                return Status::args("metal_render_index_byte_count_overflow")
+                    .field("index_count", ix.index_count)
+                    .field("index_size", index_size);
+            }
+            if ix.indices_len < ix.index_count * index_size {
+                set_err(err, "index buffer too short");
+                encoder.end_encoding();
+                return Status::args("metal_render_index_buffer_too_short")
+                    .field("index_count", ix.index_count)
+                    .field("index_size", index_size)
+                    .field("indices_len", ix.indices_len);
+            }
+        }
+        let index_buffer = device.new_buffer_with_data(
+            ix.indices as *const _,
+            ix.indices_len as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        retained_buf.push(index_buffer.clone());
+        if indexed_indirect {
+            let ind = unsafe { &*ix.indirect };
+            let indirect = device.new_buffer_with_data(
+                ind.arguments as *const _,
+                ind.arguments_len as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            retained_buf.push(indirect.clone());
+            encoder.draw_indexed_primitives_indirect(
+                prim,
+                unsafe { std::mem::transmute(ix.index_type as u64) },
+                &index_buffer,
+                0,
+                &indirect,
+                0,
+            );
+        } else {
+            encoder.draw_indexed_primitives_instanced_base_instance(
+                prim,
+                ix.index_count as u64,
+                unsafe { std::mem::transmute(ix.index_type as u64) },
+                &index_buffer,
+                0,
+                instance_count as u64,
+                base_vertex,
+                base_instance as u64,
+            );
+        }
+    } else if base_instance != 0 {
+        encoder.draw_primitives_instanced_base_instance(
+            prim,
+            first_vertex as u64,
+            vertex_count as u64,
+            instance_count as u64,
+            base_instance as u64,
+        );
+    } else if instance_count != 1 {
+        encoder.draw_primitives_instanced(
+            prim,
+            first_vertex as u64,
+            vertex_count as u64,
+            instance_count as u64,
+        );
+    } else {
+        encoder.draw_primitives(prim, first_vertex as u64, vertex_count as u64);
+    }
+
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    if command_buffer.status() == MTLCommandBufferStatus::Error {
+        let detail = command_buffer_error_description(&command_buffer);
+        set_err(err, format!("Metal command buffer failed: {detail}"));
+        return Status::execute("metal_render_command_buffer_failed");
+    }
+
+    for (i, c) in colors.iter_mut().enumerate() {
+        if let Some(out) = c.out_rgba8.as_mut() {
+            if out.is_empty() {
+                continue;
+            }
+            let (slot, target, bpp, guest_backed) = &color_textures[i];
+            let _ = slot;
+            if *guest_backed {
+                // Unified memory: the Store already landed in guest pages.
+                continue;
+            }
+            let target_len = (width as usize)
+                .saturating_mul(height as usize)
+                .saturating_mul(*bpp);
+            let mut readback = vec![0u8; target_len];
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                target.get_bytes(
+                    readback.as_mut_ptr() as *mut _,
+                    (width as u64) * (*bpp as u64),
+                    region,
+                    0,
+                );
+            }
+            let n = out.len().min(target_len);
+            out[..n].copy_from_slice(&readback[..n]);
+        }
+    }
+    color_textures.clear();
+    if let Some(depth) = depth_attachment {
+        if depth.store_action == REIMS_VGPU_MTL_STORE_ACTION_STORE {
+            if let Some(tex) = depth_texture {
+                let region = MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: width as u64,
+                        height: height as u64,
+                        depth: 1,
+                    },
+                };
+                unsafe {
+                    tex.get_bytes(
+                        depth.data as *mut _,
+                        (width as u64) * (std::mem::size_of::<f32>() as u64),
+                        region,
+                        0,
+                    );
+                }
+            }
+        }
+    }
+    if let Some(stencil) = stencil_attachment {
+        if stencil.store_action == REIMS_VGPU_MTL_STORE_ACTION_STORE {
+            if let Some(tex) = stencil_texture {
+                let region = MTLRegion {
+                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                    size: MTLSize {
+                        width: width as u64,
+                        height: height as u64,
+                        depth: 1,
+                    },
+                };
+                unsafe {
+                    tex.get_bytes(stencil.data as *mut _, width as u64, region, 0);
+                }
+            }
+        }
+    }
+    clear_err(err);
+    let _ = retained_buf;
+    Status::OK
+}

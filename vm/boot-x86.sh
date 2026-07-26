@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+#
+# vm/boot-x86.sh — boot an x86_64 macOS guest under QEMU+KVM on Linux.
+#
+# Display is selected by --device (primary VGA):
+#   vmware-svga      default console (OSX-KVM mainstream)
+#   reims-vgpu-pci   product Reims VGPU (thin C → reims-vgpu); -vga none + secondary bus
+#
+# SNAPSHOT-REVERT (same model as vm/boot-arm64.sh): snapshots form an IMMUTABLE
+# HISTORY under `vm/disks/snapshots/<label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}`
+# (each read-only, never overwritten). `vm/disks/snapshots/current` is a symlink
+# naming the active one. EVERY boot starts from a byte-identical COW clone of
+# `current` (btrfs reflink when available) and discards that clone on exit, so a
+# harsh kill or a wedge costs nothing and poisons nothing. A snapshot is never
+# booted directly.
+#
+# Boot classes:
+#   --testing      agent-driven measurement (default): GUI + serial-to-file,
+#                  SSH-driven, 7-minute hard kill + capture-then-revert. Reverts.
+#   --interactive  human/GUI boot, no time limit. Reverts (nothing persists).
+#   --snapshot     boot writable to CAPTURE A NEW snapshot: on a clean guest
+#                  shutdown the modified disk/OpenCore/OVMF_VARS are saved as a
+#                  NEW immutable snapshot and `current` is repointed to it.
+#                  Existing snapshots (incl. the base) are never touched.
+#
+# Launch configuration is CLI flags / env here (this is the boot script, not
+# device/backend code) — never an env sniff inside the device.
+#
+# Credits for the historical OSX-KVM shape: Leoyzen/KVM-Opencore, thenickdude/KVM-Opencore.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# --- Configuration (override via env or flags) ----------------------------------
+DISKS_DIR="${DISKS_DIR:-$SCRIPT_DIR/disks}"
+OVMF_DIR="${OVMF_DIR:-$SCRIPT_DIR/ovmf}"
+SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-$DISKS_DIR/snapshots}"
+RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
+
+# In-tree QEMU is rebuilt every boot unless QEMU_BIN is overridden. The boot
+# script still builds both Rust products first so stale host code and stale GOP
+# ROMs do not survive a launch.
+QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
+QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
+REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
+OVMF_CODE="${OVMF_CODE:-$OVMF_DIR/OVMF_CODE_4M.fd}"
+OVMF_VARS_MASTER="${OVMF_VARS_MASTER:-$OVMF_DIR/OVMF_VARS-1920x1080.fd}"
+OPENCORE_MASTER="${OPENCORE_MASTER:-$DISKS_DIR/OpenCore.qcow2}"
+DISK_MASTER="${DISK_MASTER:-$DISKS_DIR/macos.img}"
+
+RAM="${RAM:-16G}"
+CPU_SOCKETS="${CPU_SOCKETS:-1}"
+CPU_CORES="${CPU_CORES:-16}"
+CPU_THREADS="${CPU_THREADS:-16}"
+SSH_PORT="${SSH_PORT:-2222}"
+TESTING_TIMEOUT="${TESTING_TIMEOUT:-420}" # 7-minute hard kill for testing boots
+# PIN the guest NIC MAC across reverts (load-bearing for DHCP/sshd).
+GUEST_MAC="${GUEST_MAC:-52:54:00:c9:18:27}"
+
+CPU_MODEL="${CPU_MODEL:-Skylake-Client}"
+CPU_OPTIONS="${CPU_OPTIONS:-+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsaveopt,check}"
+
+BOOT_CLASS="testing"          # testing | interactive | snapshot
+# Default to the product device: it is the whole point of this tree, and its
+# host-owned Vulkan window (REIMS_VGPU_WINDOW=1, present + input) is what a human
+# expects to see. The legacy vmware-svga console is opt-in via --device — a bare
+# `--snapshot`/`--interactive` under vmware-svga shows QEMU's gtk window with NO
+# GPU output (the guest renders only through reims-vgpu-pci), which reads as a dead
+# window. Agents pass --device explicitly anyway, so this only fixes the bare
+# human invocation.
+GFX_DEVICE="reims-vgpu-pci"  # reims-vgpu-pci | vmware-svga
+
+usage() {
+  cat <<EOF
+usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--snapshot]
+
+  --device NAME          primary VGA (default: reims-vgpu-pci)
+                         reims-vgpu-pci   product Reims VGPU (PCI thin shim → reims-vgpu),
+                                            host-owned Vulkan window (present + input)
+                         vmware-svga         legacy OSX-KVM console (QEMU gtk window;
+                                            no GPU output once the guest uses Reims vGPU)
+  --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
+  --interactive          human/GUI boot, no time limit, reverts
+  --snapshot             boot writable; a clean guest shutdown CAPTURES a new snapshot
+                         (also bootstraps the first snapshot on a fresh guest)
+
+Every boot reverts to the current snapshot:
+  $SNAPSHOTS_DIR/current -> <label>/{macos.img,OpenCore.qcow2,OVMF_VARS.fd}
+Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
+unless QEMU_BIN is set to something other than the default path.
+Env: DISKS_DIR OVMF_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
+     OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
+     CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
+     (metal|vulkan for qemu-build)
+     NET=user (SLIRP, default) | NET=none (no NIC)
+     REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
+     REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
+     QEMU_REBOOT_ACTION=exit|pause|reset
+       (default exit — guest reboot/KP-reset → QEMU quits; serial already on disk)
+     TRACE=1 — QEMU trace events → \$RUN_DIR/trace-<stamp>.log
+     TRACE_PATTERN=glob — override the default trace glob
+     TRACE_EVENTS_FILE=path — QEMU trace event list file; overrides TRACE_PATTERN
+EOF
+}
+
+set_gfx_device() {
+  GFX_DEVICE="$1"
+  case "$GFX_DEVICE" in
+    vmware-svga|reims-vgpu-pci) ;;
+    *)
+      echo "boot-x86.sh: invalid --device '$GFX_DEVICE' (vmware-svga | reims-vgpu-pci)" >&2
+      exit 64
+      ;;
+  esac
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --device)
+      shift
+      set_gfx_device "${1:-}"
+      shift
+      ;;
+    --device=*)
+      set_gfx_device "${1#--device=}"
+      shift
+      ;;
+    --testing) BOOT_CLASS="testing"; shift ;;
+    --interactive) BOOT_CLASS="interactive"; shift ;;
+    --snapshot) BOOT_CLASS="snapshot"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "boot-x86.sh: unknown arg: $1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+# --- Preflight ------------------------------------------------------------------
+die() { echo "boot-x86.sh: $*" >&2; exit 1; }
+
+clone_file() {
+  local src="$1" dst="$2"
+  if cp --reflink=auto -f "$src" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  cp -f "$src" "$dst"
+}
+
+ensure_rust_tools() {
+  if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  command -v cargo >/dev/null 2>&1 || die "cargo not found (needed to build reims-vgpu)"
+}
+
+build_reims_vgpu_efi() {
+  [ -x "$REIMS_VGPU_EFI_ROM_SCRIPT" ] || die "EFI ROM builder not executable: $REIMS_VGPU_EFI_ROM_SCRIPT"
+  echo "boot-x86.sh: building reims-vgpu-efi option ROM ..."
+  "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
+}
+
+build_reims_vgpu_standalone() {
+  local backend="$1"
+  case "$backend" in
+    metal)
+      echo "boot-x86.sh: building reims-vgpu crate (backend-metal) ..."
+      (cd "" && cargo build --release -p reims-vgpu --features backend-metal) \
+        || die "reims-vgpu build failed"
+      ;;
+    vulkan)
+      echo "boot-x86.sh: building reims-vgpu crate (backend-vulkan,host-window) ..."
+      (cd "" && cargo build --release -p reims-vgpu \
+        --no-default-features --features backend-vulkan,host-window) \
+        || die "reims-vgpu build failed"
+      ;;
+    *) die "unknown REIMS_VGPU_BACKEND: $backend (metal | vulkan)" ;;
+  esac
+}
+
+ensure_rust_tools
+build_reims_vgpu_efi
+# Product Linux x86 rail needs Vulkan. Override REIMS_VGPU_BACKEND only for an explicit
+# alternate build.
+if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
+  REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
+  echo "boot-x86.sh: building in-tree QEMU (scripts/qemu-build --target x86_64 --backend $REIMS_VGPU_BACKEND) ..."
+  "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend "$REIMS_VGPU_BACKEND" \
+    || die "qemu-build failed"
+else
+  REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
+  build_reims_vgpu_standalone "$REIMS_VGPU_BACKEND"
+fi
+[ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
+[ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
+[ -r /dev/kvm ] || die "KVM not available (/dev/kvm); is kvm loaded and are you in the kvm group?"
+
+CURRENT="$SNAPSHOTS_DIR/current"
+HAVE_SNAPSHOT=0
+if [ -e "$CURRENT" ] && \
+   [ -f "$CURRENT/macos.img" ] && \
+   [ -f "$CURRENT/OpenCore.qcow2" ] && \
+   [ -f "$CURRENT/OVMF_VARS.fd" ]; then
+  HAVE_SNAPSHOT=1
+fi
+if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+  [ "$BOOT_CLASS" = "snapshot" ] || die \
+    "no snapshot yet — bootstrap it with:  vm/boot-x86.sh --snapshot
+(boots the provisioned disk/OpenCore/OVMF_VARS writable for Setup Assistant + config; a clean
+guest shutdown then captures the first immutable snapshot. --testing/--interactive need a
+snapshot to revert to.)"
+  [ -f "$DISK_MASTER" ] || die "no provisioned disk at $DISK_MASTER"
+  [ -f "$OPENCORE_MASTER" ] || die "no OpenCore image at $OPENCORE_MASTER"
+  [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS master at $OVMF_VARS_MASTER"
+fi
+
+# --- Choose the boot disk: revert-clone, or bootstrap write-through -------------
+mkdir -p "$RUN_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+SERIAL_LOG="$RUN_DIR/serial-$STAMP.log"
+QMP_SOCK="$RUN_DIR/qmp-$STAMP.sock"
+ln -sfn "qmp-$STAMP.sock" "$RUN_DIR/qmp.sock"
+
+# --- Control-plane trace rail ---------------------------------------------------
+TRACE="${TRACE:-0}"
+TRACE_LOG=""
+TRACE_SPEC=""
+if [ "$TRACE" = "1" ]; then
+  TRACE_LOG="$RUN_DIR/trace-$STAMP.log"
+  if [ -n "${TRACE_EVENTS_FILE:-}" ]; then
+    [ -f "$TRACE_EVENTS_FILE" ] || die "TRACE_EVENTS_FILE not found: $TRACE_EVENTS_FILE"
+    TRACE_SPEC="events=$TRACE_EVENTS_FILE"
+  else
+    if [ -z "${TRACE_PATTERN:-}" ]; then
+      case "$GFX_DEVICE" in
+        reims-vgpu-pci) TRACE_PATTERN="reims_vgpu_pci_*" ;;
+        *)                TRACE_PATTERN="vmware_vga*" ;;
+      esac
+    fi
+    TRACE_SPEC="$TRACE_PATTERN"
+  fi
+fi
+
+if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+  DISK="$DISK_MASTER"
+  OPENCORE="$OPENCORE_MASTER"
+  OVMF_VARS="$OVMF_VARS_MASTER"
+  IS_CLONE=0
+  echo "boot-x86.sh: bootstrap — booting provisioned masters write-through (no snapshot yet) ..."
+else
+  DISK="$RUN_DIR/macos-$STAMP.img"
+  OPENCORE="$RUN_DIR/OpenCore-$STAMP.qcow2"
+  OVMF_VARS="$RUN_DIR/OVMF_VARS-$STAMP.fd"
+  IS_CLONE=1
+  echo "boot-x86.sh: reverting to snapshot '$(readlink "$CURRENT" 2>/dev/null || echo current)' ..."
+  clone_file "$CURRENT/macos.img" "$DISK"
+  clone_file "$CURRENT/OpenCore.qcow2" "$OPENCORE"
+  clone_file "$CURRENT/OVMF_VARS.fd" "$OVMF_VARS"
+  chmod u+w "$DISK" "$OPENCORE" "$OVMF_VARS"
+fi
+
+# --- Network -------------------------------------------------------------------
+# SLIRP user-mode NAT; ipv6=off avoids a phantom IPv6 default that macOS prefers.
+NET="${NET:-user}"
+case "$NET" in
+  user) NETDEV="user,id=net0,ipv6=off,hostfwd=tcp::${SSH_PORT}-:22" ;;
+  none) NETDEV="" ;;
+  *) die "unknown NET: $NET (user | none)" ;;
+esac
+
+# Product Reims VGPU: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init).
+if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
+  if [ "${CPU_THREADS}" -gt 8 ] 2>/dev/null; then
+    echo "boot-x86.sh: reims-vgpu-pci — capping SMP at 8 (was threads=$CPU_THREADS cores=$CPU_CORES)"
+    CPU_THREADS=8
+    CPU_CORES=8
+    CPU_SOCKETS=1
+  fi
+fi
+
+# --- Build the QEMU command line ------------------------------------------------
+# q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
+QEMU_ARGS=(
+  -enable-kvm
+  -m "$RAM"
+  -cpu "${CPU_MODEL},-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
+  -machine q35
+  -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
+  -device qemu-xhci,id=xhci
+  -device usb-kbd,bus=xhci.0
+  -device usb-tablet,bus=xhci.0
+  -device usb-ehci,id=ehci
+  -device isa-applesmc,osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
+  -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
+  -drive "if=pflash,format=raw,file=$OVMF_VARS"
+  -smbios type=2
+  -device ich9-intel-hda
+  -device hda-duplex
+  -device ich9-ahci,id=sata
+  -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
+  -device ide-hd,bus=sata.2,drive=OpenCoreBoot
+  -drive "id=MacHDD,if=none,format=qcow2,file=$DISK"
+  -device ide-hd,bus=sata.4,drive=MacHDD
+  -qmp "unix:$QMP_SOCK,server=on,wait=off"
+)
+
+# Guest KP often reboots (even with OpenCore DB_HALT). Default exit so the GTK
+# window disappears and serial stays under vm/disks/run/serial-*.log.
+QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-exit}"
+case "$QEMU_REBOOT_ACTION" in
+  exit)
+    QEMU_ARGS+=(-action reboot=shutdown)
+    ;;
+  pause)
+    QEMU_ARGS+=(-action reboot=shutdown,shutdown=pause)
+    ;;
+  reset)
+    ;;
+  *)
+    die "unknown QEMU_REBOOT_ACTION: $QEMU_REBOOT_ACTION (exit|pause|reset)"
+    ;;
+esac
+
+# Display attach.
+case "$GFX_DEVICE" in
+  reims-vgpu-pci)
+    # Default: conventional pci-bridge secondary bus (IOFBIntegrated=No; OVMF maps BAR0).
+    # Override: REIMS_VGPU_PCI_ATTACH=bus0 (root bus; IOFBIntegrated=Yes).
+    REIMS_VGPU_PCI_ATTACH="${REIMS_VGPU_PCI_ATTACH:-pcibridge}"
+    QEMU_ARGS+=(-vga none)
+    # UEFI GOP on this same PCI device (BAR1 + option ROM) — never a second display.
+    # Build: crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh
+    if [ -z "${REIMS_VGPU_GOP_ROM+x}" ]; then
+      _reims_vgpu_gop_default="$REPO_ROOT/crates/reims-vgpu-efi/out/reims-vgpu-gop.rom"
+      if [ -f "$_reims_vgpu_gop_default" ]; then
+        REIMS_VGPU_GOP_ROM="$_reims_vgpu_gop_default"
+      fi
+    fi
+    _reims_vgpu_dev="reims-vgpu-pci,id=reimsvgpu"
+    if [ -n "${REIMS_VGPU_GOP_ROM:-}" ] && [ -f "$REIMS_VGPU_GOP_ROM" ]; then
+      _reims_vgpu_dev="${_reims_vgpu_dev},romfile=${REIMS_VGPU_GOP_ROM},rombar=1"
+      echo "boot-x86.sh: reims-vgpu-pci UEFI GOP romfile=$REIMS_VGPU_GOP_ROM"
+    fi
+    case "$REIMS_VGPU_PCI_ATTACH" in
+      bus0)
+        QEMU_ARGS+=(-device "${_reims_vgpu_dev},bus=pcie.0,addr=07.0")
+        ;;
+      pcibridge)
+        QEMU_ARGS+=(
+          -device pci-bridge,chassis_nr=5,id=pci.5,bus=pcie.0,addr=1e.0
+          -device "${_reims_vgpu_dev},bus=pci.5,addr=00.0"
+        )
+        ;;
+      *)
+        die "unknown REIMS_VGPU_PCI_ATTACH: $REIMS_VGPU_PCI_ATTACH (pcibridge|bus0)"
+        ;;
+    esac
+    ;;
+  *)
+    QEMU_ARGS+=(-device "$GFX_DEVICE")
+    ;;
+esac
+
+if [ -n "$TRACE_LOG" ]; then
+  QEMU_ARGS+=(-trace "$TRACE_SPEC" -D "$TRACE_LOG")
+fi
+if [ -n "$NETDEV" ]; then
+  QEMU_ARGS+=(-netdev "$NETDEV" -device "virtio-net-pci,netdev=net0,id=net0,mac=$GUEST_MAC")
+else
+  QEMU_ARGS+=(-nic none)
+fi
+
+echo "boot-x86.sh: device=$GFX_DEVICE class=$BOOT_CLASS cpu=$CPU_MODEL smp=${CPU_THREADS},cores=${CPU_CORES} mem=$RAM reboot=${QEMU_REBOOT_ACTION}"
+echo "boot-x86.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp → $QMP_SOCK"
+[ -n "$TRACE_LOG" ] && echo "boot-x86.sh: trace → $TRACE_LOG ($TRACE_SPEC)"
+
+discard_clone() {
+  if [ "${IS_CLONE:-1}" -eq 1 ]; then
+    rm -f "$DISK" "$OPENCORE" "$OVMF_VARS"
+  fi
+  rm -f "$QMP_SOCK" "$RUN_DIR/qmp.sock"
+}
+
+promote_to_snapshot() {
+  local label new_dir
+  if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+    label="$(date +%Y-%m-%d-%H%M%S)-base"
+  else
+    label="$(date +%Y-%m-%d-%H%M%S)-snap"
+  fi
+  new_dir="$SNAPSHOTS_DIR/$label"
+  echo "boot-x86.sh: capturing new immutable snapshot '$label' ..."
+  mkdir -p "$new_dir"
+  clone_file "$DISK" "$new_dir/macos.img"
+  clone_file "$OPENCORE" "$new_dir/OpenCore.qcow2"
+  clone_file "$OVMF_VARS" "$new_dir/OVMF_VARS.fd"
+  chmod 444 "$new_dir/macos.img" "$new_dir/OpenCore.qcow2" "$new_dir/OVMF_VARS.fd"
+  ln -sfn "$label" "$CURRENT"
+  discard_clone
+  echo "boot-x86.sh: snapshot '$label' captured; current -> $label"
+}
+
+# --- Interactive / snapshot: foreground GUI, no time limit ----------------------
+# Display backend: the supported reims-vgpu-pci path is the custom Rust host
+# window (REIMS_VGPU_WINDOW=1), so QEMU defaults to `-display none` and owns no UI
+# window. The older QEMU `gtk,gl=on` display path is deprecated for product work;
+# keep it only for explicit archaeology / A/B debugging, not as an fps lever.
+# Host-owned window is the default for reims-vgpu-pci: the
+# staticlib opens its own winit + Vulkan window (present + input) and QEMU owns
+# no window. Opt out with REIMS_VGPU_WINDOW=0 (falls back to QEMU's display). vmware-svga
+# has no host window, so it is never defaulted on.
+if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
+  REIMS_VGPU_WINDOW="${REIMS_VGPU_WINDOW:-1}"
+fi
+# Normalize to presence semantics (the C shim reads getenv): unset = off,
+# exported = on. 0/no/off/false disable; anything else enables.
+case "${REIMS_VGPU_WINDOW:-}" in
+  ''|0|no|off|false) unset REIMS_VGPU_WINDOW ;;
+  *) export REIMS_VGPU_WINDOW=1 ;;
+esac
+
+if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
+  REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-none}"
+  # winit (in the staticlib) needs a display connection to open the window, and
+  # QEMU inherits these from this script's environment. When launched from a
+  # minimal/agent shell they are often unset, so fall back to this host's known
+  # session values (only when absent) and export them. XAUTHORITY carries a
+  # per-login random suffix; override any of these in the environment if yours
+  # differ (e.g. a different seat, DISPLAY, or Wayland socket).
+  : "${XDG_RUNTIME_DIR:=/run/user/1000}"
+  : "${WAYLAND_DISPLAY:=wayland-0}"
+  : "${DISPLAY:=:0}"
+  : "${XAUTHORITY:=/run/user/1000/xauth_Kmhxwx}"
+  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY XAUTHORITY
+else
+  REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
+fi
+
+if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "snapshot" ]; then
+  # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
+  QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
+  rc=0
+  "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
+  if [ "$BOOT_CLASS" = "snapshot" ] && [ "$rc" -eq 0 ]; then
+    # mon:stdio does not fill SERIAL_LOG; promote on clean QEMU exit.
+    promote_to_snapshot
+  else
+    [ "$BOOT_CLASS" = "snapshot" ] && echo "boot-x86.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
+    discard_clone
+  fi
+  exit "$rc"
+fi
+
+# --- Testing: background GUI + hard kill + capture-then-revert -------------------
+QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial "file:$SERIAL_LOG")
+
+# Best-effort QMP register dump. Must never block hard-kill more than
+# QMP_DUMP_TIMEOUT seconds (default 3). Unbounded `nc -U` hung testing boots
+# after the 7-minute timer (kill was unreachable behind a wedged QMP).
+QMP_DUMP_TIMEOUT="${QMP_DUMP_TIMEOUT:-3}"
+
+qmp_dump_registers() {
+  local out="$RUN_DIR/registers-$STAMP.txt"
+  local watchdog_pid="" nc_pid=""
+  if [ ! -S "$QMP_SOCK" ] || ! command -v nc >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    # GNU coreutils timeout (Linux product rail).
+    timeout --signal=KILL "${QMP_DUMP_TIMEOUT}s" sh -c "
+      {
+        printf '%s\\n' '{\"execute\":\"qmp_capabilities\"}'
+        printf '%s\\n' '{\"execute\":\"human-monitor-command\",\"arguments\":{\"command-line\":\"info registers -a\"}}'
+        sleep 0.3
+      } | nc -U \"\$1\"
+    " sh "$QMP_SOCK" >"$out" 2>/dev/null || true
+    return 0
+  fi
+  # Portable fallback (macOS / no timeout): background nc + watchdog kill.
+  {
+    printf '{"execute":"qmp_capabilities"}\n'
+    printf '{"execute":"human-monitor-command","arguments":{"command-line":"info registers -a"}}\n'
+    sleep 0.3
+  } | nc -U "$QMP_SOCK" >"$out" 2>/dev/null &
+  nc_pid=$!
+  (
+    sleep "$QMP_DUMP_TIMEOUT"
+    kill -9 "$nc_pid" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+  wait "$nc_pid" 2>/dev/null || true
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+}
+
+kill_qemu() {
+  if [ -z "${QEMU_PID:-}" ]; then
+    return 0
+  fi
+  if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+    return 0
+  fi
+  echo "boot-x86.sh: killing qemu pid=$QEMU_PID"
+  kill -TERM "$QEMU_PID" 2>/dev/null || true
+  sleep 2
+  if kill -0 "$QEMU_PID" 2>/dev/null; then
+    kill -KILL "$QEMU_PID" 2>/dev/null || true
+  fi
+  # Reap so wait loops exit cleanly.
+  wait "$QEMU_PID" 2>/dev/null || true
+}
+
+capture_then_revert() {
+  local reason="$1"
+  echo "boot-x86.sh: capture-then-revert ($reason)"
+  # Dump first (bounded), then always kill — never gate kill on QMP success.
+  qmp_dump_registers
+  kill_qemu
+  discard_clone
+  echo "boot-x86.sh: reverted (clone discarded); evidence in $RUN_DIR (serial-$STAMP.log)"
+}
+
+"$QEMU_BIN" "${QEMU_ARGS[@]}" &
+QEMU_PID=$!
+trap 'capture_then_revert signal; exit 130' INT TERM
+
+elapsed=0
+while kill -0 "$QEMU_PID" 2>/dev/null; do
+  if [ "$elapsed" -ge "$TESTING_TIMEOUT" ]; then
+    capture_then_revert "timeout ${TESTING_TIMEOUT}s — wedge verdict"
+    exit 124
+  fi
+  sleep 5
+  elapsed=$((elapsed + 5))
+done
+
+wait "$QEMU_PID" 2>/dev/null || true
+capture_then_revert "qemu exited"

@@ -1,0 +1,321 @@
+/* reims_vgpu_qemu_abi.h — versioned C ABI for reims-vgpu staticlib.
+ *
+ * QEMU thin shims include this header:
+ *   - hw/display/reims-vgpu-mmio.c (sysbus, arm/vmapple)
+ *   - hw/display/reims-vgpu-pci.c  (PCI, x86 Tahoe)
+ *
+ * C owns only QOM/realize, MemoryRegionOps, IRQ/console/BH, HostOps memory
+ * callbacks. All protocol state, FIFO drain, decode, mapper, and GPU work live
+ * in the staticlib.
+ *
+ * Opaque handles only; no Rust types. ABI version must match
+ * REIMS_VGPU_QEMU_ABI_VERSION in the staticlib.
+ */
+#ifndef REIMS_VGPU_QEMU_ABI_H
+#define REIMS_VGPU_QEMU_ABI_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* v11: reims_vgpu_qemu_window_run_main — run the host window as QEMU's process-main
+ *      UI loop (required by AppKit on Darwin).
+ * v10: ReimsVgpuHostOps.map_pages_stable — whether a map_pages view is a stable
+ *      guest-RAM alias (x86 PCI: direct RAMBlock pointer, unmap is a no-op) or
+ *      a transient mapping (arm sysbus: mach_vm_remap). Gates GPU-direct
+ *      writeback's cached host-pointer imports.
+ * v9: host-window lifecycle + early FB — reims_vgpu_qemu_window_stop (close + join on
+ *     teardown), reims_vgpu_qemu_window_set_early_fb (register BAR1 GOP so the window
+ *     shows early boot), and the WindowClosed HostAction (11) the window emits
+ *     on a UI close so the shim requests a VM shutdown.
+ * v8: reims_vgpu_qemu_window_start (host-owned presentation window; winit +
+ *     VkSurfaceKHR). Always linkable; returns REIMS_VGPU_QEMU_ERR_STATE when the
+ *     staticlib lacks the host-window feature — C then keeps QEMU's display.
+ * v7: ReimsVgpuHostOps.notify_actions (schedule the HostAction-delivery BH from any
+ *     thread so IRQ pulses reach the guest mid-drain — ack fast).
+ * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
+ * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
+#define REIMS_VGPU_QEMU_ABI_VERSION 11u
+
+#define REIMS_VGPU_QEMU_OK 0
+#define REIMS_VGPU_QEMU_ERR_ARGS 1
+#define REIMS_VGPU_QEMU_ERR_STATE 2
+#define REIMS_VGPU_QEMU_ERR_PANIC 3
+#define REIMS_VGPU_QEMU_EMPTY 4
+
+/* HostAction kinds — match Rust HostActionKind / ReimsVgpuHostActionKind. */
+#define REIMS_VGPU_HOST_ACTION_NONE 0u
+#define REIMS_VGPU_HOST_ACTION_IRQ_GFX 1u
+#define REIMS_VGPU_HOST_ACTION_IRQ_IOSFC 2u
+#define REIMS_VGPU_HOST_ACTION_SCANOUT 3u
+#define REIMS_VGPU_HOST_ACTION_CURSOR 4u
+#define REIMS_VGPU_HOST_ACTION_TRACE 5u
+#define REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH 6u
+/*
+ * Deprecated pre-host-window QEMU GL/dmabuf scanout action. The supported
+ * product display path is the Rust host window/direct-present route; this wire
+ * value remains allocated only for compatibility with historical probes.
+ */
+#define REIMS_VGPU_HOST_ACTION_SCANOUT_GL 7u
+/*
+ * Host-owned-window input (see Rust runtime::input / kb host-window). Rust maps
+ * the window's platform events into these neutral wire forms; the shim replays
+ * them through qemu_input_*, which owns the QEMU-side keycode/button ABI.
+ *
+ * INPUT_KEY:            a0 = Linux evdev keycode (KEY_*), a1 = 1 down / 0 up.
+ *                       -> qemu_input_event_send_key_linux (QEMU owns evdev->qcode).
+ * INPUT_POINTER_MOVE:   a0 = x px, a1 = y px, a2 = surface width, a3 = height.
+ *                       Absolute (usb-tablet); shim scales via qemu_input_queue_abs.
+ * INPUT_POINTER_BUTTON: a0 = neutral Reims VGPU button code (ReimsVgpuButton), a1 = 1/0.
+ *                       Wheel notches arrive as a down+up pair; shim maps the
+ *                       code to QEMU InputButton.
+ */
+#define REIMS_VGPU_HOST_ACTION_INPUT_KEY 8u
+#define REIMS_VGPU_HOST_ACTION_INPUT_POINTER_MOVE 9u
+#define REIMS_VGPU_HOST_ACTION_INPUT_POINTER_BUTTON 10u
+/*
+ * The host-owned window was closed through its UI. No payload; the shim turns
+ * it into qemu_system_shutdown_request — the window is the VM's display, so
+ * closing it closes the machine.
+ */
+#define REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED 11u
+
+/* Neutral pointer/wheel button codes (ReimsVgpuButton) carried in INPUT_POINTER_BUTTON
+ * a0. Stable wire contract owned by Rust; the shim maps to QEMU InputButton. */
+#define REIMS_VGPU_BUTTON_LEFT 0u
+#define REIMS_VGPU_BUTTON_MIDDLE 1u
+#define REIMS_VGPU_BUTTON_RIGHT 2u
+#define REIMS_VGPU_BUTTON_WHEEL_UP 3u
+#define REIMS_VGPU_BUTTON_WHEEL_DOWN 4u
+#define REIMS_VGPU_BUTTON_SIDE 5u
+#define REIMS_VGPU_BUTTON_EXTRA 6u
+#define REIMS_VGPU_BUTTON_WHEEL_LEFT 7u
+#define REIMS_VGPU_BUTTON_WHEEL_RIGHT 8u
+
+/*
+ * Host services QEMU provides to Rust (apple-gfx raiseInterrupt / readMemory
+ * equivalents). QEMU owns the function pointers and ctx for the device life.
+ */
+typedef struct ReimsVgpuHostOps {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    void *ctx;
+    /* 0 = success. */
+    int (*read_gpa)(void *ctx, uint64_t gpa, uint8_t *buf, size_t len);
+    int (*write_gpa)(void *ctx, uint64_t gpa, const uint8_t *buf, size_t len);
+    uint64_t (*mono_ns)(void *ctx);
+    /* Safe from any thread; schedules a oneshot main-loop BH. */
+    void (*schedule_bh)(void *ctx);
+    /* Guest kernel VA read (cpu_memory_rw_debug). 0 = success. */
+    int (*read_kva)(void *ctx, uint64_t kva, uint8_t *buf, size_t len);
+    /* Guest CPU X-register read (iosfc mapper directed handoff). 0 = success. */
+    int (*read_xreg)(void *ctx, uint32_t index, uint64_t *out);
+    /*
+     * Build one contiguous host-VA view of `count` guest pages (each
+     * REIMS_VGPU_GUEST_PAGE_SIZE, page-aligned GPAs into guest RAM) via
+     * mach_vm_remap — the ParavirtualizedGraphics mapMemory model: the view
+     * aliases guest RAM, so CPU/GPU writes through it *are* guest memory.
+     * 0 = success, fills *out_ptr (view length = count * page size).
+     */
+    int (*map_pages)(void *ctx, const uint64_t *gpas, size_t count,
+                     void **out_ptr);
+    /*
+     * Release a transient view from map_pages (len = count * page size).
+     * No-op when map_pages_stable is 1.
+     */
+    void (*unmap_pages)(void *ctx, void *ptr, size_t len);
+    /*
+     * 1 if `gpa` translates to guest RAM (MemoryRegion is_ram), 0 otherwise.
+     * Mapper page-entry accept and multi-import fail closed on non-RAM PFNs.
+     */
+    int (*is_ram_gpa)(void *ctx, uint64_t gpa);
+    /*
+     * Safe from any thread; schedules the HostAction-delivery BH (the queue
+     * drained via reims_vgpu_qemu_device_pop_action). Distinct from schedule_bh,
+     * which wakes the ordered drain worker: prompt actions (IRQ pulses,
+     * cursor moves) must reach the guest while a drain tranche is still
+     * running, not after it.
+     */
+    void (*notify_actions)(void *ctx);
+    /*
+     * 1 if map_pages returns a *stable* alias of guest RAM: the pointer stays
+     * valid for the device lifetime, unmap_pages is a no-op, and the address
+     * is never recycled for other memory. 0 if the view is a transient mapping
+     * that unmap_pages tears down.
+     *
+     * Load-bearing for GPU-direct writeback: only a stable alias may be
+     * retained in a cached VK_EXT_external_memory_host import window. Caching
+     * an import of a transient view leaves the GPU writing into an address
+     * range the host has since unmapped or reused. Default (absent field /
+     * older shim) must be treated as 0.
+     */
+    int map_pages_stable;
+} ReimsVgpuHostOps;
+
+/* Default guest page size for arm64e / vmapple (create may override). */
+#define REIMS_VGPU_GUEST_PAGE_SIZE 16384u
+#define REIMS_VGPU_GUEST_PAGE_SHIFT_ARM64E 14u
+#define REIMS_VGPU_GUEST_PAGE_SHIFT_X86_64 12u
+#define REIMS_VGPU_GUEST_PAGE_SIZE_X86_64 4096u
+
+/* Action for the QEMU BH after drain (IRQ pulse, scanout, cursor). */
+typedef struct ReimsVgpuHostAction {
+    uint32_t kind;
+    uint64_t a0;
+    uint64_t a1;
+    uint64_t a2;
+    uint64_t a3;
+} ReimsVgpuHostAction;
+
+typedef struct ReimsVgpuQemuCreateInfo {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    /* Nullable only for pure unit tests; product always passes HostOps. */
+    const ReimsVgpuHostOps *host_ops;
+    /*
+     * Guest page shift for PFN↔GPA (and related wire math).
+     * Must be set explicitly: 14 = arm64e (16 KiB), 12 = x86_64 Tahoe (4 KiB).
+     * 0 is invalid (no default).
+     */
+    uint32_t guest_page_shift;
+} ReimsVgpuQemuCreateInfo;
+
+typedef struct ReimsVgpuQemuDevice {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint64_t handle;
+} ReimsVgpuQemuDevice;
+
+int reims_vgpu_qemu_device_create(const ReimsVgpuQemuCreateInfo *info, ReimsVgpuQemuDevice *out);
+int reims_vgpu_qemu_device_reset(uint64_t handle);
+int reims_vgpu_qemu_device_destroy(uint64_t handle);
+
+/*
+ * Start the host-owned presentation window (winit + VkSurfaceKHR) for this
+ * device — replaces QEMU's own display. The drain publishes each finished
+ * present frame to it; window input (keys/pointer/wheel) is injected through
+ * the neutral Input* prompt-action rail (qemu_input_*). width/height seed the
+ * initial size (0 → boot EFI geometry). Idempotent.
+ *
+ * REIMS_VGPU_QEMU_OK on success; REIMS_VGPU_QEMU_ERR_STATE when the staticlib was built
+ * without the host-window feature (caller keeps QEMU's display) or the handle
+ * is unknown. Call once at realize, gated on REIMS_VGPU_WINDOW; pair with -display none.
+ */
+int reims_vgpu_qemu_window_start(uint64_t handle, uint32_t width, uint32_t height);
+
+/*
+ * Run the main-thread-owned host window until UI close or backend stop. Call on
+ * the same process main thread as reims_vgpu_qemu_window_start.
+ */
+int reims_vgpu_qemu_window_run_main(uint64_t handle);
+
+/*
+ * Stop the host-owned window during VM teardown. Sets the stop flag, waits for
+ * the event loop to exit, and ensures the window's Vulkan objects tear down
+ * before this returns. Call it before reims_vgpu_qemu_device_destroy and process/driver
+ * teardown. Idempotent; REIMS_VGPU_QEMU_OK even with no window.
+ */
+int reims_vgpu_qemu_window_stop(uint64_t handle);
+
+/*
+ * Register the early-boot framebuffer (BAR1 GOP host RAM) so the window shows
+ * UEFI/OpenCore/boot.efi output before the product present path latches. ptr
+ * must stay valid (>= stride*height bytes) for the device lifetime — pass the
+ * BAR1 RAMBlock host pointer. Tight BGRA8 assumed. Call once at realize after
+ * reims_vgpu_qemu_window_start.
+ */
+int reims_vgpu_qemu_window_set_early_fb(uint64_t handle, const uint8_t *ptr,
+                                 uint32_t stride, uint32_t width,
+                                 uint32_t height);
+int reims_vgpu_qemu_backend_name(char *buf, size_t buf_len);
+uint32_t reims_vgpu_qemu_abi_version(void);
+
+int reims_vgpu_qemu_gfx_read(uint64_t handle, uint64_t offset, uint32_t size,
+                      uint64_t *out_val);
+int reims_vgpu_qemu_gfx_write(uint64_t handle, uint64_t offset, uint64_t data,
+                       uint32_t size);
+int reims_vgpu_qemu_iosfc_read(uint64_t handle, uint64_t offset, uint32_t size,
+                        uint64_t *out_val);
+int reims_vgpu_qemu_iosfc_write(uint64_t handle, uint64_t offset, uint64_t data,
+                         uint32_t size);
+
+/* BH body: drain pending FIFOs (uses HostOps GPA). Then pop actions. */
+int reims_vgpu_qemu_device_drain(uint64_t handle);
+/* gfx_update tick: re-drive display ONLINE after guest enable() (pending+IRQ). */
+int reims_vgpu_qemu_device_poll(uint64_t handle);
+/* Returns REIMS_VGPU_QEMU_OK + fills *out, or REIMS_VGPU_QEMU_EMPTY. */
+int reims_vgpu_qemu_device_pop_action(uint64_t handle, ReimsVgpuHostAction *out);
+
+/*
+ * 1 if guest crossed first product present boundary (DisplaySwap /
+ * frame_flush_seen). BAR1 UEFI GOP must keep driving the host console until
+ * then — do not cut over on the first early logo writeback.
+ * REIMS_VGPU_QEMU_OK fills *out_seen with 0 or 1.
+ */
+int reims_vgpu_qemu_present_boundary_seen(uint64_t handle, uint32_t *out_seen);
+
+/*
+ * Pre-boundary (logo + progress pill) scanout target for gfx_update re-pull.
+ * REIMS_VGPU_QEMU_OK fills outs; REIMS_VGPU_QEMU_EMPTY after first present boundary or when
+ * no compositor front mapping has been written yet.
+ */
+int reims_vgpu_qemu_early_scanout_target(uint64_t handle, uint32_t *out_mapping_id,
+                                  uint32_t *out_width, uint32_t *out_height,
+                                  uint32_t *out_generation);
+
+/*
+ * Fill a QEMU DisplaySurface (BGRA8, dst_stride bytes/row) from the guest
+ * mapping named by mapping_id — or the EFI FB / black clear fallback.
+ * generation is HostAction.a3 (0 = always paint). REIMS_VGPU_QEMU_EMPTY = unchanged.
+ * C owns the surface; Rust owns the guest-side resolve + format convert.
+ */
+int reims_vgpu_qemu_scanout_copy(uint64_t handle, uint32_t mapping_id, uint8_t *dst,
+                          uint32_t dst_stride, uint32_t width, uint32_t height,
+                          uint32_t generation);
+
+/*
+ * GPU-copy a completed resident into an aligned stable QEMU display buffer.
+ * The buffer remains valid until device teardown because Vulkan caches the
+ * external-host-memory import. OK = copied, EMPTY = hold prior, ERR_STATE =
+ * direct path unavailable and the current CPU snapshot may be used.
+ */
+int reims_vgpu_qemu_scanout_gpu_copy(uint64_t handle, uint32_t mapping_id, void *dst,
+                              uint64_t dst_len, uint32_t dst_stride,
+                              uint32_t width, uint32_t height,
+                              uint32_t generation);
+int reims_vgpu_qemu_scanout_host_alignment(uint64_t handle, uint64_t *out_alignment);
+
+/*
+ * Pre-boundary early console: guest-programmed EFI FB (MMIO 0x1210 start +
+ * 0x1228 stride), contract path for boot.efi / kernel console after it leaves
+ * BAR1 linear GOP (serial: "console relocated to 0x…").
+ *
+ * REIMS_VGPU_QEMU_OK: out_gpa and out_stride filled; copy into dst succeeds.
+ * REIMS_VGPU_QEMU_EMPTY: efi_fb_start == 0 — C should fall back to BAR1 GOP RAM.
+ */
+int reims_vgpu_qemu_efi_console_copy(uint64_t handle, uint8_t *dst, uint32_t dst_stride,
+                              uint32_t width, uint32_t height, uint64_t *out_gpa,
+                              uint32_t *out_stride);
+
+typedef struct ReimsVgpuCursorGlyphInfo {
+    uint32_t width;
+    uint32_t height;
+    uint32_t hot_x;
+    uint32_t hot_y;
+    uint32_t pixel_count;
+} ReimsVgpuCursorGlyphInfo;
+
+/* Glyph ready in Rust; C builds QEMUCursor. EMPTY when no glyph. */
+int reims_vgpu_qemu_cursor_glyph_info(uint64_t handle, ReimsVgpuCursorGlyphInfo *out);
+/* out_argb: QEMUCursor 0xAARRGGBB, capacity count pixels. */
+int reims_vgpu_qemu_cursor_glyph_copy(uint64_t handle, uint32_t *out_argb,
+                               size_t count);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* REIMS_VGPU_QEMU_ABI_H */

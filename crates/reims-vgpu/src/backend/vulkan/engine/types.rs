@@ -1,0 +1,1380 @@
+//! Draw request surface for the internal Vulkan engine (v1 §1.2 surface).
+//!
+//! Field meanings match the historical Metal→Vulkan product draw seam
+//! (viewport flip, blend, Load seed, stage-in attributes, SSBOs, sampled images).
+
+use ash::vk;
+
+use crate::backend::vulkan::translate;
+
+/// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrawError {
+    /// Init / ICD / device selection failed (negative-cached).
+    Init(super::init_decline::InitDecline),
+    /// Understood but declined — a capability this device or this engine does
+    /// not have. Typed so each distinct check carries its own `reason=` slug;
+    /// see [`super::reason::DrawReason`].
+    Unsupported(super::reason::DrawReason),
+    /// Engine façade or host-window presenter state changed under a valid
+    /// request, or a façade input cannot describe a scanout.
+    Facade(super::facade_decline::EngineFacadeDecline),
+    /// A host-pointer import violated its non-driver preconditions.
+    HostImport(super::host_import_decline::HostImportDecline),
+    /// Runtime pipeline/MTLB/AIR preparation failed before an engine request
+    /// could be validated.
+    DrawPreparation(super::draw_preparation::DrawPreparationDecline),
+    /// Draw request rejected before context creation or GPU work.
+    DrawValidation(super::draw_validation::DrawValidationDecline),
+    /// A validated draw request failed while materializing execution state.
+    DrawExecution(super::draw_execution::DrawExecutionDecline),
+    /// Compute request rejected before context creation or GPU work.
+    ComputeValidation(super::compute_validation::ComputeValidationDecline),
+    /// A validated compute request lost or mismatched resident execution state.
+    ComputeExecution(super::compute_execution::ComputeExecutionDecline),
+    /// A host-present request that violated the guest-mapping layout contract.
+    /// See [`super::reason::HostPresentDecline`].
+    Present(super::reason::HostPresentDecline),
+    /// A specific Vulkan call that returned an error, typed by *(rail,
+    /// operation)*. Former `Vulkan(String)` sites move here so the log names
+    /// which call refused.
+    /// See [`super::vk_call::VkCall`].
+    VkCall(super::vk_call::VkCall),
+    /// A `dup(2)` of an export dmabuf fd failed — a POSIX syscall failure
+    /// carrying an errno, not a `vk::Result`, so it is not [`Self::VkCall`].
+    /// See [`super::fd_dup::FdDupDecline`].
+    FdDup(super::fd_dup::FdDupDecline),
+    /// The image-memory slab rejected an impossible allocation/invariant
+    /// without pretending the driver returned OOM.
+    Slab(super::slab::SlabDecline),
+    /// Fence wait timed out.
+    FenceTimeout,
+    /// Device lost and recreate budget exhausted (or mid-draw loss).
+    DeviceLost(super::device_lost::DeviceLostDecline),
+}
+
+impl std::fmt::Display for DrawError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Init(d) => write!(f, "vk_engine_init: {d}"),
+            Self::Unsupported(r) => write!(f, "vk_engine_unsupported: {r}"),
+            Self::Facade(d) => write!(f, "vk_engine_facade: {d}"),
+            Self::HostImport(d) => write!(f, "vk_engine_host_import: {d}"),
+            Self::DrawPreparation(d) => write!(f, "vk_engine_draw_preparation: {d}"),
+            Self::DrawValidation(d) => write!(f, "vk_engine_draw_validation: {d}"),
+            Self::DrawExecution(d) => write!(f, "vk_engine_draw_execution: {d}"),
+            Self::ComputeValidation(d) => write!(f, "vk_engine_compute_validation: {d}"),
+            Self::ComputeExecution(d) => write!(f, "vk_engine_compute_execution: {d}"),
+            Self::Present(d) => write!(f, "vk_engine_present: {d}"),
+            Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
+            Self::FdDup(d) => write!(f, "vk_engine_fd_dup: {d}"),
+            Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
+            Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
+            Self::DeviceLost(d) => write!(f, "vk_engine_device_lost: {d}"),
+        }
+    }
+}
+
+impl std::error::Error for DrawError {}
+
+impl crate::observe::Decline for DrawError {
+    /// Every variant delegates to the typed decline that names its check, so
+    /// one event has one reason at every layer.
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Present(d) => d.slug(),
+            Self::Unsupported(r) => r.slug(),
+            // Delegates like the two typed variants above: the call names itself,
+            // so one event has one name whether it is read here or on `VkCall`.
+            Self::VkCall(c) => c.slug(),
+            Self::FdDup(d) => d.slug(),
+            Self::Slab(d) => d.slug(),
+            Self::FenceTimeout => "vk_engine_fence_timeout",
+            Self::Init(d) => d.slug(),
+            Self::Facade(d) => d.slug(),
+            Self::HostImport(d) => d.slug(),
+            Self::DrawPreparation(d) => d.slug(),
+            Self::DrawValidation(d) => d.slug(),
+            Self::DrawExecution(d) => d.slug(),
+            Self::ComputeValidation(d) => d.slug(),
+            Self::ComputeExecution(d) => d.slug(),
+            Self::DeviceLost(d) => d.slug(),
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Present(d) => d.fields(),
+            Self::Unsupported(r) => r.fields(),
+            Self::VkCall(c) => c.fields(),
+            Self::FdDup(d) => d.fields(),
+            Self::Slab(d) => d.fields(),
+            Self::Init(d) => d.fields(),
+            Self::DrawValidation(d) => d.fields(),
+            Self::DrawExecution(d) => d.fields(),
+            Self::ComputeValidation(d) => d.fields(),
+            Self::ComputeExecution(d) => d.fields(),
+            Self::DeviceLost(d) => d.fields(),
+            Self::FenceTimeout => Vec::new(),
+            Self::Facade(d) => d.fields(),
+            Self::HostImport(d) => d.fields(),
+            Self::DrawPreparation(d) => d.fields(),
+        }
+    }
+}
+
+impl From<DrawError> for String {
+    fn from(e: DrawError) -> Self {
+        e.to_string()
+    }
+}
+
+/// Face-culling mode (Metal `MTLCullMode`). The macOS 2D compositor issues no
+/// draw that binds a cull mode, so `None` (the default) keeps the whole UI path
+/// byte-identical to the pre-cull engine — the raster state stays `CULL_NONE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
+pub enum CullMode {
+    #[default]
+    None,
+    Front,
+    Back,
+}
+
+/// Per-draw depth-test state (Metal `MTLDepthStencilState` + depth attachment).
+/// When a `DrawRequest` carries `Some`, the engine attaches a transient
+/// D32_SFLOAT depth buffer to the pass and enables the depth test; `None` (the
+/// default) means no depth attachment at all — byte-identical to the pre-depth
+/// engine, which is the whole macOS 2D UI path (it binds no depth-stencil).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthState {
+    /// `false` disables the test (draw always passes) — used only when a bound
+    /// depth-stencil is non-trivial in some *other* way (e.g. a write with
+    /// compare Always); the plain trivial state never reaches here.
+    pub test_enable: bool,
+    pub write_enable: bool,
+    /// Metal `MTLCompareFunction` — the same enum Metal uses for sampler
+    /// compare, hence the shared type (values Never=0 .. Always=7).
+    pub compare: SamplerCompareFunction,
+    /// Depth clear value (Metal `MTLRenderPassDepthAttachment.clearDepth`).
+    pub clear_value: f32,
+    /// `true` ⇒ LOAD the existing depth resident (multi-pass); `false` ⇒ CLEAR
+    /// to `clear_value`. The transient-depth increment only supports CLEAR.
+    pub load: bool,
+    /// `Some` when the bound `MTLDepthStencilState` enables the stencil test on
+    /// either face. Engages the combined depth-stencil attachment (D32_SFLOAT_S8
+    /// with a STENCIL aspect) and the pipeline's front/back stencil op state.
+    /// `None` (the default) keeps the depth-only D32_SFLOAT path byte-identical.
+    pub stencil: Option<StencilState>,
+}
+
+/// Metal `MTLStencilOperation` → Vulkan `VkStencilOp`. The two enums share the
+/// same ordering (Keep=0 .. DecrementWrap=7), but the mapping is spelled out
+/// explicitly so a contract drift is caught by the compiler rather than aliased
+/// through a numeric cast.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum StencilOp {
+    #[default]
+    Keep,
+    Zero,
+    Replace,
+    IncrementClamp,
+    DecrementClamp,
+    Invert,
+    IncrementWrap,
+    DecrementWrap,
+}
+
+impl StencilOp {
+    pub(crate) fn vk(self) -> vk::StencilOp {
+        translate::raster::vk_stencil_op(self)
+    }
+}
+
+/// The pipeline-relevant half of one Metal `MTLStencilDescriptor` face: the
+/// compare function, the three stencil ops, and the read/write masks. Excludes
+/// the reference value, which Metal sets via a *separate* dynamic command
+/// (`SetStencilReferenceValue`) — mirrored on Vulkan with dynamic stencil
+/// reference so distinct reference values do not multiply pipelines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StencilFaceOps {
+    pub compare: SamplerCompareFunction,
+    pub fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
+    pub read_mask: u32,
+    pub write_mask: u32,
+}
+
+/// Per-draw stencil-test state (Metal `MTLDepthStencilState` front/back faces +
+/// `SetStencilReferenceValue`). Present in [`DepthState::stencil`] only when the
+/// bound state enables stencil on a face.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StencilState {
+    pub front: StencilFaceOps,
+    pub back: StencilFaceOps,
+    /// Reference values (Metal `setStencilFrontReferenceValue:backReferenceValue:`),
+    /// applied as Vulkan dynamic stencil reference per face — not baked into the
+    /// pipeline key.
+    pub reference_front: u32,
+    pub reference_back: u32,
+    /// Stencil clear value (Metal `MTLRenderPassStencilAttachment.clearStencil`).
+    /// The transient stencil buffer only supports CLEAR.
+    pub clear_value: u32,
+}
+
+/// Inputs for one offscreen draw. Engine receives resolved bytes + post-reloc SPIR-V only.
+#[derive(Debug, Default)]
+pub struct DrawRequest {
+    /// Shared from the runtime translation cache — the engine never mutates
+    /// module words; `Arc` avoids a full-module copy per draw.
+    pub vert_spirv: std::sync::Arc<Vec<u32>>,
+    pub frag_spirv: std::sync::Arc<Vec<u32>>,
+    pub width: u32,
+    pub height: u32,
+    pub vertex_count: u32,
+    pub flip_viewport_y: bool,
+    pub first_vertex: u32,
+    pub instance_count: Option<u32>,
+    /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
+    pub base_instance: u32,
+    pub primitive_topology: PrimitiveTopology,
+    pub viewports: Vec<ViewportResource>,
+    pub scissors: Vec<ScissorResource>,
+    pub indexed: Option<IndexedDrawResource>,
+    pub vertex_attributes: Vec<VertexAttributeResource>,
+    pub storage_buffers: Vec<StorageBufferResource>,
+    pub sampled_images: Vec<SampledImageResource>,
+    pub samplers: Vec<SamplerResource>,
+    /// RGBA8 Load seed for the color target (None = clear black).
+    /// Preferred when `load_op` is not set; still honored as `LoadOp::LoadSeed`.
+    pub target_rgba8: Option<Vec<u8>>,
+    pub blend: Option<BlendStateResource>,
+    /// Protocol-derived target identity for GPU residency (workstream D).
+    pub target_identity: Option<TargetIdentity>,
+    /// Explicit load action. When `None`, derived from `target_rgba8`
+    /// (`Some` → LoadSeed, `None` → Clear black).
+    pub load_op: Option<LoadOp>,
+    /// When true, skip full-frame readback (non-Store / ticket path). Content
+    /// remains on the GPU under `target_identity` when provided.
+    pub skip_readback: bool,
+    /// When true, render into a B8G8R8A8_UNORM resident target so the stored
+    /// bytes are already in guest scanout order — enables zero-copy
+    /// import-present (no CPU RGBA→BGRA swizzle). Honored only with
+    /// `target_identity` (the pooled path stays RGBA).
+    pub output_bgra: bool,
+    /// Present-boundary GPU seed: copy this READY resident target's content
+    /// into the draw target before the pass (which then runs with LOAD),
+    /// eliding the CPU front-frame read + full-frame seed upload. Requires
+    /// `target_identity`, identical geometry, and the same bgra format;
+    /// mutually exclusive with a CPU seed / `LoadFromTarget`, and the source
+    /// must not also be bound as a sampled image in the same draw.
+    pub seed_from_target: Option<TargetIdentity>,
+    /// Secondary color attachments (MRT slot >= 1). Empty ⇒ the classic
+    /// single-attachment path, byte-identical to the pre-MRT engine. Slot 0 is
+    /// the primary target (`target_identity` / pooled). Each secondary persists
+    /// as its own resident so a later draw can bind it via
+    /// [`SampledSource::Target`] — this is how a fragment shader's secondary
+    /// output (e.g. the vibrancy coverage mask that a subsequent draw samples)
+    /// is produced instead of silently discarded. Requires `target_identity`
+    /// (the resident path); the pooled single-RT path never carries secondaries.
+    pub secondary_targets: Vec<SecondaryColorTarget>,
+    /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
+    /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
+    /// "front" is `front_face_ccw`, resolved against `flip_viewport_y` in the
+    /// pipeline builder (the Metal Y-flip reverses framebuffer winding).
+    pub cull_mode: CullMode,
+    /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
+    /// CounterClockwise), `false` = the Metal default clockwise. Only affects
+    /// rasterization when `cull_mode` culls a face.
+    pub front_face_ccw: bool,
+    /// Depth test + transient depth attachment. `None` (default) = no depth
+    /// buffer, byte-identical to the pre-depth 2D path. Set only for a draw that
+    /// bound a non-trivial `MTLDepthStencilState` (see `metal_draw`).
+    pub depth: Option<DepthState>,
+    /// Fragment shader reads its destination pixel (Metal framebuffer fetch:
+    /// an `air.render_target` INPUT param, translated as a `SubpassData` image
+    /// at [`COLOR_INPUT_BINDING`]). The engine then references attachment 0 as
+    /// a subpass input (GENERAL layout, BY_REGION self-dependency) and writes
+    /// an INPUT_ATTACHMENT descriptor pointing at the color target's view.
+    /// `false` (default) keeps the pass byte-identical to the pre-fetch engine.
+    pub color_input: bool,
+}
+
+/// Descriptor binding of the attachment-0 framebuffer-fetch input attachment.
+/// This is the metal2vulkan ColorInput band base (`dest_N` → `96+N`; only
+/// `dest_0` is supported — see `runtime::spirv_bind::COLOR_INPUT_BINDING_BASE`,
+/// kept equal by a unit test there). Both fragment relocations preserve it.
+pub const COLOR_INPUT_BINDING: u32 = 96;
+
+/// One MRT color attachment beyond the primary (slot 0). Persisted as its own
+/// registry resident so a later draw can sample it.
+#[derive(Debug, Clone)]
+pub struct SecondaryColorTarget {
+    /// Residency identity — the key a later draw uses to bind this attachment
+    /// as a sampled `SampledSource::Target`.
+    pub identity: TargetIdentity,
+    pub width: u32,
+    pub height: u32,
+    /// Attachment format, already resolved from the guest's `MTLPixelFormat` by
+    /// `translate::pixel::color_attachment`. A real `VkFormat` rather than a
+    /// three-way enum, so the render pass, the pipeline key and the image agree
+    /// by construction and an sRGB attachment is expressible the day the rail
+    /// flips.
+    pub format: vk::Format,
+    /// Clear value used when `load` is false (semantic float channels).
+    pub clear: [f32; 4],
+    /// true ⇒ LOAD the existing resident content; false ⇒ CLEAR to `clear`.
+    pub load: bool,
+    /// This slot's own blend state, from the pipeline's per-attachment blend
+    /// descriptor. `None` ⇒ the slot writes unblended.
+    ///
+    /// This used to not exist, and the builder forced every secondary
+    /// attachment unblended with a comment claiming "the decode side does not
+    /// (yet) carry per-attachment blend state". It did:
+    /// `decode::resource::RenderPipelineDescriptor::color_attachments` is a
+    /// `Vec<PipelineColorAttachment>` and each entry has carried its own six
+    /// blend fields all along — the Metal arm has read them per slot for as
+    /// long as MRT has existed. Only the Vulkan `PipelineKey` collapsed them to
+    /// one, so a guest MRT pipeline that blended slot 1 got a raw store.
+    pub blend: Option<BlendStateResource>,
+}
+
+#[derive(Debug, Default)]
+pub struct DrawOutput {
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ViewportResource {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub min_depth: f32,
+    pub max_depth: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScissorResource {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum PrimitiveTopology {
+    Point,
+    Line,
+    LineStrip,
+    #[default]
+    Triangle,
+    TriangleStrip,
+}
+
+impl PrimitiveTopology {
+    pub(crate) fn vk(self) -> vk::PrimitiveTopology {
+        translate::raster::vk_topology(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum IndexType {
+    U16,
+    U32,
+}
+
+impl IndexType {
+    pub(crate) fn vk(self) -> vk::IndexType {
+        translate::raster::vk_index_type(self)
+    }
+
+    pub fn byte_size(self) -> usize {
+        match self {
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IndexedDrawResource {
+    pub index_type: IndexType,
+    pub index_count: u32,
+    pub vertex_offset: i32,
+    pub indices: Vec<u8>,
+}
+
+impl IndexedDrawResource {
+    pub(crate) fn index_range(&self) -> (u32, u32) {
+        let mut min = u32::MAX;
+        let mut max = 0u32;
+        for i in 0..self.index_count as usize {
+            let v = match self.index_type {
+                IndexType::U16 => {
+                    u16::from_le_bytes([self.indices[i * 2], self.indices[i * 2 + 1]]) as u32
+                }
+                IndexType::U32 => u32::from_le_bytes([
+                    self.indices[i * 4],
+                    self.indices[i * 4 + 1],
+                    self.indices[i * 4 + 2],
+                    self.indices[i * 4 + 3],
+                ]),
+            };
+            min = min.min(v);
+            max = max.max(v);
+        }
+        (min, max)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum VertexAttributeFormat {
+    UChar2,
+    UChar3,
+    UChar4,
+    Char2,
+    Char3,
+    Char4,
+    UChar2Normalized,
+    UChar3Normalized,
+    UChar4Normalized,
+    Char2Normalized,
+    Char3Normalized,
+    Char4Normalized,
+    UShort2,
+    UShort3,
+    UShort4,
+    Short2,
+    Short3,
+    Short4,
+    UShort2Normalized,
+    UShort3Normalized,
+    UShort4Normalized,
+    Short2Normalized,
+    Short3Normalized,
+    Short4Normalized,
+    Half2,
+    Half3,
+    Half4,
+    Float,
+    Float2,
+    Float3,
+    Float4,
+    Int,
+    Int2,
+    Int3,
+    Int4,
+    UInt,
+    UInt2,
+    UInt3,
+    UInt4,
+    Int1010102Normalized,
+    UInt1010102Normalized,
+    UChar4NormalizedBgra,
+    UChar,
+    Char,
+    UCharNormalized,
+    CharNormalized,
+    UShort,
+    Short,
+    UShortNormalized,
+    ShortNormalized,
+    Half,
+    FloatRg11B10,
+    FloatRgb9E5,
+}
+
+impl VertexAttributeFormat {
+    /// Deliberately no `vk_format()` here. An attribute's Vulkan format is not
+    /// a property of the attribute alone: Vulkan makes the three-component
+    /// 8/16-bit formats optional, so the bindable format depends on the device
+    /// and on whether the attribute's stride leaves room for a wider
+    /// substitute. Ask `translate::support::VertexFormatSupport::resolve`,
+    /// which answers both at once; `translate::vertex::vk_format` gives the
+    /// device-independent spelling for tables and tests.
+    ///
+    /// Bytes this attribute occupies in the guest's vertex buffer.
+    ///
+    /// Stated beside the Vulkan format in one table so the two cannot drift —
+    /// they are the same fact twice, and held apart they diverge into a stride
+    /// bug nobody is looking for.
+    pub fn byte_size(self) -> u32 {
+        translate::vertex::byte_size(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum VertexStepFunction {
+    Constant,
+    #[default]
+    PerVertex,
+    PerInstance,
+}
+
+#[derive(Debug)]
+pub struct VertexAttributeResource {
+    pub location: u32,
+    pub binding: u32,
+    pub format: VertexAttributeFormat,
+    pub offset: u32,
+    pub stride: u32,
+    pub step_function: VertexStepFunction,
+    pub step_rate: u32,
+    pub content: BufferContent,
+}
+
+#[derive(Debug)]
+pub struct StorageBufferResource {
+    pub binding: u32,
+    pub content: BufferContent,
+}
+
+/// Where a draw-time buffer's bytes come from (vertex attribute streams and
+/// storage/SSBO binds).
+///
+/// `Bytes` is the CPU staging origin: the runtime read the guest span at
+/// encode time and the engine memcpys it into a pooled host-visible staging
+/// buffer. The `Arc` makes intra-draw sharing free — several attributes on
+/// one interleaved stream, or a stage-in buffer doubling as a storage bind,
+/// reference the same allocation instead of cloning it.
+///
+/// `GuestRuns` is the zero-copy origin: the GPU gathers the span straight
+/// from imported guest RAM inside the draw's own command buffer (per-run
+/// `cmd_copy_buffer` into the pooled staging slot the bind then uses). No
+/// CPU read, no CPU memcpy — guest CPU writes are observed at execute time,
+/// at least as fresh as the CPU path's encode-time read (the same in-flight
+/// window contract the sampled `SampledSource::GuestRuns` rail relies on).
+/// `row_length_texels` MUST be 0 (buffers have no row stride semantics).
+#[derive(Clone, Debug)]
+pub enum BufferContent {
+    Bytes(std::sync::Arc<Vec<u8>>),
+    GuestRuns(GuestRunSource),
+}
+
+impl BufferContent {
+    /// Total byte length of the content (the staged/gathered span).
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(b) => b.len(),
+            Self::GuestRuns(src) => src.total_len as usize,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// CPU view of the content. `Bytes` borrows; `GuestRuns` copies the runs
+    /// out of guest RAM (same freshness as the CPU staging path's encode-time
+    /// read). Callers are runtime diagnostics/coverage proofs — the hot draw
+    /// path never materializes a `GuestRuns` span on the CPU.
+    pub fn cpu_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
+            Self::GuestRuns(src) => {
+                let mut out = Vec::with_capacity(src.total_len as usize);
+                for run in src.runs.iter() {
+                    let take = (src.total_len as usize).saturating_sub(out.len());
+                    if take == 0 {
+                        break;
+                    }
+                    let n = (run.len as usize).min(take);
+                    // SAFETY: `host_ptr` is a stable RAMBlock alias from
+                    // `HostOps::map_pages`, valid for the VM lifetime; the
+                    // read races guest CPU writes exactly like the staging
+                    // path's `read_task_gva_fallback` copy does.
+                    unsafe {
+                        let slice = std::slice::from_raw_parts(run.host_ptr as *const u8, n);
+                        out.extend_from_slice(slice);
+                    }
+                }
+                out.resize(src.total_len as usize, 0);
+                std::borrow::Cow::Owned(out)
+            }
+        }
+    }
+}
+
+impl From<Vec<u8>> for BufferContent {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Bytes(std::sync::Arc::new(bytes))
+    }
+}
+
+#[derive(Debug)]
+pub struct SampledImageResource {
+    pub binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub arrayed: bool,
+    pub volume: bool,
+    pub cube: bool,
+    pub source: SampledSource,
+    /// Format the image and its view are created with, and the layout
+    /// [`SampledSource::Bytes`] / [`SampledSource::GuestRuns`] content is read
+    /// as (ignored for [`SampledSource::Target`], which carries its own
+    /// resident format).
+    ///
+    /// Resolved by `translate::pixel::vk_texel_layout` from the contract
+    /// `TexelLayout` the decode rails speak. Storing the Vulkan format rather
+    /// than the layout keeps one spelling on this side of the boundary and
+    /// leaves room for formats no byte-layout enum can name — an sRGB view
+    /// first among them.
+    pub format: vk::Format,
+    /// Optional identity fast path for [`SampledSource::Bytes`] (see
+    /// [`SampledContentIdentity`]); `None` keeps the content-addressed path.
+    pub identity: Option<SampledContentIdentity>,
+    /// Decoded type-8 view swizzle, applied as the image view's component
+    /// mapping so the GPU performs it at sample time. Identity (the default)
+    /// creates the same view as before. Doing this on the view rather than by
+    /// rewriting texels is what lets a swizzled texture stay on whatever
+    /// content rail it was already on, including the zero-copy one — a CPU
+    /// remap would force every swizzled bind onto the upload path.
+    pub swizzle: crate::contract::pixel_format::SwizzlePlan,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum SamplerFilter {
+    #[default]
+    Nearest,
+    Linear,
+}
+
+impl SamplerFilter {
+    pub(crate) fn vk(self) -> vk::Filter {
+        translate::sampler::vk_filter(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum SamplerMipFilter {
+    #[default]
+    NotMipmapped,
+    Nearest,
+    Linear,
+}
+
+impl SamplerMipFilter {
+    pub(crate) fn vk(self) -> vk::SamplerMipmapMode {
+        translate::sampler::vk_mipmap_mode(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum SamplerAddressMode {
+    #[default]
+    ClampToEdge,
+    MirrorClampToEdge,
+    Repeat,
+    MirrorRepeat,
+    ClampToZero,
+    ClampToBorderColor,
+}
+
+impl SamplerAddressMode {
+    pub(crate) fn vk(self) -> vk::SamplerAddressMode {
+        translate::sampler::vk_address_mode(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum SamplerBorderColor {
+    #[default]
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
+}
+
+// Deliberately no `vk()` here. A sampler's border colour is not a property of
+// the declared colour alone: Metal's `ClampToZero` address mode forces
+// transparent black whatever the descriptor says, so the two must be decided
+// together — see `translate::sampler::vk_border_color_with_clamp_to_zero`.
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum SamplerCompareFunction {
+    #[default]
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+impl SamplerCompareFunction {
+    pub(crate) fn vk(self) -> vk::CompareOp {
+        translate::raster::vk_compare_op(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct SamplerResource {
+    pub binding: u32,
+    pub min_filter: SamplerFilter,
+    pub mag_filter: SamplerFilter,
+    pub mip_filter: SamplerMipFilter,
+    pub address_mode_u: SamplerAddressMode,
+    pub address_mode_v: SamplerAddressMode,
+    pub address_mode_w: SamplerAddressMode,
+    pub border_color: SamplerBorderColor,
+    pub compare_function: SamplerCompareFunction,
+    pub lod_min: u32, // f32 bits for Hash
+    pub lod_max: u32,
+    pub max_anisotropy: u32,
+    pub unnormalized_coordinates: bool,
+}
+
+impl SamplerResource {
+    pub fn normalized_default(binding: u32) -> Self {
+        Self {
+            binding,
+            min_filter: SamplerFilter::Linear,
+            mag_filter: SamplerFilter::Linear,
+            mip_filter: SamplerMipFilter::NotMipmapped,
+            address_mode_u: SamplerAddressMode::ClampToEdge,
+            address_mode_v: SamplerAddressMode::ClampToEdge,
+            address_mode_w: SamplerAddressMode::ClampToEdge,
+            border_color: SamplerBorderColor::TransparentBlack,
+            compare_function: SamplerCompareFunction::Never,
+            lod_min: 0.0f32.to_bits(),
+            lod_max: f32::MAX.to_bits(),
+            max_anisotropy: 1,
+            unnormalized_coordinates: false,
+        }
+    }
+
+    pub fn lod_min_f32(&self) -> f32 {
+        f32::from_bits(self.lod_min)
+    }
+
+    pub fn lod_max_f32(&self) -> f32 {
+        f32::from_bits(self.lod_max)
+    }
+
+    /// State without binding (for L6 cache key).
+    pub(crate) fn state_key(&self) -> SamplerStateKey {
+        SamplerStateKey {
+            min_filter: self.min_filter,
+            mag_filter: self.mag_filter,
+            mip_filter: self.mip_filter,
+            address_mode_u: self.address_mode_u,
+            address_mode_v: self.address_mode_v,
+            address_mode_w: self.address_mode_w,
+            border_color: self.border_color,
+            compare_function: self.compare_function,
+            lod_min: self.lod_min,
+            lod_max: self.lod_max,
+            max_anisotropy: self.max_anisotropy,
+            unnormalized_coordinates: self.unnormalized_coordinates,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct SamplerStateKey {
+    pub min_filter: SamplerFilter,
+    pub mag_filter: SamplerFilter,
+    pub mip_filter: SamplerMipFilter,
+    pub address_mode_u: SamplerAddressMode,
+    pub address_mode_v: SamplerAddressMode,
+    pub address_mode_w: SamplerAddressMode,
+    pub border_color: SamplerBorderColor,
+    pub compare_function: SamplerCompareFunction,
+    pub lod_min: u32,
+    pub lod_max: u32,
+    pub max_anisotropy: u32,
+    pub unnormalized_coordinates: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    OneMinusSrcColor,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+    DstColor,
+    OneMinusDstColor,
+    DstAlpha,
+    OneMinusDstAlpha,
+    SrcAlphaSaturated,
+    ConstantColor,
+    OneMinusConstantColor,
+    ConstantAlpha,
+    OneMinusConstantAlpha,
+}
+
+impl BlendFactor {
+    pub(crate) fn vk(self) -> vk::BlendFactor {
+        translate::blend::vk_factor(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum BlendOp {
+    Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+impl BlendOp {
+    pub(crate) fn vk(self) -> vk::BlendOp {
+        translate::blend::vk_operation(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BlendStateResource {
+    pub src_color: BlendFactor,
+    pub dst_color: BlendFactor,
+    pub color_op: BlendOp,
+    pub src_alpha: BlendFactor,
+    pub dst_alpha: BlendFactor,
+    pub alpha_op: BlendOp,
+    pub constants: [f32; 4],
+}
+
+impl BlendStateResource {
+    pub(crate) fn key(&self) -> BlendKey {
+        BlendKey {
+            src_color: self.src_color,
+            dst_color: self.dst_color,
+            color_op: self.color_op,
+            src_alpha: self.src_alpha,
+            dst_alpha: self.dst_alpha,
+            alpha_op: self.alpha_op,
+            constants: self.constants.map(|c| c.to_bits()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct BlendKey {
+    pub src_color: BlendFactor,
+    pub dst_color: BlendFactor,
+    pub color_op: BlendOp,
+    pub src_alpha: BlendFactor,
+    pub dst_alpha: BlendFactor,
+    pub alpha_op: BlendOp,
+    pub constants: [u32; 4],
+}
+
+// ---------------------------------------------------------------------------
+// Compute request surface
+// ---------------------------------------------------------------------------
+
+/// Named compute failure. Same `vk_engine_*` prefix family as draw.
+pub type ComputeError = DrawError;
+
+/// Inputs for one compute dispatch. Engine receives resolved bytes + SPIR-V only.
+#[derive(Debug, Default)]
+pub struct ComputeRequest {
+    /// Vulkan-dialect compute SPIR-V (LocalSize baked in by metal2vulkan).
+    pub spirv: Vec<u32>,
+    /// Entry point name (m2v kernel entry is `"main"`).
+    pub entry: String,
+    /// Workgroup counts in (x, y, z). Runtime converts threads→groups when needed.
+    pub grid: [u32; 3],
+    /// Storage-buffer descriptors with reflected shader write access.
+    pub storage_buffers: Vec<ComputeBufferResource>,
+    /// Sampled images (binding, format, geometry, immutable input bytes).
+    pub sampled_images: Vec<ComputeSampledImageResource>,
+    /// Separate sampler descriptors used by sampled-image operands.
+    pub samplers: Vec<SamplerResource>,
+    /// Storage images (binding, format, geometry, seed bytes); always read back.
+    pub storage_images: Vec<ComputeStorageImageResource>,
+}
+
+#[derive(Debug, Default)]
+pub struct ComputeOutput {
+    /// Writable-buffer readbacks only. Read-only descriptors never cross the
+    /// device→host boundary after dispatch.
+    pub buffers: Vec<ComputeBufferOutput>,
+    /// Image readbacks in request order (same length as `storage_images`).
+    /// Empty for images the GPU copied straight into the caller's imported
+    /// host window (see `images_direct`).
+    pub images: Vec<Vec<u8>>,
+    /// Color8 content stats fused into each image readback copy (same order
+    /// and length as `images`; `None` when the readback is not whole RGBA8
+    /// texels or the image went direct). Saves the runtime a second full scan
+    /// for its output census.
+    pub image_stats: Vec<Option<crate::backend::vulkan::engine::Color8ContentStats>>,
+    /// Per image (request order): true when the GPU copy landed in the
+    /// caller's `host_writeback` window — the caller must skip its own CPU
+    /// writeback for that image. False = the readback in `images` is
+    /// authoritative and the caller writes back as before.
+    pub images_direct: Vec<bool>,
+    /// Per image (request order): true when the readback was deferred — the
+    /// pinned resident storage image is authoritative, no bytes crossed the
+    /// device→host boundary, and the caller owns flushing it to guest pages
+    /// before any host-side access of that window (`read_resident_storage`).
+    pub images_deferred: Vec<bool>,
+}
+
+#[derive(Debug)]
+pub struct ComputeBufferResource {
+    pub binding: u32,
+    pub bytes: Vec<u8>,
+    /// Structurally proven write access in the SPIR-V pointer-use graph.
+    pub writable: bool,
+}
+
+#[derive(Debug)]
+pub struct ComputeBufferOutput {
+    pub binding: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
+#[derive(Debug)]
+pub struct ComputeStorageImageResource {
+    pub binding: u32,
+    pub format: StorageImageFormat,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub one_dim: bool,
+    pub arrayed: bool,
+    pub volume: bool,
+    pub bytes: Vec<u8>,
+    /// Exact type-11 resource lifetime/view contract for persistent GPU
+    /// storage. `None` keeps the conservative transient upload path.
+    pub residency: Option<ComputeStorageResidency>,
+    /// The caller skipped reading guest pages into `bytes` because the
+    /// resident generation matched at stage time. The engine must fail
+    /// visibly (never seed the zero placeholder) if the resident image is
+    /// gone by acquire time — the caller restages and retries.
+    pub seed_skipped: bool,
+    /// GPU-direct writeback window (VK_EXT_external_memory_host): when set
+    /// and importable, the post-dispatch copy lands in this guest-memory
+    /// window instead of the host-visible readback buffer, and the matching
+    /// `ComputeOutput::images` entry stays empty with `images_direct` true.
+    /// Import failure falls back to the readback path (never an error).
+    pub host_writeback: Option<ComputeHostWriteback>,
+    /// Deferred writeback: skip the post-dispatch GPU→host readback entirely —
+    /// the resident storage image (requires `residency`) stays the
+    /// authoritative copy, pinned against LRU eviction until the caller
+    /// flushes it to guest pages via [`read_resident_storage`]
+    /// (`crate::backend::vulkan::engine::read_resident_storage`). The matching
+    /// `ComputeOutput::images` entry stays empty with `images_deferred` true.
+    /// Ignored (conservative readback) when `residency` is `None`.
+    pub defer_readback: bool,
+}
+
+/// Bind request for a sampled input whose window content the engine already
+/// holds GPU-resident (a prior dispatch's storage output). The engine copies
+/// the resident image into the transient sampled image device-locally instead
+/// of uploading `bytes` (which is a zero placeholder and must never reach the
+/// GPU): the copy never aliases the live resident, so the same dispatch may
+/// also storage-write that identity. A missing/mismatched resident fails
+/// visibly (`compute_resident_sample_lost`) — the caller restages and retries.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeResidentSampleBind {
+    pub identity: crate::model::ComputeStorageResidencyKey,
+    /// Generation the caller verified against the registry at stage time.
+    pub generation: u32,
+}
+
+/// Imported-host-pointer writeback target for one storage image. `ptr` is the
+/// contig host view of the destination mapping (base of the mapping, not of
+/// the surface) and must stay valid for `len` bytes across the engine call;
+/// `buffer_offset` / `row_bytes` describe the guest surface window inside it.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeHostWriteback {
+    pub ptr: usize,
+    pub len: usize,
+    /// Byte offset of texel (0,0) inside the imported window; must be a
+    /// multiple of the texel size and of 4 (Vulkan bufferOffset VUs).
+    pub buffer_offset: u64,
+    /// Guest row stride in bytes (>= width * texel size, texel-size multiple).
+    pub row_bytes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeStorageResidency {
+    pub identity: crate::model::ComputeStorageResidencyKey,
+    /// Generation represented by `bytes` before this dispatch.
+    pub seed_generation: u32,
+    /// Generation guest memory will represent after successful writeback.
+    pub output_generation: u32,
+}
+
+/// Read-only sampled image for compute. The format set is shared with storage
+/// images because both are derived from the same Metal pixel-format contract;
+/// descriptor access is carried separately by the request field.
+#[derive(Debug)]
+pub struct ComputeSampledImageResource {
+    pub binding: u32,
+    pub format: StorageImageFormat,
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub one_dim: bool,
+    pub arrayed: bool,
+    pub volume: bool,
+    pub bytes: Vec<u8>,
+    /// When set, `bytes` is a zero placeholder: the engine seeds the sampled
+    /// image with a device-local copy of the named resident storage image
+    /// instead of uploading from the host (see [`ComputeResidentSampleBind`]).
+    pub resident_bind: Option<ComputeResidentSampleBind>,
+}
+
+/// Pixel formats the product compute path maps. Storage and sampled images
+/// share this type; access is carried separately by the request resource.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum StorageImageFormat {
+    #[default]
+    Rgba32Float,
+    Rgba16Float,
+    R16Float,
+    Rgba16Uint,
+    Rgba8Uint,
+    Rgba8Sint,
+    Rgba8Unorm,
+    Bgra8Unorm,
+    Rg16Float,
+    R8Unorm,
+    Rg8Unorm,
+    Rgba32Uint,
+    R32Uint,
+    R32Sint,
+    R32Float,
+    /// Packed three-channel shared-exponent float; sampled-image only on the
+    /// product path (`MTLPixelFormatRGB9E5Float`).
+    Rgb9e5Ufloat,
+}
+
+impl StorageImageFormat {
+    pub(crate) fn vk_format(self) -> vk::Format {
+        translate::pixel::vk_storage_image(self)
+    }
+
+    pub fn bytes_per_texel(self) -> usize {
+        match self {
+            Self::Rgba32Float | Self::Rgba32Uint => 16,
+            Self::Rgba16Float | Self::Rgba16Uint => 8,
+            Self::Rg16Float => 4,
+            Self::R16Float | Self::Rg8Unorm => 2,
+            Self::R8Unorm => 1,
+            Self::Rgba8Uint
+            | Self::Rgba8Sint
+            | Self::Rgba8Unorm
+            | Self::Bgra8Unorm
+            | Self::R32Uint
+            | Self::R32Sint
+            | Self::R32Float
+            | Self::Rgb9e5Ufloat => 4,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Draw residency (workstream D)
+// ---------------------------------------------------------------------------
+
+/// Protocol-derived render-target identity (resource state, not content hash).
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum TargetIdentity {
+    /// Type-4 mapping / surface id namespace.
+    Surface {
+        id: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    },
+    /// Type-2/3 texture ref namespace.
+    Texture {
+        ref_: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    },
+    /// Guest-VA surface namespace.
+    Gva {
+        gva: u64,
+        width: u32,
+        height: u32,
+        generation: u64,
+    },
+    /// Anonymous / no protocol identity (oracle / one-shot draws).
+    Anonymous { slot: u64 },
+    /// Unified compositor-output group: proven same-geometry dual-mid members
+    /// are alternating storage for ONE logical framebuffer (guest copy-swap
+    /// contract — see). All member mids at this geometry
+    /// resolve to this identity, so their draws chain one shared resident and
+    /// per-member content divergence (the a/b residue class) is structurally
+    /// impossible. Dedicated variant: guest mapping ids can never collide
+    /// with it.
+    OutputGroup {
+        id: u32,
+        width: u32,
+        height: u32,
+        generation: u64,
+    },
+}
+
+pub type PresentRect = (u32, u32, u32, u32);
+
+/// Ordered resident candidates and optional cross-member tile correction for a
+/// host-window present. The first content-ready BGRA candidate is authoritative.
+#[derive(Clone, Debug)]
+pub struct WindowPresentSource {
+    pub width: u32,
+    pub height: u32,
+    pub candidates: Vec<TargetIdentity>,
+    pub peer: Option<(TargetIdentity, Vec<PresentRect>)>,
+}
+
+impl Default for TargetIdentity {
+    fn default() -> Self {
+        Self::Anonymous { slot: 0 }
+    }
+}
+
+impl TargetIdentity {
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Surface { width, .. }
+            | Self::Texture { width, .. }
+            | Self::Gva { width, .. }
+            | Self::OutputGroup { width, .. } => *width,
+            Self::Anonymous { .. } => 0,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Surface { height, .. }
+            | Self::Texture { height, .. }
+            | Self::Gva { height, .. }
+            | Self::OutputGroup { height, .. } => *height,
+            Self::Anonymous { .. } => 0,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Surface { generation, .. }
+            | Self::Texture { generation, .. }
+            | Self::Gva { generation, .. }
+            | Self::OutputGroup { generation, .. } => *generation,
+            Self::Anonymous { .. } => 0,
+        }
+    }
+}
+
+/// Color attachment load action for resident targets.
+#[derive(Debug)]
+pub enum LoadOp {
+    /// Clear to the given RGBA float values (or black if omitted).
+    Clear([f32; 4]),
+    /// Load the live GPU image for this identity (must already exist).
+    LoadFromTarget,
+    /// Upload semantic RGBA8 CPU seed bytes into the target (first-touch / guest-newer).
+    LoadSeed(Vec<u8>),
+}
+
+impl Default for LoadOp {
+    fn default() -> Self {
+        Self::Clear([0.0, 0.0, 0.0, 0.0])
+    }
+}
+
+/// Where a sampled image's content comes from.
+#[derive(Debug)]
+pub enum SampledSource {
+    /// CPU origin (bytes re-staged each draw unless warm-path caches geometry only).
+    Bytes(std::sync::Arc<Vec<u8>>),
+    /// Bind a prior GPU-resident target directly (no CPU round-trip).
+    Target(TargetIdentity),
+    /// Zero-copy guest origin: the GPU gathers the texel bytes from imported
+    /// guest RAM inside the draw's own command buffer (two-hop: imported
+    /// buffer → pooled scratch → image). No CPU read, no hash, no sampled
+    /// cache — the copy re-executes every draw, so guest CPU writes are
+    /// observed at execute time (at least as fresh as the CPU path's
+    /// encode-time read).
+    GuestRuns(GuestRunSource),
+}
+
+/// One packed-contiguous guest-RAM span (a direct RAMBlock alias from
+/// `HostOps::map_pages`; stable for the VM lifetime, unmap is a no-op).
+#[derive(Clone, Copy, Debug)]
+pub struct GuestRun {
+    /// Host VA of the span start (page-aligned base + in-page offset).
+    pub host_ptr: usize,
+    /// Byte length of the span.
+    pub len: u64,
+}
+
+/// Zero-copy sampled source: `runs` cover the linear texel window in order
+/// (`sum(len) == total_len`). With `row_length_texels == 0` the window is
+/// tight (`total_len == tight_row_bytes * height`); a nonzero value gives
+/// the guest row stride in texels for padded layouts, and the window then
+/// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
+/// only its texels — padding past the last row may not be mapped). The
+/// caller must have verified import coverage via `ensure_host_import` for
+/// every run.
+#[derive(Clone, Debug)]
+pub struct GuestRunSource {
+    pub runs: std::sync::Arc<Vec<GuestRun>>,
+    pub total_len: u64,
+    /// Guest row stride in texels for the buffer→image copy
+    /// (`bufferRowLength`); 0 = tight rows.
+    pub row_length_texels: u32,
+}
+
+/// Producer-assigned identity + generation for CPU-sourced sampled content.
+///
+/// When two draws bind [`SampledSource::Bytes`] with the same identity, the
+/// content is byte-identical by the producer's coherence model (the runtime
+/// bumps `generation` whenever its authoritative cache entry is rewritten),
+/// so the sampled cache may bind the retained GPU image without re-hashing
+/// or comparing the bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SampledContentIdentity {
+    /// Stable key of the guest resource (runtime-chosen keyspace).
+    pub key: u64,
+    /// Content generation of the producer's authoritative cache entry.
+    pub generation: u64,
+}
+
+/// Draw completion ticket (D4): submit done; pixels materialize only via
+/// [`crate::backend::vulkan::engine::read_target`] at protocol boundaries.
+#[derive(Debug, Default, Clone)]
+pub struct DrawTicket {
+    /// Identity of the color target written by the draw (if residency used).
+    pub target: Option<TargetIdentity>,
+    /// Whether a full-frame readback was performed (oracle/Store path).
+    pub readback_performed: bool,
+    /// Optional oracle-mode pixels when readback was requested with the draw.
+    pub pixels: Option<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_draw_range_decodes_both_wire_index_widths() {
+        let u16_draw = IndexedDrawResource {
+            index_type: IndexType::U16,
+            index_count: 4,
+            vertex_offset: 0,
+            indices: [9u16, 2, 17, 4]
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        };
+        assert_eq!(u16_draw.index_range(), (2, 17));
+
+        let u32_draw = IndexedDrawResource {
+            index_type: IndexType::U32,
+            index_count: 3,
+            vertex_offset: 0,
+            indices: [u32::MAX, 7, 99]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        };
+        assert_eq!(u32_draw.index_range(), (7, u32::MAX));
+        assert_eq!(IndexType::U16.byte_size(), 2);
+        assert_eq!(IndexType::U32.byte_size(), 4);
+    }
+
+    #[test]
+    fn sampler_cache_state_excludes_binding_but_preserves_sampler_state() {
+        let first = SamplerResource::normalized_default(3);
+        let mut rebound = SamplerResource::normalized_default(27);
+        assert_eq!(first.state_key(), rebound.state_key());
+        assert_eq!(first.lod_min_f32(), 0.0);
+        assert_eq!(first.lod_max_f32(), f32::MAX);
+
+        rebound.address_mode_v = SamplerAddressMode::Repeat;
+        assert_ne!(first.state_key(), rebound.state_key());
+    }
+
+    #[test]
+    fn target_identity_accessors_never_infer_anonymous_geometry() {
+        let surface = TargetIdentity::Surface {
+            id: 7,
+            width: 1920,
+            height: 1080,
+            generation: 4,
+        };
+        assert_eq!(
+            (surface.width(), surface.height(), surface.generation()),
+            (1920, 1080, 4)
+        );
+        let anonymous = TargetIdentity::Anonymous { slot: 99 };
+        assert_eq!(
+            (
+                anonymous.width(),
+                anonymous.height(),
+                anonymous.generation()
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            TargetIdentity::default(),
+            TargetIdentity::Anonymous { slot: 0 }
+        );
+    }
+
+    #[test]
+    fn storage_format_texel_sizes_cover_every_format_variant() {
+        let cases = [
+            (StorageImageFormat::Rgba32Float, 16),
+            (StorageImageFormat::Rgba16Float, 8),
+            (StorageImageFormat::R16Float, 2),
+            (StorageImageFormat::Rgba16Uint, 8),
+            (StorageImageFormat::Rgba8Uint, 4),
+            (StorageImageFormat::Rgba8Sint, 4),
+            (StorageImageFormat::Rgba8Unorm, 4),
+            (StorageImageFormat::Bgra8Unorm, 4),
+            (StorageImageFormat::Rg16Float, 4),
+            (StorageImageFormat::R8Unorm, 1),
+            (StorageImageFormat::Rg8Unorm, 2),
+            (StorageImageFormat::Rgba32Uint, 16),
+            (StorageImageFormat::R32Uint, 4),
+            (StorageImageFormat::R32Sint, 4),
+            (StorageImageFormat::R32Float, 4),
+            (StorageImageFormat::Rgb9e5Ufloat, 4),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(format.bytes_per_texel(), expected);
+        }
+    }
+
+    #[test]
+    fn byte_buffer_content_reports_and_borrows_its_exact_payload() {
+        let content = BufferContent::from(vec![1, 2, 3, 4]);
+        assert_eq!(content.len(), 4);
+        assert!(!content.is_empty());
+        assert_eq!(content.cpu_bytes().as_ref(), &[1, 2, 3, 4]);
+        assert!(BufferContent::from(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn default_requests_keep_optional_product_paths_disabled() {
+        let draw = DrawRequest::default();
+        assert_eq!((draw.width, draw.height, draw.vertex_count), (0, 0, 0));
+        assert_eq!(draw.primitive_topology, PrimitiveTopology::Triangle);
+        assert_eq!(draw.cull_mode, CullMode::None);
+        assert!(draw.target_identity.is_none());
+        assert!(draw.depth.is_none());
+        assert!(!draw.skip_readback);
+        assert!(!draw.color_input);
+
+        let compute = ComputeRequest::default();
+        assert_eq!(compute.grid, [0, 0, 0]);
+        assert!(compute.storage_buffers.is_empty());
+        assert!(compute.storage_images.is_empty());
+    }
+}

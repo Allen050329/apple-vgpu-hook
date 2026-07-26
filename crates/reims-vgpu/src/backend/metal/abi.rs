@@ -1,0 +1,462 @@
+//! `repr(C)` ABI types matching `host/archive/.../reims-vgpu-backend-vulkan/reims_vgpu_backend.h` (archived).
+//! C ABI type mirrors for reims_vgpu_backend.h (Metal encode path).
+
+#![allow(non_camel_case_types)]
+
+use std::os::raw::c_void;
+
+pub const REIMS_VGPU_OK: i32 = 0;
+pub const REIMS_VGPU_ERR_ARGS: i32 = 1;
+pub const REIMS_VGPU_ERR_TRANSLATE: i32 = 2;
+pub const REIMS_VGPU_ERR_EXECUTE: i32 = 3;
+
+pub const REIMS_VGPU_BINDING_TEXTURE_BASE: u32 = 32;
+pub const REIMS_VGPU_BINDING_SAMPLER_BASE: u32 = 64;
+
+pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_POINT: u32 = 0;
+pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_LINE: u32 = 1;
+pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_LINE_STRIP: u32 = 2;
+pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE: u32 = 3;
+pub const REIMS_VGPU_MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP: u32 = 4;
+
+pub const REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL: u32 = 0;
+pub const REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT: u32 = 1;
+
+pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS: u32 = 0;
+pub const REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS: u32 = 1;
+
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES: usize = 16;
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS: usize = 16;
+pub const REIMS_VGPU_COMPUTE_STAGE_INPUT_STRIDE_DYNAMIC: u64 = u64::MAX;
+
+pub const REIMS_VGPU_MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u32 = 252;
+pub const REIMS_VGPU_MTL_PIXEL_FORMAT_STENCIL8: u32 = 253;
+pub const REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE: u32 = 0;
+pub const REIMS_VGPU_MTL_LOAD_ACTION_LOAD: u32 = 1;
+pub const REIMS_VGPU_MTL_LOAD_ACTION_CLEAR: u32 = 2;
+pub const REIMS_VGPU_MTL_STORE_ACTION_DONT_CARE: u32 = 0;
+pub const REIMS_VGPU_MTL_STORE_ACTION_STORE: u32 = 1;
+
+pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ: u32 = 0;
+pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE: u32 = 1;
+pub const REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE: u32 = 2;
+
+pub const REIMS_VGPU_SIMG_RGBA8_UINT: u32 = 0;
+pub const REIMS_VGPU_SIMG_RGBA8_SINT: u32 = 1;
+pub const REIMS_VGPU_SIMG_RGBA16_UINT: u32 = 2;
+pub const REIMS_VGPU_SIMG_RGBA16_FLOAT: u32 = 3;
+pub const REIMS_VGPU_SIMG_RGBA32_FLOAT: u32 = 4;
+pub const REIMS_VGPU_SIMG_RGBA8_UNORM: u32 = 5;
+pub const REIMS_VGPU_SIMG_BGRA8_UNORM: u32 = 6;
+pub const REIMS_VGPU_SIMG_R16_FLOAT: u32 = 7;
+pub const REIMS_VGPU_SIMG_RG16_FLOAT: u32 = 8;
+pub const REIMS_VGPU_SIMG_R8_UNORM: u32 = 9;
+pub const REIMS_VGPU_SIMG_RG8_UNORM: u32 = 10;
+pub const REIMS_VGPU_SIMG_RGBA32_UINT: u32 = 11;
+
+pub const REIMS_VGPU_TEXTURE_SWIZZLE_ZERO: u8 = 0;
+pub const REIMS_VGPU_TEXTURE_SWIZZLE_ONE: u8 = 1;
+pub const REIMS_VGPU_TEXTURE_SWIZZLE_RED: u8 = 2;
+pub const REIMS_VGPU_TEXTURE_SWIZZLE_GREEN: u8 = 3;
+pub const REIMS_VGPU_TEXTURE_SWIZZLE_BLUE: u8 = 4;
+pub const REIMS_VGPU_TEXTURE_SWIZZLE_ALPHA: u8 = 5;
+
+pub const REIMS_VGPU_BACKEND_MAX_VIEWPORTS: usize = 16;
+pub const REIMS_VGPU_BACKEND_MAX_SCISSORS: usize = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeStageInputAttribute {
+    pub raw_bits: u32,
+    pub location: u32,
+    pub format: u32,
+    pub offset: u32,
+    pub buffer_index: u32,
+    pub reserved0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeStageInputLayout {
+    pub raw_bits: u32,
+    pub buffer_index: u32,
+    pub step_function: u32,
+    pub step_rate: u32,
+    pub stride: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeStageInputDescriptor {
+    pub word0: u32,
+    pub header0: u32,
+    pub header1: u32,
+    pub attribute_count: u32,
+    pub layout_count: u32,
+    pub index_type: u32,
+    pub index_buffer_index: u32,
+    pub attributes:
+        [ReimsVgpuComputeStageInputAttribute; REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_ATTRIBUTES],
+    pub layouts: [ReimsVgpuComputeStageInputLayout; REIMS_VGPU_COMPUTE_STAGE_INPUT_MAX_LAYOUTS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuBuffer {
+    pub binding: u32,
+    pub data: *mut u8,
+    pub len: usize,
+    pub attribute_stride: u64,
+    pub has_attribute_stride: u32,
+    pub reserved0: u32,
+    pub backing_data: *mut u8,
+    pub backing_len: usize,
+    pub backing_offset: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuStorageImage {
+    pub binding: u32,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub data: *mut u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeSampledImage {
+    pub binding: u32,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub data: *const u8,
+    pub len: usize,
+    pub has_swizzle: u32,
+    pub swizzle: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeTextureUsage {
+    pub binding: u32,
+    pub access: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuSampledImage {
+    pub binding: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: *const u8,
+    pub len: usize,
+    pub pixel_format: u32,
+    pub bytes_per_row: u32,
+    pub data: *const u8,
+    pub data_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuSampler {
+    pub binding: u32,
+    pub unnormalized: u32,
+    pub min_filter: u32,
+    pub mag_filter: u32,
+    pub mip_filter: u32,
+    pub s_address_mode: u32,
+    pub t_address_mode: u32,
+    pub r_address_mode: u32,
+    pub border_color: u32,
+    pub compare_function: u32,
+    pub lod_min_bits: u32,
+    pub lod_max_bits: u32,
+    pub max_anisotropy: u32,
+    pub lod_average: u32,
+    pub support_argument_buffers: u32,
+    pub has_lod_clamp: u32,
+    pub clamp_lod_min_bits: u32,
+    pub clamp_lod_max_bits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuThreadgroupMemory {
+    pub index: u32,
+    pub length: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeStageInRegion {
+    pub origin_x: u64,
+    pub origin_y: u64,
+    pub origin_z: u64,
+    pub size_x: u64,
+    pub size_y: u64,
+    pub size_z: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeStageInRegionIndirectArguments {
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub origin_z: u32,
+    pub size_x: u32,
+    pub size_y: u32,
+    pub size_z: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuComputeImageblockDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuBlendState {
+    pub enable: u32,
+    pub src_rgb: u32,
+    pub dst_rgb: u32,
+    pub op_rgb: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
+    pub has_blend_color: u32,
+    pub blend_color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuViewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub znear: f32,
+    pub zfar: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuScissor {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuRasterState {
+    pub has_cull_mode: u32,
+    pub cull_mode: u32,
+    pub has_depth_clip_mode: u32,
+    pub depth_clip_mode: u32,
+    pub has_front_facing_winding: u32,
+    pub front_facing_winding: u32,
+    pub has_triangle_fill_mode: u32,
+    pub triangle_fill_mode: u32,
+    pub has_line_width: u32,
+    pub line_width: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuDepthBiasState {
+    pub depth_bias: f32,
+    pub slope_scale: f32,
+    pub clamp: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReimsVgpuDepthStencilFaceState {
+    pub compare_function: u32,
+    pub stencil_failure_operation: u32,
+    pub depth_failure_operation: u32,
+    pub depth_stencil_pass_operation: u32,
+    pub read_mask: u32,
+    pub write_mask: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReimsVgpuDepthStencilState {
+    pub depth_compare_function: u32,
+    pub depth_write_enabled: u32,
+    pub front_stencil_enabled: u32,
+    pub back_stencil_enabled: u32,
+    pub front_face: ReimsVgpuDepthStencilFaceState,
+    pub back_face: ReimsVgpuDepthStencilFaceState,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuStencilReferenceState {
+    pub front: u32,
+    pub back: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuDepthAttachment {
+    pub pixel_format: u32,
+    pub load_action: u32,
+    pub store_action: u32,
+    pub clear_depth: f64,
+    pub data: *mut u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuStencilAttachment {
+    pub pixel_format: u32,
+    pub load_action: u32,
+    pub store_action: u32,
+    pub clear_stencil: u32,
+    pub data: *mut u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuPrimitiveIndirectArguments {
+    pub vertex_count: u32,
+    pub instance_count: u32,
+    pub vertex_start: u32,
+    pub base_instance: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuPrimitiveIndirectDraw {
+    pub arguments: *const u8,
+    pub arguments_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuIndexedIndirectArguments {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub index_start: u32,
+    pub base_vertex: i32,
+    pub base_instance: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuIndexedIndirectDraw {
+    pub arguments: *const u8,
+    pub arguments_len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuIndexedDraw {
+    pub index_type: u32,
+    pub index_count: usize,
+    pub base_vertex: i64,
+    pub indices: *const u8,
+    pub indices_len: usize,
+    pub indirect: *const ReimsVgpuIndexedIndirectDraw,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReimsVgpuVertexAttr {
+    pub location: u32,
+    pub format: u32,
+    pub offset: u32,
+    pub buffer_index: u32,
+    pub stride: u32,
+    pub data: *const u8,
+    pub len: usize,
+    pub has_step_function: u32,
+    pub step_function: u32,
+    pub has_step_rate: u32,
+    pub step_rate: u32,
+}
+
+/// Cache diagnostics (matches `reims_vgpu_backend_metal_cache.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReimsVgpuMetalCacheStats {
+    pub function_hits: u64,
+    pub function_misses: u64,
+    pub render_pso_hits: u64,
+    pub render_pso_misses: u64,
+    pub compute_pso_hits: u64,
+    pub compute_pso_misses: u64,
+    pub sampler_hits: u64,
+    pub sampler_misses: u64,
+    pub depth_stencil_hits: u64,
+    pub depth_stencil_misses: u64,
+    pub compute_reflect_hits: u64,
+    pub compute_reflect_misses: u64,
+}
+
+// Silence unused for now (used by backend modules).
+const _: usize = std::mem::size_of::<ReimsVgpuBuffer>();
+const _: *const c_void = std::ptr::null();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn stage_input_abi_preserves_c_layout() {
+        assert_eq!(
+            size_of::<ReimsVgpuComputeStageInputAttribute>(),
+            6 * size_of::<u32>()
+        );
+        assert_eq!(
+            align_of::<ReimsVgpuComputeStageInputAttribute>(),
+            align_of::<u32>()
+        );
+        assert_eq!(size_of::<ReimsVgpuComputeStageInputLayout>(), 24);
+        assert_eq!(offset_of!(ReimsVgpuComputeStageInputLayout, stride), 16);
+        assert_eq!(size_of::<ReimsVgpuComputeStageInputDescriptor>(), 800);
+        assert_eq!(
+            offset_of!(ReimsVgpuComputeStageInputDescriptor, attributes),
+            28
+        );
+        assert_eq!(
+            offset_of!(ReimsVgpuComputeStageInputDescriptor, layouts),
+            416
+        );
+    }
+
+    #[test]
+    fn pointer_bearing_abi_preserves_64_bit_offsets() {
+        assert_eq!(size_of::<usize>(), 8, "Metal backend ABI is 64-bit");
+        assert_eq!(size_of::<ReimsVgpuBuffer>(), 64);
+        assert_eq!(offset_of!(ReimsVgpuBuffer, data), 8);
+        assert_eq!(offset_of!(ReimsVgpuBuffer, backing_data), 40);
+        assert_eq!(offset_of!(ReimsVgpuBuffer, backing_offset), 56);
+        assert_eq!(size_of::<ReimsVgpuStorageImage>(), 32);
+        assert_eq!(offset_of!(ReimsVgpuStorageImage, data), 16);
+        assert_eq!(size_of::<ReimsVgpuComputeSampledImage>(), 40);
+        assert_eq!(offset_of!(ReimsVgpuComputeSampledImage, swizzle), 36);
+    }
+
+    #[test]
+    fn cache_stats_remain_a_dense_twelve_counter_c_abi() {
+        assert_eq!(align_of::<ReimsVgpuMetalCacheStats>(), align_of::<u64>());
+        assert_eq!(size_of::<ReimsVgpuMetalCacheStats>(), 12 * size_of::<u64>());
+        assert_eq!(offset_of!(ReimsVgpuMetalCacheStats, function_hits), 0);
+        assert_eq!(
+            offset_of!(ReimsVgpuMetalCacheStats, compute_reflect_misses),
+            11 * size_of::<u64>()
+        );
+    }
+}
