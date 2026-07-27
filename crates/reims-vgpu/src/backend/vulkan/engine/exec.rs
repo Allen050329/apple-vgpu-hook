@@ -2578,8 +2578,16 @@ pub(crate) unsafe fn execute_draw_inner(
         return Ok(DrawOutput { pixels: Vec::new() });
     };
 
+    // Wait ONLY this draw's fence, not the whole ring. The readback copy is the
+    // tail of this CB, and single-queue submission order already guarantees it
+    // observes every prior-submitted draw's writes (the same argument
+    // `read_target_inner` relies on) — so `retire_all` here would just serialize
+    // the guest-blocking readback behind an unrelated in-flight heavy draw (the
+    // `finish_us` tail). The cleanup is already parked with `finish_entry_async`
+    // above, so the slot stays pending and the ring retires it later with no
+    // extra wait (its fence is already signaled).
     let t_wait = Instant::now();
-    pools.retire_all(ctx, counters)?;
+    pools.wait_entry_fence(ctx, counters, fence)?;
     counters.wait_us.fetch_add(
         t_wait.elapsed().as_micros() as u64,
         std::sync::atomic::Ordering::Relaxed,
