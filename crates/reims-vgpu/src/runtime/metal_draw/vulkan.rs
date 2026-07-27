@@ -5535,13 +5535,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     && load_action == Some(PASS_LOAD_ACTION_LOAD)
                     && crate::runtime::census::present_proxy::has_converged()
                 {
-                    state.peer_needs_front_seed(
+                    // Rotation-aware threshold: `dense_frame_seq` is sampled from
+                    // one global counter, so the healthy separation between the
+                    // oldest and freshest member scales with how many members
+                    // are taking turns, and a bare margin seeds every flip once
+                    // the desktop rotates more than a couple of buffers.
+                    let margin = state.retention_gap_threshold(
                         import_mid,
                         w,
                         h,
-                        true,
                         crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN,
-                    )
+                    );
+                    state.peer_needs_front_seed(import_mid, w, h, true, margin)
                 } else {
                     None
                 };

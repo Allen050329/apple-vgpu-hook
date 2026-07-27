@@ -3635,3 +3635,245 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     state.note_compositor_member_published(5, w, h);
     assert_eq!(state.note_present_backing(5), None);
 }
+
+/// The display-transaction probe must key on the payload *shape*, not fire per
+/// present.
+///
+/// A steady-state x86 boot pushes tens of thousands of opcode-6 packets. An
+/// unbounded `display_txn_payload` line would bury every other always-on record
+/// in the fail log, which is the one place a bad boot explains itself — the
+/// probe would destroy the evidence it exists to collect. A repeat of a shape we
+/// have already sampled carries no new information about where the plane list
+/// lives, so the budget is per
+/// `(opcode, payload_len, pipe_index, task_field_is_set)`.
+#[test]
+fn display_txn_payload_probe_is_bounded_per_wire_shape() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let packet = |opcode: u16, plen: usize| Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; plen],
+        next_head: 0,
+    };
+
+    for _ in 0..(DISPLAY_TXN_PAYLOAD_SAMPLES * 8) {
+        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 12));
+    }
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 0, false)),
+        Some(&DISPLAY_TXN_PAYLOAD_SAMPLES),
+        "a known shape must stop logging once its sample budget is spent"
+    );
+
+    // A *new* length is the whole point of the measurement: if the guest ever
+    // appends an inline plane list the payload grows, and that packet must be
+    // sampled even though the opcode is one we have already seen many times.
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 64, 0, false)),
+        Some(&1),
+        "a new payload length must get its own sample budget"
+    );
+
+    // Opcodes are budgeted independently: 6 and 7 are different commands with
+    // different trailers, and 8 is the arm64 pathway entirely.
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_GAMMA_X86, 0x24));
+    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 12));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_GAMMA_X86, 0x24, 0, false)),
+        Some(&1)
+    );
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_DISPLAY_SWAP, 12, 0, false)),
+        Some(&1)
+    );
+}
+
+/// The plane-0 surface id changes every frame by design; the pipe index and the
+/// task field do not.
+///
+/// Keying the budget on length alone spent it inside the first 400ms of a live
+/// boot and left the probe silent for the rest of the session, because the
+/// length never varies. The trailer's other two words are what still carry news,
+/// so a second display pipe or the task field's first non-zero value must each
+/// re-arm the budget — while a fresh surface id every frame must not, or the
+/// probe becomes unbounded again.
+#[test]
+fn display_txn_payload_probe_rearms_on_trailer_change_but_not_on_surface_id() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let trailer = |pipe: u32, surface: u32, task: u32| {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&pipe.to_le_bytes());
+        payload.extend_from_slice(&surface.to_le_bytes());
+        payload.extend_from_slice(&task.to_le_bytes());
+        Packet {
+            opcode: CHILD_OP_PRESENT_X86,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    // Bring-up: pipe 0, task still zero, a different surface id every frame.
+    for surface in 0..(DISPLAY_TXN_PAYLOAD_SAMPLES * 8) {
+        note_display_txn_payload(&mut state, 5, &trailer(0, surface + 1, 0));
+    }
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 0, false)),
+        Some(&DISPLAY_TXN_PAYLOAD_SAMPLES),
+        "a per-frame surface id must not re-arm the budget"
+    );
+    assert_eq!(
+        state.display.txn_payload_samples.len(),
+        1,
+        "surface ids must not each open their own bucket"
+    );
+
+    // Steady state: the task field goes non-zero. That transition is the open
+    // question, so it gets a fresh budget exactly once.
+    note_display_txn_payload(&mut state, 5, &trailer(0, 0x2a, 7));
+    note_display_txn_payload(&mut state, 5, &trailer(0, 0x2b, 9));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 0, true)),
+        Some(&2),
+        "the task field's first non-zero value must re-arm the budget"
+    );
+
+    // A second display pipe is a different wire shape, not a repeat.
+    note_display_txn_payload(&mut state, 6, &trailer(1, 0x2a, 7));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 1, true)),
+        Some(&1),
+        "a new pipe index must get its own sample budget"
+    );
+}
+
+/// The gamma command swaps the surface id and the task field relative to the
+/// plain one.
+///
+/// Both words are u32s in adjacent slots, so reading them at the wrong offsets
+/// still yields plausible-looking values — the probe would key its budget on the
+/// surface id and re-arm every frame, and the emitted `task=` would be a surface
+/// id. Nothing downstream would report an error.
+#[test]
+fn display_txn_trailer_slots_follow_the_emitting_command() {
+    // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
+    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, 2));
+    // command 7: [pipe][task][surface][gamma…] — the two are swapped.
+    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86), (2, 1));
+    assert_eq!(display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP), (1, 2));
+
+    // The swap has to survive the budget key, not just the log line: a gamma
+    // packet whose *task* is zero and whose surface id is non-zero must land in
+    // the task-is-zero bucket.
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes()); // pipe
+    payload.extend_from_slice(&0u32.to_le_bytes()); // task
+    payload.extend_from_slice(&0x2au32.to_le_bytes()); // surface
+    payload.resize(0x24, 0);
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &Packet {
+            opcode: CHILD_OP_PRESENT_GAMMA_X86,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_GAMMA_X86, 0x24, 0, false)),
+        Some(&1),
+        "gamma's task field is slot 1; reading slot 2 would mistake a surface id for it"
+    );
+}
+
+/// The trailer the guest appends after serializing the transaction's resource
+/// list is 0x24 bytes for the gamma command and 0x0c for the plain one.
+///
+/// The probe reports the trailer read from *both* ends of the payload, and the
+/// tail reading is only meaningful at the right width — get this wrong and a
+/// payload that does carry an inline plane list would still look trailer-only.
+#[test]
+fn display_txn_trailer_width_matches_the_emitting_command() {
+    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_X86), 0x0c);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_GAMMA_X86), 0x24);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
+}
+
+/// Head and tail readings coincide exactly when the payload is trailer-only.
+///
+/// That coincidence is the measurement's verdict: agreement means the plane list
+/// is not inline and a real decode has to reach it another way; divergence means
+/// the list precedes the trailer and our fixed offset-zero read has been parsing
+/// the list header all along.
+#[test]
+fn display_txn_probe_distinguishes_trailer_only_from_prefixed_payload() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+
+    // Trailer-only: [pipe=0][surface=0x2a][task=7].
+    let mut trailer_only = Vec::new();
+    trailer_only.extend_from_slice(&0u32.to_le_bytes());
+    trailer_only.extend_from_slice(&0x2au32.to_le_bytes());
+    trailer_only.extend_from_slice(&7u32.to_le_bytes());
+    assert_eq!(trailer_only.len(), display_txn_trailer_len(CHILD_OP_PRESENT_X86));
+
+    // Same trailer behind an 8-byte prefix: offset-zero now reads the prefix.
+    let mut prefixed = vec![0xEEu8; 8];
+    prefixed.extend_from_slice(&trailer_only);
+
+    for payload in [trailer_only, prefixed] {
+        let plen = payload.len();
+        note_display_txn_payload(
+            &mut state,
+            5,
+            &Packet {
+                opcode: CHILD_OP_PRESENT_X86,
+                stamp_count: 0,
+                total_size: PACKET_HEADER_LEN + plen as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        );
+        assert_eq!(
+            state
+                .display
+                .txn_payload_samples
+                .get(&(CHILD_OP_PRESENT_X86, plen, 0, true)),
+            Some(&1),
+            "each distinct shape must be sampled once"
+        );
+    }
+}

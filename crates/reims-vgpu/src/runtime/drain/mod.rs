@@ -52,6 +52,124 @@ fn release_translation_order_holds(state: &mut DeviceState) {
     ));
 }
 
+/// Samples logged per distinct display-transaction `(opcode, payload_len)` shape.
+///
+/// One sample proves the shape exists; a few more let the reader compare which
+/// words move between frames (surface id, task id) and which are constant
+/// (pipe index) without re-booting.
+const DISPLAY_TXN_PAYLOAD_SAMPLES: u32 = 4;
+
+/// Payload bytes hex-dumped per sample. A transaction payload that carried an
+/// inline plane list would be tens of bytes, not kilobytes; this bounds a
+/// pathological length without truncating the interesting case.
+const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
+
+/// Trailer size `submitTransaction` appends after serializing the transaction's
+/// resource list: `[pipe][task][surface][gamma…]` for the gamma command,
+/// `[pipe][surface][task]` otherwise.
+fn display_txn_trailer_len(opcode: u16) -> usize {
+    if opcode == CHILD_OP_PRESENT_GAMMA_X86 {
+        0x24
+    } else {
+        0x0c
+    }
+}
+
+/// Word slots of the surface id and the task field within the trailer. The
+/// gamma command swaps the two relative to the plain one, which is why this is
+/// keyed on the opcode rather than assumed.
+fn display_txn_trailer_slots(opcode: u16) -> (usize, usize) {
+    if opcode == CHILD_OP_PRESENT_GAMMA_X86 {
+        // [pipe][task][surface][gamma…]
+        (2, 1)
+    } else {
+        // [pipe][surface][task]
+        (1, 2)
+    }
+}
+
+/// Measurement for the display-transaction wire shape (`display_txn_payload`).
+///
+/// We decode opcode 6/7 as a fixed 12/0x24-byte record read from payload offset
+/// zero, which yields a single surface id — plane 0 of what is really an
+/// `IOAccelDisplayPipeTransaction2`: a per-frame list of planes with source,
+/// destination and dirty rects. Whether the rest of that list rides inline in
+/// this payload decides where a real decode reads it from, and nothing in the
+/// guest driver settles it statically because the serializer it calls lives in
+/// IOAcceleratorFamily2.
+///
+/// So record the shape from a live boot. `head*` is the trailer under the
+/// current offset-zero reading; `tail*` is the same trailer read from the end of
+/// the payload, which is where it lands if a plane list precedes it. When the
+/// two agree the payload is trailer-only and the list travels elsewhere; when
+/// they diverge, `hex` shows the list and `tail*` is the correct reading.
+///
+/// A live x86 session answered the framing half: every payload was trailer-only,
+/// so `tail*` is the authoritative reading and the named `pipe`/`surface`/`task`
+/// fields below are decoded from it. What remains open is the task field, which
+/// was zero for every sample taken during bring-up. It is `task->+0x268` in
+/// `submitTransaction`, and whether it identifies the GPU task that produced the
+/// surface decides how the host learns that a present's content is ready — so
+/// the sample budget re-arms when it first becomes non-zero.
+fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &Packet) {
+    let plen = packet.payload.len();
+    let trailer = display_txn_trailer_len(packet.opcode);
+    let tail_base = plen.checked_sub(trailer);
+    let word = |off: usize| -> Option<u32> {
+        (off + 4 <= plen).then(|| ld32(&packet.payload[off..]))
+    };
+    let show = |v: Option<u32>| -> String {
+        v.map_or_else(|| "-".to_string(), |w| format!("{w:#010x}"))
+    };
+    let tail = |slot: usize| -> Option<u32> { tail_base.and_then(|base| word(base + slot * 4)) };
+
+    let (surface_slot, task_slot) = display_txn_trailer_slots(packet.opcode);
+    let pipe = tail(0);
+    let surface = tail(surface_slot);
+    let task = tail(task_slot);
+
+    let seen = state
+        .display
+        .txn_payload_samples
+        .entry((
+            packet.opcode,
+            plen,
+            pipe.unwrap_or(u32::MAX),
+            task.is_some_and(|t| t != 0),
+        ))
+        .or_insert(0);
+    if *seen >= DISPLAY_TXN_PAYLOAD_SAMPLES {
+        return;
+    }
+    *seen += 1;
+    let sample = *seen;
+
+    let dumped = plen.min(DISPLAY_TXN_PAYLOAD_DUMP_MAX);
+    let mut hex = String::with_capacity(dumped * 2);
+    for b in &packet.payload[..dumped] {
+        hex.push_str(&format!("{b:02x}"));
+    }
+
+    crate::observe::fail(format!(
+        "display_txn_payload op={:#x} ch={channel_id} plen={plen} total_size={} stamp={:#x} \
+         sample={sample}/{DISPLAY_TXN_PAYLOAD_SAMPLES} trailer={trailer} \
+         pipe={} surface={} task={} \
+         head0={} head1={} head2={} tail0={} tail1={} tail2={} dumped={dumped} hex={hex}",
+        packet.opcode,
+        packet.total_size,
+        packet.completion_stamp,
+        show(pipe),
+        show(surface),
+        show(task),
+        show(word(0)),
+        show(word(4)),
+        show(word(8)),
+        show(tail(0)),
+        show(tail(1)),
+        show(tail(2)),
+    ));
+}
+
 /// Parsed FIFO packet (main + child share framing).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
@@ -1759,10 +1877,18 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                  (no full-frame store and no peer seed since this mid's last present)"
             ));
         }
+        // The threshold tracks the rotation's depth: `dense_frame_seq` comes from
+        // one global counter, so a healthy K-member rotation already separates
+        // its oldest and freshest members by K-1 with nothing stale about either.
+        let gap_threshold = state.retention_gap_threshold(
+            mapping,
+            w,
+            h,
+            crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN,
+        );
         let (capture_mid, capture_gen) = match state.dense_retention_gap(mapping, w, h) {
             Some((denser_mid, named_seq, denser_seq))
-                if denser_seq
-                    >= named_seq + crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN =>
+                if denser_seq >= named_seq + gap_threshold =>
             {
                 let denser_gen = state
                     .mappings
@@ -2100,6 +2226,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
          * - ch2 PRESENT_FRAME 0x28 / FLUSH 0x3b: bookkeeping only (mid-composite).
          */
         CHILD_OP_DISPLAY_SWAP => {
+            note_display_txn_payload(state, channel_id, packet);
             let mapping = if packet.payload.len() >= DISPLAY_SWAP_MIN_LEN {
                 ld32(&packet.payload[DISPLAY_SWAP_MAPPING..])
             } else {
@@ -2126,17 +2253,20 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // x86 Ventura/Tahoe display pipe: present is opcode 6/7 (not 0x28).
         // Live fail log: UnknownChildOpcode ch5 op6 — no paint until handled.
         CHILD_OP_PRESENT_X86 => {
+            note_display_txn_payload(state, channel_id, packet);
             let mapping = if packet.payload.len() >= PRESENT_X86_MIN_LEN {
                 ld32(&packet.payload[PRESENT_X86_SURFACE_ID..])
             } else {
                 0
             };
-            // Offline: op6 [display_id@0][surface_id@4][stamp@8].
+            // op6 trailer: [pipe_index@0][surface_id@4][task@8]. The word at +8
+            // is the submitting task's field, not a completion stamp — the
+            // packet's own stamp lives in the FIFO header.
             if packet.payload.len() >= 12 {
                 let disp = ld32(&packet.payload[0..]);
-                let stamp = ld32(&packet.payload[8..]);
+                let task = ld32(&packet.payload[8..]);
                 crate::observe::line(format!(
-                    "present_op6 ch={channel_id} disp={disp} sid={mapping} stamp={stamp:#x} plen={} unpainted={} prior_present_mapping={}",
+                    "present_op6 ch={channel_id} pipe={disp} sid={mapping} task={task:#x} plen={} unpainted={} prior_present_mapping={}",
                     packet.payload.len(),
                     state.present.unpainted_presents,
                     state.present.present_mapping
@@ -2149,6 +2279,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             }
         }
         CHILD_OP_PRESENT_GAMMA_X86 => {
+            note_display_txn_payload(state, channel_id, packet);
             let mapping = if packet.payload.len() >= PRESENT_GAMMA_X86_SURFACE_ID + 4 {
                 ld32(&packet.payload[PRESENT_GAMMA_X86_SURFACE_ID..])
             } else if packet.payload.len() >= PRESENT_X86_MIN_LEN {

@@ -1133,6 +1133,23 @@ pub struct DisplayHandshake {
     pub online_tries: u32,
     /// Cadence counter for ONLINE re-drive (archive display_poll_ctr).
     pub poll_ctr: u32,
+    /// Samples already logged per observed display-transaction wire shape,
+    /// keyed by `(opcode, payload_len, pipe_index, task_field_is_set)`.
+    ///
+    /// Backs the `display_txn_payload` measurement. A live x86 session showed the
+    /// payload is trailer-only and its length never varies, so keying on length
+    /// alone spent the whole budget inside the first 400ms of display activity
+    /// and stayed silent afterwards. The remaining trailer words are what still
+    /// carry news: `pipe_index` changes when a second display pipe appears, and
+    /// the task field is zero through early bring-up, so its first non-zero value
+    /// re-arms the probe exactly once at the transition into steady-state
+    /// compositing.
+    ///
+    /// The plane-0 surface id is deliberately *not* part of the key: it is
+    /// expected to change every frame, so keying on it would make the probe
+    /// unbounded. Whether the task field is likewise per-frame is answered by
+    /// comparing the samples within its bucket.
+    pub txn_payload_samples: BTreeMap<(u16, usize, u32, bool), u32>,
 }
 
 /// Last **command-class** write to a surface mid (not pixel occupancy).
@@ -2500,6 +2517,47 @@ impl DeviceState {
     /// A/B stale-member substitution still fires (its fresh peer is a presented
     /// sibling — see the drain-site test
     /// `composite_named_present_substitutes_fresh_peer_for_stale_member`).
+    /// How many same-geometry members are taking turns receiving full frames —
+    /// the members [`Self::dense_retention_gap`] compares against each other.
+    ///
+    /// Counts only members that have themselves been presented at this geometry,
+    /// matching that function's peer gate, plus `mapping_id` itself when it
+    /// qualifies as a member.
+    pub fn dense_rotation_depth(&self, mapping_id: u32, w: u32, h: u32) -> u64 {
+        if w == 0 || h == 0 {
+            return 0;
+        }
+        self.present
+            .compositor_output_members
+            .iter()
+            .filter(|(&mid, m)| {
+                m.width == w && m.height == h && (mid == mapping_id || self.presented_at(mid, w, h))
+            })
+            .count() as u64
+    }
+
+    /// The `dense_frame_seq` lag beyond which a member is genuinely behind,
+    /// rather than merely waiting for its turn in the rotation.
+    ///
+    /// `dense_frame_counter` is a **single global counter** bumped once per
+    /// full-frame publish by *any* member, so the gap between two members'
+    /// sequences grows with how many members are rotating, not with how stale
+    /// either one is. With K members taking turns, the member that published
+    /// longest ago sits exactly `K - 1` behind the freshest one while every
+    /// buffer is perfectly current. A fixed threshold therefore only holds for
+    /// the two-member case it was written against: a live x86 desktop rotates up
+    /// to 7 same-geometry members, which puts the healthy baseline at 6 and
+    /// makes a bare margin of 4 fire on every present.
+    ///
+    /// So the rotation's own depth is the floor, and `margin` keeps its original
+    /// meaning on top of it: how many full frames a member must miss *beyond*
+    /// its turn before it counts as having a retention gap.
+    pub fn retention_gap_threshold(&self, mapping_id: u32, w: u32, h: u32, margin: u64) -> u64 {
+        self.dense_rotation_depth(mapping_id, w, h)
+            .saturating_sub(1)
+            .saturating_add(margin)
+    }
+
     pub fn dense_retention_gap(&self, mapping_id: u32, w: u32, h: u32) -> Option<(u32, u64, u64)> {
         if mapping_id == 0 || w == 0 || h == 0 {
             return None;
