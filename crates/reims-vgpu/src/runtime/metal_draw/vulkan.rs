@@ -18,6 +18,57 @@ struct SampledImageShape {
 /// shape the sampled-draw path builds. `None` is a shape the path cannot yet
 /// express (`Cube` / `CubeArray`); the caller declines it by name so the gap
 /// stays visible instead of binding the wrong view type.
+/// Whether the a/b peer seed still has anything to do once resident
+/// unification is accounted for.
+///
+/// Members of one output group share a single resident, so a seed from one
+/// member into another is a copy onto itself and the caller drops it. Every
+/// such drop is evidence that the retention apparatus behind the seed —
+/// `peer_needs_front_seed`, `dense_retention_gap`, `dense_frame_seq`,
+/// `peer_seeded_dense_seq`, `RETENTION_GAP_MARGIN` — is compensating for a
+/// divergence that unification already makes impossible.
+///
+/// One always-on line per distinct `(source kind, target kind, survived)`
+/// triple per process. Keying on the identity *kinds* rather than on ids is
+/// what makes a survivor explain itself: `group->group` cannot survive,
+/// `surface->group` means the source never joined the output, and the counts
+/// say whether either is the steady state or a one-off. Deduped, because the
+/// seed runs per draw and an unbounded line here would bury the log it is meant
+/// to inform.
+#[cfg(feature = "backend-vulkan")]
+fn note_peer_seed_unification(
+    source: &crate::backend::vulkan::engine::types::TargetIdentity,
+    target: &crate::backend::vulkan::engine::types::TargetIdentity,
+    survives: bool,
+) {
+    use crate::backend::vulkan::engine::types::TargetIdentity;
+    use std::sync::Mutex;
+    fn kind(i: &TargetIdentity) -> &'static str {
+        match i {
+            TargetIdentity::Surface { .. } => "surface",
+            TargetIdentity::Texture { .. } => "texture",
+            TargetIdentity::Gva { .. } => "gva",
+            TargetIdentity::Anonymous { .. } => "anon",
+            TargetIdentity::OutputGroup { .. } => "group",
+        }
+    }
+    type SeedUnificationKey = (&'static str, &'static str, bool);
+    static SEEN: Mutex<Option<std::collections::BTreeSet<SeedUnificationKey>>> = Mutex::new(None);
+    let key = (kind(source), kind(target), survives);
+    {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if !guard.get_or_insert_with(Default::default).insert(key) {
+            return;
+        }
+    }
+    crate::observe::fail(format!(
+        "peer_seed_unification outcome={} src_kind={} target_kind={} src={source:?} target={target:?}",
+        if survives { "survives" } else { "elided" },
+        key.0,
+        key.1,
+    ));
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn sampled_image_shape(
     kind: crate::runtime::spirv_bind::SampledImageKind,
@@ -5566,9 +5617,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // rejects (`SeedEqualsTarget`) — failing the whole draw and
                 // freezing the guest compositor. The draw's own LoadFromTarget
                 // reads the shared resident and already carries the content.
+                //
+                // How often that elision fires is the question that decides
+                // whether the a/b seed still has a job. Unified members share one
+                // resident, so a seed between two of them is a copy onto itself
+                // and is dropped here. If every proposed seed is dropped, the
+                // whole retention apparatus behind it — `peer_needs_front_seed`,
+                // `dense_retention_gap`, `dense_frame_seq`, `peer_seeded_dense_seq`
+                // and `RETENTION_GAP_MARGIN` — is compensating for a divergence
+                // that unification already prevents. Record both outcomes, keyed
+                // on the identity pair so a survivor says WHY it survived rather
+                // than only that it did.
                 let peer_seed_source = peer_seed_source.filter(|&src_mid| {
-                    crate::runtime::import_present::surface_identity(state, src_mid, w, h)
-                        != *identity
+                    let src = crate::runtime::import_present::surface_identity(state, src_mid, w, h);
+                    let survives = src != *identity;
+                    note_peer_seed_unification(&src, identity, survives);
+                    survives
                 });
                 let peer_front_seed = peer_seed_source.is_some();
                 if peer_front_seed {
