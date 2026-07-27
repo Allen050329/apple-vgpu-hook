@@ -893,8 +893,7 @@ mod tests {
             2,
             MTL_FORMAT_RGBA16_FLOAT,
         );
-        st.linear_deferred_flush
-            .insert(obligation_key, (2, std::collections::HashSet::new()));
+        st.arm_linear_deferred_window(obligation_key, 2, std::collections::HashSet::new());
         assert!(st.delete_task(6));
         assert_eq!(st.retired_linear_residents.len(), 1);
         let key = st.retired_linear_residents[0];

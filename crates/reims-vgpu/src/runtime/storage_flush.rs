@@ -127,7 +127,9 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     // change re-check the cached pages against the current windows WITHOUT a PT
     // walk (the per-page FFI translate is the expensive part). A 1-in-64 sampled
     // full walk (`flush_verify_ctr`) self-heals a missed task-PT remap
-    // (`zc_flush_stale`, must stay 0).
+    // (`zc_flush_stale`, must stay 0) — the memo's pages are only as good as the
+    // guest telling us it remapped, which is the one invariant here that no local
+    // audit can close.
     let t_sig = std::time::Instant::now();
     let sig = state.deferred_flush_signature();
     state.tranche.zc_flush_sig_ns = state
@@ -145,16 +147,6 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         sampled_verify = state.flush_verify_ctr.is_multiple_of(64);
         if sampled_verify {
             let pages = pages.clone();
-            // Self-heal the incremental deferred-page-refs index against truth on
-            // the same 1-in-64 cadence: a missed arm/disarm site would otherwise
-            // let the fast reject skip a live window. Rebuild + fail-log on drift
-            // so a coverage hole is visible and corrected, never silent.
-            if state.verify_and_heal_deferred_refs() {
-                crate::observe::fail(format!(
-                    "deferred_ref_drift task={task_id} gva={gva:#x} span={span} healed_pages={}",
-                    state.deferred_page_refs.len()
-                ));
-            }
             verify_cheap_hit = state.deferred_pages_intersect(&pages);
             // fall through to the full PT walk (ground truth / self-heal)
         } else if vsig == sig {
@@ -1264,12 +1256,8 @@ mod tests {
             [(0x2000u64) << PAGE_SHIFT_X86].into_iter().collect();
         let disjoint_pages: std::collections::HashSet<u64> =
             [(0x3000u64) << PAGE_SHIFT_X86].into_iter().collect();
-        state
-            .linear_deferred_flush
-            .insert(lin_aliased, (1, aliased_pages));
-        state
-            .linear_deferred_flush
-            .insert(lin_disjoint, (1, disjoint_pages));
+        state.arm_linear_deferred_window(lin_aliased, 1, aliased_pages);
+        state.arm_linear_deferred_window(lin_disjoint, 1, disjoint_pages);
 
         // No windows on mapping 11: clean no-op.
         assert_eq!(
@@ -1313,16 +1301,50 @@ mod tests {
         }
     }
 
+    /// Independent restatement of what the union index owes its only caller:
+    /// `deferred_pages_intersect` answers true for exactly the pages some live
+    /// window still holds. Recomputed here from the three window maps, so the
+    /// assertion never consults the index it is checking. `ever_armed` bounds
+    /// the domain — every page the caller has armed at any point, so the check
+    /// covers pages that must have LEFT the index as well as pages still in it.
+    fn assert_index_matches_windows(state: &crate::model::DeviceState, ever_armed: &[u64]) {
+        let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for pages in state.deferred_alias_pages.values() {
+            live.extend(pages.iter().copied());
+        }
+        for (_, pages) in state.linear_deferred_flush.values() {
+            live.extend(pages.iter().copied());
+        }
+        for entry in state.gva_deferred_flush.values() {
+            live.extend(entry.pages.iter().copied());
+        }
+        for &page in ever_armed {
+            assert_eq!(
+                state.deferred_pages_intersect(&[page]),
+                live.contains(&page),
+                "page {page:#x}: fast reject disagrees with the live window sets"
+            );
+        }
+    }
+
     /// The refcounted deferred-page union index (`deferred_page_refs`, the fast
     /// reject behind `deferred_pages_intersect`) tracks exactly the live window
-    /// pages: shared pages are refcounted so a page survives until its LAST
-    /// window disarms, re-arm swaps page sets cleanly, and a fresh rebuild agrees
-    /// with the incrementally-maintained index.
+    /// pages across both window kinds that carry their own page sets: shared
+    /// pages are refcounted so a page survives until its LAST window disarms,
+    /// re-arm swaps page sets cleanly, and a page shared by a GVA window and a
+    /// linear window needs both to disarm before it leaves.
+    ///
+    /// This is the invariant the deleted 1-in-64 `deferred_ref_drift` self-heal
+    /// used to repair at runtime. `DeferredWindows` now denies mutable access to
+    /// the three source maps outside `model::state`, so a window can no longer
+    /// be armed or disarmed without the paired refcount move; what remains
+    /// testable is that the paired moves are themselves right.
     #[test]
     fn deferred_page_refs_track_arm_disarm_with_sharing() {
-        use crate::model::{DeviceState, PAGE_SHIFT_X86};
+        use crate::model::{ComputeStorageResidencyKey, DeviceState, PAGE_SHIFT_X86};
         let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let p = |pfn: u64| pfn << PAGE_SHIFT_X86;
+        let seen = [p(0xA), p(0xB), p(0xC), p(0xD), p(0xE), p(0xF)];
         // Two windows share page A; window 1 also owns B, window 2 also owns C.
         state.arm_gva_deferred_window(0x1000, gva_entry(1, 4, 4, &[p(0xA), p(0xB)]));
         state.arm_gva_deferred_window(0x2000, gva_entry(1, 4, 4, &[p(0xA), p(0xC)]));
@@ -1330,38 +1352,51 @@ mod tests {
         assert!(state.deferred_pages_intersect(&[p(0xB)]));
         assert!(state.deferred_pages_intersect(&[p(0xC)]));
         assert!(!state.deferred_pages_intersect(&[p(0xD)]));
-        // Disarm window 1: shared A stays (window 2 still holds it), B leaves.
+        assert_index_matches_windows(&state, &seen);
+        // A linear window joins on A too: the page is now held by three windows
+        // of two different kinds, and the refcount is the only thing that knows.
+        let lin = ComputeStorageResidencyKey::linear(1, 7, 0, 4, 4, 4, 2, 0x46);
+        state.arm_linear_deferred_window(lin, 1, [p(0xA), p(0xF)].into_iter().collect());
+        assert_index_matches_windows(&state, &seen);
+        // Disarm window 1: shared A stays, B leaves.
         assert!(state.take_gva_deferred_window(0x1000).is_some());
         assert!(
             state.deferred_pages_intersect(&[p(0xA)]),
-            "A shared by window 2"
+            "A shared by window 2 and the linear window"
         );
         assert!(
             !state.deferred_pages_intersect(&[p(0xB)]),
             "B was only window 1"
         );
         assert!(state.deferred_pages_intersect(&[p(0xC)]));
-        // Re-arm window 2 onto a different page set: C leaves, E joins, A stays
-        // present only if the new set keeps it — here it does not.
+        assert_index_matches_windows(&state, &seen);
+        // Re-arm window 2 onto a different page set: C leaves, E joins. A stays
+        // only because the linear window still holds it.
         state.arm_gva_deferred_window(0x2000, gva_entry(1, 4, 4, &[p(0xE)]));
-        assert!(
-            !state.deferred_pages_intersect(&[p(0xA)]),
-            "re-arm dropped A"
-        );
         assert!(
             !state.deferred_pages_intersect(&[p(0xC)]),
             "re-arm dropped C"
         );
-        assert!(state.deferred_pages_intersect(&[p(0xE)]));
-        // The incremental index must match a from-scratch rebuild (no drift).
         assert!(
-            !state.verify_and_heal_deferred_refs(),
-            "incremental index agrees with a fresh rebuild"
+            state.deferred_pages_intersect(&[p(0xA)]),
+            "the linear window still holds A"
         );
-        // Disarm the last window: index empties.
-        assert!(state.take_gva_deferred_window(0x2000).is_some());
-        assert!(!state.deferred_pages_intersect(&[p(0xE)]));
-        assert!(!state.verify_and_heal_deferred_refs());
+        assert!(state.deferred_pages_intersect(&[p(0xE)]));
+        assert_index_matches_windows(&state, &seen);
+        // Re-arm the linear window off A: now nothing holds it.
+        state.arm_linear_deferred_window(lin, 2, [p(0xF)].into_iter().collect());
+        assert!(
+            !state.deferred_pages_intersect(&[p(0xA)]),
+            "last holder of A re-armed away from it"
+        );
+        assert_index_matches_windows(&state, &seen);
+        // Disarm both remaining windows: index empties.
+        assert!(state.disarm_linear_deferred_window(&lin));
+        assert!(state.take_oldest_gva_deferred_window().is_some());
+        for page in seen {
+            assert!(!state.deferred_pages_intersect(&[page]));
+        }
+        assert_index_matches_windows(&state, &seen);
     }
 
     /// A raw task-GVA span aliasing a deferred GVA render-Store window's

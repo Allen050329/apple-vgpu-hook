@@ -1669,6 +1669,40 @@ impl TrancheStats {
     }
 }
 
+/// A map of deferred writeback windows whose page sets feed the union index
+/// [`DeviceState::deferred_page_refs`].
+///
+/// Read-only outside this module: [`Deref`](std::ops::Deref) exposes the whole
+/// `BTreeMap` read API, and there is deliberately **no** `DerefMut`, so the
+/// inner map can only be mutated where the paired refcount update lives. That
+/// is what makes the union index exact by construction — a site that armed or
+/// disarmed a window without touching the index would not compile, so nothing
+/// has to sample the index at runtime and repair it.
+#[derive(Debug)]
+pub struct DeferredWindows<K, V>(BTreeMap<K, V>);
+
+impl<K, V> DeferredWindows<K, V> {
+    fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<K, V> std::ops::Deref for DeferredWindows<K, V> {
+    type Target = BTreeMap<K, V>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// `for (k, v) in &windows`, which auto-deref does not reach on its own.
+impl<'a, K, V> IntoIterator for &'a DeferredWindows<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -1796,7 +1830,7 @@ pub struct DeviceState {
     /// the mapping's last deferred window is taken. A stale entry after a PFN
     /// change costs one spurious no-op flush call, never a wrong flush — the
     /// windows map stays the single flush authority.
-    pub deferred_alias_pages: BTreeMap<u32, std::collections::HashSet<u64>>,
+    pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
     /// Per-mid last write **command class** (ClearOnly vs Composite) — present path.
     pub surface_write_kind: BTreeMap<u32, SurfaceWriteKind>,
     /// RGB-nonzero pixel count of each mapping's last full-frame Store import
@@ -1850,12 +1884,12 @@ pub struct DeviceState {
     /// (`storage_flush::flush_intersecting_task_gva`). Cache-only-shaped
     /// windows never enter — their sync path never wrote guest pages either.
     pub linear_deferred_flush:
-        BTreeMap<ComputeStorageResidencyKey, (u32, std::collections::HashSet<u64>)>,
+        DeferredWindows<ComputeStorageResidencyKey, (u32, std::collections::HashSet<u64>)>,
     /// Deferred GVA render-Store windows (type-2/3 color0, `target_gva != 0`)
     /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
     /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
     /// authoritative content until `storage_flush::flush_gva_one` lands it.
-    pub gva_deferred_flush: BTreeMap<u64, GvaDeferredEntry>,
+    pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
     /// Monotonic arm counter for the [`Self::render_deferred_flush`]
@@ -1941,13 +1975,13 @@ pub struct DeviceState {
     /// into ONE map instead of the old O(bind_pages × num_windows) scan over
     /// every window's HashSet — the dominant `zc_flush` cost. Refcounts (not a
     /// plain set) because windows share physical pages; a page leaves the index
-    /// only when its last window disarms. All three deferred maps mutate through
-    /// the `*_deferred*`/`index_deferred_alias_pages`/`take_*` methods, which
-    /// keep this in sync; a 1-in-64 sampled self-check ([`flush_verify_ctr`])
-    /// rebuilds it from truth and fail-logs `deferred_ref_drift` if it ever
-    /// diverges (self-heal — a missed site degrades to a transient extra walk,
-    /// never a missed flush, since binds are disjoint from windows anyway).
-    pub deferred_page_refs: std::collections::HashMap<u64, u32>,
+    /// only when its last window disarms.
+    ///
+    /// Exactness is a property of the type, not of a repair pass: the three
+    /// source maps are [`DeferredWindows`], which hands out no mutable access
+    /// outside this module, so every arm and disarm necessarily runs through the
+    /// method that also moves the refcount here.
+    deferred_page_refs: std::collections::HashMap<u64, u32>,
 }
 
 /// Bound for [`DeviceState::present_store_fifo`]: the guest pipelines at most
@@ -2009,7 +2043,7 @@ impl DeviceState {
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
             render_deferred_flush: BTreeMap::new(),
-            deferred_alias_pages: BTreeMap::new(),
+            deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
             import_rgb_nz: BTreeMap::new(),
             present: PresentState::default(),
@@ -2027,8 +2061,8 @@ impl DeviceState {
             draining_mask: 0,
             retired_views: Vec::new(),
             retired_linear_residents: Vec::new(),
-            linear_deferred_flush: BTreeMap::new(),
-            gva_deferred_flush: BTreeMap::new(),
+            linear_deferred_flush: DeferredWindows::new(),
+            gva_deferred_flush: DeferredWindows::new(),
             mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,
             render_deferred_seq: 0,
@@ -2127,46 +2161,6 @@ impl DeviceState {
         }
     }
 
-    /// Rebuild [`deferred_page_refs`] from the three live deferred maps. Returns
-    /// the fresh index for the sampled self-check to compare against.
-    fn rebuild_deferred_refs(&self) -> std::collections::HashMap<u64, u32> {
-        let mut refs: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        for pages in self.deferred_alias_pages.values() {
-            for &p in pages {
-                *refs.entry(p).or_insert(0) += 1;
-            }
-        }
-        for (_, pages) in self.linear_deferred_flush.values() {
-            for &p in pages {
-                *refs.entry(p).or_insert(0) += 1;
-            }
-        }
-        for entry in self.gva_deferred_flush.values() {
-            for &p in &entry.pages {
-                *refs.entry(p).or_insert(0) += 1;
-            }
-        }
-        refs
-    }
-
-    /// Sampled (1-in-64) self-check: rebuild the index from truth and compare
-    /// its key set to the incrementally-maintained one. Returns true (drift) and
-    /// self-heals (adopts the fresh index) when they diverge, so a missed
-    /// arm/disarm site can never silently drop a live page from the fast reject.
-    pub fn verify_and_heal_deferred_refs(&mut self) -> bool {
-        let fresh = self.rebuild_deferred_refs();
-        // Key-set equality is what the fast reject depends on; refcount values
-        // only affect when a shared page is dropped.
-        let drift = fresh.len() != self.deferred_page_refs.len()
-            || fresh
-                .keys()
-                .any(|k| !self.deferred_page_refs.contains_key(k));
-        if drift {
-            self.deferred_page_refs = fresh;
-        }
-        drift
-    }
-
     /// Arm (or re-arm) a deferred GVA render-Store window, keeping the union
     /// index in sync (re-arm subtracts the superseded page set first).
     pub fn arm_gva_deferred_window(&mut self, gva: u64, entry: GvaDeferredEntry) {
@@ -2175,7 +2169,7 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&entry.pages);
-        self.gva_deferred_flush.insert(gva, entry);
+        self.gva_deferred_flush.0.insert(gva, entry);
     }
 
     /// Arm (or re-arm) a linear compute-storage deferred window, keeping the
@@ -2191,13 +2185,13 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&pages);
-        self.linear_deferred_flush.insert(key, (generation, pages));
+        self.linear_deferred_flush.0.insert(key, (generation, pages));
     }
 
     /// Disarm a linear compute-storage deferred window, keeping the union index
     /// in sync. Returns whether an entry was present.
     pub fn disarm_linear_deferred_window(&mut self, key: &ComputeStorageResidencyKey) -> bool {
-        if let Some((_, pages)) = self.linear_deferred_flush.remove(key) {
+        if let Some((_, pages)) = self.linear_deferred_flush.0.remove(key) {
             self.deferred_ref_sub_pages(&pages);
             true
         } else {
@@ -2896,7 +2890,7 @@ impl DeviceState {
             .map(|(&gva, _)| gva)
             .collect();
         for gva in doomed {
-            if let Some(entry) = self.gva_deferred_flush.remove(&gva) {
+            if let Some(entry) = self.gva_deferred_flush.0.remove(&gva) {
                 self.deferred_ref_sub_pages(&entry.pages);
                 self.retired_gva_windows.push((gva, entry));
             }
@@ -2905,7 +2899,7 @@ impl DeviceState {
 
     /// Take the deferred GVA window at exactly `gva`, if any.
     pub fn take_gva_deferred_window(&mut self, gva: u64) -> Option<GvaDeferredEntry> {
-        let entry = self.gva_deferred_flush.remove(&gva)?;
+        let entry = self.gva_deferred_flush.0.remove(&gva)?;
         self.deferred_ref_sub_pages(&entry.pages);
         Some(entry)
     }
@@ -2917,7 +2911,7 @@ impl DeviceState {
             .iter()
             .min_by_key(|(_, e)| e.armed_seq)
             .map(|(&gva, _)| gva)?;
-        let entry = self.gva_deferred_flush.remove(&gva)?;
+        let entry = self.gva_deferred_flush.0.remove(&gva)?;
         self.deferred_ref_sub_pages(&entry.pages);
         Some((gva, entry))
     }
@@ -3232,10 +3226,10 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         if set.is_empty() {
-            self.deferred_alias_pages.remove(&mapping_id);
+            self.deferred_alias_pages.0.remove(&mapping_id);
         } else {
             self.deferred_ref_add_pages(&set);
-            self.deferred_alias_pages.insert(mapping_id, set);
+            self.deferred_alias_pages.0.insert(mapping_id, set);
         }
     }
 
@@ -3251,7 +3245,7 @@ impl DeviceState {
                 .keys()
                 .any(|k| k.mapping_id == mapping_id);
         if !live {
-            if let Some(old) = self.deferred_alias_pages.remove(&mapping_id) {
+            if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
                 self.deferred_ref_sub_pages(&old);
             }
         }
@@ -3292,7 +3286,7 @@ impl DeviceState {
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
-        if let Some(old) = self.deferred_alias_pages.remove(&mapping_id) {
+        if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
             self.deferred_ref_sub_pages(&old);
         }
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
