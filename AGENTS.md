@@ -129,6 +129,33 @@ of the variants it selects among, so rendering each variant on its own establish
 output must fall in. A result outside that range is a defect and not a selection, and that argument
 holds without knowing which variant was selected.
 
+### Fit The Wrong Output Before Naming A Wrong Mechanism
+
+Once known values have been through the path, you hold measured/nominal pairs. **Fit them to a
+closed form before nominating any mechanism.** A transform that reproduces the measurements with no
+free parameters tells you the *value* that is wrong, and that converts every later probe from "does
+this look off" into "does this read X" — a question a probe can answer wrong-way-round, which is the
+only kind worth landing.
+
+It also settles arguments that qualitative reading cannot. A table of destroyed patches here sat in
+the notes for two iterations described as "YUV-shaped", which was true and useless. Fitted, it is
+full-range **BT.601** luma of the correct image with the chroma pair pinned at (0, 255) — fifteen
+numbers, worst error 1.6, zero fitted parameters, and BT.709 refuted because no constant chroma
+satisfies its green and blue together. The pinned values are the *format-fill constants* of a
+sampled image's z,w lanes, which no qualitative reading would have produced.
+
+Two rules make the fit trustworthy:
+
+- **Hold points out of sample.** Fit on one subset, predict the rest. The fit above was built on the
+  neutral ramp alone and then predicted five saturated primaries to within 2/255. Without that step
+  a six-parameter matrix fitted to six greys proves nothing.
+- **Cross your readout grid against every spatial defect before reading its values as a transfer
+  function.** A patch readout inherits the geometry of anything else wrong in the frame. Three
+  patches in that same table read exactly (0,0,0) and were written up as the frame's most specific
+  clue — a *wraparound*, which pointed away from a matrix. They were simply the three patches in the
+  rightmost column, sitting inside a separately-noted black band. The refutation was one line of
+  arithmetic on `i % COLS` and it was never run.
+
 ### Tests Define Done
 
 If there is no test for it, it is not done. No test means a future agent can regress the changeset
