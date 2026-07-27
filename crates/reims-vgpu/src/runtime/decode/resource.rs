@@ -1649,108 +1649,13 @@ pub fn texture_type8_opcode(bytes: &[u8]) -> Option<u32> {
 
 const TYPE7_MIN_LEN: usize = 17;
 
-/// The bytes of an IOSurface texture descriptor that
-/// [`decode_iosurface_texture_descriptor`] does **not** read, concatenated in
-/// wire order: `+0x04..0x10`, `+0x14..0x16`, and `+0x20..` (the tail).
-///
-/// Five fields are decoded — `mapping_id` (+0x00), `object_ref` (+0x10),
-/// `pixel_format` (+0x16), `width` (+0x18), `height` (+0x1c). Everything else
-/// this object carries has never been looked at, and the decoder's own comment
-/// calling `+0x20..` a "constant tail" is an assumption: nothing has compared
-/// the tail between two surfaces.
-///
-/// That matters because nothing decoded at surface-create time distinguishes a
-/// desktop swapchain buffer from a same-geometry offscreen render target — a
-/// WebKit content tile is also 1920x1080 BGRA8. Every mechanism that tries to
-/// tell them apart (compositor-output membership, output groups, the a/b seed)
-/// is reconstructing a property the guest may simply be telling us here. If
-/// these bytes differ between a surface the guest later names as plane 0 and one
-/// it never names, membership becomes a decoded property available before the
-/// first draw.
-///
-/// Caller-visible so the probe's notion of "undecoded" is pinned by a test
-/// rather than restated in a log format string: adding a decoded field here
-/// without shrinking this span would leave the probe reporting a difference it
-/// already understands.
-pub fn undecoded_iosurface_descriptor_bytes(bytes: &[u8]) -> Vec<u8> {
-    if bytes.len() < 0x20 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(bytes.len() - 18);
-    out.extend_from_slice(&bytes[0x04..0x10]);
-    out.extend_from_slice(&bytes[0x14..0x16]);
-    out.extend_from_slice(&bytes[0x20..]);
-    out
-}
-
-/// One always-on line per distinct value of the undecoded span, capped.
-///
-/// Keyed on the **content** of those bytes, never on the descriptor's length.
-/// The `display_txn_payload` probe keyed its budget on `(opcode, payload_len)`,
-/// the length never varied, and it exhausted itself on the first four frames and
-/// was silent for the rest of the session — it answered one question and then
-/// went blind. A new *value* is the interesting event here, so that is the key.
-///
-/// The cap exists because these decode on every texture bind, and an unbounded
-/// dump would bury the log it is meant to inform. Hitting it is reported once,
-/// so "the tail varies per surface" is a loud answer rather than a silent
-/// truncation that reads like "we saw everything".
-fn note_iosurface_descriptor_shape(bytes: &[u8]) {
-    const MAX_SHAPES: usize = 24;
-    const HEX_MAX: usize = 96;
-    use std::sync::Mutex;
-    type ShapeKey = (usize, Vec<u8>);
-    static SEEN: Mutex<Option<std::collections::BTreeSet<ShapeKey>>> = Mutex::new(None);
-
-    // Deliberately runs BEFORE the length check, and keys on `(len, undecoded)`
-    // rather than on `undecoded` alone. A record too short to decode has an
-    // empty span, and an earlier version of this probe returned on that and so
-    // reported nothing at all on a live boot — the length claim in this
-    // decoder's comment is exactly one of the things being measured, so the
-    // probe must not assume it to fire.
-    let undecoded = undecoded_iosurface_descriptor_bytes(bytes);
-    let (fresh, distinct) = {
-        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-        let seen = guard.get_or_insert_with(Default::default);
-        if seen.len() > MAX_SHAPES {
-            return;
-        }
-        (seen.insert((bytes.len(), undecoded.clone())), seen.len())
-    };
-    if !fresh {
-        return;
-    }
-    if distinct > MAX_SHAPES {
-        crate::observe::fail(format!(
-            "t11_desc_shape outcome=cap_reached distinct={distinct} \
-             (the undecoded span varies per surface; it is not a constant tail)"
-        ));
-        return;
-    }
-    let (mid, w, h) = if bytes.len() >= 0x20 {
-        (
-            ld32(&bytes[0x00..]),
-            ld32(&bytes[0x18..]),
-            ld32(&bytes[0x1c..]),
-        )
-    } else {
-        (0, 0, 0)
-    };
-    let hex: String = bytes
-        .iter()
-        .take(HEX_MAX)
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    crate::observe::fail(format!(
-        "t11_desc_shape distinct={distinct} mid={mid} {w}x{h} len={} decodable={} \
-         undecoded_nz={} hex={hex}{}",
-        bytes.len(),
-        (bytes.len() >= 0x20) as u8,
-        undecoded.iter().filter(|&&b| b != 0).count(),
-        if bytes.len() > HEX_MAX { "…" } else { "" },
-    ));
-}
-
+/// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
+/// — before the length check, so a short record would also report — emitted
+/// nothing across a full interactive session. Type-11 geometry on that pathway
+/// is latched from the **type-4** surface backing descriptor instead
+/// (`runtime/objects.rs`, `decode_type4_surface` -> `set_mapping_geom`). Do not
+/// reason about what the guest tells us at surface-create time from this
+/// decoder without re-confirming it runs; measure `decode_type4_surface`.
 pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     // Matches reims-vgpu-iosurface-pages texture descriptor min layout (mappingID,
     // object self-ref, format, width, height). Live type-11 blobs are longer
@@ -1759,7 +1664,6 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
     // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
     // and product resolve fail-closes non-zero levels rather than inventing
     // a pyramid packing in the mapping (see blit_exec::Type11Texture).
-    note_iosurface_descriptor_shape(bytes);
     if bytes.len() < 0x20 {
         return Err(DecodeStatus::ErrShort("res_iosurface_short"));
     }
@@ -2976,57 +2880,4 @@ mod tests {
         }
     }
 
-    /// The probe's notion of "undecoded" must be exactly the bytes the decoder
-    /// does not read, and it must be able to tell two descriptors apart on those
-    /// bytes alone.
-    ///
-    /// This is the question that blocks the largest deletion in the present
-    /// path: nothing decoded at surface-create time separates a desktop
-    /// swapchain buffer from a same-geometry offscreen tile, so membership is
-    /// reconstructed by half a dozen mechanisms. If the guest is telling us in
-    /// the undecoded span, the probe has to be able to see it.
-    #[test]
-    fn undecoded_descriptor_span_is_exactly_what_the_decoder_skips() {
-        // 0x38 is one of the two live blob lengths.
-        let mut a = vec![0u8; 0x38];
-        a[0x00..0x04].copy_from_slice(&7u32.to_le_bytes()); // mapping_id
-        a[0x10..0x14].copy_from_slice(&9u32.to_le_bytes()); // object_ref
-        a[0x16..0x18].copy_from_slice(&0x50u16.to_le_bytes()); // pixel_format
-        a[0x18..0x1c].copy_from_slice(&1920u32.to_le_bytes()); // width
-        a[0x1c..0x20].copy_from_slice(&1080u32.to_le_bytes()); // height
-
-        // Every decoded field can change without moving the undecoded span.
-        let mut b = a.clone();
-        b[0x00..0x04].copy_from_slice(&8u32.to_le_bytes());
-        b[0x10..0x14].copy_from_slice(&11u32.to_le_bytes());
-        b[0x16..0x18].copy_from_slice(&0x51u16.to_le_bytes());
-        b[0x18..0x1c].copy_from_slice(&1280u32.to_le_bytes());
-        b[0x1c..0x20].copy_from_slice(&720u32.to_le_bytes());
-        assert_eq!(
-            undecoded_iosurface_descriptor_bytes(&a),
-            undecoded_iosurface_descriptor_bytes(&b),
-            "changing only decoded fields must not look like a new shape"
-        );
-
-        // The span covers all three undecoded ranges: the gap between
-        // mapping_id and object_ref, the two bytes before the format, and the
-        // tail past the minimum record.
-        for probe in [0x04usize, 0x0f, 0x14, 0x15, 0x20, 0x37] {
-            let mut c = a.clone();
-            c[probe] ^= 0xff;
-            assert_ne!(
-                undecoded_iosurface_descriptor_bytes(&a),
-                undecoded_iosurface_descriptor_bytes(&c),
-                "byte {probe:#x} is undecoded and must be visible to the probe"
-            );
-        }
-
-        // The span length is the record minus the eighteen decoded bytes
-        // (4 mapping_id + 4 object_ref + 2 pixel_format + 4 width + 4 height).
-        assert_eq!(undecoded_iosurface_descriptor_bytes(&a).len(), 0x38 - 18);
-
-        // A record too short to decode reports nothing rather than a partial
-        // span that would compare unequal against every real one.
-        assert!(undecoded_iosurface_descriptor_bytes(&a[..0x1f]).is_empty());
-    }
 }

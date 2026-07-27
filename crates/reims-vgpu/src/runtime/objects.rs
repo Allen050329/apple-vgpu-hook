@@ -349,8 +349,111 @@ fn decode_type4_plane(desc: &[u8], plane_index: usize) -> Option<Type4Plane> {
     })
 }
 
+/// The bytes of a type-4 surface descriptor that [`decode_type4_surface`] does
+/// **not** read: `+0x11..0x14` and everything past the plane records it
+/// consumed (`TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE ..`).
+///
+/// Decoded today: `length` (+0x00), `backing_pfn` (+0x08), `pixel_format`
+/// (+0x0c), `plane_count` (+0x10), and each plane's offset/width/height/packed
+/// bpr. That is everything we know about a surface when the guest creates it —
+/// and it is not enough to tell a desktop swapchain buffer from a same-geometry
+/// offscreen render target, because a WebKit content tile is also 1920x1080
+/// 'BGRA'. Membership is therefore reconstructed downstream by compositor-output
+/// edges, full-frame-publish detection, output groups, presented-ness, and the
+/// a/b seed. Whether any of that can be deleted turns on whether the guest is
+/// already telling us here, in bytes nothing has ever read.
+///
+/// A `plane_count` above [`TYPE4_PLANE_CAP`] is clamped by the decoder, so the
+/// records past the clamp fall into this span too — which is correct: they are
+/// bytes we did not read.
+///
+/// Public so the probe's notion of "undecoded" is pinned by a test rather than
+/// restated in a log format string.
+pub fn undecoded_type4_surface_bytes(desc: &[u8]) -> Vec<u8> {
+    if desc.len() < TYPE4_MIN_LEN {
+        return Vec::new();
+    }
+    let plane_count = (desc[TYPE4_PLANE_COUNT] as usize).min(TYPE4_PLANE_CAP);
+    let planes_end = TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE;
+    let mut out = Vec::new();
+    out.extend_from_slice(&desc[0x11..TYPE4_PLANES]);
+    if planes_end < desc.len() {
+        out.extend_from_slice(&desc[planes_end..]);
+    }
+    out
+}
+
+/// One always-on line per distinct `(len, undecoded span)`, capped.
+///
+/// Keyed on the **content** of the undecoded bytes, never on the record length.
+/// The `display_txn_payload` probe keyed its budget on `(opcode, payload_len)`,
+/// the length never varied, and it exhausted itself inside the first 400 ms —
+/// it answered one question and then went blind for the rest of the session. A
+/// new *value* is the interesting event here, so that is the key.
+///
+/// Runs before the decoder's own validity checks, so a record that fails to
+/// decode still reports. An earlier version of this probe on the type-11
+/// descriptor sat after its length check and emitted nothing at all on a live
+/// boot; "the decoder never ran" and "the tail is constant" produced the same
+/// silence, which is the reading the probe exists to rule out.
+///
+/// Hitting the cap is reported once. A silent truncation would read like "we
+/// saw everything", which is the same class of error as a probe reporting a
+/// confident constant.
+fn note_type4_surface_shape(desc: &[u8]) {
+    const MAX_SHAPES: usize = 24;
+    const HEX_MAX: usize = 128;
+    use std::sync::Mutex;
+    type ShapeKey = (usize, Vec<u8>);
+    static SEEN: Mutex<Option<std::collections::BTreeSet<ShapeKey>>> = Mutex::new(None);
+
+    let undecoded = undecoded_type4_surface_bytes(desc);
+    let (fresh, distinct) = {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = guard.get_or_insert_with(Default::default);
+        if seen.len() > MAX_SHAPES {
+            return;
+        }
+        (seen.insert((desc.len(), undecoded.clone())), seen.len())
+    };
+    if !fresh {
+        return;
+    }
+    if distinct > MAX_SHAPES {
+        crate::observe::fail(format!(
+            "type4_desc_shape outcome=cap_reached distinct={distinct} \
+             (the undecoded span varies per surface; it is not a constant tail)"
+        ));
+        return;
+    }
+    let (w, h, fmt, pc) = if desc.len() >= TYPE4_MIN_LEN {
+        (
+            ld32(&desc[TYPE4_PLANES + 4..]),
+            ld32(&desc[TYPE4_PLANES + 8..]),
+            ld32(&desc[TYPE4_PIXEL_FORMAT..]),
+            desc[TYPE4_PLANE_COUNT],
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let hex: String = desc
+        .iter()
+        .take(HEX_MAX)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    crate::observe::fail(format!(
+        "type4_desc_shape distinct={distinct} {w}x{h} fmt={fmt:#x} planes={pc} len={} \
+         undecoded_len={} undecoded_nz={} hex={hex}{}",
+        desc.len(),
+        undecoded.len(),
+        undecoded.iter().filter(|&&b| b != 0).count(),
+        if desc.len() > HEX_MAX { "…" } else { "" },
+    ));
+}
+
 /// Decode a type-4 surface descriptor blob.
 pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
+    note_type4_surface_shape(desc);
     if desc.len() < TYPE4_MIN_LEN {
         return None;
     }
@@ -1644,5 +1747,81 @@ mod tests {
             0x42, 0x01, 0x0a, 0x00, 0, 0, 0, 0, 0x00, 0x04, 0, 0, 0x01, 0, 0, 0,
         ]);
         assert!(decode_type5_texture_view(&zw).is_none());
+    }
+
+    /// The probe's notion of "undecoded" must be exactly the bytes
+    /// `decode_type4_surface` skips, and it must distinguish two surfaces on
+    /// those bytes alone.
+    ///
+    /// This is the measurement that blocks the largest deletion in the present
+    /// path: nothing decoded at surface-create time separates a desktop
+    /// swapchain buffer from a same-geometry offscreen tile, so membership is
+    /// reconstructed by half a dozen downstream mechanisms. If the guest is
+    /// telling us in the undecoded span, the probe has to be able to see it.
+    #[test]
+    fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
+        // One plane: the decoder consumes 0x14..0x24, so the tail starts there.
+        let mut a = vec![0u8; 0x40];
+        st64(&mut a[TYPE4_LEN..], 0x800000);
+        st32(&mut a[TYPE4_BACKING_PFN..], 0x1234);
+        st32(&mut a[TYPE4_PIXEL_FORMAT..], 0x4247_5241); // 'BGRA'
+        a[TYPE4_PLANE_COUNT] = 1;
+        st32(&mut a[TYPE4_PLANES..], 0); // plane0 offset
+        st32(&mut a[TYPE4_PLANES + 4..], 1920);
+        st32(&mut a[TYPE4_PLANES + 8..], 1080);
+        st32(&mut a[TYPE4_PLANES + 12..], 1920 * 4);
+
+        // Every decoded field can change without moving the undecoded span.
+        let mut b = a.clone();
+        st64(&mut b[TYPE4_LEN..], 0x900000);
+        st32(&mut b[TYPE4_BACKING_PFN..], 0x9999);
+        st32(&mut b[TYPE4_PIXEL_FORMAT..], 0x4c31_3062);
+        st32(&mut b[TYPE4_PLANES + 4..], 1280);
+        st32(&mut b[TYPE4_PLANES + 8..], 720);
+        st32(&mut b[TYPE4_PLANES + 12..], 1280 * 4);
+        assert_eq!(
+            undecoded_type4_surface_bytes(&a),
+            undecoded_type4_surface_bytes(&b),
+            "changing only decoded fields must not look like a new shape"
+        );
+
+        // The span covers the three bytes after plane_count and the whole tail
+        // past the plane records the decoder consumed.
+        for probe in [0x11usize, 0x13, 0x24, 0x3f] {
+            let mut c = a.clone();
+            c[probe] ^= 0xff;
+            assert_ne!(
+                undecoded_type4_surface_bytes(&a),
+                undecoded_type4_surface_bytes(&c),
+                "byte {probe:#x} is undecoded and must be visible to the probe"
+            );
+        }
+
+        // Bytes the decoder DOES read must not be in the span, or ordinary
+        // surface-to-surface variation would look like a new shape forever.
+        // `plane_count` (+0x10) is excluded on purpose: it is decoded AND it
+        // moves the span's own boundary, which the two-plane case below pins.
+        for probe in [0x00usize, 0x08, 0x0c, 0x14, 0x23] {
+            let mut c = a.clone();
+            c[probe] ^= 0xff;
+            assert_eq!(
+                undecoded_type4_surface_bytes(&a),
+                undecoded_type4_surface_bytes(&c),
+                "byte {probe:#x} is decoded and must stay out of the span"
+            );
+        }
+
+        // A second plane moves the boundary: 0x24..0x34 becomes decoded.
+        let mut two = a.clone();
+        two[TYPE4_PLANE_COUNT] = 2;
+        assert_eq!(
+            undecoded_type4_surface_bytes(&two).len(),
+            undecoded_type4_surface_bytes(&a).len() - TYPE4_PLANE_STRIDE,
+            "the span shrinks by exactly one plane record"
+        );
+
+        // A record too short to decode reports nothing rather than a partial
+        // span that would compare unequal against every real one.
+        assert!(undecoded_type4_surface_bytes(&a[..TYPE4_MIN_LEN - 1]).is_empty());
     }
 }
