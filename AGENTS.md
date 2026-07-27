@@ -90,6 +90,25 @@ during the previous case and still live is used by the next one in complete sile
 the failing case showed the same count as the working one, and the exclusion had to be struck. The
 same absence-is-not-evidence trap applies to any "we never saw a decline for it" argument.
 
+**A reason the caller writes is not a reading.** The most convincing thing in a log is a typed
+`reason=`, because it looks like the code telling you what happened. Check that it is. If the callee
+returns a bare `bool` and the *caller* supplies the word, the field carries the caller's assumption at
+full confidence, and it gets quoted back later as though it had been measured.
+
+An iteration here read `gva_write fail reason=not_contig` on a dropped writeback and reasoned about
+which fragmented spans could have produced it. The callee had six distinct refusals and returned
+`bool`; the caller printed `not_contig` for all six. The label was also impossible on its face — that
+writer goes one row at a time, the row was 512 bytes, and a write inside a single guest page cannot
+be non-contiguous. Typed and re-run, every instance was `gva_zero_pfn`: the guest's own page table
+had no mapping at flush time. The narrow conclusion drawn at the time happened to survive; the
+mechanism under it was unrelated, and the per-case correlation built from the same lines came out the
+other way round on re-measure.
+
+So before quoting a `reason=`, read its emission site and confirm the value came *from* the check
+that refused. If it did not, the fix is to make the callee carry its reason, not to reason harder
+about the label. The "one status for N checks" collapse the typed-decline work already ended regrows
+anywhere a `-> bool` crosses a module boundary.
+
 **Exclusions decay, and nobody re-tests them.** The anti-pattern list already forbids claiming a
 class is fixed from one clean boot. Negative results are exactly as fragile and strictly more
 dangerous, because a wrong fix gets found the next time someone looks at the screen while a wrong
