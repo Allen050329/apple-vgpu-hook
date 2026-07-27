@@ -1014,6 +1014,18 @@ pub struct PresentState {
     /// [`DeviceState::retention_gap_threshold`]. Cleared with membership on
     /// unmap.
     pub dense_frame_period: BTreeMap<u32, u64>,
+    /// Per compositor-output member: [`Self::dense_frame_counter`] at that
+    /// member's last full-frame **publish**.
+    ///
+    /// Deliberately separate from [`Self::dense_frame_seq`], which the
+    /// inter-buffer seed also advances (a seeded member inherits its source's
+    /// seq, because the seed genuinely gives it that frame). Deriving the
+    /// turnaround from `dense_frame_seq` therefore measures publish-since-seed
+    /// rather than publish-since-publish, and on a desktop that seeds on nearly
+    /// every flip it collapses to near zero — which silently degrades
+    /// [`DeviceState::retention_gap_threshold`] back to a bare margin. Only
+    /// publishes move this. Cleared with membership on unmap.
+    pub dense_frame_publish_seq: BTreeMap<u32, u64>,
     /// Coarse per-mid per-tile damage-epoch grid.
     /// `TILE_GEN_GRID_W × TILE_GEN_GRID_H` tiles; each cell holds the
     /// [`Self::tile_epoch`] at which THIS mid last drew into that tile. Absent
@@ -2377,10 +2389,13 @@ impl DeviceState {
         // Store across all members.
         self.present.dense_frame_counter = self.present.dense_frame_counter.saturating_add(1);
         let seq = self.present.dense_frame_counter;
-        if let Some(prev) = self.present.dense_frame_seq.insert(mapping_id, seq) {
-            // This member's turnaround: how many publishes by anyone landed
-            // between its own two turns. Bounds the lag it can show while
-            // perfectly current (see `retention_gap_threshold`).
+        self.present.dense_frame_seq.insert(mapping_id, seq);
+        // This member's turnaround: how many publishes by anyone landed between
+        // its own two turns. Bounds the lag it can show while perfectly current
+        // (see `retention_gap_threshold`). Measured against the previous
+        // *publish*, never against `dense_frame_seq` — the seed advances that
+        // too, which would measure publish-since-seed instead.
+        if let Some(prev) = self.present.dense_frame_publish_seq.insert(mapping_id, seq) {
             self.present
                 .dense_frame_period
                 .insert(mapping_id, seq.saturating_sub(prev));
@@ -2984,6 +2999,7 @@ impl DeviceState {
         // The measured turnaround goes with it: a recycled id would otherwise
         // widen its retention-gap threshold using a predecessor's rotation.
         self.present.dense_frame_period.remove(&mapping_id);
+        self.present.dense_frame_publish_seq.remove(&mapping_id);
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);

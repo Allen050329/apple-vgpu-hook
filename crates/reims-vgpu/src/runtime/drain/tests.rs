@@ -3877,3 +3877,31 @@ fn display_txn_probe_distinguishes_trailer_only_from_prefixed_payload() {
         );
     }
 }
+
+/// A present the dmabuf carried is not a black present.
+///
+/// Route B skips the full-frame GPU→CPU readback on purpose, so `frame_bgra` is
+/// empty by design and any `max_rgb == 0` test reports black on every present —
+/// a live boot logged 1338 `present_black_retain` records against 1312 presents.
+/// An always-on failure sink that fires on every healthy frame cannot surface the
+/// unhealthy one, so "no pixels" must be its own verdict rather than folded into
+/// "black".
+#[test]
+fn a_dmabuf_carried_present_is_unsampled_not_black() {
+    assert_eq!(
+        present_content_verdict(&[], 0),
+        PresentContentVerdict::Unsampled,
+        "no CPU pixels means no evidence, not evidence of black"
+    );
+    // A genuinely black sampled frame must still be caught — that is the record's
+    // whole purpose, and the fix must not trade one blind spot for another.
+    assert_eq!(
+        present_content_verdict(&[0, 0, 0, 255], 0),
+        PresentContentVerdict::Black,
+        "an opaque all-zero-RGB frame is still black"
+    );
+    assert_eq!(
+        present_content_verdict(&[0, 0, 0x40, 255], 0x40),
+        PresentContentVerdict::Content
+    );
+}

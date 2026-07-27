@@ -3347,6 +3347,64 @@ mod tests {
         );
     }
 
+    /// The measured turnaround must come from publish-to-publish, never from
+    /// `dense_frame_seq` — the seed advances that too.
+    ///
+    /// A seeded member inherits its source's seq, because the seed genuinely
+    /// gives it that frame. Deriving the turnaround from `dense_frame_seq`
+    /// therefore measures publish-since-*seed*, and a desktop that seeds on
+    /// nearly every flip drives it to near zero — which silently collapses
+    /// `retention_gap_threshold` back to a bare margin without any code change.
+    /// A live boot did exactly that: three members rotating at a steady lag of
+    /// 8-9 with peer_seeds ~0.97/present substituted on every single present.
+    #[test]
+    fn rotation_turnaround_is_measured_across_publishes_not_across_seeds() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 48u32);
+        const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
+        let rotation = [1u32, 2, 3];
+
+        for mid in rotation {
+            state.note_presented_geom(mid, w, h);
+        }
+        // Each member takes its turn, and between turns the other geometries
+        // publish — a turnaround well above the bare margin. After each turn the
+        // member is seeded from the freshest peer, exactly as the live desktop
+        // does on nearly every flip.
+        for _ in 0..5 {
+            for mid in rotation {
+                state.note_compositor_member_published(mid, w, h);
+                for filler in 0..(M - 1) {
+                    state.note_compositor_member_published(200 + filler as u32, 32, 32);
+                }
+                let _ = state.peer_needs_front_seed(mid, w, h, true, M);
+            }
+        }
+
+        let oldest = rotation[0];
+        let turnaround = state
+            .present
+            .dense_frame_period
+            .get(&oldest)
+            .copied()
+            .expect("a member that took two turns has a measured turnaround");
+        assert_eq!(
+            turnaround,
+            M * 3,
+            "the turnaround spans this member's own two publishes, seeds in between included"
+        );
+
+        let (_, named_seq, peer_seq) = state
+            .dense_retention_gap(oldest, w, h)
+            .expect("the member that published longest ago lags the freshest");
+        assert!(
+            peer_seq - named_seq < state.retention_gap_threshold(oldest, w, h, M),
+            "a seeding rotation must not substitute (lag {} vs threshold {})",
+            peer_seq - named_seq,
+            state.retention_gap_threshold(oldest, w, h, M)
+        );
+    }
+
     /// Presented-peer gate on the whole-frame retention-gap substitution (the
     /// intermittent a/b residue fix): a same-geometry compositor member that
     /// publishes full frames but has NEVER been displayed (a WebKit content tile /

@@ -170,6 +170,37 @@ fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &P
     ));
 }
 
+/// What the CPU-side capture can say about a present's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentContentVerdict {
+    /// No CPU pixels exist for this present, so nothing can be claimed.
+    Unsampled,
+    /// Sampled, and every pixel's RGB is zero.
+    Black,
+    /// Sampled, and something is visible.
+    Content,
+}
+
+/// Judge a present's captured frame.
+///
+/// An empty `frame_bgra` is **not** a black frame. When a dmabuf carries the
+/// present (route B), `capture_present_frame` deliberately skips the full-frame
+/// GPU→CPU readback and leaves the buffer empty, so a plain `max_rgb == 0` test
+/// reports black on every such present — 1338 `present_black_retain` records
+/// against 1312 presents on a live boot. That buries the always-on log under a
+/// wolf-cry and hides the genuinely black frame the record exists to catch,
+/// which is the opposite of what an always-on failure sink is for. With no
+/// pixels there is no evidence either way, so the absence has its own verdict.
+fn present_content_verdict(frame_bgra: &[u8], max_rgb: u8) -> PresentContentVerdict {
+    if frame_bgra.is_empty() {
+        PresentContentVerdict::Unsampled
+    } else if max_rgb == 0 {
+        PresentContentVerdict::Black
+    } else {
+        PresentContentVerdict::Content
+    }
+}
+
 /// Parsed FIFO packet (main + child share framing).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
@@ -1949,7 +1980,13 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 .unwrap_or(0);
             let (rgb_nz, max_rgb2, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
             let max_rgb = max_rgb.max(max_rgb2);
-            if max_rgb == 0 {
+            let verdict = present_content_verdict(&state.present.frame_bgra, max_rgb);
+            if verdict == PresentContentVerdict::Unsampled {
+                crate::observe::off(format!(
+                    "present_content_unsampled mid={mapping} {w}x{h} gen={gen} \
+                     (dmabuf carried the frame; no CPU pixels to judge)"
+                ));
+            } else if verdict == PresentContentVerdict::Black {
                 // Measure dual-mid: other same-geom host_caches with visible RGB
                 // while the named mid freezes black (console stays black).
                 let mut peers = String::new();
