@@ -77,6 +77,26 @@ sides and check that it separates them. Then check the converse — that it woul
 mechanism had it been present. A probe that cannot distinguish the cases is not evidence in either
 direction.
 
+**An event count is not a state.** Separating the cases is necessary and it is not sufficient: the
+line also has to measure the quantity your claim is about. An always-on log is a record of
+*transitions*, so a count of zero means "this did not happen during the window", never "this does not
+exist". Any claim of the form "the failing case never has X" needs a probe that reads X, not one that
+fires when X is created.
+
+This has cost two iterations here. A surface-attach line was sliced per case, showed a two-plane YUV
+surface in the working case and none in the failing one, and that became a standing exclusion. The
+line's own comment says it fires on first attach and re-fires per recycle — so a surface attached
+during the previous case and still live is used by the next one in complete silence. On re-measure
+the failing case showed the same count as the working one, and the exclusion had to be struck. The
+same absence-is-not-evidence trap applies to any "we never saw a decline for it" argument.
+
+**Exclusions decay, and nobody re-tests them.** The anti-pattern list already forbids claiming a
+class is fixed from one clean boot. Negative results are exactly as fragile and strictly more
+dangerous, because a wrong fix gets found the next time someone looks at the screen while a wrong
+exclusion just sits in a table telling future readers not to look there. Before a measurement becomes
+a standing exclusion, say which boot it came from and what it would take to overturn it — and when a
+later run happens to re-measure it, actually check.
+
 **A once-per-boot probe still attributes per case.** Deduplicated dumps look like they throw
 attribution away — one line per pipeline for the whole boot, so how would you know which case ran
 it? You know because *first appearance is the signal*: a dedup'd probe fires exactly when something
