@@ -81,11 +81,6 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
 /// Resolve the span's pages, match them against each deferred window's mapping
 /// pages, and flush the mappings that hit before the caller reads.
 /// Spans up to this many pages probe every page; larger spans probe sparsely.
-const GVA_ALIAS_FULL_PROBE_PAGES: u64 = 64;
-/// Probe stride (pages) for large spans. Real aliases are same-surface (the
-/// sampled texture IS the deferred surface), so the first page hits; the
-/// stride bounds the miss window for partial overlaps to `stride` pages.
-const GVA_ALIAS_PROBE_STRIDE_PAGES: u64 = 16;
 /// Bound for the per-bind no-intersection memo (`DeviceState::flush_nohit_memo`).
 /// The memo clears on every deferred-signature change, so it only holds the
 /// distinct `(task,gva,span)` binds seen at one signature — dozens in practice.
@@ -189,25 +184,15 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     }
     let page = state.page_size();
     let n_pages = ((gva % page) + span).div_ceil(page);
-    let full_walked = n_pages <= GVA_ALIAS_FULL_PROBE_PAGES;
-    let stride = if full_walked {
-        1
-    } else {
-        GVA_ALIAS_PROBE_STRIDE_PAGES
-    };
     let mut hits: Vec<u32> = Vec::new();
     let mut linear_hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = Vec::new();
     let mut gva_hits: Vec<u64> = Vec::new();
-    // Resolved gpa pages visited by the walk. Complete only on a no-hit full
-    // walk (the visitor early-exits once every window is hit), which is exactly
-    // when it is cached.
+    // Resolved gpa pages visited by the walk. Complete only on a no-hit walk
+    // (the visitor early-exits once every window is hit), which is exactly when
+    // it is cached.
     let mut visited_pages: Vec<u64> = Vec::new();
-    // Which visited page produced the first hit. `GVA_ALIAS_PROBE_STRIDE_PAGES`
-    // exists on the claim that "real aliases are same-surface, so the first page
-    // hits" — a claim that, if true, makes the stride's miss window unreachable
-    // and the constant itself removable, and if false makes it a correctness
-    // hole on a path that decides whether guest content is ordered. Nothing has
-    // ever read it. This does.
+    // Which page produced the first hit. The walk is complete, so this is the
+    // true first overlapping page rather than the next sample point after it.
     let mut first_hit_ordinal: Option<u64> = None;
     state.tranche.zc_flush_walk = state.tranche.zc_flush_walk.saturating_add(1);
     let t_walk = std::time::Instant::now();
@@ -223,7 +208,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             gva,
             span,
             state.page_shift,
-            stride,
+            1,
             &mut |gpa_page| {
                 visited_pages.push(gpa_page);
                 for (&mid, pages) in index.iter() {
@@ -258,14 +243,14 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         .saturating_add(t_walk.elapsed().as_nanos() as u64);
     let hit_ct = (hits.len() + linear_hits.len() + gva_hits.len()) as u64;
     if hit_ct == 0 {
-        // Non-intersecting. Cache the resolved pages (full walks only — a strided
-        // page set is incomplete and unsafe to re-check later).
-        if full_walked && state.flush_nohit_memo.len() < FLUSH_NOHIT_MEMO_CAP {
+        // Non-intersecting. Cache the resolved pages for the cheap re-check on a
+        // later signature change. The walk visits every page, so the set is
+        // complete and safe to re-check; that completeness is the whole reason
+        // the memo is sound.
+        if state.flush_nohit_memo.len() < FLUSH_NOHIT_MEMO_CAP {
             state
                 .flush_nohit_memo
                 .insert(memo_key, (sig, visited_pages));
-        } else if !full_walked {
-            state.flush_nohit_memo.remove(&memo_key);
         }
         if sampled_verify {
             state.tranche.zc_flush_skip = state.tranche.zc_flush_skip.saturating_add(1);
@@ -290,9 +275,8 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     // draws), so there is no flood risk and nothing to sample.
     crate::observe::fail(format!(
         "gva_alias_hit_page task={task_id} gva={gva:#x} span={span} first_hit_page={} \
-         stride={stride} n_pages={n_pages} full_walked={} hits={hit_ct}",
-        first_hit_ordinal.map_or(-1i64, |o| (o.saturating_mul(stride)) as i64),
-        u8::from(full_walked)
+         n_pages={n_pages} hits={hit_ct}",
+        first_hit_ordinal.map_or(-1i64, |o| o as i64)
     ));
     state.tranche.zc_flush_hits = state.tranche.zc_flush_hits.saturating_add(hit_ct);
     for mid in hits {
@@ -1508,11 +1492,46 @@ mod tests {
         );
     }
 
-    /// `GVA_ALIAS_PROBE_STRIDE_PAGES` rests on one sentence — "real aliases are
-    /// same-surface, so the first page hits" — and nothing has ever read whether
-    /// that holds. `gva_alias_hit_page` reads it, so it has to be able to tell a
-    /// page-0 hit from a later one; a probe that always said 0 would "confirm"
-    /// the claim while measuring nothing.
+    /// A large bind's alias must be found wherever it sits, not only where a
+    /// sample point happens to land.
+    ///
+    /// This walk used to sample every 16th page once a span passed 64 pages, on
+    /// the stated grounds that "real aliases are same-surface, so the first page
+    /// hits". Measured on the rail, no alias hit page 0 — the three observed
+    /// landed at 16, 32 and 48 of 127- and 256-page spans, i.e. partial overlaps
+    /// somewhere below each sample point. So the miss window was live, and this
+    /// is what falls through it: a 65-page bind overlapping a window on page 1
+    /// alone, which a stride of 16 steps straight over.
+    #[test]
+    fn a_large_bind_alias_is_found_off_the_sample_points() {
+        use crate::contract::endian::st32;
+        use crate::runtime::host::HostMemory;
+        let (mut host, mut state, root_gpa, page_shift) = memo_pt_fixture();
+        // 65 pages, so the old rule ran a strided walk. Page i -> pfn 0x4000+i.
+        const N: u64 = 65;
+        for i in 0..N {
+            let pfn = 0x4000 + i;
+            host.map_range(pfn << page_shift, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn as u32);
+            host.write_gpa(root_gpa + 4 * i, &pte).unwrap();
+        }
+        // The deferred window covers page 1 and nothing else. A stride-16 walk
+        // visits 0, 16, 32, 48, 64 — never 1.
+        state.arm_gva_deferred_window(0x9100_0000, gva_entry(1, 4, 4, &[0x4001u64 << page_shift]));
+        super::flush_intersecting_task_gva(&mut state, &mut host, 1, 0, N << page_shift);
+        assert!(
+            !state.gva_deferred_flush.contains_key(&0x9100_0000),
+            "a window aliasing page 1 of a 65-page bind must be found and flushed"
+        );
+    }
+
+    /// `gva_alias_hit_page` reports which page of a bind first overlapped a live
+    /// deferred window, and the walk exists to find every such overlap — so the
+    /// line has to be able to tell a page-0 hit from a later one. A probe that
+    /// always said 0 would look healthy while measuring nothing, and reading this
+    /// number is what refuted the "real aliases hit on the first page" claim that
+    /// a 1-in-16 sampled walk used to rest on.
     ///
     /// Same fixture, same two-page span, same window geometry — only which page
     /// the window sits on differs.
