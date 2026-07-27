@@ -216,7 +216,32 @@ pub(crate) struct HostImportRegion {
 /// objects while the byte cap prevents many maximum-size windows from pinning
 /// the guest's whole RAM allocation.
 const HOST_IMPORT_REGION_CAP: usize = 512;
-const HOST_IMPORT_TOTAL_BYTE_CAP: u64 = HOST_IMPORT_WINDOW_CAP;
+
+/// How many maximal [`HOST_IMPORT_WINDOW_CAP`] windows may be resident at once.
+///
+/// The byte cap has to admit **more than one** maximal window or the window
+/// bucketing is self-defeating: `capped_import_window` deliberately rounds a
+/// span up to its whole 1 GiB VMA bucket, so the first import spends the entire
+/// budget and every later span outside that one bucket declines
+/// `host_import_total_byte_cap` for the VM's lifetime. Regions are never
+/// evicted, so that decline is permanent — a live x86 boot showed exactly this:
+/// one `host_import_region len=0x40000000 regions=1`, then every import-present
+/// store falling back to `run_unimportable` and each deferred render window
+/// dying as `deferred_flush_lost kind=render reason=host_import_resolve`, which
+/// is what put the compositor's frames on screen as black.
+///
+/// The floor is structural: an import-present store maps every run of one
+/// surface and imports them all before its DMA, so a surface whose pages
+/// straddle several buckets needs all of them resident simultaneously. The
+/// value is the measured steady-state window count of an x86 macOS desktop
+/// (Finder + Safari on apple.com) rounded up to the next power of two — see the
+/// `host_import_region` census lines, which name every window as it is created.
+const HOST_IMPORT_WINDOW_BUDGET: u64 = 8;
+
+/// Ceiling on host pages pinned for GPU DMA. Bounded pinning is the standing
+/// rule (AGENTS.md): this stays a small multiple of the window, never the whole
+/// guest RAMBlock.
+const HOST_IMPORT_TOTAL_BYTE_CAP: u64 = HOST_IMPORT_WINDOW_CAP * HOST_IMPORT_WINDOW_BUDGET;
 
 fn host_import_budget(
     region_count: usize,
@@ -961,10 +986,37 @@ mod host_import_budget_tests {
     use super::{
         host_import_budget, host_scatter, present_stats_setup_decline, resolve_scatter_regions,
         terminal_host_import_error, DrawError, HostImportDecline, PresentStatsSetup, VkCall, VkOp,
-        HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP,
+        HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP, HOST_IMPORT_WINDOW_BUDGET,
+        HOST_IMPORT_WINDOW_CAP,
     };
     use crate::observe::Decline;
     use ash::vk;
+
+    /// The budget must admit more than one maximal window. `capped_import_window`
+    /// rounds a span up to its whole 1 GiB VMA bucket, so with a one-window
+    /// budget the first import spends all of it and every span in another bucket
+    /// declines forever (regions are never evicted). That is what left the x86
+    /// desktop's deferred render flushes dying on `host_import_resolve` and the
+    /// screen black.
+    #[test]
+    fn budget_admits_a_second_window_after_a_maximal_one() {
+        assert_eq!(
+            host_import_budget(1, HOST_IMPORT_WINDOW_CAP, HOST_IMPORT_WINDOW_CAP),
+            Ok(()),
+            "a second maximal window must still fit after the first"
+        );
+        // Bounded pinning is still the point of the window cap: the budget is a
+        // ceiling, not an invitation to grow into whole-RAMBlock territory.
+        assert_eq!(
+            host_import_budget(
+                HOST_IMPORT_WINDOW_BUDGET as usize,
+                HOST_IMPORT_TOTAL_BYTE_CAP,
+                1
+            ),
+            Err(HostImportDecline::TotalBytes),
+            "the budget must still be a ceiling once every window is resident"
+        );
+    }
 
     #[test]
     fn scatter_region_resolution_refuses_every_invalid_span_before_recording() {
