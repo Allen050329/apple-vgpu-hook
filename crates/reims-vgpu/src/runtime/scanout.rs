@@ -3333,6 +3333,61 @@ mod tests {
         assert_eq!(state.dense_retention_gap(1, w, h), Some((7, 1, 21)));
     }
 
+    /// A surface the guest names in a display transaction joins the output group
+    /// on that evidence alone — it does not also have to have tripped our
+    /// full-frame-publish detector.
+    ///
+    /// The transaction's plane-0 surface id is the guest stating that the
+    /// surface is the scanout source for the frame. `compositor_output_members`
+    /// is inferred from our own detectors, and requiring it too excluded
+    /// surfaces the guest genuinely scans out: they resolved to a private
+    /// `Surface` identity with no resident behind it while the group holding the
+    /// desktop was ready at the same geometry. Four live x86 boots recorded
+    /// exactly that — `export_present_miss outcome=orphan want=surface
+    /// geom=1920x1080 group=ready` — and a desktop black everywhere except the
+    /// rect the guest had just damaged.
+    ///
+    /// The never-displayed publisher stays out, on better evidence than before:
+    /// it publishes full frames but is never *named*, so it has no
+    /// `presented_at` entry and cannot join.
+    #[test]
+    fn a_named_surface_joins_the_output_group_without_a_publish_edge() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (1920u32, 1080u32);
+
+        // A proven swapchain geometry: two surfaces already named there.
+        state.note_presented_geom(1, w, h);
+        state.note_presented_geom(4, w, h);
+        assert_eq!(state.output_group_for(1, w, h), Some(1));
+
+        // Mid 9 is a swapchain buffer the guest rotates in and names, but which
+        // never tripped the full-frame-publish detector — it is not in
+        // `compositor_output_members`. It must still resolve to the group.
+        assert!(!state.present.compositor_output_members.contains_key(&9));
+        state.note_presented_geom(9, w, h);
+        assert_eq!(
+            state.output_group_for(9, w, h),
+            Some(1),
+            "the guest named mid 9 as plane 0; that IS the evidence it is a display plane"
+        );
+
+        // A full-frame publisher the guest never names stays out, so its
+        // unrelated content is never chained onto the desktop's resident.
+        state.note_compositor_member_published(7, w, h);
+        assert!(state.present.compositor_output_members.contains_key(&7));
+        assert_eq!(
+            state.output_group_for(7, w, h),
+            None,
+            "publishing full frames is not the same as being scanned out"
+        );
+
+        // A geometry the guest has only ever named one surface at has no pair to
+        // unify, so it stays per-mid.
+        let (ow, oh) = (640u32, 480u32);
+        state.note_presented_geom(11, ow, oh);
+        assert_eq!(state.output_group_for(11, ow, oh), None);
+    }
+
     /// The display action that first unifies a swapchain member MOVES where that
     /// member's content lives, after the draws that produced the frame already
     /// went somewhere else.

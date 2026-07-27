@@ -2659,49 +2659,60 @@ impl DeviceState {
         }
         self.present.presented_geoms.insert(mapping_id, (w, h));
         // Latch the geometry as a proven multi-buffer swapchain the first time
-        // two distinct members are presented there (see `output_group_geoms`).
-        // The latch is sticky, so a later buffer recycle that momentarily leaves
-        // a single concurrently-presented member cannot collapse the group.
+        // the guest has named two distinct surfaces there (see
+        // `output_group_geoms`). The latch is sticky, so a later buffer recycle
+        // that momentarily leaves a single presented surface cannot collapse
+        // the group.
         if !self.present.output_group_geoms.contains(&(w, h))
-            && self.presented_member_count(w, h) >= 2
+            && self.presented_count(w, h) >= 2
         {
             self.present.output_group_geoms.insert((w, h));
         }
     }
 
-    /// Number of distinct compositor-output members currently presented at
-    /// `w`x`h` (the arming condition for [`Self::output_group_for`]).
-    fn presented_member_count(&self, w: u32, h: u32) -> usize {
+    /// Number of distinct surfaces the guest has named in a display transaction
+    /// at `w`x`h` (the arming condition for [`Self::output_group_for`]).
+    fn presented_count(&self, w: u32, h: u32) -> usize {
         self.present
-            .compositor_output_members
-            .iter()
-            .filter(|(&mid, m)| m.width == w && m.height == h && self.presented_at(mid, w, h))
+            .presented_geoms
+            .values()
+            .filter(|&&geom| geom == (w, h))
             .count()
     }
 
-    /// Group id when `mapping_id` is a proven compositor-output member at
-    /// `w`x`h`, has been **presented** at that geometry, AND at least one
-    /// OTHER presented member shares it — the members then act as alternating
-    /// storage for ONE logical framebuffer (guest copy-swap contract) and
-    /// every member resolves to the shared `TargetIdentity::OutputGroup`.
-    /// A single-member geometry stays per-mid (no pair, nothing to unify).
-    /// The presented gate keeps sampled sub-surfaces (WebKit content tiles,
-    /// scrollbars — full-frame publishers that are never displayed) out of
-    /// groups: unifying those chains DISTINCT surfaces onto one resident
-    /// (the Safari-scroll black-band class).
+    /// Group id when `mapping_id` has been **presented** at `w`x`h` and at least
+    /// one OTHER surface has been presented at the same geometry — the two then
+    /// act as alternating storage for ONE logical framebuffer (guest copy-swap
+    /// contract) and every one of them resolves to the shared
+    /// `TargetIdentity::OutputGroup`. A geometry only ever presented from one
+    /// surface stays per-mid: no pair, nothing to unify.
     ///
-    /// Membership is granted once the geometry is a proven swapchain (two
-    /// members presented there, latched in [`PresentState::output_group_geoms`])
-    /// OR a same-geometry peer is presented alongside this member right now. The
-    /// latch keeps a member unified across the buffer recycles that otherwise
-    /// dropped the concurrent peer count to one and re-exposed a per-mid
-    /// resident (the black-background class); the live peer check still arms the
-    /// group on the very first frame two members appear together.
+    /// **The admission criterion is the decoded display transaction, and nothing
+    /// else.** [`Self::presented_at`] records that the guest named this surface
+    /// as plane 0 of a display transaction at this geometry, which is the guest
+    /// stating outright that the surface is the scanout source for that frame.
+    /// There is no stronger evidence available, and in particular it is stronger
+    /// than `compositor_output_members`, which is *inferred* from our own
+    /// full-frame-publish detector and resource-graph edges. Requiring both
+    /// excluded surfaces the guest genuinely scans out but which never tripped
+    /// the publish detector: they resolved to a private `Surface` identity with
+    /// no resident behind it, and the export declined
+    /// (`export_present_miss outcome=orphan … group=ready` — the group holding
+    /// the desktop was ready at the same geometry the whole time) leaving a
+    /// desktop black everywhere except the rect the guest had just damaged.
+    ///
+    /// It also keeps sampled sub-surfaces out, and for a better reason than
+    /// before: a WebKit content tile or scrollbar publishes full frames but is
+    /// never *named in a display transaction*, so it has no `presented_at` entry
+    /// and cannot join. Unifying those would chain distinct surfaces onto one
+    /// resident (the Safari-scroll black-band class).
+    ///
+    /// The geometry latch ([`PresentState::output_group_geoms`]) keeps a surface
+    /// unified across buffer recycles that momentarily drop the concurrent peer
+    /// count to one and would otherwise re-expose a per-mid resident (the
+    /// black-background class); the live peer check still arms the group on the
+    /// very first frame two surfaces appear together.
     pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
-        let member = self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != w || member.height != h {
-            return None;
-        }
         if !self.presented_at(mapping_id, w, h) {
             return None;
         }
@@ -2710,11 +2721,9 @@ impl DeviceState {
         }
         let peers = self
             .present
-            .compositor_output_members
+            .presented_geoms
             .iter()
-            .filter(|(&mid, m)| {
-                mid != mapping_id && m.width == w && m.height == h && self.presented_at(mid, w, h)
-            })
+            .filter(|(&mid, &geom)| mid != mapping_id && geom == (w, h))
             .count();
         (peers >= 1).then_some(1)
     }
