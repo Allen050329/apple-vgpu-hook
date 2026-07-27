@@ -913,8 +913,15 @@ pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
 /// calling the class "a transient (re)wire gap" — one of the four, asserted for
 /// all of them. 106 render-flush losses across 73 boots carry that slug and none
 /// of them says which state produced it. Each check now owns its own:
+/// - `revalidate_condemned` — `DeleteIOSurfaceBacking2` moved the page list into
+///   `condemned_entries` and no resolve has re-adopted it. The guest deleted the
+///   backing; there is nothing safe to write through.
 /// - `revalidate_no_internal` — no `MappingInternal`, so **no resolve was ever
-///   attempted**. Says nothing about whether the pages exist.
+///   attempted**, and the page list is empty for some other reason. Note that a
+///   zero `mapping_internal` is NOT itself a sign of missing backing: measured on
+///   the rail, 2280 render windows in one boot were armed on mappings with
+///   `mapping_internal == 0` and `page_entries.len() == 2040`, and all but two
+///   flushed normally, because a non-empty page list returns `None` above.
 /// - `revalidate_resolve_miss` — resolve ran and missed, with no live page table
 ///   to condemn (so not `resolve_fail`).
 /// - `revalidate_empty_after_resolve` — resolve ran and *succeeded*, and the page
@@ -976,6 +983,7 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     match state.mappings.get(&mapping_id) {
         Some(m) if m.mapped && !m.page_entries.is_empty() => None,
         Some(m) if !m.mapped => Some("revalidate_unmapped_late"),
+        Some(m) if m.condemned_entries.is_some() => Some("revalidate_condemned"),
         Some(_) if !resolve_ran => Some("revalidate_no_internal"),
         Some(_) if !resolve_ok => Some("revalidate_resolve_miss"),
         Some(_) => Some("revalidate_empty_after_resolve"),
@@ -1420,6 +1428,19 @@ mod revalidate_tests {
         assert_eq!(
             revalidate_mapping_reason(&mut state, &host, 3),
             Some("revalidate_unmapped")
+        );
+        // A condemned backing is empty for a REASON the guest gave us
+        // (DeleteIOSurfaceBacking2 stashed the page list), which is a different
+        // answer from "the page list happens to be empty" and must not share its
+        // slug — a deferred window flushing here has nothing safe to write
+        // through, rather than nothing resolved yet.
+        state.map_surface(5);
+        state.mappings.get_mut(&5).unwrap().page_entries =
+            vec![(0x200 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.condemn_surface_backing(5));
+        assert_eq!(
+            revalidate_mapping_reason(&mut state, &host, 5),
+            Some("revalidate_condemned")
         );
         // A resolvable static page list → success (None).
         state.map_surface(4);
