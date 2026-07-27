@@ -5535,23 +5535,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     && load_action == Some(PASS_LOAD_ACTION_LOAD)
                     && crate::runtime::census::present_proxy::has_converged()
                 {
-                    // Deliberately the BARE margin, not the rotation-scaled
-                    // threshold the capture substitution uses
-                    // (`DeviceState::retention_gap_threshold`). The two guards
-                    // read the same lag and have opposite failure modes.
-                    //
-                    // Substituting a peer for the surface the guest named is
-                    // wrong whenever the named surface is merely waiting its turn
-                    // in the rotation, so that guard has to discount the
-                    // rotation's depth. The seed is the reverse: a member one
-                    // rotation behind is *precisely* one whose undamaged regions
-                    // still hold the frame from its previous turn, and the guest
-                    // is about to render only a damage rect into it. Discounting
-                    // rotation depth here withholds the seed for exactly the
-                    // members that need it — a live boot rotating 3 members at a
-                    // steady lag of 4 stopped seeding entirely, and the desktop
-                    // decayed into "only the regions the user forces a re-render
-                    // on are correct" once idle let the gap accumulate.
+                    // The margin is deliberately bare, never discounted by the
+                    // rotation's depth. A member one rotation behind is
+                    // *precisely* one whose undamaged regions still hold the
+                    // frame from its previous turn, and the guest is about to
+                    // render only a damage rect into it. Discounting rotation
+                    // depth withholds the seed from exactly the members that need
+                    // it — a live boot rotating 3 members at a steady lag of 4
+                    // stopped seeding entirely, and the desktop decayed into
+                    // "only the regions the user forces a re-render on are
+                    // correct" once idle let the gap accumulate.
                     //
                     // A needless seed copies one full frame; a withheld one loses
                     // the whole screen outside the damage rect.

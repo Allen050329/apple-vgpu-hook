@@ -1886,63 +1886,24 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // toolbar-only dual-mid under app load). Mid-writeback Stores
         // must not recapture here — present boundary only.
         //
-        // Torn/stale-capture guard, DIRECT-named form (arm64 A/B ping-pong
-        // class): a Composite-named present may name a double-buffer member
-        // whose full-frame Store sequence lags its same-geometry peer by a RUN
-        // (>= RETENTION_GAP_MARGIN) — a buffer that missed its full redraws
-        // (e.g. they failed while the engine was degraded) and has received
-        // only damage-region updates since; capturing it ping-pongs a stale
-        // body onto the console every other present. Substitute the
-        // full-frame-freshest peer as the capture source, exactly like the
-        // ClearOnly store_fifo/graph path above. Keyed only on decoded
-        // full-frame-Store sequences (protocol state), never pixel content;
-        // healthy 1-lag double-buffer alternation stays far below the margin.
-        // Always-on backing gate, on the mid the GUEST named (before any
-        // substitution below): a member presented twice with no full-frame
+        // Always-on backing gate: a member presented twice with no full-frame
         // Store and no inter-buffer seed in between is being displayed with
-        // content it never received. The substitution that follows may paper
-        // over it on screen; the loss is still real and belongs in the log.
+        // content it never received. That is a real loss of guest work and
+        // belongs in the log; nothing here papers over it.
         if let Some(seq) = state.note_present_backing(mapping) {
             crate::observe::fail(format!(
                 "present_unbacked mid={mapping} {w}x{h} gen={gen} since_seq={seq} \
                  (no full-frame store and no peer seed since this mid's last present)"
             ));
         }
-        // The threshold tracks the rotation's depth: `dense_frame_seq` comes from
-        // one global counter, so a healthy K-member rotation already separates
-        // its oldest and freshest members by K-1 with nothing stale about either.
-        let gap_threshold = state.retention_gap_threshold(
-            mapping,
-            w,
-            h,
-            crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN,
-        );
-        let (capture_mid, capture_gen) = match state.dense_retention_gap(mapping, w, h) {
-            Some((denser_mid, named_seq, denser_seq))
-                if denser_seq >= named_seq + gap_threshold =>
-            {
-                let denser_gen = state
-                    .mappings
-                    .get(&denser_mid)
-                    .map(|m| m.content_generation)
-                    .unwrap_or(gen);
-                let peer_presented = state.presented_at(denser_mid, w, h);
-                crate::runtime::census::present_proxy::note_stale_present_substitute(
-                    mapping,
-                    named_seq,
-                    denser_mid,
-                    denser_seq,
-                    w,
-                    h,
-                    "named_composite",
-                    peer_presented,
-                );
-                (denser_mid, gen.max(denser_gen))
-            }
-            _ => (mapping, gen),
-        };
-        let encoded =
-            crate::runtime::scanout::capture_present_frame(state, capture_mid, w, h, capture_gen);
+        // The transaction payload carries exactly one field: plane 0's surface
+        // id. So the capture source is the surface the guest named, and no
+        // comparison between our own full-frame sequences may override it.
+        // Presenting a "denser" same-geometry peer instead shows a buffer one
+        // rotation step behind the one the guest asked for — residue when a
+        // window closed in between, a stale region when one moved, thrash as
+        // the choice oscillates.
+        let encoded = crate::runtime::scanout::capture_present_frame(state, mapping, w, h, gen);
         if !encoded {
             // Retry encode at first host paint. Do **not** clear
             // frame_valid: PGDisplay keeps the prior presentFrame
@@ -1953,20 +1914,15 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             {
                 #[cfg(test)]
                 let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                crate::runtime::census::present_proxy::note_capture_fail(
-                    capture_mid,
-                    w,
-                    h,
-                    capture_gen,
-                );
+                crate::runtime::census::present_proxy::note_capture_fail(mapping, w, h, gen);
             }
             let (pages, mapped, fmt) = state
                 .mappings
-                .get(&capture_mid)
+                .get(&mapping)
                 .map(|m| (m.page_entries.len(), m.mapped as u8, m.format))
                 .unwrap_or((0, 0, 0));
             crate::observe::fail(format!(
-                "present capture fail mid={capture_mid} named={mapping} {w}x{h} gen={capture_gen} \
+                "present capture fail mid={mapping} {w}x{h} gen={gen} \
                  keep_prior={} pages={pages} mapped={mapped} fmt={fmt:#x}",
                 state.present.frame_valid as u8
             ));

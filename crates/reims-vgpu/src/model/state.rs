@@ -981,7 +981,7 @@ pub struct PresentState {
     /// full-frame Store and the inter-buffer seed has a stale seq: it is
     /// presenting content it never received. A presented member whose seq lags a
     /// same-geometry peer by a margin is the a/b inter-buffer retention gap
-    /// — the `dense_retention_gap` guard. Cleared with
+    /// ([`Self::dense_retention_gap`]), which the peer seed closes. Cleared with
     /// membership on unmap.
     pub dense_frame_seq: BTreeMap<u32, u64>,
     /// Per compositor-output member: the [`Self::dense_frame_seq`] value that
@@ -991,8 +991,8 @@ pub struct PresentState {
     /// seed, so a member whose seq is unchanged across two of its own presents
     /// received neither between them — it is being shown content it never
     /// received. That is the always-on `present_unbacked` gate for the
-    /// mixed-generation frame class, which the `dense_retention_gap` /
-    /// `stale_subst` counters only ever measured as a substitution rate. Keyed
+    /// mixed-generation frame class — the loss itself, reported on the mid the
+    /// guest named, rather than a rate at which we papered over it. Keyed
     /// per member (not globally) so healthy a/b alternation, where each buffer
     /// legitimately advances on its own turn, stays quiet. Cleared with
     /// membership on unmap.
@@ -1000,32 +1000,6 @@ pub struct PresentState {
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
-    /// Per compositor-output member: how far [`Self::dense_frame_counter`]
-    /// advanced between this member's two most recent full-frame publishes —
-    /// its own turnaround in the rotation.
-    ///
-    /// This is what makes a `dense_frame_seq` lag interpretable. The counter is
-    /// global and every member at *every* geometry bumps it, so a member's
-    /// healthy lag behind the freshest peer is bounded by how many publishes
-    /// happen between its own turns, which no per-geometry member count can
-    /// predict. Measuring it per member is self-calibrating: it needs no
-    /// assumption about how many buffers rotate, at what geometries, or how
-    /// often the other outputs publish. See
-    /// [`DeviceState::retention_gap_threshold`]. Cleared with membership on
-    /// unmap.
-    pub dense_frame_period: BTreeMap<u32, u64>,
-    /// Per compositor-output member: [`Self::dense_frame_counter`] at that
-    /// member's last full-frame **publish**.
-    ///
-    /// Deliberately separate from [`Self::dense_frame_seq`], which the
-    /// inter-buffer seed also advances (a seeded member inherits its source's
-    /// seq, because the seed genuinely gives it that frame). Deriving the
-    /// turnaround from `dense_frame_seq` therefore measures publish-since-seed
-    /// rather than publish-since-publish, and on a desktop that seeds on nearly
-    /// every flip it collapses to near zero — which silently degrades
-    /// [`DeviceState::retention_gap_threshold`] back to a bare margin. Only
-    /// publishes move this. Cleared with membership on unmap.
-    pub dense_frame_publish_seq: BTreeMap<u32, u64>,
     /// Coarse per-mid per-tile damage-epoch grid.
     /// `TILE_GEN_GRID_W × TILE_GEN_GRID_H` tiles; each cell holds the
     /// [`Self::tile_epoch`] at which THIS mid last drew into that tile. Absent
@@ -2384,22 +2358,12 @@ impl DeviceState {
         }
         // Protocol-structural dense marker: this member now holds a complete
         // full-frame. Advance its `dense_frame_seq` so a peer that never got a
-        // full frame (nor a seed) shows up as lagging (measure-only; the
-        // `dense_retention_gap` guard). The counter is monotonic per full-frame
-        // Store across all members.
+        // full frame (nor a seed) shows up as lagging to the peer seed and to
+        // the retention proxies. The counter is monotonic per full-frame Store
+        // across all members.
         self.present.dense_frame_counter = self.present.dense_frame_counter.saturating_add(1);
         let seq = self.present.dense_frame_counter;
         self.present.dense_frame_seq.insert(mapping_id, seq);
-        // This member's turnaround: how many publishes by anyone landed between
-        // its own two turns. Bounds the lag it can show while perfectly current
-        // (see `retention_gap_threshold`). Measured against the previous
-        // *publish*, never against `dense_frame_seq` — the seed advances that
-        // too, which would measure publish-since-seed instead.
-        if let Some(prev) = self.present.dense_frame_publish_seq.insert(mapping_id, seq) {
-            self.present
-                .dense_frame_period
-                .insert(mapping_id, seq.saturating_sub(prev));
-        }
     }
 
     /// Advance the per-present tile-epoch clock and return the new value. Call
@@ -2529,13 +2493,20 @@ impl DeviceState {
             .contains_key(&mapping_id)
     }
 
-    /// Measure-only: if `mapping_id` (presented at `w`×`h`) is a compositor
-    /// member whose last full frame lags a same-geometry peer, return
-    /// `(peer_mid, presented_seq, peer_seq)` for the peer holding the freshest
-    /// full frame. A large lag is the a/b inter-buffer retention gap
-    ///: the presented buffer is showing content it never
-    /// received (no full-frame Store, no seed). NEVER gates present/seed — the
-    /// `dense_retention_gap` guard's margin + dedup live in `present_proxy`.
+    /// The same-geometry presented peer of `mapping_id` holding the freshest
+    /// full frame: `(peer_mid, presented_seq, peer_seq)`, when that peer is
+    /// strictly ahead.
+    ///
+    /// The lag this reports is **not** a staleness measure on its own.
+    /// `dense_frame_counter` is a single global counter bumped once per
+    /// full-frame publish by *any* member at *any* geometry, so a member that
+    /// just took its turn already sits a whole turnaround behind the one that
+    /// published last with nothing stale about either. It must never decide
+    /// *which* surface to present: the transaction names plane 0's surface id
+    /// and that is the only correct capture source. Its one production reader is
+    /// the peer seed, where a member one rotation behind is exactly the case the
+    /// seed exists for — its undamaged regions still hold its previous turn's
+    /// frame while the guest renders only a damage rect into it.
     ///
     /// The peer set is scoped to same-geometry members that have themselves been
     /// **presented** at this geometry ([`Self::presented_at`]) — the SAME gate
@@ -2544,79 +2515,11 @@ impl DeviceState {
     /// output group. Without it, two *distinct logical outputs* at the same
     /// resolution — the desktop swapchain and a never-presented publisher that
     /// happens to composite full 1920×1080 frames — would share one peer set, and
-    /// the freshest-full-frame substitution could hand a publisher's frame to a
-    /// real output on a transition (the intermittent a/b residue / stale-tile
-    /// class). The invariant is pathway-independent: a buffer the guest has never
-    /// chosen to display is never a valid substitute *for* a displayed output nor
-    /// a valid seed *source* into one. Genuine swapchain siblings all get
-    /// presented as they alternate as front, so they stay in the set; the arm64
-    /// A/B stale-member substitution still fires (its fresh peer is a presented
-    /// sibling — see the drain-site test
-    /// `composite_named_present_substitutes_fresh_peer_for_stale_member`).
-    /// How many same-geometry members are taking turns receiving full frames —
-    /// the members [`Self::dense_retention_gap`] compares against each other.
-    ///
-    /// Counts only members that have themselves been presented at this geometry,
-    /// matching that function's peer gate, plus `mapping_id` itself when it
-    /// qualifies as a member.
-    pub fn dense_rotation_depth(&self, mapping_id: u32, w: u32, h: u32) -> u64 {
-        if w == 0 || h == 0 {
-            return 0;
-        }
-        self.present
-            .compositor_output_members
-            .iter()
-            .filter(|(&mid, m)| {
-                m.width == w && m.height == h && (mid == mapping_id || self.presented_at(mid, w, h))
-            })
-            .count() as u64
-    }
-
-    /// The `dense_frame_seq` lag beyond which a member is genuinely behind,
-    /// rather than merely waiting for its turn in the rotation.
-    ///
-    /// `dense_frame_counter` is a **single global counter** bumped once per
-    /// full-frame publish by *any* member at *any* geometry, so the gap between
-    /// two members' sequences grows with how busy the rotation is, not with how
-    /// stale either one is. A member that just took its turn already sits a whole
-    /// turnaround behind the one that published last, with nothing stale about
-    /// either. A fixed threshold therefore only holds for the two-member,
-    /// single-output case it was written against: a live x86 desktop rotated 3
-    /// same-geometry members at a steady lag of 4 against a margin of 4, so every
-    /// present substituted.
-    ///
-    /// The baseline is the member's own turnaround
-    /// ([`PresentState::dense_frame_period`]) — measured, not predicted, because
-    /// members at other geometries bump the same counter and no per-geometry
-    /// member count can account for them. [`Self::dense_rotation_depth`] gives a
-    /// floor for members that have not yet completed two turns. `margin` keeps
-    /// its original meaning on top: how many full frames a member must miss
-    /// *beyond* its own turn before it counts as having a retention gap.
-    ///
-    /// **This is for the capture substitution only — never for the peer seed**
-    /// ([`Self::peer_needs_front_seed`], which takes its margin explicitly). Both
-    /// read the same lag, but their failure modes are opposite. Substituting a
-    /// peer for the surface the guest named is wrong whenever the named surface
-    /// is merely waiting its turn, so that guard must discount rotation depth. A
-    /// member one rotation behind is exactly one whose undamaged regions still
-    /// hold its previous turn's frame while the guest renders only a damage rect
-    /// into it — so discounting rotation depth there withholds the seed from
-    /// precisely the members that need it, and the desktop decays to "only what
-    /// the user forces a re-render on is correct". A needless seed copies one
-    /// full frame; a withheld one loses the whole screen outside the damage rect.
-    pub fn retention_gap_threshold(&self, mapping_id: u32, w: u32, h: u32, margin: u64) -> u64 {
-        let turnaround = self
-            .present
-            .dense_frame_period
-            .get(&mapping_id)
-            .copied()
-            .unwrap_or(0);
-        let floor = self
-            .dense_rotation_depth(mapping_id, w, h)
-            .saturating_sub(1);
-        turnaround.max(floor).saturating_add(margin)
-    }
-
+    /// a publisher's frame could be seeded into a real output on a transition
+    /// (the intermittent a/b residue / stale-tile class). The invariant is
+    /// pathway-independent: a buffer the guest has never chosen to display is
+    /// never a valid seed *source* into one. Genuine swapchain siblings all get
+    /// presented as they alternate as front, so they stay in the set.
     pub fn dense_retention_gap(&self, mapping_id: u32, w: u32, h: u32) -> Option<(u32, u64, u64)> {
         if mapping_id == 0 || w == 0 || h == 0 {
             return None;
@@ -2996,10 +2899,6 @@ impl DeviceState {
         // Prune the dense-frame seq too (mirrors peer_seeded_dense_seq): a
         // recycled mapping id must not inherit a stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
-        // The measured turnaround goes with it: a recycled id would otherwise
-        // widen its retention-gap threshold using a predecessor's rotation.
-        self.present.dense_frame_period.remove(&mapping_id);
-        self.present.dense_frame_publish_seq.remove(&mapping_id);
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);

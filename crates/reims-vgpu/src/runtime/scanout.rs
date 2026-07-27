@@ -3190,109 +3190,22 @@ mod tests {
         assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 7, 8)));
     }
 
-    /// The retention-gap threshold has to grow with the number of members taking
-    /// turns, because `dense_frame_seq` is sampled from one global counter.
+    /// The peer seed must fire at the lag a healthy steady rotation produces.
     ///
-    /// With K members rotating, the member that published longest ago sits K-1
-    /// behind the freshest one while every buffer is perfectly current — so a
-    /// fixed threshold is only safe for the two-member case the original guard
-    /// was written against. A live x86 desktop rotates up to 7 same-geometry
-    /// members, and at K=7 the healthy baseline lag is 6 against a bare margin of
-    /// 4: every present substitutes, which is the thrash/residue class
-    /// (`stale_present_substitute` fired 57290 times in one session, p50 lag 6).
-    #[test]
-    fn retention_gap_threshold_scales_with_rotation_depth() {
-        let (w, h) = (64u32, 48u32);
-        const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-
-        // A round-robin over `depth` members, each publishing once per cycle,
-        // for enough cycles that every member has a settled sequence.
-        let rotate = |depth: u32| {
-            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-            let members: Vec<u32> = (1..=depth).collect();
-            for _ in 0..4 {
-                for &mid in &members {
-                    state.note_compositor_member_published(mid, w, h);
-                    state.note_presented_geom(mid, w, h);
-                }
-            }
-            state
-        };
-
-        for depth in 2u32..=7 {
-            let state = rotate(depth);
-            // The member that just took its turn is the oldest one: the whole
-            // rest of the rotation has published since.
-            let oldest = 1u32;
-            let (peer, named_seq, peer_seq) = state
-                .dense_retention_gap(oldest, w, h)
-                .expect("a rotating member always lags the one that published last");
-            let lag = peer_seq - named_seq;
-            assert_eq!(
-                lag,
-                (depth - 1) as u64,
-                "depth {depth}: healthy round-robin separates oldest from freshest \
-                 (peer {peer}) by exactly depth-1"
-            );
-            assert_eq!(
-                state.dense_rotation_depth(oldest, w, h),
-                depth as u64,
-                "depth {depth}: every same-geometry presented member counts"
-            );
-            assert!(
-                lag < state.retention_gap_threshold(oldest, w, h, M),
-                "depth {depth}: a fully current rotation must never trip the gap \
-                 (lag {lag} vs threshold {})",
-                state.retention_gap_threshold(oldest, w, h, M)
-            );
-            // Pin the defect this guards, so the regression is visible here and
-            // not only on a live desktop: comparing the same lag against the bare
-            // margin substitutes on every present once the rotation is deep
-            // enough, which is what the fixed threshold used to do.
-            assert_eq!(
-                lag >= M,
-                depth as u64 > M,
-                "depth {depth}: the bare margin's verdict on a healthy rotation"
-            );
-        }
-
-        // The threshold must still catch a member that genuinely stops receiving
-        // full frames — the case the guard exists for. Park mid 1 and let the
-        // other six keep rotating until it is a full margin beyond its turn.
-        let mut state = rotate(7);
-        let parked = 1u32;
-        let before = state.dense_retention_gap(parked, w, h).unwrap().1;
-        for _ in 0..M {
-            for mid in 2u32..=7 {
-                state.note_compositor_member_published(mid, w, h);
-            }
-        }
-        let (_, named_seq, peer_seq) = state.dense_retention_gap(parked, w, h).unwrap();
-        assert_eq!(named_seq, before, "the parked member received no full frame");
-        assert!(
-            peer_seq - named_seq >= state.retention_gap_threshold(parked, w, h, M),
-            "a member that stops receiving full frames must still trip the gap"
-        );
-    }
-
-    /// The capture substitution and the peer seed read the same lag and must NOT
-    /// share a threshold — their failure modes are opposite.
-    ///
-    /// Substituting a peer for the surface the guest named is wrong whenever the
-    /// named surface is merely waiting its turn, so that guard discounts the
-    /// rotation's depth. The seed is the reverse: a member one rotation behind is
-    /// exactly one whose undamaged regions still hold its previous turn's frame
-    /// while the guest renders only a damage rect into it. Scaling the seed's
-    /// margin the same way withholds it from precisely the members that need it —
-    /// a live boot rotating 3 members at a steady lag of 4 stopped seeding
-    /// altogether, and the desktop decayed into "only the regions the user forces
-    /// a re-render on are correct" once idle let the gap accumulate.
+    /// `dense_frame_seq` comes from one global counter that every member at
+    /// every geometry bumps, so a member that just took its turn already sits a
+    /// whole turnaround behind the freshest one. That member is exactly the one
+    /// the seed exists for: its undamaged regions still hold its previous turn's
+    /// frame while the guest renders only a damage rect into it. Raising the
+    /// seed's margin to discount rotation depth withheld it from precisely those
+    /// members on a live boot — three members at a steady lag of 4 stopped
+    /// seeding altogether and the desktop decayed into "only the regions the
+    /// user forces a re-render on are correct".
     ///
     /// A needless seed copies one full frame; a withheld one loses the whole
-    /// screen outside the damage rect. This pins the asymmetry at the exact lag a
-    /// steady rotation produces.
+    /// screen outside the damage rect.
     #[test]
-    fn steady_rotation_seeds_retention_without_substituting_the_named_surface() {
+    fn steady_rotation_seeds_retention_at_the_rotation_lag() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (w, h) = (64u32, 48u32);
         const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
@@ -3317,104 +3230,37 @@ mod tests {
         let (_, named_seq, peer_seq) = state
             .dense_retention_gap(oldest, w, h)
             .expect("the member that published longest ago lags the freshest");
-        let lag = peer_seq - named_seq;
-        assert_eq!(lag, M * 2, "steady three-member rotation at margin-sized steps");
-
-        // The substitution must stay quiet: nothing here is stale.
-        assert!(
-            lag < state.retention_gap_threshold(oldest, w, h, M),
-            "a steady rotation must not substitute (lag {lag} vs threshold {})",
-            state.retention_gap_threshold(oldest, w, h, M)
+        assert_eq!(
+            peer_seq - named_seq,
+            M * 2,
+            "steady three-member rotation at margin-sized steps"
         );
 
-        // The seed must still fire at that same lag, or the member the guest is
-        // about to damage-render into never receives the rest of the screen.
         assert_eq!(
             state.peer_needs_front_seed(oldest, w, h, true, M),
             Some(3),
             "a member a rotation behind must be seeded from the freshest peer"
         );
 
-        // ...and it would NOT fire under the substitution's scaled threshold,
-        // which is the regression this asymmetry exists to prevent.
-        let scaled = state.retention_gap_threshold(oldest, w, h, M);
-        let mut scaled_state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        std::mem::swap(&mut scaled_state, &mut state);
+        // Discounting the rotation would withhold it — the corruption class.
+        let discounted = (peer_seq - named_seq).saturating_add(1);
+        let mut fresh = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        std::mem::swap(&mut fresh, &mut state);
         assert_eq!(
-            scaled_state.peer_needs_front_seed(oldest, w, h, true, scaled),
+            fresh.peer_needs_front_seed(oldest, w, h, true, discounted),
             None,
-            "scaling the seed's margin withholds it from a steady rotation — the corruption class"
+            "a margin above the rotation lag withholds the seed from a healthy rotation"
         );
     }
 
-    /// The measured turnaround must come from publish-to-publish, never from
-    /// `dense_frame_seq` — the seed advances that too.
-    ///
-    /// A seeded member inherits its source's seq, because the seed genuinely
-    /// gives it that frame. Deriving the turnaround from `dense_frame_seq`
-    /// therefore measures publish-since-*seed*, and a desktop that seeds on
-    /// nearly every flip drives it to near zero — which silently collapses
-    /// `retention_gap_threshold` back to a bare margin without any code change.
-    /// A live boot did exactly that: three members rotating at a steady lag of
-    /// 8-9 with peer_seeds ~0.97/present substituted on every single present.
-    #[test]
-    fn rotation_turnaround_is_measured_across_publishes_not_across_seeds() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (64u32, 48u32);
-        const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-        let rotation = [1u32, 2, 3];
-
-        for mid in rotation {
-            state.note_presented_geom(mid, w, h);
-        }
-        // Each member takes its turn, and between turns the other geometries
-        // publish — a turnaround well above the bare margin. After each turn the
-        // member is seeded from the freshest peer, exactly as the live desktop
-        // does on nearly every flip.
-        for _ in 0..5 {
-            for mid in rotation {
-                state.note_compositor_member_published(mid, w, h);
-                for filler in 0..(M - 1) {
-                    state.note_compositor_member_published(200 + filler as u32, 32, 32);
-                }
-                let _ = state.peer_needs_front_seed(mid, w, h, true, M);
-            }
-        }
-
-        let oldest = rotation[0];
-        let turnaround = state
-            .present
-            .dense_frame_period
-            .get(&oldest)
-            .copied()
-            .expect("a member that took two turns has a measured turnaround");
-        assert_eq!(
-            turnaround,
-            M * 3,
-            "the turnaround spans this member's own two publishes, seeds in between included"
-        );
-
-        let (_, named_seq, peer_seq) = state
-            .dense_retention_gap(oldest, w, h)
-            .expect("the member that published longest ago lags the freshest");
-        assert!(
-            peer_seq - named_seq < state.retention_gap_threshold(oldest, w, h, M),
-            "a seeding rotation must not substitute (lag {} vs threshold {})",
-            peer_seq - named_seq,
-            state.retention_gap_threshold(oldest, w, h, M)
-        );
-    }
-
-    /// Presented-peer gate on the whole-frame retention-gap substitution (the
-    /// intermittent a/b residue fix): a same-geometry compositor member that
-    /// publishes full frames but has NEVER been displayed (a WebKit content tile /
-    /// offscreen scratch surface at the desktop resolution) is not a swapchain
-    /// sibling of the real output, so [`DeviceState::dense_retention_gap`] must
-    /// never select it as the fresh substitute — capturing a never-displayed
-    /// publisher hands its unrelated content to a real output (the residue on a
-    /// live x86 boot: `stale_present_substitute … peer_presented=0`). The gate is
-    /// precisely presented-ness: once the publisher is itself displayed it
-    /// (correctly) rejoins the peer set.
+    /// Presented-peer gate on the whole-frame retention gap (the intermittent a/b
+    /// residue fix): a same-geometry compositor member that publishes full frames
+    /// but has NEVER been displayed (a WebKit content tile / offscreen scratch
+    /// surface at the desktop resolution) is not a swapchain sibling of the real
+    /// output, so [`DeviceState::dense_retention_gap`] must never name it as the
+    /// fresh peer — seeding from a never-displayed publisher copies its unrelated
+    /// content into a real output. The gate is precisely presented-ness: once the
+    /// publisher is itself displayed it (correctly) rejoins the peer set.
     #[test]
     fn dense_retention_gap_excludes_never_presented_same_geometry_publisher() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);

@@ -1444,14 +1444,16 @@ fn clear_only_present_substitutes_fresh_peer_for_starved_fifo_member() {
     );
 }
 
-/// Direct Composite-named present (no ClearOnly pairing): a named member
-/// whose full-frame Store sequence lags its same-geometry peer by a run
-/// (>= RETENTION_GAP_MARGIN) is substituted by that peer — the arm64 A/B
-/// stale-body ping-pong class (one double-buffer member missed its full
-/// redraws and received only damage-region updates since). A healthy 1-lag
-/// alternation stays below the margin and captures the named member.
+/// Direct Composite-named present (no ClearOnly pairing): the transaction
+/// payload carries exactly one thing — plane 0's surface id — so the only
+/// correct capture source is the surface the guest named. No comparison
+/// between our own full-frame sequences may override it, however far the
+/// named member's sequence lags a same-geometry peer's. Substituting the
+/// "denser" peer is what shows a buffer one rotation step behind the one the
+/// guest asked for: residue when a window closed in between, a stale region
+/// when one moved, and visible thrash as the choice oscillates.
 #[test]
-fn composite_named_present_substitutes_fresh_peer_for_stale_member() {
+fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
@@ -1525,30 +1527,38 @@ fn composite_named_present_substitutes_fresh_peer_for_stale_member() {
         );
     };
 
-    // Healthy 1-lag alternation: both members publish, gap below margin —
-    // the named member is captured, no substitution.
+    // Healthy alternation: both members publish, the named member is captured.
     state.note_compositor_member_published(5, w, h);
     state.note_compositor_member_published(1, w, h);
     present_named(&mut state, &mut host, 5);
     assert_eq!(
         state.present.frame_mapping, 5,
-        "healthy alternation captures the named member"
+        "alternation captures the named member"
     );
     assert_eq!(state.present.frame_bgra[0], 0x55);
 
-    // Build the stale run: mid 1 publishes RETENTION_GAP_MARGIN+2 full
-    // frames while mid 5 receives none. Naming mid 5 now substitutes mid 1.
-    for _ in 0..(RETENTION_GAP_MARGIN + 2) {
+    // Drive the named member's full-frame sequence arbitrarily far behind its
+    // peer's: mid 1 publishes a long run while mid 5 receives none. The guest
+    // still names mid 5, so mid 5 is still what goes on screen.
+    for _ in 0..(RETENTION_GAP_MARGIN * 8 + 2) {
         state.note_compositor_member_published(1, w, h);
     }
+    let (peer, named_seq, peer_seq) = state
+        .dense_retention_gap(5, w, h)
+        .expect("mid 1 is a same-geometry presented peer of mid 5");
+    assert_eq!(peer, 1);
+    assert!(
+        peer_seq - named_seq > RETENTION_GAP_MARGIN,
+        "the lag this test needs is present: {peer_seq} - {named_seq}"
+    );
     present_named(&mut state, &mut host, 5);
     assert_eq!(
-        state.present.frame_mapping, 1,
-        "stale named member substituted by the full-frame-freshest peer"
+        state.present.frame_mapping, 5,
+        "the guest named mid 5; no sequence comparison may substitute a peer"
     );
     assert_eq!(
-        state.present.frame_bgra[0], 0x11,
-        "captured the fresh peer's content, not the stale member's pages"
+        state.present.frame_bgra[0], 0x55,
+        "captured the named member's content, not the peer's"
     );
 }
 
