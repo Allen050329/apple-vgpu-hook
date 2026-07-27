@@ -468,8 +468,24 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
     }
-    crate::runtime::mapper::flush_retired_views(state, host);
     let page_size = state.page_size();
+    // Fragmented span: `map_pages` can only alias page `i` at `base + i*page`
+    // inside one RAMBlock, so a gapped GPA list can never build a single packed
+    // view. Asking anyway spends an FFI call to be refused, and the refusal
+    // lands in the always-on failure log as `qemu_map_pages_callback_failed`.
+    // Decline here — quietly — so the caller takes its documented per-run
+    // multi-import fallback (the rgba8 store / `write_span`). A genuine
+    // `map_pages` refusal over a *packed* list below stays fail-visible. Mirrors
+    // the same pre-check `ensure_gva_view` already applies.
+    if !is_single_packed_run(&gpas, page_size) {
+        crate::observe::off(format!(
+            "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={} (map_fresh_span)",
+            gpas.len(),
+            contig_page_runs(&gpas, page_size).len()
+        ));
+        return None;
+    }
+    crate::runtime::mapper::flush_retired_views(state, host);
     let page_sz = page_size as usize;
     let ptr_base = host.map_pages(&gpas, page_sz)?;
     let map_len = gpas.len().saturating_mul(page_sz);
@@ -827,6 +843,40 @@ mod tests {
         assert_eq!(back, [5, 6, 7, 8], "write must follow the live PT");
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4], "stale page must not be touched");
+    }
+
+    /// A fragmented span handed to `map_fresh_span` must be declined in Rust,
+    /// exactly like `ensure_gva_view` — never a failing `map_pages` FFI call
+    /// whose -1 pollutes the always-on failure log as
+    /// `qemu_map_pages_callback_failed`. The caller's per-run multi-import
+    /// fallback (rgba8 store / `write_span`) still lands the content.
+    #[test]
+    fn fragmented_map_fresh_span_declines_without_asking_map_pages() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        // Wire PTE[1] → data1 (pfn 10) so the two-page span is gapped.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let before = host.map_pages_calls;
+        assert!(
+            map_fresh_span(&mut state, &mut host, 1, page - 4, 8).is_none(),
+            "a gapped span has no packed whole-span view"
+        );
+        assert_eq!(
+            host.map_pages_calls, before,
+            "the fragmented case must be answered in Rust, not by a failing FFI call"
+        );
+
+        // The packed case still goes to the host and still resolves.
+        let before = host.map_pages_calls;
+        let s = map_fresh_span(&mut state, &mut host, 1, 8, 4).expect("packed span maps");
+        assert!(s.avail >= 4);
+        unmap_fresh_span(&mut host, s);
+        assert_eq!(host.map_pages_calls, before + 1);
     }
 
     /// map_fresh_span re-walks per call: after a PT rewire, writes through
