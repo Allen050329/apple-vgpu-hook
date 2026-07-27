@@ -964,6 +964,17 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     }
     let grouped = matches!(identity, TargetIdentity::OutputGroup { .. });
     let member_map_generation = m.map_generation as u64;
+    // A deferred window is an obligation to write these guest pages later. Only
+    // `mapper::adopt_plan` ever fills `page_entries`, and it requires a non-zero
+    // `mapping_internal`, so a zero one means the adopt path has never run for
+    // this mapping and it has never had a resolved page list. At flush time
+    // `revalidate_mapping_reason` will answer `revalidate_no_internal` without
+    // attempting a resolve, and `render_flush_one` reports the content lost.
+    // Whether the backing arrives between the arm and the trigger is the open
+    // question, so this counts the arms to compare against the losses carrying
+    // that slug — equal counts would mean every such arm is doomed when made.
+    let armed_unbacked = m.mapping_internal == 0;
+    let pages_at_arm = m.page_entries.len();
     let fmt = if m.format != 0 {
         m.format
     } else {
@@ -1030,6 +1041,11 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     crate::observe::line(format!(
         "render_writeback_deferred mapping={mapping_id} {width}x{height} gen={map_generation} off={base_off} span_end={span_end}"
     ));
+    if armed_unbacked {
+        crate::observe::off(format!(
+            "render_deferred_armed_unbacked mapping={mapping_id} {width}x{height} gen={map_generation} pages_at_arm={pages_at_arm}"
+        ));
+    }
     // Measure-only consume census: this deferred window is now pending. Whether
     // it is later flushed (a consumer read the pages) or superseded (dropped
     // unread) is the signal for whether the writeback is elidable under dmabuf.
