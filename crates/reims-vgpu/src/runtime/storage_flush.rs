@@ -381,6 +381,69 @@ pub fn flush_gva_exact<M: HostMemory + HostOps>(
     flush_gva_one(state, host, gva, &entry, guest_write, trigger)
 }
 
+/// Does this window's GVA still resolve to the pages it was armed with?
+///
+/// `entry.pages` is the whole point of the page-alias trigger: a new guest write
+/// is matched against it to decide the window must land first, so that two
+/// writers to the same guest memory are ordered. It was recorded when the window
+/// was armed, and nothing re-checks it. If the guest has since re-pointed
+/// `[gva, gva+span)` at different pages, then the alias matched pages this window
+/// no longer owns *and* the write that follows lands in whatever owns `gva` now —
+/// the stale-view class, with our own bookkeeping as the stale part.
+///
+/// §8.53/§8.54 measured only the case where the guest zeroed the PTEs, which is
+/// caught by [`crate::runtime::host::MemError::is_guest_teardown`]. Whether a
+/// window's pages can move while still resolving has never been measured, and a
+/// guard for an unmeasured hazard is a guess. So this reads and reports; it does
+/// not decide. A silent counter would be worth nothing, and this cannot flood:
+/// only the alias/read triggers reach it, ten times in a repro boot.
+#[cfg(feature = "backend-vulkan")]
+fn report_window_page_drift<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+    trigger: &str,
+) {
+    let span = entry.span();
+    if span == 0 || entry.pages.is_empty() {
+        return;
+    }
+    let mut live = std::collections::HashSet::new();
+    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        entry.task_id,
+        gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            live.insert(gpa_page);
+            true
+        },
+    );
+    // An empty or short walk is the teardown case the writer below names
+    // precisely; reporting it here too would double-count it under a reason that
+    // does not fit.
+    if live.len() < entry.pages.len() {
+        return;
+    }
+    if live == entry.pages {
+        return;
+    }
+    crate::observe::fail(format!(
+        "deferred_window_page_drift gva={gva:#x} task={} {}x{} trigger={trigger} \
+         armed_pages={} live_pages={} moved={}",
+        entry.task_id,
+        entry.width,
+        entry.height,
+        entry.pages.len(),
+        live.len(),
+        entry.pages.difference(&live).count()
+    ));
+}
+
 /// Land a taken deferred GVA render-Store window: engine resident target →
 /// guest pages (when `guest_write` and the span is still map-covered) +
 /// `host_gva_surfaces`/texture encode caches (always). Unpins the resident
@@ -417,6 +480,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
     if guest_write && state.gva_write_allowed(entry.task_id, gva, entry.span()) {
+        report_window_page_drift(state, host, gva, entry, trigger);
         guest = match crate::runtime::metal_draw::write_gva_rgba8(
             state,
             host,
@@ -1524,6 +1588,74 @@ mod tests {
         assert_eq!(flushed, 1, "exactly the aliased GVA window");
         assert!(!state.gva_deferred_flush.contains_key(&0x9000_0000));
         assert!(state.gva_deferred_flush.contains_key(&0x9100_0000));
+    }
+
+    /// The page-drift probe must distinguish the cases it exists to separate.
+    ///
+    /// A probe that reports nothing is indistinguishable from a probe that
+    /// cannot fire, and this codebase has already paid for three of those. So
+    /// drive both controls through the same fixture: a window whose GVA still
+    /// resolves to its armed pages must stay silent, and one whose pages moved
+    /// under it must produce the line — same task, same geometry, only the
+    /// armed set differs.
+    #[test]
+    fn window_page_drift_probe_fires_on_drift_and_is_silent_without_it() {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let (dir_gpa, root_gpa, data0) = (2 * page, 3 * page, 4 * page);
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+
+        crate::observe::redirect_logs_for_tests();
+        let drift_lines = |from: usize| -> usize {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .get(from..)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("deferred_window_page_drift "))
+                .count()
+        };
+        let mark = || {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len()
+        };
+
+        // Negative control: armed on the page the GVA resolves to right now.
+        let at = mark();
+        super::report_window_page_drift(
+            &state,
+            &host,
+            0,
+            &gva_entry(1, 4, 4, &[data0]),
+            "gva_alias",
+        );
+        assert_eq!(drift_lines(at), 0, "a window that did not move must be quiet");
+
+        // Positive control: same window, armed on a page it no longer maps to.
+        let at = mark();
+        super::report_window_page_drift(
+            &state,
+            &host,
+            0,
+            &gva_entry(1, 4, 4, &[9 * page]),
+            "gva_alias",
+        );
+        assert_eq!(drift_lines(at), 1, "a window whose pages moved must report");
     }
 
     /// Task teardown moves the task's GVA windows to the retired list (model)
