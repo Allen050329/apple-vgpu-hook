@@ -2483,6 +2483,25 @@ impl DeviceState {
     ///: the presented buffer is showing content it never
     /// received (no full-frame Store, no seed). NEVER gates present/seed — the
     /// `dense_retention_gap` guard's margin + dedup live in `present_proxy`.
+    ///
+    /// Known boundary (the residual intermittent-residue class): the peer set is
+    /// every same-GEOMETRY compositor member, and membership + `output_group_for`
+    /// unification are geometry-keyed. Two *distinct logical outputs* at the same
+    /// resolution — the desktop swapchain and a full-screen app / video surface,
+    /// both 1920×1080 — therefore land in one group, so the freshest-full-frame
+    /// substitution can hand one output's frame to the other during a transition
+    /// (the residue / stale-tile the tile-composite layer then usually, but not
+    /// always, patches). This cannot be tightened with any signal decoded today:
+    /// genuine swap siblings are DISTINCT IOSurfaces (page identity differs like
+    /// a wrong output's would), the guest legitimately names stale/never-presented
+    /// buffers (so guest-name and `last_store_seq` gates both refuse the arm64 A/B
+    /// stale-member substitution this exists to make — see the drain-site test
+    /// `composite_named_present_substitutes_fresh_peer_for_stale_member`), and the
+    /// one edge that WOULD separate outputs, `CompositorOutputMember::source`
+    /// lineage, is `0` for store-created members (the common case). A correct fix
+    /// must first decode/propagate that source lineage to store members, then
+    /// scope the peer set to one lineage — a change that needs a live residue
+    /// reproduction and arm64 validation to land without regressing the A/B fix.
     pub fn dense_retention_gap(&self, mapping_id: u32, w: u32, h: u32) -> Option<(u32, u64, u64)> {
         if mapping_id == 0 || w == 0 || h == 0 {
             return None;
