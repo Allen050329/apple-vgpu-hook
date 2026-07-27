@@ -5636,12 +5636,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 });
                 let peer_front_seed = peer_seed_source.is_some();
                 if peer_front_seed {
+                    // A seed is a full-frame GPU copy, and it only runs when the
+                    // target is NOT in an output group (grouped targets share the
+                    // source's resident and are elided just above). Reporting
+                    // that split makes `peer_seeds/presents` readable: near 1
+                    // with every seed ungrouped means the path is paying one
+                    // full-screen blit per present because the buffers never
+                    // unified — an ownership question, not a rendering-speed one.
                     // Telemetry only: counts every seed for the `peer_seeds=`
                     // summary field. No flood alarm — the margin gate (unit-tested)
                     // is the every-flip-regression guard, and legitimate multi-video
                     // seeding is thousands/boot. Cheap counter, runs on the drain
                     // worker.
-                    crate::runtime::census::present_proxy::note_peer_front_seed();
+                    crate::runtime::census::present_proxy::note_peer_front_seed(matches!(
+                        identity,
+                        crate::backend::vulkan::engine::types::TargetIdentity::OutputGroup { .. }
+                    ));
                 }
                 let presented_since_last_draw = same_mid_present || peer_front_seed;
                 // If the resident image is unavailable, guest pages are the

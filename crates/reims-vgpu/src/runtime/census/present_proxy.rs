@@ -295,6 +295,18 @@ struct ThrashState {
     /// flood alarm — the margin gate + its unit test are the regression guard (see
     /// `note_peer_front_seed`).
     peer_seeds: u64,
+    /// Of [`Self::peer_seeds`], how many seeded a target that was NOT in an
+    /// output group.
+    ///
+    /// A seed is a full-frame GPU copy. Members of one group share a resident,
+    /// so a seed between two of them is elided; every seed that actually runs
+    /// therefore has an ungrouped target, and this should equal `peer_seeds`.
+    /// If it does not, the elision is leaking and that is a bug. If it does —
+    /// and `peer_seeds/presents` is near 1, as a 3040-present animated session
+    /// measured — then the render path is paying one full-screen blit per
+    /// present to compensate for buffers that never unified, which is the
+    /// performance story and not a rendering-speed problem.
+    peer_seeds_ungrouped: u64,
     /// Large-mapping type-11 zero-copy fallbacks (composite sampled guest
     /// pages because no current-generation resident was ready). Always-on
     /// black-band discriminator: `rect_void` firing while the recent ring is
@@ -518,6 +530,7 @@ impl ThrashState {
             stale_online_pending: 0,
             stale_online_logged: false,
             peer_seeds: 0,
+            peer_seeds_ungrouped: 0,
             t11_fb_total: 0,
             t11_fb_ring: [None; T11_FB_RING],
             t11_fb_next: 0,
@@ -3386,7 +3399,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
         st.last_summary_ms = now_ms;
         st.last_summary_presents = st.presents;
         thrash_line(&format!(
-            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} tile_comp={} tile_comp_skip={} stale_subst={} peer_seeds={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
+            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} tile_comp={} tile_comp_skip={} stale_subst={} peer_seeds={} seed_ungrouped={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
             st.presents,
             present_hz,
             st.mid_switches,
@@ -3407,6 +3420,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
             st.tile_composite_skipped,
             st.stale_present_substitute,
             st.peer_seeds,
+            st.peer_seeds_ungrouped,
             st.first_dense_seen as u8,
             st.post_converge_regress,
             st.stale_online_pending,
@@ -3706,6 +3720,9 @@ pub struct ThrashCounters {
     /// Distinct a/b inter-buffer retention-gap episodes (structural sibling of
     /// `selected_peer_divergence`; see [`note_dense_retention_gap`]).
     pub dense_retention_gap: u64,
+    /// Peer-seed fires whose target was NOT in an output group — i.e. the ones
+    /// that actually performed a full-frame copy.
+    pub peer_seeds_ungrouped: u64,
     /// Distinct route-B peer-copy results for tile-divergence episodes.
     pub tile_composite_applied: u64,
     pub tile_composite_skipped: u64,
@@ -3752,9 +3769,12 @@ pub fn has_converged() -> bool {
 /// removed/bypassed margin is caught at test time; the runtime alarm added no
 /// coverage and cried wolf on every active-workload boot. Runs on the
 /// render/drain worker, never the QEMU main loop. Returns the running count.
-pub fn note_peer_front_seed() -> u64 {
+pub fn note_peer_front_seed(target_grouped: bool) -> u64 {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     st.peer_seeds = st.peer_seeds.saturating_add(1);
+    if !target_grouped {
+        st.peer_seeds_ungrouped = st.peer_seeds_ungrouped.saturating_add(1);
+    }
     st.peer_seeds
 }
 
@@ -3796,6 +3816,7 @@ pub fn counters() -> ThrashCounters {
         damage_hole_bg: st.damage_hole_bg,
         selected_peer_divergence: st.selected_peer_divergence,
         dense_retention_gap: st.dense_retention_gap,
+        peer_seeds_ungrouped: st.peer_seeds_ungrouped,
         tile_composite_applied: st.tile_composite_applied,
         tile_composite_skipped: st.tile_composite_skipped,
         converged: st.first_dense_seen,
@@ -4194,10 +4215,18 @@ mod tests {
         let _g = test_lock();
         reset_for_test();
         let mut last = 0;
-        for _ in 0..500 {
-            last = note_peer_front_seed();
+        for i in 0..500 {
+            last = note_peer_front_seed(i % 5 == 0);
         }
         assert_eq!(last, 500, "every fire is counted (telemetry)");
+        // A seed only runs when the target is ungrouped (a grouped target shares
+        // the source's resident and is elided before this call), so the split is
+        // what makes the total readable rather than just large.
+        assert_eq!(
+            counters().peer_seeds_ungrouped,
+            400,
+            "the ungrouped-target split is counted separately"
+        );
         let log = std::fs::read_to_string(observe::fail_log_path()).unwrap_or_default();
         assert!(
             !log.contains("peer_seed_flood"),
