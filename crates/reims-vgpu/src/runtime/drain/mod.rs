@@ -1571,8 +1571,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                                 .get(&denser_mid)
                                 .map(|m| m.content_generation)
                                 .unwrap_or(peer_gen);
+                            let peer_presented = state.presented_at(denser_mid, w, h);
                             crate::runtime::census::present_proxy::note_stale_present_substitute(
                                 peer_mid, mine_seq, denser_mid, denser_seq, w, h, mode,
+                                peer_presented,
                             );
                             peer_mid = denser_mid;
                             peer_gen = peer_gen.max(denser_gen);
@@ -1767,6 +1769,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                     .get(&denser_mid)
                     .map(|m| m.content_generation)
                     .unwrap_or(gen);
+                let peer_presented = state.presented_at(denser_mid, w, h);
                 crate::runtime::census::present_proxy::note_stale_present_substitute(
                     mapping,
                     named_seq,
@@ -1775,6 +1778,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                     w,
                     h,
                     "named_composite",
+                    peer_presented,
                 );
                 (denser_mid, gen.max(denser_gen))
             }

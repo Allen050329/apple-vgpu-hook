@@ -1646,6 +1646,7 @@ pub fn note_stale_present_substitute(
     width: u32,
     height: u32,
     mode: &str,
+    peer_presented: bool,
 ) -> bool {
     if denser_seq <= selected_seq {
         return false;
@@ -1657,9 +1658,15 @@ pub fn note_stale_present_substitute(
     st.stale_subst_active.insert(selected_mid, denser_seq);
     st.stale_present_substitute = st.stale_present_substitute.saturating_add(1);
     drop(st);
+    // `peer_presented` separates the two populations this substitution serves:
+    // a genuine swapchain sibling has itself been presented at this geometry
+    // (`presented_at`), whereas a never-presented full-frame publisher (a WebKit
+    // content tile / offscreen scratch surface) has not — substituting the
+    // latter hands one logical output's frame to another (the residue class).
     thrash_line(&format!(
-        "stale_present_substitute selected_mid={selected_mid} selected_seq={selected_seq} denser_mid={denser_mid} denser_seq={denser_seq} lag={} mode={mode} {width}x{height}",
-        denser_seq - selected_seq
+        "stale_present_substitute selected_mid={selected_mid} selected_seq={selected_seq} denser_mid={denser_mid} denser_seq={denser_seq} lag={} mode={mode} peer_presented={} {width}x{height}",
+        denser_seq - selected_seq,
+        peer_presented as u8
     ));
     true
 }

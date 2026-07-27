@@ -1384,6 +1384,10 @@ fn clear_only_present_substitutes_fresh_peer_for_starved_fifo_member() {
     assert!(crate::runtime::scanout::note_linear_compositor_output(
         &mut state, 1, w, h, 11
     ));
+    // mid 1 is a genuine swapchain sibling displayed as it alternates as front;
+    // mark it presented so the presented-peer gate keeps it eligible as the fresh
+    // substitute (a never-displayed publisher is excluded — the residue guard).
+    state.note_presented_geom(1, w, h);
     let starved = vec![0x55u8; need];
     assert!(write_bgra8(
         &mut state, &mut host, 5, &starved, stride, w, h
@@ -1492,6 +1496,12 @@ fn composite_named_present_substitutes_fresh_peer_for_stale_member() {
     assert!(crate::runtime::scanout::note_linear_compositor_output(
         &mut state, 5, w, h, 12
     ));
+    // Both members are genuine swapchain buffers that alternate as the presented
+    // front. Mark mid 1 displayed once at this geometry so the presented-peer gate
+    // in `dense_retention_gap` keeps it eligible as the fresh substitute — a buffer
+    // the guest never displays (a WebKit content tile / offscreen publisher) is NOT
+    // a valid substitute, which is the intermittent-residue guard this gate adds.
+    state.note_presented_geom(1, w, h);
     state.present.valid = true;
     state.present.width = w;
     state.present.height = h;

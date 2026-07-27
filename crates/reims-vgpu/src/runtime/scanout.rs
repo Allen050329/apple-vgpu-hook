@@ -2993,6 +2993,11 @@ mod tests {
 
         state.note_compositor_member_published(1, w, h); // seq[1]=1
         state.note_compositor_member_published(4, w, h); // seq[4]=2
+        // Genuine swapchain siblings both reach the display as they alternate;
+        // mark each presented so the presented-peer gate keeps them mutually
+        // eligible as seed sources (a never-displayed publisher is not a source).
+        state.note_presented_geom(1, w, h);
+        state.note_presented_geom(4, w, h);
         assert!(state.is_compositor_output_member(1));
         assert!(state.is_compositor_output_member(4));
 
@@ -3075,6 +3080,8 @@ mod tests {
         for _ in 0..=M {
             state.note_compositor_member_published(4, w, h); // seq[4] ≥ margin above seq[1]
         }
+        // Re-map pruned mid 4's presented witness; it reaches the display again.
+        state.note_presented_geom(4, w, h);
         assert_eq!(
             state.peer_needs_front_seed(4, w, h, true, M),
             None,
@@ -3101,6 +3108,12 @@ mod tests {
 
         state.note_compositor_member_published(1, w, h); // dense_seq[1]=1
         state.note_compositor_member_published(4, w, h); // dense_seq[4]=2
+        // Both are genuine swapchain siblings that alternate as the presented
+        // front — mark each displayed at this geometry so the presented-peer gate
+        // in `dense_retention_gap` (which excludes never-displayed publishers)
+        // keeps them in each other's peer set.
+        state.note_presented_geom(1, w, h);
+        state.note_presented_geom(4, w, h);
 
         // mid 4 is the freshest (seq 2); mid 1 lags by exactly 1 — healthy a/b
         // alternation. The raw query reports any positive lag; the margin that
@@ -3148,6 +3161,9 @@ mod tests {
             "an unmapped mid is no longer a member"
         );
         state.note_compositor_member_published(4, w, h);
+        // Re-map pruned mid 4's presented witness; it is displayed again on its
+        // next flip.
+        state.note_presented_geom(4, w, h);
         assert_eq!(
             state.dense_retention_gap(4, w, h),
             None,
@@ -3155,6 +3171,42 @@ mod tests {
         );
         // ...and now mid 1 (seq 7) is the one lagging the fresh mid 4 (seq 8).
         assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 7, 8)));
+    }
+
+    /// Presented-peer gate on the whole-frame retention-gap substitution (the
+    /// intermittent a/b residue fix): a same-geometry compositor member that
+    /// publishes full frames but has NEVER been displayed (a WebKit content tile /
+    /// offscreen scratch surface at the desktop resolution) is not a swapchain
+    /// sibling of the real output, so [`DeviceState::dense_retention_gap`] must
+    /// never select it as the fresh substitute — capturing a never-displayed
+    /// publisher hands its unrelated content to a real output (the residue on a
+    /// live x86 boot: `stale_present_substitute … peer_presented=0`). The gate is
+    /// precisely presented-ness: once the publisher is itself displayed it
+    /// (correctly) rejoins the peer set.
+    #[test]
+    fn dense_retention_gap_excludes_never_presented_same_geometry_publisher() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (1920u32, 1080u32);
+
+        // mid 1: the real displayed output. mid 7: a never-presented publisher
+        // that composites full frames far faster (a Safari content layer).
+        state.note_compositor_member_published(1, w, h); // seq[1]=1
+        state.note_presented_geom(1, w, h);
+        for _ in 0..20 {
+            state.note_compositor_member_published(7, w, h); // seq[7] → 21, never presented
+        }
+
+        // The real output does NOT lag a phantom peer: the publisher is excluded.
+        assert_eq!(
+            state.dense_retention_gap(1, w, h),
+            None,
+            "a never-displayed publisher must not be a retention-gap peer"
+        );
+
+        // Once the publisher is itself displayed, it is a genuine sibling and the
+        // gap re-appears — the gate keys on presented-ness alone, nothing else.
+        state.note_presented_geom(7, w, h);
+        assert_eq!(state.dense_retention_gap(1, w, h), Some((7, 1, 21)));
     }
 
     /// Regression guard for `present_dims`, the scanout sizing lookup. The
