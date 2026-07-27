@@ -1000,6 +1000,20 @@ pub struct PresentState {
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
+    /// Per compositor-output member: how far [`Self::dense_frame_counter`]
+    /// advanced between this member's two most recent full-frame publishes —
+    /// its own turnaround in the rotation.
+    ///
+    /// This is what makes a `dense_frame_seq` lag interpretable. The counter is
+    /// global and every member at *every* geometry bumps it, so a member's
+    /// healthy lag behind the freshest peer is bounded by how many publishes
+    /// happen between its own turns, which no per-geometry member count can
+    /// predict. Measuring it per member is self-calibrating: it needs no
+    /// assumption about how many buffers rotate, at what geometries, or how
+    /// often the other outputs publish. See
+    /// [`DeviceState::retention_gap_threshold`]. Cleared with membership on
+    /// unmap.
+    pub dense_frame_period: BTreeMap<u32, u64>,
     /// Coarse per-mid per-tile damage-epoch grid.
     /// `TILE_GEN_GRID_W × TILE_GEN_GRID_H` tiles; each cell holds the
     /// [`Self::tile_epoch`] at which THIS mid last drew into that tile. Absent
@@ -2363,7 +2377,14 @@ impl DeviceState {
         // Store across all members.
         self.present.dense_frame_counter = self.present.dense_frame_counter.saturating_add(1);
         let seq = self.present.dense_frame_counter;
-        self.present.dense_frame_seq.insert(mapping_id, seq);
+        if let Some(prev) = self.present.dense_frame_seq.insert(mapping_id, seq) {
+            // This member's turnaround: how many publishes by anyone landed
+            // between its own two turns. Bounds the lag it can show while
+            // perfectly current (see `retention_gap_threshold`).
+            self.present
+                .dense_frame_period
+                .insert(mapping_id, seq.saturating_sub(prev));
+        }
     }
 
     /// Advance the per-present tile-epoch clock and return the new value. Call
@@ -2540,22 +2561,45 @@ impl DeviceState {
     /// rather than merely waiting for its turn in the rotation.
     ///
     /// `dense_frame_counter` is a **single global counter** bumped once per
-    /// full-frame publish by *any* member, so the gap between two members'
-    /// sequences grows with how many members are rotating, not with how stale
-    /// either one is. With K members taking turns, the member that published
-    /// longest ago sits exactly `K - 1` behind the freshest one while every
-    /// buffer is perfectly current. A fixed threshold therefore only holds for
-    /// the two-member case it was written against: a live x86 desktop rotates up
-    /// to 7 same-geometry members, which puts the healthy baseline at 6 and
-    /// makes a bare margin of 4 fire on every present.
+    /// full-frame publish by *any* member at *any* geometry, so the gap between
+    /// two members' sequences grows with how busy the rotation is, not with how
+    /// stale either one is. A member that just took its turn already sits a whole
+    /// turnaround behind the one that published last, with nothing stale about
+    /// either. A fixed threshold therefore only holds for the two-member,
+    /// single-output case it was written against: a live x86 desktop rotated 3
+    /// same-geometry members at a steady lag of 4 against a margin of 4, so every
+    /// present substituted.
     ///
-    /// So the rotation's own depth is the floor, and `margin` keeps its original
-    /// meaning on top of it: how many full frames a member must miss *beyond*
-    /// its turn before it counts as having a retention gap.
+    /// The baseline is the member's own turnaround
+    /// ([`PresentState::dense_frame_period`]) — measured, not predicted, because
+    /// members at other geometries bump the same counter and no per-geometry
+    /// member count can account for them. [`Self::dense_rotation_depth`] gives a
+    /// floor for members that have not yet completed two turns. `margin` keeps
+    /// its original meaning on top: how many full frames a member must miss
+    /// *beyond* its own turn before it counts as having a retention gap.
+    ///
+    /// **This is for the capture substitution only — never for the peer seed**
+    /// ([`Self::peer_needs_front_seed`], which takes its margin explicitly). Both
+    /// read the same lag, but their failure modes are opposite. Substituting a
+    /// peer for the surface the guest named is wrong whenever the named surface
+    /// is merely waiting its turn, so that guard must discount rotation depth. A
+    /// member one rotation behind is exactly one whose undamaged regions still
+    /// hold its previous turn's frame while the guest renders only a damage rect
+    /// into it — so discounting rotation depth there withholds the seed from
+    /// precisely the members that need it, and the desktop decays to "only what
+    /// the user forces a re-render on is correct". A needless seed copies one
+    /// full frame; a withheld one loses the whole screen outside the damage rect.
     pub fn retention_gap_threshold(&self, mapping_id: u32, w: u32, h: u32, margin: u64) -> u64 {
-        self.dense_rotation_depth(mapping_id, w, h)
-            .saturating_sub(1)
-            .saturating_add(margin)
+        let turnaround = self
+            .present
+            .dense_frame_period
+            .get(&mapping_id)
+            .copied()
+            .unwrap_or(0);
+        let floor = self
+            .dense_rotation_depth(mapping_id, w, h)
+            .saturating_sub(1);
+        turnaround.max(floor).saturating_add(margin)
     }
 
     pub fn dense_retention_gap(&self, mapping_id: u32, w: u32, h: u32) -> Option<(u32, u64, u64)> {
@@ -2937,6 +2981,9 @@ impl DeviceState {
         // Prune the dense-frame seq too (mirrors peer_seeded_dense_seq): a
         // recycled mapping id must not inherit a stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
+        // The measured turnaround goes with it: a recycled id would otherwise
+        // widen its retention-gap threshold using a predecessor's rotation.
+        self.present.dense_frame_period.remove(&mapping_id);
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
