@@ -956,33 +956,15 @@ pub struct PresentState {
     /// member+`presented_at` checks in `output_group_for` still keep never
     /// presented publish-only tiles (WebKit content surfaces) out of the group.
     pub output_group_geoms: std::collections::BTreeSet<(u32, u32)>,
-    /// Per compositor-output-member peer: the `dense_frame_seq` of the dense
-    /// source it was last seeded from. A LOAD draw into a member-peer that lags
-    /// a same-geometry peer holding a fresher full frame seeds from that dense
-    /// peer (inter-buffer framebuffer retention — the boot-27 present model: the
-    /// guest damage-draws each swapchain buffer against a CURRENT full front,
-    /// performing no CPU forward-copy of its own). Storing the source seq makes
-    /// the seed a *relaxed* one-shot: it re-arms only when a strictly-newer full
-    /// frame exists than the one already propagated here, so steady-state damage
-    /// draws (frozen seqs) never re-seed while a genuinely new full frame always
-    /// re-propagates. Because `dense_frame_seq` advances only on a full-display
-    /// Store (never a transient overlay), a re-seed can only copy a legitimate
-    /// full frame — it cannot cause the dock-tooltip / cursor-sweep residue
-    /// class. Cleared with membership on unmap. Purely structural — never gated
-    /// on measured content.
-    pub peer_seeded_dense_seq: BTreeMap<u32, u64>,
     /// Protocol-structural dense-frame tracking (measure-only, never gates a
-    /// present/seed decision): per compositor-output member, the monotonic
-    /// sequence number of the last FULL FRAME it actually holds — advanced when
-    /// the member receives a full-frame (whole-`w`×`h`) Store (the completeness
-    /// proof in [`Self::note_compositor_member_published`]) AND inherited from the
-    /// dense source's seq when the member is seeded from that source in
-    /// [`Self::peer_needs_front_seed`]. So a member that fell behind on BOTH a
-    /// full-frame Store and the inter-buffer seed has a stale seq: it is
-    /// presenting content it never received. A presented member whose seq lags a
-    /// same-geometry peer by a margin is the a/b inter-buffer retention gap
-    /// ([`Self::dense_retention_gap`]), which the peer seed closes. Cleared with
-    /// membership on unmap.
+    /// present decision): per compositor-output member, the monotonic sequence
+    /// number of the last FULL FRAME it actually holds — advanced when the
+    /// member receives a full-frame (whole-`w`×`h`) Store (the completeness
+    /// proof in [`Self::note_compositor_member_published`]). A member that fell
+    /// behind on those Stores has a stale seq: it is presenting content it never
+    /// received. A presented member whose seq lags a same-geometry peer by a
+    /// margin is the a/b inter-buffer retention gap
+    /// ([`Self::dense_retention_gap`]). Cleared with membership on unmap.
     pub dense_frame_seq: BTreeMap<u32, u64>,
     /// Per compositor-output member: the [`Self::dense_frame_seq`] value that
     /// member held the last time it was PRESENTED.
@@ -2503,10 +2485,14 @@ impl DeviceState {
     /// just took its turn already sits a whole turnaround behind the one that
     /// published last with nothing stale about either. It must never decide
     /// *which* surface to present: the transaction names plane 0's surface id
-    /// and that is the only correct capture source. Its one production reader is
-    /// the peer seed, where a member one rotation behind is exactly the case the
-    /// seed exists for — its undamaged regions still hold its previous turn's
-    /// frame while the guest renders only a damage rect into it.
+    /// and that is the only correct capture source.
+    ///
+    /// Its readers are the present census and the ClearOnly torn-capture
+    /// substitution in the drain (`stale_present_substitute`), which is measured
+    /// dead on the x86 PCI pathway and unmeasurable on arm64. Nothing on the
+    /// guest-named present path reads it: the a/b peer seed used to, and was
+    /// deleted once resident unification was shown to make it a copy onto
+    /// itself for every target the guest actually displays.
     ///
     /// The peer set is scoped to same-geometry members that have themselves been
     /// **presented** at this geometry ([`Self::presented_at`]) — the SAME gate
@@ -2760,144 +2746,6 @@ impl DeviceState {
         true
     }
 
-    /// Should a LOAD draw into `target_mid` at `w`x`h` seed from the retained
-    /// front frame because it is a compositor-output-member **peer** sitting
-    /// behind a denser-lifetime member front it has not yet inherited this
-    /// generation?
-    ///
-    /// # Before deleting this, read what happened to the deletion that was tried
-    ///
-    /// The full deletion has been written, tested and reverted once, and the
-    /// evidence that triggered the revert turned out to be a measurement error.
-    /// The question is genuinely open — not settled in either direction.
-    ///
-    /// What IS established: every seed that survives the caller's unification
-    /// filter has a target the guest has never named as plane 0 (measured — the
-    /// only `peer_seed_unification` outcome ever recorded is
-    /// `src_kind=group target_kind=surface`), because two surfaces the guest
-    /// *has* named at one geometry resolve to the same `OutputGroup` identity,
-    /// so a copy between them is a copy onto itself and is dropped. Requiring
-    /// [`Self::presented_at`] on the target is therefore equivalent to deleting
-    /// this function outright, not to narrowing it.
-    ///
-    /// What is NOT established is whether those targets need the copy. "Never
-    /// named as plane 0" is not "never displayed": such a surface is never
-    /// scanned out directly, but its content can still reach the screen as a
-    /// composited source into the frame that IS named. Nobody has yet measured
-    /// what their residents hold, and this copy would mask an empty one.
-    ///
-    /// If you A/B the deletion on the live rig, **interleave the arms**
-    /// (parent, child, parent, child). The first attempt ran three boots of one
-    /// arm and then the other, and attributed a time-of-day change in the
-    /// guest's own desktop rendering to the diff. Snapshot-revert resets the
-    /// guest disk, not the guest clock.
-    ///
-    /// This closes the dual-mid inter-buffer retention gap: the guest
-    /// composites the full frame into whichever swapchain buffer is the front,
-    /// then at the a/b flip damage-draws the peer buffer with `LoadAction=Load`
-    /// expecting the display's current front content to be retained under it.
-    /// Our per-mid residents do not share that history, so the peer's first
-    /// LOAD after the flip would `LoadFromTarget` its own stale resident and
-    /// keep an undamaged black region forever (BUG A / stale-peer strobe).
-    /// Seeding the peer **once** (a one-shot bootstrap per mapping lifetime)
-    /// from the member front — the same mechanism the same-mid
-    /// `presented_needs_guest_seed` path already uses — gives the peer its first
-    /// dense frame.
-    ///
-    /// It is ONE-SHOT on purpose. `frame_generation` bumps on every present, so
-    /// "once per front generation" was in practice "once per a/b flip" — a full
-    /// front→peer forward-copy every flip. That copy carries the front's
-    /// *transient* overlays (dock hover tooltips, the cursor) onto the peer,
-    /// where WindowServer's damage model never erases them (it does not know the
-    /// peer holds them), so they accumulate as permanent residue (the dock
-    /// tooltip / cursor-sweep smear class). A single bootstrap seed fixes BUG A
-    /// stale-black; thereafter each a/b buffer retains its own content and the
-    /// guest's damage draws keep both in sync. Genuine resident loss (eviction)
-    /// re-bootstraps through the independent `!resident_content_ready` LOAD-seed
-    /// path, not here.
-    ///
-    /// Gating is purely structural and never consults measured content:
-    /// - `target_mid` is a proven compositor-output member at this geometry,
-    /// - a *distinct* same-geometry member holds a `dense_frame_seq` at least
-    ///   `margin` full frames ahead (a run of full frames the target never
-    ///   received — NOT the ~1-lag of healthy full-frame a/b alternation),
-    /// - that dense source is strictly newer than the one this peer was last
-    ///   seeded from (the relaxed latch below).
-    ///
-    /// Returns `Some(source_mid)` — the mapping id of the dense peer to copy —
-    /// when a seed should be armed, and records the source seq so a steady-state
-    /// flip (frozen seq) does not re-seed. The source is the freshest dense peer
-    /// (`dense_retention_gap`), NEVER the possibly-sparse present front: after an
-    /// app-quit / mode churn the presented front is itself sparse and copying it
-    /// does not close the gap.
-    ///
-    /// The original one-shot-per-lifetime latch is RELAXED to a monotonic source
-    /// seq: a re-seed arms only on a strictly-newer full frame. Because
-    /// `dense_frame_seq` advances only on a full-display-geometry Store — never a
-    /// transient overlay (dock tooltip / cursor sweep) — a re-seed can only ever
-    /// copy a legitimate full frame, so it cannot cause the residue class the
-    /// one-shot originally guarded against.
-    ///
-    /// `converged` MUST be the boot-convergence latch
-    /// (`present_proxy::has_converged()`): the seed only applies to the
-    /// steady-state desktop damage-compositing regime *after* a dense frame has
-    /// been produced this boot. Before convergence the guest redraws full
-    /// logo/progress frames each present (no inter-buffer retention dependency),
-    /// so seeding there is both unnecessary and actively harmful — it copies a
-    /// stale full front onto the peer and makes the boot progress pill strobe
-    /// (opacity/fill oscillation). Gating on convergence also guarantees the
-    /// source we propagate was itself once dense, never a sparse boot frame.
-    pub fn peer_needs_front_seed(
-        &mut self,
-        target_mid: u32,
-        w: u32,
-        h: u32,
-        converged: bool,
-        margin: u64,
-    ) -> Option<u32> {
-        if !converged {
-            return None;
-        }
-        // The seed source is the freshest same-geometry dense peer the target
-        // lags. `dense_retention_gap` enforces membership + geometry + a strict
-        // lag, so a member that is itself the freshest never seeds.
-        let (source_mid, presented_seq, source_seq) = self.dense_retention_gap(target_mid, w, h)?;
-        // Margin gate — the crux that keeps healthy a/b alternation quiet. When
-        // BOTH buffers get full frames each present (the guest recompositing
-        // both halves), each is only ~1 full frame behind the other on any given
-        // flip; that 1-lag is NOT a retention gap (each buffer holds its own
-        // recent full frame) and seeding it every flip is wasteful churn — the
-        // every-flip residue regression this gate exists to prevent. Only a lag of
-        // `margin`+ full frames — the target missed BOTH a full-frame Store and the
-        // seed, repeatedly — is the real inter-buffer retention gap. Mirrors the
-        // `dense_retention_gap` proxy's own margin so the seed fixes exactly what
-        // that proxy flags. This gate (locked by the
-        // `peer_front_seed_gate_is_structural_and_once_per_lifetime` unit test) is
-        // the sole guard against the every-flip regression; there is no runtime
-        // seed-count alarm (legitimate multi-video seeding is thousands/boot).
-        if source_seq < presented_seq.saturating_add(margin) {
-            return None;
-        }
-        // Relaxed one-shot: re-seed only on a strictly-newer dense frame than
-        // the one already propagated here. Frozen/equal seqs (healthy steady
-        // state) never re-arm.
-        if let Some(&last_seq) = self.present.peer_seeded_dense_seq.get(&target_mid) {
-            if source_seq <= last_seq {
-                return None;
-            }
-        }
-        self.present
-            .peer_seeded_dense_seq
-            .insert(target_mid, source_seq);
-        // The peer inherits `source_mid`'s full frame via this seed, so it now
-        // holds a frame as fresh as the source — advance its dense seq to match
-        // so it no longer reads as lagging (the seed IS the inter-buffer
-        // retention). Measure-only bookkeeping for the `dense_retention_gap`
-        // guard.
-        self.present.dense_frame_seq.insert(target_mid, source_seq);
-        Some(source_mid)
-    }
-
     /// Record that `mapping_id` is being presented and report whether it is
     /// backed — i.e. whether it received a full-frame Store or an inter-buffer
     /// seed since its own previous present.
@@ -2931,9 +2779,8 @@ impl DeviceState {
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
         crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
         self.present.compositor_output_members.remove(&mapping_id);
-        self.present.peer_seeded_dense_seq.remove(&mapping_id);
-        // Prune the dense-frame seq too (mirrors peer_seeded_dense_seq): a
-        // recycled mapping id must not inherit a stale predecessor's dense seq.
+        // Prune the dense-frame seq: a recycled mapping id must not inherit a
+        // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
@@ -2943,16 +2790,15 @@ impl DeviceState {
         // logically-unrelated surface would show phantom cross-mid divergence.
         self.present.tile_gen.remove(&mapping_id);
         self.present.presented_geoms.remove(&mapping_id);
-        // Prune the present-boundary seed flag too, mirroring
-        // `peer_seeded_dense_seq` above. Both mark "this mid was just presented,
-        // so its next LOAD re-seeds from the front" — a per-lifetime signal that
-        // MUST NOT survive a teardown. Left stale, a recycled mapping_id (a new,
-        // logically-unrelated surface reusing this id after DeleteIOSurfaceBacking2)
-        // would have its FIRST LOAD draw consume this flag, take the
-        // present-boundary seed path, and bleed the CURRENT retained front frame
-        // (a different surface's pixels at +0x188) over its own ready resident —
-        // the "background/window content doesn't clear cleanly" residue class.
-        // `peer_seeded_dense_seq` was already pruned here; this set was the gap.
+        // Prune the present-boundary seed flag too. It marks "this mid was just
+        // presented, so its next LOAD re-seeds from the front" — a per-lifetime
+        // signal that MUST NOT survive a teardown. Left stale, a recycled
+        // mapping_id (a new, logically-unrelated surface reusing this id after
+        // DeleteIOSurfaceBacking2) would have its FIRST LOAD draw consume this
+        // flag, take the present-boundary seed path, and bleed the CURRENT
+        // retained front frame (a different surface's pixels at +0x188) over its
+        // own ready resident — the "background/window content doesn't clear
+        // cleanly" residue class.
         self.presented_needs_guest_seed.remove(&mapping_id);
         if self.present.compositor_output_mapping == mapping_id
             || self.present.compositor_output_source == mapping_id
