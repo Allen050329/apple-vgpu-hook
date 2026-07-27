@@ -59,6 +59,17 @@ Before landing a visual, protocol, performance, or translation fix, add or ident
 test-level proxy for the bug class. Screenshots are useful evidence, but they are not a regression
 gate by themselves.
 
+**Identify comes before add.** The always-on lines already carry more than they look like they do,
+and slicing an existing one per case is faster than writing a probe and cheaper than being wrong. A
+recent instance: a defect was traced to a missing multi-plane sampling conversion, the gap was real,
+and the fix site had been located — but the existing `type4 pages … planes= multi=` line, sliced per
+case, showed the two-plane surface appearing **only in the case that rendered correctly**. The
+failing case never took that path. The fix would have changed code the defect does not run through.
+
+So when a mechanism looks obvious, spend the cheap step first: find a line already emitted on both
+sides and check that it separates them. A hypothesis that survives that is worth building on; one
+that does not was going to cost a full cycle.
+
 ### Interleave The Arms Of A Live A/B
 
 A live before/after on the VM rig compares two arms separated by wall-clock time, and neither the
