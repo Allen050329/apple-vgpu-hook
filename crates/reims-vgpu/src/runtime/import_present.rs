@@ -695,18 +695,19 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     // + geometry current). Deferred grouped flushes additionally verify the
     // member's map_generation against the defer-time record before calling
     // here (recycled-pages guard).
-    let gate_ok = if matches!(identity, TargetIdentity::OutputGroup { .. }) {
-        surface_identity(state, mapping_id, width, height) == *identity
+    let gate_fail = if matches!(identity, TargetIdentity::OutputGroup { .. }) {
+        (surface_identity(state, mapping_id, width, height) != *identity)
+            .then_some(ImportDecline::GroupIdentityDrift)
     } else {
         let gen_now = state
             .mappings
             .get(&mapping_id)
             .map(|m| m.map_generation as u64)
             .unwrap_or(0);
-        identity.generation() == gen_now
+        (identity.generation() != gen_now).then_some(ImportDecline::MapGenDrift)
     };
-    if !gate_ok {
-        return import_fail(mapping_id, width, height, ImportDecline::MapGenDrift);
+    if let Some(decline) = gate_fail {
+        return import_fail(mapping_id, width, height, decline);
     }
     if !state
         .mappings
@@ -1463,9 +1464,18 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
 /// control flow, not a refusal, and typing it would invite logging it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImportDecline {
-    /// The resident identity's generation no longer matches the mapping's, so
-    /// the frame we would DMA belongs to a superseded incarnation.
+    /// A per-mid `Surface` identity whose embedded generation no longer matches
+    /// the mapping's, so the frame we would DMA belongs to a superseded
+    /// incarnation. Per-mid only — a group identity carries no member lifetime
+    /// and its generation is constant, so it can never fail this way; that case
+    /// is [`Self::GroupIdentityDrift`].
     MapGenDrift,
+    /// An `OutputGroup` identity this mapping no longer resolves to — its group
+    /// membership or geometry moved. Despite sharing a gate with
+    /// [`Self::MapGenDrift`], no generation is compared here (a group identity's
+    /// is constant), so the two must not share a slug: one says the mapping was
+    /// re-wired under us, the other says the composition graph changed shape.
+    GroupIdentityDrift,
     /// The mapping is not mapped.
     Unmapped,
     /// No type-11 sample window could be derived for this geometry.
@@ -1492,6 +1502,7 @@ impl crate::observe::Decline for ImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::MapGenDrift => "import_map_gen_drift",
+            Self::GroupIdentityDrift => "import_group_identity_drift",
             Self::Unmapped => "import_unmapped",
             Self::NoSampleWindow => "import_no_sample_window",
             Self::BprBelowTight { .. } => "import_bpr_below_tight",
@@ -1733,6 +1744,7 @@ mod tests {
         use crate::observe::Decline as _;
         const ALL: &[ImportDecline] = &[
             ImportDecline::MapGenDrift,
+            ImportDecline::GroupIdentityDrift,
             ImportDecline::Unmapped,
             ImportDecline::NoSampleWindow,
             ImportDecline::BprBelowTight { bpr: 0, tight: 0 },
@@ -2014,6 +2026,53 @@ mod tests {
         let _ = state.invalidate_mapping_pages(3);
         let id2 = surface_identity(&state, 3, 1920, 1080);
         assert_ne!(id1.generation(), id2.generation());
+    }
+
+    /// The lifetime gate has two arms and they fail for different reasons: a
+    /// per-mid `Surface` identity fails when the mapping's generation moved
+    /// under it, and an `OutputGroup` identity fails when the mapping no longer
+    /// resolves to that group — membership or geometry changed, with no
+    /// generation compared at all (a group identity's is constant). They shared
+    /// `import_map_gen_drift`, which named only the first and made the largest
+    /// surviving render-loss reason unattributable between the two.
+    #[test]
+    fn the_lifetime_gate_names_which_of_its_two_arms_refused() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let member = |w, h| crate::model::CompositorOutputMember {
+            width: w,
+            height: h,
+            source: 13,
+        };
+        for mid in [1u32, 5u32] {
+            state.map_surface(mid);
+            state.present.compositor_output_members.insert(mid, member(1920, 1080));
+            state.note_presented_geom(mid, 1920, 1080);
+        }
+        let group = surface_identity(&state, 1, 1920, 1080);
+        assert!(matches!(group, TargetIdentity::OutputGroup { .. }));
+        // Mapping 1 is presented at a new geometry (a resize), so it no longer
+        // resolves to the group identity the deferred window was armed with —
+        // `output_group_for` gates on `presented_at(mid, w, h)` first.
+        state.note_presented_geom(1, 640, 480);
+        assert_ne!(surface_identity(&state, 1, 1920, 1080), group);
+        assert_eq!(
+            try_import_present_store(&mut state, &mut host, &group, 1, 1920, 1080, false).reason(),
+            "import_group_identity_drift",
+            "a group identity that no longer resolves is not a generation drift"
+        );
+        // The other arm, unchanged: a per-mid identity whose generation moved.
+        let per_mid = surface_identity(&state, 1, 1920, 1080);
+        assert!(matches!(per_mid, TargetIdentity::Surface { .. }));
+        {
+            let m = state.mappings.get_mut(&1).unwrap();
+            DeviceState::bump_map_generation(1, m);
+        }
+        assert_eq!(
+            try_import_present_store(&mut state, &mut host, &per_mid, 1, 1920, 1080, false).reason(),
+            "import_map_gen_drift"
+        );
     }
 
     /// Two proven same-geometry compositor members resolve to one shared

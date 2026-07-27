@@ -403,6 +403,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         slug_calls: &[],
         slugs: &[
             "import_map_gen_drift",
+            "import_group_identity_drift",
             "import_unmapped",
             "import_no_sample_window",
             "import_bpr_below_tight",
