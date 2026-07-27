@@ -59,6 +59,23 @@ Before landing a visual, protocol, performance, or translation fix, add or ident
 test-level proxy for the bug class. Screenshots are useful evidence, but they are not a regression
 gate by themselves.
 
+### Interleave The Arms Of A Live A/B
+
+A live before/after on the VM rig compares two arms separated by wall-clock time, and neither the
+guest nor the host is constant in time. Snapshot-revert resets the guest disk, **not** the guest
+clock, and macOS changes its own rendering with time of day. The host is not constant either: at
+least one boot-variable colour class exists that persists across VM restarts.
+
+So do not run N boots of the parent and then N boots of the child. **Alternate them** — parent,
+child, parent, child — so anything drifting with time lands on both arms. A sequential A/B once
+produced 3-of-3 versus 2-of-2 agreement and was still entirely confounded: the "regression" survived
+a full revert of the change that supposedly caused it. Replicating the treatment says nothing about
+a confound that moves with time.
+
+Related: a boot whose captures differ from the known-good constant for that sequence must be
+**discarded**, not interpreted. A brightness floor does not catch wrong content of the right
+brightness.
+
 ### Tests Define Done
 
 If there is no test for it, it is not done. No test means a future agent can regress the changeset
