@@ -53,6 +53,10 @@ impl ResourcePools {
             storage_recycle_admits: 0,
             storage_recycle_cap_drops: 0,
             host_imports: Vec::new(),
+            host_import_touch: 0,
+            host_import_epoch: 0,
+            host_import_creates: 0,
+            host_import_evictions: 0,
             host_import_count_cap_logged: false,
             host_import_zero_len_logged: false,
             host_import_no_ext_logged: false,
@@ -687,6 +691,13 @@ impl ResourcePools {
         // release fires to trigger their free). Down to one spare.
         self.slab
             .trim_empty_blocks(&ctx.device, IDLE_SLAB_KEEP_EMPTY);
+        // …and the host-import windows, the only remaining pool whose memory is
+        // pinned *host* RAM rather than VRAM. Same age cutoff as the rest: a
+        // window the guest has not resolved through for `IDLE_TARGET_AGE_MS` is
+        // holding down host pages for nothing. Without this the budget only ever
+        // ratchets up to its high-water mark and stays there until teardown.
+        let cold = self.plan_host_import_idle_release(sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+        self.evict_host_imports(ctx, cold, "idle");
         drained
     }
 
@@ -1336,6 +1347,12 @@ impl ResourcePools {
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
+        // Close the host-import epoch: every buffer resolved for this CB is now
+        // recorded, so those windows stop being un-evictable by the epoch pin
+        // and fall back to `dispose`'s in-flight deferral. This is the only
+        // place a CB goes in flight, which is why the pin needs no bracketing at
+        // the resolve call sites.
+        self.host_import_epoch = self.host_import_epoch.wrapping_add(1);
     }
 
     /// The open batch's (CB, fence) when a draw at (identity, geometry, bgra)

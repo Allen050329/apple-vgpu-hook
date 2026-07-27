@@ -68,11 +68,18 @@ impl ResourcePools {
             crate::observe::Emit::decline("host_import_fail", &reason).fail_once(0);
             return None;
         };
-        if let Some(r) = self
+        if let Some(i) = self
             .host_imports
             .iter()
-            .find(|r| r.base as u64 <= ptr as u64 && end <= r.base as u64 + r.len)
+            .position(|r| r.base as u64 <= ptr as u64 && end <= r.base as u64 + r.len)
         {
+            let (touch, epoch, now_ms) =
+                (self.host_import_touch + 1, self.host_import_epoch, self.idle_clock_ms);
+            self.host_import_touch = touch;
+            let r = &mut self.host_imports[i];
+            r.last_touch = touch;
+            r.last_epoch = epoch;
+            r.last_touch_ms = now_ms;
             return Some((r.buffer, ptr as u64 - r.base as u64));
         }
         let align = ctx.min_imported_host_pointer_alignment.max(1);
@@ -98,13 +105,24 @@ impl ResourcePools {
             {
                 continue;
             }
-            let imported_bytes = self
-                .host_imports
-                .iter()
-                .fold(0u64, |total, region| total.saturating_add(region.len));
+            if host_import_budget(self.host_imports.len(), self.host_import_bytes(), region_len)
+                .is_err()
+            {
+                // Make room before giving up: the budget is a working-set bound,
+                // not a lifetime quota. Releasing the coldest windows is what
+                // stops a long session from ratcheting into a permanent decline
+                // once the guest's GPU pages have spread across enough buckets.
+                self.evict_host_imports(ctx, self.plan_host_import_eviction(region_len), "budget");
+            }
+            let imported_bytes = self.host_import_bytes();
             if let Err(reason) =
                 host_import_budget(self.host_imports.len(), imported_bytes, region_len)
             {
+                // Nothing evictable covered the shortfall — every window is
+                // either in the live resolve batch or the working set genuinely
+                // exceeds the budget. Decline exactly as before eviction
+                // existed, so an over-subscribed guest stays fail-visible
+                // instead of silently thrashing.
                 if self.host_import_first_time(reason) {
                     crate::observe::Emit::decline("host_import_fail", &reason)
                         .field("regions", self.host_imports.len())
@@ -146,15 +164,23 @@ impl ResourcePools {
                 )));
                 continue;
             }
+            self.host_import_creates = self.host_import_creates.saturating_add(1);
             crate::observe::off(format!(
-                "host_import_region base={base:#x} len={region_len:#x} regions={}",
-                self.host_imports.len() + 1
+                "host_import_region base={base:#x} len={region_len:#x} regions={} \
+                 creates={} evictions={}",
+                self.host_imports.len() + 1,
+                self.host_import_creates,
+                self.host_import_evictions
             ));
+            self.host_import_touch = self.host_import_touch.saturating_add(1);
             self.host_imports.push(HostImportRegion {
                 base,
                 len: region_len,
                 memory,
                 buffer,
+                last_touch: self.host_import_touch,
+                last_epoch: self.host_import_epoch,
+                last_touch_ms: self.idle_clock_ms,
             });
             let r = self.host_imports.last().unwrap();
             return Some((r.buffer, ptr as u64 - r.base as u64));
@@ -165,6 +191,52 @@ impl ResourcePools {
             .field("len", format!("{len:#x}"))
             .fail_once(0);
         None
+    }
+
+    /// Release `victims` (indices into `host_imports`, as returned by
+    /// [`Self::plan_host_import_eviction`]) through the in-flight-safe
+    /// deferral. Each is named on the always-on census next to the
+    /// `host_import_region` line that created it, so create-vs-evict rates read
+    /// off one log: equal rates mean the working set does not fit the budget and
+    /// the pool is re-importing what it just released.
+    pub(crate) unsafe fn evict_host_imports(
+        &mut self,
+        ctx: &DeviceContext,
+        victims: Vec<usize>,
+        reason: &str,
+    ) {
+        if victims.is_empty() {
+            return;
+        }
+        // Descending so each `swap_remove` leaves the lower indices valid.
+        let mut victims = victims;
+        victims.sort_unstable_by(|a, b| b.cmp(a));
+        victims.dedup();
+        for i in victims {
+            if i >= self.host_imports.len() {
+                continue;
+            }
+            let region = self.host_imports.swap_remove(i);
+            self.host_import_evictions = self.host_import_evictions.saturating_add(1);
+            crate::observe::off(format!(
+                "host_import_evict base={:#x} len={:#x} reason={reason} age_ms={} regions={} \
+                 imported_bytes={:#x} creates={} evictions={}",
+                region.base,
+                region.len,
+                self.idle_clock_ms.saturating_sub(region.last_touch_ms),
+                self.host_imports.len(),
+                self.host_import_bytes(),
+                self.host_import_creates,
+                self.host_import_evictions
+            ));
+            self.dispose(
+                &ctx.device,
+                DeferredHandle::HostImport {
+                    buffer: region.buffer,
+                    memory: region.memory,
+                },
+            );
+        }
     }
 
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
