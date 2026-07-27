@@ -664,6 +664,79 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
                     p.frame_height,
                 )
             });
+        // Route-B present-staleness proxies (Linux pathway has no divergent-tile
+        // masking — that path is macOS-only). Compare the resident we are about
+        // to present (frame_mapping) against the freshest same-geometry
+        // compositor member. A sustained whole-frame seq gap (`routeb_stale`)
+        // means we are presenting a buffer the guest has moved on from — the
+        // "frame rate != rendered" crawl. A per-tile divergence
+        // (`routeb_tile_residue`) is the localized a/b residue. Both are deduped
+        // so a persistent condition logs once, not per present.
+        {
+            let fm = p.frame_mapping;
+            let fw = p.frame_width;
+            let fh = p.frame_height;
+            let own_gen = state
+                .mappings
+                .get(&fm)
+                .map(|m| m.content_generation)
+                .unwrap_or(0);
+            let (fresh_mid, fresh_gen, fresh_seq) = state
+                .present
+                .compositor_output_members
+                .iter()
+                .filter(|(_, mem)| mem.width == fw && mem.height == fh)
+                .filter_map(|(&mid, _)| {
+                    let m = state.mappings.get(&mid)?;
+                    Some((mid, m.content_generation, m.last_store_seq))
+                })
+                .max_by_key(|&(mid, _, seq)| (seq, mid))
+                .unwrap_or((0, 0, 0));
+            let own_seq = state.mappings.get(&fm).map(|m| m.last_store_seq).unwrap_or(0);
+            // Per-tile divergence: the presented buffer (frame_mapping) vs its
+            // same-geometry compositor peer. This is the ACTUAL residue signal
+            // (a tile the peer erased but frame_mapping still shows) — the
+            // seq-gap above is whole-frame and misses it. Route-B on Linux has
+            // no divergent-tile masking, so a >0 count here == on-screen residue.
+            let (div_tiles, div_bbox, tile_peer) = state
+                .compositor_geometry_peer(fm, fw, fh)
+                .map(|peer| {
+                    let (n, bb) = state.divergent_tile_count(fm, peer);
+                    (n, bb, peer)
+                })
+                .unwrap_or((0, [0; 4], 0));
+            if div_tiles > 0 {
+                use std::collections::HashSet;
+                use std::sync::Mutex;
+                static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen
+                    .get_or_insert_with(HashSet::new)
+                    .insert((fm, tile_peer, div_tiles))
+                {
+                    crate::observe::off(format!(
+                        "routeb_tile_residue frame_mid={fm} peer={tile_peer} div_tiles={div_tiles} bbox=[{},{},{},{}] own_seq={own_seq} own_gen={own_gen}",
+                        div_bbox[0], div_bbox[1], div_bbox[2], div_bbox[3]
+                    ));
+                }
+            }
+            if fresh_mid != 0 && fresh_mid != fm && fresh_seq > own_seq {
+                use std::collections::HashSet;
+                use std::sync::Mutex;
+                static SEEN: Mutex<Option<HashSet<(u32, u32, u64)>>> = Mutex::new(None);
+                let gap_bucket = (fresh_seq - own_seq).min(64) / 4;
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen
+                    .get_or_insert_with(HashSet::new)
+                    .insert((fm, fresh_mid, gap_bucket))
+                {
+                    crate::observe::off(format!(
+                        "routeb_stale frame_mid={fm} own_gen={own_gen} own_seq={own_seq} fresh_mid={fresh_mid} fresh_gen={fresh_gen} fresh_seq={fresh_seq} gap_seq={}",
+                        fresh_seq - own_seq
+                    ));
+                }
+            }
+        }
         // Zero-copy source (direct-present route B): export this present's resident
         // target as a dmabuf the window can blit without the CPU upload. `None` when
         // the resident is not exportable (no dmabuf exts / not content-ready / not
