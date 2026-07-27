@@ -689,25 +689,64 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     }
 
     // Lifetime gate. Per-mid Surface identities embed the mapping lifetime —
-    // the generation must still match. A group identity has no member
-    // lifetime inside (generation is constant); the equivalent gate is that
-    // this mapping still RESOLVES to exactly that group identity (membership
-    // + geometry current). Deferred grouped flushes additionally verify the
-    // member's map_generation against the defer-time record before calling
-    // here (recycled-pages guard).
+    // the generation must still match.
+    //
+    // A group identity carries no member lifetime (its generation is constant),
+    // so all this arm can check is that the pinned identity describes *this*
+    // Store: same group, same geometry. It must not re-resolve membership.
+    // Membership at defer time is what chose which resident to read, and that
+    // choice is already inside the pinned identity; asking again at flush time
+    // re-decides a settled question using `presented_geoms`, which our own
+    // publish detector infers. The mapping's lifetime — the thing that would
+    // make the write unsafe — is covered by a real generation compare:
+    // `storage_flush::render_flush_one` runs one against the defer-time record
+    // for every deferred window before calling here, and a synchronous Store
+    // resolved this identity a few lines earlier in the same packet.
+    //
+    // Re-resolving cost real guest paint. `map_surface` and
+    // `condemn_surface_backing` both prune `presented_geoms` while
+    // deliberately KEEPING `map_generation` and the mapping's deferred windows,
+    // so `mapper::resolve` can settle the lifetime later by fingerprint. On a
+    // swapchain buffer recycle the flush trigger lands in that gap: pages just
+    // reprieved, membership not yet re-granted. Measured on the x86/Vulkan rail
+    // (`page-loads.sh`, boots 82 and 83): 4/4 refusals were exactly that state
+    // (`miss=presented_pruned`, generation intact), with the compositor
+    // re-granting membership to the same mid at the same geometry 30-95 ms
+    // later. Nothing there is a different logical surface; the refusal was
+    // destroying a paint the layer below had just certified.
     let gate_fail = if matches!(identity, TargetIdentity::OutputGroup { .. }) {
-        (surface_identity(state, mapping_id, width, height) != *identity).then(|| {
-            // Read *why* the group no longer admits this mapping from the
-            // resolve itself. `miss: None` means the resolve still admitted it
-            // and the identities differ some other way (a geometry mismatch
-            // between the pinned identity and the Store's), which the two
-            // membership readings would otherwise be blamed for.
-            ImportDecline::GroupIdentityDrift {
-                miss: state
-                    .output_group_resolve(mapping_id, width, height)
-                    .err(),
+        // Structural, not stateful: compare against the identity a Store of
+        // this geometry pins, so a future producer adding a field to
+        // `OutputGroup` cannot silently drop out of the comparison.
+        let for_this_store = TargetIdentity::OutputGroup {
+            id: OUTPUT_GROUP_ID,
+            width,
+            height,
+            generation: 0,
+        };
+        if *identity != for_this_store {
+            Some(ImportDecline::GroupGeomDrift)
+        } else {
+            // Measure-only: the write now proceeds while the group no longer
+            // admits this mapping. This is the case the re-resolve used to
+            // refuse, so it must stay visible — if the deletion above is wrong,
+            // this is the line that says where to look.
+            if let Err(miss) = state.output_group_resolve(mapping_id, width, height) {
+                crate::observe::fail(format!(
+                    "import_group_membership_stale mid={mapping_id} geom={width}x{height} \
+                     miss={} (writing the pinned resident anyway; the lifetime gate passed)",
+                    match miss {
+                        crate::model::OutputGroupMiss::NotPresentedHere { presented: None } =>
+                            "presented_pruned".to_string(),
+                        crate::model::OutputGroupMiss::NotPresentedHere {
+                            presented: Some((w, h)),
+                        } => format!("presented_elsewhere:{w}x{h}"),
+                        crate::model::OutputGroupMiss::NoPeer => "no_peer".to_string(),
+                    }
+                ));
             }
-        })
+            None
+        }
     } else {
         let gen_now = state
             .mappings
@@ -1478,23 +1517,24 @@ enum ImportDecline {
     /// the mapping's, so the frame we would DMA belongs to a superseded
     /// incarnation. Per-mid only — a group identity carries no member lifetime
     /// and its generation is constant, so it can never fail this way; that case
-    /// is [`Self::GroupIdentityDrift`].
+    /// is [`Self::GroupGeomDrift`].
     MapGenDrift,
     /// An `OutputGroup` identity this mapping no longer resolves to — its group
     /// membership or geometry moved. Despite sharing a gate with
     /// [`Self::MapGenDrift`], no generation is compared here (a group identity's
     /// is constant), so the two must not share a slug: one says the mapping was
-    /// re-wired under us, the other says the composition graph changed shape.
+    /// re-wired under us, the other says the pinned resident is not the one this
+    /// Store's geometry names.
     ///
-    /// `miss` is the refusing check's own reading (`None` when the group still
-    /// admits the mapping and the identities differ some other way). "The
-    /// composition graph changed shape" is four distinguishable states, and
-    /// which one it is decides whether the refusal is even correct: a mapping
-    /// whose `presented_geoms` entry was *pruned* while its `map_generation`
-    /// survived is one the lifetime layer deliberately kept alive.
-    GroupIdentityDrift {
-        miss: Option<crate::model::OutputGroupMiss>,
-    },
+    /// This arm used to re-resolve group *membership* as a stand-in for the
+    /// lifetime a group identity cannot carry, and refused whenever the mapping
+    /// no longer resolved to the group. Measurement killed that: every observed
+    /// refusal was a swapchain buffer whose membership had been pruned by a site
+    /// that deliberately keeps the generation and the deferred window, and which
+    /// the compositor re-granted tens of milliseconds later. The lifetime is
+    /// checked by a real generation compare before this call, so what is left
+    /// here is only the geometry.
+    GroupGeomDrift,
     /// The mapping is not mapped.
     Unmapped,
     /// No type-11 sample window could be derived for this geometry.
@@ -1521,7 +1561,7 @@ impl crate::observe::Decline for ImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::MapGenDrift => "import_map_gen_drift",
-            Self::GroupIdentityDrift { .. } => "import_group_identity_drift",
+            Self::GroupGeomDrift => "import_group_geom_drift",
             Self::Unmapped => "import_unmapped",
             Self::NoSampleWindow => "import_no_sample_window",
             Self::BprBelowTight { .. } => "import_bpr_below_tight",
@@ -1549,22 +1589,6 @@ impl crate::observe::Decline for ImportDecline {
             }
             Self::MapRunFailed { mlo, pages } => {
                 vec![("mlo", format!("{mlo:#x}")), ("pages", pages.to_string())]
-            }
-            Self::GroupIdentityDrift { miss } => {
-                use crate::model::OutputGroupMiss;
-                match miss {
-                    Some(OutputGroupMiss::NotPresentedHere { presented: None }) => {
-                        vec![("miss", "presented_pruned".into())]
-                    }
-                    Some(OutputGroupMiss::NotPresentedHere {
-                        presented: Some((w, h)),
-                    }) => vec![
-                        ("miss", "presented_elsewhere".into()),
-                        ("presented", format!("{w}x{h}")),
-                    ],
-                    Some(OutputGroupMiss::NoPeer) => vec![("miss", "no_peer".into())],
-                    None => vec![("miss", "identity_differs".into())],
-                }
             }
             _ => Vec::new(),
         }
@@ -1779,7 +1803,7 @@ mod tests {
         use crate::observe::Decline as _;
         const ALL: &[ImportDecline] = &[
             ImportDecline::MapGenDrift,
-            ImportDecline::GroupIdentityDrift { miss: None },
+            ImportDecline::GroupGeomDrift,
             ImportDecline::Unmapped,
             ImportDecline::NoSampleWindow,
             ImportDecline::BprBelowTight { bpr: 0, tight: 0 },
@@ -2065,11 +2089,11 @@ mod tests {
 
     /// The lifetime gate has two arms and they fail for different reasons: a
     /// per-mid `Surface` identity fails when the mapping's generation moved
-    /// under it, and an `OutputGroup` identity fails when the mapping no longer
-    /// resolves to that group — membership or geometry changed, with no
-    /// generation compared at all (a group identity's is constant). They shared
-    /// `import_map_gen_drift`, which named only the first and made the largest
-    /// surviving render-loss reason unattributable between the two.
+    /// under it, and an `OutputGroup` identity fails when the pinned resident is
+    /// not the size this Store names, with no generation compared at all (a
+    /// group identity's is constant). They shared `import_map_gen_drift`, which
+    /// named only the first and made the largest surviving render-loss reason
+    /// unattributable between the two.
     #[test]
     fn the_lifetime_gate_names_which_of_its_two_arms_refused() {
         use crate::runtime::host::FakeHost;
@@ -2087,15 +2111,28 @@ mod tests {
         }
         let group = surface_identity(&state, 1, 1920, 1080);
         assert!(matches!(group, TargetIdentity::OutputGroup { .. }));
-        // Mapping 1 is presented at a new geometry (a resize), so it no longer
-        // resolves to the group identity the deferred window was armed with —
-        // `output_group_for` gates on `presented_at(mid, w, h)` first.
+        // The grouped arm refuses on geometry: the pinned resident is 1920x1080
+        // and this Store names 640x480, so it is not the image to write.
+        assert_eq!(
+            try_import_present_store(&mut state, &mut host, &group, 1, 640, 480, false).reason(),
+            "import_group_geom_drift",
+            "a pinned resident of a different size is not a generation drift"
+        );
+        // ...and it does NOT refuse on membership. Mapping 1 is presented at a
+        // new geometry, so it no longer resolves to the group — the state the
+        // gate used to reject. It now falls through to the checks that read the
+        // mapping itself, which is what the deletion claims.
         state.note_presented_geom(1, 640, 480);
         assert_ne!(surface_identity(&state, 1, 1920, 1080), group);
-        assert_eq!(
-            try_import_present_store(&mut state, &mut host, &group, 1, 1920, 1080, false).reason(),
-            "import_group_identity_drift",
-            "a group identity that no longer resolves is not a generation drift"
+        let reason =
+            try_import_present_store(&mut state, &mut host, &group, 1, 1920, 1080, false).reason();
+        assert_ne!(
+            reason, "import_group_geom_drift",
+            "membership is not the grouped arm's business any more"
+        );
+        assert!(
+            reason.starts_with("revalidate_"),
+            "the flush must reach the checks that read the mapping, got {reason}"
         );
         // The other arm, unchanged: a per-mid identity whose generation moved.
         let per_mid = surface_identity(&state, 1, 1920, 1080);
@@ -2110,16 +2147,21 @@ mod tests {
         );
     }
 
-    /// The grouped arm refuses in four distinguishable states, and the decline
+    /// Group admission fails in three distinguishable states, and the miss
     /// carries which one from the check that refused.
     ///
-    /// Two of them arrive without the mapping's lifetime having moved at all:
+    /// This is what retired the membership re-resolve from the import gate.
     /// `condemn_surface_backing` and a fresh `map_surface` both prune
     /// `presented_geoms` while deliberately *keeping* `map_generation` and the
     /// mapping's deferred windows, so a deferred flush's recycled-pages guard
-    /// passes and this gate is the only thing that refuses. Reported as one slug
-    /// they are indistinguishable from a genuine resize, which is a different
-    /// mechanism wanting a different answer.
+    /// passes and the gate was the only thing refusing — against a window the
+    /// layer below had just certified as the same incarnation. `unmap_surface`
+    /// prunes the same way but bumps the generation, so the lifetime layer
+    /// refuses first and the gate never decides. One slug covered all of it.
+    ///
+    /// The reading still feeds `import_group_membership_stale`, which is now
+    /// measure-only: the write proceeds, and the line is what would locate a
+    /// regression from letting it.
     #[test]
     fn the_grouped_arm_reports_which_membership_reading_refused() {
         use crate::model::OutputGroupMiss;
