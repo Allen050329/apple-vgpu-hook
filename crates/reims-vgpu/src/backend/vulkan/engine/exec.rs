@@ -540,6 +540,19 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
+        // A 1D image (`texture1d` / `texture1d_array`) is a single row: it may
+        // combine only with `arrayed` (the 1D-array case) and always has
+        // height 1. `volume`/`cube` are 2D/3D shapes and cannot co-occur.
+        if image.one_dim && (image.volume || image.cube || image.height != 1) {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::SampledShapeConflict {
+                    binding: image.binding,
+                    arrayed: image.arrayed,
+                    volume: image.volume,
+                    cube: image.cube,
+                },
+            ));
+        }
         if image.cube && (image.layers != 6 || image.width != image.height) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledCubeGeometry {
@@ -1332,6 +1345,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.volume,
                     resource.cube,
                     resource.arrayed,
+                    resource.one_dim,
                     resource.format,
                     resource.swizzle,
                     bytes,
@@ -1352,6 +1366,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.volume,
                     resource.cube,
                     resource.arrayed,
+                    resource.one_dim,
                     resource.format,
                     resource.swizzle,
                     counters,
@@ -1422,6 +1437,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         resource.volume,
                         resource.cube,
                         resource.arrayed,
+                        resource.one_dim,
                         super::super::translate::pixel::resident_color(source_bgra),
                         resource.swizzle,
                         counters,
@@ -1455,6 +1471,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.volume,
                     resource.cube,
                     resource.arrayed,
+                    resource.one_dim,
                     resource.format,
                     resource.swizzle,
                     counters,
@@ -2644,6 +2661,7 @@ mod tests {
                 arrayed: false,
                 volume: false,
                 cube: false,
+                one_dim: false,
                 source: SampledSource::GuestRuns(GuestRunSource {
                     runs: std::sync::Arc::new(vec![GuestRun {
                         host_ptr: 0x1000,

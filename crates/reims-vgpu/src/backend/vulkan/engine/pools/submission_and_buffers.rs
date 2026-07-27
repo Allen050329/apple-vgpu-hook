@@ -2055,6 +2055,7 @@ impl ResourcePools {
         volume: bool,
         cube: bool,
         arrayed: bool,
+        one_dim: bool,
         format: ash::vk::Format,
         swizzle: crate::contract::pixel_format::SwizzlePlan,
         counters: &EngineCounters,
@@ -2066,6 +2067,7 @@ impl ResourcePools {
             volume,
             cube,
             arrayed,
+            one_dim,
             format,
             swizzle,
         };
@@ -2078,12 +2080,18 @@ impl ResourcePools {
                 return Ok(handles);
             }
         }
-        let image_type = if volume {
+        let image_type = if one_dim {
+            vk::ImageType::TYPE_1D
+        } else if volume {
             vk::ImageType::TYPE_3D
         } else {
             vk::ImageType::TYPE_2D
         };
-        let view_type = if volume {
+        let view_type = if one_dim && arrayed {
+            vk::ImageViewType::TYPE_1D_ARRAY
+        } else if one_dim {
+            vk::ImageViewType::TYPE_1D
+        } else if volume {
             vk::ImageViewType::TYPE_3D
         } else if cube {
             vk::ImageViewType::CUBE
@@ -2178,6 +2186,7 @@ impl ResourcePools {
             volume,
             cube,
             arrayed,
+            one_dim,
             format,
             swizzle,
         };
@@ -2198,6 +2207,7 @@ impl ResourcePools {
         volume: bool,
         cube: bool,
         arrayed: bool,
+        one_dim: bool,
         format: ash::vk::Format,
         swizzle: crate::contract::pixel_format::SwizzlePlan,
         content: &[u8],
@@ -2211,6 +2221,7 @@ impl ResourcePools {
             volume,
             cube,
             arrayed,
+            one_dim,
             format,
             swizzle,
         };
@@ -2336,6 +2347,7 @@ mod recycle_tests {
             volume: false,
             cube: false,
             arrayed: false,
+            one_dim: false,
             format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                 crate::contract::pixel_format::TexelLayout::Bgra8,
             ),

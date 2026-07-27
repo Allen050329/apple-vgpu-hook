@@ -469,6 +469,7 @@ fn sampled_guest_runs_draw_does_not_batch() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::GuestRuns(GuestRunSource {
             runs: std::sync::Arc::new(vec![GuestRun {
                 host_ptr: ptr as usize,

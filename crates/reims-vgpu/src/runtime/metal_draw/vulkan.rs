@@ -1,3 +1,45 @@
+/// Vulkan image shape for a reflected Metal sampled-image dimensionality.
+///
+/// The engine caps array layers at 1 (a single-layer array is still a distinct
+/// descriptor type from a plain 2D image), so array shapes report `layers = 1`
+/// and a genuinely multi-layer source declines on its byte length rather than
+/// binding a truncated array.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SampledImageShape {
+    arrayed: bool,
+    volume: bool,
+    cube: bool,
+    one_dim: bool,
+    layers: u32,
+}
+
+/// Map a translated SPIR-V sampled-image dimensionality onto the Vulkan image
+/// shape the sampled-draw path builds. `None` is a shape the path cannot yet
+/// express (`Cube` / `CubeArray`); the caller declines it by name so the gap
+/// stays visible instead of binding the wrong view type.
+#[cfg(feature = "backend-vulkan")]
+fn sampled_image_shape(
+    kind: crate::runtime::spirv_bind::SampledImageKind,
+) -> Option<SampledImageShape> {
+    use crate::runtime::spirv_bind::SampledImageKind;
+    let (arrayed, volume, cube, one_dim) = match kind {
+        SampledImageKind::D1 => (false, false, false, true),
+        SampledImageKind::D1Array => (true, false, false, true),
+        SampledImageKind::D2 => (false, false, false, false),
+        SampledImageKind::D2Array => (true, false, false, false),
+        SampledImageKind::D3 => (false, true, false, false),
+        SampledImageKind::Cube | SampledImageKind::CubeArray => return None,
+    };
+    Some(SampledImageShape {
+        arrayed,
+        volume,
+        cube,
+        one_dim,
+        layers: 1,
+    })
+}
+
 #[cfg(feature = "backend-vulkan")]
 pub fn encode_draw_and_writeback<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -4953,23 +4995,32 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         SampledImageKind::D2
                     }
                 };
-                let (arrayed, volume, cube, layers) = match image_kind {
-                    crate::runtime::spirv_bind::SampledImageKind::D2 => (false, false, false, 1),
-                    crate::runtime::spirv_bind::SampledImageKind::D2Array => {
-                        (true, false, false, 1)
-                    }
-                    crate::runtime::spirv_bind::SampledImageKind::D3 => (false, true, false, 1),
-                    other => {
-                        return Err(DrawError::DrawPreparation(
-                            DrawPreparationDecline::TextureDimensionUnsupported {
-                                stage: if frag_stage { "fragment" } else { "vertex" },
-                                index,
-                                texture_ref,
-                                binding: img_bind,
-                                kind: format!("{other:?}"),
-                            },
-                        ));
-                    }
+                let Some(shape) = sampled_image_shape(image_kind) else {
+                    return Err(DrawError::DrawPreparation(
+                        DrawPreparationDecline::TextureDimensionUnsupported {
+                            stage: if frag_stage { "fragment" } else { "vertex" },
+                            index,
+                            texture_ref,
+                            binding: img_bind,
+                            kind: format!("{image_kind:?}"),
+                        },
+                    ));
+                };
+                let SampledImageShape {
+                    arrayed,
+                    volume,
+                    cube,
+                    one_dim,
+                    layers,
+                } = shape;
+                // A Vulkan 1D image is defined to have height 1; the descriptor
+                // may report the LUT's texel count in either axis, so collapse
+                // to a single row and fold the other axis into the width the
+                // sampled bytes are validated against.
+                let (tw, th) = if one_dim {
+                    (tw.saturating_mul(th).max(1), 1)
+                } else {
+                    (tw, th)
                 };
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
                     binding: img_bind,
@@ -4979,6 +5030,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     arrayed,
                     volume,
                     cube,
+                    one_dim,
                     source,
                     format: translate::pixel::vk_texel_layout(sampled_format),
                     identity: bytes_identity.map(|i| {
@@ -6973,5 +7025,48 @@ mod vulkan_split_tests {
              prim=0 first=0 idx=0 colors=[] vbuf=[] fbuf=[] vtex=[] ftex=[] \
              viewport=None scissor=None"
         );
+    }
+
+    #[test]
+    fn sampled_image_shape_maps_one_dimensional_luts() {
+        use crate::runtime::spirv_bind::SampledImageKind;
+
+        // A color-transfer LUT reflects as `texture1d` / `texture1d_array`.
+        // Before this mapping the sampled path declined the whole draw with
+        // `draw_prepare_texture_dimension_unsupported`, so the color-managed
+        // desktop composite stored nothing and presented unbacked.
+        let d1 = sampled_image_shape(SampledImageKind::D1).expect("D1 is expressible");
+        assert!(d1.one_dim && !d1.arrayed && !d1.volume && !d1.cube);
+        assert_eq!(d1.layers, 1);
+
+        let d1_array =
+            sampled_image_shape(SampledImageKind::D1Array).expect("D1Array is expressible");
+        assert!(d1_array.one_dim && d1_array.arrayed && !d1_array.volume && !d1_array.cube);
+        assert_eq!(d1_array.layers, 1);
+    }
+
+    #[test]
+    fn sampled_image_shape_keeps_two_dimensional_shapes_flat() {
+        use crate::runtime::spirv_bind::SampledImageKind;
+
+        for kind in [
+            SampledImageKind::D2,
+            SampledImageKind::D2Array,
+            SampledImageKind::D3,
+        ] {
+            let shape = sampled_image_shape(kind).expect("2D/3D shapes stay expressible");
+            assert!(!shape.one_dim, "{kind:?} must not be a 1D image");
+        }
+    }
+
+    #[test]
+    fn sampled_image_shape_declines_cube_shapes_by_name() {
+        use crate::runtime::spirv_bind::SampledImageKind;
+
+        // Cube sampling is not expressed on the sampled-draw path yet; the
+        // shape stays `None` so the caller declines it visibly rather than
+        // binding a 2D view under a cube sampler.
+        assert!(sampled_image_shape(SampledImageKind::Cube).is_none());
+        assert!(sampled_image_shape(SampledImageKind::CubeArray).is_none());
     }
 }

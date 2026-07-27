@@ -611,6 +611,11 @@ pub struct SampledImageResource {
     pub arrayed: bool,
     pub volume: bool,
     pub cube: bool,
+    /// Metal `texture1d` / `texture1d_array` (color-transfer LUTs): the image is
+    /// created as a Vulkan 1D image so the sampled descriptor type matches the
+    /// shader's declared 1D image. `height` is 1; `arrayed` selects
+    /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
+    pub one_dim: bool,
     pub source: SampledSource,
     /// Format the image and its view are created with, and the layout
     /// [`SampledSource::Bytes`] / [`SampledSource::GuestRuns`] content is read

@@ -655,6 +655,12 @@ pub(crate) struct SampledSlot {
     pub volume: bool,
     pub cube: bool,
     pub arrayed: bool,
+    /// The image was created as a Vulkan 1D (`TYPE_1D` / `TYPE_1D_ARRAY`) image
+    /// because the shader's sampled binding reflects a Metal `texture1d` /
+    /// `texture1d_array` (color-transfer LUTs). Part of the pool key: a 1D view
+    /// and a `height==1` 2D view are byte-identical images but incompatible
+    /// descriptor types, so a recycled slot must never cross that boundary.
+    pub one_dim: bool,
     pub format: ash::vk::Format,
     /// The view's component mapping, from the decoded type-8 swizzle. Part of
     /// the pool key because it is baked into the `VkImageView`: a recycled slot
@@ -672,6 +678,7 @@ struct SampledKey {
     volume: bool,
     cube: bool,
     arrayed: bool,
+    one_dim: bool,
     format: ash::vk::Format,
     swizzle: crate::contract::pixel_format::SwizzlePlan,
 }
@@ -685,6 +692,7 @@ impl SampledSlot {
             volume: self.volume,
             cube: self.cube,
             arrayed: self.arrayed,
+            one_dim: self.one_dim,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -701,6 +709,7 @@ impl SampledSlot {
             volume: self.volume,
             cube: self.cube,
             arrayed: self.arrayed,
+            one_dim: self.one_dim,
             format: self.format,
             swizzle: self.swizzle,
         }
