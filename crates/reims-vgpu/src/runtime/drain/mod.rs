@@ -1746,6 +1746,17 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // ClearOnly store_fifo/graph path above. Keyed only on decoded
         // full-frame-Store sequences (protocol state), never pixel content;
         // healthy 1-lag double-buffer alternation stays far below the margin.
+        // Always-on backing gate, on the mid the GUEST named (before any
+        // substitution below): a member presented twice with no full-frame
+        // Store and no inter-buffer seed in between is being displayed with
+        // content it never received. The substitution that follows may paper
+        // over it on screen; the loss is still real and belongs in the log.
+        if let Some(seq) = state.note_present_backing(mapping) {
+            crate::observe::fail(format!(
+                "present_unbacked mid={mapping} {w}x{h} gen={gen} since_seq={seq} \
+                 (no full-frame store and no peer seed since this mid's last present)"
+            ));
+        }
         let (capture_mid, capture_gen) = match state.dense_retention_gap(mapping, w, h) {
             Some((denser_mid, named_seq, denser_seq))
                 if denser_seq

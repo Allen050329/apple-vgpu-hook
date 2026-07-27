@@ -1168,6 +1168,26 @@ impl TargetIdentity {
             Self::Anonymous { .. } => 0,
         }
     }
+
+    /// The guest mapping id this identity is keyed by, when it is keyed by one
+    /// at all.
+    ///
+    /// `ResourcePools::registry` is keyed by `TargetIdentity`, so two mappings
+    /// that produce equal identities share one `VkImage`. A resident that
+    /// carries no mapping id (or a different one) is therefore shareable across
+    /// distinct guest surfaces — which is exactly what the mixed-generation
+    /// frame class needs, since WindowServer redraws a buffer only where it
+    /// differs from what THAT buffer last held. Callers resolving a surface use
+    /// this to assert the resident belongs to the surface that asked for it.
+    pub fn surface_mapping_id(&self) -> Option<u32> {
+        match self {
+            Self::Surface { id, .. } => Some(*id),
+            Self::Texture { .. }
+            | Self::Gva { .. }
+            | Self::Anonymous { .. }
+            | Self::OutputGroup { .. } => None,
+        }
+    }
 }
 
 /// Color attachment load action for resident targets.

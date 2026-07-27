@@ -3568,3 +3568,60 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
     );
     assert_eq!(state.mappings[&0x2a].content_generation, 7);
 }
+
+/// `present_unbacked` gate: a member presented twice with neither a full-frame
+/// Store nor an inter-buffer seed in between is being displayed with content it
+/// never received — the mixed-generation frame class. `dense_frame_seq` advances
+/// on both of those events, so an unchanged seq across a member's own two
+/// presents is the exact structural witness.
+///
+/// Healthy alternation must stay quiet: each buffer advances on its own turn.
+#[test]
+fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
+    let w = 1920u32;
+    let h = 1080u32;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    for mid in [1u32, 5u32] {
+        state.map_surface(mid);
+        state.note_compositor_member_published(mid, w, h);
+    }
+
+    // First present of each member has no prior witness — never a report.
+    assert_eq!(state.note_present_backing(1), None);
+    assert_eq!(state.note_present_backing(5), None);
+
+    // Healthy a/b alternation: each member gets its own full frame before its
+    // next present, so the seq advances and the gate stays silent.
+    for _ in 0..4 {
+        state.note_compositor_member_published(1, w, h);
+        assert_eq!(state.note_present_backing(1), None);
+        state.note_compositor_member_published(5, w, h);
+        assert_eq!(state.note_present_backing(5), None);
+    }
+
+    // Mid 5 now goes dark: every full frame lands on mid 1, but the guest keeps
+    // naming mid 5 at present. Each of those presents shows content mid 5 never
+    // received, and each is reported (once per present, not once per lifetime).
+    for _ in 0..3 {
+        state.note_compositor_member_published(1, w, h);
+        assert_eq!(state.note_present_backing(1), None);
+        assert!(
+            state.note_present_backing(5).is_some(),
+            "mid 5 gained neither a full-frame store nor a seed"
+        );
+    }
+
+    // An inter-buffer seed counts as backing: `peer_needs_front_seed` inherits
+    // the source's seq, so the next present of mid 5 is quiet again.
+    state.present.dense_frame_seq.insert(
+        5,
+        state.present.dense_frame_seq.get(&1).copied().unwrap_or(0),
+    );
+    assert_eq!(state.note_present_backing(5), None);
+
+    // A recycled mapping id must not compare against its predecessor's witness.
+    state.unmap_surface(5);
+    state.map_surface(5);
+    state.note_compositor_member_published(5, w, h);
+    assert_eq!(state.note_present_backing(5), None);
+}

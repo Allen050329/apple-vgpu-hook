@@ -168,6 +168,53 @@ fn import_store_timing_line(
 /// Compositor-output members at a ≥2-member geometry resolve to the shared
 /// [`TargetIdentity::OutputGroup`] — the guest's copy-swap contract makes the
 /// members alternating storage for one logical framebuffer.
+/// Fail-visible when `identity` — the resident a surface just resolved to — is
+/// not keyed by that surface's own mapping id.
+///
+/// `ResourcePools::registry` is keyed by `TargetIdentity`, so any two mappings
+/// with equal identities render into and capture from ONE `VkImage`. Distinct
+/// guest surfaces have independent damage histories (WindowServer redraws a
+/// buffer only where it differs from what that buffer last held), so a shared
+/// resident makes every frame a fusion of damage from several buffers — the
+/// mixed-generation frame class, which no other counter detects.
+///
+/// O(1) on the hot path: the member scan runs only when the line is emitted,
+/// and emission is deduplicated by geometry and member count so a growing
+/// group reports each new size once rather than per draw.
+fn note_resident_identity_sharing(
+    state: &DeviceState,
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) {
+    if mapping_id == 0 || identity.surface_mapping_id() == Some(mapping_id) {
+        return;
+    }
+    let mids: Vec<u32> = state
+        .present
+        .compositor_output_members
+        .iter()
+        .filter(|(_, m)| m.width == width && m.height == height)
+        .map(|(&mid, _)| mid)
+        .collect();
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::BTreeSet<(u32, u32, usize)>>> = Mutex::new(None);
+    let first = {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .get_or_insert_with(Default::default)
+            .insert((width, height, mids.len()))
+    };
+    if first {
+        crate::observe::fail(format!(
+            "resident_identity_shared {width}x{height} mapping={mapping_id} \
+             identity={identity:?} mids={mids:?} count={}",
+            mids.len()
+        ));
+    }
+}
+
 pub fn surface_identity(
     state: &DeviceState,
     mapping_id: u32,
@@ -195,24 +242,30 @@ pub fn surface_identity(
                 ));
             }
         }
-        return TargetIdentity::OutputGroup {
+        let identity = TargetIdentity::OutputGroup {
             id: gid,
             width,
             height,
             generation: 0,
         };
+        note_resident_identity_sharing(state, &identity, mapping_id, width, height);
+        return identity;
     }
     let gen = state
         .mappings
         .get(&mapping_id)
         .map(|m| m.map_generation as u64)
         .unwrap_or(0);
-    TargetIdentity::Surface {
+    let identity = TargetIdentity::Surface {
         id: mapping_id,
         width,
         height,
         generation: gen,
-    }
+    };
+    // Passes by construction today; kept on this path so the guard survives any
+    // future change to what a surface resolves to.
+    note_resident_identity_sharing(state, &identity, mapping_id, width, height);
+    identity
 }
 
 /// Type-11 Store with non-zero geom — the only product Store class that imports.
@@ -2018,6 +2071,46 @@ mod tests {
             surface_identity(&state, 1, 1280, 720),
             TargetIdentity::Surface { id: 1, .. }
         ));
+    }
+
+    /// Detector for the mixed-generation frame class.
+    ///
+    /// `ResourcePools::registry` is keyed by `TargetIdentity`, so a resident
+    /// that is NOT keyed by the mapping id that resolved to it is reachable
+    /// from another surface too — and distinct guest surfaces have independent
+    /// damage histories, so sharing one resident fuses their damage into a
+    /// single frame. `surface_mapping_id()` is the O(1) predicate the always-on
+    /// `resident_identity_shared` line is built on. Two unified members trip it
+    /// today; per-surface residents cannot.
+    #[test]
+    fn shared_resident_is_detectable_from_the_identity_alone() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [1u32, 5u32] {
+            state.map_surface(mid);
+        }
+        let member = crate::model::CompositorOutputMember {
+            width: 1920,
+            height: 1080,
+            source: 13,
+        };
+        // A lone member stays per-surface: keyed by its own mapping id.
+        state.present.compositor_output_members.insert(1, member);
+        state.note_presented_geom(1, 1920, 1080);
+        assert_eq!(
+            surface_identity(&state, 1, 1920, 1080).surface_mapping_id(),
+            Some(1),
+            "a per-surface resident belongs to the surface that asked for it"
+        );
+
+        // A second presented member at the same geometry unifies both onto one
+        // resident, and neither identity names the surface that resolved to it.
+        state.present.compositor_output_members.insert(5, member);
+        state.note_presented_geom(5, 1920, 1080);
+        let a = surface_identity(&state, 1, 1920, 1080);
+        let b = surface_identity(&state, 5, 1920, 1080);
+        assert_eq!(a, b, "two distinct guest surfaces reached one resident");
+        assert_eq!(a.surface_mapping_id(), None);
+        assert_eq!(b.surface_mapping_id(), None);
     }
 
     /// The direct-present fallback identity is always per-member.

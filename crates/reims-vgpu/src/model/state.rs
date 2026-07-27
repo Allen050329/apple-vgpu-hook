@@ -968,6 +968,19 @@ pub struct PresentState {
     /// — the `dense_retention_gap` guard. Cleared with
     /// membership on unmap.
     pub dense_frame_seq: BTreeMap<u32, u64>,
+    /// Per compositor-output member: the [`Self::dense_frame_seq`] value that
+    /// member held the last time it was PRESENTED.
+    ///
+    /// `dense_frame_seq` advances on a full-frame Store and on an inter-buffer
+    /// seed, so a member whose seq is unchanged across two of its own presents
+    /// received neither between them — it is being shown content it never
+    /// received. That is the always-on `present_unbacked` gate for the
+    /// mixed-generation frame class, which the `dense_retention_gap` /
+    /// `stale_subst` counters only ever measured as a substitution rate. Keyed
+    /// per member (not globally) so healthy a/b alternation, where each buffer
+    /// legitimately advances on its own turn, stays quiet. Cleared with
+    /// membership on unmap.
+    pub presented_dense_seq: BTreeMap<u32, u64>,
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
@@ -2764,6 +2777,36 @@ impl DeviceState {
         Some(source_mid)
     }
 
+    /// Record that `mapping_id` is being presented and report whether it is
+    /// backed — i.e. whether it received a full-frame Store or an inter-buffer
+    /// seed since its own previous present.
+    ///
+    /// Returns `Some(seq)` — the unchanged [`PresentState::dense_frame_seq`] —
+    /// when it did not. That member is being displayed with content it never
+    /// received, which is the mixed-generation frame class: a shared or stale
+    /// resident supplies whatever it happens to hold. `None` on the member's
+    /// first present (no prior witness) and whenever the seq advanced.
+    ///
+    /// Structural only: decoded Store/seed bookkeeping, never measured content.
+    /// Records the witness on every call, so a member that stays unbacked
+    /// reports once per present rather than once per lifetime.
+    pub fn note_present_backing(&mut self, mapping_id: u32) -> Option<u64> {
+        if mapping_id == 0 {
+            return None;
+        }
+        let seq = self
+            .present
+            .dense_frame_seq
+            .get(&mapping_id)
+            .copied()
+            .unwrap_or(0);
+        let previous = self.present.presented_dense_seq.insert(mapping_id, seq);
+        match previous {
+            Some(prev) if prev == seq => Some(seq),
+            _ => None,
+        }
+    }
+
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
         crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
         self.present.compositor_output_members.remove(&mapping_id);
@@ -2771,6 +2814,9 @@ impl DeviceState {
         // Prune the dense-frame seq too (mirrors peer_seeded_dense_seq): a
         // recycled mapping id must not inherit a stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
+        // Same rule for the presented-seq witness: a recycled id must not
+        // compare its first present against a predecessor's seq.
+        self.present.presented_dense_seq.remove(&mapping_id);
         // Prune the per-mid tile-epoch grid too (mirrors dense_frame_seq): a
         // recycled mapping id must not inherit a predecessor's tile epochs, or a
         // logically-unrelated surface would show phantom cross-mid divergence.
