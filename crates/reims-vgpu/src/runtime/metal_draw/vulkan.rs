@@ -5047,6 +5047,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 crate::runtime::census::setup_tex_census::note_stats(
                     t_stats.elapsed().as_micros() as u64
                 );
+                // `tw`/`th` are the texture's own extent and `w`/`h` the display
+                // geometry, so their inequality is exactly "this sample is
+                // scaled". Recorded because an image that reaches the display at
+                // its own size renders correctly while the same image scaled to
+                // reach it does not, and no other always-on counter separates
+                // those two cases.
+                crate::runtime::census::setup_tex_census::note_shape(
+                    tw != w || th != h,
+                    matches!(sampled_format, TexelLayout::R8 | TexelLayout::Rg8),
+                );
                 Ok(())
             };
             for t in &req.vertex_textures {
