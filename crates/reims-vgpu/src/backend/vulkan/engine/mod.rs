@@ -612,6 +612,7 @@ enum EngineProbe {
     ComputeWritebackAlignment,
     StorageWriteWithoutFormat,
     ComputeCapable,
+    SampledR32fLinearFilter,
 }
 
 impl EngineProbe {
@@ -625,6 +626,7 @@ impl EngineProbe {
             Self::ComputeWritebackAlignment => "compute_writeback_alignment",
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::ComputeCapable => "compute_capable",
+            Self::SampledR32fLinearFilter => "sampled_r32f_linear_filter",
         }
     }
 
@@ -638,6 +640,7 @@ impl EngineProbe {
             Self::ComputeWritebackAlignment => 6,
             Self::StorageWriteWithoutFormat => 7,
             Self::ComputeCapable => 8,
+            Self::SampledR32fLinearFilter => 9,
         }
     }
 }
@@ -752,6 +755,29 @@ pub fn supports_storage_image_write_without_format() -> bool {
         Err(error) => {
             engine_probe_decline(EngineProbe::StorageWriteWithoutFormat, &error)
                 .fail_once(EngineProbe::StorageWriteWithoutFormat.discriminant());
+            false
+        }
+    }
+}
+
+/// Whether the bound device can sample an `R32_SFLOAT` image with **linear**
+/// filtering. Gates the native single-channel float32 sampled rail (color
+/// LUTs): `R16_SFLOAT` linear filtering is spec-mandatory and needs no gate,
+/// but `R32_SFLOAT`'s is optional and absent on Apple/MoltenVK. Returns `false`
+/// (declining the rail, leaving the sample fail-visible) if the engine cannot
+/// initialize.
+pub fn supports_sampled_r32f_linear_filter() -> bool {
+    let mut guard = lock_engine();
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ..
+    } = &mut *guard;
+    match owner.ensure(counters) {
+        Ok(ctx) => ctx.sampled_r32f_linear_filter,
+        Err(error) => {
+            engine_probe_decline(EngineProbe::SampledR32fLinearFilter, &error)
+                .fail_once(EngineProbe::SampledR32fLinearFilter.discriminant());
             false
         }
     }

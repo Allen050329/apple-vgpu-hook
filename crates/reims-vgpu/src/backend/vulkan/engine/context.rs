@@ -225,6 +225,9 @@ pub(crate) struct DeviceContext {
     /// storage surface without an R/B swap (SPIR-V has no `Bgra8` storage
     /// format). Universally present on desktop NVIDIA / Mesa ANV / RADV.
     pub storage_image_write_without_format: bool,
+    /// `R32_SFLOAT` usable as a linearly-filtered sampled image; gates the
+    /// native float32 color-LUT sampled rail (see [`DeviceFeatures`]).
+    pub sampled_r32f_linear_filter: bool,
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
@@ -401,6 +404,7 @@ impl DeviceContext {
         );
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
+        let sampled_r32f_linear_filter = features.sampled_r32f_linear_filter;
         let has16 = features.storage16;
         let has8 = features.storage8;
         let has_float16 = features.float16;
@@ -650,6 +654,7 @@ impl DeviceContext {
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
+            sampled_r32f_linear_filter,
             pipeline_cache,
             vertex_divisor,
             vertex_formats,

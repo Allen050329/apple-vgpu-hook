@@ -14,6 +14,7 @@ pub const RG8_BPP: u32 = 2;
 pub const RGBA8_BPP: u32 = 4;
 pub const BGRA8_BPP: u32 = RGBA8_BPP;
 pub const R16F_BPP: u32 = 2;
+pub const R32F_BPP: u32 = 4;
 pub const RG16F_BPP: u32 = 4;
 pub const RGBA16_BPP: u32 = 8;
 pub const RGBA16F_BPP: u32 = RGBA16_BPP;
@@ -117,6 +118,13 @@ pub enum TexelLayout {
     /// has no float arm, so this native rail is the only correct path. Not a
     /// four-byte color layout, so it never rides the RGBA8-shaped loaders.
     R16Float,
+    /// 4 bytes/texel — a single-channel `float32` texture, sampled natively as
+    /// `R32_SFLOAT`. Same color-LUT role as [`Self::R16Float`], but its
+    /// linear-filter feature is optional (absent on Apple/MoltenVK), so the
+    /// rail that emits this layout must first confirm the host supports it.
+    /// Four bytes wide but **not** a colour order, so it stays out of the
+    /// RGBA8-shaped loaders and `is_four_byte_color`.
+    R32Float,
 }
 
 impl TexelLayout {
@@ -127,6 +135,7 @@ impl TexelLayout {
             Self::R8 => R8_BPP,
             Self::Rg8 => RG8_BPP,
             Self::R16Float => R16F_BPP,
+            Self::R32Float => R32F_BPP,
         }
     }
 

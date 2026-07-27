@@ -2038,12 +2038,18 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // identical and the CPU loaders never decoded either. The qualifier is
     // still lost, so the census records it rather than letting the fold be
     // silent.
-    // Four-byte colour (BGRA8/RGBA8) or a single-channel `float16` LUT: both
-    // sample byte-identically through the matching native Vulkan image. Other
-    // layouts (R8/Rg8 video planes) keep their existing CPU/type-5 rails.
+    // Four-byte colour (BGRA8/RGBA8) or a single-channel float LUT: all sample
+    // byte-identically through the matching native Vulkan image. Other layouts
+    // (R8/Rg8 video planes) keep their existing CPU/type-5 rails. `R32_SFLOAT`
+    // additionally needs the optional linear-filter feature — LUTs are sampled
+    // with interpolation — so it is gated on the host capability and otherwise
+    // declines here, leaving the sample fail-visible (no CPU float loader arm).
     let native = match translate::pixel::sampled_pixels(tex.pixel_format) {
         Ok((layout, decline))
-            if layout.is_four_byte_color() || layout == TexelLayout::R16Float =>
+            if layout.is_four_byte_color()
+                || layout == TexelLayout::R16Float
+                || (layout == TexelLayout::R32Float
+                    && engine::supports_sampled_r32f_linear_filter()) =>
         {
             if decline.is_some() {
                 srgb_census::note_downgrade(
