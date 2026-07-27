@@ -60,17 +60,17 @@ test-level proxy for the bug class. Screenshots are useful evidence, but they ar
 gate by themselves.
 
 **Identify comes before add.** The always-on lines already carry more than they look like they do,
-and slicing an existing one per case is faster than writing a probe and cheaper than being wrong. A
-recent instance: a defect was traced to a missing multi-plane sampling conversion, the gap was real,
-and the fix site had been located — but the existing `type4 pages … planes= multi=` line, sliced per
-case, showed the two-plane *surface* appearing **only in the case that rendered correctly**. The
-fix would have changed code the failing case does not run through.
+and slicing an existing one per case is faster than writing a probe. A defect here was traced to a
+missing multi-plane sampling conversion, the gap was real, and the fix site had been located — and
+slicing the existing `type4 pages … planes= multi=` line per case stopped that fix cold before a
+line of it was written. That was the right move and it cost minutes.
 
-**Then say exactly what you ruled out.** That same probe was first written up as "not YUV", and the
-verbose draw log later showed both cases working in per-plane `R8` and `RG8` views — chroma
-subsampling that a surface-level plane count cannot see. The narrow claim (no multiplanar *surface*)
-held; the broad one did not, and it would have steered the next reader away from a live lead. Name
-the path a probe covers, not the idea it seemed to kill.
+**Then say exactly what you ruled out.** The claim drawn from that slice was "not YUV", and it was
+too broad twice over. First, the verbose draw log later showed both cases working in per-plane `R8`
+and `RG8` views — chroma subsampling that a surface-level plane count cannot see. Second, and worse,
+even the narrow reading did not survive: see "An event count is not a state" below, which is the same
+probe, re-measured, coming out the other way. Name the path a probe covers, not the idea it seemed
+to kill — and expect the narrow claim to be the only part that lasts, if any of it does.
 
 So when a mechanism looks obvious, spend the cheap step first: find a line already emitted on both
 sides and check that it separates them. Then check the converse — that it would have *shown* the
