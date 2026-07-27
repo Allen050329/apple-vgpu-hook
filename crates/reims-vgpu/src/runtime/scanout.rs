@@ -3136,6 +3136,15 @@ mod tests {
     /// seed at all. Do not revert this on a sequential A/B; see the wallpaper
     /// pinning and interleaving rules in `AGENTS.md`.
     ///
+    /// The A/B was then re-run properly: four boots alternating with and without
+    /// the seed, wallpaper pinned to a static image. All sixteen captures landed
+    /// within 3e-6 of each other, on arms where the seed fired 42 and 53 times
+    /// against 0. So removing it changes nothing observable on that sequence.
+    /// Read that as one-sided, because the sequence does not currently reproduce
+    /// the class the seed was supposed to protect: it shows the deletion
+    /// introduces no new defect, not that it preserves a behaviour the sequence
+    /// never exercises.
+    ///
     /// If this test ever fails, the deletion is no longer safe: named siblings
     /// would hold divergent residents again and the retention gap would be real.
     #[test]
