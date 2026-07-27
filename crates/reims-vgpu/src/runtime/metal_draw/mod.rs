@@ -4023,7 +4023,9 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
         {
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
-                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 multi)"
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
+                 row={y} rowlen={:#x} (rgba8 multi)",
+                row.len()
             ));
             return false;
         }
@@ -4126,7 +4128,9 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
         {
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
-                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 rect multi)"
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
+                 row={y} rowlen={:#x} (rgba8 rect multi)",
+                row.len()
             ));
             return false;
         }
