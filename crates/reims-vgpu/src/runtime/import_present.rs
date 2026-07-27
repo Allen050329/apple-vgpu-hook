@@ -2073,6 +2073,76 @@ mod tests {
         ));
     }
 
+    /// A proven swapchain geometry keeps unifying a lone presented member across
+    /// the buffer recycles that momentarily leave a single concurrently
+    /// presented member. This is the black-background / desktop-residue class:
+    /// WindowServer continuously recycles swapchain buffers (fresh mid ids, old
+    /// ones unmapped), so the *concurrent* peer count drops to one; without the
+    /// sticky `output_group_geoms` latch the fresh buffer resolved to a per-mid
+    /// resident that never held the accumulated full frame, and the guest's
+    /// damage-only draw left everything outside the damaged rect black.
+    #[test]
+    fn proven_swapchain_geometry_unifies_a_lone_recycled_member() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [1u32, 5u32, 9u32] {
+            state.map_surface(mid);
+        }
+        let member = |w, h| crate::model::CompositorOutputMember {
+            width: w,
+            height: h,
+            source: 13,
+        };
+        // Two members presented together: the geometry is a proven swapchain.
+        state
+            .present
+            .compositor_output_members
+            .insert(1, member(1920, 1080));
+        state
+            .present
+            .compositor_output_members
+            .insert(5, member(1920, 1080));
+        state.note_presented_geom(1, 1920, 1080);
+        state.note_presented_geom(5, 1920, 1080);
+        assert!(matches!(
+            surface_identity(&state, 1, 1920, 1080),
+            TargetIdentity::OutputGroup { .. }
+        ));
+
+        // WindowServer recycles the swapchain: the old buffers are gone and a
+        // fresh buffer (mid 9) is the only member presented at the geometry.
+        for mid in [1u32, 5u32] {
+            state.present.compositor_output_members.remove(&mid);
+            state.present.presented_geoms.remove(&mid);
+        }
+        state
+            .present
+            .compositor_output_members
+            .insert(9, member(1920, 1080));
+        state.note_presented_geom(9, 1920, 1080);
+
+        // The lone fresh buffer still resolves to the shared OutputGroup
+        // resident (per-mid resolution here is the black-background bug).
+        assert!(
+            matches!(
+                surface_identity(&state, 9, 1920, 1080),
+                TargetIdentity::OutputGroup { .. }
+            ),
+            "a proven swapchain geometry stays unified across buffer recycles"
+        );
+
+        // A geometry that was never double-buffered stays per-mid: a lone
+        // member at a fresh resolution must not spuriously unify.
+        state
+            .present
+            .compositor_output_members
+            .insert(9, member(1280, 720));
+        state.note_presented_geom(9, 1280, 720);
+        assert!(matches!(
+            surface_identity(&state, 9, 1280, 720),
+            TargetIdentity::Surface { id: 9, .. }
+        ));
+    }
+
     /// Detector for the mixed-generation frame class.
     ///
     /// `ResourcePools::registry` is keyed by `TargetIdentity`, so a resident

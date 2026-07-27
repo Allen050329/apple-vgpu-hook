@@ -940,6 +940,22 @@ pub struct PresentState {
     /// resident (the Safari-scroll black-band class).
     /// Removed on unmap with membership.
     pub presented_geoms: BTreeMap<u32, (u32, u32)>,
+    /// Display geometries proven to be a multi-buffer compositor swapchain:
+    /// latched `true` the first time two distinct compositor-output members are
+    /// *presented* at that geometry (the same condition `output_group_for`
+    /// arms on). Sticky per boot — a resolution that was ever double-buffered
+    /// stays one. WindowServer recycles swapchain buffers continuously (new mid
+    /// ids, old ones unmapped, so `presented_geoms`/membership churn), which
+    /// dropped the *concurrently* presented member count to one and collapsed
+    /// the group — a fresh or recycled buffer then resolved to a per-mid
+    /// resident that never held the accumulated full frame, so the guest's
+    /// damage-only draw left everything outside the damaged rect black (the
+    /// black-background / desktop-residue class). Latching the geometry keeps
+    /// every presented member at a proven swapchain resolution unified through
+    /// those recycles. Not gated on measured content; the per-mid
+    /// member+`presented_at` checks in `output_group_for` still keep never
+    /// presented publish-only tiles (WebKit content surfaces) out of the group.
+    pub output_group_geoms: std::collections::BTreeSet<(u32, u32)>,
     /// Per compositor-output-member peer: the `dense_frame_seq` of the dense
     /// source it was last seeded from. A LOAD draw into a member-peer that lags
     /// a same-geometry peer holding a fresher full frame seeds from that dense
@@ -2603,6 +2619,25 @@ impl DeviceState {
             return;
         }
         self.present.presented_geoms.insert(mapping_id, (w, h));
+        // Latch the geometry as a proven multi-buffer swapchain the first time
+        // two distinct members are presented there (see `output_group_geoms`).
+        // The latch is sticky, so a later buffer recycle that momentarily leaves
+        // a single concurrently-presented member cannot collapse the group.
+        if !self.present.output_group_geoms.contains(&(w, h))
+            && self.presented_member_count(w, h) >= 2
+        {
+            self.present.output_group_geoms.insert((w, h));
+        }
+    }
+
+    /// Number of distinct compositor-output members currently presented at
+    /// `w`x`h` (the arming condition for [`Self::output_group_for`]).
+    fn presented_member_count(&self, w: u32, h: u32) -> usize {
+        self.present
+            .compositor_output_members
+            .iter()
+            .filter(|(&mid, m)| m.width == w && m.height == h && self.presented_at(mid, w, h))
+            .count()
     }
 
     /// Group id when `mapping_id` is a proven compositor-output member at
@@ -2615,6 +2650,14 @@ impl DeviceState {
     /// scrollbars — full-frame publishers that are never displayed) out of
     /// groups: unifying those chains DISTINCT surfaces onto one resident
     /// (the Safari-scroll black-band class).
+    ///
+    /// Membership is granted once the geometry is a proven swapchain (two
+    /// members presented there, latched in [`PresentState::output_group_geoms`])
+    /// OR a same-geometry peer is presented alongside this member right now. The
+    /// latch keeps a member unified across the buffer recycles that otherwise
+    /// dropped the concurrent peer count to one and re-exposed a per-mid
+    /// resident (the black-background class); the live peer check still arms the
+    /// group on the very first frame two members appear together.
     pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
         let member = self.present.compositor_output_members.get(&mapping_id)?;
         if member.width != w || member.height != h {
@@ -2622,6 +2665,9 @@ impl DeviceState {
         }
         if !self.presented_at(mapping_id, w, h) {
             return None;
+        }
+        if self.present.output_group_geoms.contains(&(w, h)) {
+            return Some(1);
         }
         let peers = self
             .present
