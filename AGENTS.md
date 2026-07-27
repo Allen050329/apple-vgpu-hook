@@ -177,8 +177,16 @@ It also settles arguments that qualitative reading cannot. A table of destroyed 
 the notes for two iterations described as "YUV-shaped", which was true and useless. Fitted, it is
 full-range **BT.601** luma of the correct image with the chroma pair pinned at (0, 255) — fifteen
 numbers, worst error 1.6, zero fitted parameters, and BT.709 refuted because no constant chroma
-satisfies its green and blue together. The pinned values are the *format-fill constants* of a
-sampled image's z,w lanes, which no qualitative reading would have produced.
+satisfies its green and blue together. "YUV-shaped" cannot be acted on; "the chroma pair is exactly
+(0, 255)" can, because it turns the next probe into a yes/no about a specific value.
+
+Stop the fit there. A closed form tells you *what* the wrong value is and says nothing about where it
+came from, and the temptation to append a mechanism to it is strong precisely because the fit is
+convincing. The same result above was written up with "and (0, 255) are the format-fill constants of
+a sampled image's z,w lanes, which nothing else produces" — a day later, reading the kernel showed it
+writes a literal 1.0 into lanes itself, so a 1.0 is not evidence of a fill at all. The fit survived;
+the mechanism sentence bolted onto it did not, and it would have aimed the next iteration at the
+wrong site.
 
 Two rules make the fit trustworthy:
 
