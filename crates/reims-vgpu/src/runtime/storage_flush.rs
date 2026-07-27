@@ -202,6 +202,13 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     // walk (the visitor early-exits once every window is hit), which is exactly
     // when it is cached.
     let mut visited_pages: Vec<u64> = Vec::new();
+    // Which visited page produced the first hit. `GVA_ALIAS_PROBE_STRIDE_PAGES`
+    // exists on the claim that "real aliases are same-surface, so the first page
+    // hits" — a claim that, if true, makes the stride's miss window unreachable
+    // and the constant itself removable, and if false makes it a correctness
+    // hole on a path that decides whether guest content is ordered. Nothing has
+    // ever read it. This does.
+    let mut first_hit_ordinal: Option<u64> = None;
     state.tranche.zc_flush_walk = state.tranche.zc_flush_walk.saturating_add(1);
     let t_walk = std::time::Instant::now();
     {
@@ -233,6 +240,13 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
                     if entry.pages.contains(&gpa_page) && !gva_hits.contains(&window_gva) {
                         gva_hits.push(window_gva);
                     }
+                }
+                if first_hit_ordinal.is_none()
+                    && hits.len() + linear_hits.len() + gva_hits.len() > 0
+                {
+                    // `visited_pages` was pushed at the top of this call, so the
+                    // ordinal of the page that just hit is len-1.
+                    first_hit_ordinal = Some(visited_pages.len().saturating_sub(1) as u64);
                 }
                 hits.len() + linear_hits.len() + gva_hits.len() < total
             },
@@ -271,6 +285,15 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         }
         state.flush_nohit_memo.remove(&memo_key);
     }
+    // Always-on: a hit-producing walk is rare (six in a whole repro boot; the
+    // measurement this path's memo was built on saw zero over ~59k compositing
+    // draws), so there is no flood risk and nothing to sample.
+    crate::observe::fail(format!(
+        "gva_alias_hit_page task={task_id} gva={gva:#x} span={span} first_hit_page={} \
+         stride={stride} n_pages={n_pages} full_walked={} hits={hit_ct}",
+        first_hit_ordinal.map_or(-1i64, |o| (o.saturating_mul(stride)) as i64),
+        u8::from(full_walked)
+    ));
     state.tranche.zc_flush_hits = state.tranche.zc_flush_hits.saturating_add(hit_ct);
     for mid in hits {
         crate::observe::off(format!(
@@ -1483,6 +1506,69 @@ mod tests {
             !state.flush_nohit_memo.contains_key(&(1, 0, 0x100)),
             "task redefine must invalidate the flush memo"
         );
+    }
+
+    /// `GVA_ALIAS_PROBE_STRIDE_PAGES` rests on one sentence — "real aliases are
+    /// same-surface, so the first page hits" — and nothing has ever read whether
+    /// that holds. `gva_alias_hit_page` reads it, so it has to be able to tell a
+    /// page-0 hit from a later one; a probe that always said 0 would "confirm"
+    /// the claim while measuring nothing.
+    ///
+    /// Same fixture, same two-page span, same window geometry — only which page
+    /// the window sits on differs.
+    #[test]
+    fn alias_hit_page_probe_separates_a_first_page_hit_from_a_later_one() {
+        use crate::contract::endian::st32;
+        use crate::runtime::host::HostMemory;
+        let first_hit_page = |state: &mut DeviceState,
+                              host: &mut crate::runtime::host::FakeHost,
+                              window_page: u64|
+         -> String {
+            let page_shift = PAGE_SHIFT_X86;
+            state.arm_gva_deferred_window(
+                0x9100_0000,
+                gva_entry(1, 4, 4, &[window_page << page_shift]),
+            );
+            crate::observe::redirect_logs_for_tests();
+            let at = std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len();
+            // Two guest pages from gva 0, so page 0 resolves to 0x2000 and page 1
+            // to 0x3000 — the window sits on exactly one of them.
+            super::flush_intersecting_task_gva(state, host, 1, 0, 2 << page_shift);
+            let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+            body[at.min(body.len())..]
+                .lines()
+                .find(|l| l.starts_with("gva_alias_hit_page "))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .find(|f| f.starts_with("first_hit_page="))
+                })
+                .unwrap_or("<no line>")
+                .to_string()
+        };
+
+        let (mut host, mut state, root_gpa, page_shift) = memo_pt_fixture();
+        // Wire PTE[1] -> 0x3000 so the span's second page resolves too.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 0x3000);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        assert_eq!(
+            first_hit_page(&mut state, &mut host, 0x2000),
+            "first_hit_page=0",
+            "a window on the span's first page must report page 0"
+        );
+
+        let (mut host, mut state, root_gpa, _) = memo_pt_fixture();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 0x3000);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        assert_eq!(
+            first_hit_page(&mut state, &mut host, 0x3000),
+            "first_hit_page=1",
+            "a window on the span's second page must report page 1, not 0"
+        );
+        let _ = page_shift;
     }
 
     /// A signature change that arms a window ON the cached bind's own page is
