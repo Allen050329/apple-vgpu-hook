@@ -221,6 +221,48 @@ fn run_gpu_stats_oracle(
     }
 }
 
+/// Record the display action for `mapping_id` and report whether it moved where
+/// that surface's content lives.
+///
+/// A capture IS the display action: `note_presented_geom` is the only evidence
+/// class that qualifies a mapping for OutputGroup unification, and it also
+/// latches the geometry as a proven swapchain the first time two distinct
+/// members are presented there. Both effects feed
+/// [`crate::model::DeviceState::output_group_for`], so
+/// [`crate::runtime::import_present::surface_identity`] can answer
+/// `Surface { .. }` immediately before this call and `OutputGroup { .. }`
+/// immediately after.
+///
+/// That matters because the draw always precedes the present. Every draw that
+/// produced the frame we are about to scan out targeted the identity from
+/// BEFORE; the export reads the one from AFTER. When they differ, the image we
+/// scan out never received this frame — a real loss of guest work that looks on
+/// screen exactly like "the previous frame" or "black outside the damage rect".
+///
+/// Returns `Some((before, after))` on a flip, so the caller can name it. This is
+/// measure-only and deliberately does NOT suppress the flip: which side is
+/// correct is not established. A surface's first present is genuinely the first
+/// decoded evidence that it is a display plane — the transaction naming it as
+/// plane 0 is the strongest such evidence there is — but that evidence arrives
+/// after the draw that needed it. Neither pinning the old identity (the surface
+/// stays out of the group forever) nor accepting the new one (this frame's draw
+/// is stranded) is derivable from the contract yet.
+fn note_display_action(
+    state: &mut crate::model::DeviceState,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<(
+    crate::backend::vulkan::engine::types::TargetIdentity,
+    crate::backend::vulkan::engine::types::TargetIdentity,
+)> {
+    let before =
+        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
+    state.note_presented_geom(mapping_id, width, height);
+    let after = crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
+    (before != after).then_some((before, after))
+}
+
 /// Rebuild the exact identity a [`crate::model::PendingStats`] was armed with.
 /// Never re-resolves group membership (see the type's docs).
 #[cfg(feature = "backend-vulkan")]
@@ -417,10 +459,14 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
-    // A capture IS the display action: record the present evidence that
-    // qualifies this mapping for OutputGroup unification (see
-    // `DeviceState::output_group_for` — publish-only surfaces never unify).
-    state.note_presented_geom(mapping_id, width, height);
+    if let Some((before, after)) = note_display_action(state, mapping_id, width, height) {
+        crate::observe::fail(format!(
+            "present_identity_flip mid={mapping_id} {width}x{height} \
+             before={before:?} after={after:?} \
+             (the display action moved this surface's resident; the draws that \
+             produced this frame went to the other one)"
+        ));
+    }
     // Advance the per-present tile-epoch clock and measure per-tile
     // damage-coverage divergence against the freshest same-geometry peer
     //. The CPU-display capture below
@@ -3285,6 +3331,60 @@ mod tests {
         // gap re-appears — the gate keys on presented-ness alone, nothing else.
         state.note_presented_geom(7, w, h);
         assert_eq!(state.dense_retention_gap(1, w, h), Some((7, 1, 21)));
+    }
+
+    /// The display action that first unifies a swapchain member MOVES where that
+    /// member's content lives, after the draws that produced the frame already
+    /// went somewhere else.
+    ///
+    /// `note_presented_geom` is the only evidence class that qualifies a mapping
+    /// for OutputGroup unification, and the draw always precedes the present. So
+    /// on a member's first present, `surface_identity` answers `Surface { .. }`
+    /// on the way in and `OutputGroup { .. }` on the way out — and the image we
+    /// scan out is not the one this frame was rendered into. On a live x86 boot
+    /// that shows up as `export_present … unknown_identity identity_kind=surface`
+    /// and a desktop that is black everywhere except the rect the guest damaged.
+    ///
+    /// This pins the detector, not a fix: which side is correct is not yet
+    /// derivable from the contract (§ the KB's open question on whether surface
+    /// create carries a scanout hint).
+    #[test]
+    fn first_present_of_a_second_swapchain_member_moves_its_resident() {
+        use crate::backend::vulkan::engine::types::TargetIdentity;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 48u32);
+
+        // Two same-geometry compositor members, neither presented yet.
+        state.note_compositor_member_published(1, w, h);
+        state.note_compositor_member_published(4, w, h);
+
+        // mid 1's first present: no presented peer yet, so nothing unifies and
+        // its content stays exactly where its draws put it.
+        assert_eq!(
+            note_display_action(&mut state, 1, w, h),
+            None,
+            "the first member's first present has nothing to unify with"
+        );
+
+        // mid 4's first present unifies the pair. Everything drawn into mid 4
+        // before this instant went to `Surface { id: 4 }`; everything read after
+        // it comes from the group.
+        let (before, after) = note_display_action(&mut state, 4, w, h)
+            .expect("the display action that unifies a member moves where its content lives");
+        assert!(
+            matches!(before, TargetIdentity::Surface { id: 4, .. }),
+            "before the display action mid 4 is its own resident, got {before:?}"
+        );
+        assert!(
+            matches!(after, TargetIdentity::OutputGroup { .. }),
+            "after it, mid 4 reads the shared group resident, got {after:?}"
+        );
+
+        // Steady state: both members are already unified, so presents stop
+        // moving anything. A detector that fired here would be useless — the
+        // rotation presents on every frame.
+        assert_eq!(note_display_action(&mut state, 1, w, h), None);
+        assert_eq!(note_display_action(&mut state, 4, w, h), None);
     }
 
     /// Regression guard for `present_dims`, the scanout sizing lookup. The
