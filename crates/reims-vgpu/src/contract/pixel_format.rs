@@ -109,6 +109,14 @@ pub enum TexelLayout {
     R8,
     /// 2 bytes/texel — a biplanar video chroma plane, likewise native.
     Rg8,
+    /// 2 bytes/texel — a single-channel `float16` texture, sampled natively as
+    /// `R16_SFLOAT` (the shader reads `.x`, the other lanes expand to `0,0,1`).
+    /// Color-management 1D LUTs (macOS WindowServer's `UberCompositeFragment`
+    /// display-profile pass) are stored this way; converting them to unorm8
+    /// would quantize the transfer curve, and the CPU `texel_to_rgba8` loader
+    /// has no float arm, so this native rail is the only correct path. Not a
+    /// four-byte color layout, so it never rides the RGBA8-shaped loaders.
+    R16Float,
 }
 
 impl TexelLayout {
@@ -118,6 +126,7 @@ impl TexelLayout {
             Self::Rgba8 | Self::Bgra8 => RGBA8_BPP,
             Self::R8 => R8_BPP,
             Self::Rg8 => RG8_BPP,
+            Self::R16Float => R16F_BPP,
         }
     }
 

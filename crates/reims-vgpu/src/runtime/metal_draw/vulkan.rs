@@ -2038,8 +2038,13 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // identical and the CPU loaders never decoded either. The qualifier is
     // still lost, so the census records it rather than letting the fold be
     // silent.
+    // Four-byte colour (BGRA8/RGBA8) or a single-channel `float16` LUT: both
+    // sample byte-identically through the matching native Vulkan image. Other
+    // layouts (R8/Rg8 video planes) keep their existing CPU/type-5 rails.
     let native = match translate::pixel::sampled_pixels(tex.pixel_format) {
-        Ok((layout, decline)) if layout.is_four_byte_color() => {
+        Ok((layout, decline))
+            if layout.is_four_byte_color() || layout == TexelLayout::R16Float =>
+        {
             if decline.is_some() {
                 srgb_census::note_downgrade(
                     srgb_census::site::LINEAR_SAMPLE_ZERO_COPY,
@@ -2050,24 +2055,30 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         }
         _ => return None,
     };
+    let bpp = native.bytes_per_texel();
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
     let (w, h) = (layout.width, layout.height);
     if w == 0 || h == 0 {
         return None;
     }
     let bpr = layout.row_stride;
-    let tight = (w as u64).checked_mul(RGBA8_BPP as u64)?;
+    let tight = (w as u64).checked_mul(bpp as u64)?;
     // Padded strides ride the same rail: the buffer→image copy strides over
     // the padding via `bufferRowLength` (texel units, so bpr must be a texel
     // multiple). The window ends after the last row's texels — trailing
     // padding may not be mapped.
-    if bpr < tight || bpr % RGBA8_BPP as u64 != 0 {
+    if bpr < tight || bpr % bpp as u64 != 0 {
         return None;
     }
     let span = bpr
         .checked_mul(h.checked_sub(1)? as u64)?
         .checked_add(tight)?;
-    if span < ZERO_COPY_SAMPLED_MIN_BYTES {
+    // The min-byte floor keeps small four-byte textures on the cheaper CPU
+    // memo/cache path. Single-channel float LUTs have no CPU loader arm
+    // (`texel_to_rgba8` returns `None`), so this native gather is their only
+    // correct rail — exempt them from the floor or a small display-profile LUT
+    // would fall through to a failed resolve.
+    if native.is_four_byte_color() && span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
     if !host.map_pages_stable() {
@@ -2076,7 +2087,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     let row_length_texels = if bpr == tight {
         0
     } else {
-        u32::try_from(bpr / RGBA8_BPP as u64).ok()?
+        u32::try_from(bpr / bpp as u64).ok()?
     };
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;

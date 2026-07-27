@@ -208,6 +208,12 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         vk::Format::B8G8R8A8_UNORM => TexelLayout::Bgra8,
         vk::Format::R8_UNORM => TexelLayout::R8,
         vk::Format::R8G8_UNORM => TexelLayout::Rg8,
+        // Single-channel float16 rides its own native rail (color-management
+        // LUTs). `R16_SFLOAT` is a spec-mandatory sampled+linear format, so no
+        // capability gate is needed. `R32_SFLOAT` is deliberately absent: its
+        // linear-filter feature is optional (unsupported on Apple/MoltenVK), so
+        // it stays declined until a capability-gated rail carries it.
+        vk::Format::R16_SFLOAT => TexelLayout::R16Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
     };
     Ok((layout, srgb_decline(&f, mtl)))
@@ -225,6 +231,7 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Bgra8 => vk::Format::B8G8R8A8_UNORM,
         TexelLayout::R8 => vk::Format::R8_UNORM,
         TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
+        TexelLayout::R16Float => vk::Format::R16_SFLOAT,
     }
 }
 
@@ -995,6 +1002,29 @@ mod tests {
         );
     }
 
+    /// A single-channel `float16` texture samples natively as `R16_SFLOAT`
+    /// (its linear-filter feature is spec-mandatory, so it needs no capability
+    /// gate). The color-management LUTs of macOS WindowServer's
+    /// `UberCompositeFragment` display-profile pass arrive this way; before this
+    /// rail carried the layout the draw resolved to nothing and the whole
+    /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
+    #[test]
+    fn r16_float_samples_natively_through_its_own_layout() {
+        use crate::contract::pixel_format::TexelLayout;
+        let (layout, decline) = sampled_pixels(p::MTL_FORMAT_R16_FLOAT).expect("R16F is sampled");
+        assert_eq!(layout, TexelLayout::R16Float);
+        assert!(decline.is_none(), "no sRGB transfer function to drop");
+        assert_eq!(layout.bytes_per_texel(), 2);
+        assert!(!layout.is_four_byte_color());
+        assert_eq!(vk_texel_layout(layout), vk::Format::R16_SFLOAT);
+        // R32F stays declined: its linear-filter feature is optional (absent on
+        // Apple/MoltenVK) and no capability-gated rail carries it yet.
+        assert_eq!(
+            sampled_pixels(p::MTL_FORMAT_R32_FLOAT).unwrap_err(),
+            TranslateReason::NoSampledLayout(p::MTL_FORMAT_R32_FLOAT)
+        );
+    }
+
     /// Every rail's accepted set, spelled out. A format silently joining or
     /// leaving one of these changes which draws take the zero-copy path.
     #[test]
@@ -1011,6 +1041,10 @@ mod tests {
                 // this rail cannot carry, and binding it as bare R8 would hand
                 // the shader the byte in red instead of alpha.
                 p::MTL_FORMAT_R8_UNORM,
+                // Single-channel float16 rides its own native rail (color LUTs);
+                // R32_FLOAT stays absent until a capability-gated rail carries
+                // its optional linear-filter feature.
+                p::MTL_FORMAT_R16_FLOAT,
                 p::MTL_FORMAT_RG8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
