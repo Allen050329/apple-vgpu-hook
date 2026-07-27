@@ -63,12 +63,19 @@ gate by themselves.
 and slicing an existing one per case is faster than writing a probe and cheaper than being wrong. A
 recent instance: a defect was traced to a missing multi-plane sampling conversion, the gap was real,
 and the fix site had been located — but the existing `type4 pages … planes= multi=` line, sliced per
-case, showed the two-plane surface appearing **only in the case that rendered correctly**. The
-failing case never took that path. The fix would have changed code the defect does not run through.
+case, showed the two-plane *surface* appearing **only in the case that rendered correctly**. The
+fix would have changed code the failing case does not run through.
+
+**Then say exactly what you ruled out.** That same probe was first written up as "not YUV", and the
+verbose draw log later showed both cases working in per-plane `R8` and `RG8` views — chroma
+subsampling that a surface-level plane count cannot see. The narrow claim (no multiplanar *surface*)
+held; the broad one did not, and it would have steered the next reader away from a live lead. Name
+the path a probe covers, not the idea it seemed to kill.
 
 So when a mechanism looks obvious, spend the cheap step first: find a line already emitted on both
-sides and check that it separates them. A hypothesis that survives that is worth building on; one
-that does not was going to cost a full cycle.
+sides and check that it separates them. Then check the converse — that it would have *shown* the
+mechanism had it been present. A probe that cannot distinguish the cases is not evidence in either
+direction.
 
 ### Interleave The Arms Of A Live A/B
 
