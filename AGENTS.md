@@ -76,9 +76,6 @@ function name, pipeline ref, or observed content pattern. Implement the decoded 
 Temporary probes are fine when they collect evidence. Remove probe-only behavior before claiming the
 fix. Do not turn observations into product heuristics.
 
-For metal2vulkan, do not make translation pass by matching corpus names. Handle the structural AIR
-or LLVM semantics, or leave the gap visible.
-
 ### No Magic Numbers
 
 Do not guess numbers because they fit one observation. Derive constants from the contract: SDK
