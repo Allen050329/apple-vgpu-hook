@@ -37,6 +37,28 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
     if state.compute_deferred_flush.is_empty() && state.render_deferred_flush.is_empty() {
         return true;
     }
+    // A condemned backing is an UNDECIDED window, not a dead one.
+    // `condemn_surface_backing` deliberately keeps content state — including
+    // these deferred windows — because `DeleteIOSurfaceBacking2` may name a
+    // prior incarnation of a recycled id whose slot already carries a live
+    // surface with an unflushed paint; `mapper::resolve` settles which by
+    // comparing the stashed page fingerprint, and reprieves or drops.
+    //
+    // Taking the windows here defeats exactly that. The page list is stashed in
+    // `condemned_entries`, so the flush cannot write (and must not — the pages
+    // may be recycled, the boot-16 PTE-corruption class), and the window is
+    // consumed on the way to failing: `flush_intersecting` removes it before
+    // `render_flush_one` runs. The fingerprint decision then has nothing left to
+    // reprieve, and the loss is reported as `revalidate_condemned` as though the
+    // flush were at fault. Leave the obligation armed for the resolve instead.
+    // A second delete with no resolve between still tears down for real
+    // (`drop_windows`), and the window cap still bounds the population.
+    if state.mapping_backing_condemned(mapping_id) {
+        crate::observe::off(format!(
+            "deferred_flush_held mapping={mapping_id} reason=backing_condemned lo={lo} hi={hi}"
+        ));
+        return true;
+    }
     // Fixpoint: a taken window may extend past [lo, hi) and drag further
     // deferred siblings (compute or render) into the flush set.
     let mut pending = state.take_deferred_flush_windows(mapping_id, lo, hi);
@@ -1076,6 +1098,53 @@ mod tests {
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
         assert!(!ok, "drifted window must report the loss");
         assert!(state.render_deferred_flush.is_empty());
+    }
+
+    /// `condemn_surface_backing` keeps a mapping's deferred windows on purpose:
+    /// `DeleteIOSurfaceBacking2` may name a prior incarnation of a recycled id,
+    /// and `mapper::resolve` settles it later by fingerprint compare. A flush
+    /// trigger arriving inside that undecided window must therefore leave the
+    /// obligation armed — consuming it destroys the very thing the fingerprint
+    /// decision exists to reprieve, and reports a loss the flush did not cause.
+    #[test]
+    fn flush_holds_render_windows_while_the_backing_is_condemned() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{RenderDeferredEntry, RenderDeferredKey};
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let key = RenderDeferredKey {
+            mapping_id: 9,
+            surface_offset: 0,
+            span_end: 4096,
+        };
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.map_generation = 2;
+            m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        state.render_deferred_flush.insert(
+            key,
+            RenderDeferredEntry {
+                width: 32,
+                height: 32,
+                map_generation: 2,
+                full_quad_bounds: false,
+                grouped: false,
+                armed_seq: 0,
+            },
+        );
+        // The guest deletes the backing; the window is kept for the fingerprint
+        // decision and the page list moves to `condemned_entries`.
+        assert!(state.condemn_surface_backing(9));
+        assert!(state.mapping_backing_condemned(9));
+        let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
+        assert!(ok, "an undecided window is not a loss");
+        assert!(
+            state.render_deferred_flush.contains_key(&key),
+            "the window must survive for mapper::resolve to reprieve or drop"
+        );
     }
 
     #[test]
