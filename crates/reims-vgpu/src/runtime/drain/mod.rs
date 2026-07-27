@@ -1339,6 +1339,45 @@ fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32)
     ))
 }
 
+/// Which of the two present routes a present took, once per distinct route per
+/// process.
+///
+/// `present_named_mapping` splits on the named surface's write history: a
+/// surface we have only ever seen CLEAR stores into takes a six-way resolver
+/// (page alias, store FIFO, resource graph, retain, early front, plus a
+/// substitution) to pick *some other* surface to show, because the named one is
+/// believed to hold nothing. Everything else captures the surface the guest
+/// named.
+///
+/// That resolver is the largest remaining pile of decision points on this path,
+/// and its terminal log lines (`present_defer_boundary`, `present_owner_graph`,
+/// `stale_present_substitute`) have not appeared in any recent boot. Absence of
+/// a log is weak evidence — a branch can be entered and leave through a path
+/// that logs nothing — so this names the branch itself. Two lines per process at
+/// most, which is what makes it safe to leave on.
+///
+/// If only `route=named` ever appears on this pathway, the ClearOnly resolver is
+/// dead code here and can be deleted or fenced behind a loud decline. If
+/// `route=clear_only` appears, it is load-bearing and the next question is which
+/// of its six candidate sources actually wins.
+fn note_present_route(write_kind: crate::model::SurfaceWriteKind, is_clear_only: bool) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::BTreeSet<bool>>> = Mutex::new(None);
+    {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if !guard
+            .get_or_insert_with(Default::default)
+            .insert(is_clear_only)
+        {
+            return;
+        }
+    }
+    crate::observe::fail(format!(
+        "present_route route={} write_kind={write_kind:?}",
+        if is_clear_only { "clear_only" } else { "named" },
+    ));
+}
+
 fn log_present_page_identity(state: &DeviceState, mapping: u32, w: u32, h: u32) {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -1547,6 +1586,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // takes the normal path below. + present-thrash-proxies.
         let write_kind = state.surface_write_kind(mapping);
         let is_clear_only = matches!(write_kind, crate::model::SurfaceWriteKind::ClearOnly);
+        note_present_route(write_kind, is_clear_only);
 
         let composite_peer = |peer: u32| -> Option<(u32, u32)> {
             if peer == 0 || peer == mapping {
