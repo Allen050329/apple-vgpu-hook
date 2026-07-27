@@ -286,6 +286,27 @@ struct ThrashState {
     stale_online_pending: u64,
     /// Latch so the (per-VBL, ~60 Hz) stale-online line fires once per boot.
     stale_online_logged: bool,
+    /// Dual-mid peer dense-retention-seed fires this boot. The seed is a
+    /// **relaxed one-shot** (`DeviceState::peer_needs_front_seed`): it re-arms
+    /// re-arms only on a strictly-newer full frame, so each fire is a genuine
+    /// ≥`RETENTION_GAP_MARGIN` retention-gap fix. Pure telemetry (`peer_seeds=` in
+    /// the summary): under active multi-video compositing it legitimately climbs
+    /// into the thousands (many real dense-frame changes), so there is no runtime
+    /// flood alarm — the margin gate + its unit test are the regression guard (see
+    /// `note_peer_front_seed`).
+    peer_seeds: u64,
+    /// Of [`Self::peer_seeds`], how many seeded a target that was NOT in an
+    /// output group.
+    ///
+    /// A seed is a full-frame GPU copy. Members of one group share a resident,
+    /// so a seed between two of them is elided; every seed that actually runs
+    /// therefore has an ungrouped target, and this should equal `peer_seeds`.
+    /// If it does not, the elision is leaking and that is a bug. If it does —
+    /// and `peer_seeds/presents` is near 1, as a 3040-present animated session
+    /// measured — then the render path is paying one full-screen blit per
+    /// present to compensate for buffers that never unified, which is the
+    /// performance story and not a rendering-speed problem.
+    peer_seeds_ungrouped: u64,
     /// Large-mapping type-11 zero-copy fallbacks (composite sampled guest
     /// pages because no current-generation resident was ready). Always-on
     /// black-band discriminator: `rect_void` firing while the recent ring is
@@ -508,6 +529,8 @@ impl ThrashState {
             post_converge_regress: 0,
             stale_online_pending: 0,
             stale_online_logged: false,
+            peer_seeds: 0,
+            peer_seeds_ungrouped: 0,
             t11_fb_total: 0,
             t11_fb_ring: [None; T11_FB_RING],
             t11_fb_next: 0,
@@ -3376,7 +3399,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
         st.last_summary_ms = now_ms;
         st.last_summary_presents = st.presents;
         thrash_line(&format!(
-            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} tile_comp={} tile_comp_skip={} stale_subst={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
+            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} tile_comp={} tile_comp_skip={} stale_subst={} peer_seeds={} seed_ungrouped={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
             st.presents,
             present_hz,
             st.mid_switches,
@@ -3396,6 +3419,8 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
             st.tile_composite_applied,
             st.tile_composite_skipped,
             st.stale_present_substitute,
+            st.peer_seeds,
+            st.peer_seeds_ungrouped,
             st.first_dense_seen as u8,
             st.post_converge_regress,
             st.stale_online_pending,
@@ -3695,6 +3720,9 @@ pub struct ThrashCounters {
     /// Distinct a/b inter-buffer retention-gap episodes (structural sibling of
     /// `selected_peer_divergence`; see [`note_dense_retention_gap`]).
     pub dense_retention_gap: u64,
+    /// Peer-seed fires whose target was NOT in an output group — i.e. the ones
+    /// that actually performed a full-frame copy.
+    pub peer_seeds_ungrouped: u64,
     /// Distinct route-B peer-copy results for tile-divergence episodes.
     pub tile_composite_applied: u64,
     pub tile_composite_skipped: u64,
@@ -3717,6 +3745,37 @@ pub fn has_converged() -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .first_dense_seen
+}
+
+/// Count each dual-mid peer dense-retention-seed fire this boot. Surfaced as
+/// `peer_seeds=` in the periodic summary — pure telemetry, no alarm.
+///
+/// There is deliberately **no** runtime flood alarm here. An earlier version
+/// tripped a one-shot `peer_seed_flood` line once a cumulative-count threshold
+/// (64) was crossed, on the assumption that legitimate fires are "a handful per
+/// boot" bounded by real dense-frame changes. That assumption only holds at
+/// idle: the seed fires once per *strictly-newer* full-frame Store on a peer
+/// lagging by ≥`RETENTION_GAP_MARGIN` (`DeviceState::peer_needs_front_seed`), and
+/// under active multi-video compositing there are thousands of such dense-frame
+/// changes per boot — measured live `peer_seeds` climbing past 2000 (and >18000
+/// under a quad-4K grid), every fire a genuine ≥margin retention-gap fix. Worse,
+/// fires are counted per *draw* while presents are per *present*, so no
+/// cumulative count, rate, or seeds-vs-presents ratio separates legitimate heavy
+/// seeding from the every-flip regression the alarm targeted (both scale with
+/// draw activity). The **only** discriminator is the per-seed lag, and that is
+/// enforced structurally by the margin gate in `peer_needs_front_seed` and locked
+/// by the `peer_front_seed_gate_is_structural_and_once_per_lifetime` unit test
+/// (1-lag → no seed; ≥margin → seed; one-shot until the lag re-widens). So a
+/// removed/bypassed margin is caught at test time; the runtime alarm added no
+/// coverage and cried wolf on every active-workload boot. Runs on the
+/// render/drain worker, never the QEMU main loop. Returns the running count.
+pub fn note_peer_front_seed(target_grouped: bool) -> u64 {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.peer_seeds = st.peer_seeds.saturating_add(1);
+    if !target_grouped {
+        st.peer_seeds_ungrouped = st.peer_seeds_ungrouped.saturating_add(1);
+    }
+    st.peer_seeds
 }
 
 /// Record that a post-ack display IRQ (`src` = vbl|present) was raised while the
@@ -3757,6 +3816,7 @@ pub fn counters() -> ThrashCounters {
         damage_hole_bg: st.damage_hole_bg,
         selected_peer_divergence: st.selected_peer_divergence,
         dense_retention_gap: st.dense_retention_gap,
+        peer_seeds_ungrouped: st.peer_seeds_ungrouped,
         tile_composite_applied: st.tile_composite_applied,
         tile_composite_skipped: st.tile_composite_skipped,
         converged: st.first_dense_seen,
@@ -4141,6 +4201,38 @@ mod tests {
         );
     }
 
+    /// The peer front-seed counter is pure telemetry with NO runtime flood alarm:
+    /// under active multi-video compositing it legitimately climbs into the
+    /// thousands (every fire a genuine ≥margin retention-gap fix — measured live
+    /// >2000, >18000 under quad-4K), and no cumulative count/rate/ratio separates
+    /// > that from the every-flip regression (fires are per-draw, presents
+    /// > per-present). The margin gate + `peer_front_seed_gate_is_structural_and_
+    /// once_per_lifetime` are the regression guard. This locks that a high count
+    /// > never emits a `peer_seed_flood` (or any) fail line, so a future edit cannot
+    /// > silently reintroduce the cry-wolf alarm.
+    #[test]
+    fn peer_front_seed_counts_without_flood_alarm() {
+        let _g = test_lock();
+        reset_for_test();
+        let mut last = 0;
+        for i in 0..500 {
+            last = note_peer_front_seed(i % 5 == 0);
+        }
+        assert_eq!(last, 500, "every fire is counted (telemetry)");
+        // A seed only runs when the target is ungrouped (a grouped target shares
+        // the source's resident and is elided before this call), so the split is
+        // what makes the total readable rather than just large.
+        assert_eq!(
+            counters().peer_seeds_ungrouped,
+            400,
+            "the ungrouped-target split is counted separately"
+        );
+        let log = std::fs::read_to_string(observe::fail_log_path()).unwrap_or_default();
+        assert!(
+            !log.contains("peer_seed_flood"),
+            "no runtime flood alarm — legitimate heavy seeding must never fail-log"
+        );
+    }
 
     /// The desktop converges, then the guest reverts to a sustained overlay
     /// (rgb_frac ≈0.13 — not sparse, not dense): `post_converge_regress` fires

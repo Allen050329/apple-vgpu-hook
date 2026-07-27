@@ -3631,8 +3631,8 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
         );
     }
 
-    // Backing is the seq itself, whatever advanced it: a member that reaches the
-    // source's seq is quiet again on its next present.
+    // An inter-buffer seed counts as backing: `peer_needs_front_seed` inherits
+    // the source's seq, so the next present of mid 5 is quiet again.
     state.present.dense_frame_seq.insert(
         5,
         state.present.dense_frame_seq.get(&1).copied().unwrap_or(0),

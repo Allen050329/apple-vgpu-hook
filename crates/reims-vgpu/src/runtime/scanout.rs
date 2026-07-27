@@ -3038,14 +3038,134 @@ mod tests {
         assert_eq!(state.present.height, 1080);
     }
 
+    /// BUG A gate (dense-retention seed): a LOAD draw into a compositor-output
+    /// member that lags a same-geometry peer by at least `margin` full frames
+    /// (`dense_frame_seq`) seeds from that DENSE peer. The MARGIN is the crux:
+    /// healthy a/b alternation (both buffers full-framed each present → ~1-lag)
+    /// must NOT seed, else the seed floods every flip (the dock-tooltip / cursor-
+    /// sweep residue + churn regression a live boot exposed). The seed is a
+    /// relaxed one-shot: it re-arms only when the lag re-widens past `margin` on a
+    /// strictly-newer full frame. The freshest member, a sub-margin lag, a
+    /// non-member, and wrong geometry never seed. Structural only — never content.
+    #[test]
+    fn peer_front_seed_gate_is_structural_and_once_per_lifetime() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 48u32);
+        // Mirror the guard's margin so the seed fixes exactly what it flags.
+        const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
+
+        state.note_compositor_member_published(1, w, h); // seq[1]=1
+        state.note_compositor_member_published(4, w, h); // seq[4]=2
+        // Genuine swapchain siblings both reach the display as they alternate;
+        // mark each presented so the presented-peer gate keeps them mutually
+        // eligible as seed sources (a never-displayed publisher is not a source).
+        state.note_presented_geom(1, w, h);
+        state.note_presented_geom(4, w, h);
+        assert!(state.is_compositor_output_member(1));
+        assert!(state.is_compositor_output_member(4));
+
+        // MARGIN GATE: mid 1 lags the freshest mid 4 by exactly 1 (healthy a/b
+        // alternation — each buffer holds its own recent full frame). Must NOT
+        // seed: a 1-lag is not a retention gap and seeding it every flip floods.
+        assert_eq!(
+            state.peer_needs_front_seed(1, w, h, true, M),
+            None,
+            "healthy 1-lag alternation must NOT seed (margin gate)"
+        );
+
+        // mid 1 now keeps getting full frames while mid 4 falls behind by ≥margin
+        // (the ⌘Q-app-quit case: the guest only recomposites one buffer).
+        for _ in 0..M {
+            state.note_compositor_member_published(1, w, h); // seq[1] → 2+M
+        }
+
+        // Pre-convergence (boot logo/pill phase): never seed regardless.
+        assert_eq!(
+            state.peer_needs_front_seed(4, w, h, false, M),
+            None,
+            "must not seed before boot convergence (boot-pill strobe guard)"
+        );
+
+        // Lagging peer mid 4 (≥margin behind) → seed from the DENSE source mid 1.
+        assert_eq!(
+            state.peer_needs_front_seed(4, w, h, true, M),
+            Some(1),
+            "a member lagging a dense peer by ≥margin seeds from that dense peer"
+        );
+        // The seed advanced mid 4's dense seq to the source's → gap closed, no
+        // re-seed on the next flip.
+        assert_eq!(
+            state.peer_needs_front_seed(4, w, h, true, M),
+            None,
+            "gap closed after the seed → does not re-arm"
+        );
+
+        // The freshest member is never its own lagging peer.
+        assert_eq!(
+            state.peer_needs_front_seed(1, w, h, true, M),
+            None,
+            "the freshest dense member must not seed from itself"
+        );
+
+        // A non-member target never seeds; wrong geometry never seeds.
+        assert_eq!(
+            state.peer_needs_front_seed(9, w, h, true, M),
+            None,
+            "non-member target must not seed"
+        );
+        assert_eq!(
+            state.peer_needs_front_seed(4, w + 1, h, true, M),
+            None,
+            "geometry mismatch must not seed"
+        );
+
+        // A SUB-margin new frame on mid 1 does NOT re-seed (still healthy).
+        state.note_compositor_member_published(1, w, h); // gap(4)=1
+        assert_eq!(
+            state.peer_needs_front_seed(4, w, h, true, M),
+            None,
+            "a sub-margin lag does not re-arm the seed"
+        );
+        // The lag re-widening past margin DOES re-arm (relaxed one-shot) — safe
+        // because the source is always a full-display dense frame, never residue.
+        for _ in 0..M {
+            state.note_compositor_member_published(1, w, h);
+        }
+        assert_eq!(
+            state.peer_needs_front_seed(4, w, h, true, M),
+            Some(1),
+            "the lag re-widening past margin re-arms the seed"
+        );
+
+        // Re-map (unmap → forget) clears the dense seq + latch; a freshly
+        // re-published member is the freshest (never lags on grant).
+        state.unmap_surface(4);
+        for _ in 0..=M {
+            state.note_compositor_member_published(4, w, h); // seq[4] ≥ margin above seq[1]
+        }
+        // Re-map pruned mid 4's presented witness; it reaches the display again.
+        state.note_presented_geom(4, w, h);
+        assert_eq!(
+            state.peer_needs_front_seed(4, w, h, true, M),
+            None,
+            "a freshly re-published member is current, not lagging"
+        );
+        assert_eq!(
+            state.peer_needs_front_seed(1, w, h, true, M),
+            Some(4),
+            "mid 1 now lags the fresh mid 4 by ≥margin → seeds from it"
+        );
+    }
+
     /// Protocol-structural a/b retention-gap tracking (`dense_frame_seq`):
-    /// a member's dense seq advances on a full-frame Store, so a member that
-    /// missed a run of them reads as lagging. `dense_retention_gap` reports the
-    /// freshest same-geometry peer only while the presented member genuinely
-    /// lags, and is quiet after a re-map prunes the seq. Structural only — no
+    /// a member's dense seq advances on a full-frame Store and is INHERITED when
+    /// the member is seeded from the front, so a member that missed BOTH reads as
+    /// lagging. `dense_retention_gap` reports the freshest same-geometry peer
+    /// only while the presented member genuinely lags; it is quiet after a seed
+    /// closes the gap and after a re-map prunes the seq. Structural only — no
     /// content/nz input.
     #[test]
-    fn dense_retention_gap_tracks_full_frame_publishes() {
+    fn dense_retention_gap_tracks_full_frame_and_seed_inheritance() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (w, h) = (64u32, 48u32);
 
@@ -3076,13 +3196,23 @@ mod tests {
         // The freshest member never reports a gap.
         assert_eq!(state.dense_retention_gap(1, w, h), None);
 
-        // A full-frame Store on the lagging member closes the gap on its own —
-        // the only way a member's seq advances now that the seed is gone.
-        state.note_compositor_member_published(4, w, h);
+        // Seeding mid 4 from the dense source (mid 1) inherits mid 1's seq → gap
+        // closes: the seed IS the inter-buffer retention the guest relies on.
+        assert_eq!(
+            state.peer_needs_front_seed(
+                4,
+                w,
+                h,
+                true,
+                crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN
+            ),
+            Some(1),
+            "lagging peer seeds from the freshest dense member"
+        );
         assert_eq!(
             state.dense_retention_gap(4, w, h),
             None,
-            "a member that just took a full-frame Store is the freshest"
+            "a seeded peer inherits the front's dense seq → no retention gap"
         );
 
         // A re-map prunes the seq so a recycled id cannot inherit a stale seq,
@@ -3102,43 +3232,99 @@ mod tests {
             None,
             "a freshly published member is current, not lagging"
         );
-        // ...and now mid 1 (seq 7) is the one lagging the fresh mid 4 (seq 9).
-        assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 7, 9)));
+        // ...and now mid 1 (seq 7) is the one lagging the fresh mid 4 (seq 8).
+        assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 7, 8)));
     }
 
-    /// Inter-buffer retention is STRUCTURAL, not copied — the invariant the a/b
-    /// peer seed's deletion rests on.
+    /// The peer seed must fire at the lag a healthy steady rotation produces.
     ///
-    /// The seed existed because per-mid residents did not share history: the
-    /// guest damage-draws each swapchain buffer with `LoadAction=Load` expecting
-    /// the display's current front under it, so a peer whose own resident was
-    /// stale kept an undamaged black region. Output-group unification removes
-    /// that premise. Every surface the guest NAMES in a display transaction at a
-    /// proven swapchain geometry resolves to the same
-    /// `TargetIdentity::OutputGroup`, so the buffers share ONE resident and the
-    /// frame either holds is already the frame the other's LoadFromTarget reads.
-    /// A copy between them is a copy onto itself.
+    /// `dense_frame_seq` comes from one global counter that every member at
+    /// every geometry bumps, so a member that just took its turn already sits a
+    /// whole turnaround behind the freshest one. That member is exactly the one
+    /// the seed exists for: its undamaged regions still hold its previous turn's
+    /// frame while the guest renders only a damage rect into it. Raising the
+    /// seed's margin to discount rotation depth withheld it from precisely those
+    /// members on a live boot — three members at a steady lag of 4 stopped
+    /// seeding altogether and the desktop decayed into "only the regions the
+    /// user forces a re-render on are correct".
     ///
-    /// The other half is what must stay OUT: a full-frame publisher the guest
-    /// never names is not a display buffer, resolves to a private identity, and
-    /// must never receive the desktop's frame. That population was the seed's
-    /// entire live target set (`peer_seed_unification outcome=survives
-    /// src_kind=group target_kind=surface`), which is why deleting the seed
-    /// removes a wrong copy rather than a needed one.
-    ///
-    /// If this test ever fails, the deletion is no longer safe: named siblings
-    /// would hold divergent residents again and the retention gap would be real.
+    /// A needless seed copies one full frame; a withheld one loses the whole
+    /// screen outside the damage rect.
     #[test]
-    fn presented_siblings_share_one_identity_so_retention_needs_no_copy() {
+    fn steady_rotation_seeds_retention_at_the_rotation_lag() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 48u32);
+        const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
+
+        // Three members rotating, with the global counter advancing by M per turn
+        // because members at other geometries publish in between — the shape the
+        // live x86 desktop produced (`dense_retention_gap … lag=4`, mids 3/4/14).
+        let rotation = [1u32, 2, 3];
+        for mid in rotation {
+            state.note_presented_geom(mid, w, h);
+        }
+        for _ in 0..4 {
+            for mid in rotation {
+                state.note_compositor_member_published(mid, w, h);
+                for filler in 0..(M - 1) {
+                    state.note_compositor_member_published(100 + filler as u32, 32, 32);
+                }
+            }
+        }
+
+        let oldest = rotation[0];
+        let (_, named_seq, peer_seq) = state
+            .dense_retention_gap(oldest, w, h)
+            .expect("the member that published longest ago lags the freshest");
+        assert_eq!(
+            peer_seq - named_seq,
+            M * 2,
+            "steady three-member rotation at margin-sized steps"
+        );
+
+        assert_eq!(
+            state.peer_needs_front_seed(oldest, w, h, true, M),
+            Some(3),
+            "a member a rotation behind must be seeded from the freshest peer"
+        );
+
+        // Discounting the rotation would withhold it — the corruption class.
+        let discounted = (peer_seq - named_seq).saturating_add(1);
+        let mut fresh = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        std::mem::swap(&mut fresh, &mut state);
+        assert_eq!(
+            fresh.peer_needs_front_seed(oldest, w, h, true, discounted),
+            None,
+            "a margin above the rotation lag withholds the seed from a healthy rotation"
+        );
+    }
+
+    /// A surface the guest NAMES as plane 0 shares one identity with its
+    /// same-geometry siblings; a full-frame publisher it never names does not.
+    ///
+    /// This is the boundary the peer seed's target set is drawn against, and it
+    /// is asymmetric in a way that cost a live A/B to learn. Named siblings
+    /// resolve to one `TargetIdentity::OutputGroup` and share a resident, so a
+    /// copy between them is a copy onto itself — that half is settled. The other
+    /// half is NOT "an unnamed publisher is never displayed". An unnamed
+    /// publisher is never *scanned out directly*, but its content still reaches
+    /// the screen as a composited source into the frame that is named. Deleting
+    /// the seed into those surfaces on exactly that reasoning turned the desktop
+    /// magenta with the green channel zeroed for ~90% of pixels, on 3 of 3 boots
+    /// (`nz` 8292904 → ~6.43M at constant `rgb_nz`), and had to be reverted.
+    ///
+    /// So this test pins the identity boundary, not a licence to skip work on
+    /// either side of it: named siblings share, unnamed publishers do not, and
+    /// what an unnamed publisher's resident actually holds is a separate open
+    /// question that the seed is currently masking.
+    #[test]
+    fn named_siblings_share_one_identity_and_unnamed_publishers_do_not() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (w, h) = (1920u32, 1080u32);
 
         // Two swapchain buffers, each named as plane 0 of a display transaction.
         state.note_presented_geom(3, w, h);
         state.note_presented_geom(5, w, h);
-
-        // Both resolve to ONE output group — the shared resident that makes an
-        // inter-buffer copy unnecessary.
         assert_eq!(state.output_group_for(3, w, h), Some(1));
         assert_eq!(
             state.output_group_for(5, w, h),
@@ -3146,9 +3332,8 @@ mod tests {
             "named siblings at one geometry share a single resident identity"
         );
 
-        // A full-frame publisher the guest never names is NOT a display buffer,
-        // however dense it is. It stays private, so the desktop's frame is never
-        // copied into it.
+        // A full-frame publisher the guest never names stays private, however
+        // dense it is — it is not a swapchain buffer of this output.
         for _ in 0..32 {
             state.note_compositor_member_published(7, w, h);
         }
@@ -3156,14 +3341,8 @@ mod tests {
         assert_eq!(
             state.output_group_for(7, w, h),
             None,
-            "a never-named publisher is not a display buffer and shares nothing"
+            "a never-named publisher does not join the output group"
         );
-
-        // The seed's gate would have been `presented_at` on the target. Applied
-        // here it admits only mids 3 and 5 — both already grouped with each
-        // other, i.e. every seed it could authorise is a copy onto itself. That
-        // equivalence is why the seed could be deleted outright rather than
-        // narrowed.
         assert!(state.presented_at(3, w, h) && state.presented_at(5, w, h));
         assert!(!state.presented_at(7, w, h));
     }
@@ -3474,9 +3653,10 @@ mod tests {
     /// a recycled mapping_id (a new, unrelated surface reusing the id after
     /// DeleteIOSurfaceBacking2) does not have its FIRST LOAD draw consume a stale
     /// flag and bleed the current retained front frame over its own resident —
-    /// the "background does not clear cleanly" residue class. Both teardown
-    /// hooks (`unmap_surface`, `condemn_surface_backing`) route through
-    /// `forget_compositor_mapping`.
+    /// the "background does not clear cleanly" residue class. Mirrors the
+    /// already-pruned sibling `peer_seeded_dense_seq`. Both teardown hooks
+    /// (`unmap_surface`, `condemn_surface_backing`) route through
+    /// `forget_compositor_mapping`; only the surviving flag is asserted here.
     #[test]
     fn present_boundary_seed_flag_is_pruned_on_teardown() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);

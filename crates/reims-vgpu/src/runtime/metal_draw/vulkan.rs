@@ -18,6 +18,57 @@ struct SampledImageShape {
 /// shape the sampled-draw path builds. `None` is a shape the path cannot yet
 /// express (`Cube` / `CubeArray`); the caller declines it by name so the gap
 /// stays visible instead of binding the wrong view type.
+/// Whether the a/b peer seed still has anything to do once resident
+/// unification is accounted for.
+///
+/// Members of one output group share a single resident, so a seed from one
+/// member into another is a copy onto itself and the caller drops it. Every
+/// such drop is evidence that the retention apparatus behind the seed —
+/// `peer_needs_front_seed`, `dense_retention_gap`, `dense_frame_seq`,
+/// `peer_seeded_dense_seq`, `RETENTION_GAP_MARGIN` — is compensating for a
+/// divergence that unification already makes impossible.
+///
+/// One always-on line per distinct `(source kind, target kind, survived)`
+/// triple per process. Keying on the identity *kinds* rather than on ids is
+/// what makes a survivor explain itself: `group->group` cannot survive,
+/// `surface->group` means the source never joined the output, and the counts
+/// say whether either is the steady state or a one-off. Deduped, because the
+/// seed runs per draw and an unbounded line here would bury the log it is meant
+/// to inform.
+#[cfg(feature = "backend-vulkan")]
+fn note_peer_seed_unification(
+    source: &crate::backend::vulkan::engine::types::TargetIdentity,
+    target: &crate::backend::vulkan::engine::types::TargetIdentity,
+    survives: bool,
+) {
+    use crate::backend::vulkan::engine::types::TargetIdentity;
+    use std::sync::Mutex;
+    fn kind(i: &TargetIdentity) -> &'static str {
+        match i {
+            TargetIdentity::Surface { .. } => "surface",
+            TargetIdentity::Texture { .. } => "texture",
+            TargetIdentity::Gva { .. } => "gva",
+            TargetIdentity::Anonymous { .. } => "anon",
+            TargetIdentity::OutputGroup { .. } => "group",
+        }
+    }
+    type SeedUnificationKey = (&'static str, &'static str, bool);
+    static SEEN: Mutex<Option<std::collections::BTreeSet<SeedUnificationKey>>> = Mutex::new(None);
+    let key = (kind(source), kind(target), survives);
+    {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if !guard.get_or_insert_with(Default::default).insert(key) {
+            return;
+        }
+    }
+    crate::observe::fail(format!(
+        "peer_seed_unification outcome={} src_kind={} target_kind={} src={source:?} target={target:?}",
+        if survives { "survives" } else { "elided" },
+        key.0,
+        key.1,
+    ));
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn sampled_image_shape(
     kind: crate::runtime::spirv_bind::SampledImageKind,
@@ -5517,20 +5568,92 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // and the guest is damage-drawing it again (single-buffer case).
                 let same_mid_present = load_action == Some(PASS_LOAD_ACTION_LOAD)
                     && state.presented_needs_guest_seed.remove(&import_mid);
-                // Inter-buffer retention is STRUCTURAL, not copied. Two
-                // surfaces the guest names at one geometry resolve to the same
-                // `TargetIdentity::OutputGroup` and therefore share one
-                // resident, so the frame one holds is already the frame the
-                // other's LoadFromTarget reads. The a/b peer seed that used to
-                // sit here copied a full frame between them; every such copy was
-                // a copy onto itself and the unification filter dropped it. What
-                // survived the filter only ever had a target the guest had NEVER
-                // named as plane 0 (`peer_seed_unification outcome=survives
-                // src_kind=group target_kind=surface`, the sole outcome recorded
-                // across 11 process lifetimes) — a WebKit content tile receiving
-                // the desktop's frame at ~50/s, which is unrelated content, not
-                // retention.
-                let presented_since_last_draw = same_mid_present;
+                // Dual-mid a/b flip: this mid is a compositor-output-member
+                // *peer* that lags a same-geometry peer holding a fresher full
+                // frame (BUG A — the peer would otherwise LoadFromTarget its own
+                // stale resident and keep an undamaged black region, e.g. the
+                // sparse-letterbox left after a ⌘Q app-quit). Seed it from the
+                // freshest DENSE member (not the possibly-sparse present front —
+                // after an app-quit the front is itself sparse), via the relaxed
+                // one-shot `peer_needs_front_seed`: it re-arms only on a strictly-
+                // newer full frame, and the source is always a full-display-
+                // geometry dense frame, never a transient overlay (dock tooltip /
+                // cursor), so re-seeding cannot cause the residue class.
+                // Post-convergence only: BUG A is a post-converge desktop
+                // regression, and seeding during the boot logo/pill phase strobes
+                // the progress pill (the guest redraws full frames there).
+                let peer_seed_source = if !same_mid_present
+                    && load_action == Some(PASS_LOAD_ACTION_LOAD)
+                    && crate::runtime::census::present_proxy::has_converged()
+                {
+                    // The margin is deliberately bare, never discounted by the
+                    // rotation's depth. A member one rotation behind is
+                    // *precisely* one whose undamaged regions still hold the
+                    // frame from its previous turn, and the guest is about to
+                    // render only a damage rect into it. Discounting rotation
+                    // depth withholds the seed from exactly the members that need
+                    // it — a live boot rotating 3 members at a steady lag of 4
+                    // stopped seeding entirely, and the desktop decayed into
+                    // "only the regions the user forces a re-render on are
+                    // correct" once idle let the gap accumulate.
+                    //
+                    // A needless seed copies one full frame; a withheld one loses
+                    // the whole screen outside the damage rect.
+                    state.peer_needs_front_seed(
+                        import_mid,
+                        w,
+                        h,
+                        true,
+                        crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN,
+                    )
+                } else {
+                    None
+                };
+                // Drop a peer source that already unifies with this target: a
+                // proven swapchain geometry resolves every member to one shared
+                // resident (see `output_group_for`), so the retained full frame
+                // is present in the target itself. Seeding from it would set
+                // `seed_from_target == target_identity`, which draw validation
+                // rejects (`SeedEqualsTarget`) — failing the whole draw and
+                // freezing the guest compositor. The draw's own LoadFromTarget
+                // reads the shared resident and already carries the content.
+                //
+                // How often that elision fires is the question that decides
+                // whether the a/b seed still has a job. Unified members share one
+                // resident, so a seed between two of them is a copy onto itself
+                // and is dropped here. If every proposed seed is dropped, the
+                // whole retention apparatus behind it — `peer_needs_front_seed`,
+                // `dense_retention_gap`, `dense_frame_seq`, `peer_seeded_dense_seq`
+                // and `RETENTION_GAP_MARGIN` — is compensating for a divergence
+                // that unification already prevents. Record both outcomes, keyed
+                // on the identity pair so a survivor says WHY it survived rather
+                // than only that it did.
+                let peer_seed_source = peer_seed_source.filter(|&src_mid| {
+                    let src = crate::runtime::import_present::surface_identity(state, src_mid, w, h);
+                    let survives = src != *identity;
+                    note_peer_seed_unification(&src, identity, survives);
+                    survives
+                });
+                let peer_front_seed = peer_seed_source.is_some();
+                if peer_front_seed {
+                    // A seed is a full-frame GPU copy, and it only runs when the
+                    // target is NOT in an output group (grouped targets share the
+                    // source's resident and are elided just above). Reporting
+                    // that split makes `peer_seeds/presents` readable: near 1
+                    // with every seed ungrouped means the path is paying one
+                    // full-screen blit per present because the buffers never
+                    // unified — an ownership question, not a rendering-speed one.
+                    // Telemetry only: counts every seed for the `peer_seeds=`
+                    // summary field. No flood alarm — the margin gate (unit-tested)
+                    // is the every-flip-regression guard, and legitimate multi-video
+                    // seeding is thousands/boot. Cheap counter, runs on the drain
+                    // worker.
+                    crate::runtime::census::present_proxy::note_peer_front_seed(matches!(
+                        identity,
+                        crate::backend::vulkan::engine::types::TargetIdentity::OutputGroup { .. }
+                    ));
+                }
+                let presented_since_last_draw = same_mid_present || peer_front_seed;
                 // If the resident image is unavailable, guest pages are the
                 // final protocol-backed source. A successful read is a valid
                 // seed even when every RGB component is zero.
@@ -5549,6 +5672,66 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             w,
                             h,
                         ) == *identity);
+                // a/b inter-buffer retention seed:
+                // source the lagging peer from the freshest DENSE compositor
+                // member `peer_needs_front_seed` chose — NOT the present front,
+                // which after an app-quit is itself sparse. The dense member's
+                // own resident (GPU rail, no CPU copy) carries the full frame the
+                // peer never received; its guest pages are the fallback. Runs
+                // before the front-sourced block below and, on success, arms a
+                // rail that suppresses it (a single seed per draw).
+                if let Some(src_mid) = peer_seed_source {
+                    if !self_front_ready
+                        && src_mid != 0
+                        && src_mid != import_mid
+                        && resources.target_rgba8.is_none()
+                        && resources.seed_from_target.is_none()
+                    {
+                        let src_identity =
+                            crate::runtime::import_present::surface_identity(state, src_mid, w, h);
+                        let src_sampled = resources.sampled_images.iter().any(|img| {
+                            matches!(
+                                &img.source,
+                                crate::backend::vulkan::engine::SampledSource::Target(t)
+                                    if *t == src_identity
+                            )
+                        });
+                        if !src_sampled
+                            && crate::backend::vulkan::engine::resident_content_ready(&src_identity)
+                        {
+                            resources.seed_from_target = Some(src_identity);
+                            gpu_boundary_seed = true;
+                            seed_src = "peer_dense_resident_gpu";
+                            if w >= 1280 && h >= 720 {
+                                crate::observe::fail(format!(
+                                    "ab_retention_seed peer_mid={import_mid} {w}x{h} src_mid={src_mid} rail=resident_gpu pipe={}",
+                                    req.pipeline_ref
+                                ));
+                            }
+                        } else if let Some(rgba) =
+                            load_type11_rgba_static(state, host, src_mid, None)
+                        {
+                            resources.target_rgba8 = Some(rgba);
+                            seed_src = "peer_dense_guest_pages";
+                            if w >= 1280 && h >= 720 {
+                                crate::observe::fail(format!(
+                                    "ab_retention_seed peer_mid={import_mid} {w}x{h} src_mid={src_mid} rail=guest_pages pipe={}",
+                                    req.pipeline_ref
+                                ));
+                            }
+                        } else if w >= 1280 && h >= 720 {
+                            // No content available on either rail — the seed
+                            // decision stands (the peer's dense seq advanced) but
+                            // this draw falls through to the front-sourced block /
+                            // LoadFromTarget. Log the reason so a persistent gap
+                            // is not silent; the next dense frame re-arms the seed.
+                            crate::observe::fail(format!(
+                                "ab_retention_seed peer_mid={import_mid} {w}x{h} src_mid={src_mid} rail=none reason=no_dense_content pipe={}",
+                                req.pipeline_ref
+                            ));
+                        }
+                    }
+                }
                 if load_action == Some(PASS_LOAD_ACTION_LOAD)
                     && (!ready || presented_since_last_draw)
                     && !self_front_ready
