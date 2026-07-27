@@ -77,6 +77,22 @@ sides and check that it separates them. Then check the converse — that it woul
 mechanism had it been present. A probe that cannot distinguish the cases is not evidence in either
 direction.
 
+**A once-per-boot probe still attributes per case.** Deduplicated dumps look like they throw
+attribution away — one line per pipeline for the whole boot, so how would you know which case ran
+it? You know because *first appearance is the signal*: a dedup'd probe fires exactly when something
+ran that had never run before, and the always-on line it emits is timestamped. A repro that drives
+several cases in one boot therefore gets a free set difference between them, and the reasoning is
+one-sided in a useful way — "first seen in the failing case" proves it did not run in any earlier
+case, which is the direction you usually want. Do not add a second, per-case probe for this.
+
+Deriving the case boundaries needs the same suspicion as any other measurement, because the repro's
+step markers usually go to the console and not into the log. Anchor them on something the run
+already recorded — capture mtimes, a known cadence, the last line's timestamp — and then **print a
+consistency check the boundaries have to pass**. Here that check is the lead time from each window's
+first dump to its own capture: it must come out at the scripted sleep for every window, and one
+window disagreeing is a mis-set boundary rather than a finding. Four windows agreeing to 0.3 s is
+what makes the set difference trustworthy.
+
 ### Interleave The Arms Of A Live A/B
 
 A live before/after on the VM rig compares two arms separated by wall-clock time, and neither the
