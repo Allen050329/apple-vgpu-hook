@@ -141,7 +141,12 @@ impl Emit {
 /// unit-testable without capturing the sink. Unbounded by design: the key space
 /// is (registered slug × a wire value), and a guest that walks enough distinct
 /// values to matter has a bug the log should be shouting about.
-fn first_sight(reason: &'static str, discriminant: u64) -> bool {
+///
+/// Also reachable crate-internally for a line that is a *notice* rather than a
+/// decline, so it has no slug to build an [`Emit`] from, but sits on a path hot
+/// enough that repeating it would say nothing the first line did not. Pass the
+/// marker the line starts with as `reason`.
+pub(crate) fn first_sight(reason: &'static str, discriminant: u64) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64)>>> = OnceLock::new();

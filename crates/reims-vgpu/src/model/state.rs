@@ -2787,8 +2787,11 @@ impl DeviceState {
     /// The geometry latch ([`PresentState::output_group_geoms`]) keeps a surface
     /// unified across buffer recycles that momentarily drop the concurrent peer
     /// count to one and would otherwise re-expose a per-mid resident (the
-    /// black-background class); the live peer check still arms the group on the
-    /// very first frame two surfaces appear together.
+    /// black-background class). The latch also *arms* on the very first frame
+    /// two surfaces appear together, because `note_presented_geom` evaluates the
+    /// arming condition immediately after its own insert — so the live peer
+    /// recount below it is not what admits the first pair either. Whether it
+    /// admits anything at all is being measured; see the probe on that branch.
     pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
         self.output_group_resolve(mapping_id, w, h).ok()
     }
@@ -2833,6 +2836,36 @@ impl DeviceState {
             .filter(|&&mid| mid != mapping_id && self.presented_geom_live(mid) == Some((w, h)))
             .count();
         if peers >= 1 {
+            // MEASUREMENT, so that deleting this branch can be a decision rather
+            // than an argument.
+            //
+            // `note_presented_geom` arms the latch on `presented_count(w, h) >= 2`,
+            // and the `presented_at` gate above has already established that
+            // `mapping_id` is one of those, so `peers >= 1` is the *identical*
+            // predicate — evaluated live instead of latched. Two mechanisms
+            // deciding one membership question, which is the state-that-must-agree
+            // the latch was introduced to end.
+            //
+            // Reaching here therefore means the arming predicate became true with
+            // no `note_presented_geom` running to observe it. Its only inputs are
+            // `presented_geoms` (single insert site, latch check immediately after)
+            // and each mid's `map_generation`, so the one remaining path is a dead
+            // entry coming back to life: generations only climb, so this needs the
+            // mapping entry to disappear, taking `map_generation_or_zero` back to
+            // the 0 that an entry recorded before we held any mapping. Admitting on
+            // resurrected evidence is not something we want, so if this line never
+            // fires the branch is redundant and its deletion is a scoreboard win.
+            // Latched per geometry: the question is whether the branch fires at
+            // all, and a hot resolver repeating one line answers it no better.
+            // Zero lines over a boot is a sound reading of "never" precisely
+            // because the first sighting of each geometry is always let through.
+            let geom = ((w as u64) << 32) | h as u64;
+            if crate::observe::first_sight("output_group_unlatched_peer", geom) {
+                crate::observe::off(format!(
+                    "output_group_unlatched_peer mid={mapping_id} geom={w}x{h} peers={peers} \
+                     (admitted by the live recount at a geometry the sticky latch never armed)"
+                ));
+            }
             Ok(1)
         } else {
             Err(OutputGroupMiss::NoPeer)
@@ -3664,6 +3697,128 @@ impl DeviceState {
         // greppable by the vocabulary every other subsystem uses.
         crate::observe::Emit::decline("fail_event", &ev).fail();
         self.fails.push(ev);
+    }
+}
+
+/// Whether `output_group_resolve`'s live peer recount can ever admit a surface
+/// the sticky latch has not already admitted.
+///
+/// Two mechanisms decide one membership question, and the prime directive says
+/// that is one too many. These tests establish the two facts needed to delete
+/// the recount: it CAN fire (so a zero reading off a boot means something), and
+/// the only input that could make it fire ahead of the latch — a dead
+/// `presented_geoms` entry coming back to life — is not reachable.
+#[cfg(test)]
+mod output_group_membership_tests {
+    use super::*;
+    use crate::model::PAGE_SHIFT_X86;
+    use crate::observe::FailCapture;
+    use crate::runtime::import_present::OUTPUT_GROUP_ID;
+
+    fn state() -> DeviceState {
+        DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)
+    }
+
+    /// The probe fires, and it prints the mid, geometry and peer count it read.
+    ///
+    /// A probe that cannot fire reports zero on a healthy boot and zero on a
+    /// broken one, so this is what makes the rail reading admissible at all. The
+    /// state is built by writing `presented_geoms` directly, because the whole
+    /// claim under test is that `note_presented_geom` cannot produce it.
+    #[test]
+    fn the_unlatched_peer_probe_prints_the_reading_that_admitted() {
+        let mut s = state();
+        for mid in [4u32, 9u32] {
+            s.present.presented_geoms.insert(
+                mid,
+                PresentedGeom {
+                    width: 1920,
+                    height: 1080,
+                    map_generation: 0,
+                },
+            );
+        }
+        assert!(
+            !s.present.output_group_geoms.contains(&(1920, 1080)),
+            "the latch must be unarmed or this exercises the wrong branch"
+        );
+
+        let cap = FailCapture::start();
+        assert_eq!(s.output_group_resolve(4, 1920, 1080), Ok(OUTPUT_GROUP_ID));
+        let line = cap.one("OFF");
+        assert!(
+            line.contains("output_group_unlatched_peer mid=4 geom=1920x1080 peers=1"),
+            "the probe must name what it read, got {line:?}"
+        );
+    }
+
+    /// Arming the latch the way the guest does keeps the probe silent — the
+    /// recount is not what admitted anyone.
+    ///
+    /// `note_presented_geom` checks the latch condition immediately after its
+    /// insert, so the second present arms the geometry before anything can
+    /// resolve against it. Both members then take the latch branch.
+    #[test]
+    fn two_presents_arm_the_latch_before_the_recount_is_ever_consulted() {
+        let mut s = state();
+        let cap = FailCapture::start();
+        s.map_surface(4);
+        s.note_presented_geom(4, 1920, 1080);
+        assert_eq!(
+            s.output_group_resolve(4, 1920, 1080),
+            Err(OutputGroupMiss::NoPeer),
+            "one presented surface is not a swapchain"
+        );
+        s.map_surface(9);
+        s.note_presented_geom(9, 1920, 1080);
+        assert!(
+            s.present.output_group_geoms.contains(&(1920, 1080)),
+            "the second present must arm the latch inside note_presented_geom"
+        );
+        for mid in [4u32, 9u32] {
+            assert_eq!(s.output_group_resolve(mid, 1920, 1080), Ok(OUTPUT_GROUP_ID));
+        }
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.contains("output_group_unlatched_peer")),
+            "the latch admitted both, so the recount must not have: {:?}",
+            cap.lines()
+        );
+    }
+
+    /// The lemma the deletion rests on: presented evidence never comes back to
+    /// life, so the peer count can only rise inside `note_presented_geom` — and
+    /// that is the one place the latch condition is checked.
+    ///
+    /// `bump_map_generation` wraps but explicitly skips 0, and no site removes a
+    /// `mappings` entry, so `map_generation_or_zero` leaves 0 exactly once and
+    /// never revisits any value it has left. An entry stamped with a superseded
+    /// generation is therefore dead permanently, not until the next recycle.
+    #[test]
+    fn a_superseded_presented_entry_never_becomes_live_again() {
+        let mut s = state();
+        s.map_surface(4);
+        s.note_presented_geom(4, 1920, 1080);
+        assert!(s.presented_at(4, 1920, 1080));
+
+        let mut seen = vec![s.map_generation_or_zero(4)];
+        for _ in 0..64 {
+            let e = s.mappings.get_mut(&4).expect("mappings entries are not removed");
+            DeviceState::bump_map_generation(4, e);
+            let now = s.map_generation_or_zero(4);
+            assert_ne!(now, 0, "a bump never lands back on the never-mapped value");
+            assert!(
+                !seen.contains(&now),
+                "generation {now} recurred; the evidence it stamped would revive"
+            );
+            seen.push(now);
+            assert!(
+                !s.presented_at(4, 1920, 1080),
+                "evidence from generation {} must stay dead",
+                seen[0]
+            );
+        }
     }
 }
 
