@@ -1695,23 +1695,27 @@ pub fn undecoded_iosurface_descriptor_bytes(bytes: &[u8]) -> Vec<u8> {
 /// dump would bury the log it is meant to inform. Hitting it is reported once,
 /// so "the tail varies per surface" is a loud answer rather than a silent
 /// truncation that reads like "we saw everything".
-fn note_iosurface_descriptor_shape(bytes: &[u8], mapping_id: u32, width: u32, height: u32) {
+fn note_iosurface_descriptor_shape(bytes: &[u8]) {
     const MAX_SHAPES: usize = 24;
     const HEX_MAX: usize = 96;
     use std::sync::Mutex;
-    static SEEN: Mutex<Option<std::collections::BTreeSet<Vec<u8>>>> = Mutex::new(None);
+    type ShapeKey = (usize, Vec<u8>);
+    static SEEN: Mutex<Option<std::collections::BTreeSet<ShapeKey>>> = Mutex::new(None);
 
+    // Deliberately runs BEFORE the length check, and keys on `(len, undecoded)`
+    // rather than on `undecoded` alone. A record too short to decode has an
+    // empty span, and an earlier version of this probe returned on that and so
+    // reported nothing at all on a live boot — the length claim in this
+    // decoder's comment is exactly one of the things being measured, so the
+    // probe must not assume it to fire.
     let undecoded = undecoded_iosurface_descriptor_bytes(bytes);
-    if undecoded.is_empty() {
-        return;
-    }
     let (fresh, distinct) = {
         let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
         let seen = guard.get_or_insert_with(Default::default);
         if seen.len() > MAX_SHAPES {
             return;
         }
-        (seen.insert(undecoded.clone()), seen.len())
+        (seen.insert((bytes.len(), undecoded.clone())), seen.len())
     };
     if !fresh {
         return;
@@ -1723,15 +1727,25 @@ fn note_iosurface_descriptor_shape(bytes: &[u8], mapping_id: u32, width: u32, he
         ));
         return;
     }
+    let (mid, w, h) = if bytes.len() >= 0x20 {
+        (
+            ld32(&bytes[0x00..]),
+            ld32(&bytes[0x18..]),
+            ld32(&bytes[0x1c..]),
+        )
+    } else {
+        (0, 0, 0)
+    };
     let hex: String = bytes
         .iter()
         .take(HEX_MAX)
         .map(|b| format!("{b:02x}"))
         .collect();
     crate::observe::fail(format!(
-        "t11_desc_shape distinct={distinct} mid={mapping_id} {width}x{height} len={} \
+        "t11_desc_shape distinct={distinct} mid={mid} {w}x{h} len={} decodable={} \
          undecoded_nz={} hex={hex}{}",
         bytes.len(),
+        (bytes.len() >= 0x20) as u8,
         undecoded.iter().filter(|&&b| b != 0).count(),
         if bytes.len() > HEX_MAX { "…" } else { "" },
     ));
@@ -1745,13 +1759,13 @@ pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, D
     // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
     // and product resolve fail-closes non-zero levels rather than inventing
     // a pyramid packing in the mapping (see blit_exec::Type11Texture).
+    note_iosurface_descriptor_shape(bytes);
     if bytes.len() < 0x20 {
         return Err(DecodeStatus::ErrShort("res_iosurface_short"));
     }
     let mapping_id = ld32(&bytes[0x00..]);
     let width = ld32(&bytes[0x18..]);
     let height = ld32(&bytes[0x1c..]);
-    note_iosurface_descriptor_shape(bytes, mapping_id, width, height);
     Ok(Descriptor::IOSurfaceTexture {
         mapping_id,
         object_ref: ld32(&bytes[0x10..]),
