@@ -67,6 +67,29 @@ pub enum MemError {
     RunOutOfRange,
 }
 
+impl MemError {
+    /// The guest's own page table says nothing is mapped at this address.
+    ///
+    /// A zero PFN in a task PTE is a *decoded guest fact*: the guest owns that
+    /// entry and wrote the zero. So a deferred writeback whose target answers
+    /// this has no target — the guest tore the range down — and that is a
+    /// different outcome from a write that failed while the target still
+    /// existed. Callers landing deferred content use it to pick between
+    /// "discharge the obligation" and "report lost guest work".
+    ///
+    /// Deliberately **only** the zero-PFN status. The other fourteen walk
+    /// refusals describe a table that is malformed, out of range or unreadable,
+    /// none of which is the guest saying "I unmapped this", and widening the set
+    /// to make a log quieter would turn this into the exception list the ground
+    /// rules forbid.
+    pub fn is_guest_teardown(&self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved(crate::contract::gva_resolve::ResolveStatus::ErrZeroPfn)
+        )
+    }
+}
+
 impl crate::observe::Decline for MemError {
     fn slug(&self) -> &'static str {
         match self {
@@ -1039,5 +1062,73 @@ mod tests {
         let big = HostAction::scanout_gl(1, 1, 0, 4096, 2160);
         assert_eq!((big.a2 >> 32) as u32, 4096);
         assert_eq!((big.a2 & 0xffff_ffff) as u32, 2160);
+    }
+
+    /// Exactly one refusal means "the guest unmapped this".
+    ///
+    /// `is_guest_teardown` decides whether a deferred writeback that could not
+    /// land is discharged quietly or reported as lost guest work, so widening it
+    /// silences real losses and is the exception-list anti-pattern in miniature.
+    /// Asserted exhaustively over every walk status and every `MemError` rather
+    /// than by naming the one, so a variant added later has to be classified
+    /// here on purpose instead of falling into whichever side `matches!`
+    /// happens to put it.
+    #[test]
+    fn only_a_zero_pfn_means_the_guest_tore_the_range_down() {
+        use crate::contract::gva_resolve::ResolveStatus as R;
+        const WALK: &[R] = &[
+            R::Ok,
+            R::ErrArgs,
+            R::ErrInactiveTask,
+            R::ErrNoDirectory,
+            R::ErrDirectoryRead,
+            R::ErrZeroRootPfn,
+            R::ErrZeroDepth,
+            R::ErrDepthTooDeep,
+            R::ErrAddressOutOfRange,
+            R::ErrPageTableRead,
+            R::ErrZeroPfn,
+            R::ErrMalformedPte,
+            R::ErrSpanOverflow,
+            R::ErrVisitorStopped,
+            R::ErrUnsupportedGeometry,
+            R::ErrSpanTooLarge,
+        ];
+        let teardown: Vec<R> = WALK
+            .iter()
+            .copied()
+            .filter(|r| MemError::Unresolved(*r).is_guest_teardown())
+            .collect();
+        assert_eq!(teardown, vec![R::ErrZeroPfn]);
+
+        for e in [
+            MemError::Unmapped,
+            MemError::NoCpu,
+            MemError::Overflow,
+            MemError::BadArgs,
+            MemError::QemuReadGpaCallbackMissing,
+            MemError::QemuReadGpaCallbackFailed(-1),
+            MemError::QemuWriteGpaCallbackMissing,
+            MemError::QemuWriteGpaCallbackFailed(-1),
+            MemError::QemuReadKvaCallbackMissing,
+            MemError::QemuReadKvaCallbackFailed(-1),
+            MemError::XregUnavailable,
+            MemError::QemuReadXregCallbackMissing,
+            MemError::QemuReadXregCallbackFailed(-1),
+            MemError::NoTaskDirectory,
+            MemError::UnsupportedPageShift,
+            MemError::TaskRootRead,
+            MemError::NoSuchTask,
+            MemError::OutsideMap,
+            MemError::NotRam,
+            MemError::MapPagesRefused,
+            MemError::RunOutOfRange,
+        ] {
+            assert!(
+                !e.is_guest_teardown(),
+                "{} is not the guest saying it unmapped the range",
+                crate::observe::Decline::slug(&e)
+            );
+        }
     }
 }

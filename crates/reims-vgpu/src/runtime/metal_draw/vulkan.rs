@@ -122,6 +122,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c.format,
                     &rgba,
                 )
+                .is_ok()
             } else if c.mapping_id != 0 {
                 // Type-11 CLEAR: contig HostOps path (write_bgra8 is contig-only).
                 let bgra = swap_rb_channels(&rgba);
@@ -485,7 +486,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c0.row_stride,
                     c0.format,
                     rgba,
-                );
+                )
+                .is_ok();
                 // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
                 // host caches (not surface_id mid map — list ids collide with
                 // present mids;). Sample prefers GVA key then
@@ -6875,7 +6877,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     }
     if gva != 0 {
         supersede_gva_window(state, host, gva, w, h, "chain_land");
-        return write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba);
+        return write_gva_rgba8(state, host, task_id, gva, w, h, bpr, fmt, rgba).is_ok();
     }
     if mapping_id == 0 {
         return false;

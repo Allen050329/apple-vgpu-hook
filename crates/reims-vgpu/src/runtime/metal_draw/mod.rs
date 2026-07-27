@@ -2021,6 +2021,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     c.format,
                     out_rgba,
                 )
+                .is_ok()
             }
         } else {
             false
@@ -3955,6 +3956,10 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
 /// Archive `apple_pv_gpu_write_gva_rgba`: tight RGBA8 → native rows at GVA.
 /// Packed contig HostOps view when possible; else multi-import per row
 /// ([`gva_view::write_span`]) — no `write_gpa` walk.
+///
+/// Carries the refusal out rather than collapsing to `false`: a caller has to be
+/// able to tell "the guest tore this target down" (`MemError::is_guest_teardown`)
+/// from a write that genuinely lost content.
 #[allow(
     clippy::too_many_arguments,
     reason = "the archive writer mirrors the target GVA and native row geometry"
@@ -3969,20 +3974,21 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
     bpr: u32,
     format: u16,
     rgba: &[u8],
-) -> bool {
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
     if gva == 0 || width == 0 || height == 0 || bpr == 0 {
-        return false;
+        return Err(MemError::BadArgs);
     }
     let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
-        return false;
+        return Err(MemError::BadArgs);
     };
     if bpr < tight {
-        return false;
+        return Err(MemError::BadArgs);
     }
     let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
     let need = rgba_row.saturating_mul(height as usize);
     if rgba.len() < need {
-        return false;
+        return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
     let mut row = vec![0u8; tight as usize];
@@ -3992,16 +3998,16 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
         crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span)
     {
         let (base, avail) = (span_map.ptr, span_map.avail);
-        let mut ok = true;
+        let mut res = Ok(());
         for y in 0..height as usize {
             let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
             if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                ok = false;
+                res = Err(MemError::BadArgs);
                 break;
             }
             let off = y.saturating_mul(bpr as usize);
             if off + row.len() > avail {
-                ok = false;
+                res = Err(MemError::RunOutOfRange);
                 break;
             }
             // SAFETY: map_fresh_span covers `span`.
@@ -4010,13 +4016,13 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
             }
         }
         crate::runtime::gva_view::unmap_fresh_span(host, span_map);
-        return ok;
+        return res;
     }
     // Fragmented GVA: multi-import each converted row via write_span.
     for y in 0..height as usize {
         let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
         if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-            return false;
+            return Err(MemError::BadArgs);
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
         if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
@@ -4027,10 +4033,10 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
                  row={y} rowlen={:#x} (rgba8 multi)",
                 row.len()
             ));
-            return false;
+            return Err(err);
         }
     }
-    true
+    Ok(())
 }
 
 /// Store only the Metal scissor rect of a full-size tight RGBA8 buffer to GVA.

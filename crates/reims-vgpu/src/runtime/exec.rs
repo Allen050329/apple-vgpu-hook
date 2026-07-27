@@ -2136,7 +2136,8 @@ fn apply_clear<M: HostMemory + HostOps>(
             c0.row_stride,
             c0.format,
             &rgba,
-        );
+        )
+        .is_ok();
     }
     if c0.mapping_id == 0 {
         return false;

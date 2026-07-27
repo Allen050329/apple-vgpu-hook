@@ -417,7 +417,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
     if guest_write && state.gva_write_allowed(entry.task_id, gva, entry.span()) {
-        guest = if crate::runtime::metal_draw::write_gva_rgba8(
+        guest = match crate::runtime::metal_draw::write_gva_rgba8(
             state,
             host,
             entry.task_id,
@@ -428,15 +428,29 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             entry.format,
             &rgba,
         ) {
-            "written"
-        } else {
-            // write_gva_rgba8 fail-logs uncontiguous rows; the caches below
-            // keep the authoritative bytes either way.
-            crate::observe::fail(format!(
-                "deferred_flush_lost kind=gva reason=guest_write gva={gva:#x} {}x{} bpr={} fmt={:#x} trigger={trigger}",
-                entry.width, entry.height, entry.row_stride, entry.format
-            ));
-            "write_fail"
+            Ok(()) => "written",
+            // The guest already tore this window down and its Unmap notify has
+            // not drained yet. That is the same state the Unmap/Map notify path
+            // lands cache-only for — "on Unmap the PTEs are already gone" — just
+            // reached through a different door, because a page-alias flush races
+            // ahead of the notify. The caches below hold the content, so the
+            // obligation is discharged and nothing is lost. Expected control
+            // flow: it does not belong in the failure log.
+            Err(err) if err.is_guest_teardown() => "unmapped",
+            // A write that refused while the target still existed. The caches
+            // below keep the authoritative bytes, so guest RAM is stale rather
+            // than wrong — but this one is a real loss of guest work.
+            Err(err) => {
+                crate::observe::Emit::decline("deferred_flush_lost", &err)
+                    .field("kind", "gva")
+                    .field("gva", format!("{gva:#x}"))
+                    .field("dims", format!("{}x{}", entry.width, entry.height))
+                    .field("bpr", entry.row_stride)
+                    .field("fmt", format!("{:#x}", entry.format))
+                    .field("trigger", trigger)
+                    .fail();
+                "write_fail"
+            }
         };
     } else if guest_write {
         guest = "skip_uncovered";

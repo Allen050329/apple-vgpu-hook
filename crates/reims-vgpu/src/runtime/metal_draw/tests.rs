@@ -3286,7 +3286,8 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
             8, // bpr = 2*4
             MTL_FORMAT_BGRA8_UNORM,
             &rgba,
-        ),
+        )
+        .is_ok(),
         "x86 page_shift=12 GVA store must succeed"
     );
     let mut back = [0u8; 8];
