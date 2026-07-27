@@ -285,6 +285,23 @@ fn try_capture_from_resident(
                 height,
                 &mut divergent_rects,
             );
+            // Measure-only sibling of the `dense_retention_gap` presented-peer
+            // gate: `compositor_geometry_peer` is deliberately NOT presented-gated
+            // (its distinct-resident divergence patches the black-band class), so
+            // a never-displayed full-frame publisher CAN become the tile-composite
+            // source and bleed its tiles onto a real output — the "residue/tiles"
+            // symptom. This has been dormant on every traced x86 boot
+            // (`tile_comp=0`); if it ever fires with `peer_presented=0` the leak is
+            // now visible and a gate can be added against a real reproduction.
+            if !divergent_rects.is_empty() && !state.presented_at(peer_mid, width, height) {
+                crate::runtime::census::present_proxy::note_tile_composite_unpresented_peer(
+                    mapping_id,
+                    peer_mid,
+                    divergent_rects.len(),
+                    width,
+                    height,
+                );
+            }
             crate::runtime::import_present::member_surface_identity(state, peer_mid, width, height)
         });
     let member_peer = match &peer_identity {

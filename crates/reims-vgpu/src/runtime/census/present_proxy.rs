@@ -262,6 +262,10 @@ struct ThrashState {
     /// (reason, geometry) combinations a boot produces.
     secondary_mrt_drop_seen: std::collections::BTreeSet<(u8, u32, u32)>,
     secondary_mrt_blend_seen: std::collections::BTreeSet<(u32, u32, u32)>,
+    /// Dedup for [`note_tile_composite_unpresented_peer`], keyed on the
+    /// `(presented_mid, peer_mid)` pair so a persistent leak logs once per pair
+    /// per boot rather than once per present.
+    tile_comp_unpresented_seen: std::collections::BTreeSet<(u32, u32)>,
     /// Boot-convergence proxy: whether a full-size present has reached
     /// [`CONVERGE_DENSE_FRAC`] RGB occupancy yet (the wallpaper/desktop first
     /// fully composited). Latched once — the `present_converge` line fires
@@ -506,6 +510,7 @@ impl ThrashState {
             stale_present_substitute: 0,
             stale_subst_active: std::collections::BTreeMap::new(),
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
+            tile_comp_unpresented_seen: std::collections::BTreeSet::new(),
             secondary_mrt_blend_seen: std::collections::BTreeSet::new(),
             first_dense_seen: false,
             post_converge_nondense_run: 0,
@@ -1626,6 +1631,36 @@ pub fn note_tile_composite_result(
             .off(),
         None => observe::off(format!("tile_composite {tail} geom={width}x{height}")),
     }
+    true
+}
+
+/// Measure-only: the tile-composite path selected a `peer_mid` that has NEVER
+/// been displayed at this geometry ([`crate::model::DeviceState::presented_at`])
+/// as the source of `rects` divergent tiles. `compositor_geometry_peer` is not
+/// presented-gated (its distinct-resident divergence patches the black-band
+/// class), so a never-displayed full-frame publisher can bleed its tiles onto a
+/// real output — the residue/tiles symptom, and the tile-level analogue of the
+/// `peer_presented=0` whole-frame substitution that
+/// [`crate::model::DeviceState::dense_retention_gap`] now excludes. This has been
+/// dormant on every traced x86 boot; a nonzero count is the reproduction a real
+/// gate here would need. Deduped on `(presented_mid, peer_mid)` — one line per
+/// pair per boot, not per present. Returns whether a new pair was logged.
+pub fn note_tile_composite_unpresented_peer(
+    presented_mid: u32,
+    peer_mid: u32,
+    rects: usize,
+    width: u32,
+    height: u32,
+) -> bool {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if !st.tile_comp_unpresented_seen.insert((presented_mid, peer_mid)) {
+        return false;
+    }
+    drop(st);
+    observe::fail(format!(
+        "tile_composite_unpresented_peer presented_mid={presented_mid} peer_mid={peer_mid} \
+         rects={rects} {width}x{height} (compositing tiles from a never-displayed peer)"
+    ));
     true
 }
 
@@ -4949,6 +4984,33 @@ mod tests {
             h
         ));
         assert_eq!(counters().tile_composite_skipped, 2);
+    }
+
+    /// The tile-composite never-displayed-peer proxy logs once per
+    /// `(presented_mid, peer_mid)` pair (a persistent leak must not spam per
+    /// present), and a distinct pair re-fires.
+    #[test]
+    fn tile_composite_unpresented_peer_dedups_per_pair() {
+        let _g = test_lock();
+        reset_for_test();
+        let (w, h) = (1920u32, 1080u32);
+
+        assert!(
+            note_tile_composite_unpresented_peer(6, 1, 40, w, h),
+            "first sighting of a never-displayed peer logs"
+        );
+        assert!(
+            !note_tile_composite_unpresented_peer(6, 1, 40, w, h),
+            "same pair on a later present is deduped"
+        );
+        assert!(
+            !note_tile_composite_unpresented_peer(6, 1, 12, w, h),
+            "dedup is keyed on the pair, not the rect count"
+        );
+        assert!(
+            note_tile_composite_unpresented_peer(6, 9, 5, w, h),
+            "a distinct never-displayed peer re-fires"
+        );
     }
 
     /// `reason=` names a refusal, so a *success* must not carry one.
