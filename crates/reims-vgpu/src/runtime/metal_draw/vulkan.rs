@@ -5476,6 +5476,18 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     None
                 };
+                // Drop a peer source that already unifies with this target: a
+                // proven swapchain geometry resolves every member to one shared
+                // resident (see `output_group_for`), so the retained full frame
+                // is present in the target itself. Seeding from it would set
+                // `seed_from_target == target_identity`, which draw validation
+                // rejects (`SeedEqualsTarget`) — failing the whole draw and
+                // freezing the guest compositor. The draw's own LoadFromTarget
+                // reads the shared resident and already carries the content.
+                let peer_seed_source = peer_seed_source.filter(|&src_mid| {
+                    crate::runtime::import_present::surface_identity(state, src_mid, w, h)
+                        != *identity
+                });
                 let peer_front_seed = peer_seed_source.is_some();
                 if peer_front_seed {
                     // Telemetry only: counts every seed for the `peer_seeds=`
