@@ -4149,8 +4149,10 @@ fn build_secondary_targets(
 }
 
 /// Draw-pipeline analog of the compute `dump_kernel_handoff`.
-/// `REIMS_VGPU_M2V_DUMP_DRAW_PIPES` is a comma-separated list of pipeline refs (or
-/// `all`); a listed pipe's vertex and fragment stages land under
+/// `REIMS_VGPU_M2V_DUMP_DRAW_PIPES` selects pipes through the shared
+/// [`HandoffPipeSelection`] — a comma-separated list of pipeline refs, or
+/// `all`, same grammar as `REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES`. A listed pipe's
+/// vertex and fragment stages land under
 /// [`crate::runtime::compute_exec::m2v_handoff_dir`] once per boot as
 /// `pipe<N>.draw.{vertex,fragment}.{mtlb,air,spv}` plus a `.txt` with the draw
 /// shape. Probe tooling only — never alters device behavior; unset env means
@@ -4162,22 +4164,15 @@ fn dump_draw_handoff(
     fragment_func_ref: u32,
     stages: [DrawHandoffStage<'_>; 2],
 ) {
+    use crate::runtime::compute_exec::HandoffPipeSelection;
     use std::sync::OnceLock;
-    type DrawHandoffSelection = (bool, Vec<u32>);
-    static WANTED: OnceLock<Option<DrawHandoffSelection>> = OnceLock::new();
-    let wanted = WANTED.get_or_init(|| {
-        let raw = std::env::var("REIMS_VGPU_M2V_DUMP_DRAW_PIPES").ok()?;
-        let all = raw.trim().eq_ignore_ascii_case("all");
-        let list = raw
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
-        Some((all, list))
-    });
+    static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
     let pipe = req.pipeline_ref;
-    match wanted {
-        Some((all, list)) if *all || list.contains(&pipe) => {}
-        _ => return,
+    if !WANTED
+        .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_DRAW_PIPES"))
+        .wants(pipe)
+    {
+        return;
     }
     use std::collections::HashSet;
     use std::sync::Mutex;

@@ -95,6 +95,40 @@ fn m2v_handoff_dir_prefers_explicit_dir_then_repo_local_private_dir() {
     );
 }
 
+/// The draw and compute handoff dumps share one selection parse, so a boot that
+/// lists a pipe for one knob gets the same answer from the other. Unset must
+/// select nothing: these dumps write Apple-owned IR, so a default-on knob would
+/// litter the handoff directory on every normal boot.
+#[test]
+fn handoff_pipe_selection_matches_all_or_a_listed_ref_and_nothing_when_unset() {
+    let none = HandoffPipeSelection::from_raw(None);
+    assert!(!none.wants(0));
+    assert!(!none.wants(196));
+
+    let all = HandoffPipeSelection::from_raw(Some("all".into()));
+    assert!(all.wants(196));
+    assert!(all.wants(0));
+    // Case and surrounding whitespace come from a shell export, not from us.
+    assert!(HandoffPipeSelection::from_raw(Some("  ALL \n".into())).wants(7));
+
+    let listed = HandoffPipeSelection::from_raw(Some("53, 196,155".into()));
+    assert!(listed.wants(53));
+    assert!(listed.wants(196));
+    assert!(listed.wants(155));
+    assert!(!listed.wants(154));
+
+    // An unparseable entry drops itself, not the whole list.
+    let mixed = HandoffPipeSelection::from_raw(Some("53,notapipe,196".into()));
+    assert!(mixed.wants(53));
+    assert!(mixed.wants(196));
+    assert!(!mixed.wants(0));
+
+    // An empty variable is an empty list, not `all`.
+    let empty = HandoffPipeSelection::from_raw(Some(String::new()));
+    assert!(!empty.wants(0));
+    assert!(!empty.wants(196));
+}
+
 #[test]
 fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     let mut acc = ComputeAccum::default();

@@ -1113,6 +1113,35 @@ pub(crate) fn m2v_handoff_dir() -> std::path::PathBuf {
     )
 }
 
+/// Which pipelines a `REIMS_VGPU_M2V_DUMP_*_PIPES` probe knob selects: a
+/// comma-separated list of pipeline refs, or `all`. Shared by the draw and
+/// compute handoff dumps so the two knobs cannot drift apart.
+///
+/// Probe tooling only — never alters device behavior. An unset variable parses
+/// to "none", so a normal boot pays one atomic load per encode.
+pub(crate) struct HandoffPipeSelection(Option<(bool, Vec<u32>)>);
+
+impl HandoffPipeSelection {
+    pub(crate) fn from_raw(raw: Option<String>) -> Self {
+        Self(raw.map(|raw| {
+            let all = raw.trim().eq_ignore_ascii_case("all");
+            let list = raw
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            (all, list)
+        }))
+    }
+
+    pub(crate) fn from_env(var: &str) -> Self {
+        Self::from_raw(std::env::var(var).ok())
+    }
+
+    pub(crate) fn wants(&self, pipe: u32) -> bool {
+        matches!(&self.0, Some((all, list)) if *all || list.contains(&pipe))
+    }
+}
+
 /// Persist the exact inputs of a compute kernel that failed downstream, for
 /// off-VM handoff to the metal2vulkan agent.
 ///
@@ -3213,6 +3242,31 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     };
     let translate_us = u64::try_from(translate_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+    // Compute analog of `REIMS_VGPU_M2V_DUMP_DRAW_PIPES`: the failure sites
+    // below dump only kernels that were refused, so a kernel that translates and
+    // runs — and produces wrong pixels — is invisible to off-VM inspection.
+    // Listing it here lands its AIR and translated SPIR-V once per boot.
+    {
+        use std::sync::OnceLock;
+        static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
+        let wanted = WANTED
+            .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES"));
+        if wanted.wants(acc.pipeline_ref) {
+            dump_kernel_handoff(
+                acc.pipeline_ref,
+                "probe",
+                &mtlb,
+                air,
+                Some(&spirv),
+                &format!(
+                    "grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] textures={} buffers={}",
+                    acc.textures.len(),
+                    staged_bufs.len()
+                ),
+            );
+        }
+    }
 
     let mut buffer_accesses = Vec::with_capacity(staged_bufs.len());
     let mut buffer_readonly_count = 0usize;
