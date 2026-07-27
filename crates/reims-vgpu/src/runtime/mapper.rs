@@ -904,11 +904,24 @@ pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
 /// - `revalidate_gone` / `revalidate_unmapped` — the guest already dropped the
 ///   mapping (pageoff/unwire raced ahead of the flush trigger); nothing to write
 ///   back to, benign.
-/// - `revalidate_no_pages` — mapped but the page list is empty after resolve (a
-///   transient (re)wire gap); benign, stale-but-coherent guest bytes remain.
 /// - `revalidate_resolve_fail` — a live page table turned unreadable; the real
 ///   content-drop risk, and the only one that also emits the `st=invalidate`
 ///   line below.
+///
+/// The empty-page-list outcome is not one outcome. Four different states reach
+/// it, and they were all reported as `revalidate_no_pages` with a doc comment
+/// calling the class "a transient (re)wire gap" — one of the four, asserted for
+/// all of them. 106 render-flush losses across 73 boots carry that slug and none
+/// of them says which state produced it. Each check now owns its own:
+/// - `revalidate_no_internal` — no `MappingInternal`, so **no resolve was ever
+///   attempted**. Says nothing about whether the pages exist.
+/// - `revalidate_resolve_miss` — resolve ran and missed, with no live page table
+///   to condemn (so not `resolve_fail`).
+/// - `revalidate_empty_after_resolve` — resolve ran and *succeeded*, and the page
+///   list is still empty. The genuinely surprising one.
+/// - `revalidate_unmapped_late` / `revalidate_gone_late` — the mapping was
+///   mapped on entry and is unmapped or absent after resolve; teardown raced the
+///   revalidate, which the entry-side `revalidate_unmapped` cannot see.
 pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -923,10 +936,16 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     let has_internal = m.mapping_internal != 0;
     let had_live_table = m.page_table_kva != 0;
     let had_pages = !m.page_entries.is_empty();
+    // Whether the resolve below ran at all, and whether it reported success —
+    // the two facts that separate the empty-page-list outcomes from each other.
+    let mut resolve_ran = false;
+    let mut resolve_ok = false;
     if has_internal {
         let generation_before = m.map_generation;
         let started = std::time::Instant::now();
         let resolved = resolve_mapping_backing(state, host, mapping_id);
+        resolve_ran = true;
+        resolve_ok = resolved;
         let elapsed_us = started.elapsed().as_micros() as u64;
         let (pages_after, generation_after) = state
             .mappings
@@ -956,8 +975,11 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     }
     match state.mappings.get(&mapping_id) {
         Some(m) if m.mapped && !m.page_entries.is_empty() => None,
-        Some(_) => Some("revalidate_no_pages"),
-        None => Some("revalidate_gone"),
+        Some(m) if !m.mapped => Some("revalidate_unmapped_late"),
+        Some(_) if !resolve_ran => Some("revalidate_no_internal"),
+        Some(_) if !resolve_ok => Some("revalidate_resolve_miss"),
+        Some(_) => Some("revalidate_empty_after_resolve"),
+        None => Some("revalidate_gone_late"),
     }
 }
 
@@ -1383,13 +1405,21 @@ mod revalidate_tests {
             revalidate_mapping_reason(&mut state, &host, 7),
             Some("revalidate_gone")
         );
-        // Mapped but no MappingInternal and no page list → the benign
-        // (re)wire-gap window, NOT a live-table resolve failure. Must carry its
-        // own slug so a real content drop is never masked by this case.
+        // Mapped, no MappingInternal, no page list. The resolve never ran, so
+        // this says nothing about whether the pages exist — which is exactly
+        // what the old shared `revalidate_no_pages` slug hid behind a comment
+        // calling it a benign (re)wire gap.
         state.map_surface(2);
         assert_eq!(
             revalidate_mapping_reason(&mut state, &host, 2),
-            Some("revalidate_no_pages")
+            Some("revalidate_no_internal")
+        );
+        // Unmapped on entry is caught before the resolve and keeps its own slug.
+        state.map_surface(3);
+        state.mappings.get_mut(&3).unwrap().mapped = false;
+        assert_eq!(
+            revalidate_mapping_reason(&mut state, &host, 3),
+            Some("revalidate_unmapped")
         );
         // A resolvable static page list → success (None).
         state.map_surface(4);
