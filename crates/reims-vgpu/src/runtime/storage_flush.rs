@@ -725,6 +725,16 @@ fn flush_one<M: HostMemory + HostOps>(
     generation: u32,
 ) -> bool {
     let started = std::time::Instant::now();
+    // Two unrelated `u32` generations are in scope here and they must not be
+    // confused in the log: `key.map_generation` is the mapping's lifetime, the
+    // quantity this guard compares, and `generation` is the pinned resident's
+    // *content* generation, which only `read_resident_storage` uses. The fail
+    // line below printed `content_gen` in a field named `gen` next to
+    // `reason=map_generation_drift`, so a live boot read out as a mapping
+    // lifetime that had gone backwards (3 -> 2) when the two numbers were
+    // simply not comparable. `gen=` is the compared value; the other one says
+    // so in its name.
+    //
     // Same recycled-pages guard as the render flush: a surface window whose
     // defer-time map_generation no longer matches must not write through the
     // rewired pages.
@@ -735,8 +745,8 @@ fn flush_one<M: HostMemory + HostOps>(
     if current != Some(key.map_generation) {
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::observe::fail(format!(
-            "deferred_flush_lost mapping={} {}x{} fmt={:#x} gen={generation} reason=map_generation_drift current={current:?}",
-            key.mapping_id, key.width, key.height, key.pixel_format
+            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
     }
@@ -748,10 +758,12 @@ fn flush_one<M: HostMemory + HostOps>(
                 // same-identity key change). The window keeps its coherent
                 // pre-dispatch bytes; name the loss.
                 crate::observe::Emit::decline("deferred_flush_lost", &e)
+                    .field("kind", "compute")
                     .field("mapping", key.mapping_id)
                     .field("geom", format!("{}x{}", key.width, key.height))
                     .field("fmt", format!("{:#x}", key.pixel_format))
-                    .field("gen", generation)
+                    .field("gen", key.map_generation)
+                    .field("content_gen", generation)
                     .fail();
                 return false;
             }
@@ -759,7 +771,7 @@ fn flush_one<M: HostMemory + HostOps>(
     let expected_bpp = crate::contract::pixel_format::bytes_per_pixel(key.pixel_format);
     if expected_bpp != Some(texel) {
         crate::observe::fail(format!(
-            "deferred_flush_lost mapping={} reason=texel_mismatch engine={texel} guest={expected_bpp:?} fmt={:#x}",
+            "deferred_flush_lost kind=compute mapping={} reason=texel_mismatch engine={texel} guest={expected_bpp:?} fmt={:#x}",
             key.mapping_id, key.pixel_format
         ));
         return false;
@@ -779,7 +791,7 @@ fn flush_one<M: HostMemory + HostOps>(
         tight,
     ) {
         crate::observe::fail(format!(
-            "deferred_flush_lost mapping={} reason=guest_write {}x{} off={} bpr={} span_end={}",
+            "deferred_flush_lost kind=compute mapping={} reason=guest_write {}x{} off={} bpr={} span_end={}",
             key.mapping_id,
             key.width,
             key.height,
@@ -814,7 +826,7 @@ fn flush_one<M: HostMemory + HostOps>(
 ) -> bool {
     let _ = state;
     crate::observe::fail(format!(
-        "deferred_flush_lost mapping={} reason=no_backend gen={generation}",
+        "deferred_flush_lost kind=compute mapping={} content_gen={generation} reason=no_backend",
         key.mapping_id
     ));
     false
@@ -1065,6 +1077,48 @@ mod tests {
         let e = state.mappings.get(&6).unwrap();
         assert_eq!(e.map_generation, 10);
         assert!(e.page_entries.is_empty());
+    }
+
+    /// The compute flush's drift line must print the generation its guard
+    /// compared, not the other one in scope.
+    ///
+    /// `flush_one` holds two unrelated `u32`s: `key.map_generation` (the
+    /// mapping lifetime it compares) and the pinned resident's *content*
+    /// generation. The line printed the content generation in a field named
+    /// `gen`, adjacent to `reason=map_generation_drift current=…`, and a boot
+    /// was read as showing a mapping lifetime running backwards (`gen=3
+    /// current=Some(2)`) when the two numbers were never comparable.
+    #[test]
+    fn the_compute_drift_line_names_the_generation_it_compared() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        // Distinct on purpose: the window's map_generation is 1 (from `key`),
+        // the mapping is at 5, and the content generation is 3. Only one pair
+        // of those is what the guard compares.
+        m.map_generation = 5;
+        state.compute_deferred_flush.insert(key(9, 0, 256), 3);
+        let cap = crate::observe::FailCapture::start();
+        assert!(!super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX));
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("reason=map_generation_drift"),
+            "wrong refusal: {line}"
+        );
+        assert!(
+            line.contains(" gen=1 ") && line.contains("current=Some(5)"),
+            "`gen=` must be the compared window generation: {line}"
+        );
+        assert!(
+            line.contains("content_gen=3"),
+            "the resident's content generation must say so in its name: {line}"
+        );
+        assert!(
+            line.contains("kind=compute"),
+            "every deferred_flush_lost names its path: {line}"
+        );
     }
 
     #[test]

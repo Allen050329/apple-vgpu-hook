@@ -161,6 +161,15 @@ fn emit(sink: Sink, msg: &str) {
     let t = elapsed_ms();
     #[cfg(test)]
     {
+        if matches!(sink, Sink::Fail) {
+            if let Some(buf) = CAPTURED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
+            {
+                buf.push(msg.to_string());
+            }
+        }
         let (file, path) = match sink {
             Sink::Fail => (&FAIL_FILE, fail_log_path()),
             Sink::Draw => (&DRAW_FILE, draw_log_path()),
@@ -339,6 +348,67 @@ mod writer {
             Sink::Draw => Msg::Draw(line),
         };
         let _ = sender().send(msg);
+    }
+}
+
+/// Test-only in-memory copy of the always-on stream, armed by [`FailCapture`].
+#[cfg(test)]
+static CAPTURED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// Records every always-on ([`fail`] / [`off`]) line emitted while it is alive.
+///
+/// The always-on stream is the project's primary evidence, and until this
+/// existed nothing could assert on it: a probe could name a field after the
+/// quantity its check compared while printing a different one, and no test
+/// could tell. That is not hypothetical — the compute flush's
+/// `map_generation_drift` printed a *content* generation in a field called
+/// `gen`, next to the `map_generation` it had actually compared, and the
+/// mismatch was read off a live boot as a generation that had gone backwards.
+///
+/// Relies on the crate's serial test convention (`--test-threads=1`); a second
+/// capture armed concurrently would see the other test's lines.
+#[cfg(test)]
+pub(crate) struct FailCapture;
+
+#[cfg(test)]
+impl FailCapture {
+    pub(crate) fn start() -> Self {
+        *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+        Self
+    }
+
+    /// Every always-on line emitted since `start`, in order.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        CAPTURED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// The one line whose first whitespace token is `slug`. Panics unless
+    /// exactly one matched — "no line" and "several lines" are both reasons a
+    /// downstream assertion would otherwise pass or fail for the wrong reason.
+    pub(crate) fn one(&self, slug: &str) -> String {
+        let hits: Vec<String> = self
+            .lines()
+            .into_iter()
+            .filter(|l| l.split_whitespace().next() == Some(slug))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one `{slug}` line, got {hits:?} (all: {:?})",
+            self.lines()
+        );
+        hits.into_iter().next().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailCapture {
+    fn drop(&mut self) {
+        *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 

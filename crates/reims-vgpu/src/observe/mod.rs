@@ -60,4 +60,4 @@ pub(crate) use sink::{draw_log_enabled, elapsed_ms, enabled};
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.
 #[cfg(test)]
-pub(crate) use sink::{fail_log_path, line_is};
+pub(crate) use sink::{fail_log_path, line_is, FailCapture};
