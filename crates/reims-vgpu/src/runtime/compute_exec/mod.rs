@@ -1742,9 +1742,34 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)
             .unwrap_or(0);
-        let (surface_offset, surface_bpr, span_end) = match mapping_write::type11_sample_window(
-            m, width, height, stage_fmt,
-        ) {
+        // A type-5 record names its IOSurface plane on the wire (record `+0x20`,
+        // the `newTextureWithDescriptor:iosurface:plane:` argument), so the
+        // plane is decided, not inferred. Type-11 carries no such field and must
+        // still match a plane record by geometry — which is ambiguous whenever
+        // two planes share dims and bytes-per-element (v0a8 Y and alpha), and
+        // resolves to the invented packed window over plane 0 or to nothing at
+        // all. The draw path already binds type-5 views by index; this is the
+        // same resolution on the staging path.
+        let window = match type5_record {
+            Some(rec) => {
+                mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
+                    .map(|(offset, bpr, end, from_device)| {
+                        // Invent always produces a packed window at offset 0 —
+                        // plane 0's bytes. Reaching it after the wire named a
+                        // different plane is a guaranteed wrong bind, so it
+                        // cannot stay quiet just because it returned a window.
+                        if !from_device && rec.plane_index != 0 {
+                            crate::observe::fail(format!(
+                                "compute_stage_tex plane_invent mapping={mapping_id} plane={} {width}x{height} fmt={stage_fmt:#x} offset={offset} bpr={bpr}",
+                                rec.plane_index
+                            ));
+                        }
+                        (offset, bpr, end)
+                    })
+            }
+            None => mapping_write::type11_sample_window(m, width, height, stage_fmt),
+        };
+        let (surface_offset, surface_bpr, span_end) = match window {
             Some(w) => w,
             None => {
                 // Measure type4_len_vs_plane: which window path rejected (device bpr vs invent span).

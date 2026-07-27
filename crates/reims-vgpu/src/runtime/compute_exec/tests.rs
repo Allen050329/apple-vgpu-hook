@@ -95,6 +95,126 @@ fn m2v_handoff_dir_prefers_explicit_dir_then_repo_local_private_dir() {
     );
 }
 
+/// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
+/// `newTextureWithDescriptor:iosurface:plane:` argument). When two planes share
+/// geometry and bytes-per-element the geometry scan cannot separate them and
+/// falls back to inventing a packed window at offset 0 — which is the *first*
+/// plane's bytes. The wire index is the only key, and this path already decoded
+/// it, so a compute stage of the alpha plane must not read the luma plane.
+///
+/// Shape is the live v0a8 (biplanar video + alpha) layout scaled down: plane 0
+/// and plane 2 are both R8 at identical dims, plane 1 is the RG8 chroma.
+#[test]
+fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
+    use crate::contract::endian::st16;
+    use crate::contract::iosurface_pages::{
+        DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
+        DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
+        DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+    };
+    use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM};
+    use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
+
+    // elemW@0, width u24@1, elemH@4, height u24@5.
+    fn plane_dims(width: u32, height: u32) -> u64 {
+        ((width as u64 & 0xff_ffff) << 8) | ((height as u64 & 0xff_ffff) << 40)
+    }
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    setup_task_pages(&mut host, &mut state, 4);
+
+    let sid = 3u32;
+    let type5_ref = 10u32;
+    let pfn = 0x20u32;
+    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(gpa, 0x4000, 0x5a);
+    assert!(state.map_surface(sid));
+    {
+        let m = state.mappings.get_mut(&sid).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(sid, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+
+    let mut device_desc = vec![0u8; DEVICE_DESC_LEN];
+    st32(&mut device_desc[DEVICE_DESC_ALLOC_SIZE..], 192);
+    device_desc[DEVICE_DESC_PLANE_COUNT] = 3;
+    // (offset, size, w, h, bpr, bpe): Y and alpha are indistinguishable by dims.
+    let planes = [
+        (0u32, 64u32, 4u32, 4u32, 16u32, 1u16),
+        (64, 64, 2, 2, 16, 2),
+        (128, 64, 4, 4, 16, 1),
+    ];
+    for (i, (off, size, w, h, bpr, bpe)) in planes.iter().enumerate() {
+        let base = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
+        st32(&mut device_desc[base + DEVICE_PLANE_OFFSET..], *off);
+        st32(&mut device_desc[base + DEVICE_PLANE_SIZE..], *size);
+        st64(&mut device_desc[base + DEVICE_PLANE_DIMS..], plane_dims(*w, *h));
+        st32(&mut device_desc[base + DEVICE_PLANE_BPR..], *bpr);
+        st16(&mut device_desc[base + DEVICE_PLANE_BPE..], *bpe);
+    }
+    assert!(state.set_mapping_device_desc(sid, &device_desc));
+
+    // 56-byte type-5 blob: 8-byte head, then kind/blob_len/own_ref and a 0x24
+    // record whose `+0x20` carries the plane index.
+    let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
+    let mut type5_desc = vec![0u8; 8];
+    st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
+    type5_desc.extend_from_slice(&[
+        0x2f, 0, 0, 0, // kind
+        0x30, 0, 0, 0, // blob_len
+        10, 0, 0, 0, // own_ref
+        0x42, 0x01, MTL_FORMAT_R8_UNORM as u8, (MTL_FORMAT_R8_UNORM >> 8) as u8,
+        4, 0, 0, 0, // view width
+        4, 0, 0, 0, // view height
+        1, 0, 0, 0, // depth
+        1, 0, 1, 0, 1, 0, 0x10, 0, // trailer
+        0, 0, 0, 0, 0, 0, 0, 0, // reserved
+        2, 0, 0, 0, // IOSurface plane index = 2 (alpha)
+    ]);
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        desc_gva,
+        &type5_desc,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+    let off = list_object_entry_offset(type5_ref, 32).unwrap();
+    let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
+    st32(&mut list_entry[0..], packed);
+    list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+    assert!(gva_mem::write_task_gva(
+        &mut host,
+        &state.tasks[1],
+        off,
+        &list_entry,
+        PAGE_SHIFT_ARM64E
+    )
+    .is_ok());
+
+    let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
+        .expect("a type-5 plane view over a mapped surface must stage");
+    match staged.writeback {
+        TextureWriteback::Type11 {
+            surface_offset,
+            surface_bpr,
+            ..
+        } => {
+            assert_eq!(
+                (surface_offset, surface_bpr),
+                (128, 16),
+                "plane 2's own window; (0, 128) is the invented packed window \
+                 over plane 0 that the ambiguous geometry scan falls back to"
+            );
+        }
+        _ => panic!("a type-5 view over a surface mapping must write back as type-11"),
+    }
+}
+
 /// The draw and compute handoff dumps share one selection parse, so a boot that
 /// lists a pipe for one knob gets the same answer from the other. Unset must
 /// select nothing: these dumps write Apple-owned IR, so a default-on knob would
