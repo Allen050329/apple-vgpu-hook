@@ -2765,29 +2765,32 @@ impl DeviceState {
     /// behind a denser-lifetime member front it has not yet inherited this
     /// generation?
     ///
-    /// # Do not delete this on the "it only feeds never-displayed surfaces" argument
+    /// # Before deleting this, read what happened to the deletion that was tried
     ///
-    /// That argument is true up to a point and wrong at the end of it, and the
-    /// full deletion has already been written, tested and reverted once. The
-    /// true part: every seed that survives the caller's unification filter has a
-    /// target the guest has never named as plane 0 (measured — the sole
-    /// `peer_seed_unification` outcome ever recorded is
+    /// The full deletion has been written, tested and reverted once, and the
+    /// evidence that triggered the revert turned out to be a measurement error.
+    /// The question is genuinely open — not settled in either direction.
+    ///
+    /// What IS established: every seed that survives the caller's unification
+    /// filter has a target the guest has never named as plane 0 (measured — the
+    /// only `peer_seed_unification` outcome ever recorded is
     /// `src_kind=group target_kind=surface`), because two surfaces the guest
-    /// *has* named at one geometry resolve to the same `OutputGroup` identity
-    /// and a copy between them is a copy onto itself.
+    /// *has* named at one geometry resolve to the same `OutputGroup` identity,
+    /// so a copy between them is a copy onto itself and is dropped. Requiring
+    /// [`Self::presented_at`] on the target is therefore equivalent to deleting
+    /// this function outright, not to narrowing it.
     ///
-    /// The wrong part is concluding those targets are never displayed. A surface
-    /// the guest never names as plane 0 is never *scanned out directly*, but its
-    /// content still reaches the screen as a composited source into the frame
-    /// that is named. Deleting the seed on that reasoning cost the green channel
-    /// of the desktop: 3 of 3 boots came up with a magenta, heavily dithered
-    /// wallpaper, `nz` falling from 8292904 to ~6.43 M bytes per 1920x1080 frame
-    /// at unchanged `rgb_nz` — one channel zeroed for ~90% of pixels.
+    /// What is NOT established is whether those targets need the copy. "Never
+    /// named as plane 0" is not "never displayed": such a surface is never
+    /// scanned out directly, but its content can still reach the screen as a
+    /// composited source into the frame that IS named. Nobody has yet measured
+    /// what their residents hold, and this copy would mask an empty one.
     ///
-    /// So this copy is currently doing real work: it is masking the fact that
-    /// those surfaces' residents do not hold what the guest put in them. Retire
-    /// it by fixing that (residents that carry their own content), not by cutting
-    /// it out from under the path that depends on it.
+    /// If you A/B the deletion on the live rig, **interleave the arms**
+    /// (parent, child, parent, child). The first attempt ran three boots of one
+    /// arm and then the other, and attributed a time-of-day change in the
+    /// guest's own desktop rendering to the diff. Snapshot-revert resets the
+    /// guest disk, not the guest clock.
     ///
     /// This closes the dual-mid inter-buffer retention gap: the guest
     /// composites the full frame into whichever swapchain buffer is the front,

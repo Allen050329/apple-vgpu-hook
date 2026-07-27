@@ -3303,20 +3303,18 @@ mod tests {
     /// same-geometry siblings; a full-frame publisher it never names does not.
     ///
     /// This is the boundary the peer seed's target set is drawn against, and it
-    /// is asymmetric in a way that cost a live A/B to learn. Named siblings
-    /// resolve to one `TargetIdentity::OutputGroup` and share a resident, so a
-    /// copy between them is a copy onto itself — that half is settled. The other
-    /// half is NOT "an unnamed publisher is never displayed". An unnamed
-    /// publisher is never *scanned out directly*, but its content still reaches
-    /// the screen as a composited source into the frame that is named. Deleting
-    /// the seed into those surfaces on exactly that reasoning turned the desktop
-    /// magenta with the green channel zeroed for ~90% of pixels, on 3 of 3 boots
-    /// (`nz` 8292904 → ~6.43M at constant `rgb_nz`), and had to be reverted.
+    /// is asymmetric in a way worth stating explicitly. Named siblings resolve
+    /// to one `TargetIdentity::OutputGroup` and share a resident, so a copy
+    /// between them is a copy onto itself — that half is settled, and it is why
+    /// gating `peer_needs_front_seed` on `presented_at` would be equivalent to
+    /// deleting it rather than narrowing it.
     ///
-    /// So this test pins the identity boundary, not a licence to skip work on
-    /// either side of it: named siblings share, unnamed publishers do not, and
-    /// what an unnamed publisher's resident actually holds is a separate open
-    /// question that the seed is currently masking.
+    /// The other half is NOT "an unnamed publisher is never displayed". Such a
+    /// surface is never *scanned out directly*, but its content can still reach
+    /// the screen as a composited source into the frame that is named. What
+    /// those surfaces' residents actually hold has not been measured, so this
+    /// test pins the identity boundary only — it is not a licence to skip work
+    /// on either side of it.
     #[test]
     fn named_siblings_share_one_identity_and_unnamed_publishers_do_not() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
