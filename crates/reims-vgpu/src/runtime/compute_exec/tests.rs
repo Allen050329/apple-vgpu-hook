@@ -215,6 +215,27 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     }
 }
 
+/// The buffer handoff writes a bounded prefix, and the bound is the one Metal
+/// puts on an inline constant block (`setBytes:` is specified to 4 KiB). A
+/// buffer shorter than that must be written whole — truncating a 64-byte
+/// constant block would lose the thing the dump exists to capture — and a
+/// larger one must stop exactly at the bound rather than spill a whole image
+/// buffer to disk.
+#[test]
+fn handoff_buffer_preview_writes_short_buffers_whole_and_caps_long_ones() {
+    assert_eq!(handoff_buffer_preview(&[]).len(), 0);
+    let small = vec![0xa5u8; 64];
+    assert_eq!(handoff_buffer_preview(&small), &small[..]);
+    let exact = vec![0x5au8; HANDOFF_BUFFER_PREVIEW_LEN];
+    assert_eq!(handoff_buffer_preview(&exact).len(), HANDOFF_BUFFER_PREVIEW_LEN);
+    let big = vec![0x11u8; HANDOFF_BUFFER_PREVIEW_LEN * 4 + 7];
+    let preview = handoff_buffer_preview(&big);
+    assert_eq!(preview.len(), HANDOFF_BUFFER_PREVIEW_LEN);
+    // The prefix, not a sample or the tail: offsets in the dump must match
+    // offsets in the guest buffer or reading a struct out of it is guesswork.
+    assert_eq!(preview, &big[..HANDOFF_BUFFER_PREVIEW_LEN]);
+}
+
 /// The draw and compute handoff dumps share one selection parse, so a boot that
 /// lists a pipe for one knob gets the same answer from the other. Unset must
 /// select nothing: these dumps write Apple-owned IR, so a default-on knob would

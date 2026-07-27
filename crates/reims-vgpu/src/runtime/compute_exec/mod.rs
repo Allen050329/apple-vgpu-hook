@@ -1207,6 +1207,44 @@ fn dump_kernel_handoff(
     ));
 }
 
+/// How much of a bound buffer the handoff dump writes.
+///
+/// Metal's `setBytes:length:atIndex:` is specified for blocks of at most 4 KiB,
+/// so anything a kernel receives as inline constants — dimensions, weights, a
+/// colour conversion matrix — is inside that bound by construction. A vertex or
+/// image buffer bound at the same index can be megabytes, and writing those
+/// would turn a per-pipe probe into a per-boot disk hazard.
+const HANDOFF_BUFFER_PREVIEW_LEN: usize = 4096;
+
+fn handoff_buffer_preview(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(HANDOFF_BUFFER_PREVIEW_LEN)]
+}
+
+/// Write the constant-block prefix of each buffer bound to a dumped kernel.
+///
+/// The SPIR-V says which bindings a kernel reads and the AIR says what it does
+/// with them, but neither says what was *in* them. A kernel that takes its
+/// parameters from a buffer — which is how a conversion matrix normally
+/// arrives — is otherwise opaque off-VM.
+///
+/// Files land beside the kernel as `pipe<N>.<reason>.buf<index>.bin`, truncated
+/// to [`HANDOFF_BUFFER_PREVIEW_LEN`]; the sidecar `.txt` records each buffer's
+/// full length next to how much was written, so a truncation cannot be misread
+/// as a short buffer. Guest-owned bytes: the directory is gitignored, and the
+/// dump is off unless a pipe is explicitly listed.
+fn dump_kernel_buffers(pipe: u32, reason: &str, bufs: &[StagedBuffer]) {
+    let dir = m2v_handoff_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for s in bufs {
+        let _ = std::fs::write(
+            dir.join(format!("pipe{pipe}.{reason}.buf{}.bin", s.bind.index)),
+            handoff_buffer_preview(&s.bytes),
+        );
+    }
+}
+
 pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3278,18 +3316,31 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         let wanted = WANTED
             .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES"));
         if wanted.wants(acc.pipeline_ref) {
+            let mut meta = format!(
+                "grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] textures={} buffers={}",
+                acc.textures.len(),
+                staged_bufs.len()
+            );
+            for s in &staged_bufs {
+                let preview = handoff_buffer_preview(&s.bytes);
+                meta.push_str(&format!(
+                    "\nbuf index={} ref={} gva={:#x} len={} dumped={}",
+                    s.bind.index,
+                    s.bind.buffer_ref,
+                    s.gva,
+                    s.bytes.len(),
+                    preview.len()
+                ));
+            }
             dump_kernel_handoff(
                 acc.pipeline_ref,
                 "probe",
                 &mtlb,
                 air,
                 Some(&spirv),
-                &format!(
-                    "grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] textures={} buffers={}",
-                    acc.textures.len(),
-                    staged_bufs.len()
-                ),
+                &meta,
             );
+            dump_kernel_buffers(acc.pipeline_ref, "probe", &staged_bufs);
         }
     }
 
