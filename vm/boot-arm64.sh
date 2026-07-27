@@ -319,7 +319,17 @@ echo "boot-arm64.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp 
 
 # Discard the per-boot working clone. Never deletes the provisioned master (used
 # write-through during bootstrap), only a RUN_DIR clone.
-discard_clone() { [ "${IS_CLONE:-1}" -eq 1 ] && rm -f "$DISK" "$AUX"; rm -f "$QMP_SOCK" "$RUN_DIR/qmp.sock"; }
+discard_clone() {
+  [ "${IS_CLONE:-1}" -eq 1 ] && rm -f "$DISK" "$AUX"
+  rm -f "$QMP_SOCK"
+  # Only drop the shared alias while it still names THIS boot's socket — same
+  # guard as boot-x86.sh. A dying instance that deletes the live instance's
+  # symlink makes the next driver run fail on a missing socket partway through,
+  # which is indistinguishable from a guest defect in the captures it leaves.
+  if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
+    rm -f "$RUN_DIR/qmp.sock"
+  fi
+}
 
 promote_to_snapshot() {
   # Save this boot's (modified) disk/aux as a NEW immutable snapshot and repoint

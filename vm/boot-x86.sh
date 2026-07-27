@@ -376,7 +376,16 @@ discard_clone() {
   if [ "${IS_CLONE:-1}" -eq 1 ]; then
     rm -f "$DISK" "$OPENCORE" "$OVMF_VARS"
   fi
-  rm -f "$QMP_SOCK" "$RUN_DIR/qmp.sock"
+  rm -f "$QMP_SOCK"
+  # `qmp.sock` is the shared name every driver script resolves, and it is
+  # re-pointed by whichever boot started last. A boot shutting down must only
+  # remove it while it still names ITS socket: killing one VM and starting the
+  # next immediately otherwise has the dying instance delete the live
+  # instance's symlink, and the driver then fails with a bare ENOENT partway
+  # through a run — which reads as a guest defect, not as a missing socket.
+  if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
+    rm -f "$RUN_DIR/qmp.sock"
+  fi
 }
 
 promote_to_snapshot() {
