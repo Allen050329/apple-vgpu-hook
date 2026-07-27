@@ -137,6 +137,16 @@ done
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-x86.sh: $*" >&2; exit 1; }
 
+# metal2vulkan spawns `llvm-dis` and `spirv-val` on every uncached shader
+# translate, and QEMU inherits this script's PATH — resolve them here so a
+# missing toolchain fails now, not at the guest's first shader.
+require_shader_toolchain() {
+  command -v llvm-dis >/dev/null 2>&1 || die \
+    "llvm-dis not found in PATH (install the LLVM tools, e.g. apt install llvm; versioned packages install llvm-dis-<N>, so symlink or add that bin dir to PATH)"
+  command -v spirv-val >/dev/null 2>&1 || die \
+    "spirv-val not found in PATH (ships in SPIRV-Tools, not LLVM: apt install spirv-tools)"
+}
+
 clone_file() {
   local src="$1" dst="$2"
   if cp --reflink=auto -f "$src" "$dst" 2>/dev/null; then
@@ -176,6 +186,7 @@ build_reims_vgpu_standalone() {
   esac
 }
 
+require_shader_toolchain
 ensure_rust_tools
 build_reims_vgpu_efi
 # Product Linux x86 rail needs Vulkan. Override REIMS_VGPU_BACKEND only for an explicit
