@@ -1131,9 +1131,12 @@ mod tests {
         assert!(write_full_rect_raw_at(
             &mut state, &mut host, mid, 0, 2048, 6160, 4, 4, 4, &src, 16,
         ));
-        // Two failed packed-view attempts plus one successful import per GPA run.
-        // The old row loop took nine attempts for these four rows and scaled with height.
-        assert_eq!(host.map_pages_calls, 4);
+        // One successful import per maximal GPA run, and nothing else: the
+        // fragmented page list fails `is_single_packed_run` in Rust, so the
+        // packed-view fast path never spends a call the host can only refuse.
+        // The old row loop took nine attempts for these four rows and scaled
+        // with height.
+        assert_eq!(host.map_pages_calls, 2);
         let calls_after_write = host.map_pages_calls;
 
         let mut row = [0u8; 16];
@@ -1141,7 +1144,7 @@ mod tests {
             &mut state, &mut host, mid, 4096, &mut row,
         ));
         assert_eq!(row, [0x2a; 16]);
-        assert_eq!(calls_after_write, 4);
+        assert_eq!(calls_after_write, 2);
     }
 
     /// Linux product: non-packed page list still lands BGRA via multi-import.

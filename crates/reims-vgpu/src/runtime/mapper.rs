@@ -1109,6 +1109,18 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
+    // A fragmented page list can never map as one packed view, and asking
+    // anyway turns documented control flow ("use write_mapping_bytes /
+    // read_mapping_bytes / multi-run import-present") into a logged
+    // `qemu_map_pages_callback_failed`.
+    if !crate::runtime::gva_view::is_single_packed_run(&gpas, page_sz as u64) {
+        crate::observe::off(format!(
+            "contig_view_fragmented mid={mapping_id} pages={} runs={}",
+            gpas.len(),
+            crate::runtime::gva_view::contig_page_runs(&gpas, page_sz as u64).len()
+        ));
+        return None;
+    }
     let ptr = host.map_pages(&gpas, page_sz)?;
     let len = gpas.len() * page_sz;
     let m = state.mappings.get_mut(&mapping_id)?;

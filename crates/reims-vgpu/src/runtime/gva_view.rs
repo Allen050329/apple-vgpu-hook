@@ -213,6 +213,24 @@ pub fn contig_page_runs(gpas: &[u64], page_size: u64) -> Vec<std::ops::Range<usi
     runs
 }
 
+/// Whether `gpas` can possibly produce a whole-span packed host view.
+///
+/// [`HostOps::map_pages`] aliases page `i` at `base + i * page_size` inside one
+/// RAMBlock, and two RAMBlock offsets are only adjacent in host VA when their
+/// GPAs are adjacent — so a list that is not a single packed run can never map
+/// as one view. Callers whose contract is "packed view or use the multi-run
+/// path" ask here first: without it every fragmented surface spends an FFI call
+/// to be told no, and the refusal lands in the always-on failure log as
+/// `qemu_map_pages_callback_failed` even though the multi-run path then handles
+/// it. A single boot of the x86 desktop logged 536 such non-failures.
+///
+/// Contiguous GPAs remain necessary, not sufficient (a run can still cross a
+/// MemoryRegion edge or cover non-RAM), so a genuine `map_pages` refusal over a
+/// packed list stays fail-visible.
+pub fn is_single_packed_run(gpas: &[u64], page_size: u64) -> bool {
+    contig_page_runs(gpas, page_size).len() == 1
+}
+
 /// Build or reuse a contiguous host-VA view of guest pages for `[gva, gva+length)`.
 ///
 /// Walks the task page table (PPNs already installed by the guest before MapMemory2),
@@ -278,7 +296,17 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
     }
-    // Full-span packed view only (single map_pages). Fragmented → None.
+    // Full-span packed view only (single map_pages). Fragmented → None, and
+    // asking `map_pages` for a view it cannot build is not a failure to log:
+    // `write_span` / `read_span` import the maximal runs instead.
+    if !is_single_packed_run(&gpas, state.page_size()) {
+        crate::observe::off(format!(
+            "gva_view_fragmented task={resolved_tid} gva={gva:#x} pages={} runs={}",
+            gpas.len(),
+            contig_page_runs(&gpas, state.page_size()).len()
+        ));
+        return None;
+    }
     let ptr = host.map_pages(&gpas, page_sz)?;
     let page_sz = (1usize) << page_shift;
     let ptr_len = gpas.len().saturating_mul(page_sz);
@@ -640,6 +668,48 @@ mod tests {
         assert_eq!(runs, vec![0..2, 2..4, 4..5]);
         assert_eq!(contig_page_runs(&[0x1000], page), vec![0..1]);
         assert!(contig_page_runs(&[], page).is_empty());
+    }
+
+    #[test]
+    fn single_packed_run_is_the_map_pages_precondition() {
+        let page = 0x1000u64;
+        assert!(is_single_packed_run(&[0x1000, 0x2000, 0x3000], page));
+        assert!(is_single_packed_run(&[0x1000], page));
+        assert!(!is_single_packed_run(&[0x1000, 0x3000], page));
+        assert!(!is_single_packed_run(&[], page));
+    }
+
+    /// A fragmented span must not spend a `map_pages` call to be told no. The
+    /// C shim can only alias page `i` at `base + i * page`, so a gapped GPA list
+    /// always returns -1 — and that -1 reaches the always-on failure log as
+    /// `qemu_map_pages_callback_failed`, which is how one x86 boot logged 536
+    /// non-failures over documented fall-back-to-multi-run control flow.
+    #[test]
+    fn fragmented_gva_view_declines_without_asking_map_pages() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        // Wire PTE[1] → data1 (pfn 10) so the two-page span is gapped.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let before = host.map_pages_calls;
+        assert_eq!(
+            ensure_gva_view(&mut state, &mut host, 1, page - 4, 8),
+            None,
+            "a gapped span has no packed whole-span view"
+        );
+        assert_eq!(
+            host.map_pages_calls, before,
+            "the fragmented case must be answered in Rust, not by a failing FFI call"
+        );
+
+        // The packed case still goes to the host and still resolves.
+        let before = host.map_pages_calls;
+        assert!(ensure_gva_view(&mut state, &mut host, 1, 8, 4).is_some());
+        assert_eq!(host.map_pages_calls, before + 1);
     }
 
     #[test]
