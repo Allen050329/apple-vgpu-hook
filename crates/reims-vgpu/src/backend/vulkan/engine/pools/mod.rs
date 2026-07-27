@@ -368,6 +368,17 @@ impl ResourcePools {
             .collect()
     }
 
+    /// Idle-sweep entry point for host-import windows: the same planner as
+    /// [`Self::plan_host_import_idle_release`], but with the cutoff derived from
+    /// the dedicated [`HOST_IMPORT_IDLE_AGE_MS`] rather than the cheap-VRAM
+    /// [`IDLE_TARGET_AGE_MS`]. Keeping the cutoff computation here — not at the
+    /// drain call site — is what lets the thrash regression test exercise the
+    /// real age gate a window is held to.
+    fn plan_host_import_idle_sweep(&self, now_ms: u64, max: usize) -> Vec<usize> {
+        let cutoff = now_ms.saturating_sub(HOST_IMPORT_IDLE_AGE_MS);
+        self.plan_host_import_idle_release(cutoff, max)
+    }
+
     /// Total bytes currently pinned by import windows.
     fn host_import_bytes(&self) -> u64 {
         self.host_imports
@@ -973,6 +984,33 @@ const REGISTRY_CAP: usize = 320;
 /// residents (~516 MiB) never aged out and VRAM never returned to the ~1005 MiB
 /// idle baseline. Real time keeps advancing regardless of guest activity.
 const IDLE_TARGET_AGE_MS: u64 = 2000;
+/// Wall-clock milliseconds a host-import window may go untouched before the idle
+/// sweep releases it — deliberately far longer than [`IDLE_TARGET_AGE_MS`],
+/// which governs cheap-to-recreate VRAM residents.
+///
+/// A host-import window is not VRAM: it is a `VK_EXT_external_memory_host`
+/// registration pinning up to [`HOST_IMPORT_WINDOW_CAP`] (1 GiB) of guest RAM,
+/// and re-pinning one costs 100–290 ms of `dma_us` on a live x86 boot (the
+/// registration + first fault-in of a 1 GiB span), versus microseconds to
+/// recreate a VRAM resident. The two must not share a cutoff.
+///
+/// The generic 2 s cutoff thrashed the whole working set. During steady route-B
+/// (dmabuf direct) presentation the guest presents for many seconds without a
+/// single import-present resolve — that is the *point* of route B — yet those
+/// eight consecutive windows (see [`HOST_IMPORT_WINDOW_BUDGET`]) are still the
+/// hot set the next app-switch or Launchpad open will resolve through. At 2 s
+/// the sweep evicted all eight mid-session (measured `creates=109
+/// evictions=106` across one Safari→apple.com→Launchpad session, the same eight
+/// bases cycling evict→re-create), and the next import-present re-pinned the
+/// whole set at once — ~2.3 s of stalls that froze the display on a stale frame
+/// (the app-switch "corrupted background" class). The correctness bound is the
+/// byte budget ([`ResourcePools::plan_host_import_eviction`], unchanged); this
+/// long cutoff only returns pinned host RAM once the VM is genuinely quiescent,
+/// not on the constant sub-second lulls of interactive use. 30 s is an order of
+/// magnitude above the full-set re-pin cost and comfortably above the gaps
+/// between resolves during active use, so a returning user pays at most one
+/// re-pin rather than a per-lull thrash.
+const HOST_IMPORT_IDLE_AGE_MS: u64 = 30_000;
 /// Minimum wall-clock spacing between reclaim passes. The poll path calls the
 /// drain ~244×/s; without this it would empty the whole registry in well under a
 /// second. At `IDLE_TARGET_DRAIN_MAX_PER_CALL` per pass this bounds reclaim to
@@ -1132,8 +1170,9 @@ mod host_import_budget_tests {
     use super::{
         host_import_budget, host_scatter, present_stats_setup_decline, resolve_scatter_regions,
         terminal_host_import_error, DrawError, HostImportDecline, HostImportRegion,
-        PresentStatsSetup, ResourcePools, VkCall, VkOp, HOST_IMPORT_REGION_CAP,
-        HOST_IMPORT_TOTAL_BYTE_CAP, HOST_IMPORT_WINDOW_BUDGET, HOST_IMPORT_WINDOW_CAP,
+        PresentStatsSetup, ResourcePools, VkCall, VkOp, HOST_IMPORT_IDLE_AGE_MS,
+        HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP, HOST_IMPORT_WINDOW_BUDGET,
+        HOST_IMPORT_WINDOW_CAP, IDLE_RECYCLE_TRIM_PER_PASS, IDLE_TARGET_AGE_MS,
     };
     use crate::observe::Decline;
     use ash::vk;
@@ -1270,6 +1309,50 @@ mod host_import_budget_tests {
         assert!(
             pools.plan_host_import_idle_release(0, 16).is_empty(),
             "nothing is cold before the first cutoff"
+        );
+    }
+
+    /// The idle sweep holds host-import windows to [`HOST_IMPORT_IDLE_AGE_MS`],
+    /// NOT the cheap-VRAM [`IDLE_TARGET_AGE_MS`]. This is the app-switch-freeze
+    /// regression: the eight-window working set that steady route-B presentation
+    /// leaves untouched for seconds must survive the generic 2 s cutoff, or it is
+    /// evicted mid-session and re-pinned all at once on the next import-present
+    /// (~2.3 s of stalls). It is released only after a genuinely long quiescence.
+    #[test]
+    fn host_import_idle_sweep_uses_the_long_cutoff_not_the_vram_one() {
+        // Whole working set last resolved at a realistic post-boot clock stamp,
+        // cold epoch (route B has since advanced the submit epoch without
+        // resolving through these windows). `TOUCH` is nonzero because the live
+        // idle clock is minutes-large by the time the desktop is up.
+        const TOUCH: u64 = 100_000;
+        let stamps: Vec<(u64, u64, u64)> = (0..HOST_IMPORT_WINDOW_BUDGET)
+            .map(|i| (i + 1, 1, TOUCH))
+            .collect();
+        let pools = pool_with_windows(&stamps, 9);
+        // A lull just past the generic VRAM cutoff but well within the
+        // host-import cutoff: the old code (sampled_cutoff = now - 2000) released
+        // everything here; the fix must release nothing.
+        let now = TOUCH + IDLE_TARGET_AGE_MS + 500;
+        assert_eq!(
+            pools
+                .plan_host_import_idle_release(now.saturating_sub(IDLE_TARGET_AGE_MS), 16)
+                .len(),
+            HOST_IMPORT_WINDOW_BUDGET as usize,
+            "sanity: the generic 2 s cutoff WOULD evict the whole set — the thrash"
+        );
+        assert!(
+            pools.plan_host_import_idle_sweep(now, 16).is_empty(),
+            "the hot working set must survive a sub-30 s lull under the long cutoff"
+        );
+        // Once genuinely quiescent past the long cutoff, the sweep does release
+        // (bounded per pass), so pinned host RAM still returns on real idle.
+        let quiescent = TOUCH + HOST_IMPORT_IDLE_AGE_MS + 1;
+        assert_eq!(
+            pools
+                .plan_host_import_idle_sweep(quiescent, IDLE_RECYCLE_TRIM_PER_PASS)
+                .len(),
+            IDLE_RECYCLE_TRIM_PER_PASS.min(HOST_IMPORT_WINDOW_BUDGET as usize),
+            "a genuinely idle VM still returns its pinned windows, bounded per pass"
         );
     }
 

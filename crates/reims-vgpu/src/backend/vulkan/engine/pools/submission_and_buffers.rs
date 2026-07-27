@@ -692,11 +692,16 @@ impl ResourcePools {
         self.slab
             .trim_empty_blocks(&ctx.device, IDLE_SLAB_KEEP_EMPTY);
         // …and the host-import windows, the only remaining pool whose memory is
-        // pinned *host* RAM rather than VRAM. Same age cutoff as the rest: a
-        // window the guest has not resolved through for `IDLE_TARGET_AGE_MS` is
-        // holding down host pages for nothing. Without this the budget only ever
-        // ratchets up to its high-water mark and stays there until teardown.
-        let cold = self.plan_host_import_idle_release(sampled_cutoff, IDLE_RECYCLE_TRIM_PER_PASS);
+        // pinned *host* RAM rather than VRAM. These get their OWN, far longer age
+        // cutoff (`HOST_IMPORT_IDLE_AGE_MS`, not the `sampled_cutoff` shared by
+        // the VRAM pools above): a window costs 100–290 ms to re-pin, and route-B
+        // presentation legitimately leaves the hot working set untouched for
+        // seconds, so releasing it on the 2 s VRAM cutoff evicted the whole set
+        // mid-session and the next import-present re-pinned all of it at once — a
+        // multi-second app-switch freeze. Without any sweep the budget only ever
+        // ratchets to its high-water mark and holds pinned host RAM until
+        // teardown; this releases it once the VM is genuinely quiescent.
+        let cold = self.plan_host_import_idle_sweep(self.idle_clock_ms, IDLE_RECYCLE_TRIM_PER_PASS);
         self.evict_host_imports(ctx, cold, "idle");
         drained
     }
