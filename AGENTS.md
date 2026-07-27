@@ -63,18 +63,53 @@ gate by themselves.
 
 A live before/after on the VM rig compares two arms separated by wall-clock time, and neither the
 guest nor the host is constant in time. Snapshot-revert resets the guest disk, **not** the guest
-clock, and macOS changes its own rendering with time of day. The host is not constant either: at
-least one boot-variable colour class exists that persists across VM restarts.
+clock, and macOS changes its own rendering with time of day.
 
-So do not run N boots of the parent and then N boots of the child. **Alternate them** — parent,
-child, parent, child — so anything drifting with time lands on both arms. A sequential A/B once
-produced 3-of-3 versus 2-of-2 agreement and was still entirely confounded: the "regression" survived
-a full revert of the change that supposedly caused it. Replicating the treatment says nothing about
-a confound that moves with time.
+The largest known instance: the guest's default desktop picture is a **dynamic** desktop — a
+Display-P3 HEIC carrying five variants that macOS selects and crossfades between on a daily
+schedule. Its rendered colour is therefore a function of when the boot happened. Measured on one
+boot by moving the guest clock and restarting the Dock, whole-screen mean RGB:
+
+| guest clock | mean R / G / B |
+|---|---|
+| 10:30 | 0.9827 / 0.3178 / 0.2382 |
+| 14:00 | 0.9827 / 0.3178 / 0.2382 |
+| 19:30 | 0.9780 / 0.1254 / 0.2347 |
+| 23:00 | 0.9718 / 0.0991 / 0.2270 |
+
+**So pin the wallpaper to a static image before any colour-sensitive comparison.** A static image
+renders identically regardless of the clock. The Dock only re-reads its picture on restart, so a
+clock change with no `killall Dock` proves nothing — an earlier probe concluded time of day was not
+involved for exactly that reason.
+
+Even with the wallpaper pinned, do not run N boots of the parent and then N boots of the child.
+**Alternate them** — parent, child, parent, child — so anything else drifting with time lands on
+both arms. A sequential A/B once produced 3-of-3 versus 2-of-2 agreement and was still entirely
+confounded: the "regression" survived a full revert of the change that supposedly caused it.
+Replicating the treatment says nothing about a confound that moves with time.
 
 Related: a boot whose captures differ from the known-good constant for that sequence must be
 **discarded**, not interpreted. A brightness floor does not catch wrong content of the right
 brightness.
+
+### Measure Against Known Input, Not Against Another Unknown
+
+Comparing a rendered frame to a *different* rendered frame can show that two states differ. It
+cannot say what the transform between them is, and it inherits every confound both frames carry.
+Two separate investigations here stalled for exactly that reason: one compared a boot's desktop
+against another boot's desktop, the other compared it against a wallpaper file whose on-screen crop,
+scale and variant selection were all unknown.
+
+When the question is "is this path faithful", put **known values** through it and read them back.
+Displaying a generated patch pattern and measuring the patches settled in one boot what
+boot-to-boot capture comparison had not settled in eleven: the present path reproduces the neutral
+ramp with zero deviation on both the host window and the guest's own screencapture, so a
+wrong-looking desktop is not the present path.
+
+The same discipline bounds a claim. Content selection can only ever produce a *convex combination*
+of the variants it selects among, so rendering each variant on its own establishes the range the
+output must fall in. A result outside that range is a defect and not a selection, and that argument
+holds without knowing which variant was selected.
 
 ### Tests Define Done
 
