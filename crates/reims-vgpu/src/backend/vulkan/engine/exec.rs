@@ -617,7 +617,14 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             }
             SampledSource::Bytes(_) => {}
             SampledSource::GuestRuns(src) => {
-                if image.arrayed || image.volume || image.cube || image.layers != 1 {
+                // The zero-copy gather uploads a single array layer into a
+                // single-depth image (`layer_count: 1`, `depth: 1` below), so
+                // it serves any shape that is one layer deep: plain 2D, a
+                // single-layer 2D array, and the 1D / single-layer 1D-array
+                // color-transfer LUTs. Volume and multi-layer shapes still
+                // decline by name — the gather would upload only their first
+                // slice.
+                if image.volume || image.cube || image.layers != 1 {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::GuestRunSampledNot2d {
                             binding: image.binding,
