@@ -500,9 +500,11 @@ pub fn capture_present_frame(
     // over the resident (`run_gpu_stats_oracle`), which returns 32 bytes, so the
     // oracle costs no full-frame copy and needs no opt-in.
     //
-    // Consequence: with dmabuf carrying, `frame_bgra` is never filled and stays
-    // empty. `publish_window_frame` must not require it when it produced a
-    // dmabuf — it does not; the export runs before the bgra check.
+    // Consequence: with dmabuf carrying, `frame_bgra` holds no frame for this
+    // present, and the branch below drops it so that stays literally true.
+    // `publish_window_frame` must not require it when it produced a dmabuf — it
+    // does not; the export runs before the bgra check, and an empty buffer is
+    // what tells it there are no CPU pixels to fall back to.
     let display_needs_cpu_frame = !state.present.dmabuf_active;
     if !display_needs_cpu_frame {
         // Protocol-structural a/b retention-gap guard (cheap map lookup, no pixel
@@ -524,6 +526,23 @@ pub fn capture_present_frame(
         // resident carries the display. An export miss costs one dropped frame
         // (the window holds its last good frame and publish logs the drop), then
         // `dmabuf_active=false` forces the next capture to read back for fallback.
+        //
+        // Dropping it is what makes "no CPU pixels for this present" a fact
+        // rather than an inference. Skipping the readback only leaves the buffer
+        // empty if it was already empty, and it is not: the first present of a
+        // boot runs the full path — before the guest has painted anything, so it
+        // captures black — and every light present after it retained those bytes.
+        // Everything downstream that asks "were there pixels" asks
+        // `frame_bgra.is_empty()`, so all of them read that one stale frame as
+        // the current one. `present_content_verdict` judged it Black on 481 of
+        // 481 presents of a boot whose screen was correct throughout (0
+        // `present_content`, 0 `present_content_unsampled`), sending
+        // `present_black_retain` to the always-on failure sink 481 times with no
+        // guest work lost — the wolf-cry the `Unsampled` verdict exists to
+        // prevent, reintroduced through a buffer it could not see was stale. The
+        // console blit is gated on the same emptiness and would have painted
+        // those bytes as the live frame.
+        state.present.frame_bgra.clear();
         state.present.frame_mapping = mapping_id;
         state.present.frame_width = width;
         state.present.frame_height = height;
@@ -2718,9 +2737,15 @@ mod tests {
     ///
     /// - dmabuf carrying → NO readback, ever, however long since the last one.
     ///   The proxies are fed by the GPU reduction instead, so there is no
-    ///   sampling floor forcing a copy any more. The prior `frame_bgra` is left
-    ///   untouched (the window ignores it under dmabuf) while the present
-    ///   metadata advances so `publish_window_frame` exports the fresh resident.
+    ///   sampling floor forcing a copy any more. `frame_bgra` is dropped rather
+    ///   than left holding the previous readback, while the present metadata
+    ///   advances so `publish_window_frame` exports the fresh resident.
+    ///
+    ///   The buffer still holding the earlier frame used to be this test's
+    ///   evidence that no copy ran, and it was the wrong evidence: that same
+    ///   buffer is what the content verdict and the console blit read as the
+    ///   CURRENT frame. `full_captures` counts readbacks directly, so it answers
+    ///   the question the assertion was actually asking.
     /// - dmabuf NOT carrying → the window blits `frame_bgra`, so the readback
     ///   runs. This is what keeps the display off any env gate.
     #[test]
@@ -2764,13 +2789,12 @@ mod tests {
         assert_ne!(gen_a, gen_b);
         assert!(capture_present_frame(&mut state, mid, 2, 2, gen_b));
         assert_eq!(
-            &state.present.frame_bgra[..16],
-            &frame_a[..],
+            state.present.full_captures, 1,
             "no sampling floor may force a copy once the GPU oracle feeds proxies"
         );
-        assert_eq!(
-            state.present.full_captures, 1,
-            "a dmabuf-carried present must never take a full capture"
+        assert!(
+            state.present.frame_bgra.is_empty(),
+            "the readback did not run, so no frame belongs to this present"
         );
         assert_eq!(state.present.light_captures, 1);
         // Present metadata still advances so the fresh resident gets exported.
@@ -3692,5 +3716,59 @@ mod tests {
         // Centered → interior tiles, never column 0 or the last column.
         assert!(bbox[0] > 0 && bbox[2] < (crate::model::TILE_GEN_GRID_W as u32 - 1));
         assert!(bbox[1] > 0 && bbox[3] < (crate::model::TILE_GEN_GRID_H as u32 - 1));
+    }
+
+    /// A light capture must leave no frame behind, because everything
+    /// downstream reads "is there a frame for this present" off
+    /// `frame_bgra.is_empty()`.
+    ///
+    /// Skipping the readback only leaves the buffer empty if it was empty going
+    /// in, and on a real boot it is not: the first present runs the full path
+    /// before the guest has painted anything, capturing black, and direct
+    /// present then carries every frame after it. Boot 86 on the x86/Vulkan rail
+    /// judged that one frame `Black` on 481 of 481 presents — 0 `present_content`
+    /// and 0 `present_content_unsampled` — while the host window rendered
+    /// correctly from settle through an 11-minute idle.
+    #[test]
+    fn a_light_capture_leaves_no_stale_frame_behind() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 64u32);
+        // The frame a full capture leaves: opaque, RGB black — the first present
+        // of a boot, before anything has been composited.
+        let stale: Vec<u8> = (0..(w * h) as usize).flat_map(|_| [0, 0, 0, 255]).collect();
+        state.present.frame_bgra = stale.clone();
+        state.present.frame_width = w;
+        state.present.frame_height = h;
+
+        // Direct present is carrying the display, so this capture takes the
+        // light path and reads back nothing.
+        state.present.dmabuf_active = true;
+        let before = state.present.light_captures;
+        assert!(capture_present_frame(&mut state, 1, w, h, 1));
+        assert_eq!(
+            state.present.light_captures,
+            before.wrapping_add(1),
+            "the light path is the one under test"
+        );
+        assert!(
+            state.present.frame_bgra.is_empty(),
+            "a light capture wrote no pixels, so it must not leave {} bytes of an \
+             earlier present for the content verdict and the console blit to read \
+             as this one",
+            state.present.frame_bgra.len()
+        );
+
+        // And the verdict that reads it now says so, instead of reporting the
+        // stale frame's colour as this present's.
+        use crate::runtime::drain::present_content_verdict;
+        assert_eq!(
+            present_content_verdict(&state.present.frame_bgra, 0),
+            crate::runtime::drain::PresentContentVerdict::Unsampled
+        );
+        assert_eq!(
+            present_content_verdict(&stale, 0),
+            crate::runtime::drain::PresentContentVerdict::Black,
+            "the retained frame is what used to be judged"
+        );
     }
 }

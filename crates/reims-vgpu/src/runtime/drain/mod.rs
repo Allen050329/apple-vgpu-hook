@@ -172,7 +172,7 @@ fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &P
 
 /// What the CPU-side capture can say about a present's content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresentContentVerdict {
+pub(crate) enum PresentContentVerdict {
     /// No CPU pixels exist for this present, so nothing can be claimed.
     Unsampled,
     /// Sampled, and every pixel's RGB is zero.
@@ -191,7 +191,7 @@ enum PresentContentVerdict {
 /// wolf-cry and hides the genuinely black frame the record exists to catch,
 /// which is the opposite of what an always-on failure sink is for. With no
 /// pixels there is no evidence either way, so the absence has its own verdict.
-fn present_content_verdict(frame_bgra: &[u8], max_rgb: u8) -> PresentContentVerdict {
+pub(crate) fn present_content_verdict(frame_bgra: &[u8], max_rgb: u8) -> PresentContentVerdict {
     if frame_bgra.is_empty() {
         PresentContentVerdict::Unsampled
     } else if max_rgb == 0 {

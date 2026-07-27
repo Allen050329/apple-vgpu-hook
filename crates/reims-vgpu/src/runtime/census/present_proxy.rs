@@ -1203,6 +1203,14 @@ pub fn note_rect_void_origin(
     if prev_w != width || prev_h != height {
         return;
     }
+    // No retained frame means no reading. `band_rgb_nz` answers 0 for a buffer it
+    // cannot index, and 0 scores as `persistent_black` — a claim about what the
+    // band held one present ago, drawn from an absence. Direct present leaves
+    // `frame_bgra` empty on every light capture, so this is the ordinary state on
+    // that path rather than an edge case.
+    if prev_frame.is_empty() {
+        return;
+    }
     let bounds = void_pixel_bounds(s, width, height);
     let (x0, x1, y0, y1) = bounds;
     let band_px = (x1.saturating_sub(x0)).saturating_mul(y1.saturating_sub(y0));
