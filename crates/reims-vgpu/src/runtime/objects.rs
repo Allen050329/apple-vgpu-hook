@@ -913,10 +913,12 @@ fn apply_type4_backing<M: HostMemory>(
                 entries.len(),
                 m.map_generation
             ));
-            // Same recycled-mid rule for present evidence: a new backing may
-            // be a new surface — it must re-earn OutputGroup qualification by
-            // being presented again (one capture, ~1 frame).
-            state.present.presented_geoms.remove(&surface_id);
+            // Present evidence needs no prune here: this branch only runs when
+            // the plan changed, which bumped `map_generation` just above, and
+            // the evidence is stamped with the incarnation that recorded it.
+            // Pruning it unconditionally is what the identical-plan path used
+            // to do via `map_surface`, and that demoted a surface the compare
+            // had just called the SAME incarnation.
         }
         m.page_entries = entries;
         m.mapped = true;

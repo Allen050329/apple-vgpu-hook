@@ -16,7 +16,7 @@ pub use state::{
     GvaHostView, HostLinearTexture, HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture,
     MappingEntry, MmioWindow, ObjectEntry, OutputGroupMiss, PacketFault, PaintSrc, PendingStats,
     PendingWork,
-    PresentState, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
+    PresentState, PresentedGeom, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
     TaskMapSpan, TrancheStats, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
     FENCE_DOMAIN_RENDER,
 };

@@ -742,6 +742,11 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
                             presented: Some((w, h)),
                         } => format!("presented_elsewhere:{w}x{h}"),
                         crate::model::OutputGroupMiss::NoPeer => "no_peer".to_string(),
+                        crate::model::OutputGroupMiss::PriorIncarnation {
+                            entry_gen,
+                            current_gen,
+                            ..
+                        } => format!("prior_incarnation:{entry_gen}->{current_gen}"),
                     }
                 ));
             }
@@ -2197,11 +2202,10 @@ mod tests {
             })
         );
 
-        // The tension: a fresh MAP prunes the membership evidence, and the
-        // precondition is that it does NOT move the lifetime the flush guards
-        // on. Assert that first — a test that only checked the miss would pass
-        // just as happily if `map_surface` had bumped the generation, which is
-        // the case where refusing is right.
+        // A fresh MAP does NOT move the lifetime — it stashes the page plan as
+        // the incarnation fingerprint and lets the next resolve decide. Assert
+        // that precondition first, because it is what makes keeping the
+        // qualification correct rather than merely permissive.
         let gen_before = state.mappings.get(&1).unwrap().map_generation;
         state.map_surface(1);
         assert_eq!(
@@ -2211,10 +2215,11 @@ mod tests {
         );
         assert_eq!(
             state.output_group_resolve(1, 1920, 1080),
-            Err(OutputGroupMiss::NotPresentedHere { presented: None })
+            Ok(1),
+            "an undecided recycle must not demote a proven swapchain member"
         );
 
-        // `condemn_surface_backing` reaches the same state by the other route.
+        // `condemn_surface_backing` is the other undecided route, same answer.
         let mut condemned = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         for mid in [2u32, 3u32] {
             condemned.map_surface(mid);
@@ -2232,26 +2237,27 @@ mod tests {
             gen_before,
             "a condemned backing keeps content state for the fingerprint compare"
         );
-        assert_eq!(
-            condemned.output_group_resolve(2, 1920, 1080),
-            Err(OutputGroupMiss::NotPresentedHere { presented: None })
-        );
+        assert_eq!(condemned.output_group_resolve(2, 1920, 1080), Ok(1));
 
         // The contrast that makes those two preconditions mean something:
-        // `unmap_surface` prunes membership the same way but DOES bump the
-        // generation, so the lifetime layer refuses on its own and this gate's
-        // opinion never decides anything. `presented_pruned` is one reading
-        // covering both, which is exactly why it has to be readable.
+        // `unmap_surface` DOES bump the generation, so the evidence expires on
+        // its own and the recycled id must re-earn its qualification. Same
+        // observable state as the two above under the old unconditional prune —
+        // which is exactly why they had to become distinguishable.
         let gen_before = condemned.mappings.get(&3).unwrap().map_generation;
         condemned.unmap_surface(3);
+        let gen_now = condemned.mappings.get(&3).unwrap().map_generation;
         assert_ne!(
-            condemned.mappings.get(&3).unwrap().map_generation,
-            gen_before,
+            gen_now, gen_before,
             "an unmap is a lifetime boundary, not a deferred decision"
         );
         assert_eq!(
             condemned.output_group_resolve(3, 1920, 1080),
-            Err(OutputGroupMiss::NotPresentedHere { presented: None })
+            Err(OutputGroupMiss::PriorIncarnation {
+                presented: (1920, 1080),
+                entry_gen: gen_before,
+                current_gen: gen_now,
+            })
         );
 
         // `output_group_for` is this resolve's `.ok()`, so the admission
@@ -2262,6 +2268,86 @@ mod tests {
                 state.output_group_resolve(mid, w, h).ok()
             );
         }
+    }
+
+    /// A swapchain buffer recycled onto an IDENTICAL page plan must keep
+    /// resolving to the output group — this is the black-desktop class.
+    ///
+    /// `objects.rs`'s type-4 attach calls `map_surface` and only *afterwards*
+    /// compares the fresh page plan against the stashed fingerprint. On an
+    /// identical plan that compare declines to bump `map_generation`, on the
+    /// stated grounds that this is the SAME incarnation and the resident and
+    /// deferred windows survive. But `map_surface` had already dropped the
+    /// mapping's present evidence, so `output_group_for` demoted it and every
+    /// draw until its next present landed on a private per-mid resident that
+    /// had never held the accumulated full frame. Measured on the rail: the
+    /// resident's non-zero pixel count collapsed from 1.84 M to 0.62-0.78 M of
+    /// 2.07 M and never recovered, and the screen kept only the damaged rects.
+    #[test]
+    fn a_recycle_onto_the_same_plan_does_not_demote_a_swapchain_member() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [1u32, 5u32] {
+            state.map_surface(mid);
+            state.mappings.get_mut(&mid).unwrap().page_entries = vec![0x301];
+            state.note_presented_geom(mid, 1920, 1080);
+        }
+        let group = surface_identity(&state, 1, 1920, 1080);
+        assert!(
+            matches!(group, TargetIdentity::OutputGroup { .. }),
+            "two presented members at one geometry are a proven swapchain"
+        );
+
+        // The recycle. `map_surface` stashes the page plan as the incarnation
+        // fingerprint and does NOT bump — assert that precondition, because it
+        // is the whole reason the demotion was wrong rather than correct.
+        let gen_before = state.mappings.get(&1).unwrap().map_generation;
+        state.map_surface(1);
+        assert_eq!(
+            state.mappings.get(&1).unwrap().map_generation,
+            gen_before,
+            "an identical-plan recycle is the same incarnation"
+        );
+        assert_eq!(
+            surface_identity(&state, 1, 1920, 1080),
+            group,
+            "a member the fingerprint compare calls the SAME incarnation must \
+             not be demoted to a private resident"
+        );
+
+        // The converse, so this is not just \"never demote\": a recycle onto a
+        // DIFFERENT plan bumps the generation, and the id must re-earn its
+        // qualification rather than inherit the predecessor's.
+        {
+            let m = state.mappings.get_mut(&1).unwrap();
+            DeviceState::bump_map_generation(1, m);
+        }
+        assert!(
+            matches!(
+                surface_identity(&state, 1, 1920, 1080),
+                TargetIdentity::Surface { id: 1, .. }
+            ),
+            "a genuinely new surface must not inherit present evidence"
+        );
+        assert!(matches!(
+            state.output_group_resolve(1, 1920, 1080),
+            Err(crate::model::OutputGroupMiss::PriorIncarnation { .. })
+        ));
+
+        // And a surface that was NEVER presented stays out however much it
+        // publishes — the Safari-scroll black-band guard, unchanged.
+        state.map_surface(7);
+        state
+            .present
+            .compositor_output_members
+            .insert(7, crate::model::CompositorOutputMember {
+                width: 1920,
+                height: 1080,
+                source: 13,
+            });
+        assert!(matches!(
+            surface_identity(&state, 7, 1920, 1080),
+            TargetIdentity::Surface { id: 7, .. }
+        ));
     }
 
     /// Two proven same-geometry compositor members resolve to one shared

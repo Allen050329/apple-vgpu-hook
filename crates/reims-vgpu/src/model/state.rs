@@ -939,7 +939,9 @@ pub struct PresentState {
     /// same-geometry publishers unified and distinct surfaces chained one
     /// resident (the Safari-scroll black-band class).
     /// Removed on unmap with membership.
-    pub presented_geoms: BTreeMap<u32, (u32, u32)>,
+    /// Stamped with the mapping lifetime that presented it — see
+    /// [`DeviceState::presented_geom_live`], which is the only way to read it.
+    pub presented_geoms: BTreeMap<u32, PresentedGeom>,
     /// Display geometries proven to be a multi-buffer compositor swapchain:
     /// latched `true` the first time two distinct compositor-output members are
     /// *presented* at that geometry (the same condition `output_group_for`
@@ -1070,6 +1072,20 @@ pub struct PresentState {
     pub stats_seq: u64,
 }
 
+/// One surface's present/scanout evidence: the geometry the guest named it at,
+/// and the mapping incarnation that was current when it did.
+///
+/// The generation is what makes the evidence expire on its own. Without it the
+/// entry outlives the surface it describes, and every site that recycles a
+/// mapping has to remember to prune it — five did, and the one that pruned too
+/// eagerly cost the desktop (see [`DeviceState::presented_geom_live`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresentedGeom {
+    pub width: u32,
+    pub height: u32,
+    pub map_generation: u32,
+}
+
 /// Why [`DeviceState::output_group_resolve`] refused to unify a surface into
 /// the compositor output group. Produced by the check that refused, so a caller
 /// can never supply the word itself.
@@ -1084,6 +1100,18 @@ pub enum OutputGroupMiss {
     /// Presented here, but the geometry is not a latched swapchain and no other
     /// surface is presented at it right now — nothing to unify with.
     NoPeer,
+    /// There IS evidence at this geometry, but it was recorded by a prior
+    /// incarnation of this mapping id: the guest recycled the id into a
+    /// different surface, which must re-earn its qualification.
+    ///
+    /// Kept distinct from [`Self::NotPresentedHere`] because a wrong prune used
+    /// to manufacture the latter out of a surface that was still the same
+    /// incarnation, and the two want opposite responses.
+    PriorIncarnation {
+        presented: (u32, u32),
+        entry_gen: u32,
+        current_gen: u32,
+    },
 }
 
 /// Key for an in-flight GPU stats reduction (the zero-copy present oracle).
@@ -2641,9 +2669,52 @@ impl DeviceState {
     }
 
     /// Present/scanout evidence that `mapping_id` was displayed at `w`x`h`
-    /// (see [`Self::note_presented_geom`]).
+    /// **by its current incarnation** (see [`Self::note_presented_geom`]).
     pub fn presented_at(&self, mapping_id: u32, w: u32, h: u32) -> bool {
-        self.present.presented_geoms.get(&mapping_id) == Some(&(w, h))
+        self.presented_geom_live(mapping_id) == Some((w, h))
+    }
+
+    /// The geometry `mapping_id` was presented at, or `None` when there is no
+    /// evidence *or* the evidence belongs to a prior incarnation of this id.
+    ///
+    /// The generation compare is what makes the evidence self-invalidating. It
+    /// replaced five scattered `presented_geoms.remove` sites, every one of
+    /// which was a place that had to *remember* to forget — and one of them was
+    /// wrong in a way that blacked out the desktop. `objects.rs`'s type-4
+    /// attach calls `map_surface` (which pruned unconditionally) and only
+    /// *afterwards* runs the fingerprint compare that decides whether this is a
+    /// new incarnation at all. On an identical page plan that compare says "the
+    /// SAME incarnation, deferred windows and the resident survive" — but the
+    /// presented evidence was already gone, so a proven swapchain buffer was
+    /// demoted to a private per-mid resident that had never held the
+    /// accumulated full frame, and every draw until the next present landed
+    /// there. The screen kept only the damaged rects and went black elsewhere.
+    ///
+    /// Tying the evidence to `map_generation` makes each prune site's own rule
+    /// hold automatically: the sites that mean "genuinely new surface"
+    /// (`unmap_surface`, `attach_mapping_internal`, and `objects.rs`'s refresh,
+    /// which prunes only on the branch that bumps) invalidate it, and the ones
+    /// that deliberately keep the lifetime undecided pending a fingerprint
+    /// compare (`map_surface`, `condemn_surface_backing`) keep it — which is
+    /// exactly what they say they intend for every other piece of state.
+    fn presented_geom_live(&self, mapping_id: u32) -> Option<(u32, u32)> {
+        let seen = self.present.presented_geoms.get(&mapping_id)?;
+        (seen.map_generation == self.map_generation_or_zero(mapping_id))
+            .then_some((seen.width, seen.height))
+    }
+
+    /// A mapping's lifetime counter, or 0 when we hold no entry for the id.
+    ///
+    /// Same convention as `surface_identity`'s per-mid generation. An id we
+    /// have never mapped is not a *different* incarnation, it is the absence of
+    /// one, and must compare equal to itself — the guest can name a surface in
+    /// a display transaction before our mapping entry for it exists, and that
+    /// evidence must not be silently discarded.
+    fn map_generation_or_zero(&self, mapping_id: u32) -> u32 {
+        self.mappings
+            .get(&mapping_id)
+            .map(|m| m.map_generation)
+            .unwrap_or(0)
     }
 
     /// Record a present/scanout action displaying `mapping_id` at `w`x`h`.
@@ -2653,7 +2724,17 @@ impl DeviceState {
         if mapping_id == 0 || w == 0 || h == 0 {
             return;
         }
-        self.present.presented_geoms.insert(mapping_id, (w, h));
+        // Stamp the incarnation this evidence belongs to, so it expires on its
+        // own when the id is recycled into a different surface.
+        let map_generation = self.map_generation_or_zero(mapping_id);
+        self.present.presented_geoms.insert(
+            mapping_id,
+            PresentedGeom {
+                width: w,
+                height: h,
+                map_generation,
+            },
+        );
         // Latch the geometry as a proven multi-buffer swapchain the first time
         // the guest has named two distinct surfaces there (see
         // `output_group_geoms`). The latch is sticky, so a later buffer recycle
@@ -2671,8 +2752,8 @@ impl DeviceState {
     fn presented_count(&self, w: u32, h: u32) -> usize {
         self.present
             .presented_geoms
-            .values()
-            .filter(|&&geom| geom == (w, h))
+            .keys()
+            .filter(|&&mid| self.presented_geom_live(mid) == Some((w, h)))
             .count()
     }
 
@@ -2726,8 +2807,20 @@ impl DeviceState {
         h: u32,
     ) -> Result<u32, OutputGroupMiss> {
         if !self.presented_at(mapping_id, w, h) {
-            return Err(OutputGroupMiss::NotPresentedHere {
-                presented: self.present.presented_geoms.get(&mapping_id).copied(),
+            let current = self.map_generation_or_zero(mapping_id);
+            return Err(match self.present.presented_geoms.get(&mapping_id) {
+                // An entry from a superseded incarnation: the id was recycled
+                // into a genuinely different surface, which must re-earn its
+                // qualification. Distinct from having no entry at all, because
+                // this is the state a wrong prune used to manufacture.
+                Some(g) if g.map_generation != current => OutputGroupMiss::PriorIncarnation {
+                    presented: (g.width, g.height),
+                    entry_gen: g.map_generation,
+                    current_gen: current,
+                },
+                _ => OutputGroupMiss::NotPresentedHere {
+                    presented: self.presented_geom_live(mapping_id),
+                },
             });
         }
         if self.present.output_group_geoms.contains(&(w, h)) {
@@ -2736,8 +2829,8 @@ impl DeviceState {
         let peers = self
             .present
             .presented_geoms
-            .iter()
-            .filter(|(&mid, &geom)| mid != mapping_id && geom == (w, h))
+            .keys()
+            .filter(|&&mid| mid != mapping_id && self.presented_geom_live(mid) == Some((w, h)))
             .count();
         if peers >= 1 {
             Ok(1)
@@ -2821,7 +2914,11 @@ impl DeviceState {
         // recycled mapping id must not inherit a predecessor's tile epochs, or a
         // logically-unrelated surface would show phantom cross-mid divergence.
         self.present.tile_gen.remove(&mapping_id);
-        self.present.presented_geoms.remove(&mapping_id);
+        // `presented_geoms` is NOT pruned here. It carries the incarnation that
+        // presented it, so an unmap (which bumps `map_generation`) invalidates
+        // it automatically, while a condemned backing — which keeps the
+        // generation on purpose, pending the fingerprint compare — keeps its
+        // evidence too, exactly as it keeps the deferred windows.
         // Prune the present-boundary seed flag too. It marks "this mid was just
         // presented, so its next LOAD re-seeds from the front" — a per-lifetime
         // signal that MUST NOT survive a teardown. Left stale, a recycled
@@ -3393,7 +3490,12 @@ impl DeviceState {
         // presented_geoms entry could wrongly qualify a recycled publish-only
         // surface for OutputGroup unification).
         self.host_surfaces.remove(&mapping_id);
-        self.present.presented_geoms.remove(&mapping_id);
+        // Present evidence is stamped with the incarnation and deliberately NOT
+        // dropped here. A fresh MAP does not yet know whether this is a new
+        // surface — that is what the fingerprint compare decides, bumping the
+        // generation when it is. Dropping it eagerly demoted a proven swapchain
+        // buffer to a private resident for every draw until its next present,
+        // which is the black-desktop class.
         crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
         true
     }
@@ -3467,9 +3569,10 @@ impl DeviceState {
         }
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
-        // New MappingInternal ⇒ new surface: stale present evidence must not
-        // qualify the recycled slot for OutputGroup unification.
-        self.present.presented_geoms.remove(&mapping_id);
+        // New MappingInternal ⇒ new surface, and the `bump_map_generation`
+        // above is what retires the stale present evidence: it is stamped with
+        // the incarnation that recorded it, so the recycled slot cannot inherit
+        // an OutputGroup qualification it did not earn.
         true
     }
 
