@@ -2590,7 +2590,9 @@ pub const REGISTRY: &[DeclineClass] = &[
             "mem_task_root_read",
             "mem_no_such_task",
             "mem_outside_map",
-            "mem_not_contiguous",
+            "mem_not_ram",
+            "mem_map_pages_refused",
+            "mem_run_out_of_range",
         ],
     },
     DeclineClass {

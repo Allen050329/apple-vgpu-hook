@@ -183,7 +183,8 @@ pub fn write_task_gva_fallback<M: HostMemory>(
 /// packed GPA runs ([`crate::runtime::gva_view::write_span`]). Fails closed when
 /// any page is unmapped or a run cannot be mapped. When the task has recorded
 /// MapMemory2 spans, the write must lie inside one span (`outside_map`).
-/// Always-on: `gva_write fail reason=…`.
+/// Always-on: `gva_write fail reason=…`, carrying the check `write_span`
+/// actually refused on rather than a reason chosen here.
 pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
     host: &mut H,
@@ -203,10 +204,9 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
             .fail();
         return Err(err);
     }
-    if crate::runtime::gva_view::write_span(state, host, task_id, gva, buf) {
+    let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, gva, buf) else {
         return Ok(());
-    }
-    let err = MemError::NotContiguous;
+    };
     crate::observe::Emit::decline("gva_write", &err)
         .field("task", task_id)
         .field("gva", format!("{gva:#x}"))
@@ -502,14 +502,16 @@ mod tests {
                     MemError::TaskRootRead,
                     MemError::NoSuchTask,
                     MemError::OutsideMap,
-                    MemError::NotContiguous,
+                    MemError::NotRam,
+                    MemError::MapPagesRefused,
+                    MemError::RunOutOfRange,
                 ]
                 .iter()
                 .map(|e| e.slug()),
             )
             .collect();
         let total = slugs.len();
-        assert_eq!(total, 34, "15 walk reasons + 19 memory reasons");
+        assert_eq!(total, 36, "15 walk reasons + 21 memory reasons");
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(

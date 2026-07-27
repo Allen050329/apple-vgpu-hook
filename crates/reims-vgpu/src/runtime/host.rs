@@ -54,9 +54,17 @@ pub enum MemError {
     /// The write span falls outside the mapping the guest declared for this
     /// task — refused rather than trusted, per the no-scanning rule.
     OutsideMap,
-    /// The span resolves but its pages are not contiguous in a host view, so a
-    /// single write cannot cover it.
-    NotContiguous,
+    /// A page of the span resolves to a GPA that is not guest RAM, so no host
+    /// mapping can cover it (mapper / wild-PFN class).
+    NotRam,
+    /// [`HostOps::map_pages`] refused a **packed** page run the walk had already
+    /// resolved — a RAMBlock or MemoryRegion edge, not a gap in the GPA list.
+    /// Fragmentation alone never reaches here: the multi-import path splits a
+    /// gapped span into packed runs and maps them one at a time.
+    MapPagesRefused,
+    /// A packed run's copy window fell outside the bytes `map_pages` returned or
+    /// outside the caller's buffer. Run arithmetic, not a guest condition.
+    RunOutOfRange,
 }
 
 impl crate::observe::Decline for MemError {
@@ -89,7 +97,9 @@ impl crate::observe::Decline for MemError {
             Self::TaskRootRead => "mem_task_root_read",
             Self::NoSuchTask => "mem_no_such_task",
             Self::OutsideMap => "mem_outside_map",
-            Self::NotContiguous => "mem_not_contiguous",
+            Self::NotRam => "mem_not_ram",
+            Self::MapPagesRefused => "mem_map_pages_refused",
+            Self::RunOutOfRange => "mem_run_out_of_range",
         }
     }
 

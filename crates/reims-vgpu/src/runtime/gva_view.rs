@@ -17,7 +17,7 @@
 use crate::contract::gva_resolve::{read_task_root, translate_root, Cache, ResolveStatus, Task};
 use crate::model::{DeviceState, GvaHostView, TaskEntry};
 use crate::runtime::gva_mem::geometry_for_page_shift;
-use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::host::{HostMemory, HostOps, MemError};
 
 /// True if half-open ranges `[a, a+la)` and `[b, b+lb)` overlap.
 #[inline]
@@ -141,18 +141,24 @@ fn resolve_task_for_walk(tasks: &[TaskEntry], task_id: u32) -> Option<(u32, &Tas
 
 /// Collect one GPA per guest page covering `[gva, gva+length)` under the task PT.
 ///
-/// Returns page-aligned GPAs in GVA order. Fails closed on any unmapped page.
+/// Returns page-aligned GPAs in GVA order. Fails closed on any unmapped page,
+/// carrying **which** check refused — the walk's own status when the walk is
+/// what said no. Callers that only need "yes or no" take `.ok()`; the guest-write
+/// path propagates the reason so the always-on line names it.
 fn collect_span_gpas<M: HostMemory>(
     host: &M,
     task: &TaskEntry,
     gva: u64,
     length: u64,
     page_shift: u32,
-) -> Option<Vec<u64>> {
-    if length == 0 || !task.active || task.directory_pfn == 0 {
-        return None;
+) -> Result<Vec<u64>, MemError> {
+    if length == 0 {
+        return Err(MemError::BadArgs);
     }
-    let geom = geometry_for_page_shift(page_shift)?;
+    if !task.active || task.directory_pfn == 0 {
+        return Err(MemError::NoTaskDirectory);
+    }
+    let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
     let page_size = geom.page_size as u64;
     struct HostPhys<'a, M: HostMemory>(&'a M);
     impl<M: HostMemory> crate::contract::gva_resolve::PhysReader for HostPhys<'_, M> {
@@ -165,7 +171,7 @@ fn collect_span_gpas<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).ok()?;
+    let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
     let mut cache = Cache::default();
     let end = gva.saturating_add(length);
     let mut page_gva = gva & !(page_size - 1);
@@ -180,7 +186,7 @@ fn collect_span_gpas<M: HostMemory>(
             Some(&mut cache),
         );
         if t.status != ResolveStatus::Ok {
-            return None;
+            return Err(MemError::Unresolved(t.status));
         }
         // HostOps map_pages expects page-aligned GPAs (page base, not +offset).
         let gpa_base = t.gpa & !(page_size - 1);
@@ -188,9 +194,9 @@ fn collect_span_gpas<M: HostMemory>(
         page_gva = page_gva.saturating_add(page_size);
     }
     if gpas.is_empty() {
-        return None;
+        return Err(MemError::BadArgs);
     }
-    Some(gpas)
+    Ok(gpas)
 }
 
 /// Maximal packed-contig runs in a page-GPA list (product Linux `map_pages`).
@@ -288,7 +294,7 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     let page_shift = state.page_shift;
     let (resolved_tid, gpas) = {
         let (tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
-        let gpas = collect_span_gpas(host, task, gva, length, page_shift)?;
+        let gpas = collect_span_gpas(host, task, gva, length, page_shift).ok()?;
         (tid, gpas)
     };
     let page_sz = state.page_size() as usize;
@@ -342,14 +348,14 @@ fn view_gpas_current<H: HostMemory>(
     let page = 1u64 << page_shift;
     let first_page = v.gva & !(page - 1);
     match collect_span_gpas(host, task, first_page, 1, page_shift) {
-        Some(g) if g.first() == Some(&v.first_gpa) => {}
+        Ok(g) if g.first() == Some(&v.first_gpa) => {}
         _ => return false,
     }
     if v.last_gpa != 0 {
         let last_page = v.gva.saturating_add(v.length).saturating_sub(1) & !(page - 1);
         if last_page != first_page {
             match collect_span_gpas(host, task, last_page, 1, page_shift) {
-                Some(g) if g.first() == Some(&v.last_gpa) => {}
+                Ok(g) if g.first() == Some(&v.last_gpa) => {}
                 _ => return false,
             }
         }
@@ -425,9 +431,9 @@ pub fn write_span<H: HostMemory + HostOps>(
     task_id: u32,
     gva: u64,
     buf: &[u8],
-) -> bool {
+) -> Result<(), MemError> {
     if buf.is_empty() {
-        return true;
+        return Ok(());
     }
     write_span_multi(state, host, task_id, gva, buf)
 }
@@ -463,7 +469,7 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     let page_shift = state.page_shift;
     let gpas = {
         let (_tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
-        collect_span_gpas(host, task, gva, length, page_shift)?
+        collect_span_gpas(host, task, gva, length, page_shift).ok()?
     };
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
@@ -535,32 +541,34 @@ pub fn read_span<H: HostMemory + HostOps>(
 ///
 /// Ephemeral per-run maps (do not register partial views — Darwin unmap needs
 /// the full map_pages base; product Linux alias is a no-op unmap).
+///
+/// Every refusal here names its own check. Fragmentation is **not** one of them:
+/// a gapped span is split into packed runs and mapped a run at a time, so a
+/// caller reporting "not contiguous" for a failure of this function is reporting
+/// a condition the function does not test.
 fn write_span_multi<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,
     gva: u64,
     buf: &[u8],
-) -> bool {
+) -> Result<(), MemError> {
     let length = buf.len() as u64;
     let page_shift = state.page_shift;
     let page_size = state.page_size();
     let page_sz = page_size as usize;
     let gpas = {
         let Some((_tid, task)) = resolve_task_for_walk(&state.tasks, task_id) else {
-            return false;
+            return Err(MemError::NoSuchTask);
         };
-        let Some(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
-            return false;
-        };
-        gpas
+        collect_span_gpas(host, task, gva, length, page_shift)?
     };
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
-        return false;
+        return Err(MemError::NotRam);
     }
     let runs = contig_page_runs(&gpas, page_size);
     if runs.is_empty() {
-        return false;
+        return Err(MemError::BadArgs);
     }
     crate::runtime::mapper::flush_retired_views(state, host);
     let span_page_base = gva & !(page_size - 1);
@@ -568,7 +576,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
     for run in &runs {
         let run_gpas = &gpas[run.clone()];
         let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            return false;
+            return Err(MemError::MapPagesRefused);
         };
         let total = run_gpas.len().saturating_mul(page_sz);
         let run_gva = span_page_base.saturating_add((run.start as u64).saturating_mul(page_size));
@@ -584,7 +592,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
         let n = (copy_hi - copy_lo) as usize;
         if host_off + n > total || buf_off + n > buf.len() {
             host.unmap_pages(ptr, total);
-            return false;
+            return Err(MemError::RunOutOfRange);
         }
         // SAFETY: map_pages packed `total` bytes; host_off+n in range.
         unsafe {
@@ -596,7 +604,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
         }
         host.unmap_pages(ptr, total);
     }
-    true
+    Ok(())
 }
 
 /// Multi-import read: map each packed GPA run, copy out, unmap.
@@ -615,7 +623,7 @@ fn read_span_multi<H: HostMemory + HostOps>(
         let Some((_tid, task)) = resolve_task_for_walk(&state.tasks, task_id) else {
             return false;
         };
-        let Some(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
+        let Ok(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
             return false;
         };
         gpas
@@ -825,7 +833,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         let gva = 8u64;
-        assert!(write_span(&mut state, &mut host, 1, gva, &[1, 2, 3, 4]));
+        assert!(write_span(&mut state, &mut host, 1, gva, &[1, 2, 3, 4]).is_ok());
         let mut back = [0u8; 4];
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4]);
@@ -838,11 +846,104 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
 
-        assert!(write_span(&mut state, &mut host, 1, gva, &[5, 6, 7, 8]));
+        assert!(write_span(&mut state, &mut host, 1, gva, &[5, 6, 7, 8]).is_ok());
         host.read_gpa(data1 + gva, &mut back).unwrap();
         assert_eq!(back, [5, 6, 7, 8], "write must follow the live PT");
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4], "stale page must not be touched");
+    }
+
+    /// The product guest-write path must name the check that refused, not
+    /// assume contiguity. `write_span_multi` has six distinct refusals — no
+    /// task, an unresolved page, a non-RAM GPA, an empty run list, a `map_pages`
+    /// refusal and an out-of-range run window — and every one of them used to
+    /// reach the always-on log as `mem_not_contiguous`. That is the same "one
+    /// status for N checks" collapse that
+    /// `no_two_guest_memory_checks_answer_with_the_same_reason` ended for the
+    /// read paths, still standing on the write path.
+    ///
+    /// Here the span's second page has no PTE, so the walk refuses and
+    /// contiguity is never even in question.
+    #[test]
+    fn product_gva_write_reports_the_check_that_refused() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        crate::observe::redirect_logs_for_tests();
+        let before = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        // pt_fixture wires PTE[0] only, so page 1 of this two-page span is
+        // unresolved. `page - 4` straddles the boundary.
+        assert!(crate::runtime::gva_mem::write_task_gva_product(
+            &mut state,
+            &mut host,
+            1,
+            page - 4,
+            &[0u8; 8]
+        )
+        .is_err());
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let tail = &body[before.min(body.len())..];
+        let line = tail
+            .lines()
+            .find(|l| l.starts_with("gva_write "))
+            .expect("a refused product guest write is always-on");
+        assert!(
+            line.contains("reason=gva_zero_pfn"),
+            "the walk's own check must be the reason: {line}"
+        );
+    }
+
+    /// The three refusals `write_span_multi` owns must stay distinguishable
+    /// from each other and from the walk's. Asserted as "no two share a slug"
+    /// rather than by naming each, because the property that matters is the
+    /// absence of aliasing — the same shape
+    /// `no_two_guest_memory_checks_answer_with_the_same_reason` asserts crate-wide.
+    #[test]
+    fn write_span_refusals_do_not_share_a_reason() {
+        use crate::observe::Decline;
+        let mut slugs: Vec<&str> = [
+            MemError::NoSuchTask,
+            MemError::NotRam,
+            MemError::MapPagesRefused,
+            MemError::RunOutOfRange,
+            MemError::BadArgs,
+            MemError::Unresolved(ResolveStatus::ErrZeroPfn),
+        ]
+        .iter()
+        .map(|e| e.slug())
+        .collect();
+        let total = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), total, "two write-span refusals share a slug");
+    }
+
+    /// A gapped span is the one thing the multi-import path is *for*, so it must
+    /// succeed — the reason it can no longer be reported as is now impossible to
+    /// name. Guards the direction the vocabulary change could have gone wrong in:
+    /// renaming the refusal without checking fragmentation still works.
+    #[test]
+    fn fragmented_write_succeeds_so_no_refusal_can_mean_fragmented() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
+        // PTE[1] → pfn 10, leaving a gap after PTE[0]'s pfn 4.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        assert!(
+            write_span(&mut state, &mut host, 1, page - 4, &[1, 2, 3, 4, 5, 6, 7, 8]).is_ok(),
+            "the multi-import path exists to write a gapped span"
+        );
+        let mut back = [0u8; 4];
+        host.read_gpa(data0 + page - 4, &mut back).unwrap();
+        assert_eq!(back, [1, 2, 3, 4]);
+        host.read_gpa(data1, &mut back).unwrap();
+        assert_eq!(back, [5, 6, 7, 8]);
     }
 
     /// A fragmented span handed to `map_fresh_span` must be declined in Rust,

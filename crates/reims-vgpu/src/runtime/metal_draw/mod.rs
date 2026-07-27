@@ -4019,9 +4019,11 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
             return false;
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
-        if !crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row) {
+        if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
+        {
+            let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
-                "gva_write fail reason=not_contig task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 multi)"
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 multi)"
             ));
             return false;
         }
@@ -4120,9 +4122,11 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
         let row_gva = gva
             .saturating_add((y as u64).saturating_mul(bpr as u64))
             .saturating_add(x_bytes);
-        if !crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row) {
+        if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
+        {
+            let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
-                "gva_write fail reason=not_contig task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 rect multi)"
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 rect multi)"
             ));
             return false;
         }

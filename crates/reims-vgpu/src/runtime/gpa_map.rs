@@ -2,7 +2,7 @@
 //!
 //! Product stamp / DeviceInfo / display shared / child HEAD writes map the
 //! covering guest page(s), poke host bytes, then unmap. Fail closed when
-//! `map_pages` cannot build a contig view (`gpa_write fail reason=not_contig`).
+//! `map_pages` refuses the packed page run (`gpa_write reason=mem_map_pages_refused`).
 
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 
@@ -31,13 +31,18 @@ pub fn write_bytes<H: HostMemory + HostOps>(
         gpas.push(p);
         p = p.checked_add(page_size_u).ok_or(MemError::Overflow)?;
     }
+    // The GPA list here is packed by construction (`p += page_size`), so a
+    // refusal is `map_pages` declining a run it cannot alias — a RAMBlock or
+    // MemoryRegion edge — never a gap in the list. Naming it that way keeps the
+    // reason a fact about the refusal rather than a guess about the input.
     let Some(ptr) = host.map_pages(&gpas, page_size) else {
-        crate::observe::fail(format!(
-            "gpa_write fail reason=not_contig gpa={gpa:#x} len={:#x} pages={}",
-            buf.len(),
-            gpas.len()
-        ));
-        return Err(MemError::Unmapped);
+        let err = MemError::MapPagesRefused;
+        crate::observe::Emit::decline("gpa_write", &err)
+            .field("gpa", format!("{gpa:#x}"))
+            .field("len", format!("{:#x}", buf.len()))
+            .field("pages", gpas.len())
+            .fail();
+        return Err(err);
     };
     let total = gpas.len() * page_size;
     let off = (gpa - start) as usize;
