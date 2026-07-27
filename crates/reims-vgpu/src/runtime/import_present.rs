@@ -696,8 +696,18 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     // member's map_generation against the defer-time record before calling
     // here (recycled-pages guard).
     let gate_fail = if matches!(identity, TargetIdentity::OutputGroup { .. }) {
-        (surface_identity(state, mapping_id, width, height) != *identity)
-            .then_some(ImportDecline::GroupIdentityDrift)
+        (surface_identity(state, mapping_id, width, height) != *identity).then(|| {
+            // Read *why* the group no longer admits this mapping from the
+            // resolve itself. `miss: None` means the resolve still admitted it
+            // and the identities differ some other way (a geometry mismatch
+            // between the pinned identity and the Store's), which the two
+            // membership readings would otherwise be blamed for.
+            ImportDecline::GroupIdentityDrift {
+                miss: state
+                    .output_group_resolve(mapping_id, width, height)
+                    .err(),
+            }
+        })
     } else {
         let gen_now = state
             .mappings
@@ -1475,7 +1485,16 @@ enum ImportDecline {
     /// [`Self::MapGenDrift`], no generation is compared here (a group identity's
     /// is constant), so the two must not share a slug: one says the mapping was
     /// re-wired under us, the other says the composition graph changed shape.
-    GroupIdentityDrift,
+    ///
+    /// `miss` is the refusing check's own reading (`None` when the group still
+    /// admits the mapping and the identities differ some other way). "The
+    /// composition graph changed shape" is four distinguishable states, and
+    /// which one it is decides whether the refusal is even correct: a mapping
+    /// whose `presented_geoms` entry was *pruned* while its `map_generation`
+    /// survived is one the lifetime layer deliberately kept alive.
+    GroupIdentityDrift {
+        miss: Option<crate::model::OutputGroupMiss>,
+    },
     /// The mapping is not mapped.
     Unmapped,
     /// No type-11 sample window could be derived for this geometry.
@@ -1502,7 +1521,7 @@ impl crate::observe::Decline for ImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::MapGenDrift => "import_map_gen_drift",
-            Self::GroupIdentityDrift => "import_group_identity_drift",
+            Self::GroupIdentityDrift { .. } => "import_group_identity_drift",
             Self::Unmapped => "import_unmapped",
             Self::NoSampleWindow => "import_no_sample_window",
             Self::BprBelowTight { .. } => "import_bpr_below_tight",
@@ -1530,6 +1549,22 @@ impl crate::observe::Decline for ImportDecline {
             }
             Self::MapRunFailed { mlo, pages } => {
                 vec![("mlo", format!("{mlo:#x}")), ("pages", pages.to_string())]
+            }
+            Self::GroupIdentityDrift { miss } => {
+                use crate::model::OutputGroupMiss;
+                match miss {
+                    Some(OutputGroupMiss::NotPresentedHere { presented: None }) => {
+                        vec![("miss", "presented_pruned".into())]
+                    }
+                    Some(OutputGroupMiss::NotPresentedHere {
+                        presented: Some((w, h)),
+                    }) => vec![
+                        ("miss", "presented_elsewhere".into()),
+                        ("presented", format!("{w}x{h}")),
+                    ],
+                    Some(OutputGroupMiss::NoPeer) => vec![("miss", "no_peer".into())],
+                    None => vec![("miss", "identity_differs".into())],
+                }
             }
             _ => Vec::new(),
         }
@@ -1744,7 +1779,7 @@ mod tests {
         use crate::observe::Decline as _;
         const ALL: &[ImportDecline] = &[
             ImportDecline::MapGenDrift,
-            ImportDecline::GroupIdentityDrift,
+            ImportDecline::GroupIdentityDrift { miss: None },
             ImportDecline::Unmapped,
             ImportDecline::NoSampleWindow,
             ImportDecline::BprBelowTight { bpr: 0, tight: 0 },
@@ -2073,6 +2108,118 @@ mod tests {
             try_import_present_store(&mut state, &mut host, &per_mid, 1, 1920, 1080, false).reason(),
             "import_map_gen_drift"
         );
+    }
+
+    /// The grouped arm refuses in four distinguishable states, and the decline
+    /// carries which one from the check that refused.
+    ///
+    /// Two of them arrive without the mapping's lifetime having moved at all:
+    /// `condemn_surface_backing` and a fresh `map_surface` both prune
+    /// `presented_geoms` while deliberately *keeping* `map_generation` and the
+    /// mapping's deferred windows, so a deferred flush's recycled-pages guard
+    /// passes and this gate is the only thing that refuses. Reported as one slug
+    /// they are indistinguishable from a genuine resize, which is a different
+    /// mechanism wanting a different answer.
+    #[test]
+    fn the_grouped_arm_reports_which_membership_reading_refused() {
+        use crate::model::OutputGroupMiss;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let member = |w, h| crate::model::CompositorOutputMember {
+            width: w,
+            height: h,
+            source: 13,
+        };
+        for mid in [1u32, 5u32] {
+            state.map_surface(mid);
+            state
+                .present
+                .compositor_output_members
+                .insert(mid, member(1920, 1080));
+            state.note_presented_geom(mid, 1920, 1080);
+        }
+        assert_eq!(state.output_group_resolve(1, 1920, 1080), Ok(1));
+
+        // A geometry only ever presented from one surface: no peer to unify.
+        state.note_presented_geom(7, 800, 600);
+        assert_eq!(
+            state.output_group_resolve(7, 800, 600),
+            Err(OutputGroupMiss::NoPeer)
+        );
+
+        // A resize: still presented, elsewhere. The reading names where.
+        state.note_presented_geom(5, 640, 480);
+        assert_eq!(
+            state.output_group_resolve(5, 1920, 1080),
+            Err(OutputGroupMiss::NotPresentedHere {
+                presented: Some((640, 480))
+            })
+        );
+
+        // The tension: a fresh MAP prunes the membership evidence, and the
+        // precondition is that it does NOT move the lifetime the flush guards
+        // on. Assert that first — a test that only checked the miss would pass
+        // just as happily if `map_surface` had bumped the generation, which is
+        // the case where refusing is right.
+        let gen_before = state.mappings.get(&1).unwrap().map_generation;
+        state.map_surface(1);
+        assert_eq!(
+            state.mappings.get(&1).unwrap().map_generation,
+            gen_before,
+            "a fresh MAP defers the lifetime decision to the fingerprint compare"
+        );
+        assert_eq!(
+            state.output_group_resolve(1, 1920, 1080),
+            Err(OutputGroupMiss::NotPresentedHere { presented: None })
+        );
+
+        // `condemn_surface_backing` reaches the same state by the other route.
+        let mut condemned = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [2u32, 3u32] {
+            condemned.map_surface(mid);
+            condemned
+                .present
+                .compositor_output_members
+                .insert(mid, member(1920, 1080));
+            condemned.note_presented_geom(mid, 1920, 1080);
+            condemned.mappings.get_mut(&mid).unwrap().page_entries = vec![0x301];
+        }
+        let gen_before = condemned.mappings.get(&2).unwrap().map_generation;
+        assert!(condemned.condemn_surface_backing(2));
+        assert_eq!(
+            condemned.mappings.get(&2).unwrap().map_generation,
+            gen_before,
+            "a condemned backing keeps content state for the fingerprint compare"
+        );
+        assert_eq!(
+            condemned.output_group_resolve(2, 1920, 1080),
+            Err(OutputGroupMiss::NotPresentedHere { presented: None })
+        );
+
+        // The contrast that makes those two preconditions mean something:
+        // `unmap_surface` prunes membership the same way but DOES bump the
+        // generation, so the lifetime layer refuses on its own and this gate's
+        // opinion never decides anything. `presented_pruned` is one reading
+        // covering both, which is exactly why it has to be readable.
+        let gen_before = condemned.mappings.get(&3).unwrap().map_generation;
+        condemned.unmap_surface(3);
+        assert_ne!(
+            condemned.mappings.get(&3).unwrap().map_generation,
+            gen_before,
+            "an unmap is a lifetime boundary, not a deferred decision"
+        );
+        assert_eq!(
+            condemned.output_group_resolve(3, 1920, 1080),
+            Err(OutputGroupMiss::NotPresentedHere { presented: None })
+        );
+
+        // `output_group_for` is this resolve's `.ok()`, so the admission
+        // decision cannot drift from the reading that explains it.
+        for (mid, w, h) in [(1u32, 1920u32, 1080u32), (5, 1920, 1080), (7, 800, 600)] {
+            assert_eq!(
+                state.output_group_for(mid, w, h),
+                state.output_group_resolve(mid, w, h).ok()
+            );
+        }
     }
 
     /// Two proven same-geometry compositor members resolve to one shared

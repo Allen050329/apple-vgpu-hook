@@ -1070,6 +1070,22 @@ pub struct PresentState {
     pub stats_seq: u64,
 }
 
+/// Why [`DeviceState::output_group_resolve`] refused to unify a surface into
+/// the compositor output group. Produced by the check that refused, so a caller
+/// can never supply the word itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputGroupMiss {
+    /// The guest has not named this surface as plane 0 of a display transaction
+    /// at this geometry. `presented` is what `presented_geoms` holds for the
+    /// mapping instead: `None` when the entry was pruned (fresh MAP, unmap,
+    /// condemned backing, new `MappingInternal`), `Some(other)` when the guest
+    /// last presented this surface at a different geometry.
+    NotPresentedHere { presented: Option<(u32, u32)> },
+    /// Presented here, but the geometry is not a latched swapchain and no other
+    /// surface is presented at it right now — nothing to unify with.
+    NoPeer,
+}
+
 /// Key for an in-flight GPU stats reduction (the zero-copy present oracle).
 ///
 /// Carries everything needed to rebuild the resident identity that was armed,
@@ -2693,11 +2709,29 @@ impl DeviceState {
     /// black-background class); the live peer check still arms the group on the
     /// very first frame two surfaces appear together.
     pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
+        self.output_group_resolve(mapping_id, w, h).ok()
+    }
+
+    /// [`Self::output_group_for`], plus the reading taken by whichever check
+    /// refused. This is the only implementation; `output_group_for` is its
+    /// `.ok()`, so the two can never disagree about the admission decision.
+    ///
+    /// A caller that only learns "not a member" has to *guess* which of the two
+    /// admission conditions failed, and both have said the wrong thing here
+    /// before. The miss carries the state it read instead.
+    pub fn output_group_resolve(
+        &self,
+        mapping_id: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<u32, OutputGroupMiss> {
         if !self.presented_at(mapping_id, w, h) {
-            return None;
+            return Err(OutputGroupMiss::NotPresentedHere {
+                presented: self.present.presented_geoms.get(&mapping_id).copied(),
+            });
         }
         if self.present.output_group_geoms.contains(&(w, h)) {
-            return Some(1);
+            return Ok(1);
         }
         let peers = self
             .present
@@ -2705,7 +2739,11 @@ impl DeviceState {
             .iter()
             .filter(|(&mid, &geom)| mid != mapping_id && geom == (w, h))
             .count();
-        (peers >= 1).then_some(1)
+        if peers >= 1 {
+            Ok(1)
+        } else {
+            Err(OutputGroupMiss::NoPeer)
+        }
     }
 
     /// Queue a proven member's Composite full-FB writeback for present↔store
