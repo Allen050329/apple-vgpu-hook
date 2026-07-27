@@ -25,11 +25,6 @@
 //! [`EMIT_EVERY`] binds via the always-on `observe::off` sink. Measure-only —
 //! never gates behavior.
 //!
-//! The line also carries two SHAPE counters, `scaled_binds` and `plane_binds`,
-//! which are not timing at all — see their definitions below. They exist so a
-//! correct render and a colour-destroyed one can be told apart in the log; every
-//! other always-on counter is identical between the two.
-//!
 //! Wall-clock buckets are SCHED_IDLE-contaminated under the agent harness, so
 //! trust the RATIO between the buckets (all preempted the same way), not the
 //! absolute us — the ratio names which sub-op to cut.
@@ -47,20 +42,6 @@ static ENSURE_US: AtomicU64 = AtomicU64::new(0);
 static BIND_US: AtomicU64 = AtomicU64::new(0);
 static BINDS: AtomicU64 = AtomicU64::new(0);
 
-// Bind SHAPE, not bind cost. A guest image that reaches the display at its own
-// size renders correctly; one that must be scaled to reach it comes out with the
-// colour destroyed, and nothing else we emit says which of the two a given bind
-// is. `scaled` counts binds whose texture extent differs from the display
-// geometry, and `plane` counts binds read through a native luma/chroma layout
-// (`R8`/`Rg8`) rather than a four-byte colour one — the two properties that
-// distinguish a correct render from a corrupted one on the same wallpaper.
-//
-// Counted rather than logged per bind: there are ~1000 binds per wallpaper
-// change, so a line each would drown the sink for a signal that only means
-// anything as a ratio against `binds`.
-static SCALED_BINDS: AtomicU64 = AtomicU64::new(0);
-static PLANE_BINDS: AtomicU64 = AtomicU64::new(0);
-
 // Snapshot at the previous emit, for window (recent) per-bind deltas.
 static LAST_RESOLVE_US: AtomicU64 = AtomicU64::new(0);
 static LAST_REF_US: AtomicU64 = AtomicU64::new(0);
@@ -71,11 +52,6 @@ static LAST_BINDS: AtomicU64 = AtomicU64::new(0);
 // wait accrued (and acquisitions taken) since the last line.
 static LAST_ENG_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_ENG_ACQ: AtomicU64 = AtomicU64::new(0);
-// Shape counters need a window for the same reason the timing ones do, and more
-// so: they are read to attribute a defect to one interval (a wallpaper change,
-// a page load), and a cumulative total cannot be attributed to anything.
-static LAST_SCALED: AtomicU64 = AtomicU64::new(0);
-static LAST_PLANE: AtomicU64 = AtomicU64::new(0);
 
 /// One cumulative census line per this many sampled binds.
 const EMIT_EVERY: u64 = 512;
@@ -88,18 +64,6 @@ pub fn note_resolve(us: u64) {
     let binds = BINDS.fetch_add(1, Ordering::Relaxed) + 1;
     if binds.is_multiple_of(EMIT_EVERY) {
         crate::observe::off(format_line());
-    }
-}
-
-/// Record one bind's shape: whether the sample is scaled (texture extent differs
-/// from the display geometry) and whether it is read through a native
-/// luma/chroma plane layout. Called once per bind, alongside the timing notes.
-pub fn note_shape(scaled: bool, plane: bool) {
-    if scaled {
-        SCALED_BINDS.fetch_add(1, Ordering::Relaxed);
-    }
-    if plane {
-        PLANE_BINDS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -154,8 +118,6 @@ fn format_line() -> String {
     // WAITING for the global engine mutex (vs doing work under it). A high
     // `eng_wait_per_acq_us` during a dock-hover freeze proves the drain worker
     // is lock-bound behind a present-path holder, not compute-bound.
-    let scaled = SCALED_BINDS.load(Ordering::Relaxed);
-    let plane = PLANE_BINDS.load(Ordering::Relaxed);
     let (eng_wait_ns, eng_acq, eng_max_ns) = engine_lock_snapshot();
     let w_eng_wait_ns = eng_wait_ns - LAST_ENG_WAIT_NS.swap(eng_wait_ns, Ordering::Relaxed);
     let w_eng_acq = eng_acq - LAST_ENG_ACQ.swap(eng_acq, Ordering::Relaxed);
@@ -163,8 +125,7 @@ fn format_line() -> String {
         "setup_tex_split binds={binds} resolve_per_bind_us={} ref_per_bind_us={} \
          ensure_per_bind_us={} bind_per_bind_us={} stats_per_bind_us={} | \
          win_resolve_us={} win_ref_us={} win_ensure_us={} win_bind_us={} | \
-         eng_wait_per_acq_us={} eng_acq={} eng_max_us={} | \
-         scaled_binds={} plane_binds={} win_scaled={} win_plane={}",
+         eng_wait_per_acq_us={} eng_acq={} eng_max_us={}",
         per(resolve_us, binds),
         per(ref_us, binds),
         per(ensure_us, binds),
@@ -177,10 +138,6 @@ fn format_line() -> String {
         per(w_eng_wait_ns / 1000, w_eng_acq),
         w_eng_acq,
         eng_max_ns / 1000,
-        scaled,
-        plane,
-        scaled - LAST_SCALED.swap(scaled, Ordering::Relaxed),
-        plane - LAST_PLANE.swap(plane, Ordering::Relaxed),
     )
 }
 
@@ -220,40 +177,8 @@ mod tests {
         assert_eq!(b1 - b0, 2);
         let line = format_line();
         assert!(line.starts_with("setup_tex_split"));
-        assert!(line.contains("scaled_binds="));
-        assert!(line.contains("plane_binds="));
         assert!(line.contains("ref_per_bind_us="));
         assert!(line.contains("ensure_per_bind_us="));
         assert!(line.contains("win_resolve_us="));
-    }
-
-    /// The shape counters must move only for the case each one names. A counter
-    /// that advances on every bind would report the same value for a correct
-    /// render and a destroyed one, which is the exact failure mode that made the
-    /// surface-level plane count useless for this class.
-    #[test]
-    fn shape_counters_count_only_their_own_case() {
-        let scaled0 = SCALED_BINDS.load(Ordering::Relaxed);
-        let plane0 = PLANE_BINDS.load(Ordering::Relaxed);
-
-        note_shape(false, false);
-        assert_eq!(SCALED_BINDS.load(Ordering::Relaxed), scaled0);
-        assert_eq!(PLANE_BINDS.load(Ordering::Relaxed), plane0);
-
-        note_shape(true, false);
-        note_shape(false, true);
-        note_shape(true, true);
-        assert_eq!(SCALED_BINDS.load(Ordering::Relaxed), scaled0 + 2);
-        assert_eq!(PLANE_BINDS.load(Ordering::Relaxed), plane0 + 2);
-
-        let line = format_line();
-        assert!(line.contains(&format!("scaled_binds={}", scaled0 + 2)));
-        assert!(line.contains(&format!("plane_binds={}", plane0 + 2)));
-        // The window must reset, or a second read reports the first read's work
-        // again and every attribution after it is wrong.
-        note_shape(true, false);
-        let line = format_line();
-        assert!(line.contains("win_scaled=1"), "{line}");
-        assert!(line.contains("win_plane=0"), "{line}");
     }
 }
