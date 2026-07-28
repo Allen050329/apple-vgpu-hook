@@ -4580,6 +4580,30 @@ fn spirv_image_format_to_engine_storage(
 }
 
 #[cfg(feature = "backend-vulkan")]
+/// Numeric class of a guest storage format: 0 normalized/float, 1 unsigned
+/// integer, 2 signed integer.
+///
+/// Kept apart from the specialization table below because that table also
+/// refuses formats whose storage path is unproven, and the class of a format is
+/// a fact about it that holds whether or not we are willing to target it.
+fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat) -> u8 {
+    use crate::backend::vulkan::engine::StorageImageFormat as V;
+    match guest {
+        V::Rgba32Float
+        | V::Rgba16Float
+        | V::R16Float
+        | V::Rgba8Unorm
+        | V::Bgra8Unorm
+        | V::Rg16Float
+        | V::R8Unorm
+        | V::Rg8Unorm
+        | V::R32Float
+        | V::Rgb9e5Ufloat => 0,
+        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
+        V::Rgba8Sint | V::R32Sint => 2,
+    }
+}
+
 fn specialized_storage_image_format(
     guest: crate::backend::vulkan::engine::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
@@ -4625,18 +4649,11 @@ fn specialized_storage_image_format(
             });
         }
     }
-    if guest.bytes_per_texel() == shader_engine.bytes_per_texel() && !matches!(guest, V::R32Uint) {
-        // Equal-size mismatches are intentional raw views (for example Metal
-        // BGRA8Unorm bound to a uint texture and translated as Rgba8Uint).
-        //
-        // R32Uint is the ONE equal-bytes case that is NOT a valid raw view: the
-        // translator declares a 4x8-bit `Rgba8ui` storage image for a generic
-        // `texture2d<uint, write>`, but the guest surface is a single 32-bit
-        // uint channel. Reinterpreting it as Rgba8ui would store only the low
-        // byte of each written lane (correct only for values < 256). It falls
-        // through to the class-matched specialization below, which re-targets
-        // the SPIR-V storage image to `R32ui` (VK_FORMAT_R32_UINT) so a written
-        // `uint4`'s `.x` lane is stored as the full u32.
+    // Nothing to specialize when the translator already named the guest's own
+    // format. Stated before the class rules below so a guest surface whose
+    // storage path is otherwise unproven (`R32Float`, `R32Sint`) is not refused
+    // for a shader that declares exactly it.
+    if shader_engine == guest {
         return Ok(shader);
     }
 
@@ -4656,6 +4673,33 @@ fn specialized_storage_image_format(
         // deliberately for the BGRA path, which returns above.
         S::Unknown | S::Unsupported(_) => return Err("spirv_storage_format_unsupported"),
     };
+    // An integer-class shader over a normalized/float-class guest surface of the
+    // same texel width is a deliberate raw byte view — Metal `BGRA8Unorm` bound
+    // to a `texture2d<uint, write>` and translated as `Rgba8Uint` writes bytes,
+    // not colours, and re-targeting it would convert values that were never meant
+    // to be converted. The reverse (a float shader over an integer surface) has
+    // never been captured and is refused below rather than guessed at.
+    //
+    // Within one class equal width means nothing, and the store is a value store:
+    // `R32Float` and `Rg16Float` are both four float bytes and mean different
+    // things. A `float4` written through the former stores lane `.x` as one f32,
+    // which the guest then reads as two halves — so a two-channel write loses its
+    // second channel outright and corrupts its first. That is measured, not
+    // hypothetical: the guest's decode-time HEIC downsample writes chroma with
+    // `OpVectorShuffle … 1 2 1 2` into an `Rg16Float` surface the translator
+    // declared `R32f`, and the picture speckles.
+    //
+    // The `R32Uint` guest case used to be carved out of a bare width test by name
+    // for the same reason (`Rgba8Uint` declared over one 32-bit uint channel,
+    // storing only the low byte of each lane). It needs no exception now: uint
+    // over uint is one class, so it reaches the class-matched table below.
+    if guest.bytes_per_texel() == shader_engine.bytes_per_texel()
+        && shader_class != 0
+        && guest_numeric_class(guest) == 0
+    {
+        return Ok(shader);
+    }
+
     let (guest_class, specialized) = match guest {
         // R32-single-channel: R32Uint is supported as a storage image by
         // re-targeting the SPIR-V to `R32ui` (its class must still match the

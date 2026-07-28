@@ -2124,6 +2124,52 @@ fn r32f_write_images_specialize_to_the_bound_guest_surface() {
     );
 }
 
+/// Equal bytes per texel inside one numeric class is a coincidence, not a raw
+/// view, and adopting the shader's placeholder there silently drops channels.
+///
+/// The guest's decode-time HEIC downsample writes chroma as
+/// `OpVectorShuffle … 1 2 1 2` — two live lanes — into an `Rg16Float` surface
+/// that `metal2vulkan` declared `R32f`. Both are four float bytes, so a
+/// width-only raw-view test kept `R32f`, `OpImageWrite` stored lane `.x` as one
+/// f32, and the guest read those four bytes back as two halves: the second
+/// chroma channel was never written and the first was destroyed. On screen that
+/// is the wallpaper speckle class; measured off-screen it is
+/// `.agents/repros/heic-decode-isolation.sh` going from dB 0.23 to dB 7.11
+/// between a 1921-wide source and a 1984-wide one.
+///
+/// The same trap had already been carved out by name for `R32Uint` under
+/// `Rgba8Uint`. These are one rule, so the rule is asserted here for every
+/// same-class equal-width pair the format table can produce.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn same_class_equal_width_storage_formats_take_the_guest_surface_not_the_placeholder() {
+    use crate::backend::vulkan::engine::StorageImageFormat as V;
+    use crate::runtime::spirv_bind::ImageFormat as S;
+
+    // 4 bytes both sides, float class both sides — the measured case.
+    assert_eq!(
+        specialized_storage_image_format(V::Rg16Float, S::R32Float, true),
+        Ok(S::Rg16Float)
+    );
+    // Same width and class again, and a colour store: `.x` as one f32 would be
+    // three channels short.
+    assert_eq!(
+        specialized_storage_image_format(V::Rgba8Unorm, S::R32Float, true),
+        Ok(S::Rgba8Unorm)
+    );
+    // 2 bytes both sides.
+    assert_eq!(
+        specialized_storage_image_format(V::Rg8Unorm, S::R16Float, true),
+        Ok(S::Rg8Unorm)
+    );
+    // The genuine raw view — integer shader over a normalized surface — is not
+    // disturbed by narrowing the width test.
+    assert_eq!(
+        specialized_storage_image_format(V::Rgba8Unorm, S::Rgba8Uint, true),
+        Ok(S::Rgba8Uint)
+    );
+}
+
 /// x86 (12-bit) task page table with depth-1 root; ptes map gva page i →
 /// `pfns[i]`. Mirrors the gva_view multi-import fixture.
 fn setup_linear_task_x86(host: &mut FakeHost, state: &mut DeviceState, pfns: &[u32]) {
