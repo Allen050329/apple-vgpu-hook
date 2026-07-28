@@ -3324,11 +3324,11 @@ fn log_linux_m2v_timing(
         engine_submit_us: submit_us,
         engine_target_us: target_prepare_us,
         engine_sampled_us: sampled_prepare_us,
-        engine_bufprep_us: sampler_prepare_us
-            .saturating_add(vertex_prepare_us)
-            .saturating_add(index_prepare_us)
-            .saturating_add(storage_prepare_us)
-            .saturating_add(seed_prepare_us),
+        engine_sampler_prep_us: sampler_prepare_us,
+        engine_vertex_prep_us: vertex_prepare_us,
+        engine_index_prep_us: index_prepare_us,
+        engine_storage_prep_us: storage_prepare_us,
+        engine_seed_prep_us: seed_prepare_us,
         engine_creates: creates,
         engine_allocs: allocs,
         target_reuse,

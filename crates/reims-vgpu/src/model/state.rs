@@ -1299,13 +1299,22 @@ pub struct TrancheStats {
     /// Resource-prep decomposition (subset of `engine_resource_us`), to locate
     /// the dominant sub-phase of the ~65 µs/draw resource cost off-main-core.
     /// `engine_target_us` = render-target image acquire/manage; `engine_sampled_us`
-    /// = sampled-texture load/import; `engine_bufprep_us` = the
-    /// vertex/index/storage/seed/sampler staging-prep loops. The remainder
-    /// (`engine_resource_us` minus these three, `engine_descriptor_us`, and
-    /// readback prep) is the resource-phase unattributed residual.
+    /// = sampled-texture load/import; the five `engine_*_prep_us` fields are the
+    /// per-binding-class staging-prep loops. The remainder (`engine_resource_us`
+    /// minus all of these, `engine_descriptor_us`, and readback prep) is the
+    /// resource-phase unattributed residual.
+    ///
+    /// The five prep fields used to reach this struct pre-summed as one
+    /// `engine_bufprep_us`. That sum was 32% of over-25 ms tranche wall clock and
+    /// named no lever: the parts were already measured per draw, and only the
+    /// tranche line threw them away.
     pub engine_target_us: u64,
     pub engine_sampled_us: u64,
-    pub engine_bufprep_us: u64,
+    pub engine_sampler_prep_us: u64,
+    pub engine_vertex_prep_us: u64,
+    pub engine_index_prep_us: u64,
+    pub engine_storage_prep_us: u64,
+    pub engine_seed_prep_us: u64,
     /// GPU-object churn proxy (scheduling-independent, unlike the `*_us` fields):
     /// `engine_creates` = `vkCreateImage`/framebuffer/view creates this tranche,
     /// `engine_allocs` = `vkAllocateMemory` calls. On a steady workload these
@@ -1678,7 +1687,21 @@ impl TrancheStats {
         self.engine_submit_us = self.engine_submit_us.saturating_add(d.engine_submit_us);
         self.engine_target_us = self.engine_target_us.saturating_add(d.engine_target_us);
         self.engine_sampled_us = self.engine_sampled_us.saturating_add(d.engine_sampled_us);
-        self.engine_bufprep_us = self.engine_bufprep_us.saturating_add(d.engine_bufprep_us);
+        self.engine_sampler_prep_us = self
+            .engine_sampler_prep_us
+            .saturating_add(d.engine_sampler_prep_us);
+        self.engine_vertex_prep_us = self
+            .engine_vertex_prep_us
+            .saturating_add(d.engine_vertex_prep_us);
+        self.engine_index_prep_us = self
+            .engine_index_prep_us
+            .saturating_add(d.engine_index_prep_us);
+        self.engine_storage_prep_us = self
+            .engine_storage_prep_us
+            .saturating_add(d.engine_storage_prep_us);
+        self.engine_seed_prep_us = self
+            .engine_seed_prep_us
+            .saturating_add(d.engine_seed_prep_us);
         self.engine_creates = self.engine_creates.saturating_add(d.engine_creates);
         self.engine_allocs = self.engine_allocs.saturating_add(d.engine_allocs);
         self.target_reuse = self.target_reuse.saturating_add(d.target_reuse);

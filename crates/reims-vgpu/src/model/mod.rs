@@ -198,6 +198,34 @@ mod tests {
         assert_eq!(t.setup_tex_us, 0);
     }
 
+    /// The five resource-prep classes accumulate independently. They reached this
+    /// struct pre-summed as one `engine_bufprep_us`, which named 32% of over-25 ms
+    /// tranche wall clock and no lever inside it; re-fusing any pair (or wiring two
+    /// fields to one source) puts that back. Distinct powers of two so a wrong sum
+    /// cannot land on a right answer by coincidence.
+    #[test]
+    fn the_five_resource_prep_classes_do_not_fold_into_each_other() {
+        let mut t = TrancheStats::default();
+        for scale in [1, 2] {
+            t.add(TrancheStats {
+                engine_sampler_prep_us: scale,
+                engine_vertex_prep_us: scale * 4,
+                engine_index_prep_us: scale * 16,
+                engine_storage_prep_us: scale * 64,
+                engine_seed_prep_us: scale * 256,
+                ..Default::default()
+            });
+        }
+        let taken = t.take();
+        assert_eq!(taken.engine_sampler_prep_us, 3);
+        assert_eq!(taken.engine_vertex_prep_us, 12);
+        assert_eq!(taken.engine_index_prep_us, 48);
+        assert_eq!(taken.engine_storage_prep_us, 192);
+        assert_eq!(taken.engine_seed_prep_us, 768);
+        assert_eq!(t.engine_sampler_prep_us, 0);
+        assert_eq!(t.engine_seed_prep_us, 0);
+    }
+
     /// x86 stamp page is 4 KiB → 1024 slots; arm 16 KiB → 4096. Indices that fit
     /// the arm page but not x86 must be rejected on x86 (wild-write class).
     #[test]

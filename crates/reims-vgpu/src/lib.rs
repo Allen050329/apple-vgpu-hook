@@ -1319,7 +1319,7 @@ pub fn device_drain(id: u64) -> bool {
             .saturating_add(tr.capture_us);
         let other_us = tranche_us.saturating_sub(attributed);
         observe::off(format!(
-            "drain_tranche_us={tranche_us} draws={} draw_total_us={} load_us={} m2v_us={} setup_us={} setup_bufs_us={} setup_tex_us={} setup_seed_us={} setup_asm_us={} engine_us={} engine_resource_us={} engine_descriptor_us={} engine_record_us={} engine_submit_us={} engine_target_us={} engine_sampled_us={} engine_bufprep_us={} engine_creates={} engine_allocs={} target_reuse={} engine_memory_alloc_us={} wait_us={} retire_wait_us={} readback_us={} readbacks={} reuploads={} reupload_kb={} buf_zc={} buf_snap={} batch_st={} batch_join={} b_open={} b_joined={} rmemo_hit={} rmemo_miss={} rmemo_stale={} buf_resolve_us={} buf_read_us={} bufs_load_us={} zc_flush_us={} zc_import_us={} zc_fail_import={} zc_flush_hits={} zc_flush_skip={} zc_flush_stale={} zc_flush_walk={} zc_flush_walk_us={} zc_flush_recheck={} zc_flush_sig_us={} zc_flush_isect_us={} zc_flush_calls={} zc_flush_slow={} zc_flush_max_us={} zc_flush_exact_us={} compute_n={} compute_us={} store_n={} store_us={} capture_n={} capture_us={} other_us={other_us}",
+            "drain_tranche_us={tranche_us} draws={} draw_total_us={} load_us={} m2v_us={} setup_us={} setup_bufs_us={} setup_tex_us={} setup_seed_us={} setup_asm_us={} engine_us={} engine_resource_us={} engine_descriptor_us={} engine_record_us={} engine_submit_us={} engine_target_us={} engine_sampled_us={} engine_sampler_prep_us={} engine_vertex_prep_us={} engine_index_prep_us={} engine_storage_prep_us={} engine_seed_prep_us={} engine_creates={} engine_allocs={} target_reuse={} engine_memory_alloc_us={} wait_us={} retire_wait_us={} readback_us={} readbacks={} reuploads={} reupload_kb={} buf_zc={} buf_snap={} batch_st={} batch_join={} b_open={} b_joined={} rmemo_hit={} rmemo_miss={} rmemo_stale={} buf_resolve_us={} buf_read_us={} bufs_load_us={} zc_flush_us={} zc_import_us={} zc_fail_import={} zc_flush_hits={} zc_flush_skip={} zc_flush_stale={} zc_flush_walk={} zc_flush_walk_us={} zc_flush_recheck={} zc_flush_sig_us={} zc_flush_isect_us={} zc_flush_calls={} zc_flush_slow={} zc_flush_max_us={} zc_flush_exact_us={} compute_n={} compute_us={} store_n={} store_us={} capture_n={} capture_us={} other_us={other_us}",
             tr.draws,
             tr.draw_total_us,
             tr.load_us,
@@ -1336,7 +1336,11 @@ pub fn device_drain(id: u64) -> bool {
             tr.engine_submit_us,
             tr.engine_target_us,
             tr.engine_sampled_us,
-            tr.engine_bufprep_us,
+            tr.engine_sampler_prep_us,
+            tr.engine_vertex_prep_us,
+            tr.engine_index_prep_us,
+            tr.engine_storage_prep_us,
+            tr.engine_seed_prep_us,
             tr.engine_creates,
             tr.engine_allocs,
             tr.target_reuse,
