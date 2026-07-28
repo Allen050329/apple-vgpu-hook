@@ -213,6 +213,28 @@ and 1984x1116 differ by 3% in every dimension and land on opposite sides. Anythi
 the traffic between those two arms is the defect; almost everything else is held constant by
 construction. That is the tightest differential this class has, and it is where a probe goes.
 
+**Then read the corrupt pixels at native resolution, and the shape of the defect changes.** Every
+capture up to this point was our host window, downscaled to 1280x719 or 640x360, and at that scale
+the defect reads as dense speckle over the whole picture. The guest's `screencapture` is native
+1920x1080. On it, the same frame is *mostly correct*, with **63 816 outlier pixels — 3.08%** —
+isolated against clean surroundings. "Dense speckle" was the downscale accumulating sparse errors.
+
+Two measurements on that native frame close out the family of explanations this investigation spent
+all its time in:
+
+- **No grid alignment.** Outlier positions are uniform in `x%2`, `y%2`, `x%4` and `y%4` — 25.0 /
+  25.0 / 25.0 / 24.8 % in the four `(x%2, y%2)` cells, and 24.9-25.3 % across the mod-4 bins. Chroma
+  subsampling, block artifacts and tiling at those scales all predict a strong bias and there is
+  none.
+- **No plateau at 2x2.** Residual against a block mean grows smoothly with block size — 0, 5.18,
+  12.1, 19.0, 24.7 for 1x1 through 16x16. If the error lived on a 4:2:0 chroma block the 2x2 figure
+  would be near zero; it is a third of the way to the 16x16 value.
+
+So the corruption is sparse, per-pixel, uniformly scattered, and each affected pixel is wrong by a
+large margin rather than slightly off. That is not the signature of a format conversion, a
+subsampling ratio or a tile boundary — the three things every hypothesis in this class has assumed.
+Measure the geometry of the wrong pixels before assuming a transform produced them.
+
 The always-on sink refutes the YUV lead a second time, independently of the pixels. Slicing this
 boot per arm, the `type4 pages … multi=1` biplanar `'420f'` lines appear in arms F, G and H — four
 each — and in no other arm. **F and G are clean arms.** Biplanar YUV traffic is therefore present
