@@ -218,10 +218,24 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
             _ => 0,
         };
         if crate::observe::first_sight(gate.slug(), (u64::from(task_id) << 32) | u64::from(by)) {
+            // `by` is the gate's own answer and it is also the only answer the
+            // gate's alias predicate can give — it searches `task >> 1` alone,
+            // so reading `by == task >> 1` back as a finding measures the
+            // predicate. `owners` is the unfiltered version of the same
+            // question: every task whose span actually covers this range, with
+            // no relation assumed. If it ever holds an id that is not
+            // `task >> 1`, the halving is not the relationship.
+            //
+            // `spans` is here for the other permissive arm: `no_spans` means "no
+            // span for this task or its alias", not "the registry is empty", and
+            // only the second of those is a bounds check that did not run.
+            let owners = state.tasks_covering(gva, buf.len() as u64);
             crate::observe::Emit::decline("gva_write_gate", &gate)
                 .field("task", task_id)
                 .field("gva", format!("{gva:#x}"))
                 .field("len", format!("{:#x}", buf.len()))
+                .field("owners", format!("{owners:?}"))
+                .field("spans", state.task_map_span_count())
                 .fail();
         }
     }
@@ -739,6 +753,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The unfiltered owner scan sees what the gate's one-candidate search
+    /// cannot, and it does not change what the gate decides.
+    ///
+    /// Task 9's span covers the range and task 5's does not, so a write by task
+    /// 11 (`11 >> 1 == 5`) is refused — and the log line must be able to say
+    /// that a *different* task, unrelated by halving, held the covering span.
+    /// With `owners` reporting only what `by` could, "the covering owner is
+    /// always `task >> 1`" would be true by construction on every boot.
+    #[test]
+    fn the_owner_readout_sees_covering_tasks_the_gate_never_considered() {
+        use crate::model::WriteGate;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(11, 0x1_0000, 2));
+        state.note_task_map(5, 0x8000, 0x1000);
+        state.note_task_map(9, 0x4000, 0x1000);
+        state.note_task_map(4, 0x4000, 0x1000);
+
+        assert_eq!(
+            state.gva_write_gate(11, 0x4000, 0x100),
+            WriteGate::Outside,
+            "the gate's decision must not move because a readout was added"
+        );
+        assert_eq!(
+            state.tasks_covering(0x4000, 0x100),
+            vec![4, 9],
+            "both covering owners, ascending, and neither is 11 >> 1"
+        );
+        assert_eq!(state.task_map_span_count(), 3);
+        // A zero-length write covers nothing, matching the gate's own early out.
+        assert!(state.tasks_covering(0x4000, 0).is_empty());
+    }
+
+    /// `no_spans` names what the gate searched, not what the registry holds, so
+    /// the line has to carry the total or it reads as "the registry is empty".
+    #[test]
+    fn a_populated_registry_can_still_answer_no_spans() {
+        use crate::model::WriteGate;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(11, 0x1_0000, 2));
+        state.note_task_map(7, 0x4000, 0x1000);
+        assert_eq!(
+            state.gva_write_gate(11, 0x4000, 0x100),
+            WriteGate::NoSpans,
+            "nothing filed by 11 or 5, so the bounds check did not run"
+        );
+        assert_eq!(state.task_map_span_count(), 1, "yet the registry is not empty");
+        assert_eq!(state.tasks_covering(0x4000, 0x100), vec![7]);
     }
 
     /// The only inputs the deleted clause ever added were `u32` wraparound, and

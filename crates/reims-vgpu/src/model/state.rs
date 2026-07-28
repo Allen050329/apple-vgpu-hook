@@ -3303,6 +3303,45 @@ impl DeviceState {
         }
     }
 
+    /// Every task id holding a span that covers `[gva, gva+len)`, ascending and
+    /// deduplicated. **Readout only** — [`Self::gva_write_gate`] does not call
+    /// this and nothing may branch on it.
+    ///
+    /// This exists because the gate's own `by` field cannot answer the question
+    /// it appears to. The gate only ever considers spans filed under
+    /// `task_id >> 1`, so `WriteGate::Aliased { by }` is guaranteed to report
+    /// that value and nothing else — the search space, printed back as though it
+    /// were an observation. What is genuinely unknown is who *else* has a
+    /// covering span, and the only way to see it is to look without the filter.
+    ///
+    /// Ambiguity is a property of the registry at the instant of the write, so
+    /// it is read from the registry rather than counted from map/unmap events: a
+    /// count of registrations would say how many spans were filed, never which
+    /// of them authorise this particular range right now.
+    pub fn tasks_covering(&self, gva: u64, len: u64) -> Vec<u32> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut owners: Vec<u32> = self
+            .task_map_spans
+            .iter()
+            .filter(|s| s.covers(gva, len))
+            .map(|s| s.task_id)
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+    }
+
+    /// How many MapMemory2 spans the registry holds in total, across all tasks.
+    ///
+    /// Pairs with [`WriteGate::NoSpans`], whose name overstates what it saw: it
+    /// means "no span for this task or its one alias", which is not the same as
+    /// an empty registry, and only one of those two is "the gate did not run".
+    pub fn task_map_span_count(&self) -> usize {
+        self.task_map_spans.len()
+    }
+
     /// Whether the gate permits the write. See [`Self::gva_write_gate`] for why.
     pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
         self.gva_write_gate(task_id, gva, len) != WriteGate::Outside
