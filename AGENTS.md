@@ -252,6 +252,13 @@ because 93% of this picture sits in the bottom bin. A defect that spares 0 and 2
 mid-tones is a different animal from one that corrupts uniformly, and it is the first result in this
 class that points at *what* is being computed rather than what it is being computed from.
 
+The channels are hit at different rates — in the same 512x512 crop, B 2.70% and G 0.98%, with G's
+value dependence weak and non-monotone where B's is strong. **Do not read R's zero residual as "R is
+correct".** R is pinned at 255 across this whole picture, so an error in R has nowhere to go and
+would clip back to 255 regardless; a saturated channel cannot report. The honest statement is that B
+is corrupted about three times as often as G and that R is untestable on this content. Testing it
+needs an image whose red channel is not already at the top of its range.
+
 **A per-pixel join is a join — check the lengths.** The first run of that table came out flat, 0.2-1.4%
 in every bin, which reads as "no value dependence" and would have closed the question the wrong way.
 The two pixel dumps were `paste`d together and one of them had exactly twice as many lines, because
