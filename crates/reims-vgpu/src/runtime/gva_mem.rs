@@ -80,8 +80,48 @@ pub fn read_task_gva<M: HostMemory>(
     Ok(())
 }
 
-/// Same as [`read_task_gva`] but also tries `task_id >> 1` when the wire task
-/// word is a raw define-task id (archive cursor path).
+/// Which arm of [`read_task_gva_fallback`] produced the answer.
+///
+/// Censused only when the task the guest named could not serve the read, so the
+/// success path pays nothing. That is also the only interesting question: the
+/// wire word is a slot id (see [`crate::runtime::task_slot`]), so `task_id >> 1`
+/// is a **different task**, and a read served by it returns another task's bytes
+/// to the caller with no way for anything downstream to notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadFallbackArm {
+    /// The named task's walk failed and `task_id >> 1`'s walk succeeded. This
+    /// arm is the only thing that produced bytes, and they are not the named
+    /// task's bytes.
+    ShiftedServed,
+    /// Neither task could serve the read. Nothing was substituted; the named
+    /// task's own walk failure is what the caller receives.
+    NeitherServed,
+}
+
+impl crate::observe::Decline for ReadFallbackArm {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ShiftedServed => "read_fallback_shifted",
+            Self::NeitherServed => "read_fallback_neither",
+        }
+    }
+}
+
+/// Same as [`read_task_gva`] but also tries `task_id >> 1` when the named task's
+/// walk fails.
+///
+/// The fallback arrived for one path — the archive cursor — and is now reached
+/// from **26** product call sites across blit, mipmap, draw, texture-view,
+/// compute and object resolution, none of which asked for it. Nothing has ever
+/// recorded whether it decides.
+///
+/// `#[track_caller]` so a firing arm names which of those sites reached it, and
+/// the census is latched per `(arm, task, site)`. Both arms are read-only
+/// measurements: this still returns exactly what it returned before, except
+/// that a total failure now carries the **named task's own walk error** rather
+/// than a blanket `NoSuchTask` the function chose for it — the caller's reason
+/// should be the check that refused, not a label written here.
+#[track_caller]
 pub fn read_task_gva_fallback<M: HostMemory>(
     host: &M,
     tasks: &[TaskEntry],
@@ -90,16 +130,55 @@ pub fn read_task_gva_fallback<M: HostMemory>(
     buf: &mut [u8],
     page_shift: u32,
 ) -> Result<(), MemError> {
-    if (task_id as usize) < tasks.len()
-        && read_task_gva(host, &tasks[task_id as usize], gva, buf, page_shift).is_ok()
-    {
+    let named = if (task_id as usize) < tasks.len() {
+        match read_task_gva(host, &tasks[task_id as usize], gva, buf, page_shift) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        }
+    } else {
+        MemError::NoSuchTask
+    };
+    let shifted = task_id >> 1;
+    let served = if shifted != task_id && (shifted as usize) < tasks.len() {
+        read_task_gva(host, &tasks[shifted as usize], gva, buf, page_shift)
+    } else {
+        Err(named)
+    };
+    note_read_fallback(task_id, shifted, gva, served.is_ok(), named);
+    if served.is_ok() {
         return Ok(());
     }
-    let shifted = task_id >> 1;
-    if shifted != task_id && (shifted as usize) < tasks.len() {
-        return read_task_gva(host, &tasks[shifted as usize], gva, buf, page_shift);
+    Err(named)
+}
+
+/// Record which arm answered a fallback read, latched per `(arm, task, site)`.
+///
+/// The latch is taken before the line is built: `Emit::field` renders eagerly,
+/// and this sits one level below per-row blit loops, so building and dropping
+/// strings on every refused read would make the probe cost scale with the
+/// traffic it is measuring.
+#[track_caller]
+fn note_read_fallback(task_id: u32, shifted: u32, gva: u64, served: bool, named: MemError) {
+    use crate::observe::Decline;
+    let arm = if served {
+        ReadFallbackArm::ShiftedServed
+    } else {
+        ReadFallbackArm::NeitherServed
+    };
+    // Key off the raw location, not its rendering — a refused read can repeat
+    // per row, and formatting before the latch would allocate on every one.
+    let loc = std::panic::Location::caller();
+    if !crate::observe::first_sight(arm.slug(), latch_key(task_id, shifted, loc)) {
+        return;
     }
-    Err(MemError::NoSuchTask)
+    let via = via_caller();
+    crate::observe::Emit::decline("gva_read_fallback", &arm)
+        .field("task", task_id)
+        .field("shifted", shifted)
+        .field("gva", format!("{gva:#x}"))
+        .field("named_err", named.slug())
+        .field("via", via)
+        .fail();
 }
 
 /// Translate `gva` under `task` and write `buf` into guest RAM via `write_gpa`.
@@ -189,18 +268,24 @@ fn via_caller() -> String {
     format!("{tail}:{}", loc.line())
 }
 
-/// Dedup key for the write-gate census: the arm's identity is the task, the
-/// authorising task, **and** the call site.
+/// Dedup key for the guest-memory censuses: two task ids **and** the call site.
 ///
-/// Hashed rather than bit-packed because `by` comes from the span registry and
-/// carries a raw wire word, so no field here has a bound worth relying on. This
-/// is a set key for suppressing repeats, not a value anything reads back.
-fn latch_key(task_id: u32, by: u32, via: &str) -> u64 {
+/// The call site belongs in the identity. Without it the second site to reach a
+/// given `(arm, task, other)` is silent for the life of the process, and
+/// `first_sight` is per-process rather than per-boot — the hazard that has
+/// already caused one census here to be read as a behavioural difference.
+///
+/// Hashed rather than bit-packed because both ids can carry a raw wire word, so
+/// neither has a bound worth relying on. This is a set key for suppressing
+/// repeats, not a value anything reads back. Takes the `Location` rather than
+/// its rendering so callers on a per-row path can key without allocating.
+fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     task_id.hash(&mut h);
-    by.hash(&mut h);
-    via.hash(&mut h);
+    other.hash(&mut h);
+    loc.file().hash(&mut h);
+    loc.line().hash(&mut h);
     h.finish()
 }
 
@@ -258,7 +343,7 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
         // reached from two sites is two findings, and a latch keyed on
         // `(arm, task, by)` alone would show whichever ran first and hide the
         // other for the whole process.
-        if crate::observe::first_sight(gate.slug(), latch_key(task_id, by, &via)) {
+        if crate::observe::first_sight(gate.slug(), latch_key(task_id, by, std::panic::Location::caller())) {
             // `by` is the gate's own answer and it is also the only answer the
             // gate's alias predicate can give — it searches `task >> 1` alone,
             // so reading `by == task >> 1` back as a finding measures the
@@ -867,13 +952,73 @@ mod tests {
     /// per-process latching hazard that has already misread one census.
     #[test]
     fn the_write_gate_latch_key_separates_call_sites() {
+        #[track_caller]
+        fn key(task: u32, other: u32) -> u64 {
+            latch_key(task, other, std::panic::Location::caller())
+        }
+        let a = key(1, 0);
+        let b = key(1, 0);
+        assert_ne!(a, b, "two call sites, same ids, must be two sightings");
+        assert_ne!(key(1, 0), key(2, 0));
+        assert_ne!(key(1, 0), key(1, 1));
+        let loc = std::panic::Location::caller();
+        assert_eq!(latch_key(1, 0, loc), latch_key(1, 0, loc), "and it is stable");
+    }
+
+    /// The read fallback's two arms must not share a slug: one hands the caller
+    /// a **different task's bytes** and the other refuses, and a census that
+    /// could not separate them would answer the deletion question wrong.
+    #[test]
+    fn the_read_fallback_arms_do_not_share_a_reason() {
+        use crate::observe::Decline;
         assert_ne!(
-            latch_key(1, 0, "runtime/blit_exec.rs:1039"),
-            latch_key(1, 0, "runtime/mipmap.rs:337")
+            ReadFallbackArm::ShiftedServed.slug(),
+            ReadFallbackArm::NeitherServed.slug()
         );
-        assert_ne!(latch_key(1, 0, "a:1"), latch_key(2, 0, "a:1"));
-        assert_ne!(latch_key(1, 0, "a:1"), latch_key(1, 1, "a:1"));
-        assert_eq!(latch_key(1, 0, "a:1"), latch_key(1, 0, "a:1"));
+    }
+
+    /// When neither task can serve the read, the caller must receive the
+    /// **named** task's own walk error, not a `NoSuchTask` this function chose.
+    ///
+    /// The task exists and is active here; what fails is the walk, with no
+    /// directory installed. Reporting `NoSuchTask` for that would name a check
+    /// that never ran — the collapse the typed-decline vocabulary exists to
+    /// prevent, and it regrew here because the fallback discarded both errors.
+    #[test]
+    fn a_failed_fallback_read_carries_the_named_tasks_own_refusal() {
+        let host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(6, 0x1_0000, 0));
+        assert!(state.tasks[6].active, "the slot is live; only the walk fails");
+        let mut buf = [0u8; 4];
+        let err = read_task_gva_fallback(
+            &host,
+            &state.tasks,
+            6,
+            0x1000,
+            &mut buf,
+            PAGE_SHIFT_X86,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            MemError::NoTaskDirectory,
+            "the walk's own refusal, not a blanket NoSuchTask"
+        );
+    }
+
+    /// A word naming no slot at all still reports `NoSuchTask` — that one IS
+    /// the check that refused.
+    #[test]
+    fn a_fallback_read_for_an_out_of_range_word_still_reports_no_such_task() {
+        let host = FakeHost::new();
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut buf = [0u8; 4];
+        let oob = state.tasks.len() as u32 + 4;
+        let err =
+            read_task_gva_fallback(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
+                .unwrap_err();
+        assert_eq!(err, MemError::NoSuchTask);
     }
 
     /// `Aliased` is returned in two states that call for opposite fixes, and
