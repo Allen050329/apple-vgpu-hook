@@ -1500,7 +1500,66 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
         0,
         false,
     );
+    // The host-import windows are a **cache**, and a cache running out is not a
+    // reason to lose the guest's work.
+    //
+    // Whether a writeback can go through host-pointer DMA is asked once, far
+    // above here, as `host.map_pages_stable()` — a property of the *host*. That
+    // is the right question for a capability, and the wrong one for this: the
+    // scatter resolves every run of the surface before its DMA and is
+    // all-or-nothing, so what actually decides is how many import windows *this*
+    // surface needs against how many are free *now*. A live x86 boot measured a
+    // working set of ten 1 GiB buckets against a budget of eight, thrashing
+    // `creates=1771 evictions=1763` with victims at `age_ms=0`, and dropped
+    // seven full renders as `deferred_flush_lost reason=host_import_total_byte_cap`
+    // while the CPU writeback below sat correct and unreachable behind the
+    // capability gate.
+    //
+    // So a shortage of our own windows re-routes to that path. A capability or
+    // structural refusal must NOT: the CPU path would fail those too, and the
+    // loss has to stay visible rather than being retried into a second failure.
+    //
+    // This demotes the import budget from a correctness bound to a performance
+    // one, which is what a cache budget is supposed to be. Raising the budget
+    // instead cannot work in principle — a surface straddling more buckets than
+    // the budget fails at every setting.
+    if let ImportPresentResult::Fail(reason) = result {
+        if is_import_window_shortage(reason) {
+            crate::observe::fail(format!(
+                "import_window_cpu_writeback mid={mapping_id} {width}x{height} \
+                 runs={} reason={reason} (host-import budget exhausted; \
+                 writing the render back on the CPU instead of dropping it)",
+                host_runs.len()
+            ));
+            return try_import_present_cpu_unstable(
+                state,
+                host,
+                identity,
+                mapping_id,
+                width,
+                height,
+                base_off,
+                bpr,
+                guest_before_center,
+                from_device,
+                timing,
+            );
+        }
+    }
     result
+}
+
+/// True when an import refusal was a shortage of **our own** host-import
+/// windows, rather than something the CPU writeback would hit as well.
+///
+/// Compared against the typed slugs rather than string literals so that renaming
+/// a cause moves both sides together. The two admitted here are the budget
+/// bounds; every other [`HostImportDecline`] is a capability, alignment, or
+/// range fact that a retry cannot change.
+fn is_import_window_shortage(reason: &str) -> bool {
+    use crate::backend::vulkan::engine::HostImportDecline;
+    use crate::observe::Decline;
+    reason == HostImportDecline::TotalBytes.slug() || reason == HostImportDecline::RegionCount.slug()
 }
 
 /// Why the runtime refused a guest-page import before the engine was asked.
@@ -1726,6 +1785,52 @@ fn log_result(mid: u32, w: u32, h: u32, r: ImportPresentResult) {
 
 #[cfg(test)]
 mod tests {
+    /// The retry decision this module makes must partition the eight host-import
+    /// causes by **whether a retry can possibly help**, not by how they read.
+    ///
+    /// Getting it wrong is silent both ways. Admit a capability or alignment
+    /// cause and every such refusal is retried into a second, slower failure
+    /// while the original loss stops being named. Omit a budget cause and the
+    /// render is dropped for a shortage of our own cache — the defect this
+    /// routing exists to end, which cost seven full renders on one measured x86
+    /// boot.
+    #[test]
+    fn only_our_own_window_shortages_are_worth_a_cpu_retry() {
+        use crate::backend::vulkan::engine::HostImportDecline;
+        use crate::observe::Decline;
+
+        // A retry frees windows and can then succeed: these are *our* limits.
+        for shortage in [HostImportDecline::TotalBytes, HostImportDecline::RegionCount] {
+            assert!(
+                is_import_window_shortage(shortage.slug()),
+                "{} is a budget bound and must re-route to the CPU writeback",
+                shortage.slug()
+            );
+        }
+
+        // Nothing a retry can change: the extension is absent for the device's
+        // lifetime, and alignment/range are facts about the span itself.
+        for hard in [
+            HostImportDecline::ExtensionAbsent,
+            HostImportDecline::ZeroLength,
+            HostImportDecline::PointerMisaligned { host_ptr: 0x1001, alignment: 4096 },
+            HostImportDecline::SizeMisaligned { size: 0x2001, alignment: 4096 },
+            HostImportDecline::RangeOverflow { host_ptr: usize::MAX, len: 0x1000 },
+            HostImportDecline::NoValidWindow { host_ptr: 0x1000, len: 0x1000, alignment: 4096 },
+        ] {
+            assert!(
+                !is_import_window_shortage(hard.slug()),
+                "{} cannot be fixed by retrying and must stay a visible loss",
+                hard.slug()
+            );
+        }
+
+        // An unrelated reason from elsewhere in the chain must not be admitted
+        // just because it mentions imports.
+        assert!(!is_import_window_shortage("host_import_resolve"));
+        assert!(!is_import_window_shortage("map_generation_drift"));
+    }
+
     use super::*;
     use crate::backend::vulkan::engine::reason::{DrawReason, HostPresentDecline};
     use crate::backend::vulkan::engine::DrawError;
