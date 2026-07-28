@@ -109,6 +109,27 @@ that refused. If it did not, the fix is to make the callee carry its reason, not
 about the label. The "one status for N checks" collapse the typed-decline work already ended regrows
 anywhere a `-> bool` crosses a module boundary.
 
+**A pixel count is not a visual defect — read the magnitude.** `magick compare -metric AE` counts a
+pixel as differing if any channel differs *at all*, so a pixel off by 1/255 scores exactly like one
+off by 255/255. Every screen-difference number this project recorded for the residue class came from
+that metric, and the metric was manufacturing the defect.
+
+Two boots each reported ~52 000 "residue pixels" after a rubber-band drag, in a region that turned
+out to be precisely the front window's rect plus its drop shadow — a convincing, reproducible,
+replicated result. The largest channel deviation anywhere in either frame was **3/255**, and zero
+pixels differed by more than 4. It was a re-encode rounding difference. The class had never been
+reproduced by the rig at all, and a mechanism had already been written up for it from a census
+correlation on one of those boots.
+
+So a difference count needs its magnitude distribution next to it or it means nothing. Report the
+max deviation and counts at several magnitudes, and treat a run whose max is a handful of LSB as
+**not having reproduced** anything. `.agents/repros/imgdiff.py` does this; prefer it to a bare `AE`.
+The same trap applies to any "N pixels changed" claim, including brightness means and region diffs.
+
+Note what saved it and what did not: the sub-perceptual reading came from looking at the *pixels*,
+after two boots of counts, a 2x2 design, an interleaved A/B and a null arm had all agreed with each
+other. Agreement among measurements that share a metric does not test the metric.
+
 **Exclusions decay, and nobody re-tests them.** The anti-pattern list already forbids claiming a
 class is fixed from one clean boot. Negative results are exactly as fragile and strictly more
 dangerous, because a wrong fix gets found the next time someone looks at the screen while a wrong
