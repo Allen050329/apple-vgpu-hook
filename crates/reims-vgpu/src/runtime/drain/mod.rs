@@ -1717,7 +1717,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             // Never hop retain to a different early_front Composite mid.  A
             // non-self compositor edge is the only post-retain ownership move
             // (page identity aside — that IS the protocol naming).
-            let (mut peer_mid, mut peer_gen, mode) = if let Some((am, ag)) = alias_peer {
+            let (peer_mid, peer_gen, mode) = if let Some((am, ag)) = alias_peer {
                 (am, ag, "page_alias")
             } else if let Some((_, fm, fg)) = fifo_peer {
                 (fm, fg, "store_fifo")
@@ -1739,44 +1739,22 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             };
 
             if peer_mid != 0 {
-                // Torn-capture guard (fullscreen-transition streak class): the
-                // selected member may have missed a RUN of full frames — its
-                // full-frame sequence (`dense_frame_seq`) lags a same-geometry
-                // peer by >= RETENTION_GAP_MARGIN. store_fifo ring order (and the
-                // graph fallback) can pair a present with such a starved/transient
-                // member (a scaling snapshot enqueued on one early full-frame
-                // Store, then abandoned): capturing it shows stale / partially-
-                // unwritten pages — the vertical-strip + checkerboard torn frame.
-                // Substitute the full-frame-freshest same-geometry peer as the
-                // capture source. Keyed only on the decoded full-frame-Store
-                // sequence (protocol state), never pixel content — healthy 1-lag
-                // alternation stays below the margin and is untouched. Never
-                // override page_alias (the present names a frame by exact page
-                // identity — explicit protocol naming) or keep (re-shows the
-                // retain, no capture). Runs on the present drain, off the main core.
-                if mode != "page_alias" && mode != "keep" {
-                    if let Some((denser_mid, mine_seq, denser_seq)) =
-                        state.dense_retention_gap(peer_mid, w, h)
-                    {
-                        if denser_seq
-                            >= mine_seq
-                                + crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN
-                        {
-                            let denser_gen = state
-                                .mappings
-                                .get(&denser_mid)
-                                .map(|m| m.content_generation)
-                                .unwrap_or(peer_gen);
-                            let peer_presented = state.presented_at(denser_mid, w, h);
-                            crate::runtime::census::present_proxy::note_stale_present_substitute(
-                                peer_mid, mine_seq, denser_mid, denser_seq, w, h, mode,
-                                peer_presented,
-                            );
-                            peer_mid = denser_mid;
-                            peer_gen = peer_gen.max(denser_gen);
-                        }
-                    }
-                }
+                // A "torn-capture guard" used to sit here and REPLACE the capture
+                // source with whichever same-geometry peer had the freshest
+                // full-frame sequence, above a `RETENTION_GAP_MARGIN` of 4.
+                //
+                // Deleted, and it is the one thing `dense_retention_gap`'s own doc
+                // says must never be done with it: "It must never decide *which*
+                // surface to present: the transaction names plane 0's surface id
+                // and that is the only correct capture source." Presenting a
+                // "denser" peer instead shows a buffer one rotation step behind the
+                // one the guest asked for. It also compared two of our own
+                // bookkeeping counters to decide what the guest must have meant,
+                // and needed an invented margin to do it.
+                //
+                // Measured dead before deleting: `stale_subst=0` on boots 86, 87,
+                // 88 and 89 of the x86/Vulkan rail. NOT measurable on arm64 — see
+                // the commit body.
                 // Consume the paired entry (and any leading no-longer-
                 // qualified entries) only when the FIFO actually decided;
                 // alias-decided presents leave the queue for the cap to age.

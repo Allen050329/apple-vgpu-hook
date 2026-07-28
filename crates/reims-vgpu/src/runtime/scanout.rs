@@ -3062,72 +3062,48 @@ mod tests {
         assert_eq!(state.present.height, 1080);
     }
 
-    /// Protocol-structural a/b retention-gap tracking (`dense_frame_seq`):
-    /// a member's dense seq advances on a full-frame Store, so a member that
-    /// missed a run of them reads as lagging. `dense_retention_gap` reports the
-    /// freshest same-geometry peer only while the presented member genuinely
-    /// lags, and is quiet after a re-map prunes the seq. Structural only — no
-    /// content/nz input.
+    /// A proven swapchain geometry has no retention gap to report.
+    ///
+    /// `dense_frame_seq` counts full-frame Stores per MAPPING ID. Once two
+    /// surfaces have been presented at a geometry the latch arms, both resolve to
+    /// the one `TargetIdentity::OutputGroup` resident, and they stop being
+    /// separate storage — so their per-member counts can diverge as far as they
+    /// like without any difference in pixels. Boot 87 emitted 77 of these, all at
+    /// 1920x1080 between mids 2/5/6, on a boot whose screen was correct at every
+    /// capture.
+    ///
+    /// The peer filter requires a presented peer, and a presented peer plus a
+    /// presented subject is exactly the latch condition — so at the production
+    /// call site, which runs after the display action, there is no configuration
+    /// left that reports a gap.
     #[test]
-    fn dense_retention_gap_tracks_full_frame_publishes() {
+    fn a_unified_swapchain_has_no_retention_gap_to_report() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (w, h) = (64u32, 48u32);
 
         state.note_compositor_member_published(1, w, h); // dense_seq[1]=1
         state.note_compositor_member_published(4, w, h); // dense_seq[4]=2
-        // Both are genuine swapchain siblings that alternate as the presented
-        // front — mark each displayed at this geometry so the presented-peer gate
-        // in `dense_retention_gap` (which excludes never-displayed publishers)
-        // keeps them in each other's peer set.
         state.note_presented_geom(1, w, h);
+
+        // One presented surface: no peer in the set, nothing to compare against.
+        assert_eq!(state.dense_retention_gap(1, w, h), None);
+
+        // The second present latches the swapchain and unifies both.
         state.note_presented_geom(4, w, h);
+        assert!(state.output_group_for(1, w, h).is_some());
+        assert!(state.output_group_for(4, w, h).is_some());
 
-        // mid 4 is the freshest (seq 2); mid 1 lags by exactly 1 — healthy a/b
-        // alternation. The raw query reports any positive lag; the margin that
-        // separates "healthy 1-lag" from "retention gap" lives in present_proxy.
-        assert_eq!(state.dense_retention_gap(4, w, h), None);
-        assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 1, 2)));
-
-        // Mid 1 keeps receiving full frames; mid 4 never does → mid 4 lags widely.
+        // Let the per-member counts diverge as far as they can. Neither member
+        // reports a gap, because there is only one image behind both of them.
         for _ in 0..5 {
             state.note_compositor_member_published(1, w, h);
         }
         assert_eq!(
             state.dense_retention_gap(4, w, h),
-            Some((1, 2, 7)),
-            "mid 4 (last full frame seq 2) lags mid 1 (seq 7)"
+            None,
+            "mid 4 trails mid 1 by 5 full-frame Stores and presents the same pixels"
         );
-        // The freshest member never reports a gap.
         assert_eq!(state.dense_retention_gap(1, w, h), None);
-
-        // A full-frame Store on the lagging member closes the gap on its own —
-        // the only way a member's seq advances now that the seed is gone.
-        state.note_compositor_member_published(4, w, h);
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "a member that just took a full-frame Store is the freshest"
-        );
-
-        // A re-map prunes the seq so a recycled id cannot inherit a stale seq,
-        // and a freshly re-published member is current (never lags on grant).
-        state.unmap_surface(4);
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "an unmapped mid is no longer a member"
-        );
-        state.note_compositor_member_published(4, w, h);
-        // Re-map pruned mid 4's presented witness; it is displayed again on its
-        // next flip.
-        state.note_presented_geom(4, w, h);
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "a freshly published member is current, not lagging"
-        );
-        // ...and now mid 1 (seq 7) is the one lagging the fresh mid 4 (seq 9).
-        assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 7, 9)));
     }
 
     /// Inter-buffer retention is STRUCTURAL, not copied — the invariant the a/b
@@ -3239,10 +3215,19 @@ mod tests {
             "a never-displayed publisher must not be a retention-gap peer"
         );
 
-        // Once the publisher is itself displayed, it is a genuine sibling and the
-        // gap re-appears — the gate keys on presented-ness alone, nothing else.
+        // Once the publisher is itself displayed, the two are genuine siblings —
+        // and that is exactly when they stop being separate storage. A second
+        // presented surface at this geometry latches the swapchain, both resolve
+        // to the one `OutputGroup` resident, and there is no longer any gap to
+        // report: they hold the same pixels.
         state.note_presented_geom(7, w, h);
-        assert_eq!(state.dense_retention_gap(1, w, h), Some((7, 1, 21)));
+        assert!(state.output_group_for(1, w, h).is_some());
+        assert_eq!(
+            state.dense_retention_gap(1, w, h),
+            None,
+            "unified members share a resident; a lag in their per-member Store \
+             counts cannot mean their pixels differ"
+        );
     }
 
     /// A surface the guest names in a display transaction joins the output group

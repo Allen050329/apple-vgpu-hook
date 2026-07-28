@@ -1344,7 +1344,7 @@ fn clear_only_present_pairs_with_store_fifo_order() {
 /// the healthy-alternation case (both within 1 → no substitution) is locked by
 /// `clear_only_present_pairs_with_store_fifo_order`.
 #[test]
-fn clear_only_present_substitutes_fresh_peer_for_starved_fifo_member() {
+fn clear_only_present_captures_the_fifo_paired_member_not_a_denser_peer() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
@@ -1402,13 +1402,11 @@ fn clear_only_present_substitutes_fresh_peer_for_starved_fifo_member() {
     for _ in 0..(RETENTION_GAP_MARGIN + 2) {
         state.note_compositor_member_published(1, w, h);
     }
-    let (peer, mine_seq, peer_seq) = state
-        .dense_retention_gap(5, w, h)
-        .expect("mid 5 lags a fresher peer");
-    assert_eq!(peer, 1, "mid 1 is the full-frame-freshest peer");
+    let mine_seq = state.present.dense_frame_seq[&5];
+    let peer_seq = state.present.dense_frame_seq[&1];
     assert!(
         peer_seq >= mine_seq + RETENTION_GAP_MARGIN,
-        "the gap crosses the substitution margin"
+        "the lag that used to trigger a substitution is present"
     );
     // The FIFO pairs the next present with the STARVED member (mid 5).
     assert!(state.note_member_store(5, w, h, 12));
@@ -1435,12 +1433,12 @@ fn clear_only_present_substitutes_fresh_peer_for_starved_fifo_member() {
     );
 
     assert_eq!(
-        state.present.frame_mapping, 1,
-        "starved FIFO member (mid 5) substituted by the full-frame-freshest peer (mid 1)"
+        state.present.frame_mapping, 5,
+        "the FIFO-paired member is captured; nothing substitutes a `denser` peer"
     );
     assert_eq!(
-        state.present.frame_bgra[0], 0x11,
-        "captured the fresh peer's content, not the starved member's stale pages"
+        state.present.frame_bgra[0], 0x55,
+        "its own pages, however far its per-member Store count lags a sibling's"
     );
 }
 
@@ -1543,10 +1541,11 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     for _ in 0..(RETENTION_GAP_MARGIN * 8 + 2) {
         state.note_compositor_member_published(1, w, h);
     }
-    let (peer, named_seq, peer_seq) = state
-        .dense_retention_gap(5, w, h)
-        .expect("mid 1 is a same-geometry presented peer of mid 5");
-    assert_eq!(peer, 1);
+    // Read the lag straight out of the per-member counters. It used to be read
+    // through `dense_retention_gap`, which no longer reports one between unified
+    // members — the point of this test is that the lag exists and changes nothing.
+    let named_seq = state.present.dense_frame_seq[&5];
+    let peer_seq = state.present.dense_frame_seq[&1];
     assert!(
         peer_seq - named_seq > RETENTION_GAP_MARGIN,
         "the lag this test needs is present: {peer_seq} - {named_seq}"

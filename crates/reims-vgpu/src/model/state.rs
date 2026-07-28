@@ -2565,6 +2565,22 @@ impl DeviceState {
         if member.width != w || member.height != h {
             return None;
         }
+        // A proven swapchain geometry has no retention gap to report, because its
+        // members are not separate storage. Every presented member at a latched
+        // geometry resolves to the one `TargetIdentity::OutputGroup` resident —
+        // that is what unification means, and `presented_at` (the peer filter
+        // below) is the same admission gate — so a lag between their per-member
+        // full-frame counts cannot correspond to any difference in pixels. The
+        // comparison is not merely weak evidence here; there is nothing for it to
+        // be evidence about.
+        //
+        // Measured before deleting: boot 87 emitted 77 of these, **all** at
+        // 1920x1080, all between mids 2/5/6 — precisely the members that boot's
+        // `resident_identity_shared` lines show sharing one resident — on a boot
+        // whose screen was correct at every capture.
+        if self.output_group_for(mapping_id, w, h).is_some() {
+            return None;
+        }
         let presented_seq = self
             .present
             .dense_frame_seq
