@@ -1999,12 +1999,15 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 ));
             }
         }
-        // The frame is decided; this only reads it. `capture_present_frame`
-        // above took its pixels from the GPU resident and the host surface
-        // cache, so the guest's own pages are the one copy in the comparison
-        // our present path did not produce — and the only way to tell a stale
-        // resident from a guest that has not repainted.
-        crate::runtime::present_divergence::note_present(state, host, mapping, w, h);
+        // No guest-page comparison here. The presented surface's guest window is
+        // stale by construction on the Vulkan rail — `import_present` defers the
+        // compositor front buffer's writeback on every present, so the pinned
+        // resident is authoritative and those pages hold pre-dispatch bytes
+        // until a host path reads them. Measured: ~99.5% of the frame differs at
+        // full swing on every present, with a deferred window armed every time.
+        // The guest's `screencapture` is an oracle because it makes the guest
+        // re-execute the composite; its memory for a surface we render into is
+        // not.
         crate::observe::line(format!(
             "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={}",
             encoded as u8, state.present.frame_valid as u8

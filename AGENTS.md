@@ -263,6 +263,28 @@ zero, not a keystroke that was sent. A first hand-run of that sequence quit with
 did not quit, and the post-close capture scored 391 083 differing pixels — which is "a window is
 present", not residue. It was caught by looking at the image.
 
+**The guest's screen is an oracle. The guest's memory is not.** The distinction is that
+`screencapture` makes the guest *re-execute* the composite; guest memory for a surface we render
+into is our own output one step removed, and on a rail that defers the writeback it is not even
+that. It is tempting to skip the external capture and read the pages from inside the device, because
+that gives a continuous always-on line instead of a scripted round. It does not give an independent
+one.
+
+Measured, on x86/Vulkan: a present-boundary probe compared the frame being shown against the
+presented surface's own guest pages. Every window read ~2 062 000 of 2 073 600 pixels differing at
+full swing, on every present, with a deferred render window armed over the span every time. That is
+the deferred-writeback contract stating itself — the pinned resident is authoritative and the guest
+window holds pre-dispatch bytes until something reads them — and because the compositor's front
+buffer is deferred on every present, the "nothing owed" case that would have meant something never
+occurred. Fifty-two windows, zero.
+
+That is the **third** way a probe fails, after "cannot distinguish the cases" and "counts events, not
+state": the discriminating condition is unreachable by construction. It is the most flattering of the
+three, because the probe fires, produces large confident numbers, and every one of them is the
+mechanism you already knew about. Guard against it by splitting the line so the discriminating
+subset has its own counter — then "it never fired" and "it could never fire" are different readings,
+and a zero denominator says which. A single fused count cannot.
+
 ### Fit The Wrong Output Before Naming A Wrong Mechanism
 
 Once known values have been through the path, you hold measured/nominal pairs. **Fit them to a

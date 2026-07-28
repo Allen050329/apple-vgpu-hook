@@ -51,8 +51,6 @@ pub mod mtlb;
 /// Object-list lookup and type-11 registration.
 pub mod objects;
 pub mod plan;
-/// Present-boundary probe: captured frame vs the guest's own pages.
-pub mod present_divergence;
 /// GVA resolver traits (wraps [`crate::contract::gva_resolve`]).
 pub mod resolve;
 /// Guest surface → host BGRA8 for the QEMU console.
