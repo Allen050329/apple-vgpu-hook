@@ -2584,6 +2584,62 @@ mod tests {
         ));
     }
 
+    /// A compositor buffer's draws and its first capture reach different
+    /// residents, which is the gap `note_present_identity_handoff` counts.
+    /// `surface_identity` shares a resident only once a mid has been presented
+    /// at a latched geometry, and `capture_present_frame` marks it presented
+    /// before it resolves — so the draws into a fresh buffer land in a resident
+    /// of its own and the present that names it reads the shared one.
+    #[test]
+    fn a_buffers_resident_changes_under_it_on_its_first_present() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [1u32, 5u32, 9u32] {
+            state.map_surface(mid);
+        }
+        // Two members already presented here: the geometry is a proven
+        // swapchain, so anything that joins resolves to the shared resident.
+        state.note_presented_geom(1, 1920, 1080);
+        state.note_presented_geom(5, 1920, 1080);
+        assert!(state.present.output_group_geoms.contains(&(1920, 1080)));
+
+        // WindowServer allocates a fresh buffer and draws into it. It has not
+        // been named in a display transaction yet, so every draw resolves to a
+        // resident of its own.
+        let drawing = surface_identity(&state, 9, 1920, 1080);
+        assert_eq!(drawing.surface_mapping_id(), Some(9));
+
+        // The transaction then names it. `capture_present_frame` marks it
+        // presented before resolving, so the capture reads the shared resident
+        // — a different image than the one those draws went into.
+        state.note_presented_geom(9, 1920, 1080);
+        let capturing = surface_identity(&state, 9, 1920, 1080);
+        assert!(matches!(capturing, TargetIdentity::OutputGroup { .. }));
+        assert_ne!(
+            drawing, capturing,
+            "the draws and the capture must be shown to disagree, or \
+             `note_present_identity_handoff` is counting nothing"
+        );
+    }
+
+    /// A geometry with only one surface ever presented has no group, so a
+    /// buffer's draws and its first capture reach the same resident. This is
+    /// the arm that keeps the sibling test from passing for the wrong reason.
+    #[test]
+    fn an_unlatched_geometry_has_no_resident_to_hand_off_to() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [1u32, 9u32] {
+            state.map_surface(mid);
+        }
+        state.note_presented_geom(1, 1280, 720);
+        assert!(!state.present.output_group_geoms.contains(&(1280, 720)));
+        let drawing = surface_identity(&state, 9, 1280, 720);
+        state.note_presented_geom(9, 1280, 720);
+        // Presenting the second surface latches the geometry, which is exactly
+        // why the reading must be taken before the present, not after.
+        assert!(state.present.output_group_geoms.contains(&(1280, 720)));
+        assert_eq!(drawing.surface_mapping_id(), Some(9));
+    }
+
     /// A proven swapchain geometry keeps unifying a lone presented member across
     /// the buffer recycles that momentarily leave a single concurrently
     /// presented member. This is the black-background / desktop-residue class:
