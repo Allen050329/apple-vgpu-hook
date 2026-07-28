@@ -1069,8 +1069,8 @@ pub struct PresentState {
     /// erased in a peer has a higher epoch there than in a presented mid still
     /// showing the stale content (the a/b damage-coverage residue). Pruned on
     /// unmap in [`Self::forget_compositor_mapping`]. Feeds the `tile_divergence`
-    /// proxy and the route-B cross-mid correction rects; the correction result is
-    /// separately classified by the always-on `tile_composite` proxy.
+    /// proxy, which reports the size of that residue; nothing here selects or
+    /// alters the pixels that get presented.
     pub tile_gen: BTreeMap<u32, Box<[u64; TILE_GEN_TILES]>>,
     /// Monotonic frame clock for [`Self::tile_gen`], advanced ONCE PER PRESENT
     /// cycle (never per draw — a per-draw clock makes an actively-repainted
@@ -2662,10 +2662,23 @@ impl DeviceState {
     }
 
     /// The same-geometry compositor-output peer of `mapping_id` holding the
-    /// freshest full frame (`dense_frame_seq`). Unlike [`Self::dense_retention_gap`]
-    /// this does NOT gate on a whole-frame seq lag — tile-level residue is exactly
-    /// the case where the whole-frame seqs match but individual tiles diverge, so
-    /// the tile-divergence path needs the peer regardless of whole-frame lag.
+    /// freshest full frame (`dense_frame_seq`).
+    ///
+    /// **Measurement only. This must never decide what is presented.** The
+    /// display transaction names plane 0's surface id and that is the capture
+    /// source; a comparison between two of our own bookkeeping counters is not
+    /// evidence that some other buffer is the frame the guest asked for.
+    /// Substituting the "denser" peer shows a buffer one rotation step behind
+    /// what was named — residue when a window closed in between, a stale region
+    /// when one moved, and thrash whenever the ranking oscillates.
+    ///
+    /// What the peer is for is stating the size of that divergence:
+    /// [`Self::tile_divergence_vs_peer`] and [`Self::divergent_tile_count`] read
+    /// it to report how far the presented buffer has drifted from its sibling,
+    /// which is the always-on proxy for the a/b residue class. Unlike
+    /// [`Self::dense_retention_gap`] it does NOT gate on a whole-frame seq lag,
+    /// because tile-level residue is exactly the case where the whole-frame seqs
+    /// match and individual tiles still diverge.
     pub fn compositor_geometry_peer(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
         if mapping_id == 0 || w == 0 || h == 0 {
             return None;
@@ -2686,61 +2699,6 @@ impl DeviceState {
             })
             .max_by_key(|(_, s)| *s)
             .map(|(mid, _)| mid)
-    }
-
-    /// Fill `out` (cleared first) with the pixel-space rects `(x0,y0,x1,y1)` of
-    /// the tiles where `peer_mid` is fresher than `presented_mid` by the retention
-    /// margin — the residue tiles to composite from the peer's resident. Adjacent
-    /// divergent tiles in a row are coalesced into one rect to cut the copy-region
-    /// count. Tiling matches the `present_proxy` DAMAGE_GRID. Returns the number
-    /// of divergent TILES (not rects). Reuses `out` so the present path allocates
-    /// only on growth. A peer tile the peer never drew (epoch 0 ≤ presented) is
-    /// never emitted — the by-construction guard against pulling black over the
-    /// presented mid's good background.
-    pub fn collect_divergent_tile_rects(
-        &self,
-        presented_mid: u32,
-        peer_mid: u32,
-        w: u32,
-        h: u32,
-        out: &mut Vec<(u32, u32, u32, u32)>,
-    ) -> u32 {
-        out.clear();
-        if presented_mid == peer_mid || w == 0 || h == 0 {
-            return 0;
-        }
-        let (Some(pres), Some(peer)) = (
-            self.present.tile_gen.get(&presented_mid),
-            self.present.tile_gen.get(&peer_mid),
-        ) else {
-            return 0;
-        };
-        let margin = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-        let mut count = 0u32;
-        for gy in 0..TILE_GEN_GRID_H {
-            let y0 = (gy * h as usize / TILE_GEN_GRID_H) as u32;
-            let y1 = ((gy + 1) * h as usize / TILE_GEN_GRID_H) as u32;
-            let row = gy * TILE_GEN_GRID_W;
-            let mut run_start: Option<usize> = None;
-            for gx in 0..TILE_GEN_GRID_W {
-                let divergent = peer[row + gx] >= pres[row + gx].saturating_add(margin);
-                if divergent {
-                    count += 1;
-                    if run_start.is_none() {
-                        run_start = Some(gx);
-                    }
-                } else if let Some(start) = run_start.take() {
-                    let x0 = (start * w as usize / TILE_GEN_GRID_W) as u32;
-                    let x1 = (gx * w as usize / TILE_GEN_GRID_W) as u32;
-                    out.push((x0, y0, x1, y1));
-                }
-            }
-            if let Some(start) = run_start.take() {
-                let x0 = (start * w as usize / TILE_GEN_GRID_W) as u32;
-                out.push((x0, y0, w, y1));
-            }
-        }
-        count
     }
 
     /// For a presented `mapping_id`, find its freshest same-geometry peer and

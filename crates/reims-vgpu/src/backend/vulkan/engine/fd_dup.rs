@@ -29,7 +29,7 @@ pub enum FdDupRail {
     /// `export_scanout_from_bgra`'s scanout export fd (the CPU-capture → dmabuf
     /// scanout rail).
     ExportScanout,
-    /// `export_present_from_resident_composited_fd_policy`'s present export fd
+    /// `export_present_from_resident_fd_policy`'s present export fd
     /// (the zero-copy resident → dmabuf present rail).
     ExportPresent,
 }

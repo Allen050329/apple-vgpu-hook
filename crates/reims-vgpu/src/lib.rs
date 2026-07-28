@@ -601,7 +601,6 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         // every non-macOS host.
         let resident_source =
             window_present_source(state, p.frame_mapping, p.frame_width, p.frame_height);
-        let peer_keepalive_identity = resident_source.peer.as_ref().map(|(identity, _)| identity);
         let direct_ready = resident_source
             .candidates
             .iter()
@@ -618,9 +617,8 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             return;
         }
         let now_ms = crate::observe::elapsed_ms() as u64;
-        crate::backend::vulkan::engine::touch_resident_targets(
+        crate::backend::vulkan::engine::touch_resident_target(
             resident_source.candidates.first(),
-            peer_keepalive_identity,
             now_ms,
         );
         let mut cap_sample = crate::backend::vulkan::engine::cap_pressure_snapshot();
@@ -654,24 +652,14 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             p.frame_width,
             p.frame_height,
         );
-        let peer_keepalive_identity = state
-            .compositor_geometry_peer(p.frame_mapping, p.frame_width, p.frame_height)
-            .map(|peer_mid| {
-                crate::runtime::import_present::member_surface_identity(
-                    state,
-                    peer_mid,
-                    p.frame_width,
-                    p.frame_height,
-                )
-            });
-        // Route-B present-staleness proxies (Linux pathway has no divergent-tile
-        // masking — that path is macOS-only). Compare the resident we are about
+        // Route-B present-staleness proxies. Compare the resident we are about
         // to present (frame_mapping) against the freshest same-geometry
         // compositor member. A sustained whole-frame seq gap (`routeb_stale`)
         // means we are presenting a buffer the guest has moved on from — the
         // "frame rate != rendered" crawl. A per-tile divergence
         // (`routeb_tile_residue`) is the localized a/b residue. Both are deduped
-        // so a persistent condition logs once, not per present.
+        // so a persistent condition logs once, not per present. Measure-only:
+        // the presented surface is the one the display transaction named.
         {
             let fm = p.frame_mapping;
             let fw = p.frame_width;
@@ -696,8 +684,9 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             // Per-tile divergence: the presented buffer (frame_mapping) vs its
             // same-geometry compositor peer. This is the ACTUAL residue signal
             // (a tile the peer erased but frame_mapping still shows) — the
-            // seq-gap above is whole-frame and misses it. Route-B on Linux has
-            // no divergent-tile masking, so a >0 count here == on-screen residue.
+            // seq-gap above is whole-frame and misses it. Nothing masks these
+            // tiles on the way to the screen, so a >0 count here == on-screen
+            // residue.
             let (div_tiles, div_bbox, tile_peer) = state
                 .compositor_geometry_peer(fm, fw, fh)
                 .map(|peer| {
@@ -758,11 +747,7 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             // SCHED_OTHER for the user; hits/misses are count-trustworthy.
             let export_started = std::time::Instant::now();
             let now_ms = crate::observe::elapsed_ms() as u64;
-            crate::backend::vulkan::engine::touch_resident_targets(
-                Some(&present_identity),
-                peer_keepalive_identity.as_ref(),
-                now_ms,
-            );
+            crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
             let dmabuf = export_present_dmabuf(
                 state,
                 p.frame_mapping,
@@ -865,19 +850,6 @@ fn window_present_source(
 
     let identity = crate::runtime::import_present::surface_identity(state, mapping, width, height);
     let mut candidates = vec![identity.clone()];
-    let mut divergent_rects = Vec::new();
-    let peer = state
-        .compositor_geometry_peer(mapping, width, height)
-        .map(|peer_mid| {
-            state.collect_divergent_tile_rects(
-                mapping,
-                peer_mid,
-                width,
-                height,
-                &mut divergent_rects,
-            );
-            crate::runtime::import_present::member_surface_identity(state, peer_mid, width, height)
-        });
     if matches!(identity, TargetIdentity::OutputGroup { .. }) {
         candidates.push(crate::runtime::import_present::member_surface_identity(
             state, mapping, width, height,
@@ -887,9 +859,6 @@ fn window_present_source(
         width,
         height,
         candidates,
-        peer: peer
-            .filter(|_| !divergent_rects.is_empty())
-            .map(|identity| (identity, divergent_rects)),
     }
 }
 
@@ -908,28 +877,9 @@ fn export_present_dmabuf(
     use std::os::fd::FromRawFd;
     let source = window_present_source(state, mapping, width, height);
     let identity = source.candidates.first()?;
-    // Cross-mid damage-coverage correction: if the presented mid is the STALE
-    // half of the a/b pair, composite
-    // the freshest same-geometry peer's divergent tiles (ones the guest erased in
-    // the peer but this mid still holds stale — the stuck-menu / rubber-band
-    // residue) onto the export. When we present the FRESH mid, `collect_*` finds
-    // no peer-fresher tiles → no composite. The engine skips the composite unless
-    // the peer resident is ready + BGRA + same geometry, so this never darkens a
-    // tile.
-    let peer_arg = source
-        .peer
-        .as_ref()
-        .map(|(identity, rects)| (identity, rects.as_slice()));
-    let identity_peer = matches!(
-        identity,
-        crate::backend::vulkan::engine::TargetIdentity::Surface { .. }
-    )
-    .then_some(peer_arg)
-    .flatten();
     let mut export = unsafe {
-        crate::backend::vulkan::engine::export_present_from_resident_composited_fd_policy(
+        crate::backend::vulkan::engine::export_present_from_resident_fd_policy(
             identity,
-            identity_peer,
             |ring_idx, ew, eh| !import_ack.is_imported(ew, eh, ring_idx),
         )
     };
@@ -941,9 +891,8 @@ fn export_present_dmabuf(
     {
         let member = source.candidates.get(1)?;
         export = unsafe {
-            crate::backend::vulkan::engine::export_present_from_resident_composited_fd_policy(
+            crate::backend::vulkan::engine::export_present_from_resident_fd_policy(
                 member,
-                peer_arg,
                 |ring_idx, ew, eh| !import_ack.is_imported(ew, eh, ring_idx),
             )
         };

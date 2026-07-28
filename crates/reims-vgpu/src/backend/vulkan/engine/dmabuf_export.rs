@@ -329,27 +329,6 @@ pub(crate) unsafe fn record_blit_present_into_export(
     src_layout: vk::ImageLayout,
     export: &ExportedScanoutImage,
 ) {
-    record_blit_present_into_export_composited(device, cb, src_image, src_layout, export, None);
-}
-
-/// As [`record_blit_present_into_export`], but after the full-frame base blit
-/// from `src_image` (the presented mid), composite the divergent-tile `regions`
-/// from `peer` (a same-geometry peer mid's resident) on top — the cross-mid
-/// damage-coverage correction. `peer` is
-/// `Some((peer_image, peer_layout, regions))` ONLY when the caller has already
-/// verified the peer resident is ready + BGRA + same geometry AND `regions` is
-/// non-empty; passing an empty region list is a no-op base blit. Each region is
-/// a same-offset src→dst `ImageCopy` (peer[x0..x1] → export[x0..x1]) so a tile
-/// the guest erased in the peer overrides the stale tile the presented mid still
-/// holds.
-pub(crate) unsafe fn record_blit_present_into_export_composited(
-    device: &ash::Device,
-    cb: vk::CommandBuffer,
-    src_image: vk::Image,
-    src_layout: vk::ImageLayout,
-    export: &ExportedScanoutImage,
-    peer: Option<(vk::Image, vk::ImageLayout, &[vk::ImageCopy])>,
-) {
     let color_range = vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)
@@ -357,12 +336,9 @@ pub(crate) unsafe fn record_blit_present_into_export_composited(
         .base_array_layer(0)
         .layer_count(1);
 
-    // Only composite the peer when there are regions to copy.
-    let peer = peer.filter(|(_, _, regions)| !regions.is_empty());
-
     // Export UNDEFINED → TRANSFER_DST (we overwrite every texel, so UNDEFINED
     // discards its prior contents), and source → TRANSFER_SRC for the read.
-    let mut pre = vec![
+    let pre = [
         vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -382,22 +358,6 @@ pub(crate) unsafe fn record_blit_present_into_export_composited(
             .image(src_image)
             .subresource_range(color_range),
     ];
-    // The peer resident also needs to be readable as TRANSFER_SRC for the
-    // divergent-tile copy. (When peer == src_image this would be a duplicate
-    // barrier, but the caller only supplies a DIFFERENT peer mid's resident.)
-    if let Some((peer_image, peer_layout, _)) = peer {
-        pre.push(
-            vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(peer_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(peer_image)
-                .subresource_range(color_range),
-        );
-    }
     device.cmd_pipeline_barrier(
         cb,
         vk::PipelineStageFlags::ALL_COMMANDS,
@@ -429,20 +389,6 @@ pub(crate) unsafe fn record_blit_present_into_export_composited(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &[copy],
     );
-
-    // Cross-mid correction: overwrite the divergent tiles with the peer's fresher
-    // content. The base copy already landed the whole frame, so these regions
-    // strictly refine it (the guest erased these tiles in the peer).
-    if let Some((peer_image, _, regions)) = peer {
-        device.cmd_copy_image(
-            cb,
-            peer_image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            export.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            regions,
-        );
-    }
 
     // Export → GENERAL, making the transfer write available to any later read
     // (readback copy in tests; the external dmabuf consumer at boot).

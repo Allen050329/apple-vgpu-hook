@@ -345,64 +345,12 @@ fn try_capture_from_resident(
     let need = buf.len();
     let identity =
         crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    let mut divergent_rects = Vec::new();
-    let peer_identity = state
-        .compositor_geometry_peer(mapping_id, width, height)
-        .map(|peer_mid| {
-            state.collect_divergent_tile_rects(
-                mapping_id,
-                peer_mid,
-                width,
-                height,
-                &mut divergent_rects,
-            );
-            // Measure-only sibling of the `dense_retention_gap` presented-peer
-            // gate: `compositor_geometry_peer` is deliberately NOT presented-gated
-            // (its distinct-resident divergence patches the black-band class), so
-            // a never-displayed full-frame publisher CAN become the tile-composite
-            // source and bleed its tiles onto a real output — the "residue/tiles"
-            // symptom. This has been dormant on every traced x86 boot
-            // (`tile_comp=0`); if it ever fires with `peer_presented=0` the leak is
-            // now visible and a gate can be added against a real reproduction.
-            if !divergent_rects.is_empty() && !state.presented_at(peer_mid, width, height) {
-                crate::runtime::census::present_proxy::note_tile_composite_unpresented_peer(
-                    mapping_id,
-                    peer_mid,
-                    divergent_rects.len(),
-                    width,
-                    height,
-                );
-            }
-            crate::runtime::import_present::member_surface_identity(state, peer_mid, width, height)
-        });
-    let member_peer = match &peer_identity {
-        Some(peer_identity) if !divergent_rects.is_empty() => {
-            Some((peer_identity, divergent_rects.as_slice()))
-        }
-        _ => None,
-    };
-    let identity_peer = matches!(
-        identity,
-        crate::backend::vulkan::engine::TargetIdentity::Surface { .. }
-    )
-    .then_some(member_peer)
-    .flatten();
-    let primary = crate::backend::vulkan::engine::read_resident_bgra_composited(
-        &identity,
-        identity_peer,
-        need,
-    );
+    let primary = crate::backend::vulkan::engine::read_resident_bgra(&identity, need);
     let member =
         crate::runtime::import_present::member_surface_identity(state, mapping_id, width, height);
     let bgra = primary.or_else(|| {
         (member != identity)
-            .then(|| {
-                crate::backend::vulkan::engine::read_resident_bgra_composited(
-                    &member,
-                    member_peer,
-                    need,
-                )
-            })
+            .then(|| crate::backend::vulkan::engine::read_resident_bgra(&member, need))
             .flatten()
     });
     let Some(bgra) = bgra else {
@@ -3745,39 +3693,6 @@ mod tests {
         }
         let (count, _) = state.divergent_tile_count(1, 5);
         assert!(count <= 1, "only the corner tile may diverge, got {count}");
-    }
-
-    #[test]
-    fn tile_gen_collect_rects_coalesces_and_guards_undrawn_peer() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        // Presented mid 1 holds the full frame; peer 5 re-damages the whole top
-        // menu strip repeatedly (a full-width row-0 run).
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (0, 0, w, 30), w, h);
-        }
-        let mut rects = Vec::new();
-        let n = state.collect_divergent_tile_rects(1, 5, w, h, &mut rects);
-        assert!(n > 0);
-        // A full-width divergent row coalesces to ONE rect spanning x 0..w.
-        assert_eq!(
-            rects.len(),
-            1,
-            "full-width divergent row coalesces to one rect"
-        );
-        assert_eq!(rects[0].0, 0);
-        assert_eq!(rects[0].2, w);
-        // Presenting the FRESH mid instead finds nothing (no peer-fresher tiles).
-        assert_eq!(
-            state.collect_divergent_tile_rects(5, 1, w, h, &mut rects),
-            0
-        );
-        assert!(rects.is_empty());
     }
 
     #[test]

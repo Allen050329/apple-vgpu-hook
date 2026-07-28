@@ -80,8 +80,6 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::atomic::Ordering;
 use types::ComputeError;
 
-pub type DivergentRect = (u32, u32, u32, u32);
-pub type ResidentPeer<'a> = (&'a TargetIdentity, &'a [DivergentRect]);
 pub type OptionalExportedPresent = (Option<i32>, u64, u32, u32, usize);
 type ResidentReadback = (Vec<u8>, Option<Color8ContentStats>);
 
@@ -502,24 +500,15 @@ pub fn unpin_resident_target(identity: &TargetIdentity) {
     let _ = guard.pools.pin_resident_target(identity, false);
 }
 
-/// Refresh one or two resident targets' idle-drain timestamps without doing GPU
-/// work. Direct-present uses this before export so the displayed resident and a
-/// same-geometry peer that may be needed for route-B tile compositing cannot be
-/// reclaimed simply because the peer is offscreen.
-pub fn touch_resident_targets(
-    primary: Option<&TargetIdentity>,
-    secondary: Option<&TargetIdentity>,
-    now_ms: u64,
-) {
+/// Refresh a resident target's idle-drain timestamp without doing GPU work.
+/// Direct-present uses this before export so the displayed resident is not
+/// reclaimed underneath the window on a present that does no draw.
+pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
+    let Some(identity) = identity else {
+        return;
+    };
     let mut guard = lock_engine();
-    if let Some(identity) = primary {
-        guard.pools.registry_touch_at(identity, now_ms);
-    }
-    if let Some(identity) = secondary {
-        if primary != Some(identity) {
-            guard.pools.registry_touch_at(identity, now_ms);
-        }
-    }
+    guard.pools.registry_touch_at(identity, now_ms);
 }
 
 /// Arm a GPU-side present-proxy stats reduction for `identity` (see
@@ -800,21 +789,6 @@ pub fn supports_sampled_r32f_linear_filter() -> bool {
 /// fall back silently. These are speculative conditions on a normal boot (a cold
 /// mid has no resident yet), not failures worth a fail-log line.
 pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
-    read_resident_bgra_composited(identity, None, need)
-}
-
-/// As [`read_resident_bgra`], with an optional same-geometry peer whose
-/// divergent tile rects overwrite the base frame in the readback buffer.
-///
-/// Both copies are recorded on the GPU before the one host readback. Neither
-/// authoritative resident nor guest memory is modified. This is the CPU
-/// display-route counterpart of
-/// [`export_present_from_resident_composited_fd_policy`].
-pub fn read_resident_bgra_composited(
-    identity: &TargetIdentity,
-    peer: Option<ResidentPeer<'_>>,
-    need: usize,
-) -> Option<Vec<u8>> {
     {
         let guard = lock_engine();
         let slot = guard.pools.registry_get(identity)?;
@@ -822,7 +796,7 @@ pub fn read_resident_bgra_composited(
             return None;
         }
     }
-    let mut px = match read_target_inner(identity, false, peer) {
+    let mut px = match read_target_inner(identity, false) {
         Ok((pixels, _)) => pixels,
         Err(e) => {
             let mut emit = crate::observe::Emit::decline("present_capture", &e);
@@ -843,7 +817,6 @@ pub fn read_resident_bgra_composited(
 fn read_target_inner(
     identity: &TargetIdentity,
     measure_content: bool,
-    peer: Option<ResidentPeer<'_>>,
 ) -> Result<ResidentReadback, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
@@ -866,42 +839,6 @@ fn read_target_inner(
     let height = slot.height;
     let image = slot.image;
     let old_layout = slot.layout;
-    let mut peer_skip_reason =
-        crate::runtime::census::present_proxy::TileComposite::NoPeerRequested;
-    let peer_snapshot = match peer {
-        None => None,
-        Some((_peer_identity, [])) => {
-            peer_skip_reason = crate::runtime::census::present_proxy::TileComposite::EmptyRects;
-            None
-        }
-        Some((peer_identity, _)) if peer_identity == identity => {
-            peer_skip_reason = crate::runtime::census::present_proxy::TileComposite::SameIdentity;
-            None
-        }
-        Some((peer_identity, _)) => match pools.registry_get(peer_identity) {
-            None => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerMissing;
-                None
-            }
-            Some(peer_slot) if !peer_slot.content_ready => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerNotReady;
-                None
-            }
-            Some(peer_slot) if !peer_slot.bgra => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerNotBgra;
-                None
-            }
-            Some(peer_slot) if peer_slot.width != width || peer_slot.height != height => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerGeomMismatch;
-                None
-            }
-            Some(peer_slot) => Some((peer_identity, peer_slot.image, peer_slot.layout)),
-        },
-    };
     let rb_size = (width as u64) * (height as u64) * 4;
     let readback = unsafe { pools.acquire_readback(ctx, rb_size, counters)? };
 
@@ -972,96 +909,6 @@ fn read_target_inner(
             readback.buffer,
             &region,
         );
-        let peer_regions: Vec<ash::vk::BufferImageCopy> = if peer_snapshot.is_some() {
-            peer.map(|(_, rects)| {
-                rects
-                    .iter()
-                    .filter_map(|&(x0, y0, x1, y1)| {
-                        let x1 = x1.min(width);
-                        let y1 = y1.min(height);
-                        (x0 < x1 && y0 < y1 && x0 < width && y0 < height).then(|| {
-                            ash::vk::BufferImageCopy::default()
-                                .buffer_offset(((y0 as u64 * width as u64) + x0 as u64) * 4)
-                                .buffer_row_length(width)
-                                .buffer_image_height(height)
-                                .image_subresource(ash::vk::ImageSubresourceLayers {
-                                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                                    mip_level: 0,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                })
-                                .image_offset(ash::vk::Offset3D {
-                                    x: x0 as i32,
-                                    y: y0 as i32,
-                                    z: 0,
-                                })
-                                .image_extent(ash::vk::Extent3D {
-                                    width: x1 - x0,
-                                    height: y1 - y0,
-                                    depth: 1,
-                                })
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        if let Some((_, peer_image, peer_layout)) = peer_snapshot {
-            if !peer_regions.is_empty() {
-                if peer_layout != ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                    let barrier = [ash::vk::ImageMemoryBarrier::default()
-                        .src_access_mask(
-                            ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                                | ash::vk::AccessFlags::TRANSFER_WRITE
-                                | ash::vk::AccessFlags::SHADER_WRITE,
-                        )
-                        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
-                        .old_layout(peer_layout)
-                        .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                        .image(peer_image)
-                        .subresource_range(ash::vk::ImageSubresourceRange {
-                            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })];
-                    ctx.device.cmd_pipeline_barrier(
-                        cb,
-                        ash::vk::PipelineStageFlags::ALL_COMMANDS,
-                        ash::vk::PipelineStageFlags::TRANSFER,
-                        ash::vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &barrier,
-                    );
-                }
-                let overwrite_barrier = [ash::vk::BufferMemoryBarrier::default()
-                    .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-                    .buffer(readback.buffer)
-                    .offset(0)
-                    .size(rb_size)];
-                ctx.device.cmd_pipeline_barrier(
-                    cb,
-                    ash::vk::PipelineStageFlags::TRANSFER,
-                    ash::vk::PipelineStageFlags::TRANSFER,
-                    ash::vk::DependencyFlags::empty(),
-                    &[],
-                    &overwrite_barrier,
-                    &[],
-                );
-                ctx.device.cmd_copy_image_to_buffer(
-                    cb,
-                    peer_image,
-                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    readback.buffer,
-                    &peer_regions,
-                );
-            }
-        }
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackEndCb, e)))?;
@@ -1103,30 +950,6 @@ fn read_target_inner(
         };
         ctx.device.unmap_memory(readback.memory);
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        if let Some((peer_identity, _, _)) = peer_snapshot {
-            if !peer_regions.is_empty() {
-                pools
-                    .registry_set_layout(peer_identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-            }
-        }
-        if let Some((_, rects)) = peer {
-            if !rects.is_empty() {
-                let reason = if !peer_regions.is_empty() {
-                    crate::runtime::census::present_proxy::TileComposite::Applied
-                } else if peer_snapshot.is_some() {
-                    crate::runtime::census::present_proxy::TileComposite::EmptyRegions
-                } else {
-                    peer_skip_reason
-                };
-                crate::runtime::census::present_proxy::note_tile_composite_result(
-                    reason,
-                    rects.len(),
-                    peer_regions.len(),
-                    width,
-                    height,
-                );
-            }
-        }
         counters.note_readback(rb_size);
         Ok((out, content))
     }
@@ -1134,7 +957,7 @@ fn read_target_inner(
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
-    read_target_inner(identity, false, None).map(|(pixels, _)| pixels)
+    read_target_inner(identity, false).map(|(pixels, _)| pixels)
 }
 
 /// Flush read of a **pinned deferred-writeback resident storage image**: copy
@@ -1700,7 +1523,7 @@ fn identity_kind(identity: &TargetIdentity) -> &'static str {
     }
 }
 
-/// Classify an `export_present_from_resident_composited_fd_policy` registry miss
+/// Classify an `export_present_from_resident_fd_policy` registry miss
 /// into an actionable outcome, ONE always-on line per (kind, geometry) per
 /// process (deduped so a steady miss never floods). A resident that exists under
 /// a DIFFERENT key at this geometry
@@ -1754,18 +1577,11 @@ fn classify_export_present_miss(pools: &pools::ResourcePools, identity: &TargetI
     ));
 }
 
-/// # Safety
+/// Blit `identity`'s resident into the next present export ring slot and hand
+/// back that slot's dmabuf.
 ///
-/// When `peer` is `Some((peer_identity, divergent_rects))` and that peer
-/// resident is present, ready, BGRA and the same geometry, the export blit
-/// composites the peer's content for `divergent_rects` on top of the presented
-/// mid's full-frame blit — the cross-mid damage-coverage correction
-/// (). When the peer resident is
-/// missing/not-ready/mismatched, the composite is silently skipped (the
-/// presented mid's own frame is exported unchanged — no regression, never a
-/// black tile). `divergent_rects` are pixel-space `(x0,y0,x1,y1)`.
-///
-/// `fd_needed` lets the caller decide whether the selected export ring slot
+/// The exported pixels are exactly the named resident's; nothing else is mixed
+/// in. `fd_needed` lets the caller decide whether the selected export ring slot
 /// needs another fd duplicate. The export image is still updated every call;
 /// suppressing the fd only avoids redundant fd dup/close churn when the
 /// consumer has acknowledged an existing import.
@@ -1774,9 +1590,8 @@ fn classify_export_present_miss(pools: &pools::ResourcePools, identity: &TargetI
 ///
 /// Engine teardown must not race this call. When `fd_needed` requests an fd,
 /// the caller owns it and must close it after importing or abandoning it.
-pub unsafe fn export_present_from_resident_composited_fd_policy(
+pub unsafe fn export_present_from_resident_fd_policy(
     identity: &TargetIdentity,
-    peer: Option<ResidentPeer<'_>>,
     fd_needed: impl FnOnce(usize, u32, u32) -> bool,
 ) -> Result<OptionalExportedPresent, DrawError> {
     let mut guard = lock_engine();
@@ -1826,42 +1641,6 @@ pub unsafe fn export_present_from_resident_composited_fd_policy(
         }
         (slot.image, slot.layout, slot.width, slot.height)
     };
-    // Resolve the optional peer resident for the cross-mid tile composite. Every
-    // guard is a REQUIREMENT (ready + BGRA + exact geometry) — a miss simply
-    // skips the composite, exporting the presented mid's own frame unchanged, so
-    // this can never darken a tile or export mismatched content.
-    let mut peer_skip_reason =
-        crate::runtime::census::present_proxy::TileComposite::NoPeerRequested;
-    let peer_snapshot: Option<(ash::vk::Image, ash::vk::ImageLayout)> = match peer {
-        None => None,
-        Some((_peer_id, [])) => {
-            peer_skip_reason = crate::runtime::census::present_proxy::TileComposite::EmptyRects;
-            None
-        }
-        Some((peer_id, _)) => match pools.registry_get(peer_id) {
-            None => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerMissing;
-                None
-            }
-            Some(slot) if !slot.content_ready => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerNotReady;
-                None
-            }
-            Some(slot) if !slot.bgra => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerNotBgra;
-                None
-            }
-            Some(slot) if slot.width != width || slot.height != height => {
-                peer_skip_reason =
-                    crate::runtime::census::present_proxy::TileComposite::PeerGeomMismatch;
-                None
-            }
-            Some(slot) => Some((slot.image, slot.layout)),
-        },
-    };
     // Keep the presented target alive against the idle drain: a re-presented but
     // not re-drawn resident is resolved via registry_get (no draw-path stamp), so
     // without this it could age out from under the display.
@@ -1903,72 +1682,7 @@ pub unsafe fn export_present_from_resident_composited_fd_policy(
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentBeginCb, e)))?;
     // GPU→GPU: resident (OPTIMAL, current layout) → export (LINEAR). Same helper
     // the byte-identical blit test validates.
-    // Build the divergent-tile copy regions when a peer composite is armed.
-    let sub_layers = ash::vk::ImageSubresourceLayers::default()
-        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-        .mip_level(0)
-        .base_array_layer(0)
-        .layer_count(1);
-    let peer_copies: Vec<ash::vk::ImageCopy> = if peer_snapshot.is_some() {
-        peer.map(|(_, rects)| {
-            rects
-                .iter()
-                .filter(|&&(x0, y0, x1, y1)| x1 > x0 && y1 > y0)
-                .map(|&(x0, y0, x1, y1)| {
-                    ash::vk::ImageCopy::default()
-                        .src_subresource(sub_layers)
-                        .dst_subresource(sub_layers)
-                        .src_offset(ash::vk::Offset3D {
-                            x: x0 as i32,
-                            y: y0 as i32,
-                            z: 0,
-                        })
-                        .dst_offset(ash::vk::Offset3D {
-                            x: x0 as i32,
-                            y: y0 as i32,
-                            z: 0,
-                        })
-                        .extent(ash::vk::Extent3D {
-                            width: x1 - x0,
-                            height: y1 - y0,
-                            depth: 1,
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if let Some((_, rects)) = peer {
-        if !rects.is_empty() {
-            let reason = if !peer_copies.is_empty() {
-                crate::runtime::census::present_proxy::TileComposite::Applied
-            } else if peer_snapshot.is_some() {
-                crate::runtime::census::present_proxy::TileComposite::EmptyRegions
-            } else {
-                peer_skip_reason
-            };
-            crate::runtime::census::present_proxy::note_tile_composite_result(
-                reason,
-                rects.len(),
-                peer_copies.len(),
-                width,
-                height,
-            );
-        }
-    };
-    let peer_arg = peer_snapshot
-        .filter(|_| !peer_copies.is_empty())
-        .map(|(img, lay)| (img, lay, peer_copies.as_slice()));
-    dmabuf_export::record_blit_present_into_export_composited(
-        &ctx.device,
-        cb,
-        src_image,
-        src_layout,
-        export,
-        peer_arg,
-    );
+    dmabuf_export::record_blit_present_into_export(&ctx.device, cb, src_image, src_layout, export);
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentEndCb, e)))?;

@@ -1398,9 +1398,7 @@ fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
     let i = ((h / 2) * w + w / 2) as usize * 4;
     let center_before = [before[i], before[i + 1], before[i + 2], before[i + 3]];
 
-    match unsafe {
-        engine::export_present_from_resident_composited_fd_policy(&identity, None, |_, _, _| true)
-    } {
+    match unsafe { engine::export_present_from_resident_fd_policy(&identity, |_, _, _| true) } {
         Ok((fd, pitch, ew, eh, ring_idx)) => {
             let fd = fd.expect("always-true fd policy must return an fd");
             assert!(fd >= 0, "export returned an invalid fd");
@@ -1421,7 +1419,7 @@ fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
             eprintln!("SKIP export-present resident (no dmabuf export): {e}");
             return;
         }
-        Err(e) => panic!("export_present_from_resident_composited_fd_policy: {e}"),
+        Err(e) => panic!("export_present_from_resident_fd_policy: {e}"),
     }
 
     // The export blit must not have corrupted the resident: the same content is
@@ -1439,103 +1437,6 @@ fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
             && near(center_after[2], 64)
             && near(center_after[3], 255),
         "resident center BGRA={center_after:?}; expected ~(191,128,64,255)"
-    );
-}
-
-/// The arm Cocoa route consumes a host BGRA frame rather than a dmabuf. Its
-/// readback must apply the same cross-mid tile correction as direct export,
-/// entirely on the GPU and without changing either resident.
-#[test]
-fn resident_readback_composites_peer_rects_without_mutating_residents() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
-    let (v, f) = triangle_spirv();
-    let (w, h) = (16u32, 16u32);
-    let base = TargetIdentity::Surface {
-        id: 101,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    let peer = TargetIdentity::Surface {
-        id: 102,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    let make = |identity: TargetIdentity| {
-        let mut req = engine_req(&v, &f, w, h);
-        req.target_identity = Some(identity);
-        req.output_bgra = true;
-        req.skip_readback = true;
-        req
-    };
-    let base_req = make(base.clone());
-    let peer_req = make(peer.clone());
-    for (label, req) in [("composite base", &base_req), ("composite peer", &peer_req)] {
-        match engine::execute_draw_request(req) {
-            Ok(_) => {}
-            Err(e) if skip_if_no_gpu(&e.to_string()) => {
-                eprintln!("SKIP {label}: {e}");
-                return;
-            }
-            Err(e) => panic!("{label}: {e}"),
-        }
-    }
-    let mut peer_add = make(peer.clone());
-    peer_add.load_op = Some(LoadOp::LoadFromTarget);
-    peer_add.blend = Some(BlendStateResource {
-        src_color: BlendFactor::One,
-        dst_color: BlendFactor::One,
-        color_op: BlendOp::Add,
-        src_alpha: BlendFactor::One,
-        dst_alpha: BlendFactor::Zero,
-        alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
-    });
-    engine::execute_draw_request(&peer_add).expect("make peer content distinct");
-
-    let base_before = engine::read_target(&base).expect("read base before composite");
-    let peer_before = engine::read_target(&peer).expect("read peer before composite");
-    let rects = [(0, h / 2, w, h)];
-    let composed = engine::read_resident_bgra_composited(
-        &base,
-        Some((&peer, rects.as_slice())),
-        (w * h * 4) as usize,
-    )
-    .expect("composited resident readback");
-
-    let pixel = |bytes: &[u8], x: u32, y: u32| {
-        let i = ((y * w + x) * 4) as usize;
-        [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]
-    };
-    let differing_pixel = |y0: u32, y1: u32| {
-        (y0..y1)
-            .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .find(|&(x, y)| pixel(&base_before, x, y) != pixel(&peer_before, x, y))
-            .expect("base and peer clears differ in the selected half")
-    };
-    let outside = (0, 0);
-    let inside = differing_pixel(h / 2, h);
-    assert_eq!(
-        pixel(&composed, outside.0, outside.1),
-        pixel(&base_before, outside.0, outside.1),
-        "outside the peer rect must retain the base resident"
-    );
-    assert_eq!(
-        pixel(&composed, inside.0, inside.1),
-        pixel(&peer_before, inside.0, inside.1),
-        "inside the peer rect must use the peer resident"
-    );
-    assert_eq!(
-        engine::read_target(&base).expect("read base after composite"),
-        base_before,
-        "composited readback must not mutate the base resident"
-    );
-    assert_eq!(
-        engine::read_target(&peer).expect("read peer after composite"),
-        peer_before,
-        "composited readback must not mutate the peer resident"
     );
 }
 

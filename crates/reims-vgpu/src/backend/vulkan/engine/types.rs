@@ -1127,14 +1127,15 @@ pub enum TargetIdentity {
 
 pub type PresentRect = (u32, u32, u32, u32);
 
-/// Ordered resident candidates and optional cross-member tile correction for a
-/// host-window present. The first content-ready BGRA candidate is authoritative.
+/// Ordered resident candidates for a host-window present. The first
+/// content-ready BGRA candidate at `width`x`height` is authoritative; the whole
+/// list resolves the ONE surface the display transaction named (an output-group
+/// identity plus its member fallback), never a choice between surfaces.
 #[derive(Clone, Debug)]
 pub struct WindowPresentSource {
     pub width: u32,
     pub height: u32,
     pub candidates: Vec<TargetIdentity>,
-    pub peer: Option<(TargetIdentity, Vec<PresentRect>)>,
 }
 
 impl Default for TargetIdentity {

@@ -18,9 +18,8 @@
 //! | `rect_void` | A populated frame contains a large axis-aligned block of near-black coarse tiles | Stable black quadrants / missing retained damage base |
 //! | `damage_hole` | A large connected frame transition encloses a large unchanged rectangle | Old wallpaper retained inside newly painted window bounds |
 //! | `selected_peer_divergence` | The protocol-selected retain is sparse while a same-geometry Store peer is dense | Hidden complete ping/pong sibling / incomplete retained Load base |
-//! | `tile_composite` | A detected tile-divergence episode was route-B composited or skipped with a named reason | Separates corrected residue from a missing peer-copy precondition |
 //!
-//! Summary counters: `reims_vgpu_thrash_summary mid_sw=… nz_sw=… sparse=… geom=… fail=… dock=… rainbow=… void=… damage_hole=… peer_divergence=… tile_comp=… tile_comp_skip=…`
+//! Summary counters: `reims_vgpu_thrash_summary mid_sw=… nz_sw=… sparse=… geom=… fail=… dock=… rainbow=… void=… damage_hole=… peer_divergence=…`
 //! (emitted every [`SUMMARY_EVERY`] present captures).
 //!
 //! Always-on census (not a thrash event): `OFF present_strip …` on every display-sized
@@ -229,17 +228,6 @@ struct ThrashState {
     /// reported, so a sustained residue fires once per changed count, never per
     /// present (the anti-flood the reverted prototype lacked).
     tile_divergence_active: std::collections::BTreeMap<u32, u32>,
-    /// Distinct route-B tile-composite outcomes for tile-divergence episodes:
-    /// `applied` when the peer-copy preconditions held and at least one Vulkan
-    /// region was recorded, otherwise `skipped reason=<slug>` naming the exact
-    /// missing precondition. This is a result census for the already-detected
-    /// divergence; it never influences which frame is presented.
-    tile_composite_applied: u64,
-    tile_composite_skipped: u64,
-    /// Dedup the latest composite result shape. Cleared when `tile_divergence`
-    /// clears, so a later episode with the same shape re-fires without logging
-    /// every present while a residue is stable.
-    tile_composite_active: Option<TileCompositeLast>,
     /// Distinct torn-capture substitutions: a ClearOnly present's selection (via
     /// store_fifo ring order or a graph fallback) picked a compositor member
     /// whose full-frame sequence (`dense_frame_seq`) lagged a same-geometry peer
@@ -262,10 +250,6 @@ struct ThrashState {
     /// (reason, geometry) combinations a boot produces.
     secondary_mrt_drop_seen: std::collections::BTreeSet<(u8, u32, u32)>,
     secondary_mrt_blend_seen: std::collections::BTreeSet<(u32, u32, u32)>,
-    /// Dedup for [`note_tile_composite_unpresented_peer`], keyed on the
-    /// `(presented_mid, peer_mid)` pair so a persistent leak logs once per pair
-    /// per boot rather than once per present.
-    tile_comp_unpresented_seen: std::collections::BTreeSet<(u32, u32)>,
     /// Boot-convergence proxy: whether a full-size present has reached
     /// [`CONVERGE_DENSE_FRAC`] RGB occupancy yet (the wallpaper/desktop first
     /// fully composited). Latched once — the `present_converge` line fires
@@ -306,73 +290,6 @@ struct ThrashState {
     last_summary_ms: u64,
     last_summary_presents: u64,
     damage: std::collections::BTreeMap<u32, DamageAnchor>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TileCompositeLast {
-    outcome: TileComposite,
-    width: u32,
-    height: u32,
-    rects: usize,
-    regions: usize,
-}
-
-/// How a detected tile-divergence episode ended.
-///
-/// Every skip is a **requirement** that did not hold (ready + BGRA + exact
-/// geometry), so a miss exports the presented mid's own frame unchanged and can
-/// never darken a tile. It is still a correction that did not run, which is why
-/// each one is named rather than counted as "skipped".
-///
-/// A `Refusal` and not a `Decline`: `Applied` and `NoPeerRequested` are the two
-/// values that are not skips at all, and `Emit::refusal` is what makes them
-/// unable to write a `reason=` by accident — the exact defect the census survey
-/// found on the sibling `import_content` line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TileComposite {
-    /// The peer copy ran: preconditions held and `regions>0` were recorded.
-    Applied,
-    /// No peer was offered for this present — not a tile-composite situation.
-    NoPeerRequested,
-    /// A peer was offered with an empty damage-rect list.
-    EmptyRects,
-    /// The peer resolved but produced no copy regions.
-    EmptyRegions,
-    /// The peer identity is the presented target itself.
-    SameIdentity,
-    /// The peer identity is not in the resident registry.
-    PeerMissing,
-    /// The peer resident has never had content written.
-    PeerNotReady,
-    /// The peer resident is not BGRA, so a copy would mis-order channels.
-    PeerNotBgra,
-    /// The peer resident's geometry differs from the presented target's.
-    PeerGeomMismatch,
-}
-
-impl crate::observe::Refusal for TileComposite {
-    fn refusal(&self) -> Option<&'static str> {
-        match self {
-            Self::Applied | Self::NoPeerRequested => None,
-            Self::EmptyRects => Some("tile_peer_empty_rects"),
-            Self::EmptyRegions => Some("tile_peer_empty_regions"),
-            Self::SameIdentity => Some("tile_peer_same_identity"),
-            Self::PeerMissing => Some("tile_peer_missing"),
-            Self::PeerNotReady => Some("tile_peer_not_ready"),
-            Self::PeerNotBgra => Some("tile_peer_not_bgra"),
-            Self::PeerGeomMismatch => Some("tile_peer_geom_mismatch"),
-        }
-    }
-}
-
-impl TileComposite {
-    /// `status=` on the census line: whether the correction ran.
-    pub fn status(&self) -> &'static str {
-        match self {
-            Self::Applied => "applied",
-            _ => "skipped",
-        }
-    }
 }
 
 /// Which multi-RT build check bailed, degrading the draw to single-RT.
@@ -495,13 +412,9 @@ impl ThrashState {
             dense_gap_active: std::collections::BTreeMap::new(),
             tile_divergence: 0,
             tile_divergence_active: std::collections::BTreeMap::new(),
-            tile_composite_applied: 0,
-            tile_composite_skipped: 0,
-            tile_composite_active: None,
             stale_present_substitute: 0,
             stale_subst_active: std::collections::BTreeMap::new(),
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
-            tile_comp_unpresented_seen: std::collections::BTreeSet::new(),
             secondary_mrt_blend_seen: std::collections::BTreeSet::new(),
             first_dense_seen: false,
             post_converge_nondense_run: 0,
@@ -1559,7 +1472,6 @@ pub fn note_tile_divergence(
     if tiles == 0 {
         // Residue cleared: drop the dedup so a fresh episode re-fires.
         st.tile_divergence_active.remove(&presented_mid);
-        st.tile_composite_active = None;
         return false;
     }
     if st.tile_divergence_active.get(&presented_mid) == Some(&tiles) {
@@ -1571,93 +1483,6 @@ pub fn note_tile_divergence(
     thrash_line(&format!(
         "tile_divergence presented_mid={presented_mid} peer_mid={peer_mid} tiles={tiles} bbox=[{},{},{},{}] {width}x{height}",
         bbox[0], bbox[1], bbox[2], bbox[3]
-    ));
-    true
-}
-
-/// Route-B tile-composite result census for an already-detected
-/// [`note_tile_divergence`] episode. `reason="applied"` means the peer-copy
-/// preconditions held and `regions>0` copy regions were recorded; every other
-/// reason is a named skip precondition (`peer_missing`, `peer_not_ready`,
-/// `peer_not_bgra`, `peer_geom_mismatch`, `empty_regions`, ...). Always-on and
-/// fail-log visible, but behavior-neutral: this only names whether the existing
-/// divergent-tile correction actually ran. Returns true when a distinct result
-/// was logged.
-pub fn note_tile_composite_result(
-    outcome: TileComposite,
-    rects: usize,
-    regions: usize,
-    width: u32,
-    height: u32,
-) -> bool {
-    if rects == 0 || width == 0 || height == 0 {
-        return false;
-    }
-    let event = TileCompositeLast {
-        outcome,
-        width,
-        height,
-        rects,
-        regions,
-    };
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if st.tile_composite_active == Some(event) {
-        return false;
-    }
-    st.tile_composite_active = Some(event);
-    if outcome == TileComposite::Applied {
-        st.tile_composite_applied = st.tile_composite_applied.saturating_add(1);
-    } else {
-        st.tile_composite_skipped = st.tile_composite_skipped.saturating_add(1);
-    }
-    drop(st);
-    // `status=` says whether the correction ran; `reason=` appears **only** when
-    // it did not, because a success has no reason to name. The line used to
-    // carry `reason=applied`, which is the shape that teaches a reader to ignore
-    // `reason=`. Field order is identical in both branches so one grep reads
-    // either.
-    let tail = format!(
-        "status={} rects={rects} regions={regions}",
-        outcome.status()
-    );
-    match observe::Emit::refusal("tile_composite", &outcome) {
-        Some(e) => e
-            .field("status", outcome.status())
-            .field("rects", rects)
-            .field("regions", regions)
-            .field("geom", format!("{width}x{height}"))
-            .off(),
-        None => observe::off(format!("tile_composite {tail} geom={width}x{height}")),
-    }
-    true
-}
-
-/// Measure-only: the tile-composite path selected a `peer_mid` that has NEVER
-/// been displayed at this geometry ([`crate::model::DeviceState::presented_at`])
-/// as the source of `rects` divergent tiles. `compositor_geometry_peer` is not
-/// presented-gated (its distinct-resident divergence patches the black-band
-/// class), so a never-displayed full-frame publisher can bleed its tiles onto a
-/// real output — the residue/tiles symptom, and the tile-level analogue of the
-/// `peer_presented=0` whole-frame substitution that
-/// [`crate::model::DeviceState::dense_retention_gap`] now excludes. This has been
-/// dormant on every traced x86 boot; a nonzero count is the reproduction a real
-/// gate here would need. Deduped on `(presented_mid, peer_mid)` — one line per
-/// pair per boot, not per present. Returns whether a new pair was logged.
-pub fn note_tile_composite_unpresented_peer(
-    presented_mid: u32,
-    peer_mid: u32,
-    rects: usize,
-    width: u32,
-    height: u32,
-) -> bool {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if !st.tile_comp_unpresented_seen.insert((presented_mid, peer_mid)) {
-        return false;
-    }
-    drop(st);
-    observe::fail(format!(
-        "tile_composite_unpresented_peer presented_mid={presented_mid} peer_mid={peer_mid} \
-         rects={rects} {width}x{height} (compositing tiles from a never-displayed peer)"
     ));
     true
 }
@@ -2798,7 +2623,7 @@ pub mod capture_source {
 /// `export_present_dmabuf` every present, which submits a synchronous GPU blit
 /// (OPTIMAL resident → LINEAR export image) and WAITS on its fence on the drain
 /// worker before returning the fd
-/// (`export_present_from_resident_composited_fd_policy` → `retire_all`).
+/// (`export_present_from_resident_fd_policy` → `retire_all`).
 /// This is the biggest remaining per-present serialization once the CPU readback
 /// and writeback prefetch are elided, but its cost is otherwise lumped into
 /// `retire_wait_us`. This census isolates it: `hits` (a dmabuf fd was produced) /
@@ -3384,7 +3209,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
         st.last_summary_ms = now_ms;
         st.last_summary_presents = st.presents;
         thrash_line(&format!(
-            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} tile_comp={} tile_comp_skip={} stale_subst={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
+            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} stale_subst={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
             st.presents,
             present_hz,
             st.mid_switches,
@@ -3401,8 +3226,6 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
             st.damage_hole_bg,
             st.selected_peer_divergence,
             st.dense_retention_gap,
-            st.tile_composite_applied,
-            st.tile_composite_skipped,
             st.stale_present_substitute,
             st.first_dense_seen as u8,
             st.post_converge_regress,
@@ -3703,9 +3526,6 @@ pub struct ThrashCounters {
     /// Distinct a/b inter-buffer retention-gap episodes (structural sibling of
     /// `selected_peer_divergence`; see [`note_dense_retention_gap`]).
     pub dense_retention_gap: u64,
-    /// Distinct route-B peer-copy results for tile-divergence episodes.
-    pub tile_composite_applied: u64,
-    pub tile_composite_skipped: u64,
     /// True once a full-size present reached [`CONVERGE_DENSE_FRAC`] occupancy
     /// (the desktop first fully composited this boot).
     pub converged: bool,
@@ -3765,8 +3585,6 @@ pub fn counters() -> ThrashCounters {
         damage_hole_bg: st.damage_hole_bg,
         selected_peer_divergence: st.selected_peer_divergence,
         dense_retention_gap: st.dense_retention_gap,
-        tile_composite_applied: st.tile_composite_applied,
-        tile_composite_skipped: st.tile_composite_skipped,
         converged: st.first_dense_seen,
         post_converge_regress: st.post_converge_regress,
         stale_online_pending: st.stale_online_pending,
@@ -4148,7 +3966,6 @@ mod tests {
             "first stale-online must log the always-on line"
         );
     }
-
 
     /// The desktop converges, then the guest reverts to a sustained overlay
     /// (rgb_frac ≈0.13 — not sparse, not dense): `post_converge_regress` fires
@@ -4880,141 +4697,35 @@ mod tests {
         assert_eq!(counters().dense_retention_gap, 3);
     }
 
+    /// The per-tile residue proxy fires on a new or changed episode, stays quiet
+    /// while the count holds, and re-arms once the residue clears — so a
+    /// sustained residue costs one line rather than one per present, and the next
+    /// episode is still visible.
     #[test]
-    fn tile_composite_result_dedups_and_rearms_on_divergence_clear() {
+    fn tile_divergence_dedups_per_count_and_rearms_when_it_clears() {
         let _g = test_lock();
         reset_for_test();
         let (w, h) = (1920u32, 1080u32);
 
         assert!(note_tile_divergence(4, 1, 6, [1, 0, 3, 2], w, h));
-        assert!(note_tile_composite_result(
-            TileComposite::Applied,
-            2,
-            2,
-            w,
-            h
-        ));
-        assert_eq!(counters().tile_composite_applied, 1);
-        assert_eq!(counters().tile_composite_skipped, 0);
         assert!(
-            !note_tile_composite_result(TileComposite::Applied, 2, 2, w, h),
-            "stable applied result should not re-log every present"
+            !note_tile_divergence(4, 1, 6, [1, 0, 3, 2], w, h),
+            "a stable residue must not re-log every present"
         );
-        assert_eq!(counters().tile_composite_applied, 1);
-
-        assert!(note_tile_composite_result(
-            TileComposite::PeerNotReady,
-            2,
-            0,
-            w,
-            h
-        ));
-        assert_eq!(counters().tile_composite_applied, 1);
-        assert_eq!(counters().tile_composite_skipped, 1);
         assert!(
-            !note_tile_composite_result(TileComposite::PeerNotReady, 2, 0, w, h),
-            "stable skip reason should be deduped"
+            note_tile_divergence(4, 1, 9, [1, 0, 4, 2], w, h),
+            "a widened residue is a new episode"
         );
-        assert_eq!(counters().tile_composite_skipped, 1);
-
         assert!(
             !note_tile_divergence(4, 1, 0, [0; 4], w, h),
-            "clearing divergence only rearms the result dedup"
-        );
-        assert!(note_tile_composite_result(
-            TileComposite::PeerNotReady,
-            2,
-            0,
-            w,
-            h
-        ));
-        assert_eq!(counters().tile_composite_skipped, 2);
-    }
-
-    /// The tile-composite never-displayed-peer proxy logs once per
-    /// `(presented_mid, peer_mid)` pair (a persistent leak must not spam per
-    /// present), and a distinct pair re-fires.
-    #[test]
-    fn tile_composite_unpresented_peer_dedups_per_pair() {
-        let _g = test_lock();
-        reset_for_test();
-        let (w, h) = (1920u32, 1080u32);
-
-        assert!(
-            note_tile_composite_unpresented_peer(6, 1, 40, w, h),
-            "first sighting of a never-displayed peer logs"
+            "clearing the residue only rearms the dedup"
         );
         assert!(
-            !note_tile_composite_unpresented_peer(6, 1, 40, w, h),
-            "same pair on a later present is deduped"
+            note_tile_divergence(4, 1, 6, [1, 0, 3, 2], w, h),
+            "the same count after a clear is a fresh episode"
         );
-        assert!(
-            !note_tile_composite_unpresented_peer(6, 1, 12, w, h),
-            "dedup is keyed on the pair, not the rect count"
-        );
-        assert!(
-            note_tile_composite_unpresented_peer(6, 9, 5, w, h),
-            "a distinct never-displayed peer re-fires"
-        );
-    }
-
-    /// `reason=` names a refusal, so a *success* must not carry one.
-    ///
-    /// This line used to render `reason=applied`, which is the shape that teaches
-    /// a reader to ignore the field — and the census survey that opened this unit
-    /// found 190 lines of the same shape on one boot. `Emit::refusal` returning
-    /// `Option` is what makes it unrepresentable now rather than merely
-    /// discouraged.
-    #[test]
-    fn only_a_skipped_tile_composite_carries_a_reason() {
-        let _g = test_lock();
-        reset_for_test();
-        let path = observe::fail_log_path();
-        let read = || std::fs::read_to_string(path).unwrap_or_default();
-        let (w, h) = (1913u32, 1077u32);
-
-        let before = read().lines().count();
-        let lines_since = |before: usize| -> Vec<String> {
-            read()
-                .lines()
-                .skip(before)
-                .filter(|l| l.contains("tile_composite "))
-                .map(str::to_string)
-                .collect()
-        };
-
-        assert!(note_tile_composite_result(
-            TileComposite::Applied,
-            2,
-            2,
-            w,
-            h
-        ));
-        let applied = lines_since(before);
-        assert_eq!(applied.len(), 1, "expected one line, got {applied:?}");
-        assert!(
-            applied[0].contains("status=applied") && !applied[0].contains("reason="),
-            "a success must not name a reason: {}",
-            applied[0]
-        );
-
-        let before = read().lines().count();
-        assert!(note_tile_composite_result(
-            TileComposite::PeerGeomMismatch,
-            2,
-            0,
-            w,
-            h
-        ));
-        let skipped = lines_since(before);
-        assert_eq!(skipped.len(), 1, "expected one line, got {skipped:?}");
-        assert!(
-            skipped[0].contains("reason=tile_peer_geom_mismatch")
-                && skipped[0].contains("status=skipped"),
-            "a skip must name which precondition failed: {}",
-            skipped[0]
-        );
-        reset_for_test();
+        // A different presented buffer keeps its own dedup.
+        assert!(note_tile_divergence(5, 1, 6, [1, 0, 3, 2], w, h));
     }
 
     /// The sample side and the render side of the MRT-mask class had one name

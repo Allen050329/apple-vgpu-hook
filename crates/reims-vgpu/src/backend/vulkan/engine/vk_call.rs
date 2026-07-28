@@ -127,7 +127,7 @@ pub enum VkOp {
     /// `vkQueueSubmit` of the scanout export blit.
     ExportScanoutSubmit,
 
-    // ---- mod.rs `export_present_from_resident_composited_fd_policy` — the
+    // ---- mod.rs `export_present_from_resident_fd_policy` — the
     //      zero-copy resident → dmabuf present export rail ----
     /// `vkResetCommandBuffer` before recording the present export blit.
     ExportPresentResetCb,

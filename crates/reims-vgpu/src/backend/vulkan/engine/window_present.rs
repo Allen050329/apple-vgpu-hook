@@ -32,16 +32,10 @@ const SLATE_CLEAR: [f32; 4] = [0.05, 0.06, 0.08, 1.0];
 
 /// A host-window present degradation that does not abort the whole present.
 ///
-/// These are not [`SlateReason`]s: a malformed peer rect skips only that
-/// correction tile, and a persistent suboptimal flag still queues presents
-/// while warning that swapchain recreation is not converging.
+/// This is not a [`SlateReason`]: a persistent suboptimal flag still queues
+/// presents while warning that swapchain recreation is not converging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WindowPresentDecline {
-    PeerRectOutOfBounds {
-        rect: PresentRect,
-        width: u32,
-        height: u32,
-    },
     SuboptimalPersistent {
         streak: u32,
         width: u32,
@@ -52,25 +46,12 @@ pub(crate) enum WindowPresentDecline {
 impl crate::observe::Decline for WindowPresentDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::PeerRectOutOfBounds { .. } => "window_present_peer_rect_out_of_bounds",
             Self::SuboptimalPersistent { .. } => "window_present_suboptimal_persistent",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::PeerRectOutOfBounds {
-                rect: (x0, y0, x1, y1),
-                width,
-                height,
-            } => vec![
-                ("x0", x0.to_string()),
-                ("y0", y0.to_string()),
-                ("x1", x1.to_string()),
-                ("y1", y1.to_string()),
-                ("width", width.to_string()),
-                ("height", height.to_string()),
-            ],
             Self::SuboptimalPersistent {
                 streak,
                 width,
@@ -205,9 +186,6 @@ pub(crate) struct WindowPresenter {
     /// Consecutive presents whose acquire or present reported a suboptimal
     /// surface. Each one arms a recreation; see [`SUBOPTIMAL_ALARM_STREAK`].
     suboptimal_streak: u32,
-    /// Latch for the malformed peer-rect fail line — once per presenter, not
-    /// per frame, because one bad upstream producer would flood otherwise.
-    peer_rect_warned: bool,
     /// Reason for the slate run currently in progress, `None` while presenting
     /// guest content. A line is emitted when a run STARTS or its reason
     /// CHANGES, and a summary when it ends — so a window blank for a minute at
@@ -350,7 +328,6 @@ impl WindowPresenter {
             recreate_pending: true,
             recreate_reason: "init",
             suboptimal_streak: 0,
-            peer_rect_warned: false,
             slate_reason: None,
             slate_run: 0,
             cmd_pool,
@@ -649,47 +626,11 @@ impl WindowPresenter {
                 &states,
             );
         }
-        let peer = selected
-            .as_ref()
-            .and_then(|(identity, _, _, width, height)| {
-                if !matches!(identity, TargetIdentity::Surface { .. }) {
-                    return None;
-                }
-                let (peer_identity, rects) = source?.peer.as_ref()?;
-                let slot = pools.registry_get(peer_identity)?;
-                (slot.content_ready
-                    && slot.bgra
-                    && slot.width == *width
-                    && slot.height == *height
-                    && !rects.is_empty())
-                .then(|| {
-                    (
-                        peer_identity.clone(),
-                        slot.image,
-                        slot.layout,
-                        rects.as_slice(),
-                    )
-                })
-            });
-
-        let mut pinned = Vec::with_capacity(2);
+        let mut pinned = Vec::with_capacity(1);
         if let Some((identity, _, _, _, _)) = selected.as_ref() {
             if !pools.pin_resident_target(identity, true) {
                 return Err(DrawError::Facade(
                     EngineFacadeDecline::WindowSourceDisappearedBeforePin {
-                        identity: identity.clone(),
-                    },
-                ));
-            }
-            pinned.push(identity.clone());
-        }
-        if let Some((identity, _, _, _)) = peer.as_ref() {
-            if !pools.pin_resident_target(identity, true) {
-                for pinned_identity in pinned.drain(..) {
-                    let _ = pools.pin_resident_target(&pinned_identity, false);
-                }
-                return Err(DrawError::Facade(
-                    EngineFacadeDecline::WindowPeerDisappearedBeforePin {
                         identity: identity.clone(),
                     },
                 ));
@@ -765,32 +706,6 @@ impl WindowPresenter {
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
                 pools.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                if let Some((peer_identity, peer_image, peer_layout, rects)) = peer.as_ref() {
-                    transition_source(&ctx.device, self.cmd, *peer_image, *peer_layout);
-                    for &rect in *rects {
-                        // The divergent-tile contract is endpoint rects
-                        // (x0,y0,x1,y1) — the same form `read_target_inner`
-                        // consumes on the CPU capture route. Reading them as
-                        // (x,y,w,h) displaced every non-edge peer region.
-                        let Some((src_rect, dst_rect)) =
-                            map_peer_rect(rect, (*base_width, *base_height), &vp)
-                        else {
-                            if !self.peer_rect_warned {
-                                let decline = WindowPresentDecline::PeerRectOutOfBounds {
-                                    rect,
-                                    width: *base_width,
-                                    height: *base_height,
-                                };
-                                crate::observe::Emit::decline("host_window_present", &decline)
-                                    .fail();
-                                self.peer_rect_warned = true;
-                            }
-                            continue;
-                        };
-                        blit_rect(&ctx.device, self.cmd, *peer_image, dst, src_rect, dst_rect);
-                    }
-                    pools.registry_set_layout(peer_identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                }
             } else {
                 ctx.device.cmd_clear_color_image(
                     self.cmd,
@@ -1004,30 +919,6 @@ impl WindowPresenter {
     }
 }
 
-/// Clip an endpoint-form `(x0,y0,x1,y1)` damage rect to the source bounds and
-/// scale it into the destination viewport. `None` for a rect that is empty or
-/// entirely out of range after clipping — the caller treats that as a
-/// fail-visible upstream contract violation, not silent control flow.
-fn map_peer_rect(
-    rect: (u32, u32, u32, u32),
-    src: (u32, u32),
-    vp: &crate::host_window::viewport::Viewport,
-) -> Option<(PresentRect, PresentRect)> {
-    let (x0, y0, x1, y1) = rect;
-    let x1 = x1.min(src.0);
-    let y1 = y1.min(src.1);
-    if x0 >= x1 || y0 >= y1 {
-        return None;
-    }
-    let dst_rect = (
-        vp.x + scale_edge(x0, src.0, vp.width),
-        vp.y + scale_edge(y0, src.1, vp.height),
-        vp.x + scale_edge_ceil(x1, src.0, vp.width),
-        vp.y + scale_edge_ceil(y1, src.1, vp.height),
-    );
-    Some(((x0, y0, x1, y1), dst_rect))
-}
-
 fn swapchain_recreated_line(from: vk::Extent2D, to: vk::Extent2D, reason: &str) -> String {
     format!(
         "host_window_swapchain status=recreated from={}x{} to={}x{} trigger={reason}",
@@ -1154,93 +1045,9 @@ unsafe fn blit_rect(
     );
 }
 
-fn scale_edge(value: u32, source: u32, destination: u32) -> u32 {
-    (value as u64)
-        .saturating_mul(destination as u64)
-        .checked_div(source.max(1) as u64)
-        .unwrap_or(0) as u32
-}
-
-fn scale_edge_ceil(value: u32, source: u32, destination: u32) -> u32 {
-    let numerator = (value as u64).saturating_mul(destination as u64);
-    numerator
-        .saturating_add(source.max(1) as u64 - 1)
-        .checked_div(source.max(1) as u64)
-        .unwrap_or(0)
-        .min(destination as u64) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scaled_damage_edges_cover_the_source_rect() {
-        assert_eq!(scale_edge(1, 3, 10), 3);
-        assert_eq!(scale_edge_ceil(2, 3, 10), 7);
-        assert_eq!(scale_edge(0, 0, 10), 0);
-        assert_eq!(scale_edge_ceil(5, 0, 10), 10);
-    }
-
-    fn full_vp(width: u32, height: u32) -> crate::host_window::viewport::Viewport {
-        crate::host_window::viewport::Viewport {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        }
-    }
-
-    #[test]
-    fn peer_rects_are_endpoints_not_extents() {
-        // A lower-right-quadrant endpoint rect maps to itself at equal
-        // source/destination geometry.
-        assert_eq!(
-            map_peer_rect((960, 540, 1920, 1080), (1920, 1080), &full_vp(1920, 1080)),
-            Some(((960, 540, 1920, 1080), (960, 540, 1920, 1080)))
-        );
-        // A non-edge rect stays in place — the historical (x,y,w,h) misread
-        // turned this into a displaced (100,100,300,300) blit.
-        assert_eq!(
-            map_peer_rect((100, 100, 200, 200), (1920, 1080), &full_vp(1920, 1080)),
-            Some(((100, 100, 200, 200), (100, 100, 200, 200)))
-        );
-    }
-
-    #[test]
-    fn peer_rects_clip_to_bounds_and_reject_empty() {
-        assert_eq!(
-            map_peer_rect((1000, 500, 4000, 4000), (1920, 1080), &full_vp(1920, 1080)),
-            Some(((1000, 500, 1920, 1080), (1000, 500, 1920, 1080)))
-        );
-        // Scaling into a half-size destination keeps endpoint coverage.
-        assert_eq!(
-            map_peer_rect((0, 0, 1920, 1080), (1920, 1080), &full_vp(960, 540)),
-            Some(((0, 0, 1920, 1080), (0, 0, 960, 540)))
-        );
-        assert_eq!(
-            map_peer_rect((5, 5, 5, 9), (1920, 1080), &full_vp(1920, 1080)),
-            None
-        );
-        assert_eq!(
-            map_peer_rect((2000, 0, 2100, 50), (1920, 1080), &full_vp(1920, 1080)),
-            None
-        );
-    }
-
-    #[test]
-    fn peer_rects_offset_into_a_letterboxed_viewport() {
-        // 1440x1080 guest pillarboxed into a 1920x1080 drawable at x=240.
-        let vp = crate::host_window::viewport::aspect_fit((1440, 1080), (1920, 1080));
-        assert_eq!(
-            map_peer_rect((0, 0, 1440, 1080), (1440, 1080), &vp),
-            Some(((0, 0, 1440, 1080), (240, 0, 1680, 1080)))
-        );
-        assert_eq!(
-            map_peer_rect((100, 100, 200, 200), (1440, 1080), &vp),
-            Some(((100, 100, 200, 200), (340, 100, 440, 200)))
-        );
-    }
 
     #[test]
     fn swapchain_recreation_line_names_geometry_and_reason() {
@@ -1367,17 +1174,6 @@ mod tests {
     #[test]
     fn non_aborting_present_degradations_keep_exact_geometry() {
         use crate::observe::Decline as _;
-        let peer = WindowPresentDecline::PeerRectOutOfBounds {
-            rect: (1, 2, 65, 66),
-            width: 64,
-            height: 64,
-        };
-        assert_eq!(
-            crate::observe::Emit::decline("host_window_present", &peer).render(),
-            "host_window_present reason=window_present_peer_rect_out_of_bounds \
-             x0=1 y0=2 x1=65 y1=66 width=64 height=64"
-        );
-
         let suboptimal = WindowPresentDecline::SuboptimalPersistent {
             streak: 60,
             width: 1440,
@@ -1391,6 +1187,11 @@ mod tests {
                 ("width", "1440".into()),
                 ("height", "1080".into()),
             ]
+        );
+        assert_eq!(
+            crate::observe::Emit::decline("host_window_present", &suboptimal).render(),
+            "host_window_present reason=window_present_suboptimal_persistent \
+             streak=60 width=1440 height=1080"
         );
     }
 

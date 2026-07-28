@@ -1197,16 +1197,15 @@ mod pin_count_tests {
         );
     }
 
-    /// Route-B tile compositing may need the offscreen same-geometry peer even
-    /// when the displayed member is the only target being presented. Touching
-    /// that peer before export must refresh it against the idle-drain cutoff,
-    /// otherwise the later peer-copy lookup degrades to `tile_composite
-    /// reason=peer_missing` after a static desktop interval.
+    /// `registry_touch_at` refreshes a target against the idle-drain cutoff
+    /// without going through the draw path, so a target that is registered but
+    /// not being drawn survives a static desktop interval when a caller still
+    /// needs it.
     #[test]
-    fn registry_touch_at_keeps_offscreen_peer_alive() {
+    fn registry_touch_at_defers_the_idle_drain_for_an_untouched_target() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0); // displayed target
-        admit(&mut pools, surf(4), 0, 0); // offscreen peer, otherwise aged
+        admit(&mut pools, surf(4), 0, 0); // registered but undrawn, otherwise aged
         let now = IDLE_TARGET_AGE_MS + 500;
 
         pools.registry_touch_at(&surf(4), now);
@@ -1216,12 +1215,12 @@ mod pin_count_tests {
         assert_eq!(
             victims,
             Vec::<TargetIdentity>::new(),
-            "display and touched peer both survive"
+            "the display target and the touched target both survive"
         );
         assert_eq!(
             pools.registry.get(&surf(4)).unwrap().last_touch_ms,
             now,
-            "peer stamped fresh for the export-time composite lookup"
+            "the touched target is stamped at the touch time"
         );
     }
 

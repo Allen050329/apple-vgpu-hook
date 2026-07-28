@@ -1038,7 +1038,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_engine_scatter_present_unknown_identity",
             "vk_engine_scatter_present_not_ready",
             "vk_engine_window_source_disappeared_before_pin",
-            "vk_engine_window_peer_disappeared_before_pin",
         ],
     },
     DeclineClass {
@@ -3044,24 +3043,6 @@ pub const REGISTRY: &[DeclineClass] = &[
     // reader to ignore the field. The censuses whose lines carry only *counts*
     // are correctly absent from this table.
     DeclineClass {
-        type_name: "TileComposite",
-        defined_in: "runtime/census/present_proxy.rs",
-        slug_blocks: &[],
-        emission: Emission::At(&[("runtime/census/present_proxy.rs", "tile_composite")]),
-        slug_calls: &[],
-        // A `Refusal`: `Applied` and `NoPeerRequested` are not skips, and the
-        // line used to render `reason=applied` for the first of them.
-        slugs: &[
-            "tile_peer_empty_rects",
-            "tile_peer_empty_regions",
-            "tile_peer_same_identity",
-            "tile_peer_missing",
-            "tile_peer_not_ready",
-            "tile_peer_not_bgra",
-            "tile_peer_geom_mismatch",
-        ],
-    },
-    DeclineClass {
         type_name: "MrtDrop",
         defined_in: "runtime/census/present_proxy.rs",
         slug_blocks: &[],
@@ -3185,10 +3166,7 @@ pub const REGISTRY: &[DeclineClass] = &[
             "host_window_present",
         )]),
         slug_calls: &[],
-        slugs: &[
-            "window_present_peer_rect_out_of_bounds",
-            "window_present_suboptimal_persistent",
-        ],
+        slugs: &["window_present_suboptimal_persistent"],
     },
     DeclineClass {
         type_name: "SlateReason",
