@@ -63,7 +63,7 @@ unsafe fn stage_buffer_content(
         ),
     };
     if let Some(slot) = slots_by_content.get(&key) {
-        return Ok(slot.clone());
+        return Ok(*slot);
     }
     let slot = match content {
         BufferContent::Bytes(b) => {
@@ -125,7 +125,7 @@ unsafe fn stage_buffer_content(
             slot
         }
     };
-    slots_by_content.insert(key, slot.clone());
+    slots_by_content.insert(key, slot);
     Ok(slot)
 }
 

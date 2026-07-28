@@ -34,11 +34,23 @@ pub(crate) struct TargetKey {
     pub with_transfer_dst: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct BufferSlot {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub size: u64,
+    /// Host address of `memory`, mapped for the slot's whole lifetime, or 0 when
+    /// the slot is not persistently mapped (the readback pools).
+    ///
+    /// A `usize` rather than a pointer so [`crate::backend::vulkan::engine`]'s
+    /// state stays `Send` — the same reason `GuestRun::host_ptr` is one.
+    ///
+    /// Staging memory is HOST_VISIBLE|HOST_COHERENT by construction
+    /// (`MemoryClass::Upload` requires both), so a persistent map needs no
+    /// flush — exactly as the map/write/unmap form it replaces needed none.
+    /// Vulkan permits a memory object to stay mapped for its lifetime, and
+    /// `vkFreeMemory` unmaps implicitly, so no teardown changes.
+    pub mapped: usize,
 }
 
 pub(crate) struct TargetSlot {
@@ -1675,5 +1687,81 @@ mod pool_trim_order_tests {
         }
         assert_eq!(n, 3);
         assert!(pool.is_empty());
+    }
+}
+
+/// Host write pointer for a staging slot's first `size` bytes.
+///
+/// Staging slots are mapped for their lifetime at allocation, so this is a field
+/// read. The fallback map exists for a slot that predates the persistent
+/// mapping or was built by a path that does not map — it is the same
+/// map-per-write the pools used to do everywhere, and it leaks nothing because
+/// `vkFreeMemory` unmaps implicitly.
+unsafe fn staging_write_ptr(
+    ctx: &DeviceContext,
+    slot: &BufferSlot,
+    size: u64,
+) -> Result<*mut u8, DrawError> {
+    if slot.mapped != 0 {
+        return Ok(slot.mapped as *mut u8);
+    }
+    Ok(ctx
+        .device
+        .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))? as *mut u8)
+}
+
+#[cfg(test)]
+mod staging_mapping_tests {
+    use super::{DeviceContext, ResourcePools};
+    use crate::backend::vulkan::engine::counters::EngineCounters;
+    use ash::vk;
+
+    /// A staging slot carries its own host mapping, and keeps it across recycle.
+    ///
+    /// Every staging write used to bracket itself in
+    /// `vkMapMemory`/`vkUnmapMemory` — two driver round trips per buffer bind,
+    /// and the outlier tranches carry ~92 000 binds. The pool's premise is that
+    /// the allocation outlives the bind; so does its mapping.
+    ///
+    /// The recycle half is the part worth pinning: a slot that came back from the
+    /// free list with `mapped == 0` would silently fall back to map-per-write and
+    /// nothing else would notice.
+    #[test]
+    fn a_staging_slot_keeps_one_mapping_across_recycle() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP staging mapping: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
+
+        let first = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+            .expect("a 4 KiB staging slot must be available");
+        assert_ne!(first.mapped, 0, "a fresh staging slot must be mapped");
+
+        // Written through the persistent pointer, readable through it.
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        unsafe { pools.write_staging(&ctx, &first, &payload) }.expect("write must land");
+        let seen = unsafe { std::slice::from_raw_parts(first.mapped as *const u8, payload.len()) };
+        assert_eq!(seen, &payload[..], "the mapping does not observe the write");
+
+        pools.recycle_staging();
+        let again = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+            .expect("the recycled slot must come back");
+        assert_eq!(again.buffer, first.buffer, "expected the recycled slot");
+        assert_eq!(
+            again.mapped, first.mapped,
+            "a recycled slot lost its mapping and would map per write again"
+        );
+
+        pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
     }
 }

@@ -1724,16 +1724,8 @@ impl ResourcePools {
         if let Some(list) = self.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
                 self.note_staging_hit();
-                self.staging_live.push(BufferSlot {
-                    buffer: slot.buffer,
-                    memory: slot.memory,
-                    size: slot.size,
-                });
-                return Ok(BufferSlot {
-                    buffer: slot.buffer,
-                    memory: slot.memory,
-                    size: slot.size,
-                });
+                self.staging_live.push(slot);
+                return Ok(slot);
             }
         }
         let miss_started = Instant::now();
@@ -1783,16 +1775,25 @@ impl ResourcePools {
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
+        // Map once, for the slot's lifetime. Every write went through a
+        // vkMapMemory/vkUnmapMemory pair, two driver round trips per buffer bind
+        // and ~92 000 binds per 202 outlier tranches; the pool's whole point is
+        // that the allocation outlives the bind, and so can its mapping.
+        let mapped = ctx
+            .device
+            .map_memory(memory, 0, bucket, vk::MemoryMapFlags::empty())
+            .map_err(|e| {
+                ctx.device.destroy_buffer(buffer, None);
+                ctx.device.free_memory(memory, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e))
+            })? as usize;
         let slot = BufferSlot {
             buffer,
             memory,
             size: bucket,
+            mapped,
         };
-        self.staging_live.push(BufferSlot {
-            buffer: slot.buffer,
-            memory: slot.memory,
-            size: slot.size,
-        });
+        self.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
         Ok(slot)
     }
@@ -1804,11 +1805,7 @@ impl ResourcePools {
         bytes: &[u8],
     ) -> Result<(), DrawError> {
         let size = bytes.len().max(4) as u64;
-        let ptr = ctx
-            .device
-            .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))?
-            as *mut u8;
+        let ptr = staging_write_ptr(ctx, slot, size)?;
         unsafe {
             if bytes.is_empty() {
                 // Nothing to copy — the mapped span is the 4-byte minimum; zero it
@@ -1821,7 +1818,6 @@ impl ResourcePools {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
             }
         }
-        ctx.device.unmap_memory(slot.memory);
         Ok(())
     }
 
@@ -1843,11 +1839,7 @@ impl ResourcePools {
         total_len: u64,
     ) -> Result<(), DrawError> {
         let size = total_len.max(4);
-        let ptr = ctx
-            .device
-            .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))?
-            as *mut u8;
+        let ptr = staging_write_ptr(ctx, slot, size)?;
         let total = total_len as usize;
         let mut off = 0usize;
         unsafe {
@@ -1869,7 +1861,6 @@ impl ResourcePools {
                 std::ptr::write_bytes(ptr.add(off), 0, size as usize - off);
             }
         }
-        ctx.device.unmap_memory(slot.memory);
         Ok(())
     }
 
@@ -1889,11 +1880,7 @@ impl ResourcePools {
         let bucket = Self::bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.readback_live = Some(BufferSlot {
-                    buffer: slot.buffer,
-                    memory: slot.memory,
-                    size: slot.size,
-                });
+                self.readback_live = Some(slot);
                 return Ok(slot);
             }
         }
@@ -1940,12 +1927,9 @@ impl ResourcePools {
             buffer,
             memory,
             size: bucket,
+            mapped: 0,
         };
-        self.readback_live = Some(BufferSlot {
-            buffer: slot.buffer,
-            memory: slot.memory,
-            size: slot.size,
-        });
+        self.readback_live = Some(slot);
         Ok(slot)
     }
 
@@ -1970,11 +1954,7 @@ impl ResourcePools {
         let bucket = Self::bucket(size.max(4));
         if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.readback_multi_live.push(BufferSlot {
-                    buffer: slot.buffer,
-                    memory: slot.memory,
-                    size: slot.size,
-                });
+                self.readback_multi_live.push(slot);
                 return Ok(slot);
             }
         }
@@ -2021,12 +2001,9 @@ impl ResourcePools {
             buffer,
             memory,
             size: bucket,
+            mapped: 0,
         };
-        self.readback_multi_live.push(BufferSlot {
-            buffer: slot.buffer,
-            memory: slot.memory,
-            size: slot.size,
-        });
+        self.readback_multi_live.push(slot);
         Ok(slot)
     }
 
