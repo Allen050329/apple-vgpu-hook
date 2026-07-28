@@ -1150,6 +1150,43 @@ mod pin_count_tests {
         assert_eq!(victims.len(), IDLE_TARGET_DRAIN_MAX_PER_CALL);
     }
 
+    /// A pass with no registry victim but live staging traffic is NOT settled.
+    ///
+    /// This is the case the victim count alone cannot see and the one that
+    /// actually happens: a steady animation re-uses the same render targets, so
+    /// nothing ages out and every pass reads as quiet, while the upload path runs
+    /// flat out. Measured under testufo the trim fired about once a second
+    /// throughout the load and cost 607 re-allocations of the 8 MiB full-frame
+    /// staging bucket at 12.6 ms each.
+    #[test]
+    fn a_pass_with_no_victims_but_live_uploads_is_not_settled() {
+        let mut pools = ResourcePools::new();
+        // Quiet the gate first, so the assertion below is about uploads and not
+        // about the counter still warming up.
+        for _ in 0..SETTLED_PASSES_FOR_BUFFER_TRIM {
+            pools.note_drain_settled(0);
+        }
+        assert!(pools.note_drain_settled(0), "no victims, no uploads → settled");
+
+        // One staging acquire between passes — no victim, still not settled.
+        pools.staging_hits += 1;
+        assert!(
+            !pools.note_drain_settled(0),
+            "uploads ran between passes; the buffer pools must not be trimmed"
+        );
+        // …and the gate stays shut while uploads keep flowing, however many
+        // zero-victim passes go by.
+        for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM * 3) {
+            pools.staging_misses += 1;
+            assert!(!pools.note_drain_settled(0), "still uploading");
+        }
+        // Uploads stop: the gate reopens after the usual consecutive passes.
+        for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
+            assert!(!pools.note_drain_settled(0), "counter restarted from zero");
+        }
+        assert!(pools.note_drain_settled(0), "settled once uploads stopped");
+    }
+
     /// The HOST_VISIBLE buffer trim gate: only permitted after
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive zero-victim passes, and any
     /// pass that drains ≥1 victim (active churn) resets the counter — so a

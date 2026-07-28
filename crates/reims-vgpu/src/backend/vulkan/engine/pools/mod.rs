@@ -59,6 +59,9 @@ pub(crate) struct ResourcePools {
     staging_misses: u64,
     staging_miss_bins: [usize; STAGING_BUCKET_BINS],
     staging_miss_us_bins: [u64; STAGING_BUCKET_BINS],
+    /// `staging_hits + staging_misses` at the previous fired idle pass; see
+    /// `note_drain_settled`.
+    settled_staging_mark: u64,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,

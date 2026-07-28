@@ -21,6 +21,7 @@ impl ResourcePools {
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
             staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
+            settled_staging_mark: 0,
             targets: HashMap::new(),
             target_order: Vec::new(),
             readback_free: HashMap::new(),
@@ -610,14 +611,33 @@ impl ResourcePools {
 
     /// Update the consecutive-settled-pass counter for a fired idle-drain pass
     /// that reclaimed `drained` registry victims, and return whether the
-    /// HOST_VISIBLE buffer pools may be trimmed this pass. A pass that drained
-    /// ≥1 victim means the working set is still churning (active video ages out
-    /// old frame RTs each pass), so the counter resets. The buffer trim is only
-    /// permitted after `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive zero-victim
-    /// passes, so a single quiet pass mid-playback cannot steal a staging buffer
-    /// and spike the next upload's latency with a full `vkAllocateMemory`.
+    /// HOST_VISIBLE buffer pools may be trimmed this pass.
+    ///
+    /// A pass is settled only if it drained no registry victim AND no staging
+    /// buffer was acquired since the previous pass. The trim then needs
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes.
+    ///
+    /// The victim count alone was the wrong signal, and its own doc comment named
+    /// the failure it was meant to prevent: "a single quiet pass mid-playback
+    /// cannot steal a staging buffer and spike the next upload's latency with a
+    /// full `vkAllocateMemory`". Registry victims go to zero when the session is
+    /// idle *and* when it is busy with a stable working set — a steady animation
+    /// re-uses the same render targets forever, so nothing ages out and every pass
+    /// reads as quiet. Measured under testufo: `idle_target_drain` fired 169 times
+    /// in one boot, roughly once a second throughout the load, and the staging pool
+    /// re-allocated the 8 MiB full-frame bucket 607 times at **12.6 ms each**.
+    ///
+    /// So ask the pool that is about to be trimmed. `staging_hits + misses` is
+    /// every acquire, so an unchanged total is the upload path genuinely doing
+    /// nothing — the quantity the victim count was standing in for, measured
+    /// directly instead of inferred. At true idle the guest stops publishing, no
+    /// draw acquires staging, and the trim still fires and still returns the
+    /// memory.
     fn note_drain_settled(&mut self, drained: usize) -> bool {
-        if drained == 0 {
+        let acquires = self.staging_hits.wrapping_add(self.staging_misses);
+        let uploads_ran = acquires != self.settled_staging_mark;
+        self.settled_staging_mark = acquires;
+        if drained == 0 && !uploads_ran {
             self.settled_drain_passes = self.settled_drain_passes.saturating_add(1);
         } else {
             self.settled_drain_passes = 0;
