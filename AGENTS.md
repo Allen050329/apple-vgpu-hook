@@ -130,6 +130,37 @@ Note what saved it and what did not: the sub-perceptual reading came from lookin
 after two boots of counts, a 2x2 design, an interleaved A/B and a null arm had all agreed with each
 other. Agreement among measurements that share a metric does not test the metric.
 
+**A channel mean cannot see speckle, and every colour reading here has been a mean.** Per-pixel noise
+is roughly symmetric about the value it corrupts, so a wallpaper rendering as dense speckle scores an
+utterly ordinary mean. The whole-screen means recorded for the desktop class — R 0.97-0.98 across
+four guest clock settings — are all equally consistent with a smooth image, and say nothing about
+whether neighbouring pixels agree with each other.
+
+The cheap separator is the residual against a local median, `mean |px - 3x3 median|`, per channel. It
+needs no reference frame and does not care about crop, downscale, variant selection or guest clock —
+the four confounds that have wrecked every whole-screen comparison this project has run. Measured on
+one boot, in the same relative patch of bare wallpaper, at 1280x719:
+
+| desktop picture | dR | dG | dB |
+|---|---|---|---|
+| PNG extracted from the HEIC, variant 0 | 0.14 | 0.18 | 0.31 |
+| PNG extracted from the HEIC, variant 4 | 0.14 | 0.18 | 0.33 |
+| stock HEIC, our host window | **0.00** | 7.64 | 18.23 |
+| stock HEIC, the guest's `screencapture` | **0.00** | 8.76 | 20.80 |
+
+Sixty times the blue residual, and a red channel that is not merely "pinned at 255" as a range but
+*exactly* flat — zero deviation from its own local median. A min/max range cannot state that and a
+mean cannot see it. Report the residual next to the mean whenever the complaint is about colour.
+
+**Count what your A/B actually changed.** Swapping the guest's desktop picture from the stock HEIC to
+a PNG extracted from that same HEIC makes the corruption vanish, which reads as a clean isolation of
+one mechanism. It changes three: subsampled YUV becomes packed RGB, Display-P3 becomes sRGB, and a
+dynamic multi-variant picture becomes a static one. Each alone explains the result. The one that gets
+written down is whichever the reader already suspected — here the YUV reading was about to aim the
+next iteration at the biplanar sampling path on the strength of a comparison that never isolated it.
+Enumerate every property the swap changed *before* naming the one you like, then add the control that
+separates them: a static sRGB JPEG is subsampled YUV and splits all three at once.
+
 **A transient defect is invisible to a before/after pair.** A repro that captures once before a
 gesture and once after cannot see anything that repairs itself in between, and it will report clean
 runs indefinitely while a human watching the same screen sees the defect plainly. That happened
@@ -237,6 +268,15 @@ The same discipline bounds a claim. Content selection can only ever produce a *c
 of the variants it selects among, so rendering each variant on its own establishes the range the
 output must fall in. A result outside that range is a defect and not a selection, and that argument
 holds without knowing which variant was selected.
+
+**Bound that combination on the extremum, not the mean.** A convex combination is taken per pixel, so
+if every variant's value at every pixel of a patch is at most V, no blend of them can exceed V
+anywhere in that patch. The max is therefore a far tighter test than the average, and it survives
+crop and scale. In a fixed bare-wallpaper patch the five desktop-picture variants each render with a
+blue channel reaching at most 93/255, while the stock picture reaches 250-255 in the same patch —
+refuted by 2.7x, pixel-wise, with no free parameters and no need to know the blend weights. The same
+argument on whole-screen means had a margin of a few percent and still had to reason about which
+variant was selected.
 
 **Capture the guest's screen next to ours — it is the nearest thing to known input this rig has.**
 The host window is our present path's output. The guest's own `screencapture` reads the window
