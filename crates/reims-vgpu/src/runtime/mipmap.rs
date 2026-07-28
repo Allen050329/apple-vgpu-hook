@@ -272,7 +272,7 @@ fn load_level_tight_native<M: HostMemory + HostOps>(
         let Some(row_gva) = gva.checked_add((y as u64).saturating_mul(bpr)) else {
             return Err(MipmapStatus::GuestIo);
         };
-        if gva_mem::read_task_gva_fallback(
+        if gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,

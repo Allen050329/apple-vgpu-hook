@@ -594,7 +594,7 @@ pub(crate) fn load_mtlb<M: HostMemory + HostOps>(
         );
     };
     let mut mtlb = vec![0u8; len];
-    if gva_mem::read_task_gva_fallback(
+    if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -714,7 +714,7 @@ pub(crate) fn read_buffer_window<M: HostMemory + HostOps>(
         .checked_add(offset)
         .ok_or(ComputeStatus::MissingBuffer("compute_buf_win_gva_overflow"))?;
     let mut bytes = vec![0u8; len];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -801,7 +801,7 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
         );
     };
     let mut bytes = vec![0u8; want];
-    if let Err(e) = gva_mem::read_task_gva_fallback(
+    if let Err(e) = gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -2296,7 +2296,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
                     )?)
                     .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
-                if let Err(e) = gva_mem::read_task_gva_fallback(
+                if let Err(e) = gva_mem::read_task_gva_by_id(
                     host,
                     &state.tasks,
                     task_id,

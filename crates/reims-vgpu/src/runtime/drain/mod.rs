@@ -1113,7 +1113,7 @@ fn load_cursor_glyph<H: HostMemory + HostOps>(
     };
 
     let mut src = vec![0u8; need_host];
-    if crate::runtime::gva_mem::read_task_gva_fallback(
+    if crate::runtime::gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,

@@ -880,7 +880,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
                 .base_gva
                 .checked_add(off)
                 .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_gva_overflow"))?;
-            if gva_mem::read_task_gva_fallback(
+            if gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,
@@ -1064,7 +1064,7 @@ fn copy_bytes<M: HostMemory + HostOps>(
     let mut buf = vec![0u8; CHUNK.min(length as usize).max(1)];
     while remaining > 0 {
         let n = remaining.min(buf.len() as u64) as usize;
-        if gva_mem::read_task_gva_fallback(
+        if gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,
@@ -1149,7 +1149,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
                         .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_row_overflow"))?,
                 )
                 .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_row_overflow"))?;
-            if gva_mem::read_task_gva_fallback(
+            if gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,
@@ -1385,7 +1385,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                 .checked_add(y.checked_mul(buf_row_stride).ok_or(BlitStatus::Capacity)?)
                 .ok_or(BlitStatus::Capacity)?;
             if to_texture {
-                if gva_mem::read_task_gva_fallback(
+                if gva_mem::read_task_gva_by_id(
                     host,
                     &state.tasks,
                     task_id,
@@ -1685,7 +1685,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
                 Some(v) => v,
                 None => return br(BlitStatus::Bounds, "b2t_t11_src_gva_overflow"),
             };
-            if gva_mem::read_task_gva_fallback(
+            if gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,

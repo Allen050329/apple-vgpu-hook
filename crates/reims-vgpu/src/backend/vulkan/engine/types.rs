@@ -583,7 +583,7 @@ impl BufferContent {
                     // SAFETY: `host_ptr` is a stable RAMBlock alias from
                     // `HostOps::map_pages`, valid for the VM lifetime; the
                     // read races guest CPU writes exactly like the staging
-                    // path's `read_task_gva_fallback` copy does.
+                    // path's `read_task_gva_by_id` copy does.
                     unsafe {
                         let slice = std::slice::from_raw_parts(run.host_ptr as *const u8, n);
                         out.extend_from_slice(slice);

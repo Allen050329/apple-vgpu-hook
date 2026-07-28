@@ -684,7 +684,7 @@ fn load_mtlb<M: HostMemory + HostOps>(
     let len = host_alloc_len(f.blob_size as u64)?;
     let mut mtlb = vec![0u8; len];
     // Device page_shift (x86=12); unshifted helper defaults to arm14 and fails loads.
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -841,7 +841,7 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let mut buf = vec![0u8; want];
     // Use device page_shift (x86=12); unshifted helper defaults to arm14 and fails.
-    if gva_mem::read_task_gva_fallback(
+    if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -1021,7 +1021,7 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
         return Err(R::OutOfBounds);
     }
     let mut buf = vec![0u8; need];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -2321,7 +2321,7 @@ fn load_linear_raw<M: HostMemory + HostOps>(
             Some(a) => a,
             None => return false,
         };
-        if gva_mem::read_task_gva_fallback(
+        if gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,
@@ -2847,7 +2847,7 @@ fn empty_layer_gva_probe<M: HostMemory + HostOps>(
         );
     };
     let mut page = [0u8; 64];
-    match gva_mem::read_task_gva_fallback(
+    match gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -3247,7 +3247,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     let mut row = vec![0u8; tight as usize];
     for y in 0..h {
         let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
-        gva_mem::read_task_gva_fallback(
+        gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,

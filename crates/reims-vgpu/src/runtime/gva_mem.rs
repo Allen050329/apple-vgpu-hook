@@ -80,49 +80,56 @@ pub fn read_task_gva<M: HostMemory>(
     Ok(())
 }
 
-/// Which arm of [`read_task_gva_fallback`] produced the answer.
+/// What the deleted `task_id >> 1` read arm **would** have done, had it stayed.
 ///
-/// Censused only when the task the guest named could not serve the read, so the
-/// success path pays nothing. That is also the only interesting question: the
-/// wire word is a slot id (see [`crate::runtime::task_slot`]), so `task_id >> 1`
-/// is a **different task**, and a read served by it returns another task's bytes
-/// to the caller with no way for anything downstream to notice.
+/// A tripwire, not a decision. [`read_task_gva_by_id`] refuses whenever the task
+/// the guest named cannot serve the read; this records whether the neighbouring
+/// task could have, so the count stays directly comparable across the deletion
+/// rather than simply vanishing with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReadFallbackArm {
-    /// The named task's walk failed and `task_id >> 1`'s walk succeeded. This
-    /// arm is the only thing that produced bytes, and they are not the named
-    /// task's bytes.
-    ShiftedServed,
-    /// Neither task could serve the read. Nothing was substituted; the named
-    /// task's own walk failure is what the caller receives.
-    NeitherServed,
+pub(crate) enum ReadRefusal {
+    /// The named task's walk failed and `task_id >> 1`'s walk **would** have
+    /// succeeded — this is exactly where the old code substituted another
+    /// task's bytes. Measured 9-11 times per boot before the deletion, all from
+    /// object-list resolution.
+    ShiftedWouldServe,
+    /// Neither task could serve the read, so the old code refused here too.
+    NeitherServes,
 }
 
-impl crate::observe::Decline for ReadFallbackArm {
+impl crate::observe::Decline for ReadRefusal {
     fn slug(&self) -> &'static str {
         match self {
-            Self::ShiftedServed => "read_fallback_shifted",
-            Self::NeitherServed => "read_fallback_neither",
+            Self::ShiftedWouldServe => "read_refused_shifted_would_serve",
+            Self::NeitherServes => "read_refused_neither",
         }
     }
 }
 
-/// Same as [`read_task_gva`] but also tries `task_id >> 1` when the named task's
-/// walk fails.
+/// Read `[gva, gva+len)` under the task the guest named. **That task, or an
+/// error.**
 ///
-/// The fallback arrived for one path — the archive cursor — and is now reached
-/// from **26** product call sites across blit, mipmap, draw, texture-view,
-/// compute and object resolution, none of which asked for it. Nothing has ever
-/// recorded whether it decides.
+/// This used to fall back to walking `task_id >> 1`'s page table at the same
+/// address, and it is the last of the three `>> 1` arms this crate improvised.
+/// The other two were deleted after measuring zero. This one measured **9-11
+/// substitutions per boot**, every boot, all from `objects::lookup_list_entry` —
+/// and the contract says every one of them was wrong:
 ///
-/// `#[track_caller]` so a firing arm names which of those sites reached it, and
-/// the census is latched per `(arm, task, site)`. Both arms are read-only
-/// measurements: this still returns exactly what it returned before, except
-/// that a total failure now carries the **named task's own walk error** rather
-/// than a blanket `NoSuchTask` the function chose for it — the caller's reason
-/// should be the check that refused, not a label written here.
+/// A GVA has no meaning apart from the page table it is resolved against.
+/// `lookup_list_entry` builds its address from the **named** task's own
+/// `object_list_pfn`, so the same number under a different task's table is a
+/// different location that merely happens to be readable. And it always is:
+/// tasks put their object lists in low pages, so the neighbour's table has
+/// something mapped there on essentially every attempt. The fallback therefore
+/// did not fail loudly when it was wrong — it succeeded, and returned the
+/// neighbour's object-list entry as if it were this task's.
+///
+/// The failure mode is now a typed refusal the caller already handles
+/// (`lookup_list_entry` returns `None`, which is its "the guest has not told us"
+/// answer). `#[track_caller]` names the site; the census above records where the
+/// old substitution would have happened.
 #[track_caller]
-pub fn read_task_gva_fallback<M: HostMemory>(
+pub fn read_task_gva_by_id<M: HostMemory>(
     host: &M,
     tasks: &[TaskEntry],
     task_id: u32,
@@ -138,32 +145,37 @@ pub fn read_task_gva_fallback<M: HostMemory>(
     } else {
         MemError::NoSuchTask
     };
+    // Counterfactual only — the result is logged and discarded. It runs on the
+    // refusal path, which is a few dozen reads per boot, so the extra walk costs
+    // nothing measurable and keeps the before/after numbers comparable.
     let shifted = task_id >> 1;
-    let served = if shifted != task_id && (shifted as usize) < tasks.len() {
-        read_task_gva(host, &tasks[shifted as usize], gva, buf, page_shift)
-    } else {
-        Err(named)
-    };
-    note_read_fallback(task_id, shifted, gva, served.is_ok(), named);
-    if served.is_ok() {
-        return Ok(());
-    }
+    let would_serve = shifted != task_id
+        && (shifted as usize) < tasks.len()
+        && read_task_gva(
+            host,
+            &tasks[shifted as usize],
+            gva,
+            &mut vec![0u8; buf.len()],
+            page_shift,
+        )
+        .is_ok();
+    note_read_refusal(task_id, shifted, gva, would_serve, named);
     Err(named)
 }
 
-/// Record which arm answered a fallback read, latched per `(arm, task, site)`.
+/// Record a refused read, latched per `(arm, task, site)`.
 ///
 /// The latch is taken before the line is built: `Emit::field` renders eagerly,
 /// and this sits one level below per-row blit loops, so building and dropping
 /// strings on every refused read would make the probe cost scale with the
 /// traffic it is measuring.
 #[track_caller]
-fn note_read_fallback(task_id: u32, shifted: u32, gva: u64, served: bool, named: MemError) {
+fn note_read_refusal(task_id: u32, shifted: u32, gva: u64, served: bool, named: MemError) {
     use crate::observe::Decline;
     let arm = if served {
-        ReadFallbackArm::ShiftedServed
+        ReadRefusal::ShiftedWouldServe
     } else {
-        ReadFallbackArm::NeitherServed
+        ReadRefusal::NeitherServes
     };
     // Key off the raw location, not its rendering — a refused read can repeat
     // per row, and formatting before the latch would allocate on every one.
@@ -172,7 +184,7 @@ fn note_read_fallback(task_id: u32, shifted: u32, gva: u64, served: bool, named:
         return;
     }
     let via = via_caller();
-    crate::observe::Emit::decline("gva_read_fallback", &arm)
+    crate::observe::Emit::decline("gva_read_refused", &arm)
         .field("task", task_id)
         .field("shifted", shifted)
         .field("gva", format!("{gva:#x}"))
@@ -386,7 +398,7 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
 }
 
 /// Resolve pages of `[gva, gva + span)` under the same task selection as
-/// [`read_task_gva_fallback`] (wire id first, then `id >> 1`) and call `visit`
+/// [`read_task_gva_by_id`] (wire id first, then `id >> 1`) and call `visit`
 /// with each page-aligned GPA. Stops early when `visit` returns `false`.
 /// `stride_pages` visits every Nth page plus always the last (1 = every page);
 /// callers trade probe density against walk cost.
@@ -965,16 +977,64 @@ mod tests {
         assert_eq!(latch_key(1, 0, loc), latch_key(1, 0, loc), "and it is stable");
     }
 
-    /// The read fallback's two arms must not share a slug: one hands the caller
-    /// a **different task's bytes** and the other refuses, and a census that
-    /// could not separate them would answer the deletion question wrong.
+    /// Both refusal arms must keep their own slug. They are the same *decision*
+    /// now — the read is refused either way — but only one of them marks a spot
+    /// where the deleted arm used to hand back a neighbour's bytes, and that is
+    /// the number the deletion is judged on.
     #[test]
-    fn the_read_fallback_arms_do_not_share_a_reason() {
+    fn the_read_refusal_arms_do_not_share_a_reason() {
         use crate::observe::Decline;
         assert_ne!(
-            ReadFallbackArm::ShiftedServed.slug(),
-            ReadFallbackArm::NeitherServed.slug()
+            ReadRefusal::ShiftedWouldServe.slug(),
+            ReadRefusal::NeitherServes.slug()
         );
+    }
+
+    /// A read the named task cannot serve is **refused**, even when the
+    /// neighbouring task's page table would have resolved the same address.
+    ///
+    /// This is the deletion itself. Task 2 maps GVA page 1; task 5 (`5 >> 1 == 2`)
+    /// maps nothing. The old code walked task 2 here and returned its bytes,
+    /// which is why the substitution never surfaced as an error — a GVA under
+    /// the wrong page table is a different location that merely happens to be
+    /// readable, and low pages essentially always are.
+    #[test]
+    fn a_read_the_named_task_cannot_serve_is_refused_not_redirected() {
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x100, 0xab);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(2, 0x1_0000, 2));
+        assert!(state.define_task(5, 0x1_0000, 9));
+
+        // The donor really can serve it — otherwise this test would pass for
+        // the wrong reason.
+        let mut buf = [0u8; 4];
+        assert!(
+            read_task_gva_by_id(&host, &state.tasks, 2, 0x1000, &mut buf, PAGE_SHIFT_X86).is_ok()
+        );
+        assert_eq!(buf, [0xab; 4]);
+
+        let mut buf = [0u8; 4];
+        let err = read_task_gva_by_id(&host, &state.tasks, 5, 0x1000, &mut buf, PAGE_SHIFT_X86)
+            .unwrap_err();
+        assert!(
+            matches!(err, MemError::Unresolved(_)),
+            "task 5's own walk must be what answers, got {err:?}"
+        );
+        assert_eq!(buf, [0u8; 4], "and no neighbour's bytes may reach the caller");
     }
 
     /// When neither task can serve the read, the caller must receive the
@@ -991,7 +1051,7 @@ mod tests {
         assert!(state.define_task(6, 0x1_0000, 0));
         assert!(state.tasks[6].active, "the slot is live; only the walk fails");
         let mut buf = [0u8; 4];
-        let err = read_task_gva_fallback(
+        let err = read_task_gva_by_id(
             &host,
             &state.tasks,
             6,
@@ -1016,7 +1076,7 @@ mod tests {
         let mut buf = [0u8; 4];
         let oob = state.tasks.len() as u32 + 4;
         let err =
-            read_task_gva_fallback(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
+            read_task_gva_by_id(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
                 .unwrap_err();
         assert_eq!(err, MemError::NoSuchTask);
     }

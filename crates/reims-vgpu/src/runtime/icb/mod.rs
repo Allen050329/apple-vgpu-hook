@@ -1694,7 +1694,7 @@ pub fn fill_icb_from_command_memory<M: HostMemory + HostOps>(
         return Err(IcbStatus::Args("icb_fill_range_past_memory"));
     }
     let mut bytes = vec![0u8; need as usize];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -1887,7 +1887,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             let len = crate::runtime::metal_draw::host_alloc_len(f.blob_size as u64)
                 .ok_or(IcbStatus::Args("icb_frc_function_blob_too_large"))?;
             let mut mtlb = vec![0u8; len];
-            gva_mem::read_task_gva_fallback(
+            gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,

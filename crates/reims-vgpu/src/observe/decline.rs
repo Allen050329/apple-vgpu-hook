@@ -2618,16 +2618,17 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
-        type_name: "ReadFallbackArm",
+        type_name: "ReadRefusal",
         defined_in: "runtime/gva_mem.rs",
         slug_blocks: &[],
-        // Census on the guest-read path, taken only when the task the guest
-        // named could not serve the read, so the success path pays nothing.
-        // Both arms are registered: one substitutes another task's bytes, the
-        // other is the honest refusal, and separating them is the reading.
-        emission: Emission::At(&[("runtime/gva_mem.rs", "gva_read_fallback")]),
+        // Tripwire on the guest-read path, taken only when the task the guest
+        // named could not serve the read. Both arms are refusals now; the split
+        // records whether the deleted `task_id >> 1` arm would have substituted
+        // a neighbour's bytes here, so the count stays comparable across the
+        // deletion instead of vanishing with it.
+        emission: Emission::At(&[("runtime/gva_mem.rs", "gva_read_refused")]),
         slug_calls: &[],
-        slugs: &["read_fallback_shifted", "read_fallback_neither"],
+        slugs: &["read_refused_shifted_would_serve", "read_refused_neither"],
     },
     DeclineClass {
         type_name: "MemError",

@@ -279,7 +279,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         let mut stream = vec![0u8; stream_len];
         // Product x86 uses page_shift=12; the unshifted helper defaults to arm14
         // and silently fails every stream load on Ventura/Tahoe x86.
-        if gva_mem::read_task_gva_fallback(
+        if gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,

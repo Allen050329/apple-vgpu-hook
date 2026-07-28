@@ -500,7 +500,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     if bpr_u32 == tight {
         let started = Instant::now();
         let (rgba, fmt) = load_tight_linear_rgba_with(w, h, sample_fmt, native_bgra8, |native| {
-            gva_mem::read_task_gva_fallback(
+            gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,
@@ -540,7 +540,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         for y in 0..h {
             let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
             let dst_off = (y as usize).checked_mul(row_bytes)?;
-            gva_mem::read_task_gva_fallback(
+            gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,
@@ -570,7 +570,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     let started = Instant::now();
     for y in 0..h {
         let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
-        gva_mem::read_task_gva_fallback(
+        gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,

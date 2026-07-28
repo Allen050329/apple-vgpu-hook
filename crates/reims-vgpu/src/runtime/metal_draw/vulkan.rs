@@ -2548,7 +2548,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
-    if gva_mem::read_task_gva_fallback(
+    if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,

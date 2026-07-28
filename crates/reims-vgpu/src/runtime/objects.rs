@@ -582,7 +582,7 @@ pub fn lookup_list_entry<M: HostMemory>(
     let off = list_object_entry_offset(ref_, task.object_list_count)?;
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -609,7 +609,7 @@ pub fn read_descriptor<M: HostMemory>(
     let len = crate::runtime::metal_draw::host_alloc_len(entry.descriptor_length as u64)
         .filter(|&n| n > 0)?;
     let mut buf = vec![0u8; len];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -1571,7 +1571,7 @@ mod tests {
     /// boot. `TaskEntry::define` used to invent `object_list_pfn = 1` and
     /// `count = 0x100000`, so a task with no `SetObjectList` still computed an
     /// entry address of `0x1000 + off`. Nothing is mapped there for that task,
-    /// the walk failed `gva_zero_pfn`, and `read_task_gva_fallback` then walked
+    /// the walk failed `gva_zero_pfn`, and `read_task_gva_by_id` then walked
     /// task `5 >> 1 == 2`'s page table at the same address — where task 2's
     /// object list genuinely lives — and decoded task 2's entry as task 5's.
     ///
