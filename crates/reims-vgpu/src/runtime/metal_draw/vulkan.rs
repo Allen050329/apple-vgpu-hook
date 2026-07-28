@@ -1991,20 +1991,15 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         None => task_gva_guest_runs(state, host, task_id, gva + offset, span)?,
     };
     let t_import = std::time::Instant::now();
-    for r in &runs {
-        if !engine::ensure_host_import(r.host_ptr, r.len) {
-            state.tranche.zc_import_ns = state
-                .tranche
-                .zc_import_ns
-                .saturating_add(t_import.elapsed().as_nanos() as u64);
-            state.tranche.zc_fail_import = state.tranche.zc_fail_import.saturating_add(1);
-            return None;
-        }
-    }
+    let imported = engine::ensure_host_imports(&runs);
     state.tranche.zc_import_ns = state
         .tranche
         .zc_import_ns
         .saturating_add(t_import.elapsed().as_nanos() as u64);
+    if !imported {
+        state.tranche.zc_fail_import = state.tranche.zc_fail_import.saturating_add(1);
+        return None;
+    }
     Some(engine::BufferContent::GuestRuns(engine::GuestRunSource {
         runs: std::sync::Arc::new(runs),
         total_len: span,
@@ -2152,10 +2147,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         Some(runs) => runs,
         None => task_gva_guest_runs(state, host, task_id, gva, span)?,
     };
-    for r in &runs {
-        if !engine::ensure_host_import(r.host_ptr, r.len) {
-            return None;
-        }
+    if !engine::ensure_host_imports(&runs) {
+        return None;
     }
     sampled_census::note(sampled_census::Branch::LinZeroCopy, 0);
     Some((
@@ -2279,12 +2272,10 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     if consumed != span {
         return Err(Reason::ImportFail);
     }
-    for r in &runs {
-        if !sampled_census::timed(sampled_census::Step::T11ZcImport, || {
-            engine::ensure_host_import(r.host_ptr, r.len)
-        }) {
-            return Err(Reason::ImportFail);
-        }
+    if !sampled_census::timed(sampled_census::Step::T11ZcImport, || {
+        engine::ensure_host_imports(&runs)
+    }) {
+        return Err(Reason::ImportFail);
     }
     let row_length_texels = if bpr == tight {
         0
@@ -2410,10 +2401,8 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     if consumed != span {
         return None;
     }
-    for r in &runs {
-        if !engine::ensure_host_import(r.host_ptr, r.len) {
-            return None;
-        }
+    if !engine::ensure_host_imports(&runs) {
+        return None;
     }
     let row_length_texels = if bpr == tight {
         0

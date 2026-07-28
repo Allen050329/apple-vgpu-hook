@@ -638,12 +638,24 @@ fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> crate::observe
     crate::observe::Emit::decline("vk_engine_probe", error).field("probe", probe.name())
 }
 
-/// Ensure a guest-RAM host span is covered by a cached
-/// VK_EXT_external_memory_host import (creating it on first sight — a 1 GiB-capped
-/// window of the containing VMA, aligned span fallback; see AGENTS.md). The zero-copy sampled
-/// gate calls this per run BEFORE choosing [`SampledSource::GuestRuns`]; a
-/// `false` means the caller must stay on the CPU byte path.
-pub fn ensure_host_import(ptr: usize, len: u64) -> bool {
+/// Ensure every run's guest-RAM host span is covered by a cached
+/// VK_EXT_external_memory_host import (creating one on first sight — a 1 GiB-capped
+/// window of the containing VMA, aligned span fallback; see AGENTS.md). The
+/// zero-copy gates call this with the whole coalesced run list BEFORE choosing
+/// [`SampledSource::GuestRuns`]; a `false` means the caller must stay on the CPU
+/// byte path.
+///
+/// Takes the run list rather than one span because the engine prologue — global
+/// lock, device-context ensure, pool-init check — is per *entry*, not per span,
+/// while the question it guards is per *window*. A fragmented full-screen
+/// IOSurface coalesces to ~77 runs that all resolve against the same handful of
+/// 1 GiB windows, so the per-span form paid that prologue 77 times per bind:
+/// measured at 14.8 µs a call and 18 324 calls over 237 binds, it was 271 ms of
+/// the 453 ms those binds spent resolving.
+pub fn ensure_host_imports(runs: &[GuestRun]) -> bool {
+    if runs.is_empty() {
+        return true;
+    }
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -664,7 +676,8 @@ pub fn ensure_host_import(ptr: usize, len: u64) -> bool {
             .fail_once(EngineProbe::HostImportPools.discriminant());
         return false;
     }
-    unsafe { pools.host_import_resolve(ctx, ptr, len) }.is_ok()
+    runs.iter()
+        .all(|r| unsafe { pools.host_import_resolve(ctx, r.host_ptr, r.len) }.is_ok())
 }
 
 /// Generation of a resident compute storage image, if the engine holds one.
@@ -2208,5 +2221,54 @@ mod probe_visibility_tests {
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
             assert!(line.ends_with(&format!(" probe={}", probe.name())));
         }
+    }
+
+    /// One engine entry per run list, whatever its length.
+    ///
+    /// The prologue this guards — global lock, device-context ensure, pool-init
+    /// check — is per entry, while the coverage question is per import window. A
+    /// fragmented full-screen IOSurface coalesces to ~77 runs that all resolve
+    /// against the same handful of windows, so a per-span form pays the prologue
+    /// 77 times to answer one question. Counting acquisitions is the only
+    /// assertion that fails if this regresses to a loop of single-span calls;
+    /// the returned bool is identical either way.
+    ///
+    /// The runs must be spans that actually RESOLVE. `all` short-circuits, so a
+    /// list of unbacked pointers refuses on the first run and takes exactly one
+    /// engine entry in the per-span shape too. A first draft used unbacked spans,
+    /// passed against a deliberately reintroduced per-span loop, and was no gate
+    /// at all — hence real, page-aligned, mapped host memory here.
+    #[test]
+    fn ensure_host_imports_enters_the_engine_once_for_the_whole_run_list() {
+        crate::observe::redirect_logs_for_tests();
+        const PAGE: usize = 4096;
+        let buf = vec![0u8; PAGE * 24];
+        let base = (buf.as_ptr() as usize).next_multiple_of(PAGE);
+        let runs: Vec<GuestRun> = (0..8)
+            .map(|i| GuestRun {
+                host_ptr: base + i * PAGE,
+                len: PAGE as u64,
+            })
+            .collect();
+        let (_, before, _) = engine_lock_wait_snapshot();
+        let ok = ensure_host_imports(&runs);
+        let (_, after, _) = engine_lock_wait_snapshot();
+        if !ok {
+            eprintln!("SKIP engine-entry count: no device or no VK_EXT_external_memory_host here");
+            return;
+        }
+        assert_eq!(
+            after - before,
+            1,
+            "{} resolvable runs took {} engine entries; the prologue is per entry, not per span",
+            runs.len(),
+            after - before
+        );
+
+        // An empty list asks nothing and must not enter at all.
+        let (_, before, _) = engine_lock_wait_snapshot();
+        assert!(ensure_host_imports(&[]));
+        let (_, after, _) = engine_lock_wait_snapshot();
+        assert_eq!(after, before);
     }
 }

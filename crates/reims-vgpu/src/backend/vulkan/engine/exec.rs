@@ -89,7 +89,7 @@ unsafe fn stage_buffer_content(
                 usage | vk::BufferUsageFlags::TRANSFER_DST,
                 counters,
             )?;
-            // Runs were pre-checked by the runtime via ensure_host_import, so
+            // Runs were pre-checked by the runtime via ensure_host_imports, so
             // a missing region here is a genuine failure (the runtime gate
             // falls back to the CPU staging path only at encode time).
             let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
@@ -1489,7 +1489,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
                     counters,
                 )?;
-                // Runs were pre-checked by the runtime via ensure_host_import,
+                // Runs were pre-checked by the runtime via ensure_host_imports,
                 // so a missing region here is a genuine failure (the draw
                 // gate falls back to the CPU path on the reported error).
                 let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();

@@ -447,7 +447,10 @@ fn sampled_guest_runs_draw_does_not_batch() {
     let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     assert!(!ptr.is_null());
-    if !engine::ensure_host_import(ptr as usize, 4096) {
+    if !engine::ensure_host_imports(&[engine::GuestRun {
+        host_ptr: ptr as usize,
+        len: 4096,
+    }]) {
         eprintln!("skipping: ICD refused host-pointer import of heap memory");
         unsafe { std::alloc::dealloc(ptr, layout) };
         return;

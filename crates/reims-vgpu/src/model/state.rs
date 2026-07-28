@@ -1403,7 +1403,7 @@ pub struct TrancheStats {
     /// Draw-time zero-copy-attempt cost split (nanoseconds), for binds that ride
     /// `try_buffer_zero_copy_resolved`. `zc_flush` = the intersecting-deferred
     /// store flush (per-bind page walk when any deferred surface is live);
-    /// `zc_import` = the `ensure_host_import` engine-lock + window resolve loop.
+    /// `zc_import` = the `ensure_host_imports` engine-lock + window resolve loop.
     /// `zc_fail_import` counts ZC attempts that fell back to the CPU read
     /// because a run was not coverable by a host import window.
     pub zc_flush_ns: u64,

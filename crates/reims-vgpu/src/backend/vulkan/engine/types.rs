@@ -1245,7 +1245,7 @@ pub struct GuestRun {
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
 /// only its texels — padding past the last row may not be mapped). The
-/// caller must have verified import coverage via `ensure_host_import` for
+/// caller must have verified import coverage via `ensure_host_imports` for
 /// every run.
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {

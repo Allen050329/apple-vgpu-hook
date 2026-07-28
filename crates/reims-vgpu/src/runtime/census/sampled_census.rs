@@ -203,8 +203,16 @@ pub enum Step {
     T11ZcGpas,
     /// `try_type11_sample_zero_copy`: one `HostOps::map_pages` per coalesced run.
     T11ZcMap,
-    /// `try_type11_sample_zero_copy`: one `engine::ensure_host_import` per run.
+    /// `try_type11_sample_zero_copy`: `engine::ensure_host_imports` over the
+    /// whole coalesced run list — one engine entry per bind.
     T11ZcImport,
+    /// `mapper::mapping_page_gpas`: `revalidate_mapping_pages`, which re-walks
+    /// the guest page table so a cached view can never alias recycled PFNs.
+    MapRevalidate,
+    /// `mapper::mapping_page_gpas`: `first_control_page_collision` — the
+    /// membership set over the surface's pages plus a probe per live control
+    /// page (FIFO rings, task directories, task object lists).
+    MapCollision,
     /// `load_type11_rgba_memoized`: native BGRA re-read of the whole surface.
     T11MemoRead,
     /// `load_type11_rgba_memoized`: memcmp of the re-read against the memo.
@@ -213,7 +221,7 @@ pub enum Step {
     T11MemoConvert,
 }
 
-const STEP_N: usize = 7;
+const STEP_N: usize = 9;
 
 impl Step {
     const fn idx(self) -> usize {
@@ -225,6 +233,8 @@ impl Step {
             Step::T11MemoRead => 4,
             Step::T11MemoCmp => 5,
             Step::T11MemoConvert => 6,
+            Step::MapRevalidate => 7,
+            Step::MapCollision => 8,
         }
     }
 }
@@ -237,6 +247,8 @@ const STEP_NAMES: [&str; STEP_N] = [
     "t11m_read",
     "t11m_cmp",
     "t11m_convert",
+    "map_revalidate",
+    "map_collision",
 ];
 
 static STEP_COUNTS: [AtomicU64; STEP_N] = [const { AtomicU64::new(0) }; STEP_N];
