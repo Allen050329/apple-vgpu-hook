@@ -481,11 +481,20 @@ pub fn capture_present_frame(
     // fires on a healthy boot the model behind it is wrong, which is the cheap
     // thing to learn.
     let resident = state.present_resident(mapping_id, width, height);
+    // `counter` is the discriminator, and it is the whole reason this line is
+    // worth reading. `since_seq` says this resident gained no full frame since it
+    // was last shown; `counter` says whether ANY resident did. Equal means no full
+    // frame was published at all in that interval — the compositor damage-drew
+    // into a resident that legitimately retains, and the present is correct.
+    // Greater means full frames were published and went somewhere else, which is
+    // the routing failure that blacks out the desktop.
+    let counter = state.present.dense_frame_counter;
     if let Some(seq) = state.note_present_resident_backing(resident) {
         crate::observe::off(format!(
             "present_resident_unbacked mid={mapping_id} {width}x{height} \
-             resident={resident:?} since_seq={seq} \
-             (no full frame published into this resident since it was last shown)"
+             resident={resident:?} since_seq={seq} counter={counter} \
+             (no full frame published into this resident since it was last shown; \
+             counter>since_seq means some other resident got them)"
         ));
     }
     // Advance the per-present tile-epoch clock and measure per-tile
