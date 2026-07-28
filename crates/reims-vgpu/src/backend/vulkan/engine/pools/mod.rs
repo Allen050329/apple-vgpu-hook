@@ -53,6 +53,11 @@ pub(crate) struct ResourcePools {
     staging_free: HashMap<u64, Vec<BufferSlot>>,
     /// In-use staging slots returned after submit/wait.
     staging_live: Vec<BufferSlot>,
+    /// Staging free-list hits / misses and the miss bucket histogram; see
+    /// `note_staging_miss`. Measure-only.
+    staging_hits: u64,
+    staging_misses: u64,
+    staging_miss_bins: [usize; STAGING_BUCKET_BINS],
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -1086,6 +1091,11 @@ where
     }
     item
 }
+/// Bucket bins for the staging census: one per power of two up to 2^31.
+pub(crate) const STAGING_BUCKET_BINS: usize = 32;
+/// One `staging_pool` line per this many misses.
+const STAGING_MISS_EMIT_EVERY: u64 = 512;
+
 /// Graveyard size at which begin_entry force-quiesces the ring to destroy
 /// deferred handles (pure-async streak backstop).
 const GRAVEYARD_FORCE_DRAIN: usize = 256;

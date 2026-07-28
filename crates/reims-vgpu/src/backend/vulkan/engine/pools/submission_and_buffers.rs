@@ -17,6 +17,9 @@ impl ResourcePools {
         Self {
             staging_free: HashMap::new(),
             staging_live: Vec::new(),
+            staging_hits: 0,
+            staging_misses: 0,
+            staging_miss_bins: [0; STAGING_BUCKET_BINS],
             targets: HashMap::new(),
             target_order: Vec::new(),
             readback_free: HashMap::new(),
@@ -1615,6 +1618,60 @@ impl ResourcePools {
         b
     }
 
+    fn note_staging_hit(&mut self) {
+        self.staging_hits = self.staging_hits.saturating_add(1);
+    }
+
+    /// A staging acquire that found no free slot in its bucket and must pay a
+    /// full `vkAllocateMemory`.
+    ///
+    /// `vk_alloc_sites` puts 99.4 % of all allocation wall-clock in this pool —
+    /// 9 725 allocations at ~817 µs each over one 260 s boot — while the `vram`
+    /// census showed the free pool holding up to 133 MiB at the same time. A pool
+    /// that is simultaneously full and missing is either holding the wrong
+    /// buckets or being emptied behind the hot path, and the aggregate cannot
+    /// tell those apart. The miss's own bucket plus the free pool's bucket
+    /// histogram at the moment of the miss can.
+    fn note_staging_miss(&mut self, bucket: u64) {
+        self.staging_misses = self.staging_misses.saturating_add(1);
+        let log2 = bucket.trailing_zeros().min(STAGING_BUCKET_BINS as u32 - 1) as usize;
+        self.staging_miss_bins[log2] = self.staging_miss_bins[log2].saturating_add(1);
+        if !self.staging_misses.is_multiple_of(STAGING_MISS_EMIT_EVERY) {
+            return;
+        }
+        use std::fmt::Write as _;
+        let mut free_slots = 0usize;
+        let mut free_bytes = 0u64;
+        let mut free_bins = [0usize; STAGING_BUCKET_BINS];
+        for (&b, list) in &self.staging_free {
+            free_slots += list.len();
+            free_bytes += b.saturating_mul(list.len() as u64);
+            let i = (b.trailing_zeros() as usize).min(STAGING_BUCKET_BINS - 1);
+            free_bins[i] += list.len();
+        }
+        let bins = |v: &[usize; STAGING_BUCKET_BINS]| {
+            let mut s = String::new();
+            for (i, n) in v.iter().enumerate() {
+                if *n != 0 {
+                    let _ = write!(s, "{}{}:{n}", if s.is_empty() { "" } else { "," }, 1u64 << i);
+                }
+            }
+            if s.is_empty() {
+                s.push('-');
+            }
+            s
+        };
+        crate::observe::off(format!(
+            "staging_pool hits={} misses={} live={} free_slots={free_slots} free_mb={} miss_bins={} free_bins={}",
+            self.staging_hits,
+            self.staging_misses,
+            self.staging_live.len(),
+            free_bytes >> 20,
+            bins(&self.staging_miss_bins),
+            bins(&free_bins),
+        ));
+    }
+
     pub(crate) unsafe fn acquire_staging(
         &mut self,
         ctx: &DeviceContext,
@@ -1627,6 +1684,7 @@ impl ResourcePools {
         // Prefer exact-usage free slots in this bucket; usage is OR'd broadly so reuse is fine.
         if let Some(list) = self.staging_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
+                self.note_staging_hit();
                 self.staging_live.push(BufferSlot {
                     buffer: slot.buffer,
                     memory: slot.memory,
@@ -1639,6 +1697,7 @@ impl ResourcePools {
                 });
             }
         }
+        self.note_staging_miss(bucket);
         let buffer = ctx
             .device
             .create_buffer(
