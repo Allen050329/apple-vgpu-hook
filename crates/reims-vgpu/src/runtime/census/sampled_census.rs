@@ -181,6 +181,91 @@ pub fn count(branch: Branch) -> u64 {
     COUNTS[branch.idx()].load(Ordering::Relaxed)
 }
 
+/// A sub-step *inside* one branch's resolve.
+///
+/// The per-branch µs column says which branch is expensive. It cannot say which
+/// part of that branch is, and for the type-11 rails that is now the open
+/// question: they are 2.4 % of binds and 68 % of resolve time, and each runs
+/// four or more sub-steps whose costs plausibly differ by three orders of
+/// magnitude. One total reads identically whichever of them dominates, so a fix
+/// aimed from it would be a guess.
+///
+/// Each variant times exactly one call site, so `count` here is the number of
+/// times that site ran — not the number of binds. The map/import steps run once
+/// per *guest run* (hundreds per bind), which is the distinction the per-bind
+/// total cannot express and the reason a per-run fixed cost is invisible to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    /// `try_type11_sample_zero_copy`: deferred-writeback flush over the surface.
+    T11ZcFlush,
+    /// `try_type11_sample_zero_copy`: `mapper::mapping_page_gpas` (revalidate +
+    /// page-entry vector + control-page collision set).
+    T11ZcGpas,
+    /// `try_type11_sample_zero_copy`: one `HostOps::map_pages` per coalesced run.
+    T11ZcMap,
+    /// `try_type11_sample_zero_copy`: one `engine::ensure_host_import` per run.
+    T11ZcImport,
+    /// `load_type11_rgba_memoized`: native BGRA re-read of the whole surface.
+    T11MemoRead,
+    /// `load_type11_rgba_memoized`: memcmp of the re-read against the memo.
+    T11MemoCmp,
+    /// `load_type11_rgba_memoized`: BGRA→RGBA row conversion on a memo miss.
+    T11MemoConvert,
+}
+
+const STEP_N: usize = 7;
+
+impl Step {
+    const fn idx(self) -> usize {
+        match self {
+            Step::T11ZcFlush => 0,
+            Step::T11ZcGpas => 1,
+            Step::T11ZcMap => 2,
+            Step::T11ZcImport => 3,
+            Step::T11MemoRead => 4,
+            Step::T11MemoCmp => 5,
+            Step::T11MemoConvert => 6,
+        }
+    }
+}
+
+const STEP_NAMES: [&str; STEP_N] = [
+    "t11zc_flush",
+    "t11zc_gpas",
+    "t11zc_map",
+    "t11zc_import",
+    "t11m_read",
+    "t11m_cmp",
+    "t11m_convert",
+];
+
+static STEP_COUNTS: [AtomicU64; STEP_N] = [const { AtomicU64::new(0) }; STEP_N];
+static STEP_US: [AtomicU64; STEP_N] = [const { AtomicU64::new(0) }; STEP_N];
+
+/// Charge one execution of `step` with `us` microseconds.
+pub fn note_step_us(step: Step, us: u64) {
+    let i = step.idx();
+    STEP_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+    STEP_US[i].fetch_add(us, Ordering::Relaxed);
+}
+
+/// Time `f`, charge it to `step`, and return its value.
+pub fn timed<T>(step: Step, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    note_step_us(step, started.elapsed().as_micros() as u64);
+    out
+}
+
+/// Cumulative (count, microseconds) for one step. Test accessor.
+pub fn step_snapshot(step: Step) -> (u64, u64) {
+    let i = step.idx();
+    (
+        STEP_COUNTS[i].load(Ordering::Relaxed),
+        STEP_US[i].load(Ordering::Relaxed),
+    )
+}
+
 /// Cumulative (count, bytes) per branch, indexed as [`NAMES`]; last = total.
 pub fn snapshot() -> ([(u64, u64); N], u64) {
     let mut s = [(0u64, 0u64); N];
@@ -213,6 +298,16 @@ fn format_line(&(ref s, total): &([(u64, u64); N], u64)) -> String {
         UNNAMED.load(Ordering::Relaxed),
         UNNAMED_US.load(Ordering::Relaxed)
     );
+    for (i, name) in STEP_NAMES.iter().enumerate() {
+        // executions:microseconds — an execution is one call of that step, which
+        // for the per-run steps is not one bind.
+        let _ = write!(
+            line,
+            " {name}={}:{}",
+            STEP_COUNTS[i].load(Ordering::Relaxed),
+            STEP_US[i].load(Ordering::Relaxed)
+        );
+    }
     line
 }
 
@@ -237,12 +332,33 @@ mod tests {
 
         let line = format_line(&(after, after_total));
         assert!(line.starts_with("sampled_branch_census total="));
-        for name in NAMES {
+        for name in NAMES.iter().chain(STEP_NAMES.iter()) {
             assert!(
                 line.contains(&format!(" {name}=")),
-                "census line missing branch {name}: {line}"
+                "census line missing column {name}: {line}"
             );
         }
+    }
+
+    /// A step charge lands on its own step and is counted per execution, not per
+    /// bind — the per-run steps run hundreds of times inside one resolve, which is
+    /// the quantity the per-branch total cannot express.
+    #[test]
+    fn step_charges_land_per_execution_on_their_own_step() {
+        let map = Step::T11ZcMap;
+        let import = Step::T11ZcImport;
+        let (map_n, map_us) = step_snapshot(map);
+        let (import_n, import_us) = step_snapshot(import);
+
+        note_step_us(map, 5);
+        note_step_us(map, 7);
+        assert_eq!(step_snapshot(map), (map_n + 2, map_us + 12));
+        assert_eq!(step_snapshot(import), (import_n, import_us));
+
+        // `timed` returns the closure's value and charges the elapsed time.
+        let out = timed(import, || 42u32);
+        assert_eq!(out, 42);
+        assert_eq!(step_snapshot(import).0, import_n + 1);
     }
 
     /// A resolve's time lands on the branch that resolved it, and a resolve that

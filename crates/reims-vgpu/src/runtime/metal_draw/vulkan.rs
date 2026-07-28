@@ -2234,8 +2234,13 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     }
     // Land any resident-authoritative deferred window before the GPU reads
     // the pages (same coherence rule as paint_mapping / the linear rail).
-    let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
-    let gpas = mapper::mapping_page_gpas(state, host, mid).ok_or(Reason::Coverage)?;
+    sampled_census::timed(sampled_census::Step::T11ZcFlush, || {
+        let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
+    });
+    let gpas = sampled_census::timed(sampled_census::Step::T11ZcGpas, || {
+        mapper::mapping_page_gpas(state, host, mid)
+    })
+    .ok_or(Reason::Coverage)?;
     let page = state.page_size();
     let window_end = base_off.checked_add(span).ok_or(Reason::Coverage)?;
     if (gpas.len() as u64).saturating_mul(page) < window_end {
@@ -2257,9 +2262,10 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
             j += 1;
         }
-        let base = host
-            .map_pages(&window[i..j], page as usize)
-            .ok_or(Reason::ImportFail)? as u64;
+        let base = sampled_census::timed(sampled_census::Step::T11ZcMap, || {
+            host.map_pages(&window[i..j], page as usize)
+        })
+        .ok_or(Reason::ImportFail)? as u64;
         let start_in_run = if i == 0 { head_off } else { 0 };
         let avail = ((j - i) as u64) * page - start_in_run;
         let len = avail.min(span - consumed);
@@ -2274,7 +2280,9 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         return Err(Reason::ImportFail);
     }
     for r in &runs {
-        if !engine::ensure_host_import(r.host_ptr, r.len) {
+        if !sampled_census::timed(sampled_census::Step::T11ZcImport, || {
+            engine::ensure_host_import(r.host_ptr, r.len)
+        }) {
             return Err(Reason::ImportFail);
         }
     }

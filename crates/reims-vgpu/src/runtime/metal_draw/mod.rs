@@ -4551,7 +4551,9 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         span,
         (stride as usize).saturating_mul(h as usize),
     );
-    if !crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h) {
+    if !sampled_census::timed(sampled_census::Step::T11MemoRead, || {
+        crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
+    }) {
         state.type11_memo_scratch = scratch;
         return None;
     }
@@ -4562,7 +4564,7 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
     if let Some(m) = state.type11_memo.get_touch(&key) {
-        if m.native == scratch {
+        if sampled_census::timed(sampled_census::Step::T11MemoCmp, || m.native == scratch) {
             let rgba = m.rgba.clone();
             let generation = m.generation;
             state.type11_memo_scratch = scratch;
@@ -4578,17 +4580,23 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     }
     // First sight or the native bytes changed: convert BGRA→RGBA fresh.
     let mut rgba = vec![0u8; span];
-    for y in 0..h as usize {
-        let off = y * (stride as usize);
-        if !pixel_format::convert_row_to_rgba8(
-            sample_fmt,
-            &scratch[off..off + (w as usize) * 4],
-            w,
-            &mut rgba[off..off + (w as usize) * 4],
-        ) {
-            state.type11_memo_scratch = scratch;
-            return None;
+    let converted = sampled_census::timed(sampled_census::Step::T11MemoConvert, || {
+        for y in 0..h as usize {
+            let off = y * (stride as usize);
+            if !pixel_format::convert_row_to_rgba8(
+                sample_fmt,
+                &scratch[off..off + (w as usize) * 4],
+                w,
+                &mut rgba[off..off + (w as usize) * 4],
+            ) {
+                return false;
+            }
         }
+        true
+    });
+    if !converted {
+        state.type11_memo_scratch = scratch;
+        return None;
     }
     let rgba = std::sync::Arc::new(rgba);
     let rgba_len = rgba.len();
