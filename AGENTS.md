@@ -183,6 +183,21 @@ What is left is an **interaction** — HEIC *and* a source larger than the displ
 effect would have found and which every single-knob A/B in this investigation had to miss. When a
 swap changes N things, the answer can be a pair of them. Build the grid.
 
+The always-on sink refutes the YUV lead a second time, independently of the pixels. Slicing this
+boot per arm, the `type4 pages … multi=1` biplanar `'420f'` lines appear in arms F, G and H — four
+each — and in no other arm. **F and G are clean arms.** Biplanar YUV traffic is therefore present
+while the screen is correct and absent from every arm that reproduces, which is the converse check:
+the line can see multi-plane surfaces, and it puts them on the wrong side.
+
+Nothing else in the census separates the arms either. A first pass found `compute_linear_flush` and
+`linear_deferred_flush` at 36 each in the reproducing set and zero in the clean set — until the
+per-arm breakdown showed all 72 belonged to one arm and predated every arm window. A set difference
+computed over a pooled class is worth exactly as much as the pooling; print the per-arm column before
+believing the totals.
+
+So the defect is invisible to every line this device already emits. That is the actionable part:
+the next step has to be a probe, and the census is not where to put it.
+
 That is where the measurement stops. Which property of an oversized HEIC decode does it is
 **unmeasured**, and no mechanism is named here.
 
