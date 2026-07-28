@@ -191,10 +191,27 @@ scale factor after it fires:
 |---|---|---|---|---|---|---|---|
 | dB, our window | 0.11 | 0.11 | **4.40** | **5.88** | **7.12** | **6.80** | **6.14** |
 
-41x between 1920 and 2048 wide, then flat. 1920x1080 is the guest's display size, so the arm that
-needs no downscale is the only clean one, and *any* downscale is as bad as a large one. Grid tiling
-is not the discriminator either: every one of these files is a tiled HEIC, including the clean
-1920x1080 one, so "it got tiled above some size" does not survive the file itself being read.
+41x between 1920 and 2048 wide, then flat. The obvious reading — "the clean arm is the one needing no
+downscale, so any downscale does it" — is wrong, and bisecting further is what caught it:
+
+| static HEIC source | 960x540 | 1920x1080 | 1920x1920 | 1921x1081 | 1984x1116 | 2047x1152 | 2048x1152 |
+|---|---|---|---|---|---|---|---|
+| dB, our window | 0.13 | 0.11 | 0.11 | 0.11 | **3.70** | **4.15** | **4.40** |
+
+1921x1081 needs a downscale and is clean, so it is not "any downscale". An *upscale* from 960x540 is
+clean too, so it is not scaling in general. The step sits between 1921 and 1984 wide — not at 2048,
+so not a power of two, and nowhere near a 4096 texture limit. It is also not pixel count: 1920x1920
+is 3.7 MP and clean while 2048x1152 is 2.4 MP and speckles, which makes the governing dimension the
+width and not the area.
+
+Grid tiling is not the discriminator either: every one of these files is a tiled HEIC, including the
+clean 1920x1080 one, so "it got tiled above some size" does not survive reading the files.
+
+The useful product of the bisection is not the threshold — that is a guest-side decode policy, not
+our contract, and pinning it to the exact pixel would be overfitting. It is the **pair**: 1921x1081
+and 1984x1116 differ by 3% in every dimension and land on opposite sides. Anything that differs in
+the traffic between those two arms is the defect; almost everything else is held constant by
+construction. That is the tightest differential this class has, and it is where a probe goes.
 
 The always-on sink refutes the YUV lead a second time, independently of the pixels. Slicing this
 boot per arm, the `type4 pages … multi=1` biplanar `'420f'` lines appear in arms F, G and H — four
