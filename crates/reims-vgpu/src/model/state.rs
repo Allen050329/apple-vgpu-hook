@@ -3264,7 +3264,20 @@ impl DeviceState {
         if len == 0 {
             return WriteGate::Exact;
         }
-        let aliases = |t: u32| t == (task_id >> 1) || (t << 1) == task_id;
+        // One candidate, and the code now says so. This read `t == (task_id >> 1)
+        // || (t << 1) == task_id`, which looks like a two-way search and is not:
+        // for even `task_id` the clauses are the same set, and for odd `task_id`
+        // the second can never hold because `t << 1` is even. The only inputs it
+        // added were `t >= 0x8000_0000`, where `t << 1` wraps — a span filed by
+        // task 0x8000_0001 authorising a write by task 2, which is not an
+        // ownership relation but arithmetic overflow, and which fails open
+        // whenever the writer has spans of its own that do not cover the range.
+        //
+        // This matters beyond the dead branch: `WriteGate::Aliased { by }` can
+        // therefore only ever carry `task_id >> 1`, so "`by == task >> 1` in
+        // every observed case" is forced by this predicate and measures nothing
+        // about the guest. See the unfiltered owner readout at the emission site.
+        let aliases = |t: u32| t == (task_id >> 1);
         let mut saw_any = false;
         let mut aliased_by: Option<u32> = None;
         for s in &self.task_map_spans {

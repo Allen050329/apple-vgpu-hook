@@ -718,4 +718,50 @@ mod tests {
         aliased.note_task_map(6, 0x4000, 0x1000);
         assert_eq!(aliased.gva_write_gate(6, 0x4000, 0x100), WriteGate::Exact);
     }
+
+    /// The alias predicate has exactly **one** candidate, and `by` therefore
+    /// cannot report anything except `task >> 1`.
+    ///
+    /// It used to read `t == (task_id >> 1) || (t << 1) == task_id`, which reads
+    /// as a search over two relations. Over every id the task table can hold
+    /// those clauses accept exactly the same set — so `by == task >> 1` was
+    /// forced by the predicate, not measured from the guest, and two rounds of
+    /// notes read it as evidence of a factor of two on the write path.
+    #[test]
+    fn the_alias_predicate_never_had_a_second_candidate() {
+        use crate::model::MAX_TASKS;
+        for task_id in 0..MAX_TASKS as u32 {
+            for t in 0..MAX_TASKS as u32 {
+                assert_eq!(
+                    t == (task_id >> 1),
+                    t == (task_id >> 1) || (t << 1) == task_id,
+                    "the deleted clause changed the answer for t={t} task={task_id}"
+                );
+            }
+        }
+    }
+
+    /// The only inputs the deleted clause ever added were `u32` wraparound, and
+    /// on those it failed **open**.
+    ///
+    /// `0x8000_0001 << 1` wraps to `2`, so a span filed by task `0x8000_0001`
+    /// used to authorise a write by task 2 — arithmetic overflow presented as an
+    /// ownership relation. Task 2 has spans of its own here and none covers the
+    /// range, so the correct answer is the refusal `Outside`; the old predicate
+    /// returned `Aliased` and let the write through.
+    #[test]
+    fn a_span_owned_by_a_wrapping_id_no_longer_authorises_another_tasks_write() {
+        use crate::model::WriteGate;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(2, 0x1_0000, 2));
+        state.note_task_map(2, 0x8000, 0x1000);
+        state.note_task_map(0x8000_0001, 0x4000, 0x1000);
+        assert_eq!(0x8000_0001u32 << 1, 2, "the wrap this test is about");
+        assert_eq!(
+            state.gva_write_gate(2, 0x4000, 0x100),
+            WriteGate::Outside,
+            "a wrapped id is not an alias, and task 2's own spans do not cover this"
+        );
+        assert!(!state.gva_write_allowed(2, 0x4000, 0x100));
+    }
 }
