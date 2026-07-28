@@ -41,74 +41,92 @@
 use crate::model::DeviceState;
 use crate::runtime::host::{HostMemory, HostOps};
 
-/// Rows sampled per present, as fractions of the frame height. Three rows
-/// spread over the frame, so a divergence confined to one band (a window, a
-/// menu strip) is still crossed by at least one of them; the probe reports
-/// which rows it actually read.
-const SAMPLE_ROW_NUMERATORS: [u32; 3] = [1, 2, 3];
-const SAMPLE_ROW_DENOMINATOR: u32 = 4;
-
-/// Per-channel deviation between the frame we captured and the guest's pages.
+/// Per-channel deviation between the frame we are showing and the guest's
+/// pages, over the **whole frame**.
+///
+/// It compares every pixel rather than a row grid, and that is not thoroughness
+/// for its own sake. A first version of this probe sampled three rows at h/4,
+/// h/2 and 3h/4; the residue it was built to find landed in a 61-pixel band at
+/// y=618..679, which all three rows miss. It would have reported agreement
+/// across the exact capture that scored 32 403 differing pixels on the host
+/// window, and the reading would have looked like a result. A readout grid
+/// inherits the geometry of whatever else is wrong in the frame, so there is
+/// no grid.
 ///
 /// `px` is the number of pixels compared, so every count below has a
 /// denominator on the same line. `gt*` are pixel counts whose largest
 /// colour-channel deviation exceeds the named threshold; `max` is the largest
-/// deviation anywhere in the sample.
+/// deviation anywhere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RowDivergence {
+pub struct FrameDivergence {
     pub px: usize,
     pub gt1: usize,
     pub gt4: usize,
     pub gt16: usize,
     pub gt64: usize,
     pub max: u8,
-    /// Largest deviation after swapping the guest row's first and third
+    /// Largest deviation after swapping the guest pixel's first and third
     /// channels. A channel-order mismatch reads as a large `max` with a small
     /// `max_swapped`; a stale resident is large in both. Without this the two
     /// are indistinguishable, and this project has confused them before.
     pub max_swapped: u8,
+    /// Bounding box of the pixels over the visibility threshold, as
+    /// `(x0, y0, x1, y1)` half-open. Directly comparable to the `bbox` the
+    /// screen-capture differ prints, which is what makes a log line and a
+    /// screenshot the same claim.
+    pub bbox: Option<(u32, u32, u32, u32)>,
 }
 
-impl RowDivergence {
-    /// Accumulate `other` into `self`, keeping worst-case magnitudes.
-    pub fn merge(&mut self, other: RowDivergence) {
-        self.px += other.px;
-        self.gt1 += other.gt1;
-        self.gt4 += other.gt4;
-        self.gt16 += other.gt16;
-        self.gt64 += other.gt64;
-        self.max = self.max.max(other.max);
-        self.max_swapped = self.max_swapped.max(other.max_swapped);
-    }
-
+impl FrameDivergence {
     /// Whether anything above sub-perceptual rounding was seen. 4/255 is the
     /// ceiling this project measured for a pure re-encode difference over a
     /// whole frame; below it there is nothing a human could see.
     pub fn is_visible(&self) -> bool {
         self.gt4 > 0
     }
+
+    pub fn bbox_str(&self) -> String {
+        match self.bbox {
+            Some((x0, y0, x1, y1)) => format!("{}x{}+{x0}+{y0}", x1 - x0, y1 - y0),
+            None => "-".to_string(),
+        }
+    }
 }
 
-/// Compare two tight BGRA8 rows of the same pixel count.
+/// Compare two tight BGRA8 frames of `width` x `height`.
 ///
 /// Both sides are wire order (BGRA); alpha is excluded because the present
 /// path and the guest's own compositor do not agree on it by contract and a
 /// difference there is not a visible defect.
-pub fn compare_bgra_rows(ours: &[u8], guest: &[u8]) -> RowDivergence {
-    let mut d = RowDivergence::default();
-    for (a, b) in ours.chunks_exact(4).zip(guest.chunks_exact(4)) {
-        let dev = (0..3).map(|i| a[i].abs_diff(b[i])).max().unwrap_or(0);
+pub fn compare_bgra_frames(ours: &[u8], guest: &[u8], width: u32) -> FrameDivergence {
+    let mut d = FrameDivergence::default();
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for (i, (a, b)) in ours.chunks_exact(4).zip(guest.chunks_exact(4)).enumerate() {
+        let dev = a[0]
+            .abs_diff(b[0])
+            .max(a[1].abs_diff(b[1]))
+            .max(a[2].abs_diff(b[2]));
         let dev_swapped = a[0]
             .abs_diff(b[2])
             .max(a[1].abs_diff(b[1]))
             .max(a[2].abs_diff(b[0]));
         d.px += 1;
         d.gt1 += usize::from(dev > 1);
-        d.gt4 += usize::from(dev > 4);
         d.gt16 += usize::from(dev > 16);
         d.gt64 += usize::from(dev > 64);
         d.max = d.max.max(dev);
         d.max_swapped = d.max_swapped.max(dev_swapped);
+        if dev > 4 {
+            d.gt4 += 1;
+            let (x, y) = ((i as u32) % width, (i as u32) / width);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    if d.gt4 > 0 {
+        d.bbox = Some((x0, y0, x1, y1));
     }
     d
 }
@@ -203,7 +221,7 @@ impl DivergenceSkip {
             DivergenceSkip::FrameGeometry => "frame_geometry",
             DivergenceSkip::NoSampleWindow => "no_sample_window",
             DivergenceSkip::BprBelowTight => "bpr_below_tight",
-            DivergenceSkip::GuestRowUnreadable => "guest_row_unreadable",
+            DivergenceSkip::GuestRowUnreadable => "guest_pages_unreadable",
         }
     }
 }
@@ -239,12 +257,10 @@ impl OurSide {
 /// What one present's comparison found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentDivergence {
-    pub div: RowDivergence,
+    pub div: FrameDivergence,
     /// Which copy of ours the guest's pages were compared against.
     pub src: OurSide,
-    /// Rows actually compared (0..=`SAMPLE_ROW_NUMERATORS.len()`).
-    pub rows: u32,
-    /// Deferred render windows intersecting the sampled rows.
+    /// Deferred render windows intersecting the compared surface span.
     pub pending: usize,
     /// The sample window came from the guest's own device descriptor
     /// (`true`) rather than an invented packed layout (`false`). An invented
@@ -348,35 +364,29 @@ pub fn measure<H: HostMemory + HostOps>(
         return Err(DivergenceSkip::BprBelowTight);
     }
 
-    let mut out = PresentDivergence {
-        div: RowDivergence::default(),
-        src,
-        rows: 0,
-        pending: 0,
-        from_device,
-    };
-    let mut guest_row = vec![0u8; tight];
-    for num in SAMPLE_ROW_NUMERATORS {
-        let y = height.saturating_mul(num) / SAMPLE_ROW_DENOMINATOR;
-        if y >= height {
-            continue;
-        }
+    // The guest's rows are `bpr` apart and ours are tight, so the guest side is
+    // gathered row by row into a tight frame before the compare.
+    let mut guest = vec![0u8; need];
+    for y in 0..height {
         let off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-        out.pending += pending_deferred_windows(state, mapping_id, off, off + tight as u64);
-        if !read_guest_span_unflushed(state, host, mapping_id, off, &mut guest_row) {
+        let at = (y as usize) * tight;
+        if !read_guest_span_unflushed(state, host, mapping_id, off, &mut guest[at..at + tight]) {
             return Err(DivergenceSkip::GuestRowUnreadable);
         }
-        let row_at = (y as usize) * tight;
-        let ours_row = match &ours {
-            Some(px) => &px[row_at..][..tight],
-            None => &state.present.frame_bgra[row_at..][..tight],
-        };
-        out.div.merge(compare_bgra_rows(ours_row, &guest_row));
-        out.rows += 1;
     }
-    if out.rows == 0 {
-        return Err(DivergenceSkip::FrameGeometry);
-    }
+    let span_lo = base_off;
+    let span_hi = base_off.saturating_add((height as u64).saturating_mul(bpr as u64));
+    let mut out = PresentDivergence {
+        div: FrameDivergence::default(),
+        src,
+        pending: pending_deferred_windows(state, mapping_id, span_lo, span_hi),
+        from_device,
+    };
+    let ours = match &ours {
+        Some(px) => px.as_slice(),
+        None => state.present.frame_bgra.as_slice(),
+    };
+    out.div = compare_bgra_frames(ours, &guest, width);
     Ok(out)
 }
 
@@ -386,16 +396,68 @@ pub fn measure<H: HostMemory + HostOps>(
 /// own flood detector; per-window keeps the worst case and the rate.
 const WINDOW_MS: u128 = 2000;
 
+/// Worst case over a set of comparisons, with the count they came from.
+///
+/// `compared` is the denominator every other number here needs; without it a
+/// window that compared nothing and a window that compared ten clean frames
+/// both print zeros.
+#[derive(Default)]
+struct Agg {
+    compared: u32,
+    visible: u32,
+    worst: FrameDivergence,
+    worst_mid: u32,
+}
+
+impl Agg {
+    fn note(&mut self, mapping_id: u32, d: &PresentDivergence) {
+        self.compared += 1;
+        self.visible += u32::from(d.div.is_visible());
+        // Worst by the magnitude that matters, not by pixel count: a frame with
+        // a million pixels off by 2 has not lost guest work and one with a
+        // thousand off by 200 has. The first comparison always takes the slot,
+        // so a clean window still reports the pixel count it read.
+        if self.compared == 1
+            || d.div.max > self.worst.max
+            || (d.div.max == self.worst.max && d.div.gt64 > self.worst.gt64)
+        {
+            self.worst = d.div;
+            self.worst_mid = mapping_id;
+        }
+    }
+
+    fn fields(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}cmp={} {prefix}vis={} {prefix}mid={} {prefix}px={} {prefix}gt1={} \
+             {prefix}gt4={} {prefix}gt16={} {prefix}gt64={} {prefix}max={} {prefix}swap={} \
+             {prefix}bbox={}",
+            self.compared,
+            self.visible,
+            self.worst_mid,
+            self.worst.px,
+            self.worst.gt1,
+            self.worst.gt4,
+            self.worst.gt16,
+            self.worst.gt64,
+            self.worst.max,
+            self.worst.max_swapped,
+            self.worst.bbox_str()
+        )
+    }
+}
+
 #[derive(Default)]
 struct Window {
     presents: u32,
-    compared: u32,
-    visible: u32,
-    worst: RowDivergence,
-    worst_mid: u32,
-    worst_pending: usize,
+    /// Every comparison, including those with a deferred window armed.
+    all: Agg,
+    /// Only comparisons with **no** deferred render window over the sampled
+    /// rows. This is the reading that means something: with an obligation
+    /// outstanding the guest's pages are supposed to be behind us, so a
+    /// divergence there is the deferred-writeback contract working. With none
+    /// outstanding, the two copies of the surface have no licence to differ.
+    settled: Agg,
     invented: u32,
-    pending_any: u32,
     /// Comparisons that read our GPU resident rather than a captured frame.
     resident_reads: u32,
     skips: Vec<(DivergenceSkip, u32)>,
@@ -425,54 +487,36 @@ impl Window {
             self.note_skip(measured.unwrap_err());
             return;
         };
-        self.compared += 1;
         self.resident_reads += u32::from(d.src == OurSide::Resident);
         self.invented += u32::from(!d.from_device);
-        self.pending_any += u32::from(d.pending > 0);
-        self.visible += u32::from(d.div.is_visible());
-        // Worst by the magnitude that matters, not by pixel count: a frame with
-        // a million pixels off by 2 has not lost guest work and one with a
-        // thousand off by 200 has.
-        if d.div.max > self.worst.max
-            || (d.div.max == self.worst.max && d.div.gt64 > self.worst.gt64)
-        {
-            self.worst = d.div;
-            self.worst_mid = mapping_id;
-            self.worst_pending = d.pending;
+        self.all.note(mapping_id, &d);
+        if d.pending == 0 {
+            self.settled.note(mapping_id, &d);
         }
     }
 
     /// The window's line, and whether it is a failure.
     ///
-    /// A window that saw a visible divergence is reporting the frame on screen
-    /// disagreeing with the frame the guest holds for the surface it named.
-    /// Nothing on the present path can correct that — the resident is the only
-    /// copy we read — so it is a loss of guest work reaching the display, not a
-    /// transient, and it belongs on the always-on failure channel.
+    /// Only the **settled** subset can fail. A window whose divergences all
+    /// carried an armed deferred window is reporting the deferred-writeback
+    /// rail doing exactly what it says: the pinned resident is authoritative
+    /// and the guest window is stale until something reads it. Failing on that
+    /// would put a line under most frames of a healthy boot and bury the case
+    /// that matters — a settled divergence, where our copy and the guest's
+    /// disagree with no obligation outstanding to explain it.
     fn line(&self, dt: u128) -> (String, bool) {
         (
             format!(
-                "present_vs_guest window_ms={dt} presents={} compared={} resident={} visible={} \
-                 worst_mid={} px={} gt1={} gt4={} gt16={} gt64={} max={} max_swapped={} \
-                 pending={} pending_presents={} invented={} skips=[{}]",
+                "present_vs_guest window_ms={dt} presents={} resident={} invented={} \
+                 {} {} skips=[{}]",
                 self.presents,
-                self.compared,
                 self.resident_reads,
-                self.visible,
-                self.worst_mid,
-                self.worst.px,
-                self.worst.gt1,
-                self.worst.gt4,
-                self.worst.gt16,
-                self.worst.gt64,
-                self.worst.max,
-                self.worst.max_swapped,
-                self.worst_pending,
-                self.pending_any,
                 self.invented,
+                self.settled.fields("settled_"),
+                self.all.fields("all_"),
                 self.skips_str()
             ),
-            self.visible > 0,
+            self.settled.visible > 0,
         )
     }
 }
@@ -531,7 +575,7 @@ mod tests {
     use crate::runtime::host::FakeHost;
 
     const W: u32 = 64;
-    const H: u32 = 8;
+    const H: u32 = 16;
 
     /// A mapping whose guest pages are real host memory, filled with `fill`,
     /// plus a captured present frame of the same geometry filled with `ours`.
@@ -567,10 +611,10 @@ mod tests {
     fn a_constructed_disagreement_is_reported_with_its_magnitude() {
         let (mut state, mut host) = rig(0x10, 0xf0);
         let d = super::measure(&mut state, &mut host, 1, W, H, false).expect("comparison must run");
-        assert_eq!(d.rows, 3, "three spread rows must be read");
-        assert_eq!(d.div.px, (W as usize) * 3);
+        assert_eq!(d.div.px, (W as usize) * (H as usize), "every pixel compared");
         assert_eq!(d.div.max, 0xe0);
-        assert_eq!(d.div.gt64, (W as usize) * 3);
+        assert_eq!(d.div.gt64, (W as usize) * (H as usize));
+        assert_eq!(d.div.bbox, Some((0, 0, W, H)));
         assert!(d.div.is_visible());
         assert_eq!(d.pending, 0, "no deferred window was armed");
     }
@@ -582,28 +626,43 @@ mod tests {
     fn matching_content_reads_clean_on_the_same_rig() {
         let (mut state, mut host) = rig(0x77, 0x77);
         let d = super::measure(&mut state, &mut host, 1, W, H, false).expect("comparison must run");
-        assert_eq!(d.rows, 3);
+        assert_eq!(d.div.px, (W as usize) * (H as usize));
         assert_eq!(d.div.max, 0, "identical bytes must not report a deviation");
+        assert_eq!(d.div.bbox, None);
         assert!(!d.div.is_visible());
     }
 
-    /// A divergence confined to one band must still be found, because that is
+    /// A band anywhere in the frame must be found and located, because that is
     /// the shape the class takes: a dead window's rect, not a whole frame.
+    ///
+    /// This test exists because the first version of this probe would have
+    /// failed it. It sampled y = H/4, H/2, 3H/4; the band that reproduced on
+    /// the rig sat at y = 618..679 of 1080 and none of those rows crosses it.
+    /// The band here is deliberately placed off every such fraction.
     #[test]
-    fn a_band_that_crosses_one_sampled_row_is_found() {
+    fn a_band_that_no_row_grid_would_cross_is_found_and_located() {
         let (mut state, mut host) = rig(0x20, 0x20);
-        // Row H/2 only — the middle of the three sampled rows.
         let tight = (W as usize) * 4;
-        let y = (H / 2) as usize;
-        for b in &mut state.present.frame_bgra[y * tight..(y + 1) * tight] {
-            *b = 0xd0;
+        let (y_lo, y_hi) = (5usize, 7usize);
+        for y in y_lo..y_hi {
+            for b in &mut state.present.frame_bgra[y * tight..(y + 1) * tight] {
+                *b = 0xd0;
+            }
         }
+        assert!(
+            ![1, 2, 3].iter().any(|n| (H as usize) * n / 4 >= y_lo
+                && (H as usize) * n / 4 < y_hi),
+            "the band must miss every quarter row, or this test proves nothing"
+        );
         let d = super::measure(&mut state, &mut host, 1, W, H, false).expect("comparison must run");
         assert_eq!(d.div.max, 0xb0);
+        assert_eq!(d.div.gt64, (W as usize) * (y_hi - y_lo));
         assert_eq!(
-            d.div.gt64, W as usize,
-            "exactly the one sampled row that crosses the band"
+            d.div.bbox,
+            Some((0, y_lo as u32, W, y_hi as u32)),
+            "the bbox must name where the divergence is, not just that there is one"
         );
+        assert_eq!(d.div.bbox_str(), format!("{W}x2+0+{y_lo}"));
     }
 
     /// Route B leaves no CPU pixels. The probe must say "nothing was compared"
@@ -651,26 +710,66 @@ mod tests {
         assert_eq!(d.div.max, 0xe0);
     }
 
-    /// The window that a visible divergence produces must reach the failure
-    /// channel and carry its magnitude. Without this the measurement above can
-    /// be perfect and still never be seen, which is the shape of a probe that
-    /// looks healthy and reports nothing.
+    /// A settled divergence — the two copies disagree with no deferred window
+    /// outstanding to explain it — must reach the failure channel and carry its
+    /// magnitude. Without this the measurement can be perfect and still never
+    /// be seen, which is the shape of a probe that looks healthy and reports
+    /// nothing.
     #[test]
-    fn a_visible_divergence_closes_the_window_on_the_failure_channel() {
+    fn a_settled_divergence_closes_the_window_on_the_failure_channel() {
         let (mut state, mut host) = rig(0x10, 0xf0);
         let measured = super::measure(&mut state, &mut host, 1, W, H, false);
         let mut w = Window::default();
         w.note(1, measured);
         let (line, is_fail) = w.line(2001);
-        assert!(is_fail, "a visible divergence must be a failure, not census");
+        assert!(is_fail, "a settled divergence must be a failure, not census");
+        // `invented=1`: the fixture mapping carries no device descriptor, so
+        // the sample window is the packed fallback. The flag comes from the
+        // resolver that decided, which is the point of carrying it.
+        assert!(line.contains("presents=1 resident=0 invented=1"), "{line}");
+        assert!(line.contains("settled_cmp=1 settled_vis=1"), "{line}");
+        assert!(line.contains("settled_mid=1"), "{line}");
         assert!(
-            line.contains("presents=1 compared=1 resident=0 visible=1"),
+            line.contains(&format!("settled_gt64={}", (W as usize) * (H as usize))),
             "{line}"
         );
-        assert!(line.contains("worst_mid=1"), "{line}");
-        assert!(line.contains(&format!("gt64={}", (W as usize) * 3)), "{line}");
-        assert!(line.contains("max=224"), "{line}");
+        assert!(line.contains("settled_max=224"), "{line}");
+        assert!(line.contains("all_cmp=1 all_vis=1"), "{line}");
         assert!(line.contains("skips=[]"), "{line}");
+    }
+
+    /// A divergence with a deferred window armed over the surface span is the
+    /// deferred-writeback contract, not a lost render: the pinned resident is
+    /// authoritative and the guest's pages are stale until something reads
+    /// them. It must be counted and must NOT fail — on the live rail nearly
+    /// every present has one, and failing on it would bury the settled case.
+    #[test]
+    fn a_divergence_with_a_deferred_window_armed_is_counted_but_does_not_fail() {
+        let d = PresentDivergence {
+            div: FrameDivergence {
+                px: 100,
+                gt1: 100,
+                gt4: 100,
+                gt16: 100,
+                gt64: 100,
+                max: 255,
+                max_swapped: 255,
+                bbox: Some((0, 0, 10, 10)),
+            },
+            src: OurSide::Resident,
+            pending: 3,
+            from_device: true,
+        };
+        let mut w = Window::default();
+        w.note(6, Ok(d));
+        let (line, is_fail) = w.line(2000);
+        assert!(!is_fail, "the deferred contract is not a failure: {line}");
+        assert!(line.contains("all_cmp=1 all_vis=1"), "{line}");
+        assert!(line.contains("all_max=255"), "{line}");
+        assert!(
+            line.contains("settled_cmp=0 settled_vis=0"),
+            "an armed window must not enter the settled reading: {line}"
+        );
     }
 
     /// The converse for the emission half: agreement is a census line, and a
@@ -684,8 +783,12 @@ mod tests {
         w.note(1, measured);
         let (line, is_fail) = w.line(2000);
         assert!(!is_fail, "agreement is not a failure");
-        assert!(line.contains("visible=0"), "{line}");
-        assert!(line.contains("max=0"), "{line}");
+        assert!(line.contains("settled_cmp=1 settled_vis=0"), "{line}");
+        assert!(line.contains("settled_max=0"), "{line}");
+        assert!(
+            line.contains(&format!("settled_px={}", (W as usize) * (H as usize))),
+            "a clean comparison must still report what it read: {line}"
+        );
 
         let mut w = Window::default();
         w.note(1, Err(DivergenceSkip::NoCpuFrame));
@@ -693,7 +796,7 @@ mod tests {
         let (line, is_fail) = w.line(2000);
         assert!(!is_fail);
         assert!(
-            line.contains("presents=2 compared=0"),
+            line.contains("presents=2 ") && line.contains("all_cmp=0"),
             "a skipped window must not read as two clean presents: {line}"
         );
         assert!(line.contains("skips=[no_cpu_frame:2]"), "{line}");
@@ -712,10 +815,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_rows_diverge_nowhere() {
+    fn identical_frames_diverge_nowhere() {
         let row = vec![0x40u8; 64];
-        let d = compare_bgra_rows(&row, &row);
+        let d = compare_bgra_frames(&row, &row, 16);
         assert_eq!(d.px, 16);
+        assert_eq!(d.bbox, None);
         assert_eq!(d.max, 0);
         assert_eq!(d.gt1, 0);
         assert!(!d.is_visible());
@@ -729,13 +833,13 @@ mod tests {
         for px in rounding.chunks_exact_mut(4) {
             px[1] = 0x81;
         }
-        let d = compare_bgra_rows(&ours, &rounding);
+        let d = compare_bgra_frames(&ours, &rounding, 16);
         assert_eq!(d.max, 1);
         assert_eq!(d.gt1, 0);
         assert!(!d.is_visible());
 
         let stale = vec![0x00u8; 64];
-        let d = compare_bgra_rows(&ours, &stale);
+        let d = compare_bgra_frames(&ours, &stale, 16);
         assert_eq!(d.max, 0x80);
         assert_eq!(d.gt64, 16);
         assert!(d.is_visible());
@@ -750,7 +854,7 @@ mod tests {
             ours.extend_from_slice(&[b, g, r, 0xff]);
             guest.extend_from_slice(&[r, g, b, 0xff]);
         }
-        let d = compare_bgra_rows(&ours, &guest);
+        let d = compare_bgra_frames(&ours, &guest, 16);
         assert!(d.max > 64, "a channel swap must not read as agreement");
         assert_eq!(
             d.max_swapped, 0,
@@ -763,32 +867,6 @@ mod tests {
     fn alpha_is_excluded() {
         let ours = vec![0x10, 0x20, 0x30, 0x00];
         let guest = vec![0x10, 0x20, 0x30, 0xff];
-        assert_eq!(compare_bgra_rows(&ours, &guest).max, 0);
-    }
-
-    #[test]
-    fn merge_keeps_worst_case_and_sums_counts() {
-        let mut a = RowDivergence {
-            px: 10,
-            gt1: 3,
-            gt4: 2,
-            gt16: 1,
-            gt64: 0,
-            max: 20,
-            max_swapped: 5,
-        };
-        a.merge(RowDivergence {
-            px: 10,
-            gt1: 1,
-            gt4: 1,
-            gt16: 1,
-            gt64: 1,
-            max: 200,
-            max_swapped: 2,
-        });
-        assert_eq!(a.px, 20);
-        assert_eq!(a.gt64, 1);
-        assert_eq!(a.max, 200);
-        assert_eq!(a.max_swapped, 5);
+        assert_eq!(compare_bgra_frames(&ours, &guest, 1).max, 0);
     }
 }
