@@ -3692,45 +3692,6 @@ fn the_backing_gate_answers_the_same_whichever_resident_the_mid_resolves_to() {
         // Frames now go to mid 1 only; mid 6 gains nothing.
         state.note_compositor_member_published(1, w, h);
     }
-    // The resident-keyed twin, on the same two states, DOES separate them —
-    // that is the whole reason it exists. Asserted here rather than in its own
-    // test so the contrast is one diff away from the blindness it answers.
-    {
-        use crate::model::ResidentKey;
-        let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 6u32] {
-            s.map_surface(mid);
-            s.note_presented_geom(mid, w, h);
-        }
-        let group = ResidentKey::Group {
-            width: w,
-            height: h,
-        };
-        assert_eq!(s.present_resident(6, w, h), group);
-
-        // A full frame published into the SHARED resident backs a present of any
-        // member, including one that never had a Store of its own.
-        s.note_compositor_member_published(1, w, h);
-        s.note_resident_published(group);
-        assert_eq!(s.note_present_resident_backing(group), None);
-
-        // Now the routing failure: the guest stores a full frame for mid 6, but
-        // the draws went to mid 6's PRIVATE resident. The mid-keyed gate sees a
-        // Store naming 6 and stays quiet; the resident-keyed one sees that the
-        // shared resident — the one the present reads — gained nothing.
-        s.note_compositor_member_published(6, w, h);
-        s.note_resident_published(ResidentKey::Mid { mapping_id: 6 });
-        assert_eq!(
-            s.note_present_backing(6),
-            None,
-            "the mid-keyed gate is quiet: a Store did name mid 6"
-        );
-        assert!(
-            s.note_present_resident_backing(group).is_some(),
-            "the resident-keyed gate must fire: the shared resident got nothing"
-        );
-    }
-
     let (g, p) = (grouped.note_present_backing(6), private.note_present_backing(6));
     assert!(
         g.is_some() && p.is_some(),
@@ -3743,58 +3704,6 @@ fn the_backing_gate_answers_the_same_whichever_resident_the_mid_resolves_to() {
         "the gate must not be read as evidence about the resident: it gives the \
          same answer for a mid on the shared resident and a mid on its own"
     );
-}
-
-/// Healthy swapchain rotation must keep the resident-keyed gate silent, and a
-/// member unmapping must not make the shared resident look freshly unbacked.
-///
-/// Both are predictions about a real boot, so they are worth holding: the gate
-/// is measure-only precisely because a flood would mean the model behind it is
-/// wrong, and the second half is the `af19bfb` mistake in a new place — pruning
-/// evidence on a recycle. WindowServer rotates swapchain buffers continuously,
-/// unmapping old mids, and the `Group` key names a GEOMETRY, not a member.
-#[test]
-fn the_resident_gate_is_quiet_through_rotation_and_survives_a_member_unmap() {
-    use crate::model::ResidentKey;
-    let (w, h) = (1920u32, 1080u32);
-    let mut s = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    for mid in [1u32, 4u32, 6u32] {
-        s.map_surface(mid);
-        s.note_presented_geom(mid, w, h);
-    }
-    let group = ResidentKey::Group {
-        width: w,
-        height: h,
-    };
-
-    // Rotation: each member draws into the shared resident, then is presented.
-    for mid in [1u32, 4, 6, 1, 4, 6, 1, 4] {
-        s.note_compositor_member_published(mid, w, h);
-        s.note_resident_published(group);
-        assert_eq!(
-            s.note_present_resident_backing(s.present_resident(mid, w, h)),
-            None,
-            "mid {mid} presented a resident that had just received a full frame"
-        );
-    }
-
-    // A buffer is recycled out. The shared resident still holds the frame it was
-    // given, so the next member's present must stay quiet.
-    s.unmap_surface(4);
-    s.note_compositor_member_published(6, w, h);
-    s.note_resident_published(group);
-    assert_eq!(s.note_present_resident_backing(group), None);
-    assert!(
-        s.present.resident_dense_seq.contains_key(&group),
-        "the Group key names a geometry, not a member: an unmap must not drop it"
-    );
-
-    // The unmapped member's own private keys DO go, so a recycled id cannot
-    // inherit its predecessor's witness.
-    assert!(!s
-        .present
-        .resident_dense_seq
-        .contains_key(&ResidentKey::Mid { mapping_id: 4 }));
 }
 
 /// The display-transaction probe must key on the payload *shape*, not fire per

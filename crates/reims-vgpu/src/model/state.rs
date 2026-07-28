@@ -997,28 +997,6 @@ pub struct PresentState {
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
-    /// [`Self::dense_frame_seq`] asked of the **resident** instead of the
-    /// mapping id: the [`Self::dense_frame_counter`] value at the last full
-    /// frame published into each [`ResidentKey`].
-    ///
-    /// MEASURE-ONLY, and it exists to be compared against the mid-keyed pair
-    /// above rather than to live beside it. The mid-keyed gate reports what the
-    /// guest SENT; this one reports what the thing we are about to scan out
-    /// HOLDS, which is the question the black-desktop class turns on. Both the
-    /// blindness and the latent false positive documented on
-    /// [`Self::dense_frame_seq`] come from that keying, and one key fixes both:
-    /// unified members share one resident, so a frame stored through any of them
-    /// backs all of them, while a frame stored into a private resident backs
-    /// only that one and leaves the shared resident visibly empty.
-    ///
-    /// Fed from the identity resolved at DRAW time and carried to the publish,
-    /// never re-resolved at store time — re-resolving a settled routing question
-    /// is what `f481e85` had to delete from the flush gate.
-    pub resident_dense_seq: BTreeMap<ResidentKey, u64>,
-    /// Per resident: the [`Self::resident_dense_seq`] value it held the last
-    /// time a present read it. The resident-keyed twin of
-    /// [`Self::presented_dense_seq`].
-    pub presented_resident_seq: BTreeMap<ResidentKey, u64>,
     /// Coarse per-mid per-tile damage-epoch grid.
     /// `TILE_GEN_GRID_W × TILE_GEN_GRID_H` tiles; each cell holds the
     /// [`Self::tile_epoch`] at which THIS mid last drew into that tile. Absent
@@ -1119,29 +1097,6 @@ pub struct PresentedGeom {
     pub width: u32,
     pub height: u32,
     pub map_generation: u32,
-}
-
-/// Which of our residents a complete frame landed in.
-///
-/// The model-level half of the backend's `TargetIdentity`. It is not that type:
-/// `TargetIdentity` lives in `backend::vulkan`, and `model` must stay
-/// backend-agnostic or the Metal arm stops compiling. The present path only ever
-/// needs to tell the shared compositor-output resident from a private one, so
-/// that is all this carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ResidentKey {
-    /// The shared compositor-output resident at this geometry. Every unified
-    /// member's draws chain into it, so a frame stored through any one member is
-    /// the frame all of them present.
-    Group { width: u32, height: u32 },
-    /// A private per-mapping resident.
-    Mid { mapping_id: u32 },
-    /// No resident at all: the CPU portability fallback wrote the frame straight
-    /// into guest pages, with no GPU draw to have established an identity. A
-    /// distinct variant rather than folding into `Mid`, because "the private
-    /// resident holds this frame" and "nothing holds it but the guest's own
-    /// pages" are different answers to the question the gate asks.
-    GuestPagesOnly { mapping_id: u32 },
 }
 
 /// Why [`DeviceState::output_group_resolve`] refused to unify a surface into
@@ -2955,52 +2910,6 @@ impl DeviceState {
     /// quiet. `present_identity_flip` is the gate for that; see
     /// [`PresentState::dense_frame_seq`].
     ///
-    /// Record that the full frame just published lives in `resident`.
-    ///
-    /// Reuses the sequence [`Self::note_compositor_member_published`] has just
-    /// advanced rather than counting its own, so the mid-keyed and
-    /// resident-keyed witnesses cannot drift apart while both exist. Call it
-    /// immediately after, with the identity resolved at DRAW time.
-    pub fn note_resident_published(&mut self, resident: ResidentKey) {
-        let seq = self.present.dense_frame_counter;
-        self.present.resident_dense_seq.insert(resident, seq);
-    }
-
-    /// [`Self::note_present_backing`] asked of the resident: has `resident`
-    /// received a full frame since the last present that read it?
-    ///
-    /// Returns `Some(seq)` — the unchanged sequence — when it has not, which is
-    /// the reading the mid-keyed gate cannot take. `None` on the resident's
-    /// first present and whenever the sequence advanced.
-    pub fn note_present_resident_backing(&mut self, resident: ResidentKey) -> Option<u64> {
-        let seq = self
-            .present
-            .resident_dense_seq
-            .get(&resident)
-            .copied()
-            .unwrap_or(0);
-        let previous = self.present.presented_resident_seq.insert(resident, seq);
-        match previous {
-            Some(prev) if prev == seq => Some(seq),
-            _ => None,
-        }
-    }
-
-    /// The resident a present of `mapping_id` at this geometry will read.
-    ///
-    /// Derived from [`Self::output_group_for`], which is what
-    /// `import_present::surface_identity` resolves the export's identity with,
-    /// so this cannot disagree with the resident actually scanned out.
-    pub fn present_resident(&self, mapping_id: u32, w: u32, h: u32) -> ResidentKey {
-        match self.output_group_for(mapping_id, w, h) {
-            Some(_) => ResidentKey::Group {
-                width: w,
-                height: h,
-            },
-            None => ResidentKey::Mid { mapping_id },
-        }
-    }
-
     /// Records the witness on every call, so a member that stays unbacked
     /// reports once per present rather than once per lifetime.
     pub fn note_present_backing(&mut self, mapping_id: u32) -> Option<u64> {
@@ -3029,24 +2938,6 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
-        // The private-resident keys for this id, for the same reason. The
-        // `Group` key is deliberately NOT pruned: it names a geometry, not a
-        // mapping, and it outlives any one member — dropping it when a member
-        // unmaps is exactly the "evidence pruned by a recycle" mistake
-        // `af19bfb` had to undo, and it would make the shared resident look
-        // freshly-unbacked on every swapchain rotation.
-        self.present
-            .resident_dense_seq
-            .remove(&ResidentKey::Mid { mapping_id });
-        self.present
-            .resident_dense_seq
-            .remove(&ResidentKey::GuestPagesOnly { mapping_id });
-        self.present
-            .presented_resident_seq
-            .remove(&ResidentKey::Mid { mapping_id });
-        self.present
-            .presented_resident_seq
-            .remove(&ResidentKey::GuestPagesOnly { mapping_id });
         // Prune the per-mid tile-epoch grid too (mirrors dense_frame_seq): a
         // recycled mapping id must not inherit a predecessor's tile epochs, or a
         // logically-unrelated surface would show phantom cross-mid divergence.

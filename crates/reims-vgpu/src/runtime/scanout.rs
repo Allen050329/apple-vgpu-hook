@@ -467,36 +467,6 @@ pub fn capture_present_frame(
              produced this frame went to the other one)"
         ));
     }
-    // Resident-keyed backing, read AFTER the display action, because that is the
-    // identity the export resolves and therefore the image that will actually be
-    // scanned out. The mid-keyed `present_unbacked` gate in `drain` asks whether
-    // the guest SENT a frame for this mapping; this asks whether the thing we are
-    // about to show RECEIVED one. They disagree exactly when draws were routed to
-    // one resident while the present reads another, which is the black-desktop
-    // class.
-    //
-    // MEASURE-ONLY (`off`, not `fail`) until a clean boot says what it reports.
-    // If it stays quiet through a healthy session it replaces the mid-keyed gate,
-    // whose blindness and latent false positive both come from that keying; if it
-    // fires on a healthy boot the model behind it is wrong, which is the cheap
-    // thing to learn.
-    let resident = state.present_resident(mapping_id, width, height);
-    // `counter` is the discriminator, and it is the whole reason this line is
-    // worth reading. `since_seq` says this resident gained no full frame since it
-    // was last shown; `counter` says whether ANY resident did. Equal means no full
-    // frame was published at all in that interval — the compositor damage-drew
-    // into a resident that legitimately retains, and the present is correct.
-    // Greater means full frames were published and went somewhere else, which is
-    // the routing failure that blacks out the desktop.
-    let counter = state.present.dense_frame_counter;
-    if let Some(seq) = state.note_present_resident_backing(resident) {
-        crate::observe::off(format!(
-            "present_resident_unbacked mid={mapping_id} {width}x{height} \
-             resident={resident:?} since_seq={seq} counter={counter} \
-             (no full frame published into this resident since it was last shown; \
-             counter>since_seq means some other resident got them)"
-        ));
-    }
     // Advance the per-present tile-epoch clock and measure per-tile
     // damage-coverage divergence against the freshest same-geometry peer
     //. The CPU-display capture below
