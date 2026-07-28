@@ -1288,6 +1288,93 @@ fn maybe_enqueue_scanout_gl<H: HostOps>(
 /// IOSurface pages (alias) or disjoint swap surfaces decides the present
 /// ownership contract. This logs decoded page-table facts only and never
 /// selects behavior. One line per (named mid, named map_generation).
+/// Running totals for [`note_clearonly_peer_choice`]. Plain counters, because
+/// the question is about a rate and a subset, not about transitions.
+#[derive(Default)]
+struct ClearOnlyPeerCensus {
+    /// ClearOnly presents that selected some peer at all.
+    presents: u64,
+    /// …of those, the ones whose peer is not the surface the transaction named.
+    /// This is the denominator: at zero, the cascade never moved and `image_moved`
+    /// says nothing.
+    mid_moved: u64,
+    /// …of *those*, the ones where the peer resolves to a DIFFERENT resident
+    /// than the named surface would have. This is the only subset in which the
+    /// five-resolver cascade can have changed what is on screen.
+    image_moved: u64,
+    /// Distinct `(mode, mid_moved, image_moved)` shapes already reported.
+    shapes: std::collections::BTreeSet<(&'static str, bool, bool)>,
+    /// Individually-reported `image_moved` events, before the class falls back
+    /// to the power-of-two rollup.
+    named_events: u32,
+}
+
+/// Census: does the ClearOnly peer cascade ever select a different *image* than
+/// the surface the display transaction names?
+///
+/// Five resolvers — `alias_peer`, `fifo_peer`, `graph_peer`, `retain_peer`,
+/// `early_peer` — choose `peer_mid`, and `capture_present_frame` then reads
+/// whichever resident that mid resolves to. When the geometry is a proven output
+/// group every member resolves to ONE resident, so choosing a different mid is
+/// choosing another name for the same `VkImage` and the cascade cannot have
+/// changed a pixel. That is not a supposition about the desktop: it is what
+/// `surface_identity` does, and [`resolves_to_same_resident`] reads it.
+///
+/// The two readings are split on purpose. A single "the cascade fired N times"
+/// count would be large and completely uninformative, which is the failure mode
+/// where a probe produces confident numbers that are all the mechanism already
+/// known. `mid_moved` is the denominator and `image_moved` the discriminating
+/// subset, so `mid_moved=0` ("could never fire") and `mid_moved>0,
+/// image_moved=0` ("fired, could not matter") are different readings.
+///
+/// Emission: every new `(mode, mid_moved, image_moved)` shape, every
+/// `image_moved` event up to a cap, and a rollup at each power of two of
+/// `presents` so the denominator is always readable without reconstructing it.
+fn note_clearonly_peer_choice(
+    state: &DeviceState,
+    named: u32,
+    peer: u32,
+    w: u32,
+    h: u32,
+    mode: &'static str,
+) {
+    const NAMED_EVENT_CAP: u32 = 32;
+    use std::sync::Mutex;
+    static CENSUS: Mutex<Option<ClearOnlyPeerCensus>> = Mutex::new(None);
+
+    let mid_moved = peer != named;
+    let image_moved = mid_moved
+        && !crate::runtime::import_present::resolves_to_same_resident(state, named, peer, w, h);
+
+    let mut guard = CENSUS.lock().unwrap_or_else(|p| p.into_inner());
+    let c = guard.get_or_insert_with(Default::default);
+    c.presents += 1;
+    c.mid_moved += u64::from(mid_moved);
+    c.image_moved += u64::from(image_moved);
+    let fresh_shape = c.shapes.insert((mode, mid_moved, image_moved));
+    let name_it = image_moved && c.named_events < NAMED_EVENT_CAP;
+    if name_it {
+        c.named_events += 1;
+    }
+    let rollup = c.presents.is_power_of_two();
+    if !(fresh_shape || name_it || rollup) {
+        return;
+    }
+    let line = format!(
+        "clearonly_peer_choice mode={mode} {w}x{h} named={named} peer={peer} \
+         mid_moved={} image_moved={} totals presents={} mid_moved={} image_moved={} \
+         shapes={} named_cap={NAMED_EVENT_CAP}",
+        mid_moved as u8,
+        image_moved as u8,
+        c.presents,
+        c.mid_moved,
+        c.image_moved,
+        c.shapes.len()
+    );
+    drop(guard);
+    crate::observe::fail(line);
+}
+
 fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32) -> Option<String> {
     use std::collections::HashSet;
     let named = state.mappings.get(&mapping)?;
@@ -1732,6 +1819,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             };
 
             if peer_mid != 0 {
+                note_clearonly_peer_choice(state, mapping, peer_mid, w, h, mode);
                 // A "torn-capture guard" used to sit here and REPLACE the capture
                 // source with whichever same-geometry peer had the freshest
                 // full-frame sequence, above a `RETENTION_GAP_MARGIN` of 4.

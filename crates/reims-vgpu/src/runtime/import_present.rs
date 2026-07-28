@@ -273,6 +273,32 @@ pub fn eligible(mapping_id: u32, width: u32, height: u32) -> bool {
     mapping_id != 0 && width > 0 && height > 0
 }
 
+/// Whether two mapping ids at one geometry render into and capture from the
+/// SAME resident — i.e. whether [`surface_identity`] answers equally for both.
+///
+/// Side-effect free, unlike calling [`surface_identity`] twice: that emits the
+/// deduplicated `compositor_group_unify` / `resident_identity_shared` lines, and
+/// a census asking a question must not consume the budget of the lines that
+/// answer a different one.
+///
+/// Kept honest by `same_resident_agrees_with_surface_identity`, which asserts it
+/// against real [`surface_identity`] results rather than restating the rule.
+pub fn resolves_to_same_resident(
+    state: &DeviceState,
+    a: u32,
+    b: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    // Distinct mids can only share a resident through output-group unification:
+    // the `Surface` variant carries the mapping id, so two of them never match.
+    let ga = state.output_group_for(a, width, height);
+    ga.is_some() && ga == state.output_group_for(b, width, height)
+}
+
 /// The per-member `Surface` identity, ignoring output-group unification.
 pub fn member_surface_identity(
     state: &DeviceState,
@@ -2696,6 +2722,60 @@ mod tests {
         assert_eq!(a, b, "two distinct guest surfaces reached one resident");
         assert_eq!(a.surface_mapping_id(), None);
         assert_eq!(b.surface_mapping_id(), None);
+    }
+
+    /// `resolves_to_same_resident` must answer exactly what comparing two
+    /// `surface_identity` results answers, in every state the ClearOnly peer
+    /// census can observe. Asserted against real `surface_identity` calls rather
+    /// than against a restatement of the unification rule, so the two cannot
+    /// drift: the census's whole value is that "the peer is a different name for
+    /// the same image" means what the render path means by it.
+    #[test]
+    fn same_resident_agrees_with_surface_identity() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for mid in [1u32, 5u32, 9u32] {
+            state.map_surface(mid);
+        }
+        let member = crate::model::CompositorOutputMember {
+            width: 1920,
+            height: 1080,
+            source: 13,
+        };
+        for mid in [1u32, 5u32, 9u32] {
+            state.present.compositor_output_members.insert(mid, member);
+        }
+        let agrees = |state: &DeviceState, a: u32, b: u32| {
+            let want = surface_identity(state, a, 1920, 1080) == surface_identity(state, b, 1920, 1080);
+            assert_eq!(
+                resolves_to_same_resident(state, a, b, 1920, 1080),
+                want,
+                "mids {a},{b} disagree with surface_identity"
+            );
+            want
+        };
+
+        // Nothing presented yet: every mid is its own resident, and a mid is
+        // always the same resident as itself.
+        assert!(!agrees(&state, 1, 5));
+        assert!(agrees(&state, 1, 1));
+
+        // One presented surface is still a lone member — no group to share.
+        state.note_presented_geom(1, 1920, 1080);
+        assert!(!agrees(&state, 1, 5));
+
+        // Two presented surfaces latch the geometry, and both resolve to the
+        // shared group: a peer hop between them cannot change the image.
+        state.note_presented_geom(5, 1920, 1080);
+        assert!(agrees(&state, 1, 5));
+
+        // A mid that never qualified stays private even at the latched
+        // geometry, so a hop onto it DOES change the image.
+        assert!(!agrees(&state, 1, 9));
+        assert!(!agrees(&state, 9, 5));
+
+        // …and joins once the guest names it in a display transaction.
+        state.note_presented_geom(9, 1920, 1080);
+        assert!(agrees(&state, 1, 9));
     }
 
     /// The direct-present fallback identity is always per-member.
