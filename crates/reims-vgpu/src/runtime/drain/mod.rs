@@ -1999,6 +1999,12 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // The frame is decided; this only reads it. `capture_present_frame`
+        // above took its pixels from the GPU resident and the host surface
+        // cache, so the guest's own pages are the one copy in the comparison
+        // our present path did not produce — and the only way to tell a stale
+        // resident from a guest that has not repainted.
+        crate::runtime::present_divergence::note_present(state, host, mapping, w, h);
         crate::observe::line(format!(
             "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={}",
             encoded as u8, state.present.frame_valid as u8
