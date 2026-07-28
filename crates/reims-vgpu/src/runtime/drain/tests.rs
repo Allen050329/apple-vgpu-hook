@@ -393,30 +393,6 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
     assert_coalesced_paint_action(&host, "named surface, not composite peer");
 }
 
-/// The census rollup schedule must stay readable after the power-of-two
-/// thinning stops, or a long run's final denominator is unrecoverable: a
-/// session ending at 900 has its last reading at 512.
-#[test]
-fn rollup_schedule_keeps_reporting_after_the_powers_of_two_thin_out() {
-    use super::{rollup_due, ROLLUP_STRIDE};
-    // Dense while the population is small — every early count reports.
-    for n in [1u64, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
-        assert!(rollup_due(n), "{n} is a power of two");
-    }
-    // The gap a pure power-of-two schedule leaves: nothing between 512 and
-    // 1024 without the flat stride.
-    assert!(!(513u64..1024).any(|n| n.is_power_of_two()));
-    assert!(rollup_due(1024));
-    assert!(rollup_due(1536), "the stride must fill the gap");
-    // And it keeps firing at a bounded interval forever after.
-    for k in 1..=8u64 {
-        assert!(rollup_due(100 * ROLLUP_STRIDE + k * ROLLUP_STRIDE));
-    }
-    // Still quiet between rollups, so this stays safe to leave always-on.
-    assert!(!rollup_due(1025));
-    assert!(!rollup_due(1535));
-}
-
 /// CmdDeleteTask (root 0x20) must clear the task — not flood UnknownRootOpcode.
 #[test]
 fn delete_task_root_clears_active_task() {
@@ -2550,62 +2526,6 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     state.map_surface(5);
     state.note_dense_frame_published(5, w, h);
     assert_eq!(state.note_present_backing(5), None);
-}
-
-/// What the backing gate CANNOT see, pinned so the limitation is executable
-/// rather than a comment someone stops believing.
-///
-/// The gate's answer is a function of Store bookkeeping alone. Two states with
-/// identical publish/present histories give identical answers even when one
-/// resolves the mid to the shared `OutputGroup` resident and the other to a
-/// private per-mid `Surface` — which is precisely the disagreement that blacks
-/// out the desktop: the guest's full frame is stored, so the seq advances and
-/// this gate reports backed, while the present reads a resident that never got
-/// those pixels. `present_identity_flip` is the gate for that, and it is the one
-/// that moved 9 -> 0 across the fix.
-#[test]
-fn the_backing_gate_answers_the_same_whichever_resident_the_mid_resolves_to() {
-    let (w, h) = (1920u32, 1080u32);
-
-    // Grouped: two members presented at this geometry, so the swapchain latches
-    // and both resolve to the shared resident.
-    let mut grouped = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    for mid in [1u32, 6u32] {
-        grouped.map_surface(mid);
-        grouped.note_presented_geom(mid, w, h);
-    }
-    assert!(grouped.output_group_for(6, w, h).is_some());
-
-    // Private: same publish/present history, but nothing was ever presented
-    // here, so mid 6 keeps a per-mid resident.
-    let mut private = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    for mid in [1u32, 6u32] {
-        private.map_surface(mid);
-    }
-    assert!(private.output_group_for(6, w, h).is_none());
-
-    for state in [&mut grouped, &mut private] {
-        // A full frame naming mid 6 was stored. The gate goes quiet on the next
-        // present in BOTH states — including the one where mid 6 owns a private
-        // resident. That silence is about the Store, not about where its pixels
-        // landed, and it is the false negative the black-desktop class hides in.
-        state.note_dense_frame_published(6, w, h);
-        assert_eq!(state.note_present_backing(6), None);
-        // Frames now go to mid 1 only; mid 6 gains nothing.
-        state.note_dense_frame_published(1, w, h);
-    }
-    let (g, p) = (grouped.note_present_backing(6), private.note_present_backing(6));
-    assert!(
-        g.is_some() && p.is_some(),
-        "both arms must actually reach the firing state, or the equality below \
-         proves nothing: grouped={g:?} private={p:?}"
-    );
-    assert_eq!(
-        g.is_some(),
-        p.is_some(),
-        "the gate must not be read as evidence about the resident: it gives the \
-         same answer for a mid on the shared resident and a mid on its own"
-    );
 }
 
 /// An AIR-load hold is control flow; a hold that outlives the device is the

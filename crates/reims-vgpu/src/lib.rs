@@ -819,19 +819,12 @@ fn window_present_source(
     width: u32,
     height: u32,
 ) -> crate::backend::vulkan::engine::WindowPresentSource {
-    use crate::backend::vulkan::engine::{TargetIdentity, WindowPresentSource};
-
-    let identity = crate::runtime::import_present::surface_identity(state, mapping, width, height);
-    let mut candidates = vec![identity.clone()];
-    if matches!(identity, TargetIdentity::OutputGroup { .. }) {
-        candidates.push(crate::runtime::import_present::member_surface_identity(
-            state, mapping, width, height,
-        ));
-    }
-    WindowPresentSource {
+    crate::backend::vulkan::engine::WindowPresentSource {
         width,
         height,
-        candidates,
+        candidates: vec![crate::runtime::import_present::surface_identity(
+            state, mapping, width, height,
+        )],
     }
 }
 
@@ -850,26 +843,12 @@ fn export_present_dmabuf(
     use std::os::fd::FromRawFd;
     let source = window_present_source(state, mapping, width, height);
     let identity = source.candidates.first()?;
-    let mut export = unsafe {
+    let export = unsafe {
         crate::backend::vulkan::engine::export_present_from_resident_fd_policy(
             identity,
             |ring_idx, ew, eh| !import_ack.is_imported(ew, eh, ring_idx),
         )
     };
-    if export.is_err()
-        && matches!(
-            identity,
-            crate::backend::vulkan::engine::TargetIdentity::OutputGroup { .. }
-        )
-    {
-        let member = source.candidates.get(1)?;
-        export = unsafe {
-            crate::backend::vulkan::engine::export_present_from_resident_fd_policy(
-                member,
-                |ring_idx, ew, eh| !import_ack.is_imported(ew, eh, ring_idx),
-            )
-        };
-    }
     match export {
         Ok((fd, pitch, ew, eh, ring_idx)) if ew == width && eh == height => {
             // SAFETY: when present, `fd` is a fresh owned dmabuf dup from the

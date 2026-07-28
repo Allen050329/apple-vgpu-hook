@@ -999,7 +999,6 @@ mod tests {
             height: 4,
             map_generation: 1,
             full_quad_bounds: false,
-            grouped: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32, lo: u64, hi: u64| RenderDeferredKey {
@@ -1155,8 +1154,7 @@ mod tests {
                 height: 32,
                 map_generation: 2,
                 full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
+                    armed_seq: 0,
             },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
@@ -1195,8 +1193,7 @@ mod tests {
                 height: 32,
                 map_generation: 2,
                 full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
+                    armed_seq: 0,
             },
         );
         // The guest deletes the backing; the window is kept for the fingerprint
@@ -1230,8 +1227,7 @@ mod tests {
                 height: 32,
                 map_generation: 1,
                 full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
+                    armed_seq: 0,
             },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
@@ -1252,8 +1248,7 @@ mod tests {
                 height: 32,
                 map_generation: 1,
                 full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
+                    armed_seq: 0,
             },
         );
         assert!(super::flush_intersecting(
@@ -1311,7 +1306,6 @@ mod tests {
             height: 32,
             map_generation: 1,
             full_quad_bounds: false,
-            grouped: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32| RenderDeferredKey {
@@ -1369,7 +1363,6 @@ mod tests {
             height: 32,
             map_generation: 1,
             full_quad_bounds: false,
-            grouped: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32| RenderDeferredKey {

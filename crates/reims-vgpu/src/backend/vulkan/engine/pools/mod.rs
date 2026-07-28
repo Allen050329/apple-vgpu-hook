@@ -813,7 +813,7 @@ pub(crate) struct ResidentTargetSlot {
     pub color_format: vk::Format,
     /// Deferred render-Store pin count: this target's content exists only on
     /// the GPU (guest pages stale). The registry LRU sweep skips slots with a
-    /// nonzero count. A count (not a bool) because a shared `OutputGroup`
+    /// nonzero count. A count (not a bool) because a surface with several
     /// identity is pinned independently by each member's deferred window —
     /// the first member's flush must not expose the image to eviction while
     /// a peer's window is still armed.
@@ -876,8 +876,6 @@ impl FreeTargetImage {
 pub(crate) struct RegistryGeomCensus {
     /// Total registry occupancy (all geometries).
     pub total: usize,
-    /// `Some(content_ready)` if an `OutputGroup` resident exists at this geom.
-    pub group: Option<bool>,
     /// Every `Surface` resident at this geom: `(id, generation, content_ready)`.
     pub surfaces: Vec<(u32, u64, bool)>,
     /// Count of `Gva` residents at this geom.

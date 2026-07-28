@@ -1279,115 +1279,6 @@ fn maybe_enqueue_scanout_gl<H: HostOps>(
 ) {
 }
 
-/// Always-on diagnostic: log guest page-table identity between the
-/// present-named surface and every same-geometry mapping.
-///
-/// The x86 present op names a surface-id-namespace entry (mids 3/4/5) that only
-/// ever receives a boot display_clear, while composite Stores land on
-/// mapping-namespace mids (1/2). Whether those are two views of the SAME
-/// IOSurface pages (alias) or disjoint swap surfaces decides the present
-/// ownership contract. This logs decoded page-table facts only and never
-/// selects behavior. One line per (named mid, named map_generation).
-/// Rollup cadence for a running total: every count while the population is
-/// small, then thinning to powers of two, then flat every
-/// [`ROLLUP_STRIDE`]. A pure power-of-two schedule reads fine on a short boot
-/// and then goes silent for the rest of a long one — a session that ends at
-/// 900 presents has its last reading at 512, and recovering the final total
-/// needs arithmetic on a different line that may be counting something else.
-/// The flat tail keeps the denominator readable at any point a run is cut
-/// short.
-fn rollup_due(n: u64) -> bool {
-    n.is_power_of_two() || n.is_multiple_of(ROLLUP_STRIDE)
-}
-
-/// Flat rollup interval once the power-of-two schedule has thinned out. At the
-/// measured steady-state present rate on this rail (~2-3/s through
-/// `present_named_mapping`) this is a line every few minutes.
-const ROLLUP_STRIDE: u64 = 512;
-
-/// Running totals for [`note_present_identity_handoff`].
-#[derive(Default)]
-struct PresentIdentityHandoffCensus {
-    /// Presents that reached the capture call with a geometry.
-    presents: u64,
-    /// …whose named mid had not been presented at this geometry before, so
-    /// every draw into it so far resolved to a private `Surface` resident.
-    first_present: u64,
-    /// …of *those*, the ones the guest had actually drawn into
-    /// (`content_generation != 0`) at a geometry already latched as a proven
-    /// swapchain — so the private resident holds guest work and the capture is
-    /// about to read the shared `OutputGroup` instead. The discriminating
-    /// subset; everything above it is denominator.
-    handoff: u64,
-    /// Individually-reported `handoff` events before the class falls back to
-    /// the power-of-two rollup.
-    named_events: u32,
-}
-
-/// Census: does a present ever capture from a different resident than the one
-/// the named surface's own draws went into?
-///
-/// `surface_identity` resolves a mid to the shared `OutputGroup` only once that
-/// mid has been *presented* at a latched geometry. A brand-new or recycled
-/// compositor buffer is therefore private while the guest draws into it and
-/// shared from the moment it is presented — and `capture_present_frame` marks it
-/// presented before resolving. So a mid's first present reads a resident that
-/// none of its draws reached, and the guest work in the private one is not on
-/// screen. The ordering is inherent: the draw genuinely precedes the
-/// transaction, and no rule keyed on presented-ness can classify the buffer at
-/// draw time.
-///
-/// This measures whether that gap is real traffic rather than a paper argument.
-/// The readings are split so a zero is readable: `first_present` is the
-/// denominator (a mid arrived at a present having never been presented at this
-/// geometry) and `handoff` the subset where that mid had been drawn into at an
-/// already-latched geometry. `first_present=0` would mean the situation never
-/// arises; `first_present>0, handoff=0` that it arises only for buffers holding
-/// nothing.
-///
-/// Called before `capture_present_frame`, which is what makes the reading
-/// possible at all — afterwards the mid is presented and the state is gone.
-fn note_present_identity_handoff(state: &DeviceState, mapping: u32, w: u32, h: u32) {
-    const NAMED_EVENT_CAP: u32 = 32;
-    use std::sync::Mutex;
-    static CENSUS: Mutex<Option<PresentIdentityHandoffCensus>> = Mutex::new(None);
-
-    let first_present = !state.presented_at(mapping, w, h);
-    let content_gen = state
-        .mappings
-        .get(&mapping)
-        .map(|m| m.content_generation)
-        .unwrap_or(0);
-    let latched = state.present.output_group_geoms.contains(&(w, h));
-    let handoff = first_present && latched && content_gen != 0;
-
-    let mut guard = CENSUS.lock().unwrap_or_else(|p| p.into_inner());
-    let c = guard.get_or_insert_with(Default::default);
-    c.presents += 1;
-    c.first_present += u64::from(first_present);
-    c.handoff += u64::from(handoff);
-    let name_it = handoff && c.named_events < NAMED_EVENT_CAP;
-    if name_it {
-        c.named_events += 1;
-    }
-    if !(name_it || rollup_due(c.presents)) {
-        return;
-    }
-    let line = format!(
-        "present_identity_handoff mid={mapping} {w}x{h} content_gen={content_gen} \
-         first_present={} latched={} handoff={} totals presents={} first_present={} handoff={} \
-         named_cap={NAMED_EVENT_CAP}",
-        first_present as u8,
-        latched as u8,
-        handoff as u8,
-        c.presents,
-        c.first_present,
-        c.handoff
-    );
-    drop(guard);
-    crate::observe::fail(line);
-}
-
 fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32) -> Option<String> {
     use std::collections::HashSet;
     let named = state.mappings.get(&mapping)?;
@@ -1709,8 +1600,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                  the resident it will read was not checked)"
             ));
         }
-        // Read before `capture_present_frame`, which marks the mid presented.
-        note_present_identity_handoff(state, mapping, w, h);
         // The transaction payload carries exactly one field: plane 0's surface
         // id. So the capture source is the surface the guest named, and no
         // comparison between our own full-frame sequences may override it.

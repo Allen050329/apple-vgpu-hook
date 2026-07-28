@@ -190,16 +190,11 @@ fn run_gpu_stats_oracle(
         engine::cancel_present_stats(p.seq);
         crate::runtime::census::present_proxy::stats_oracle::note_superseded();
     }
-    let grouped = state.output_group_for(mapping_id, width, height).is_some();
-    let map_generation = if grouped {
-        0
-    } else {
-        state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.map_generation as u64)
-            .unwrap_or(0)
-    };
+    let map_generation = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.map_generation as u64)
+        .unwrap_or(0);
     let seq = state.present.stats_seq.wrapping_add(1).max(1);
     state.present.stats_seq = seq;
     let pending = crate::model::PendingStats {
@@ -208,7 +203,6 @@ fn run_gpu_stats_oracle(
         height,
         generation,
         map_generation,
-        grouped,
         seq,
     };
     let identity = pending_stats_identity(&pending);
@@ -220,98 +214,31 @@ fn run_gpu_stats_oracle(
     }
 }
 
-/// Record the display action for `mapping_id` and report whether it moved where
-/// that surface's content lives.
+/// Record the display action for `mapping_id`.
 ///
-/// A capture IS the display action: `note_presented_geom` is the only evidence
-/// class that qualifies a mapping for OutputGroup unification, and it also
-/// latches the geometry as a proven swapchain the first time two distinct
-/// members are presented there. Both effects feed
-/// [`crate::model::DeviceState::output_group_for`], so
-/// [`crate::runtime::import_present::surface_identity`] can answer
-/// `Surface { .. }` immediately before this call and `OutputGroup { .. }`
-/// immediately after.
-///
-/// That matters because the draw always precedes the present. Every draw that
-/// produced the frame we are about to scan out targeted the identity from
-/// BEFORE; the export reads the one from AFTER. When they differ, the image we
-/// scan out never received this frame — a real loss of guest work that looks on
-/// screen exactly like "the previous frame" or "black outside the damage rect".
-///
-/// Returns `Some((before, after, miss))` on a flip, so the caller can name it.
-/// This is measure-only and deliberately does NOT suppress the flip: which side
-/// is correct is not established. A surface's first present is genuinely the
-/// first decoded evidence that it is a display plane — the transaction naming it
-/// as plane 0 is the strongest such evidence there is — but that evidence
-/// arrives after the draw that needed it. Neither pinning the old identity (the
-/// surface stays out of the group forever) nor accepting the new one (this
-/// frame's draw is stranded) is derivable from the contract yet.
-///
-/// `miss` is the refusal [`crate::model::DeviceState::output_group_resolve`]
-/// returned for the BEFORE state, read from the check that refused rather than
-/// assumed by this caller. Without it the line says only "the identity moved",
-/// and the ways it can move want different answers:
-///
-/// - `NotPresentedHere { presented: None }` — no evidence for this id at all.
-///   Either the surface's genuine first present, or the state a wrong prune
-///   manufactured out of a live swapchain member (the black-desktop class).
-/// - `NotPresentedHere { presented: Some(other) }` — the guest last presented
-///   this id at a different geometry.
-/// - `PriorIncarnation` — the id was recycled and its evidence expired with the
-///   mapping, which is what `presented_geom_live` is for.
-///
-/// `NoPeer` cannot appear: it means the id IS presented here, so the insert
-/// below cannot change the count the latch arms on, and evidence never comes
-/// back to life. A `NoPeer` on this line would mean that invariant broke.
-///
-/// Separating those classes in a boot log needed a reconstructed per-mid
-/// generation history until this field existed.
+/// A capture IS the display action, and `presented_geoms` is where the decoded
+/// display transaction is recorded: the guest naming this surface as plane 0 at
+/// this geometry.
 fn note_display_action(
     state: &mut crate::model::DeviceState,
     mapping_id: u32,
     width: u32,
     height: u32,
-) -> Option<(
-    crate::backend::vulkan::engine::types::TargetIdentity,
-    crate::backend::vulkan::engine::types::TargetIdentity,
-    crate::model::OutputGroupMiss,
-)> {
-    // Take the refusal before the insert below can change the answer.
-    let miss = state.output_group_resolve(mapping_id, width, height).err();
-    let before =
-        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
+) {
     state.note_presented_geom(mapping_id, width, height);
-    let after = crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    if before == after {
-        return None;
-    }
-    // `note_presented_geom` only ever adds evidence and arms the latch, so an
-    // identity that moved means the BEFORE state was not a member and the
-    // resolve above returned its reason.
-    miss.map(|miss| (before, after, miss))
 }
 
 /// Rebuild the exact identity a [`crate::model::PendingStats`] was armed with.
-/// Never re-resolves group membership (see the type's docs).
+/// Never re-resolves it (see the type's docs).
 #[cfg(feature = "backend-vulkan")]
 fn pending_stats_identity(
     p: &crate::model::PendingStats,
 ) -> crate::backend::vulkan::engine::types::TargetIdentity {
-    use crate::backend::vulkan::engine::types::TargetIdentity;
-    if p.grouped {
-        TargetIdentity::OutputGroup {
-            id: crate::runtime::import_present::OUTPUT_GROUP_ID,
-            width: p.width,
-            height: p.height,
-            generation: 0,
-        }
-    } else {
-        TargetIdentity::Surface {
-            id: p.mapping_id,
-            width: p.width,
-            height: p.height,
-            generation: p.map_generation,
-        }
+    crate::backend::vulkan::engine::types::TargetIdentity::Surface {
+        id: p.mapping_id,
+        width: p.width,
+        height: p.height,
+        generation: p.map_generation,
     }
 }
 
@@ -344,15 +271,7 @@ fn try_capture_from_resident(
     let need = buf.len();
     let identity =
         crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    let primary = crate::backend::vulkan::engine::read_resident_bgra(&identity, need);
-    let member =
-        crate::runtime::import_present::member_surface_identity(state, mapping_id, width, height);
-    let bgra = primary.or_else(|| {
-        (member != identity)
-            .then(|| crate::backend::vulkan::engine::read_resident_bgra(&member, need))
-            .flatten()
-    });
-    let Some(bgra) = bgra else {
+    let Some(bgra) = crate::backend::vulkan::engine::read_resident_bgra(&identity, need) else {
         crate::runtime::census::present_proxy::capture_source::note(false);
         return false;
     };
@@ -410,14 +329,7 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
-    if let Some((before, after, miss)) = note_display_action(state, mapping_id, width, height) {
-        crate::observe::fail(format!(
-            "present_identity_flip mid={mapping_id} {width}x{height} \
-             before={before:?} after={after:?} miss={miss:?} \
-             (the display action moved this surface's resident; the draws that \
-             produced this frame went to the other one)"
-        ));
-    }
+    note_display_action(state, mapping_id, width, height);
     state.advance_present_epoch();
     // --- Direct-present readback elision (step 2 of the CPU-readback removal) ---
     // When the previous present's window publish carried the frame as a zero-copy
@@ -2823,275 +2735,6 @@ mod tests {
         assert_eq!(state.present.present_mapping, 3);
         assert_eq!(state.present.width, 1920);
         assert_eq!(state.present.height, 1080);
-    }
-
-    /// Inter-buffer retention is STRUCTURAL, not copied — the invariant the a/b
-    /// peer seed's deletion rests on.
-    ///
-    /// The seed existed because per-mid residents did not share history: the
-    /// guest damage-draws each swapchain buffer with `LoadAction=Load` expecting
-    /// the display's current front under it, so a peer whose own resident was
-    /// stale kept an undamaged black region. Output-group unification removes
-    /// that premise. Every surface the guest NAMES in a display transaction at a
-    /// proven swapchain geometry resolves to the same
-    /// `TargetIdentity::OutputGroup`, so the buffers share ONE resident and the
-    /// frame either holds is already the frame the other's LoadFromTarget reads.
-    /// A copy between them is a copy onto itself.
-    ///
-    /// The other half is what must stay OUT: a full-frame publisher the guest
-    /// never names is not a display buffer, resolves to a private identity, and
-    /// must never receive the desktop's frame. That population was the seed's
-    /// entire live target set (`peer_seed_unification outcome=survives
-    /// src_kind=group target_kind=surface`), which is why deleting the seed
-    /// removes a wrong copy rather than a needed one.
-    ///
-    /// This deletion was landed once, reverted, and landed again. The revert was
-    /// based on a live A/B in which the desktop came up the wrong colour on the
-    /// arm without the seed. That comparison was confounded: the two arms ran
-    /// twenty minutes apart, and the guest's default desktop picture is a
-    /// dynamic one whose rendered colour follows the guest clock. The wrong
-    /// colour reproduces with the seed present and reproduces on demand inside a
-    /// single boot by swapping the wallpaper, so it was never evidence about the
-    /// seed at all. Do not revert this on a sequential A/B; see the wallpaper
-    /// pinning and interleaving rules in `AGENTS.md`.
-    ///
-    /// The A/B was then re-run properly: four boots alternating with and without
-    /// the seed, wallpaper pinned to a static image. All sixteen captures landed
-    /// within 3e-6 of each other, on arms where the seed fired 42 and 53 times
-    /// against 0. So removing it changes nothing observable on that sequence.
-    /// Read that as one-sided, because the sequence does not currently reproduce
-    /// the class the seed was supposed to protect: it shows the deletion
-    /// introduces no new defect, not that it preserves a behaviour the sequence
-    /// never exercises.
-    ///
-    /// If this test ever fails, the deletion is no longer safe: named siblings
-    /// would hold divergent residents again and the retention gap would be real.
-    #[test]
-    fn presented_siblings_share_one_identity_so_retention_needs_no_copy() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-
-        // Two swapchain buffers, each named as plane 0 of a display transaction.
-        state.note_presented_geom(3, w, h);
-        state.note_presented_geom(5, w, h);
-
-        // Both resolve to ONE output group — the shared resident that makes an
-        // inter-buffer copy unnecessary.
-        assert_eq!(state.output_group_for(3, w, h), Some(1));
-        assert_eq!(
-            state.output_group_for(5, w, h),
-            state.output_group_for(3, w, h),
-            "named siblings at one geometry share a single resident identity"
-        );
-
-        // A full-frame publisher the guest never names is NOT a display buffer,
-        // however dense it is. It stays private, so the desktop's frame is never
-        // copied into it.
-        for _ in 0..32 {
-            state.note_dense_frame_published(7, w, h);
-        }
-        assert_eq!(
-            state.output_group_for(7, w, h),
-            None,
-            "a never-named publisher is not a display buffer and shares nothing"
-        );
-
-        // The seed's gate would have been `presented_at` on the target. Applied
-        // here it admits only mids 3 and 5 — both already grouped with each
-        // other, i.e. every seed it could authorise is a copy onto itself. That
-        // equivalence is why the seed could be deleted outright rather than
-        // narrowed.
-        assert!(state.presented_at(3, w, h) && state.presented_at(5, w, h));
-        assert!(!state.presented_at(7, w, h));
-    }
-
-    /// A surface the guest names in a display transaction joins the output group
-    /// on that evidence alone — it does not also have to have tripped our
-    /// full-frame-publish detector.
-    ///
-    /// The transaction's plane-0 surface id is the guest stating that the
-    /// surface is the scanout source for the frame. A compositor-output
-    /// membership inferred from our own detectors was required too, and that
-    /// excluded surfaces the guest genuinely scans out: they resolved to a private
-    /// `Surface` identity with no resident behind it while the group holding the
-    /// desktop was ready at the same geometry. Four live x86 boots recorded
-    /// exactly that — `export_present_miss outcome=orphan want=surface
-    /// geom=1920x1080 group=ready` — and a desktop black everywhere except the
-    /// rect the guest had just damaged.
-    ///
-    /// The never-displayed publisher stays out, on better evidence than before:
-    /// it publishes full frames but is never *named*, so it has no
-    /// `presented_at` entry and cannot join.
-    #[test]
-    fn a_named_surface_joins_the_output_group_without_a_publish_edge() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-
-        // A proven swapchain geometry: two surfaces already named there.
-        state.note_presented_geom(1, w, h);
-        state.note_presented_geom(4, w, h);
-        assert_eq!(state.output_group_for(1, w, h), Some(1));
-
-        // Mid 9 is a swapchain buffer the guest rotates in and names, but which
-        // never tripped the full-frame-publish detector. It must still resolve
-        // to the group.
-        state.note_presented_geom(9, w, h);
-        assert_eq!(
-            state.output_group_for(9, w, h),
-            Some(1),
-            "the guest named mid 9 as plane 0; that IS the evidence it is a display plane"
-        );
-
-        // A full-frame publisher the guest never names stays out, so its
-        // unrelated content is never chained onto the desktop's resident.
-        state.note_dense_frame_published(7, w, h);
-        assert_eq!(
-            state.output_group_for(7, w, h),
-            None,
-            "publishing full frames is not the same as being scanned out"
-        );
-
-        // A geometry the guest has only ever named one surface at has no pair to
-        // unify, so it stays per-mid.
-        let (ow, oh) = (640u32, 480u32);
-        state.note_presented_geom(11, ow, oh);
-        assert_eq!(state.output_group_for(11, ow, oh), None);
-    }
-
-    /// The display action that first unifies a swapchain member MOVES where that
-    /// member's content lives, after the draws that produced the frame already
-    /// went somewhere else.
-    ///
-    /// `note_presented_geom` is the only evidence class that qualifies a mapping
-    /// for OutputGroup unification, and the draw always precedes the present. So
-    /// on a member's first present, `surface_identity` answers `Surface { .. }`
-    /// on the way in and `OutputGroup { .. }` on the way out — and the image we
-    /// scan out is not the one this frame was rendered into. On a live x86 boot
-    /// that shows up as `export_present … unknown_identity identity_kind=surface`
-    /// and a desktop that is black everywhere except the rect the guest damaged.
-    ///
-    /// This pins the detector, not a fix: which side is correct is not yet
-    /// derivable from the contract (§ the KB's open question on whether surface
-    /// create carries a scanout hint).
-    #[test]
-    fn first_present_of_a_second_swapchain_member_moves_its_resident() {
-        use crate::backend::vulkan::engine::types::TargetIdentity;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (64u32, 48u32);
-
-        // Two same-geometry swapchain buffers, neither presented yet.
-        // mid 1's first present: no presented peer yet, so nothing unifies and
-        // its content stays exactly where its draws put it.
-        assert_eq!(
-            note_display_action(&mut state, 1, w, h),
-            None,
-            "the first member's first present has nothing to unify with"
-        );
-
-        // mid 4's first present unifies the pair. Everything drawn into mid 4
-        // before this instant went to `Surface { id: 4 }`; everything read after
-        // it comes from the group.
-        let (before, after, miss) = note_display_action(&mut state, 4, w, h)
-            .expect("the display action that unifies a member moves where its content lives");
-        assert!(
-            matches!(before, TargetIdentity::Surface { id: 4, .. }),
-            "before the display action mid 4 is its own resident, got {before:?}"
-        );
-        assert!(
-            matches!(after, TargetIdentity::OutputGroup { .. }),
-            "after it, mid 4 reads the shared group resident, got {after:?}"
-        );
-        assert_eq!(
-            miss,
-            crate::model::OutputGroupMiss::NotPresentedHere { presented: None },
-            "mid 4 had never been named in a display transaction, so the refusal \
-             must read as no evidence at all"
-        );
-
-        // Steady state: both members are already unified, so presents stop
-        // moving anything. A detector that fired here would be useless — the
-        // rotation presents on every frame.
-        assert_eq!(note_display_action(&mut state, 1, w, h), None);
-        assert_eq!(note_display_action(&mut state, 4, w, h), None);
-    }
-
-    /// The flip line must carry the refusal that made the identity move, because
-    /// the refusals mean opposite things and the line reads identically without
-    /// one.
-    ///
-    /// A boot's flips split into "this surface had no evidence at all" and "this
-    /// id was recycled, so its evidence expired with the mapping". The second is
-    /// the designed behaviour of `presented_geom_live`; the first is the state a
-    /// wrong prune manufactured out of a live swapchain member and blacked the
-    /// desktop out. Told apart in a log, they needed a reconstructed per-mid
-    /// `map_generation` history over every flip in the file; told apart here,
-    /// they are one field the check that refused wrote itself.
-    #[test]
-    fn the_flip_line_carries_the_refusal_that_moved_the_identity() {
-        use crate::model::OutputGroupMiss;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (64u32, 48u32);
-        let (ow, oh) = (32u32, 24u32);
-        for mid in [1u32, 4u32, 7u32] {
-            state.map_surface(mid);
-        }
-
-        // Latch the geometry with a pair, so every later first-present at it
-        // flips rather than staying per-mid.
-        state.note_presented_geom(1, w, h);
-        state.note_presented_geom(4, w, h);
-        assert!(state.output_group_for(1, w, h).is_some());
-
-        // A surface that last presented at ANOTHER geometry: the refusal names
-        // the geometry it holds instead, not "no evidence".
-        state.note_presented_geom(7, ow, oh);
-        let (.., miss) = note_display_action(&mut state, 7, w, h)
-            .expect("mid 7's first present at the latched geometry moves its resident");
-        assert_eq!(
-            miss,
-            OutputGroupMiss::NotPresentedHere {
-                presented: Some((ow, oh))
-            },
-            "the refusal must report the live evidence it read"
-        );
-
-        // A recycled id: the entry survives but belongs to the prior
-        // incarnation, which is what makes the evidence expire.
-        let entry = state.mappings.get_mut(&4).expect("mid 4 was mapped");
-        let before_gen = entry.map_generation;
-        DeviceState::bump_map_generation(4, entry);
-        let after_gen = state.mappings[&4].map_generation;
-        let (.., miss) = note_display_action(&mut state, 4, w, h)
-            .expect("a recycled member re-earns its qualification, so its identity moves again");
-        assert_eq!(
-            miss,
-            OutputGroupMiss::PriorIncarnation {
-                presented: (w, h),
-                entry_gen: before_gen,
-                current_gen: after_gen,
-            },
-            "a recycled id must not read as a surface that was never presented"
-        );
-
-        // And the emitted line says so, on the failure channel: a flip strands
-        // the draws that produced this frame whichever refusal caused it.
-        let cap = crate::observe::FailCapture::start();
-        let entry = state.mappings.get_mut(&4).expect("mid 4 was mapped");
-        DeviceState::bump_map_generation(4, entry);
-        capture_present_frame(&mut state, 4, w, h, 0);
-        let lines = cap.lines();
-        let flip = lines
-            .iter()
-            .find(|l| l.contains("present_identity_flip"))
-            .unwrap_or_else(|| panic!("no flip on the failure channel: {lines:?}"));
-        assert!(
-            flip.contains("miss=PriorIncarnation"),
-            "the flip line must name the refusal, got {flip}"
-        );
-        assert!(
-            !flip.starts_with("OFF "),
-            "a stranded frame belongs on the failure channel, got {flip}"
-        );
     }
 
     /// Regression guard for `present_dims`, the scanout sizing lookup. The

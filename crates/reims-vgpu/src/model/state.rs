@@ -755,12 +755,6 @@ pub struct RenderDeferredEntry {
     pub map_generation: u64,
     /// Bounds mode the original Store would have used.
     pub full_quad_bounds: bool,
-    /// The deferred draw targeted the unified compositor-output group
-    /// resident (`TargetIdentity::OutputGroup`), not the per-mid Surface
-    /// identity. The flush rebuilds exactly the identity that was pinned;
-    /// `map_generation` still records the MEMBER's page lifetime so the
-    /// recycled-pages drop guard keeps working for grouped windows.
-    pub grouped: bool,
     /// Arm order for oldest-first flush when the render-deferred window cap is
     /// hit — mirrors [`GvaDeferredEntry::armed_seq`]. Bounds the pinned resident
     /// population so a compositing burst (YouTube page-load) cannot balloon the
@@ -953,32 +947,14 @@ pub struct PresentState {
     pub early_front_mapping: u32,
     pub early_front_generation: u32,
     /// Present/scanout evidence: mapping → latest geometry it was displayed
-    /// at (a `capture_present_frame` action or a retained-frame re-show).
-    /// OutputGroup unification requires this — the copy-swap contract is a
-    /// *presented* double-buffer property.
-    /// Sampled sub-surfaces (WebKit content tiles, scrollbars) publish full
-    /// frames every paint but are never presented; without this gate any two
-    /// same-geometry publishers unified and distinct surfaces chained one
-    /// resident (the Safari-scroll black-band class).
+    /// at (a `capture_present_frame` action or a retained-frame re-show). The
+    /// decoded display transaction naming this surface as plane 0 is the only
+    /// thing that writes it, so it separates a scanout buffer from a sampled
+    /// sub-surface (a WebKit content tile publishes full frames every paint and
+    /// is never presented).
     /// Stamped with the mapping lifetime that presented it — see
     /// [`DeviceState::presented_geom_live`], which is the only way to read it.
     pub presented_geoms: BTreeMap<u32, PresentedGeom>,
-    /// Display geometries proven to be a multi-buffer compositor swapchain:
-    /// latched `true` the first time two distinct surfaces are *presented* at
-    /// that geometry (the same condition `output_group_for` arms on). Sticky
-    /// per boot — a resolution that was ever double-buffered stays one.
-    /// WindowServer recycles swapchain buffers continuously (new mid ids, old
-    /// ones unmapped, so `presented_geoms` churns), which dropped the
-    /// *concurrently* presented surface count to one and collapsed the group —
-    /// a fresh or recycled buffer then resolved to a per-mid resident that
-    /// never held the accumulated full frame, so the guest's damage-only draw
-    /// left everything outside the damaged rect black (the black-background /
-    /// desktop-residue class). Latching the geometry keeps every presented
-    /// surface at a proven swapchain resolution unified through those recycles.
-    /// Not gated on measured content; the per-mid `presented_at` check in
-    /// `output_group_for` still keeps never presented publish-only tiles
-    /// (WebKit content surfaces) out of the group.
-    pub output_group_geoms: std::collections::BTreeSet<(u32, u32)>,
     /// Protocol-structural dense-frame tracking (measure-only, never gates a
     /// present decision): per mapping id, the value of
     /// [`Self::dense_frame_counter`] at the last full-frame (whole-`w`×`h`)
@@ -988,13 +964,11 @@ pub struct PresentState {
     /// `present_unbacked` gate. Cleared on unmap.
     ///
     /// **What this is keyed on, and what that means it cannot see.** The advance
-    /// is a function of the mapping id the Store named and nothing else; it does
-    /// not consult [`DeviceState::output_group_for`] or any resident handle. So a
-    /// full frame the guest sent for a member, whose draws were routed to a
-    /// *different* resident than the one that member's present will read, still
-    /// advances the seq. That routing failure is the black-desktop mechanism
-    /// (§8.80 of the local KB), and the gate below is structurally blind to it —
-    /// `present_identity_flip` is what catches it. It is also keyed per mapping
+    /// is a function of the mapping id the Store named and nothing else; it
+    /// consults no resident handle. So a full frame the guest sent for a
+    /// surface, whose draws were routed to a *different* resident than the one
+    /// that surface's present will read, still advances the seq — the gate below
+    /// is structurally blind to that. It is also keyed per mapping
     /// id while unified surfaces share ONE resident, so a full frame stored
     /// through one of them does not mark its siblings backed even though they
     /// hold the same pixels.
@@ -1105,40 +1079,12 @@ pub struct PresentedGeom {
     pub map_generation: u32,
 }
 
-/// Why [`DeviceState::output_group_resolve`] refused to unify a surface into
-/// the compositor output group. Produced by the check that refused, so a caller
-/// can never supply the word itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutputGroupMiss {
-    /// The guest has not named this surface as plane 0 of a display transaction
-    /// at this geometry. `presented` is what `presented_geoms` holds for the
-    /// mapping instead: `None` when the entry was pruned (fresh MAP, unmap,
-    /// condemned backing, new `MappingInternal`), `Some(other)` when the guest
-    /// last presented this surface at a different geometry.
-    NotPresentedHere { presented: Option<(u32, u32)> },
-    /// Presented here, but the geometry is not a latched swapchain and no other
-    /// surface is presented at it right now — nothing to unify with.
-    NoPeer,
-    /// There IS evidence at this geometry, but it was recorded by a prior
-    /// incarnation of this mapping id: the guest recycled the id into a
-    /// different surface, which must re-earn its qualification.
-    ///
-    /// Kept distinct from [`Self::NotPresentedHere`] because a wrong prune used
-    /// to manufacture the latter out of a surface that was still the same
-    /// incarnation, and the two want opposite responses.
-    PriorIncarnation {
-        presented: (u32, u32),
-        entry_gen: u32,
-        current_gen: u32,
-    },
-}
-
 /// Key for an in-flight GPU stats reduction (the zero-copy present oracle).
 ///
 /// Carries everything needed to rebuild the resident identity that was armed,
-/// **without re-resolving it** — same rule as `render_deferred_identity`: a
-/// compositor-membership change between arm and consume must not make us look
-/// up a different image than the one the dispatch actually read.
+/// **without re-resolving it** — same rule as `render_deferred_identity`:
+/// anything that moves between arm and consume must not make us look up a
+/// different image than the one the dispatch actually read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingStats {
     pub mapping_id: u32,
@@ -1146,10 +1092,8 @@ pub struct PendingStats {
     pub height: u32,
     /// Protocol content generation, for proxy attribution.
     pub generation: u32,
-    /// Identity generation (0 for a unified `OutputGroup`).
+    /// Identity generation — the mapping's lifetime at arm time.
     pub map_generation: u64,
-    /// True when the armed identity was the unified compositor `OutputGroup`.
-    pub grouped: bool,
     pub seq: u64,
 }
 
@@ -2383,9 +2327,9 @@ impl DeviceState {
     /// new incarnation at all. On an identical page plan that compare says "the
     /// SAME incarnation, deferred windows and the resident survive" — but the
     /// presented evidence was already gone, so a proven swapchain buffer was
-    /// demoted to a private per-mid resident that had never held the
-    /// accumulated full frame, and every draw until the next present landed
-    /// there. The screen kept only the damaged rects and went black elsewhere.
+    /// demoted, and every draw until the next present landed on the wrong
+    /// resident. The screen kept only the damaged rects and went black
+    /// elsewhere.
     ///
     /// Tying the evidence to `map_generation` makes each prune site's own rule
     /// hold automatically: the sites that mean "genuinely new surface"
@@ -2415,8 +2359,6 @@ impl DeviceState {
     }
 
     /// Record a present/scanout action displaying `mapping_id` at `w`x`h`.
-    /// This is the only evidence class that can qualify a mapping for
-    /// OutputGroup unification.
     pub fn note_presented_geom(&mut self, mapping_id: u32, w: u32, h: u32) {
         if mapping_id == 0 || w == 0 || h == 0 {
             return;
@@ -2432,130 +2374,6 @@ impl DeviceState {
                 map_generation,
             },
         );
-        // Latch the geometry as a proven multi-buffer swapchain the first time
-        // the guest has named two distinct surfaces there (see
-        // `output_group_geoms`). The latch is sticky, so a later buffer recycle
-        // that momentarily leaves a single presented surface cannot collapse
-        // the group.
-        if !self.present.output_group_geoms.contains(&(w, h))
-            && self.presented_count(w, h) >= 2
-        {
-            self.present.output_group_geoms.insert((w, h));
-        }
-    }
-
-    /// Number of distinct surfaces the guest has named in a display transaction
-    /// at `w`x`h` (the arming condition for [`Self::output_group_for`]).
-    fn presented_count(&self, w: u32, h: u32) -> usize {
-        self.present
-            .presented_geoms
-            .keys()
-            .filter(|&&mid| self.presented_geom_live(mid) == Some((w, h)))
-            .count()
-    }
-
-    /// Group id when `mapping_id` has been **presented** at `w`x`h` and at least
-    /// one OTHER surface has been presented at the same geometry — the two then
-    /// act as alternating storage for ONE logical framebuffer (guest copy-swap
-    /// contract) and every one of them resolves to the shared
-    /// `TargetIdentity::OutputGroup`. A geometry only ever presented from one
-    /// surface stays per-mid: no pair, nothing to unify.
-    ///
-    /// **The admission criterion is the decoded display transaction, and nothing
-    /// else.** [`Self::presented_at`] records that the guest named this surface
-    /// as plane 0 of a display transaction at this geometry, which is the guest
-    /// stating outright that the surface is the scanout source for that frame.
-    /// There is no stronger evidence available, and in particular it is stronger
-    /// than a compositor-output membership *inferred* from our own
-    /// full-frame-publish detector and resource-graph edges. Requiring both
-    /// excluded surfaces the guest genuinely scans out but which never tripped
-    /// the publish detector: they resolved to a private `Surface` identity with
-    /// no resident behind it, and the export declined
-    /// (`export_present_miss outcome=orphan … group=ready` — the group holding
-    /// the desktop was ready at the same geometry the whole time) leaving a
-    /// desktop black everywhere except the rect the guest had just damaged.
-    ///
-    /// It also keeps sampled sub-surfaces out, and for a better reason than
-    /// before: a WebKit content tile or scrollbar publishes full frames but is
-    /// never *named in a display transaction*, so it has no `presented_at` entry
-    /// and cannot join. Unifying those would chain distinct surfaces onto one
-    /// resident (the Safari-scroll black-band class).
-    ///
-    /// The geometry latch ([`PresentState::output_group_geoms`]) keeps a surface
-    /// unified across buffer recycles that momentarily drop the concurrent peer
-    /// count to one and would otherwise re-expose a per-mid resident (the
-    /// black-background class). It also *arms* on the very first frame two
-    /// surfaces appear together, because `note_presented_geom` evaluates the
-    /// arming condition immediately after its own insert. It is therefore the
-    /// only thing that decides membership at a geometry: there is no live peer
-    /// recount to disagree with it.
-    pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
-        self.output_group_resolve(mapping_id, w, h).ok()
-    }
-
-    /// [`Self::output_group_for`], plus the reading taken by whichever check
-    /// refused. This is the only implementation; `output_group_for` is its
-    /// `.ok()`, so the two can never disagree about the admission decision.
-    ///
-    /// A caller that only learns "not a member" has to *guess* which of the two
-    /// admission conditions failed, and both have said the wrong thing here
-    /// before. The miss carries the state it read instead.
-    pub fn output_group_resolve(
-        &self,
-        mapping_id: u32,
-        w: u32,
-        h: u32,
-    ) -> Result<u32, OutputGroupMiss> {
-        // TEMPORARY EXPERIMENT SWITCH — `REIMS_VGPU_NO_GROUP=1`, off by default.
-        // Unification makes every scanout buffer the guest names at one geometry
-        // share ONE resident, so a damage draw's `LoadFromTarget` reads the
-        // frame the PREVIOUS buffer left rather than the frame this buffer left.
-        // That is either exactly right (the guest damage-draws against the
-        // current front, which is what the present-boundary seed asserts) or the
-        // rubber-band residue class, and no line this device emits separates the
-        // two. Turning it off for one boot does.
-        static NO_GROUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *NO_GROUP.get_or_init(|| std::env::var_os("REIMS_VGPU_NO_GROUP").is_some()) {
-            return Err(OutputGroupMiss::NoPeer);
-        }
-        if !self.presented_at(mapping_id, w, h) {
-            let current = self.map_generation_or_zero(mapping_id);
-            return Err(match self.present.presented_geoms.get(&mapping_id) {
-                // An entry from a superseded incarnation: the id was recycled
-                // into a genuinely different surface, which must re-earn its
-                // qualification. Distinct from having no entry at all, because
-                // this is the state a wrong prune used to manufacture.
-                Some(g) if g.map_generation != current => OutputGroupMiss::PriorIncarnation {
-                    presented: (g.width, g.height),
-                    entry_gen: g.map_generation,
-                    current_gen: current,
-                },
-                _ => OutputGroupMiss::NotPresentedHere {
-                    presented: self.presented_geom_live(mapping_id),
-                },
-            });
-        }
-        // One question, one answer: has this geometry been proven a multi-buffer
-        // swapchain? A live recount of same-geometry peers used to sit under
-        // this, and given the `presented_at` gate above it tested the *identical*
-        // predicate the latch arms on (`presented_count(w, h) >= 2`) — a second
-        // mechanism re-deriving a permanent fact from transient state.
-        //
-        // It could only have admitted anyone the latch had missed, which needs
-        // the arming predicate to become true with no `note_presented_geom`
-        // running to observe it. Its inputs are `presented_geoms` (one insert
-        // site, latch check immediately after) and each mid's `map_generation`,
-        // and evidence never comes back to life
-        // (`a_superseded_presented_entry_never_becomes_live_again`), so the count
-        // rises only inside the call that checks the latch. Measured before
-        // deleting: a probe on that branch emitted nothing across boot 87, whose
-        // `resident_identity_shared` lines show this resolver admitting mids
-        // 2, 4, 5 and 6 at 1920x1080 the whole time.
-        if self.present.output_group_geoms.contains(&(w, h)) {
-            Ok(1)
-        } else {
-            Err(OutputGroupMiss::NoPeer)
-        }
     }
 
     /// Record that `mapping_id` is being presented and report whether a
@@ -2568,10 +2386,7 @@ impl DeviceState {
     /// Structural only: decoded Store bookkeeping, never measured content, and
     /// never the resident. Say what that leaves out, because the name reads
     /// broader than the check: a `None` here means the guest sent a frame for
-    /// this mid, **not** that the resident this present will read holds it. When
-    /// the two disagree — draws routed to a per-mid resident while the present
-    /// reads the shared one — the seq advances all the same and this stays
-    /// quiet. `present_identity_flip` is the gate for that; see
+    /// this mid, **not** that the resident this present will read holds it. See
     /// [`PresentState::dense_frame_seq`].
     ///
     /// Records the witness on every call, so a member that stays unbacked
@@ -3269,9 +3084,7 @@ impl DeviceState {
         #[cfg(all(feature = "backend-metal", target_os = "macos"))]
         crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
-        // any present evidence — the slot may hold a NEW surface (a stale
-        // presented_geoms entry could wrongly qualify a recycled publish-only
-        // surface for OutputGroup unification).
+        // any present evidence — the slot may hold a NEW surface.
         self.host_surfaces.remove(&mapping_id);
         // Present evidence is stamped with the incarnation and deliberately NOT
         // dropped here. A fresh MAP does not yet know whether this is a new
@@ -3355,7 +3168,7 @@ impl DeviceState {
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with
         // the incarnation that recorded it, so the recycled slot cannot inherit
-        // an OutputGroup qualification it did not earn.
+        // a display-plane qualification it did not earn.
         true
     }
 
@@ -3450,114 +3263,6 @@ impl DeviceState {
     }
 }
 
-/// The sticky geometry latch is the only thing that decides output-group
-/// membership.
-///
-/// It used to share that job with a live recount of same-geometry presented
-/// peers, which tested the identical predicate the latch arms on — two
-/// mechanisms answering one question, so one of them had to go. These tests hold
-/// the line: the latch alone admits, and the state the recount used to admit on
-/// is refused.
-#[cfg(test)]
-mod output_group_membership_tests {
-    use super::*;
-    use crate::model::PAGE_SHIFT_X86;
-    use crate::runtime::import_present::OUTPUT_GROUP_ID;
-
-    fn state() -> DeviceState {
-        DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)
-    }
-
-    /// Presented peers with no latch do not make a group.
-    ///
-    /// This state is not reachable through `note_presented_geom` — it checks the
-    /// latch immediately after its own insert — so it is built by writing
-    /// `presented_geoms` directly. That is the point: the recount's admission
-    /// could only ever come from bookkeeping the arming path never saw, and the
-    /// contract says a swapchain is proven at the moment two surfaces are
-    /// presented together, not inferred from a later recount.
-    #[test]
-    fn presented_peers_without_the_latch_are_not_a_group() {
-        let mut s = state();
-        for mid in [4u32, 9u32] {
-            s.present.presented_geoms.insert(
-                mid,
-                PresentedGeom {
-                    width: 1920,
-                    height: 1080,
-                    map_generation: 0,
-                },
-            );
-        }
-        assert!(!s.present.output_group_geoms.contains(&(1920, 1080)));
-        assert_eq!(
-            s.output_group_resolve(4, 1920, 1080),
-            Err(OutputGroupMiss::NoPeer),
-            "a live recount must not admit what the arming path never proved"
-        );
-    }
-
-    /// The guest's own ordering arms the latch before anything can resolve, so
-    /// nothing else is needed to admit the first pair.
-    ///
-    /// `note_presented_geom` checks the arming condition immediately after its
-    /// own insert, which is what made the recount below it unreachable: the
-    /// count cannot pass 2 anywhere else.
-    #[test]
-    fn the_second_present_arms_the_latch_that_admits_both_members() {
-        let mut s = state();
-        s.map_surface(4);
-        s.note_presented_geom(4, 1920, 1080);
-        assert_eq!(
-            s.output_group_resolve(4, 1920, 1080),
-            Err(OutputGroupMiss::NoPeer),
-            "one presented surface is not a swapchain"
-        );
-        s.map_surface(9);
-        s.note_presented_geom(9, 1920, 1080);
-        assert!(
-            s.present.output_group_geoms.contains(&(1920, 1080)),
-            "the second present must arm the latch inside note_presented_geom"
-        );
-        for mid in [4u32, 9u32] {
-            assert_eq!(s.output_group_resolve(mid, 1920, 1080), Ok(OUTPUT_GROUP_ID));
-        }
-    }
-
-    /// The lemma the deletion rests on: presented evidence never comes back to
-    /// life, so the peer count can only rise inside `note_presented_geom` — and
-    /// that is the one place the latch condition is checked.
-    ///
-    /// `bump_map_generation` wraps but explicitly skips 0, and no site removes a
-    /// `mappings` entry, so `map_generation_or_zero` leaves 0 exactly once and
-    /// never revisits any value it has left. An entry stamped with a superseded
-    /// generation is therefore dead permanently, not until the next recycle.
-    #[test]
-    fn a_superseded_presented_entry_never_becomes_live_again() {
-        let mut s = state();
-        s.map_surface(4);
-        s.note_presented_geom(4, 1920, 1080);
-        assert!(s.presented_at(4, 1920, 1080));
-
-        let mut seen = vec![s.map_generation_or_zero(4)];
-        for _ in 0..64 {
-            let e = s.mappings.get_mut(&4).expect("mappings entries are not removed");
-            DeviceState::bump_map_generation(4, e);
-            let now = s.map_generation_or_zero(4);
-            assert_ne!(now, 0, "a bump never lands back on the never-mapped value");
-            assert!(
-                !seen.contains(&now),
-                "generation {now} recurred; the evidence it stamped would revive"
-            );
-            seen.push(now);
-            assert!(
-                !s.presented_at(4, 1920, 1080),
-                "evidence from generation {} must stay dead",
-                seen[0]
-            );
-        }
-    }
-}
 
 #[cfg(test)]
 mod fail_vocabulary_tests {

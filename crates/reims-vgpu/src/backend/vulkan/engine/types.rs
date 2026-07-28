@@ -1110,27 +1110,14 @@ pub enum TargetIdentity {
     },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
-    /// Unified compositor-output group: proven same-geometry dual-mid members
-    /// are alternating storage for ONE logical framebuffer (guest copy-swap
-    /// contract — see). All member mids at this geometry
-    /// resolve to this identity, so their draws chain one shared resident and
-    /// per-member content divergence (the a/b residue class) is structurally
-    /// impossible. Dedicated variant: guest mapping ids can never collide
-    /// with it.
-    OutputGroup {
-        id: u32,
-        width: u32,
-        height: u32,
-        generation: u64,
-    },
 }
 
 pub type PresentRect = (u32, u32, u32, u32);
 
 /// Ordered resident candidates for a host-window present. The first
-/// content-ready BGRA candidate at `width`x`height` is authoritative; the whole
-/// list resolves the ONE surface the display transaction named (an output-group
-/// identity plus its member fallback), never a choice between surfaces.
+/// content-ready BGRA candidate at `width`x`height` is authoritative; the list
+/// resolves the ONE surface the display transaction named, never a choice
+/// between surfaces.
 #[derive(Clone, Debug)]
 pub struct WindowPresentSource {
     pub width: u32,
@@ -1149,8 +1136,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { width, .. }
             | Self::Texture { width, .. }
-            | Self::Gva { width, .. }
-            | Self::OutputGroup { width, .. } => *width,
+            | Self::Gva { width, .. } => *width,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1159,8 +1145,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { height, .. }
             | Self::Texture { height, .. }
-            | Self::Gva { height, .. }
-            | Self::OutputGroup { height, .. } => *height,
+            | Self::Gva { height, .. } => *height,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1169,8 +1154,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { generation, .. }
             | Self::Texture { generation, .. }
-            | Self::Gva { generation, .. }
-            | Self::OutputGroup { generation, .. } => *generation,
+            | Self::Gva { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1188,10 +1172,7 @@ impl TargetIdentity {
     pub fn surface_mapping_id(&self) -> Option<u32> {
         match self {
             Self::Surface { id, .. } => Some(*id),
-            Self::Texture { .. }
-            | Self::Gva { .. }
-            | Self::Anonymous { .. }
-            | Self::OutputGroup { .. } => None,
+            Self::Texture { .. } | Self::Gva { .. } | Self::Anonymous { .. } => None,
         }
     }
 }

@@ -358,9 +358,8 @@ impl ResourcePools {
 
     /// Measure-only: classify what the registry holds at `width`x`height`. Used
     /// to diagnose an `export_present_miss` event — it distinguishes a
-    /// resident that exists but under a DIFFERENT key (generation/identity
-    /// orphan: `OutputGroup` present while present asked for `Surface`, or a
-    /// stale-generation `Surface`) from a genuinely-absent one (no GPU render
+    /// resident that exists but under a DIFFERENT key (a stale-generation
+    /// `Surface`) from a genuinely-absent one (no GPU render
     /// pass produced this frame — the composited content lives only in guest
     /// pages / the CPU surface cache, so there is nothing on the GPU to export).
     /// That split decides whether the direct-present fix is "align the export
@@ -373,13 +372,6 @@ impl ResourcePools {
         };
         for (k, s) in self.registry.iter() {
             match k {
-                TargetIdentity::OutputGroup {
-                    width: w,
-                    height: h,
-                    ..
-                } if *w == width && *h == height => {
-                    c.group = Some(s.content_ready);
-                }
                 TargetIdentity::Surface {
                     id,
                     width: w,
@@ -943,10 +935,9 @@ impl ResourcePools {
     }
 
     /// Pin/unpin a resident render target against LRU eviction (deferred
-    /// render Stores). Pins are counted, not boolean: each deferred window
-    /// holds one count, and a shared `OutputGroup` identity carries one count
-    /// per member window — the slot stays protected until every holder
-    /// unpins. Returns false when the identity is absent or (for pinning) its
+    /// render Stores). Pins are counted, not boolean: a surface can have several
+    /// deferred windows armed at once and each holds one count, so the slot
+    /// stays protected until every holder unpins. Returns false when the identity is absent or (for pinning) its
     /// content is not ready — callers must fall back to the synchronous
     /// Store. Unpin saturates at zero (a spurious unpin never underflows).
     pub(crate) fn pin_resident_target(&mut self, identity: &TargetIdentity, pinned: bool) -> bool {
@@ -1006,8 +997,8 @@ mod pin_count_tests {
         }
     }
 
-    fn group_identity() -> TargetIdentity {
-        TargetIdentity::OutputGroup {
+    fn pinned_identity() -> TargetIdentity {
+        TargetIdentity::Surface {
             id: 1,
             width: 16,
             height: 16,
@@ -1015,29 +1006,28 @@ mod pin_count_tests {
         }
     }
 
-    /// Two members' deferred windows pin the SAME OutputGroup identity; the
-    /// first member's flush-unpin must NOT expose the shared image to the LRU
-    /// sweep while the peer's window is still armed. This is the eviction
-    /// window a boolean pin had.
+    /// Two deferred windows on one surface pin the SAME identity; the first
+    /// window's flush-unpin must NOT expose the image to the LRU sweep while the
+    /// second is still armed. This is the eviction window a boolean pin had.
     #[test]
     fn shared_identity_pin_is_counted_not_boolean() {
         let mut pools = ResourcePools::new();
-        let id = group_identity();
+        let id = pinned_identity();
         pools.registry.insert(id.clone(), dummy_slot(true));
 
-        assert!(pools.pin_resident_target(&id, true), "member A pin");
-        assert!(pools.pin_resident_target(&id, true), "member B pin");
+        assert!(pools.pin_resident_target(&id, true), "window A pin");
+        assert!(pools.pin_resident_target(&id, true), "window B pin");
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 2);
 
-        // Member A flushes: one unpin — the slot must stay sweep-protected.
+        // Window A flushes: one unpin — the slot must stay sweep-protected.
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(
             pools.registry.get(&id).unwrap().pin_count,
             1,
-            "peer window still armed: slot must remain pinned"
+            "the second window is still armed: slot must remain pinned"
         );
 
-        // Member B flushes: fully released.
+        // Window B flushes: fully released.
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
     }
@@ -1047,7 +1037,7 @@ mod pin_count_tests {
     #[test]
     fn unpin_saturates_at_zero() {
         let mut pools = ResourcePools::new();
-        let id = group_identity();
+        let id = pinned_identity();
         pools.registry.insert(id.clone(), dummy_slot(true));
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
@@ -1060,7 +1050,7 @@ mod pin_count_tests {
     #[test]
     fn pin_refuses_not_ready_and_absent() {
         let mut pools = ResourcePools::new();
-        let id = group_identity();
+        let id = pinned_identity();
         assert!(!pools.pin_resident_target(&id, true), "absent identity");
         pools.registry.insert(id.clone(), dummy_slot(false));
         assert!(!pools.pin_resident_target(&id, true), "not-ready slot");
@@ -1269,19 +1259,16 @@ mod pin_count_tests {
     /// direct-present must recover) and report an empty census when nothing
     /// backs that geometry (the "content is only on the CPU/guest side" case).
     #[test]
-    fn geom_census_reports_group_and_surfaces_at_geometry() {
+    fn geom_census_reports_surfaces_at_geometry() {
         let mut pools = ResourcePools::new();
         // Empty registry: nothing at any geometry.
         let empty = pools.registry_geom_census(16, 16);
         assert_eq!(empty.total, 0);
-        assert!(empty.group.is_none());
         assert!(empty.surfaces.is_empty());
         assert_eq!(empty.gva, 0);
 
-        // A ready OutputGroup at 16x16 plus two Surface residents (one at a
-        // different generation, one not-ready) at the same geometry, and one
-        // resident at a DIFFERENT geometry that must not leak into the census.
-        pools.registry.insert(group_identity(), dummy_slot(true));
+        // Two Surface residents at 16x16 (one at a different generation, one
+        // not-ready), and one at a DIFFERENT geometry that must not leak in.
         pools.registry.insert(
             TargetIdentity::Surface {
                 id: 3,
@@ -1311,8 +1298,7 @@ mod pin_count_tests {
         );
 
         let c = pools.registry_geom_census(16, 16);
-        assert_eq!(c.total, 4, "counts all geometries");
-        assert_eq!(c.group, Some(true), "group resident present + ready");
+        assert_eq!(c.total, 3, "counts all geometries");
         assert_eq!(c.surfaces.len(), 2, "only the two 16x16 surfaces");
         assert!(c.surfaces.contains(&(3, 7, true)));
         assert!(c.surfaces.contains(&(5, 2, false)));
@@ -1325,7 +1311,7 @@ mod pin_count_tests {
         // A geometry with no resident: the miss classifier reads this as "no GPU
         // content — CPU/guest-only", not an orphan.
         let bare = pools.registry_geom_census(64, 64);
-        assert!(bare.group.is_none() && bare.surfaces.is_empty() && bare.gva == 0);
-        assert_eq!(bare.total, 4);
+        assert!(bare.surfaces.is_empty() && bare.gva == 0);
+        assert_eq!(bare.total, 3);
     }
 }

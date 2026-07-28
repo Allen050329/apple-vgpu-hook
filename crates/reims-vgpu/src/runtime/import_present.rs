@@ -165,117 +165,14 @@ fn import_store_timing_line(
 /// Build a protocol-stable resident identity for this mapping at its current
 /// [`crate::model::MappingEntry::map_generation`].
 ///
-/// Surfaces the guest has named in a display transaction at a geometry proven
-/// to be double-buffered resolve to the shared [`TargetIdentity::OutputGroup`]
-/// — the guest's copy-swap contract makes them alternating storage for one
-/// logical framebuffer.
-/// Fail-visible when `identity` — the resident a surface just resolved to — is
-/// not keyed by that surface's own mapping id.
-///
-/// `ResourcePools::registry` is keyed by `TargetIdentity`, so any two mappings
-/// with equal identities render into and capture from ONE `VkImage`. Distinct
-/// guest surfaces have independent damage histories (WindowServer redraws a
-/// buffer only where it differs from what that buffer last held), so a shared
-/// resident makes every frame a fusion of damage from several buffers — the
-/// mixed-generation frame class, which no other counter detects.
-///
-/// O(1) on the hot path: the peer scan runs only when the line is emitted,
-/// and emission is deduplicated by geometry and peer count so a growing
-/// group reports each new size once rather than per draw.
-fn note_resident_identity_sharing(
-    state: &DeviceState,
-    identity: &TargetIdentity,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) {
-    if mapping_id == 0 || identity.surface_mapping_id() == Some(mapping_id) {
-        return;
-    }
-    let mids: Vec<u32> = state
-        .present
-        .presented_geoms
-        .keys()
-        .copied()
-        .filter(|&mid| state.presented_at(mid, width, height))
-        .collect();
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<std::collections::BTreeSet<(u32, u32, usize)>>> = Mutex::new(None);
-    let first = {
-        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
-        guard
-            .get_or_insert_with(Default::default)
-            .insert((width, height, mids.len()))
-    };
-    if first {
-        crate::observe::fail(format!(
-            "resident_identity_shared {width}x{height} mapping={mapping_id} \
-             identity={identity:?} mids={mids:?} count={}",
-            mids.len()
-        ));
-    }
-}
-
+/// One identity per mapping, always. `ResourcePools::registry` is keyed by
+/// `TargetIdentity`, so two mappings with equal identities would render into and
+/// capture from ONE `VkImage` — and distinct guest surfaces have independent
+/// damage histories, because WindowServer redraws a buffer only where it differs
+/// from what THAT buffer last held. Sharing a resident between them makes every
+/// frame a fusion of damage from several buffers, which is the rubber-band
+/// residue class.
 pub fn surface_identity(
-    state: &DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> TargetIdentity {
-    if let Some(gid) = state.output_group_for(mapping_id, width, height) {
-        {
-            use std::sync::Mutex;
-            static LOGGED: Mutex<Option<std::collections::BTreeSet<(u32, u32)>>> = Mutex::new(None);
-            let mut guard = LOGGED.lock().unwrap_or_else(|p| p.into_inner());
-            if guard
-                .get_or_insert_with(Default::default)
-                .insert((width, height))
-            {
-                let members: Vec<u32> = state
-                    .present
-                    .presented_geoms
-                    .keys()
-                    .copied()
-                    .filter(|&mid| state.presented_at(mid, width, height))
-                    .collect();
-                crate::observe::fail(format!(
-                    "compositor_group_unify {width}x{height} members={members:?} first_mid={mapping_id}"
-                ));
-            }
-        }
-        let identity = TargetIdentity::OutputGroup {
-            id: gid,
-            width,
-            height,
-            generation: 0,
-        };
-        note_resident_identity_sharing(state, &identity, mapping_id, width, height);
-        return identity;
-    }
-    let gen = state
-        .mappings
-        .get(&mapping_id)
-        .map(|m| m.map_generation as u64)
-        .unwrap_or(0);
-    let identity = TargetIdentity::Surface {
-        id: mapping_id,
-        width,
-        height,
-        generation: gen,
-    };
-    // Passes by construction today; kept on this path so the guard survives any
-    // future change to what a surface resolves to.
-    note_resident_identity_sharing(state, &identity, mapping_id, width, height);
-    identity
-}
-
-/// Type-11 Store with non-zero geom — the only product Store class that imports.
-pub fn eligible(mapping_id: u32, width: u32, height: u32) -> bool {
-    mapping_id != 0 && width > 0 && height > 0
-}
-
-/// The per-member `Surface` identity, ignoring output-group unification.
-pub fn member_surface_identity(
     state: &DeviceState,
     mapping_id: u32,
     width: u32,
@@ -294,35 +191,26 @@ pub fn member_surface_identity(
     }
 }
 
+/// Type-11 Store with non-zero geom — the only product Store class that imports.
+pub fn eligible(mapping_id: u32, width: u32, height: u32) -> bool {
+    mapping_id != 0 && width > 0 && height > 0
+}
+
 /// Rebuild exactly the resident identity a deferred render window pinned at
-/// defer time (see [`try_defer_present_store`]): the unified group identity
-/// for `grouped` windows, the per-mid Surface identity otherwise. Never
-/// re-resolves against current membership — a membership change between
-/// defer and flush must not unpin a different image than was pinned.
+/// defer time (see [`try_defer_present_store`]). Never re-resolves against
+/// current state: whatever moved between defer and flush must not unpin a
+/// different image than was pinned.
 pub fn render_deferred_identity(
     mapping_id: u32,
     entry: &crate::model::RenderDeferredEntry,
 ) -> TargetIdentity {
-    if entry.grouped {
-        TargetIdentity::OutputGroup {
-            id: OUTPUT_GROUP_ID,
-            width: entry.width,
-            height: entry.height,
-            generation: 0,
-        }
-    } else {
-        TargetIdentity::Surface {
-            id: mapping_id,
-            width: entry.width,
-            height: entry.height,
-            generation: entry.map_generation,
-        }
+    TargetIdentity::Surface {
+        id: mapping_id,
+        width: entry.width,
+        height: entry.height,
+        generation: entry.map_generation,
     }
 }
-
-/// The single compositor-output group id (`DeviceState::output_group_for`
-/// always returns this; the geometry inside the identity disambiguates).
-pub const OUTPUT_GROUP_ID: u32 = 1;
 
 /// Safety backstop on live `render_deferred_flush` windows. Each window pins a
 /// resident, so an unbounded population would grow toward `MAX_MAPPINGS` (4096)
@@ -715,52 +603,12 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     // re-granting membership to the same mid at the same geometry 30-95 ms
     // later. Nothing there is a different logical surface; the refusal was
     // destroying a paint the layer below had just certified.
-    let gate_fail = if matches!(identity, TargetIdentity::OutputGroup { .. }) {
-        // Structural, not stateful: compare against the identity a Store of
-        // this geometry pins, so a future producer adding a field to
-        // `OutputGroup` cannot silently drop out of the comparison.
-        let for_this_store = TargetIdentity::OutputGroup {
-            id: OUTPUT_GROUP_ID,
-            width,
-            height,
-            generation: 0,
-        };
-        if *identity != for_this_store {
-            Some(ImportDecline::GroupGeomDrift)
-        } else {
-            // Measure-only: the write now proceeds while the group no longer
-            // admits this mapping. This is the case the re-resolve used to
-            // refuse, so it must stay visible — if the deletion above is wrong,
-            // this is the line that says where to look.
-            if let Err(miss) = state.output_group_resolve(mapping_id, width, height) {
-                crate::observe::fail(format!(
-                    "import_group_membership_stale mid={mapping_id} geom={width}x{height} \
-                     miss={} (writing the pinned resident anyway; the lifetime gate passed)",
-                    match miss {
-                        crate::model::OutputGroupMiss::NotPresentedHere { presented: None } =>
-                            "presented_pruned".to_string(),
-                        crate::model::OutputGroupMiss::NotPresentedHere {
-                            presented: Some((w, h)),
-                        } => format!("presented_elsewhere:{w}x{h}"),
-                        crate::model::OutputGroupMiss::NoPeer => "no_peer".to_string(),
-                        crate::model::OutputGroupMiss::PriorIncarnation {
-                            entry_gen,
-                            current_gen,
-                            ..
-                        } => format!("prior_incarnation:{entry_gen}->{current_gen}"),
-                    }
-                ));
-            }
-            None
-        }
-    } else {
-        let gen_now = state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.map_generation as u64)
-            .unwrap_or(0);
-        (identity.generation() != gen_now).then_some(ImportDecline::MapGenDrift)
-    };
+    let gen_now = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.map_generation as u64)
+        .unwrap_or(0);
+    let gate_fail = (identity.generation() != gen_now).then_some(ImportDecline::MapGenDrift);
     if let Some(decline) = gate_fail {
         return import_fail(mapping_id, width, height, decline);
     }
@@ -1035,7 +883,6 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     if !m.mapped || *identity != expected {
         return false;
     }
-    let grouped = matches!(identity, TargetIdentity::OutputGroup { .. });
     let member_map_generation = m.map_generation as u64;
     let fmt = if m.format != 0 {
         m.format
@@ -1089,7 +936,6 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
             height,
             map_generation,
             full_quad_bounds,
-            grouped,
             armed_seq,
         },
     );
@@ -1654,28 +1500,9 @@ fn is_import_window_shortage(reason: &str) -> bool {
 /// control flow, not a refusal, and typing it would invite logging it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ImportDecline {
-    /// A per-mid `Surface` identity whose embedded generation no longer matches
-    /// the mapping's, so the frame we would DMA belongs to a superseded
-    /// incarnation. Per-mid only — a group identity carries no member lifetime
-    /// and its generation is constant, so it can never fail this way; that case
-    /// is [`Self::GroupGeomDrift`].
+    /// The identity's embedded generation no longer matches the mapping's, so
+    /// the frame we would DMA belongs to a superseded incarnation.
     MapGenDrift,
-    /// An `OutputGroup` identity this mapping no longer resolves to — its group
-    /// membership or geometry moved. Despite sharing a gate with
-    /// [`Self::MapGenDrift`], no generation is compared here (a group identity's
-    /// is constant), so the two must not share a slug: one says the mapping was
-    /// re-wired under us, the other says the pinned resident is not the one this
-    /// Store's geometry names.
-    ///
-    /// This arm used to re-resolve group *membership* as a stand-in for the
-    /// lifetime a group identity cannot carry, and refused whenever the mapping
-    /// no longer resolved to the group. Measurement killed that: every observed
-    /// refusal was a swapchain buffer whose membership had been pruned by a site
-    /// that deliberately keeps the generation and the deferred window, and which
-    /// the compositor re-granted tens of milliseconds later. The lifetime is
-    /// checked by a real generation compare before this call, so what is left
-    /// here is only the geometry.
-    GroupGeomDrift,
     /// The mapping is not mapped.
     Unmapped,
     /// No type-11 sample window could be derived for this geometry.
@@ -1702,7 +1529,6 @@ impl crate::observe::Decline for ImportDecline {
     fn slug(&self) -> &'static str {
         match self {
             Self::MapGenDrift => "import_map_gen_drift",
-            Self::GroupGeomDrift => "import_group_geom_drift",
             Self::Unmapped => "import_unmapped",
             Self::NoSampleWindow => "import_no_sample_window",
             Self::BprBelowTight { .. } => "import_bpr_below_tight",
@@ -1802,12 +1628,11 @@ fn finish_import(
                 engine::unpin_resident_target(&render_deferred_identity(key.mapping_id, &entry));
                 superseded += 1;
                 crate::observe::off(format!(
-                    "render_deferred_superseded mapping={} {}x{} gen={} grouped={}",
+                    "render_deferred_superseded mapping={} {}x{} gen={}",
                     key.mapping_id,
                     entry.width,
                     entry.height,
                     entry.map_generation,
-                    entry.grouped as u8
                 ));
             }
             crate::runtime::census::writeback_census::note_superseded(superseded);
@@ -1990,7 +1815,6 @@ mod tests {
         use crate::observe::Decline as _;
         const ALL: &[ImportDecline] = &[
             ImportDecline::MapGenDrift,
-            ImportDecline::GroupGeomDrift,
             ImportDecline::Unmapped,
             ImportDecline::NoSampleWindow,
             ImportDecline::BprBelowTight { bpr: 0, tight: 0 },
@@ -2063,7 +1887,6 @@ mod tests {
             height: 8,
             map_generation: 1,
             full_quad_bounds: false,
-            grouped: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32, lo: u64, hi: u64| RenderDeferredKey {
@@ -2104,8 +1927,7 @@ mod tests {
                     height: 8,
                     map_generation: 1,
                     full_quad_bounds: false,
-                    grouped: false,
-                    armed_seq,
+                            armed_seq,
                 },
             )
         };
@@ -2274,481 +2096,76 @@ mod tests {
         assert_ne!(id1.generation(), id2.generation());
     }
 
-    /// The lifetime gate has two arms and they fail for different reasons: a
-    /// per-mid `Surface` identity fails when the mapping's generation moved
-    /// under it, and an `OutputGroup` identity fails when the pinned resident is
-    /// not the size this Store names, with no generation compared at all (a
-    /// group identity's is constant). They shared `import_map_gen_drift`, which
-    /// named only the first and made the largest surviving render-loss reason
-    /// unattributable between the two.
-    #[test]
-    fn the_lifetime_gate_names_which_of_its_two_arms_refused() {
-        use crate::runtime::host::FakeHost;
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let mut host = FakeHost::new();
-        for mid in [1u32, 5u32] {
-            state.map_surface(mid);
-            state.note_presented_geom(mid, 1920, 1080);
-        }
-        let group = surface_identity(&state, 1, 1920, 1080);
-        assert!(matches!(group, TargetIdentity::OutputGroup { .. }));
-        // The grouped arm refuses on geometry: the pinned resident is 1920x1080
-        // and this Store names 640x480, so it is not the image to write.
-        assert_eq!(
-            try_import_present_store(&mut state, &mut host, &group, 1, 640, 480, false).reason(),
-            "import_group_geom_drift",
-            "a pinned resident of a different size is not a generation drift"
-        );
-        // ...and it does NOT refuse on membership. Mapping 1 is presented at a
-        // new geometry, so it no longer resolves to the group — the state the
-        // gate used to reject. It now falls through to the checks that read the
-        // mapping itself, which is what the deletion claims.
-        state.note_presented_geom(1, 640, 480);
-        assert_ne!(surface_identity(&state, 1, 1920, 1080), group);
-        let reason =
-            try_import_present_store(&mut state, &mut host, &group, 1, 1920, 1080, false).reason();
-        assert_ne!(
-            reason, "import_group_geom_drift",
-            "membership is not the grouped arm's business any more"
-        );
-        assert!(
-            reason.starts_with("revalidate_"),
-            "the flush must reach the checks that read the mapping, got {reason}"
-        );
-        // The other arm, unchanged: a per-mid identity whose generation moved.
-        let per_mid = surface_identity(&state, 1, 1920, 1080);
-        assert!(matches!(per_mid, TargetIdentity::Surface { .. }));
-        {
-            let m = state.mappings.get_mut(&1).unwrap();
-            DeviceState::bump_map_generation(1, m);
-        }
-        assert_eq!(
-            try_import_present_store(&mut state, &mut host, &per_mid, 1, 1920, 1080, false).reason(),
-            "import_map_gen_drift"
-        );
-    }
-
-    /// Group admission fails in three distinguishable states, and the miss
-    /// carries which one from the check that refused.
+    /// **Two guest surfaces never reach one resident.** This is the rubber-band
+    /// residue fix, stated as an invariant rather than as the absence of the
+    /// mechanism that broke it.
     ///
-    /// This is what retired the membership re-resolve from the import gate.
-    /// `condemn_surface_backing` and a fresh `map_surface` both prune
-    /// `presented_geoms` while deliberately *keeping* `map_generation` and the
-    /// mapping's deferred windows, so a deferred flush's recycled-pages guard
-    /// passes and the gate was the only thing refusing — against a window the
-    /// layer below had just certified as the same incarnation. `unmap_surface`
-    /// prunes the same way but bumps the generation, so the lifetime layer
-    /// refuses first and the gate never decides. One slug covered all of it.
+    /// `ResourcePools::registry` is keyed by `TargetIdentity`, so two mappings
+    /// with equal identities render into and capture from ONE `VkImage`. Guest
+    /// surfaces have independent damage histories — WindowServer redraws a
+    /// buffer only where it differs from what THAT buffer last held — so a
+    /// shared resident makes a damage-only draw composite over the wrong base
+    /// and strands whatever the other buffer left there.
     ///
-    /// The reading still feeds `import_group_membership_stale`, which is now
-    /// measure-only: the write proceeds, and the line is what would locate a
-    /// regression from letting it.
+    /// Four scanout buffers at one geometry used to collapse onto a single
+    /// `TargetIdentity::OutputGroup`, and a held drag that reverses direction
+    /// left a selection-rectangle fragment on the desktop in about half of
+    /// rounds. Interleaved on/off A/B over four boots: 5 of 12 rounds with the
+    /// collapse, 1 of 12 without, and the dominant sub-class (a 15x15 fragment
+    /// at the press point) went 4 to 0.
+    ///
+    /// `surface_mapping_id()` is the O(1) predicate: every identity a mapping
+    /// resolves to must name that mapping.
     #[test]
-    fn the_grouped_arm_reports_which_membership_reading_refused() {
-        use crate::model::OutputGroupMiss;
+    fn every_presented_surface_keeps_a_resident_of_its_own() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32] {
+        let mids = [1u32, 3, 5, 7];
+        for mid in mids {
             state.map_surface(mid);
+        }
+        // Present all four at one geometry — a compositor swapchain, which is
+        // exactly the shape that used to unify.
+        for mid in mids {
             state.note_presented_geom(mid, 1920, 1080);
+            assert!(state.presented_at(mid, 1920, 1080));
         }
-        assert_eq!(state.output_group_resolve(1, 1920, 1080), Ok(1));
-
-        // A geometry only ever presented from one surface: no peer to unify.
-        state.note_presented_geom(7, 800, 600);
-        assert_eq!(
-            state.output_group_resolve(7, 800, 600),
-            Err(OutputGroupMiss::NoPeer)
-        );
-
-        // A resize: still presented, elsewhere. The reading names where.
-        state.note_presented_geom(5, 640, 480);
-        assert_eq!(
-            state.output_group_resolve(5, 1920, 1080),
-            Err(OutputGroupMiss::NotPresentedHere {
-                presented: Some((640, 480))
-            })
-        );
-
-        // A fresh MAP does NOT move the lifetime — it stashes the page plan as
-        // the incarnation fingerprint and lets the next resolve decide. Assert
-        // that precondition first, because it is what makes keeping the
-        // qualification correct rather than merely permissive.
-        let gen_before = state.mappings.get(&1).unwrap().map_generation;
-        state.map_surface(1);
-        assert_eq!(
-            state.mappings.get(&1).unwrap().map_generation,
-            gen_before,
-            "a fresh MAP defers the lifetime decision to the fingerprint compare"
-        );
-        assert_eq!(
-            state.output_group_resolve(1, 1920, 1080),
-            Ok(1),
-            "an undecided recycle must not demote a proven swapchain member"
-        );
-
-        // `condemn_surface_backing` is the other undecided route, same answer.
-        let mut condemned = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [2u32, 3u32] {
-            condemned.map_surface(mid);
-            condemned.note_presented_geom(mid, 1920, 1080);
-            condemned.mappings.get_mut(&mid).unwrap().page_entries = vec![0x301];
-        }
-        let gen_before = condemned.mappings.get(&2).unwrap().map_generation;
-        assert!(condemned.condemn_surface_backing(2));
-        assert_eq!(
-            condemned.mappings.get(&2).unwrap().map_generation,
-            gen_before,
-            "a condemned backing keeps content state for the fingerprint compare"
-        );
-        assert_eq!(condemned.output_group_resolve(2, 1920, 1080), Ok(1));
-
-        // The contrast that makes those two preconditions mean something:
-        // `unmap_surface` DOES bump the generation, so the evidence expires on
-        // its own and the recycled id must re-earn its qualification. Same
-        // observable state as the two above under the old unconditional prune —
-        // which is exactly why they had to become distinguishable.
-        let gen_before = condemned.mappings.get(&3).unwrap().map_generation;
-        condemned.unmap_surface(3);
-        let gen_now = condemned.mappings.get(&3).unwrap().map_generation;
-        assert_ne!(
-            gen_now, gen_before,
-            "an unmap is a lifetime boundary, not a deferred decision"
-        );
-        assert_eq!(
-            condemned.output_group_resolve(3, 1920, 1080),
-            Err(OutputGroupMiss::PriorIncarnation {
-                presented: (1920, 1080),
-                entry_gen: gen_before,
-                current_gen: gen_now,
-            })
-        );
-
-        // `output_group_for` is this resolve's `.ok()`, so the admission
-        // decision cannot drift from the reading that explains it.
-        for (mid, w, h) in [(1u32, 1920u32, 1080u32), (5, 1920, 1080), (7, 800, 600)] {
+        let ids: Vec<_> = mids
+            .iter()
+            .map(|&mid| surface_identity(&state, mid, 1920, 1080))
+            .collect();
+        for (mid, id) in mids.iter().zip(&ids) {
             assert_eq!(
-                state.output_group_for(mid, w, h),
-                state.output_group_resolve(mid, w, h).ok()
+                id.surface_mapping_id(),
+                Some(*mid),
+                "a resident must belong to the surface that asked for it"
             );
         }
-    }
-
-    /// A swapchain buffer recycled onto an IDENTICAL page plan must keep
-    /// resolving to the output group — this is the black-desktop class.
-    ///
-    /// `objects.rs`'s type-4 attach calls `map_surface` and only *afterwards*
-    /// compares the fresh page plan against the stashed fingerprint. On an
-    /// identical plan that compare declines to bump `map_generation`, on the
-    /// stated grounds that this is the SAME incarnation and the resident and
-    /// deferred windows survive. But `map_surface` had already dropped the
-    /// mapping's present evidence, so `output_group_for` demoted it and every
-    /// draw until its next present landed on a private per-mid resident that
-    /// had never held the accumulated full frame. Measured on the rail: the
-    /// resident's non-zero pixel count collapsed from 1.84 M to 0.62-0.78 M of
-    /// 2.07 M and never recovered, and the screen kept only the damaged rects.
-    #[test]
-    fn a_recycle_onto_the_same_plan_does_not_demote_a_swapchain_member() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32] {
-            state.map_surface(mid);
-            state.mappings.get_mut(&mid).unwrap().page_entries = vec![0x301];
-            state.note_presented_geom(mid, 1920, 1080);
-        }
-        let group = surface_identity(&state, 1, 1920, 1080);
-        assert!(
-            matches!(group, TargetIdentity::OutputGroup { .. }),
-            "two presented members at one geometry are a proven swapchain"
-        );
-
-        // The recycle. `map_surface` stashes the page plan as the incarnation
-        // fingerprint and does NOT bump — assert that precondition, because it
-        // is the whole reason the demotion was wrong rather than correct.
-        let gen_before = state.mappings.get(&1).unwrap().map_generation;
-        state.map_surface(1);
-        assert_eq!(
-            state.mappings.get(&1).unwrap().map_generation,
-            gen_before,
-            "an identical-plan recycle is the same incarnation"
-        );
-        assert_eq!(
-            surface_identity(&state, 1, 1920, 1080),
-            group,
-            "a member the fingerprint compare calls the SAME incarnation must \
-             not be demoted to a private resident"
-        );
-
-        // The converse, so this is not just \"never demote\": a recycle onto a
-        // DIFFERENT plan bumps the generation, and the id must re-earn its
-        // qualification rather than inherit the predecessor's.
-        {
-            let m = state.mappings.get_mut(&1).unwrap();
-            DeviceState::bump_map_generation(1, m);
-        }
-        assert!(
-            matches!(
-                surface_identity(&state, 1, 1920, 1080),
-                TargetIdentity::Surface { id: 1, .. }
-            ),
-            "a genuinely new surface must not inherit present evidence"
-        );
-        assert!(matches!(
-            state.output_group_resolve(1, 1920, 1080),
-            Err(crate::model::OutputGroupMiss::PriorIncarnation { .. })
-        ));
-
-        // And a surface that was NEVER presented stays out however much it
-        // publishes — the Safari-scroll black-band guard, unchanged.
-        state.map_surface(7);
-        for _ in 0..8 {
-            state.note_dense_frame_published(7, 1920, 1080);
-        }
-        assert!(matches!(
-            surface_identity(&state, 7, 1920, 1080),
-            TargetIdentity::Surface { id: 7, .. }
-        ));
-    }
-
-    /// Two same-geometry surfaces the guest has presented resolve to one
-    /// shared OutputGroup identity.
-    #[test]
-    fn surface_identity_unifies_presented_siblings() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32, 7u32] {
-            state.map_surface(mid);
-        }
-        // One presented surface only: per-mid.
-        state.note_presented_geom(1, 1920, 1080);
-        assert!(matches!(
-            surface_identity(&state, 1, 1920, 1080),
-            TargetIdentity::Surface { id: 1, .. }
-        ));
-        // A second surface at the same geometry that publishes full frames but
-        // is never presented: both stay per-mid — the black-band regression
-        // guard. WebKit content tiles publish full frames every paint;
-        // unifying them chains DISTINCT surfaces onto one resident.
-        state.note_dense_frame_published(5, 1920, 1080);
-        assert!(matches!(
-            surface_identity(&state, 1, 1920, 1080),
-            TargetIdentity::Surface { id: 1, .. }
-        ));
-        assert!(matches!(
-            surface_identity(&state, 5, 1920, 1080),
-            TargetIdentity::Surface { id: 5, .. }
-        ));
-        // Present evidence for the second member unifies the logical output.
-        state.note_presented_geom(5, 1920, 1080);
-        let a = surface_identity(&state, 1, 1920, 1080);
-        let b = surface_identity(&state, 5, 1920, 1080);
-        assert!(matches!(a, TargetIdentity::OutputGroup { .. }));
-        assert_eq!(a, b, "members share one logical framebuffer identity");
-        // Non-member at the same geometry: per-mid.
-        assert!(matches!(
-            surface_identity(&state, 7, 1920, 1080),
-            TargetIdentity::Surface { id: 7, .. }
-        ));
-        // Member at a different geometry than proven: per-mid.
-        assert!(matches!(
-            surface_identity(&state, 1, 1280, 720),
-            TargetIdentity::Surface { id: 1, .. }
-        ));
-    }
-
-    /// A compositor buffer's draws and its first capture reach different
-    /// residents, which is the gap `note_present_identity_handoff` counts.
-    /// `surface_identity` shares a resident only once a mid has been presented
-    /// at a latched geometry, and `capture_present_frame` marks it presented
-    /// before it resolves — so the draws into a fresh buffer land in a resident
-    /// of its own and the present that names it reads the shared one.
-    #[test]
-    fn a_buffers_resident_changes_under_it_on_its_first_present() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32, 9u32] {
-            state.map_surface(mid);
-        }
-        // Two members already presented here: the geometry is a proven
-        // swapchain, so anything that joins resolves to the shared resident.
-        state.note_presented_geom(1, 1920, 1080);
-        state.note_presented_geom(5, 1920, 1080);
-        assert!(state.present.output_group_geoms.contains(&(1920, 1080)));
-
-        // WindowServer allocates a fresh buffer and draws into it. It has not
-        // been named in a display transaction yet, so every draw resolves to a
-        // resident of its own.
-        let drawing = surface_identity(&state, 9, 1920, 1080);
-        assert_eq!(drawing.surface_mapping_id(), Some(9));
-
-        // The transaction then names it. `capture_present_frame` marks it
-        // presented before resolving, so the capture reads the shared resident
-        // — a different image than the one those draws went into.
-        state.note_presented_geom(9, 1920, 1080);
-        let capturing = surface_identity(&state, 9, 1920, 1080);
-        assert!(matches!(capturing, TargetIdentity::OutputGroup { .. }));
-        assert_ne!(
-            drawing, capturing,
-            "the draws and the capture must be shown to disagree, or \
-             `note_present_identity_handoff` is counting nothing"
-        );
-    }
-
-    /// A geometry with only one surface ever presented has no group, so a
-    /// buffer's draws and its first capture reach the same resident. This is
-    /// the arm that keeps the sibling test from passing for the wrong reason.
-    #[test]
-    fn an_unlatched_geometry_has_no_resident_to_hand_off_to() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 9u32] {
-            state.map_surface(mid);
-        }
-        state.note_presented_geom(1, 1280, 720);
-        assert!(!state.present.output_group_geoms.contains(&(1280, 720)));
-        let drawing = surface_identity(&state, 9, 1280, 720);
-        state.note_presented_geom(9, 1280, 720);
-        // Presenting the second surface latches the geometry, which is exactly
-        // why the reading must be taken before the present, not after.
-        assert!(state.present.output_group_geoms.contains(&(1280, 720)));
-        assert_eq!(drawing.surface_mapping_id(), Some(9));
-    }
-
-    /// A proven swapchain geometry keeps unifying a lone presented member across
-    /// the buffer recycles that momentarily leave a single concurrently
-    /// presented member. This is the black-background / desktop-residue class:
-    /// WindowServer continuously recycles swapchain buffers (fresh mid ids, old
-    /// ones unmapped), so the *concurrent* peer count drops to one; without the
-    /// sticky `output_group_geoms` latch the fresh buffer resolved to a per-mid
-    /// resident that never held the accumulated full frame, and the guest's
-    /// damage-only draw left everything outside the damaged rect black.
-    #[test]
-    fn proven_swapchain_geometry_unifies_a_lone_recycled_member() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32, 9u32] {
-            state.map_surface(mid);
-        }
-        // Two surfaces presented together: the geometry is a proven swapchain.
-        state.note_presented_geom(1, 1920, 1080);
-        state.note_presented_geom(5, 1920, 1080);
-        assert!(matches!(
-            surface_identity(&state, 1, 1920, 1080),
-            TargetIdentity::OutputGroup { .. }
-        ));
-
-        // WindowServer recycles the swapchain: the old buffers are gone and a
-        // fresh buffer (mid 9) is the only member presented at the geometry.
-        for mid in [1u32, 5u32] {
-            state.present.presented_geoms.remove(&mid);
-        }
-        state.note_presented_geom(9, 1920, 1080);
-
-        // The lone fresh buffer still resolves to the shared OutputGroup
-        // resident (per-mid resolution here is the black-background bug).
-        assert!(
-            matches!(
-                surface_identity(&state, 9, 1920, 1080),
-                TargetIdentity::OutputGroup { .. }
-            ),
-            "a proven swapchain geometry stays unified across buffer recycles"
-        );
-
-        // A geometry that was never double-buffered stays per-mid: a lone
-        // surface at a fresh resolution must not spuriously unify.
-        state.note_presented_geom(9, 1280, 720);
-        assert!(matches!(
-            surface_identity(&state, 9, 1280, 720),
-            TargetIdentity::Surface { id: 9, .. }
-        ));
-    }
-
-    /// Detector for the mixed-generation frame class.
-    ///
-    /// `ResourcePools::registry` is keyed by `TargetIdentity`, so a resident
-    /// that is NOT keyed by the mapping id that resolved to it is reachable
-    /// from another surface too — and distinct guest surfaces have independent
-    /// damage histories, so sharing one resident fuses their damage into a
-    /// single frame. `surface_mapping_id()` is the O(1) predicate the always-on
-    /// `resident_identity_shared` line is built on. Two unified members trip it
-    /// today; per-surface residents cannot.
-    #[test]
-    fn shared_resident_is_detectable_from_the_identity_alone() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32] {
-            state.map_surface(mid);
-        }
-        // A lone presented surface stays per-surface: keyed by its own mapping id.
-        state.note_presented_geom(1, 1920, 1080);
-        assert_eq!(
-            surface_identity(&state, 1, 1920, 1080).surface_mapping_id(),
-            Some(1),
-            "a per-surface resident belongs to the surface that asked for it"
-        );
-
-        // A second presented surface at the same geometry unifies both onto one
-        // resident, and neither identity names the surface that resolved to it.
-        state.note_presented_geom(5, 1920, 1080);
-        let a = surface_identity(&state, 1, 1920, 1080);
-        let b = surface_identity(&state, 5, 1920, 1080);
-        assert_eq!(a, b, "two distinct guest surfaces reached one resident");
-        assert_eq!(a.surface_mapping_id(), None);
-        assert_eq!(b.surface_mapping_id(), None);
-    }
-
-    /// The direct-present fallback identity is always per-member.
-    #[test]
-    fn member_surface_identity_is_always_per_mid_even_when_unified() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        for mid in [1u32, 5u32] {
-            state.map_surface(mid);
-        }
-        state.note_presented_geom(1, 1920, 1080);
-        state.note_presented_geom(5, 1920, 1080);
-        assert!(matches!(
-            surface_identity(&state, 1, 1920, 1080),
-            TargetIdentity::OutputGroup { .. }
-        ));
-        let g1 = state.mappings.get(&1).unwrap().map_generation as u64;
-        assert_eq!(
-            member_surface_identity(&state, 1, 1920, 1080),
-            TargetIdentity::Surface {
-                id: 1,
-                width: 1920,
-                height: 1080,
-                generation: g1,
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "two scanout buffers must not share one resident");
             }
-        );
-        // A distinct member gets its own distinct key (never collapsed).
-        assert_ne!(
-            member_surface_identity(&state, 1, 1920, 1080),
-            member_surface_identity(&state, 5, 1920, 1080)
-        );
+        }
     }
 
-    /// A grouped deferred window rebuilds the OutputGroup identity it pinned
-    /// (never re-resolved against current membership); per-mid windows keep
-    /// the Surface identity with the member's map_generation.
+    /// A deferred window rebuilds the identity it pinned, carrying the member's
+    /// `map_generation` — never re-resolved against current state, so nothing
+    /// that moves between defer and flush can unpin a different image.
     #[test]
     fn render_deferred_identity_rebuilds_pinned_identity() {
-        let entry = |grouped| crate::model::RenderDeferredEntry {
+        let entry = crate::model::RenderDeferredEntry {
             width: 1920,
             height: 1080,
             map_generation: 7,
             full_quad_bounds: false,
-            grouped,
             armed_seq: 0,
         };
         assert_eq!(
-            render_deferred_identity(4, &entry(false)),
+            render_deferred_identity(4, &entry),
             TargetIdentity::Surface {
                 id: 4,
                 width: 1920,
                 height: 1080,
                 generation: 7
-            }
-        );
-        assert_eq!(
-            render_deferred_identity(4, &entry(true)),
-            TargetIdentity::OutputGroup {
-                id: OUTPUT_GROUP_ID,
-                width: 1920,
-                height: 1080,
-                generation: 0
             }
         );
     }

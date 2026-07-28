@@ -5521,19 +5521,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // and the guest is damage-drawing it again (single-buffer case).
                 let same_mid_present = load_action == Some(PASS_LOAD_ACTION_LOAD)
                     && state.presented_needs_guest_seed.remove(&import_mid);
-                // Inter-buffer retention is STRUCTURAL, not copied. Two
-                // surfaces the guest names at one geometry resolve to the same
-                // `TargetIdentity::OutputGroup` and therefore share one
-                // resident, so the frame one holds is already the frame the
-                // other's LoadFromTarget reads. The a/b peer seed that used to
-                // sit here copied a full frame between them; every such copy was
-                // a copy onto itself and the unification filter dropped it. What
-                // survived the filter only ever had a target the guest had NEVER
-                // named as plane 0 (`peer_seed_unification outcome=survives
-                // src_kind=group target_kind=surface`, the sole outcome recorded
-                // across 11 process lifetimes) — a WebKit content tile receiving
-                // the desktop's frame at ~50/s, which is unrelated content, not
-                // retention.
+                // Inter-buffer retention is the present boundary and nothing
+                // else. Each scanout buffer owns its resident, so a buffer's
+                // `LoadFromTarget` reads the frame THAT buffer last held, which
+                // is what WindowServer's damage is computed against.
                 let presented_since_last_draw = same_mid_present;
                 // If the resident image is unavailable, guest pages are the
                 // final protocol-backed source. A successful read is a valid

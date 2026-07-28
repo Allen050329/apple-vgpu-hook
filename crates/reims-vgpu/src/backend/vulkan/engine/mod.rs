@@ -1532,7 +1532,6 @@ fn identity_kind(identity: &TargetIdentity) -> &'static str {
         TargetIdentity::Texture { .. } => "texture",
         TargetIdentity::Gva { .. } => "gva",
         TargetIdentity::Anonymous { .. } => "anon",
-        TargetIdentity::OutputGroup { .. } => "group",
     }
 }
 
@@ -1562,11 +1561,6 @@ fn classify_export_present_miss(pools: &pools::ResourcePools, identity: &TargetI
         }
     }
     let c = pools.registry_geom_census(w, h);
-    let group = match c.group {
-        Some(true) => "ready",
-        Some(false) => "notready",
-        None => "none",
-    };
     // Summarize surfaces compactly: id:gen:ready, capped so the line stays bounded.
     let mut surf = String::new();
     for (i, (id, gen, ready)) in c.surfaces.iter().take(8).enumerate() {
@@ -1579,10 +1573,10 @@ fn classify_export_present_miss(pools: &pools::ResourcePools, identity: &TargetI
         surf.push_str(",…");
     }
     // The orphan verdict: content exists at this geometry under another key.
-    let orphan = c.group.is_some() || !c.surfaces.is_empty() || c.gva > 0;
+    let orphan = !c.surfaces.is_empty() || c.gva > 0;
     crate::observe::off(format!(
         "export_present_miss outcome={} want={kind} geom={w}x{h} want_gen={} \
-         group={group} surfaces=[{surf}] gva={} reg_len={}",
+         surfaces=[{surf}] gva={} reg_len={}",
         if orphan { "orphan" } else { "absent" },
         identity.generation(),
         c.gva,

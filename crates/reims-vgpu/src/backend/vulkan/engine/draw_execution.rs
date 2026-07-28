@@ -240,18 +240,6 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             ("identity_kind", "anonymous".into()),
             ("identity_slot", slot.to_string()),
         ],
-        TargetIdentity::OutputGroup {
-            id,
-            width,
-            height,
-            generation,
-        } => vec![
-            ("identity_kind", "output_group".into()),
-            ("identity_id", id.to_string()),
-            ("identity_width", width.to_string()),
-            ("identity_height", height.to_string()),
-            ("identity_generation", generation.to_string()),
-        ],
     }
 }
 
@@ -411,16 +399,6 @@ mod tests {
                 TargetIdentity::Anonymous { slot: 9 },
                 "anonymous",
                 ("identity_slot", "9"),
-            ),
-            (
-                TargetIdentity::OutputGroup {
-                    id: 10,
-                    width: 80,
-                    height: 60,
-                    generation: 11,
-                },
-                "output_group",
-                ("identity_id", "10"),
             ),
         ];
 
