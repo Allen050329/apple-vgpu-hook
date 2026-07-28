@@ -177,6 +177,33 @@ pub fn write_task_gva_fallback<M: HostMemory>(
     Err(MemError::Unmapped)
 }
 
+/// `file:line` of whoever called the `#[track_caller]` function above this one.
+///
+/// Rendered as the repo-relative tail so the field stays short enough to sit on
+/// an always-on line: `runtime/blit_exec.rs:1039`.
+#[track_caller]
+fn via_caller() -> String {
+    let loc = std::panic::Location::caller();
+    let file = loc.file();
+    let tail = file.rfind("/src/").map_or(file, |i| &file[i + 5..]);
+    format!("{tail}:{}", loc.line())
+}
+
+/// Dedup key for the write-gate census: the arm's identity is the task, the
+/// authorising task, **and** the call site.
+///
+/// Hashed rather than bit-packed because `by` comes from the span registry and
+/// carries a raw wire word, so no field here has a bound worth relying on. This
+/// is a set key for suppressing repeats, not a value anything reads back.
+fn latch_key(task_id: u32, by: u32, via: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    task_id.hash(&mut h);
+    by.hash(&mut h);
+    via.hash(&mut h);
+    h.finish()
+}
+
 /// Product GVA write: HostOps `map_pages` only (no `write_gpa` walk).
 ///
 /// Full-span packed view when possible; otherwise **multi-import** maximal
@@ -185,6 +212,14 @@ pub fn write_task_gva_fallback<M: HostMemory>(
 /// MapMemory2 spans, the write must lie inside one span (`outside_map`).
 /// Always-on: `gva_write fail reason=…`, carrying the check `write_span`
 /// actually refused on rather than a reason chosen here.
+///
+/// `#[track_caller]` so the always-on lines can name **which** of the fifteen
+/// product call sites issued the write. The reason and the writer were both
+/// unattributable before: a refusal or a gate census named a task, an address
+/// and a length, and finding the code that produced them meant guessing from
+/// the size. Reading `Location::caller()` keeps that a reading — the callee
+/// asks who called it, rather than each caller passing a label it chose.
+#[track_caller]
 pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
     host: &mut H,
@@ -195,6 +230,7 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     if buf.is_empty() {
         return Ok(());
     }
+    let via = via_caller();
     // The gate's own answer, not a label chosen here. It has three distinct ways
     // to permit a write and nothing has ever read which one applied: a covered
     // span, an *aliased* task's span, or no span registry at all. Only the last
@@ -206,6 +242,7 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
             .field("task", task_id)
             .field("gva", format!("{gva:#x}"))
             .field("len", format!("{:#x}", buf.len()))
+            .field("via", via)
             .fail();
         return Err(MemError::OutsideMap);
     }
@@ -217,7 +254,11 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
             crate::model::WriteGate::Aliased { by } => by,
             _ => 0,
         };
-        if crate::observe::first_sight(gate.slug(), (u64::from(task_id) << 32) | u64::from(by)) {
+        // The caller is part of the identity, not decoration. The same arm
+        // reached from two sites is two findings, and a latch keyed on
+        // `(arm, task, by)` alone would show whichever ran first and hide the
+        // other for the whole process.
+        if crate::observe::first_sight(gate.slug(), latch_key(task_id, by, &via)) {
             // `by` is the gate's own answer and it is also the only answer the
             // gate's alias predicate can give — it searches `task >> 1` alone,
             // so reading `by == task >> 1` back as a finding measures the
@@ -244,6 +285,7 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
                 .field("owners", format!("{owners:?}"))
                 .field("own", state.task_own_span_count(task_id))
                 .field("spans", state.task_map_span_count())
+                .field("via", via)
                 .fail();
         }
     }
@@ -793,6 +835,45 @@ mod tests {
         assert_eq!(state.task_map_span_count(), 3);
         // A zero-length write covers nothing, matching the gate's own early out.
         assert!(state.tasks_covering(0x4000, 0).is_empty());
+    }
+
+    /// The `via=` field must name the **caller**, not `gva_mem.rs` itself, or it
+    /// reports where the log line is written and nothing about who wrote.
+    ///
+    /// Also pins the rendering: a bare `Location::file()` is the whole build
+    /// path, which is long enough to push the load-bearing fields off the end of
+    /// a scanned log line.
+    #[test]
+    fn the_via_field_names_the_call_site_and_not_the_logging_site() {
+        #[track_caller]
+        fn relay() -> String {
+            via_caller()
+        }
+        let here = relay();
+        assert!(
+            here.starts_with("runtime/gva_mem.rs:"),
+            "expected a repo-relative caller, got {here}"
+        );
+        assert!(
+            !here.contains("crates/") && !here.starts_with('/'),
+            "the crate prefix must be trimmed off, got {here}"
+        );
+        let line: u32 = here.rsplit(':').next().unwrap().parse().unwrap();
+        assert!(line > 0);
+    }
+
+    /// The latch key must separate call sites, or the second site to reach a
+    /// given `(arm, task, by)` is silent for the life of the process — the same
+    /// per-process latching hazard that has already misread one census.
+    #[test]
+    fn the_write_gate_latch_key_separates_call_sites() {
+        assert_ne!(
+            latch_key(1, 0, "runtime/blit_exec.rs:1039"),
+            latch_key(1, 0, "runtime/mipmap.rs:337")
+        );
+        assert_ne!(latch_key(1, 0, "a:1"), latch_key(2, 0, "a:1"));
+        assert_ne!(latch_key(1, 0, "a:1"), latch_key(1, 1, "a:1"));
+        assert_eq!(latch_key(1, 0, "a:1"), latch_key(1, 0, "a:1"));
     }
 
     /// `Aliased` is returned in two states that call for opposite fixes, and
