@@ -130,6 +130,18 @@ Note what saved it and what did not: the sub-perceptual reading came from lookin
 after two boots of counts, a 2x2 design, an interleaved A/B and a null arm had all agreed with each
 other. Agreement among measurements that share a metric does not test the metric.
 
+**A transient defect is invisible to a before/after pair.** A repro that captures once before a
+gesture and once after cannot see anything that repairs itself in between, and it will report clean
+runs indefinitely while a human watching the same screen sees the defect plainly. That happened
+here: a scripted gesture sweep scored byte-identical frames at every step while an observer watching
+the live window during the same run reported black corruption that had self-repaired by the next
+capture.
+
+So when the class involves corruption that comes and goes, capture **continuously** through and
+after the gesture and score the burst, rather than sampling its endpoints. Before concluding a
+sequence does not reproduce, confirm the sampling rate could have caught it — and prefer the
+always-on log, which is continuous by construction and did record the failure the captures missed.
+
 **Exclusions decay, and nobody re-tests them.** The anti-pattern list already forbids claiming a
 class is fixed from one clean boot. Negative results are exactly as fragile and strictly more
 dangerous, because a wrong fix gets found the next time someone looks at the screen while a wrong
