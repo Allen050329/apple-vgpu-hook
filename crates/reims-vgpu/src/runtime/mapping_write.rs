@@ -1233,6 +1233,59 @@ mod tests {
         );
     }
 
+    /// The packed-contig BGRA write pokes rows straight into a raw host pointer,
+    /// so its only bound is the sample window `contig_for_span` validated. The
+    /// fragmented path's equivalent is checked by
+    /// `write_bgra8_fragmented_skips_final_row_padding`; this pins the same
+    /// contract on the pointer path, where an overrun is a write into whatever
+    /// guest allocation follows rather than a refused import.
+    ///
+    /// Asserted as "every byte outside the window is unchanged", not just the
+    /// final row's padding: inter-row padding belongs to the same class and a
+    /// stride bug hits it first.
+    #[test]
+    fn write_bgra8_contig_writes_only_inside_the_sample_window() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x7300_0000u64;
+        host.map_range(gpa, page as usize, 0xCC);
+        let pfn = (gpa >> PAGE_SHIFT_X86) as u32;
+        let mid = 21u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        // No device descriptor, so the invented window applies: tight = 2 × 4,
+        // bpr = ALIGN_UP(8, ROW_BYTES_ALIGN) = 128, two rows.
+        let tight = 8usize;
+        let bpr = 128usize;
+        let src: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(17)).collect();
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_some(),
+            "one packed page must take the contig path this test is about"
+        );
+        assert!(write_bgra8(&mut state, &mut host, mid, &src, 8, 2, 2));
+
+        let mut got = vec![0u8; page as usize];
+        assert!(host.read_gpa(gpa, &mut got).is_ok());
+        let mut want = vec![0xCCu8; page as usize];
+        want[..tight].copy_from_slice(&src[..tight]);
+        want[bpr..bpr + tight].copy_from_slice(&src[tight..]);
+        let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+        assert_eq!(
+            first_diff, None,
+            "byte {first_diff:?} outside the sample window was modified"
+        );
+    }
+
     /// Fragmented compute staging materializes the sample window once and
     /// preserves padded-row addressing across non-contiguous guest pages.
     #[test]
