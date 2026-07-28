@@ -59,10 +59,14 @@ impl ResourcePools {
     /// either constant moves: `mib` against `windows*1024` is the density, and
     /// `g<N>` is how many N MiB windows would have had to be resident to carry
     /// the same traffic — i.e. `g<N> * N` MiB is what that granule would pin.
-    /// Emitted per 64 creates so a thrashing boot reports its progression
-    /// without the line tracking the create rate.
-    fn report_host_import_occupancy(&self) {
-        if !self.host_import_creates.is_multiple_of(64) {
+    ///
+    /// Emitted once per *newly seen bucket*, which is bounded by guest RAM over
+    /// the window size and does not track the create rate. Keying it on creates
+    /// instead would have gone silent exactly when the pool stopped thrashing:
+    /// a healthy boot now makes about a dozen imports in total, and a
+    /// per-64-creates line would never fire on one.
+    fn report_host_import_occupancy(&self, buckets_before: usize) {
+        if self.host_import_occupancy.len() == buckets_before {
             return;
         }
         let chunks = |granule_mib: usize| -> usize {
@@ -158,24 +162,26 @@ impl ResourcePools {
             {
                 continue;
             }
-            if host_import_budget(self.host_imports.len(), self.host_import_bytes(), region_len)
-                .is_err()
-            {
-                // Make room before giving up: the budget is a working-set bound,
-                // not a lifetime quota. Releasing the coldest windows is what
-                // stops a long session from ratcheting into a permanent decline
-                // once the guest's GPU pages have spread across enough buckets.
-                self.evict_host_imports(ctx, self.plan_host_import_eviction(region_len), "budget");
-            }
             let imported_bytes = self.host_import_bytes();
             if let Err(reason) =
                 host_import_budget(self.host_imports.len(), imported_bytes, region_len)
             {
-                // Nothing evictable covered the shortfall — every window is
-                // either in the live resolve batch or the working set genuinely
-                // exceeds the budget. Decline exactly as before eviction
-                // existed, so an over-subscribed guest stays fail-visible
-                // instead of silently thrashing.
+                // Admit only when admission is free. A miss here is not a
+                // failure — the caller writes the span through the CPU byte
+                // path — so releasing a resident window to make room trades a
+                // few megabytes of `memcpy` for a whole 1 GiB re-import, and
+                // then pays it again next frame because the window it released
+                // is in the same working set.
+                //
+                // That is not a hypothetical LRU argument, it is what the census
+                // recorded: 2247 creates against 2246 evictions over one browsing
+                // session, victims logged `age_ms=0`, 14 one-GiB buckets touched
+                // against a budget of 8. An import measured 19.3 ms — longer than
+                // a 60 Hz frame — and one drain tranche spent 1342 ms of its life
+                // inside `zc_import_us`. The guest's spread is real and no window
+                // size closes it (`host_import_density` put 6.4 GiB of touched
+                // pages across those buckets at 46 % occupancy), so the overflow
+                // has to be *served*, not shuffled.
                 if self.host_import_first_time(reason) {
                     crate::observe::Emit::decline("host_import_fail", &reason)
                         .field("regions", self.host_imports.len())
@@ -235,8 +241,9 @@ impl ResourcePools {
                 last_epoch: self.host_import_epoch,
                 last_touch_ms: self.idle_clock_ms,
             });
+            let buckets_before = self.host_import_occupancy.len();
             self.mark_host_import_occupancy(base, ptr as u64 - base as u64, len);
-            self.report_host_import_occupancy();
+            self.report_host_import_occupancy(buckets_before);
             let r = self.host_imports.last().unwrap();
             return Ok((r.buffer, ptr as u64 - r.base as u64));
         }

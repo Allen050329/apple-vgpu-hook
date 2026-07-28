@@ -148,9 +148,11 @@ pub(crate) struct ResourcePools {
     storage_recycle_admits: u64,
     storage_recycle_cap_drops: u64,
     /// VK_EXT_external_memory_host imports over guest-RAM host VAs (direct
-    /// RAMBlock aliases — stable for the VM lifetime, so entries are never
-    /// evicted; freed only at teardown). Each entry carries a TRANSFER_SRC
-    /// buffer bound over the whole import for zero-copy guest gathers.
+    /// RAMBlock aliases — stable for the VM lifetime). Each entry carries a
+    /// TRANSFER_SRC buffer bound over the whole import for zero-copy guest
+    /// gathers. Entries are admitted only while [`HOST_IMPORT_WINDOW_BUDGET`]
+    /// has room and released only by the idle sweep, never to make room for
+    /// another.
     host_imports: Vec<HostImportRegion>,
     /// Monotonic resolve counter stamped into `HostImportRegion::last_touch`.
     host_import_touch: u64,
@@ -262,27 +264,37 @@ const HOST_IMPORT_REGION_CAP: usize = 512;
 /// surface and imports them all before its DMA, so a surface whose pages
 /// straddle several buckets needs all of them resident simultaneously.
 ///
-/// This is a **working-set bound, not a lifetime quota** — cold windows are
-/// released by [`ResourcePools::plan_host_import_eviction`] under budget
-/// pressure and by the idle sweep, so overflowing it costs a re-import rather
-/// than the permanent decline it used to.
+/// This bounds **how much is resident, not how much can be served.** A span
+/// outside the resident set is not refused work: `host_import_resolve` declines,
+/// and the caller writes it through the CPU byte path. So the budget is a
+/// hit-rate knob, and the resolve path admits only when admission is free —
+/// releasing a resident window to make room costs a whole 1 GiB re-import to
+/// save a few megabytes of `memcpy`, and then costs it again next frame because
+/// the released window is in the same working set.
 ///
 /// 8 is the measured steady state of an x86 macOS desktop (Finder + Safari on
-/// apple.com): eight *consecutive* 1 GiB buckets, so the guest's GPU pages span
-/// a contiguous 8 GiB slice of the RAMBlock. Eviction does not license setting
-/// this below that. A live boot at 4 was tried and thrashed outright —
-/// `creates=804 evictions=800` over one session, most victims logged
-/// `age_ms=0`, and `zc_import_us=181244` of a `drain_tranche_us=317235`, i.e.
-/// 57 % of the tranche spent re-importing what had just been released. The
-/// desktop was visibly slow.
+/// apple.com): eight *consecutive* 1 GiB buckets. A real browsing session is
+/// wider than that and no window size closes the gap. One measured run —
+/// twelve heavy pages kept live, then sixty seconds of sustained compositing —
+/// touched **14** buckets, and `host_import_density` put 6.4 GiB of pages inside
+/// them at 46 % occupancy per bucket, so a finer `HOST_IMPORT_WINDOW_CAP` would
+/// halve the bytes at best while multiplying the region count by hundreds. The
+/// spread is the guest's, and the overflow has to be served rather than shuffled.
 ///
-/// So the census on every `host_import_region` / `host_import_evict` line is
-/// load-bearing, not decoration: comparable `creates=` and `evictions=` rates
-/// mean the budget is below the working set. The remedy is a smaller
-/// `HOST_IMPORT_WINDOW_CAP` **only if** the hot pages prove sparse within the
-/// spread — finer buckets cut bytes per window but need proportionally more
-/// windows to cover the same span, so on a dense working set they buy nothing.
-/// Measure before shrinking either constant.
+/// The `host_import_region` / `host_import_evict` census stays load-bearing, and
+/// now reads the other way round: `creates` should approach the bucket count and
+/// `evictions` should come only from the idle sweep. Comparable rates would mean
+/// something started evicting under pressure again. The same session measured
+/// 2247 creates against 2246 evictions before that stopped, with victims logged
+/// `age_ms=0`, an import costing 19.3 ms — longer than a 60 Hz frame — and one
+/// drain tranche spending 1342 ms inside `zc_import_us`.
+///
+/// The cost of *not* evicting is that the resident set is whichever buckets
+/// arrived first and it only turns over on the idle sweep, so a long session can
+/// hold eight lukewarm windows while a hotter ninth pays `memcpy` every frame.
+/// That is bounded by construction — the fallback is a copy of the span, not of
+/// the window — and it is the cheaper side of the trade by more than an order of
+/// magnitude.
 const HOST_IMPORT_WINDOW_BUDGET: u64 = 8;
 
 /// Ceiling on host pages pinned for GPU DMA. Bounded pinning is the standing
@@ -305,54 +317,6 @@ fn host_import_budget(
 }
 
 impl ResourcePools {
-    /// Indices of the coldest import windows to release so a `candidate_bytes`
-    /// import fits the budget, or empty when no eligible set covers the
-    /// shortfall (caller then declines exactly as it did before eviction
-    /// existed). Victims come out in eviction order, coldest first.
-    ///
-    /// **A region touched in the live epoch is never a victim.** That is the
-    /// property that keeps `present_scatter_gpu` sound: it resolves *every* run
-    /// of a surface into a local list before recording any of them ("a partial
-    /// scatter would leave the guest surface torn, so this is all-or-nothing"),
-    /// and it flushes the open batch first — so mid-loop the pool can look
-    /// perfectly quiescent (`in_flight == 0`, no open batch) while the caller
-    /// still holds live `vk::Buffer` handles. `dispose`'s in-flight check cannot
-    /// see those; the epoch can, because nothing has submitted since they were
-    /// resolved.
-    ///
-    /// Device-free so the eligibility and accounting are unit-testable without a
-    /// GPU, matching `plan_idle_drain` and `try_recycle_sampled`.
-    fn plan_host_import_eviction(&self, candidate_bytes: u64) -> Vec<usize> {
-        let imported_bytes = self.host_import_bytes();
-        let over_bytes = imported_bytes
-            .saturating_add(candidate_bytes)
-            .saturating_sub(HOST_IMPORT_TOTAL_BYTE_CAP);
-        let over_count = self.host_imports.len() + 1 > HOST_IMPORT_REGION_CAP;
-        if over_bytes == 0 && !over_count {
-            return Vec::new();
-        }
-        let mut cold: Vec<usize> = (0..self.host_imports.len())
-            .filter(|&i| self.host_imports[i].last_epoch != self.host_import_epoch)
-            .collect();
-        cold.sort_by_key(|&i| self.host_imports[i].last_touch);
-        let mut freed = 0u64;
-        let mut victims = Vec::new();
-        for i in cold {
-            if freed >= over_bytes && !(over_count && victims.is_empty()) {
-                break;
-            }
-            freed = freed.saturating_add(self.host_imports[i].len);
-            victims.push(i);
-        }
-        // All-or-nothing: releasing a subset that still leaves us over budget
-        // would drop live windows and decline anyway — strictly worse than
-        // declining with everything intact.
-        if freed < over_bytes || (over_count && victims.is_empty()) {
-            return Vec::new();
-        }
-        victims
-    }
-
     /// Indices of import windows the idle sweep may release: not in the live
     /// resolve epoch, and untouched since `cutoff`. At most `max` per pass, so a
     /// fired pass cannot empty the set in one go.
@@ -1203,49 +1167,16 @@ mod host_import_budget_tests {
         pools
     }
 
-    /// Budget pressure releases the coldest window, and exactly that one — the
-    /// property that turns the budget from a lifetime quota into a working-set
-    /// bound. Before eviction existed, a full budget declined forever because
-    /// regions were only ever freed at teardown.
-    #[test]
-    fn evicting_the_coldest_window_admits_a_new_one() {
-        // A full budget: every window resident, all resolved in older epochs.
-        let stamps: Vec<(u64, u64, u64)> = (0..HOST_IMPORT_WINDOW_BUDGET)
-            .map(|i| (i + 1, 1, (i + 1) * 1000))
-            .collect();
-        let pools = pool_with_windows(&stamps, 9);
-        assert_eq!(
-            host_import_budget(
-                pools.host_imports.len(),
-                pools.host_import_bytes(),
-                HOST_IMPORT_WINDOW_CAP
-            ),
-            Err(HostImportDecline::TotalBytes),
-            "fixture must actually be at the budget or the test proves nothing"
-        );
-
-        let victims = pools.plan_host_import_eviction(HOST_IMPORT_WINDOW_CAP);
-        assert_eq!(victims, vec![0], "the coldest window, and only it");
-
-        // …and the shortfall is genuinely covered afterwards.
-        let freed: u64 = victims.iter().map(|&i| pools.host_imports[i].len).sum();
-        assert_eq!(
-            host_import_budget(
-                pools.host_imports.len() - victims.len(),
-                pools.host_import_bytes() - freed,
-                HOST_IMPORT_WINDOW_CAP
-            ),
-            Ok(())
-        );
-    }
-
     /// The torn-scatter guard. `present_scatter_gpu` resolves EVERY run of a
     /// surface into a local buffer list before recording any of them, and
     /// flushes the open batch first — so mid-loop the pool looks quiescent
     /// (`in_flight == 0`, no open batch) while the caller still holds live
-    /// handles. `dispose`'s in-flight check cannot see those. Evicting a window
+    /// handles. `dispose`'s in-flight check cannot see those. Releasing a window
     /// resolved in the live epoch would hand the GPU a destroyed buffer and tear
-    /// the guest surface, so the planner must refuse even under full pressure.
+    /// the guest surface, so the idle sweep must refuse one however old its
+    /// wall-clock stamp looks — `last_touch_ms` rides the poll-driven idle
+    /// clock, which does not tick during a resolve burst, so an entire live run
+    /// list can share one stale millisecond stamp.
     #[test]
     fn a_region_touched_this_epoch_is_never_evicted() {
         let epoch = 7;
@@ -1255,41 +1186,8 @@ mod host_import_budget_tests {
             .collect();
         let pools = pool_with_windows(&stamps, epoch);
         assert!(
-            pools
-                .plan_host_import_eviction(HOST_IMPORT_WINDOW_CAP)
-                .is_empty(),
-            "a window resolved since the last submit must never be a victim"
-        );
-        // The idle sweep applies the same guard: `last_touch_ms` rides the
-        // poll-driven idle clock, which does not tick during a resolve burst, so
-        // an entire live run list can share one stale millisecond stamp.
-        assert!(
             pools.plan_host_import_idle_release(u64::MAX, 16).is_empty(),
             "the age cutoff alone must not be able to release a live window"
-        );
-    }
-
-    /// Eviction is all-or-nothing: if the evictable set cannot cover the
-    /// shortfall, release nothing. Dropping a partial set would unpin live
-    /// windows and still decline — strictly worse than declining intact.
-    #[test]
-    fn eviction_is_all_or_nothing_when_the_shortfall_cannot_be_covered() {
-        let epoch = 3;
-        // One cold window, the rest live: a full-budget import needs more than
-        // the single cold window can free.
-        let mut stamps: Vec<(u64, u64, u64)> = vec![(1, 1, 0)];
-        stamps.extend((1..HOST_IMPORT_WINDOW_BUDGET).map(|i| (i + 10, epoch, 0)));
-        let pools = pool_with_windows(&stamps, epoch);
-        assert!(
-            pools
-                .plan_host_import_eviction(HOST_IMPORT_WINDOW_CAP * 2)
-                .is_empty(),
-            "an uncoverable shortfall must release nothing at all"
-        );
-        // The same pool DOES release its one cold window for a fitting request.
-        assert_eq!(
-            pools.plan_host_import_eviction(HOST_IMPORT_WINDOW_CAP),
-            vec![0]
         );
     }
 
@@ -1384,17 +1282,15 @@ mod host_import_budget_tests {
             Err(HostImportDecline::TotalBytes),
             "the budget must still be a ceiling once every window is resident"
         );
-        // Eviction must not turn an over-subscribed working set into a silent
-        // degrade: with every window pinned there is nothing to release, and the
-        // resolve path falls through to this same typed, latched decline.
+        // A full budget declines rather than shuffling: the resolve path admits
+        // only when admission is free, so this typed, latched decline is what an
+        // over-subscribed working set produces, and the caller serves the span
+        // from the CPU byte path.
         let epoch = 4;
         let stamps: Vec<(u64, u64, u64)> = (0..HOST_IMPORT_WINDOW_BUDGET)
             .map(|i| (i + 1, epoch, 0))
             .collect();
         let pools = pool_with_windows(&stamps, epoch);
-        assert!(pools
-            .plan_host_import_eviction(HOST_IMPORT_WINDOW_CAP)
-            .is_empty());
         assert_eq!(
             host_import_budget(
                 pools.host_imports.len(),
