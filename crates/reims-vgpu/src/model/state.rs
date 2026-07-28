@@ -2977,6 +2977,22 @@ impl DeviceState {
     }
 
     pub fn reset(&mut self) {
+        // A translation hold that is still standing here never resolved. The
+        // hold itself is control flow — the FIFO is parked until an AIR module
+        // finishes loading and the packet is retried, not consumed — so it is
+        // census. THIS is the failure: the device went away with guest packets
+        // still parked behind a load that never completed, and those packets are
+        // lost. Reading it at the lifetime boundary needs no age, depth or
+        // timeout; the guest's own teardown is the deadline.
+        if self.translation_order_hold_mask != 0 || self.translation_deferred_mask != 0 {
+            crate::observe::fail(format!(
+                "translation_hold_unreleased held_mask={:#x} producer_mask={:#x} episodes={} \
+                 (device reset with guest packets still parked behind an AIR load)",
+                self.translation_order_hold_mask,
+                self.translation_deferred_mask,
+                self.translation_order_holds
+            ));
+        }
         let id = self.id;
         let page_shift = self.page_shift;
         // Keep the interrupt-status Arcs wired to the registry slot: the

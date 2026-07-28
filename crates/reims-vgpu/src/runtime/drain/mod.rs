@@ -34,7 +34,14 @@ fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
     if starts_episode {
         state.translation_order_holds = state.translation_order_holds.saturating_add(1);
     }
-    crate::observe::fail(format!(
+    // Census, not a failure: this is a resolver saying "not ready yet". The FIFO
+    // is parked until the AIR module loads and `release_translation_order_holds`
+    // takes the mask back down — and its release line was already `off`, so
+    // logging the wait half as a failure made one control-flow pair straddle both
+    // channels. Boot 87: 34 episodes started, 35 released, i.e. every one. A hold
+    // that never releases is caught at `DeviceState::reset` instead, where the
+    // guest's own teardown is the deadline and no age or depth has to be invented.
+    crate::observe::off(format!(
         "translation_order_hold reason=air_loading held_mask={:#x} new_mask={new_mask:#x} producer_mask={:#x} count={}",
         state.translation_order_hold_mask,
         state.translation_deferred_mask,
@@ -2392,7 +2399,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 if result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
                         state.translation_deferred_mask |= channel_bit;
-                        crate::observe::fail(format!(
+                        // Census for the same reason as `translation_order_hold`:
+                        // the packet is NOT consumed (`Deferred` leaves it at the
+                        // FIFO head to be retried), and the matching
+                        // `exec_translation_ready` below is already `off`. Boot 87:
+                        // 55 deferrals, 56 readies.
+                        crate::observe::off(format!(
                             "exec_translation_deferred reason=air_loading ch={channel_id} task={} pending_mask={:#x}",
                             result.task_id, state.translation_deferred_mask
                         ));

@@ -3706,6 +3706,72 @@ fn the_backing_gate_answers_the_same_whichever_resident_the_mid_resolves_to() {
     );
 }
 
+/// An AIR-load hold is control flow; a hold that outlives the device is the
+/// failure. The two must not share a channel.
+///
+/// `observe::off` prefixes `OFF `, `observe::fail` does not, and the failure
+/// channel is the one place a bad boot explains itself. `translation_order_hold`
+/// and `exec_translation_deferred` park a FIFO until an AIR module finishes
+/// loading — the packet is retried, not consumed — and both of their resolution
+/// lines (`translation_order_release`, `exec_translation_ready`) were already
+/// census. Logging only the wait half as a failure put one control-flow pair
+/// across both channels, and cost 126 of boot 87's 300 failure lines, 42 %.
+///
+/// The real loss needs no age, depth or timeout to detect: at reset, a mask still
+/// standing means guest packets are parked behind a load that never finished.
+#[test]
+fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+    // The wait: census only, nothing on the failure channel.
+    {
+        let cap = crate::observe::FailCapture::start();
+        super::note_translation_order_hold(&mut state, 0b101);
+        let lines = cap.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("OFF translation_order_hold")),
+            "the hold must still be logged, on the census channel: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("translation_order_hold")),
+            "a resolver saying `not ready yet` is not a failure: {lines:?}"
+        );
+    }
+
+    // Released while the device is still alive: nothing failed.
+    {
+        let cap = crate::observe::FailCapture::start();
+        super::release_translation_order_holds(&mut state);
+        assert_eq!(state.translation_order_hold_mask, 0);
+        state.reset();
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.starts_with("translation_hold_unreleased")),
+            "a hold that released before teardown is not a loss: {:?}",
+            cap.lines()
+        );
+    }
+
+    // A hold still standing at reset IS a loss, and it says so on the failure
+    // channel carrying the masks it read.
+    {
+        let mut stuck = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        super::note_translation_order_hold(&mut stuck, 0b110);
+        stuck.translation_deferred_mask = 0b10;
+        let cap = crate::observe::FailCapture::start();
+        stuck.reset();
+        let line = cap.one("translation_hold_unreleased");
+        assert!(
+            line.contains("held_mask=0x6") && line.contains("producer_mask=0x2"),
+            "the failure must carry what it read: {line}"
+        );
+        assert_eq!(stuck.translation_order_hold_mask, 0, "reset still resets");
+    }
+}
+
 /// The display-transaction probe must key on the payload *shape*, not fire per
 /// present.
 ///
