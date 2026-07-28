@@ -1540,18 +1540,13 @@ pub fn note_compositor_edge(
         return false;
     }
 
-    state.note_compositor_output(
-        source_mapping,
-        output_mapping,
-        width,
-        height,
-        output_generation,
-    );
+    state.note_compositor_output(source_mapping, output_mapping, width, height);
     // Per-present-per-source re-assertion of an already-discovered edge (~2.8k/
     // 25s under a continuously-animating app — the single largest present-path
     // flood). The always-on compositor-graph signal is the deduplicated
-    // `compositor_member_grant` (new member) + `compositor_member_refresh` (pin
-    // move); gate this per-present edge trace behind REIMS_VGPU_DRAW_LOG.
+    // `compositor_member_grant` (new member) + `compositor_member_refresh`
+    // (writeback moved to another member); gate this per-present edge trace
+    // behind REIMS_VGPU_DRAW_LOG.
     crate::observe::line(format!(
         "compositor_edge source_mid={source_mapping} output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
     ));
@@ -1579,11 +1574,7 @@ pub fn note_linear_compositor_output(
         return false;
     };
 
-    state.present.compositor_output_mapping = output_mapping;
-    state.present.compositor_output_source = 0;
-    state.present.compositor_output_generation = output_generation;
-    state.present.compositor_output_width = width;
-    state.present.compositor_output_height = height;
+    state.present.last_compositor_output_member = output_mapping;
     state.present.compositor_output_members.insert(
         output_mapping,
         crate::model::CompositorOutputMember {
@@ -1665,22 +1656,15 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             // here so a later writeback into the same mid refreshes the gen.
             state.present.early_front_mapping = mapping_id;
             state.present.early_front_generation = gen;
-            // Proven compositor-output member: move the graph output pin to the
-            // buffer the guest just finished writing. Steady-state WindowServer
-            // composite passes are damage passes (partial quads) that never
-            // re-fire the full-coverage edge, so without this the pin freezes on
-            // whichever buffer got the last boot-time full paint and ClearOnly
-            // presents show only half the double-buffered frames (lag + captures
-            // of a buffer mid-redraw). Membership itself is only granted by a
-            // decoded full-coverage/sampled edge — unproven writers still cannot
-            // steal the pin (serial-223416 follow oscillation stays fixed).
-            if let Some(prev) =
-                state.refresh_compositor_output_member(mapping_id, width, height, gen)
-            {
-                // Always-on a/b-follow rail: fires only when the pin MOVES to a
-                // different proven member (the graph followed the guest's buffer
-                // swap), not on every store — the load-bearing signal for the a/b
-                // divergence class the user tracks. Locked always-on by
+            // Name the proven compositor-output member the guest just finished
+            // writing. Membership is granted only by a decoded full-coverage /
+            // sampled edge or a full-frame publish, so an unproven full-frame
+            // writer at the same geometry is not counted as an alternation.
+            if let Some(prev) = state.refresh_compositor_output_member(mapping_id, width, height) {
+                // Always-on a/b-follow rail: fires only when the writeback moves
+                // to a DIFFERENT proven member (the guest swapped its double
+                // buffer), not on every store — the load-bearing signal for the
+                // a/b divergence class the user tracks. Locked always-on by
                 // `composite_writeback_on_member_refollows_graph_output`.
                 crate::observe::off(format!(
                     "compositor_member_refresh output_mid={mapping_id} prev_mid={prev} {width}x{height} gen={gen} (Composite store on proven member; graph follows guest buffer alternation)"
@@ -1984,11 +1968,9 @@ mod tests {
         }
         let pipeline_ref = std::process::id();
         assert!(note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
-        assert_eq!(state.present.compositor_output_source, 5);
-        assert_eq!(state.present.compositor_output_mapping, 6);
-        assert_eq!(state.present.compositor_output_generation, 6);
-        assert_eq!(state.present.compositor_output_width, 64);
-        assert_eq!(state.present.compositor_output_height, 48);
+        assert!(state.is_compositor_output_member(6));
+        assert!(!state.is_compositor_output_member(5));
+        assert_eq!(state.present.last_compositor_output_member, 6);
         // The per-present `compositor_edge` line is REIMS_VGPU_DRAW_LOG-gated diagnostic
         // (2026-07-19); the always-on graph signal is `compositor_member_grant`/
         // `compositor_member_refresh` (asserted in `member_refresh_...`). This
@@ -2010,9 +1992,11 @@ mod tests {
             48,
             pipeline_ref
         ));
-        assert!(state.unmap_surface(5));
-        assert_eq!(state.present.compositor_output_mapping, 0);
-        assert_eq!(state.present.compositor_output_source, 0);
+        // Unmapping the output drops membership and the last-named member, so a
+        // recycled id starts from a clean comparison.
+        assert!(state.unmap_surface(6));
+        assert!(!state.is_compositor_output_member(6));
+        assert_eq!(state.present.last_compositor_output_member, 0);
     }
 
     #[test]
@@ -2034,9 +2018,8 @@ mod tests {
             48,
             pipeline_ref
         ));
-        assert_eq!(state.present.compositor_output_source, 0);
-        assert_eq!(state.present.compositor_output_mapping, 6);
-        assert_eq!(state.present.compositor_output_generation, 9);
+        assert!(state.is_compositor_output_member(6));
+        assert_eq!(state.present.last_compositor_output_member, 6);
         // `compositor_edge` is REIMS_VGPU_DRAW_LOG-gated diagnostic (2026-07-19); this
         // test owns the linear-source graph-state recording + geometry gating.
         assert!(!note_linear_compositor_output(
@@ -2050,8 +2033,9 @@ mod tests {
 
     /// Steady-state WindowServer composite passes are damage passes that never
     /// re-fire the full-coverage edge. A Composite writeback into a *proven*
-    /// compositor-output member must re-pin the graph output to that member
-    /// (guest double-buffer alternation); unproven writers must not move it.
+    /// compositor-output member must name that member (guest double-buffer
+    /// alternation) and report the move on the always-on
+    /// `compositor_member_refresh` line; unproven writers must not name one.
     #[test]
     fn composite_writeback_on_member_refollows_graph_output() {
         use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -2080,50 +2064,49 @@ mod tests {
         // full-coverage draw edge, mid 5 by a full-frame publish (ok_runs
         // store) — snapshot boots may never fire a coverage edge for one half.
         assert!(note_linear_compositor_output(&mut state, 1, w, h, 11));
-        assert_eq!(state.present.compositor_output_mapping, 1);
+        assert_eq!(state.present.last_compositor_output_member, 1);
         state.note_compositor_member_published(5, w, h);
         assert!(state.is_compositor_output_member(5));
         assert_eq!(
-            state.present.compositor_output_mapping, 1,
-            "publish grants membership but must not move the pin by itself"
+            state.present.last_compositor_output_member, 1,
+            "publish grants membership but must not name the member by itself"
         );
-        // First Composite writeback on published member 5 takes the pin.
+        // First Composite writeback on published member 5 names it.
         state.note_surface_composite(5);
         state.mappings.get_mut(&5).unwrap().content_generation = 2;
         note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 5);
+        assert_eq!(state.present.last_compositor_output_member, 5);
 
-        // Damage-pass Composite writeback on member 1 → pin follows to 1.
+        // Damage-pass Composite writeback on member 1 → naming follows to 1.
         state.note_surface_composite(1);
         state.mappings.get_mut(&1).unwrap().content_generation = 2;
         note_front_buffer_writeback(&mut state, &mut host, 1, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 1);
-        assert_eq!(state.present.compositor_output_generation, 2);
+        assert_eq!(state.present.last_compositor_output_member, 1);
 
         // Alternate back to member 5.
         state.note_surface_composite(5);
         state.mappings.get_mut(&5).unwrap().content_generation = 3;
         note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 5);
+        assert_eq!(state.present.last_compositor_output_member, 5);
 
-        // Unproven Composite writer 7 must not steal the pin (early_front only).
+        // Unproven Composite writer 7 is not a member (early_front only).
         state.note_surface_composite(7);
         state.mappings.get_mut(&7).unwrap().content_generation = 4;
         note_front_buffer_writeback(&mut state, &mut host, 7, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 5);
+        assert_eq!(state.present.last_compositor_output_member, 5);
         assert_eq!(state.present.early_front_mapping, 7);
 
-        // Unmap drops membership and the pin.
+        // Unmap drops membership and the last-named member.
         assert!(state.unmap_surface(5));
         assert!(!state.is_compositor_output_member(5));
-        assert_eq!(state.present.compositor_output_mapping, 0);
+        assert_eq!(state.present.last_compositor_output_member, 0);
 
         let body = std::fs::read_to_string(crate::observe::fail_log_path())
             .expect("reims-vgpu-fail.log readable");
         assert!(
             body.lines().any(|line| line
                 .starts_with("OFF compositor_member_refresh output_mid=1 prev_mid=5 64x48 gen=2")),
-            "member refresh pin move must be always-on visible"
+            "member refresh must be always-on visible when the writeback moves"
         );
         assert!(
             body.lines().any(|line| line

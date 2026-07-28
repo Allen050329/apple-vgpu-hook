@@ -165,7 +165,7 @@ fn cpu_portability_store_publishes_composite_and_refollows_output() {
     state.present.width = width;
     state.present.height = height;
     state.present.frame_flush_seen = true;
-    state.note_compositor_output(9, 1, width, height, 1);
+    state.note_compositor_output(9, 1, width, height);
 
     publish_cpu_portability_store(
         &mut state,
@@ -178,8 +178,7 @@ fn cpu_portability_store_publishes_composite_and_refollows_output() {
 
     assert_eq!(state.surface_write_kind(mid), SurfaceWriteKind::Composite);
     assert!(state.is_compositor_output_member(mid));
-    assert_eq!(state.present.compositor_output_mapping, mid);
-    assert_eq!(state.present.compositor_output_generation, 2);
+    assert_eq!(state.present.last_compositor_output_member, mid);
 }
 
 #[test]

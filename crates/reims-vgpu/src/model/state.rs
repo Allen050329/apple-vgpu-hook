@@ -962,28 +962,29 @@ pub struct PresentState {
     /// the peer there is what makes that split visible in a boot log.
     pub early_front_mapping: u32,
     pub early_front_generation: u32,
-    /// Latest successful full-geometry compositor edge `source -> output`.
+    /// Mapping id of the compositor-output member most recently named by the
+    /// present-side graph: either by a decoded full-geometry edge
+    /// ([`DeviceState::note_compositor_output`],
+    /// [`crate::runtime::scanout::note_linear_compositor_output`]) or by a
+    /// Composite full-frame writeback landing on an already-proven member
+    /// ([`DeviceState::refresh_compositor_output_member`]).
     ///
-    /// A non-self type-11 sample, or a same-geometry type-2/3 linear sample,
-    /// establishes that `compositor_output_mapping` is downstream of a decoded
-    /// texture input.  `compositor_output_source == 0` names the linear-input
-    /// case (linear textures do not have a surface mapping id).  ClearOnly
-    /// DisplaySwap uses this protocol/resource relationship to distinguish a
-    /// completed compositor output from unrelated full-frame writers; pixel
-    /// occupancy is never consulted.
-    pub compositor_output_mapping: u32,
-    pub compositor_output_source: u32,
-    pub compositor_output_generation: u32,
-    pub compositor_output_width: u32,
-    pub compositor_output_height: u32,
+    /// This is change-detection memory and nothing else: the single read
+    /// compares the incoming member against it so the always-on
+    /// `compositor_member_refresh` line fires exactly when the writeback moves
+    /// to a different member, which is the guest's double-buffer alternation.
+    /// No present source, resident or capture decision consults it. Cleared on
+    /// unmap so a recycled mapping id is never compared against its
+    /// predecessor's writeback.
+    pub last_compositor_output_member: u32,
     /// Mappings proven compositor outputs by a decoded edge (full-coverage
     /// linear sample or non-self type-11 sample), keyed by mapping id with the
     /// geometry/source recorded at proof time.  Steady-state WindowServer
     /// composite passes are damage passes (partial quads) that never re-prove
     /// full coverage, so membership is sticky: a later Composite-class
-    /// writeback into a member at the proven geometry refreshes
-    /// `compositor_output_mapping` to that member, following the guest's
-    /// double-buffer alternation.  Removed on unmap.
+    /// writeback into a member at the proven geometry names that member in
+    /// `last_compositor_output_member`, following the guest's double-buffer
+    /// alternation.  Removed on unmap.
     pub compositor_output_members: BTreeMap<u32, CompositorOutputMember>,
     /// Present/scanout evidence: mapping → latest geometry it was displayed
     /// at (a `capture_present_frame` action or a retained-frame re-show).
@@ -2350,14 +2351,14 @@ impl DeviceState {
             .insert(mapping_id, SurfaceWriteKind::Composite);
     }
 
-    /// Record the latest successful non-self full-geometry type-11 edge.
+    /// Grant compositor-output membership from a decoded non-self full-geometry
+    /// type-11 edge, and name that member as the latest one seen.
     pub fn note_compositor_output(
         &mut self,
         source_mapping: u32,
         output_mapping: u32,
         width: u32,
         height: u32,
-        generation: u32,
     ) {
         if source_mapping == 0
             || output_mapping == 0
@@ -2367,11 +2368,7 @@ impl DeviceState {
         {
             return;
         }
-        self.present.compositor_output_mapping = output_mapping;
-        self.present.compositor_output_source = source_mapping;
-        self.present.compositor_output_generation = generation;
-        self.present.compositor_output_width = width;
-        self.present.compositor_output_height = height;
+        self.present.last_compositor_output_member = output_mapping;
         self.present.compositor_output_members.insert(
             output_mapping,
             CompositorOutputMember {
@@ -2387,8 +2384,8 @@ impl DeviceState {
     /// compositor-output membership at that geometry. Unlike the one-shot
     /// full-coverage draw edges, this fires on every steady-state composite
     /// pass, so both halves of a guest double buffer qualify on any boot.
-    /// Does not move the output pin itself — only Composite writebacks on a
-    /// member do (see [`Self::refresh_compositor_output_member`]).
+    /// Grants membership only; naming the latest member is a Composite
+    /// writeback's job (see [`Self::refresh_compositor_output_member`]).
     pub fn note_compositor_member_published(&mut self, mapping_id: u32, width: u32, height: u32) {
         if mapping_id == 0 || width == 0 || height == 0 {
             return;
@@ -2432,31 +2429,30 @@ impl DeviceState {
     }
 
     /// A Composite-class writeback landed on a proven compositor-output member
-    /// at its proven geometry: move the graph output pin to that member so
-    /// ClearOnly presents follow the guest's buffer alternation (damage passes
-    /// never re-prove full coverage). Returns `Some(previous_output_mapping)`
-    /// when the pin moved to a different mapping, `None` when only refreshed
-    /// in place or not a matching member.
+    /// at its proven geometry: name that member as the latest one written.
+    /// Returns `Some(previous_member)` when it differs from the member named
+    /// before — the guest alternated its double buffer — and `None` when the
+    /// same member is written again or `mapping_id` is not a member at this
+    /// geometry.
     pub fn refresh_compositor_output_member(
         &mut self,
         mapping_id: u32,
         width: u32,
         height: u32,
-        generation: u32,
     ) -> Option<u32> {
         if mapping_id == 0 || width == 0 || height == 0 {
             return None;
         }
-        let member = *self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != width || member.height != height {
+        let at_proven_geom = self
+            .present
+            .compositor_output_members
+            .get(&mapping_id)
+            .is_some_and(|member| member.width == width && member.height == height);
+        if !at_proven_geom {
             return None;
         }
-        let prev = self.present.compositor_output_mapping;
-        self.present.compositor_output_mapping = mapping_id;
-        self.present.compositor_output_source = member.source;
-        self.present.compositor_output_generation = generation;
-        self.present.compositor_output_width = width;
-        self.present.compositor_output_height = height;
+        let prev = self.present.last_compositor_output_member;
+        self.present.last_compositor_output_member = mapping_id;
         (prev != mapping_id).then_some(prev)
     }
 
@@ -2779,14 +2775,11 @@ impl DeviceState {
         // own ready resident — the "background/window content doesn't clear
         // cleanly" residue class.
         self.presented_needs_guest_seed.remove(&mapping_id);
-        if self.present.compositor_output_mapping == mapping_id
-            || self.present.compositor_output_source == mapping_id
-        {
-            self.present.compositor_output_mapping = 0;
-            self.present.compositor_output_source = 0;
-            self.present.compositor_output_generation = 0;
-            self.present.compositor_output_width = 0;
-            self.present.compositor_output_height = 0;
+        // Same rule for the last-named member: a recycled mapping id must not
+        // have its first Composite writeback compared against a predecessor's,
+        // which would silence the `compositor_member_refresh` line for it.
+        if self.present.last_compositor_output_member == mapping_id {
+            self.present.last_compositor_output_member = 0;
         }
     }
 

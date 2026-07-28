@@ -285,6 +285,35 @@ mechanism you already knew about. Guard against it by splitting the line so the 
 subset has its own counter — then "it never fired" and "it could never fire" are different readings,
 and a zero denominator says which. A single fused count cannot.
 
+**Instrument the branch, not the arm.** The cheapest version of that split costs nothing and is
+almost always skipped: a probe placed *inside* a conditional cannot tell "the condition was false"
+from "the outcome never occurred", so its zero is unreadable no matter how carefully the rest of it
+was designed. The first line on any suspect path should therefore report **which way the path went**,
+before anything reports what happened along it.
+
+That was paid for here, twice, in opposite directions. A six-way resolver on the present path had
+three terminal log lines, all silent for many boots, and "absence of a log is weak evidence" was the
+correct reading — a branch can be entered and leave through a path that logs nothing. The line that
+settled it was `present_route`: two lines per process, naming the branch itself, and 104 boots of
+`route=named` with not one `route=clear_only` proved ~300 lines of resolver had never executed. Then
+the lesson was immediately un-learned: a careful census was built *inside* that same branch, with a
+split denominator and a test pinning its identity rule, and it reported nothing — because its branch
+does not run. Grepping the always-on sink for the lines already emitted on that path would have cost
+one command and saved the commit.
+
+So before adding a probe, grep the sink for what the path already emits, and if nothing there names
+the branch, make that the probe. Prefer a line whose *dedup key is the branch taken* — it is bounded
+at one line per outcome per process, which is what makes it safe to leave on forever, and it keeps
+answering for every boot after the question that prompted it is closed.
+
+**Deleting a consumer makes its producer's waste audible — listen on the next boot.** When a mechanism
+comes out, the state that fed it usually does not, and it starts reporting. Here, removing the
+resolver left the present↔store pairing queue with nothing draining it: `present_store_fifo_drop` had
+zero occurrences across 141 boots and fired 1750 times on the first boot after, saying in its own
+always-on text that entries were ageing out unpaired. That is not a regression to fix, it is the next
+deletion announcing itself. Boot once after any deletion and diff the always-on line census against
+the boot before — the new lines are the work list, and the ones that vanish are the confirmation.
+
 ### Fit The Wrong Output Before Naming A Wrong Mechanism
 
 Once known values have been through the path, you hold measured/nominal pairs. **Fit them to a
