@@ -962,39 +962,24 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         timing.log(
             "contig", mapping_id, width, height, map_us, dma_us, post_us, 1, 0, 0, false,
         );
-        // Same reasoning as the multi-run tail below: the import windows are a
-        // cache, and running out of them is not a reason to drop the render.
-        //
-        // A packed-contig surface needs exactly one window, so this path looks
-        // immune to a budget bound. It is not — the budget is global, so a
-        // single-run surface is refused whenever the *other* surfaces have
-        // already spent it. Covering only the fragmented path left exactly one
-        // loss standing on a live boot, and it was this one: `path=contig
-        // mid=216 43x24 runs=1`, a 43x24 window asking for its single import
-        // against a fully-spent 8 GiB budget.
-        if let ImportPresentResult::Fail(reason) = r {
-            if is_import_window_shortage(reason) {
-                crate::observe::fail(format!(
-                    "import_window_cpu_writeback mid={mapping_id} {width}x{height} \
-                     runs=1 reason={reason} (host-import budget exhausted; \
-                     writing the render back on the CPU instead of dropping it)"
-                ));
-                return try_import_present_cpu_unstable(
-                    state,
-                    host,
-                    identity,
-                    mapping_id,
-                    width,
-                    height,
-                    base_off,
-                    bpr,
-                    guest_before_center,
-                    from_device,
-                    timing,
-                );
-            }
-        }
-        return r;
+        // A packed-contig surface needs exactly one window, which looks immune to
+        // a budget bound and is not: the budget is global, so one run is refused
+        // once the other surfaces have spent it.
+        return cpu_writeback_on_window_shortage(
+            r,
+            1,
+            state,
+            host,
+            identity,
+            mapping_id,
+            width,
+            height,
+            base_off,
+            bpr,
+            guest_before_center,
+            from_device,
+            timing,
+        );
     }
 
     // --- Path 2: fragmented multi-run zero-copy (no staging) ---
@@ -1532,53 +1517,97 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
         0,
         false,
     );
-    // The host-import windows are a **cache**, and a cache running out is not a
-    // reason to lose the guest's work.
-    //
-    // Whether a writeback can go through host-pointer DMA is asked once, far
-    // above here, as `host.map_pages_stable()` — a property of the *host*. That
-    // is the right question for a capability, and the wrong one for this: the
-    // scatter resolves every run of the surface before its DMA and is
-    // all-or-nothing, so what actually decides is how many import windows *this*
-    // surface needs against how many are free *now*. A live x86 boot measured a
-    // working set of ten 1 GiB buckets against a budget of eight, thrashing
-    // `creates=1771 evictions=1763` with victims at `age_ms=0`, and dropped
-    // seven full renders as `deferred_flush_lost reason=host_import_total_byte_cap`
-    // while the CPU writeback below sat correct and unreachable behind the
-    // capability gate.
-    //
-    // So a shortage of our own windows re-routes to that path. A capability or
-    // structural refusal must NOT: the CPU path would fail those too, and the
-    // loss has to stay visible rather than being retried into a second failure.
-    //
-    // This demotes the import budget from a correctness bound to a performance
-    // one, which is what a cache budget is supposed to be. Raising the budget
-    // instead cannot work in principle — a surface straddling more buckets than
-    // the budget fails at every setting.
-    if let ImportPresentResult::Fail(reason) = result {
-        if is_import_window_shortage(reason) {
-            crate::observe::fail(format!(
-                "import_window_cpu_writeback mid={mapping_id} {width}x{height} \
-                 runs={} reason={reason} (host-import budget exhausted; \
-                 writing the render back on the CPU instead of dropping it)",
-                host_runs.len()
-            ));
-            return try_import_present_cpu_unstable(
-                state,
-                host,
-                identity,
-                mapping_id,
-                width,
-                height,
-                base_off,
-                bpr,
-                guest_before_center,
-                from_device,
-                timing,
-            );
-        }
+    cpu_writeback_on_window_shortage(
+        result,
+        host_runs.len(),
+        state,
+        host,
+        identity,
+        mapping_id,
+        width,
+        height,
+        base_off,
+        bpr,
+        guest_before_center,
+        from_device,
+        timing,
+    )
+}
+
+/// Re-route a host-import **window shortage** to the CPU writeback, or return
+/// `result` untouched.
+///
+/// The host-import windows are a **cache**, and a cache running out is not a
+/// reason to lose the guest's work.
+///
+/// Whether a writeback can go through host-pointer DMA is asked once, far above
+/// the import, as `host.map_pages_stable()` — a property of the *host*. That is
+/// the right question for a capability and the wrong one here: the scatter
+/// resolves every run of the surface before its DMA and is all-or-nothing, so
+/// what actually decides is how many import windows *this* surface needs against
+/// how many are free *now*. A live x86 boot measured a working set of ten 1 GiB
+/// buckets against a budget of eight, thrashing `creates=1771 evictions=1763`
+/// with victims at `age_ms=0`, and dropped seven full renders as
+/// `deferred_flush_lost reason=host_import_total_byte_cap` while
+/// [`try_import_present_cpu_unstable`] sat correct and unreachable behind the
+/// capability gate.
+///
+/// A capability or structural refusal must NOT re-route: the CPU path would fail
+/// those too, and the loss has to stay visible rather than being retried into a
+/// second failure. [`is_import_window_shortage`] draws that line.
+///
+/// This demotes the import budget from a correctness bound to a performance one,
+/// which is what a cache budget is supposed to be. Raising the budget instead
+/// cannot work in principle — a surface straddling more buckets than the budget
+/// fails at every setting.
+///
+/// Both import paths end here rather than each testing the result themselves.
+/// The contig path was added second and stayed a drop for one commit, which is
+/// what a duplicated decision costs: `runs` is the only thing the two sites
+/// disagree about, so it is a parameter and the decision is not.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forwards the import operation's mapping, surface, and row geometry unchanged"
+)]
+fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
+    result: ImportPresentResult,
+    runs: usize,
+    state: &mut DeviceState,
+    host: &mut H,
+    identity: &TargetIdentity,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    base_off: u64,
+    bpr: u32,
+    guest_before_center: Option<Vec<u8>>,
+    from_device: bool,
+    timing: ImportTiming,
+) -> ImportPresentResult {
+    let ImportPresentResult::Fail(reason) = result else {
+        return result;
+    };
+    if !is_import_window_shortage(reason) {
+        return result;
     }
-    result
+    crate::observe::fail(format!(
+        "import_window_cpu_writeback mid={mapping_id} {width}x{height} \
+         runs={runs} reason={reason} (host-import budget exhausted; \
+         writing the render back on the CPU instead of dropping it)"
+    ));
+    try_import_present_cpu_unstable(
+        state,
+        host,
+        identity,
+        mapping_id,
+        width,
+        height,
+        base_off,
+        bpr,
+        guest_before_center,
+        from_device,
+        timing,
+    )
 }
 
 /// True when an import refusal was a shortage of **our own** host-import
@@ -2721,6 +2750,88 @@ mod tests {
                 height: 1080,
                 generation: 0
             }
+        );
+    }
+
+    /// The predicate test above says which reasons *ought* to re-route. This
+    /// says the routing actually happens, which is a separate claim: the contig
+    /// path shipped with the predicate already correct and still dropped its
+    /// renders, because it never asked.
+    ///
+    /// Observable without an engine. A shortage leaves the import path for
+    /// [`try_import_present_cpu_unstable`], which cannot succeed in a unit test —
+    /// but it fails at `read_target` with a *different* reason, so "the returned
+    /// reason is no longer the byte cap" is exactly the assertion that the
+    /// re-route was taken. A hard refusal must come back byte-identical.
+    #[test]
+    fn a_window_shortage_leaves_the_import_path_and_a_hard_refusal_does_not() {
+        use crate::backend::vulkan::engine::HostImportDecline;
+        use crate::observe::Decline as _;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::default();
+        // Distinct from every other mid in this module: the fail log is a single
+        // shared file and the assertion below greps it.
+        let mid = 23063u32;
+        let id = TargetIdentity::Surface {
+            id: mid,
+            width: 2,
+            height: 2,
+            generation: 0,
+        };
+        // The fail log appends across boots *and* across test runs, so a line
+        // this test wrote on an earlier run would satisfy the assertion below
+        // with the routing deleted. Read only what this run appends.
+        let log_path = crate::observe::fail_log_path();
+        let mark = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0) as usize;
+
+        let mut route = |result| {
+            cpu_writeback_on_window_shortage(
+                result,
+                1,
+                &mut state,
+                &mut host,
+                &id,
+                mid,
+                2,
+                2,
+                0,
+                8,
+                None,
+                false,
+                ImportTiming::new(),
+            )
+        };
+
+        // Not a failure at all: passes through untouched.
+        assert_eq!(route(ImportPresentResult::Ok), ImportPresentResult::Ok);
+
+        // A capability refusal the CPU path would hit too: the loss stays named.
+        let hard = HostImportDecline::ExtensionAbsent.slug();
+        assert_eq!(
+            route(ImportPresentResult::Fail(hard)),
+            ImportPresentResult::Fail(hard),
+            "a refusal a retry cannot fix must be returned unchanged, not retried"
+        );
+
+        // Our own budget: must leave this path rather than be returned as a drop.
+        let cap = HostImportDecline::TotalBytes.slug();
+        assert_ne!(
+            route(ImportPresentResult::Fail(cap)),
+            ImportPresentResult::Fail(cap),
+            "a shortage of our own windows must re-route to the CPU writeback"
+        );
+
+        let whole = std::fs::read_to_string(log_path).expect("fail log");
+        let appended = &whole[mark.min(whole.len())..];
+        let line = |reason: &str| format!("import_window_cpu_writeback mid={mid} 2x2 runs=1 reason={reason}");
+        assert!(
+            appended.contains(&line(cap)),
+            "the re-route must name itself and the check that refused"
+        );
+        assert!(
+            !appended.contains(&line(hard)),
+            "a hard refusal must not be logged as a re-route"
         );
     }
 
