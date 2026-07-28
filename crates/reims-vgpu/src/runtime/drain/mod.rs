@@ -400,23 +400,24 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         return false;
     }
     let raw_task = ld32(&payload[0..]);
-    let task_id = resolve_task_word(&state.tasks, TaskWordSite::ComputeInfo, raw_task);
     let pipeline_ref = ld32(&payload[4..]);
     let max_key = ld32(&payload[8..]);
     let count = ld32(&payload[12..]);
     let reply_gva = u64::from_le_bytes(payload[16..24].try_into().unwrap_or([0; 8]));
     if reply_gva == 0 || count == 0 {
         crate::observe::fail(format!(
-            "get_compute_info empty task={task_id} pipe={pipeline_ref} max_key={max_key} count={count} gva={reply_gva:#x}"
+            "get_compute_info empty task={raw_task} pipe={pipeline_ref} max_key={max_key} count={count} gva={reply_gva:#x}"
         ));
         return false;
     }
-    if (task_id as usize) >= state.tasks.len() || !state.tasks[task_id as usize].active {
+    // A live slot or nothing; `bad_task` now names the word the guest sent
+    // rather than the halved id this used to have resolved to by then.
+    let Some(task_id) = resolve_task_word(&state.tasks, TaskWordSite::ComputeInfo, raw_task) else {
         crate::observe::fail(format!(
-            "get_compute_info bad_task task={task_id} pipe={pipeline_ref}"
+            "get_compute_info bad_task task={raw_task} pipe={pipeline_ref}"
         ));
         return false;
-    }
+    };
     let mut wrote = 0u32;
     for &(key, value) in COMPUTE_INFO_CAPS {
         if key > max_key {
@@ -479,15 +480,17 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             return false;
         }
     };
-    let task_id = resolve_task_word(&state.tasks, TaskWordSite::HeapTextureQuery, request.task_id);
-    if (task_id as usize) >= state.tasks.len() || !state.tasks[task_id as usize].active {
+    // A live slot or nothing. `resolved_task` is gone with the arm that made the
+    // two differ: the only slot this can act on is the one the guest named.
+    let Some(task_id) =
+        resolve_task_word(&state.tasks, TaskWordSite::HeapTextureQuery, request.task_id)
+    else {
         Emit::decline("heap_texture_query", &QueryError::BadTask)
             .field("task", request.task_id)
-            .field("resolved_task", task_id)
             .field("gva", format!("{:#x}", request.reply_gva))
             .fail();
         return false;
-    }
+    };
     let requirement = match crate::runtime::heap_query::query_size_and_align(&request.descriptor) {
         Ok(requirement) => requirement,
         Err(error) => {

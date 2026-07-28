@@ -12,27 +12,32 @@
 //! taken at one site said nothing about the other two. They are one function
 //! here, and that function carries the census.
 //!
-//! # The question this measures
+//! # Which space each word is in, and how that is decided
 //!
 //! `DefineTask2` (`0x38`) registers a task under `raw >> 1`
 //! ([`crate::model::DEFINE_TASK_ID_SHIFT`]); every other opcode measured so far
 //! reads its task word **unshifted**. Nothing decodes the word canonically, so
-//! for each opcode the open question is which space its word is in.
+//! for each opcode the open question is which space its word is in, and the way
+//! to settle it is to read the *set* of words that opcode actually receives.
 //!
-//! `MapMemory2`'s word was settled by reading the *set* of words it files spans
-//! under: it contains odd values, and a doubled space `2n` cannot produce an odd
-//! value, so `MapMemory2` already names slots. The same one-sided argument works
-//! here, which is why the census latches on the **raw word** and not on the
-//! outcome. A site whose words are all even and all twice a live slot is
-//! plausibly in the doubled space and its raw-first arm is then wrong every
-//! time; a site with a single odd word is naming slots directly and raw-first is
-//! right. The reading can come out either way, which is what makes it worth
-//! taking.
+//! The `DefineTask2` wire space, enumerated over a full x86/Vulkan boot for
+//! slots 0–12, is `0x1, 0x2, 0x4, 0x6, 0x8, 0xa … 0x18`: one odd value — `0x1`,
+//! for slot 0 — and then strictly even. So the argument has to be "odd **and
+//! greater than one**", not merely "odd"; the doubled space does produce exactly
+//! one odd word and a looser reading of the same numbers would have proved the
+//! opposite of what they say.
+//!
+//! `exec_indirect2` receives `0x5`, `0x7` and `0x9`, which that space does not
+//! contain, so its word is a slot id. `MapMemory2` files spans under `0x5`,
+//! `0x7`, `0x9` for the same reason. The two decodes agree, and both are slot
+//! ids, so halving either one names a **different task**.
 //!
 //! Slots run densely from 0, so for almost any word `n` the slot `n >> 1` is
-//! *also* live and raw-first wins by position rather than by evidence. Counting
-//! how often the fallback arm *ran* cannot see that — it is a property of
-//! `tasks[]` at the instant of the decode, so it is read from the table.
+//! *also* live and a raw-first resolver wins by position rather than by
+//! evidence. Counting how often a fallback arm *ran* cannot see that — it is a
+//! property of `tasks[]` at the instant of the decode, so it is read from the
+//! table, and the four-arm partition below is what makes both readings legible
+//! at once.
 
 use crate::model::{TaskEntry, DEFINE_TASK_ID_SHIFT};
 
@@ -91,17 +96,37 @@ fn slot_live(tasks: &[TaskEntry], id: u32) -> bool {
     (id as usize) < tasks.len() && tasks[id as usize].active
 }
 
-/// Resolve the wire task word to the slot this crate will act on.
+/// Resolve the wire task word to the slot this crate will act on. **The word,
+/// or nothing.**
 ///
-/// **Behaviour is unchanged from the three copies this replaces**: the raw word
-/// wins when it names a live slot, otherwise `raw >> 1` is returned whether or
-/// not it is live. Callers re-check liveness and refuse — that check is theirs
-/// because each has its own typed refusal to emit.
+/// This used to fall back to `raw >> 1` when the word named no live slot. That
+/// arm was censused over two x86/Vulkan boots and **decided zero times** at both
+/// sites the guest exercised, while `Direct` also never fired — so every decode
+/// on those boots was ambiguous and the raw-first arm won by position on all of
+/// them, never on evidence.
+///
+/// Both readings point the same way. Dead, it costs nothing to remove. Live, it
+/// could not have failed safely: slots run densely from 0, so `raw >> 1` is
+/// almost always some *other* live task, and this returned that task's slot
+/// rather than refusing. `CmdExecIndirect2` then runs a whole command stream —
+/// including guest writes — against page tables the named task does not own.
+///
+/// The word set the guest actually sent says the fallback is wrong on the
+/// contract too, not merely unexercised: `exec_indirect2` received `0x5`, `0x7`
+/// and `0x9`, which the `DefineTask2` wire space (`0x1`, then strictly even) does
+/// not contain, so the word is a slot id and halving it names a different task.
+///
+/// Returning `None` is what makes that case visible: each caller turns it into
+/// its own always-on refusal rather than a plausible wrong answer nothing sees.
 ///
 /// The latch is taken before the line is built. `Emit::field` renders eagerly
 /// and this sits on the command path, so building and dropping the strings on
 /// every decode would make the probe cost scale with the traffic it measures.
-pub(crate) fn resolve_task_word(tasks: &[TaskEntry], site: TaskWordSite, raw: u32) -> u32 {
+pub(crate) fn resolve_task_word(
+    tasks: &[TaskEntry],
+    site: TaskWordSite,
+    raw: u32,
+) -> Option<u32> {
     use crate::observe::Decline;
     let shifted = raw >> DEFINE_TASK_ID_SHIFT;
     let raw_live = slot_live(tasks, raw);
@@ -120,11 +145,7 @@ pub(crate) fn resolve_task_word(tasks: &[TaskEntry], site: TaskWordSite, raw: u3
             .field("shifted", shifted)
             .fail();
     }
-    if raw_live {
-        raw
-    } else {
-        shifted
-    }
+    raw_live.then_some(raw)
 }
 
 #[cfg(test)]
@@ -166,7 +187,7 @@ mod tests {
         let tasks = table(&[5]);
         assert_eq!(
             resolve_task_word(&tasks, TaskWordSite::ExecIndirect2, 5),
-            5
+            Some(5)
         );
     }
 
@@ -178,31 +199,27 @@ mod tests {
         let tasks = table(&[3, 6]);
         assert_eq!(
             resolve_task_word(&tasks, TaskWordSite::ExecIndirect2, 6),
-            6
+            Some(6)
         );
     }
 
-    /// Slot 6 dead, slot 3 live: the fallback arm is the only one with an
-    /// answer, and it is what the three replaced copies returned.
+    /// Slot 6 dead, slot 3 live — the case the deleted fallback was for. It
+    /// answered `3`, which is a **different task** whose page tables the guest
+    /// never named. Refusing is the only answer the decoded word supports.
     #[test]
-    fn a_word_naming_no_live_slot_falls_back_to_the_shifted_one() {
+    fn a_word_naming_no_live_slot_refuses_rather_than_naming_its_neighbour() {
         let tasks = table(&[3]);
-        assert_eq!(
-            resolve_task_word(&tasks, TaskWordSite::ComputeInfo, 6),
-            3
-        );
+        assert_eq!(resolve_task_word(&tasks, TaskWordSite::ComputeInfo, 6), None);
     }
 
-    /// Neither slot live: the resolver still returns the shifted id, unchanged
-    /// from the copies it replaces, and every caller re-checks and refuses.
+    /// Neither slot live: still nothing, and the caller emits its own refusal.
     #[test]
-    fn a_word_naming_nothing_live_returns_the_shifted_id_for_the_caller_to_refuse() {
+    fn a_word_naming_nothing_live_refuses() {
         let tasks = table(&[]);
         assert_eq!(
             resolve_task_word(&tasks, TaskWordSite::HeapTextureQuery, 6),
-            3
+            None
         );
-        assert!(!slot_live(&tasks, 3));
     }
 
     /// Word 0 shifts to itself, so there is no second candidate and the decode
@@ -212,7 +229,7 @@ mod tests {
         let tasks = table(&[0]);
         assert_eq!(
             resolve_task_word(&tasks, TaskWordSite::ExecIndirect2, 0),
-            0
+            Some(0)
         );
     }
 

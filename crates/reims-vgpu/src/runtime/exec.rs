@@ -215,11 +215,21 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
     let raw_task = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
-    let task_id = resolve_task_word(&state.tasks, TaskWordSite::ExecIndirect2, raw_task);
-    out.task_id = task_id;
-    if (task_id as usize) >= state.tasks.len() || !state.tasks[task_id as usize].active {
+    // The resolver guarantees a live slot or nothing, so there is no second
+    // liveness check here. The refusal is always-on: an exec packet the crate
+    // drops is a whole command stream of guest work lost, and it used to leave
+    // no line at all.
+    let Some(task_id) = resolve_task_word(&state.tasks, TaskWordSite::ExecIndirect2, raw_task)
+    else {
+        out.task_id = raw_task;
+        crate::observe::fail(format!(
+            "exec_indirect2 no_such_task task={raw_task} tasks={} plen={}",
+            state.tasks.len(),
+            payload.len()
+        ));
         return out;
-    }
+    };
+    out.task_id = task_id;
 
     let resource_count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
     let cmdbuf_count = ld32(&payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..]);
@@ -2204,6 +2214,42 @@ mod tests {
         let mut host = FakeHost::new();
         let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
         assert_eq!(r.streams_loaded, 0);
+    }
+
+    /// An exec packet naming a slot that is not live must be refused under the
+    /// word the guest sent, not silently re-aimed at slot `word >> 1`.
+    ///
+    /// Slot 3 is live and slot 6 is not, so word `6` names a dead slot whose
+    /// halved form is live — the exact ambiguity the two boots that justified
+    /// this deletion measured on every single exec decode. The old fallback
+    /// answered `3` here, and `3` is a different task: everything the packet
+    /// goes on to do, including its guest writes, would run against page tables
+    /// the guest never named for this work.
+    ///
+    /// `task_id` is the separator because it is what the crate acts as and what
+    /// `exec_summary` reports. Asserting only "no streams loaded" would pass
+    /// either way — with no page tables mapped nothing loads regardless, which
+    /// is a probe that cannot distinguish the cases.
+    #[test]
+    fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+        assert!(state.tasks[3].active);
+        assert!(!state.tasks[6].active, "slot 6 must be dead for this to bite");
+
+        let mut payload = vec![0u8; CHILD_EXEC_INDIRECT_HEADER_LEN as usize];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+
+        let r = process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(
+            r.task_id, 6,
+            "the refusal must name the word the guest sent, not the slot we \
+             would have substituted"
+        );
+        assert_eq!(r.streams_loaded, 0);
+        assert!(!r.saw_draw);
     }
 
     /// One segment header whose declared length runs `overshoot` bytes past the
