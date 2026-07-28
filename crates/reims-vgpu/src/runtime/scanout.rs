@@ -1659,11 +1659,10 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             && width == state.present.width
             && height == state.present.height
         {
-            // Track latest Composite full-FB writeback for ClearOnly bootstrap
-            // (when +0x188 empty) and pre-boundary early feed. Post-retain peer
-            // selection is sticky on frame_mapping — early_front must not drive
-            // hop (serial-223416 follow oscillation). Always update here so
-            // retain writebacks can refresh gen when early_front==retain.
+            // Track the latest Composite full-FB writeback. Pre-boundary this
+            // feeds `early_scanout_target`; post-boundary it is the peer named
+            // on the `front_wb` / `present_order_hold` lines. Always update
+            // here so a later writeback into the same mid refreshes the gen.
             state.present.early_front_mapping = mapping_id;
             state.present.early_front_generation = gen;
             // Proven compositor-output member: move the graph output pin to the
@@ -1687,16 +1686,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
                     "compositor_member_refresh output_mid={mapping_id} prev_mid={prev} {width}x{height} gen={gen} (Composite store on proven member; graph follows guest buffer alternation)"
                 ));
             }
-            // Present↔store FIFO pairing: queue this finished member so the
-            // next ClearOnly present pairs with it in ring order (the guest
-            // pipelines store B, store A, present, present — capturing only
-            // the newest member drops B's frame every cycle).
-            if state.note_member_store(mapping_id, width, height, gen) {
-                crate::observe::line(format!(
-                    "present_store_enqueue mid={mapping_id} {width}x{height} gen={gen} depth={}",
-                    state.present_store_fifo.len()
-                ));
-            }
         }
         // Offline: only log when writeback mid ≠ present (dual-mid gap class).
         if mapping_id != state.present.present_mapping
@@ -1706,7 +1695,7 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             && height >= 720
         {
             crate::observe::line(format!(
-                "front_wb SKIP post_boundary mid={mapping_id} {width}x{height} present_mapping={} frame_mapping={} early_peer={} (content mid ≠ present mid — ClearOnly present may capture peer)",
+                "front_wb SKIP post_boundary mid={mapping_id} {width}x{height} present_mapping={} frame_mapping={} early_peer={} (full-frame writeback landed on a surface none of the present slots name)",
                 state.present.present_mapping,
                 state.present.frame_mapping,
                 state.present.early_front_mapping

@@ -1342,36 +1342,25 @@ fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32)
 /// Which of the two present routes a present took, once per distinct route per
 /// process.
 ///
-/// `present_named_mapping` splits on the named surface's write history: a
-/// surface we have only ever seen CLEAR stores into takes a six-way resolver
-/// (page alias, store FIFO, resource graph, retain, early front, plus a
-/// substitution) to pick *some other* surface to show, because the named one is
-/// believed to hold nothing. Everything else captures the surface the guest
-/// named.
-///
-/// That resolver is the largest remaining pile of decision points on this path,
-/// and its terminal log lines (`present_defer_boundary`, `present_owner_graph`,
-/// `stale_present_substitute`) have not appeared in any recent boot. Absence of
-/// a log is weak evidence — a branch can be entered and leave through a path
-/// that logs nothing — so this names the branch itself. Two lines per process at
-/// most, which is what makes it safe to leave on.
-///
-/// If only `route=named` ever appears on this pathway, the ClearOnly resolver is
-/// dead code here and can be deleted or fenced behind a loud decline. If
-/// `route=clear_only` appears, it is load-bearing and the next question is which
-/// of its six candidate sources actually wins.
+/// Every present captures the surface the transaction names. This line splits
+/// them on the named surface's write history anyway: `route=clear_only` is a
+/// present whose named mid's most recent write was a `display_clear`/CLEAR
+/// Store rather than a draw — the guest asking us to show a surface it has only
+/// ever cleared. `route=named` is everything else. The split is the standing
+/// measurement of whether that case occurs at all on a given rail; two lines per
+/// process at most, which is what makes it safe to leave on.
 ///
 /// **Measured: only `route=named write_kind=Composite`, on 104 x86/Vulkan boots
 /// — every boot in the failure log since this line landed.** Not one
 /// `route=clear_only`, including a 1766 s session driven through the
 /// heavy-Safari residue repro. The dedup is per process, so one line per boot is
-/// the whole reading for that boot: no present it served took the resolver.
+/// the whole reading for that boot.
 ///
 /// That is an x86 statement only. `note_surface_clear` marks a mid ClearOnly
 /// from a decoded `display_clear`/CLEAR Store, which is not rail-specific — what
 /// the measurement shows is that on x86 the guest never *presents* a mid whose
-/// most recent write was a Clear. An arm64 reading of this same line is the
-/// thing that would say whether the resolver is dead everywhere.
+/// most recent write was a Clear. An arm64 reading of this same line is what
+/// would say whether that holds everywhere.
 fn note_present_route(write_kind: crate::model::SurfaceWriteKind, is_clear_only: bool) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<bool>>> = Mutex::new(None);

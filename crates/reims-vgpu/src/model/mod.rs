@@ -18,7 +18,7 @@ pub use state::{
     PendingWork,
     PresentState, PresentedGeom, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
     TaskMapSpan, TrancheStats, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER, PRESENT_STORE_FIFO_CAP,
+    FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;

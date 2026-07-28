@@ -956,9 +956,10 @@ pub struct PresentState {
     /// Latest type-11 **Composite** writeback mid (logo/desktop content).
     /// Pre-boundary: sticky early feed for gfx_update when present_mapping is a
     /// ClearOnly flip buffer (dual-mid buffer-setup thrash class).
-    /// Post-boundary: dual-mid *peer* tracker — x86 present often names ClearOnly
-    /// mid 2/3 while Stores land on Composite mid 1/4/5; ClearOnly present
-    /// captures this peer into +0x188 (not the black clear mid).
+    /// Post-boundary: dual-mid *peer* tracker, read only by the failure/census
+    /// lines (`front_wb`, `present_order_hold`) — x86 present often names
+    /// ClearOnly mid 2/3 while Stores land on Composite mid 1/4/5, and naming
+    /// the peer there is what makes that split visible in a boot log.
     pub early_front_mapping: u32,
     pub early_front_generation: u32,
     /// Latest successful full-geometry compositor edge `source -> output`.
@@ -2018,16 +2019,6 @@ pub struct DeviceState {
     /// ClearOnly dual-mid peer-select uses to find the latest-finished
     /// compositor member.
     pub store_seq: u64,
-    /// FIFO of proven compositor-output members that received a Composite
-    /// full-FB writeback and are not yet matched to a present. The guest
-    /// pipelines its double buffer in ring order (store B, store A, present,
-    /// present), so each ClearOnly present pairs with the OLDEST unconsumed
-    /// member store. Capturing the newest member for every present drops the
-    /// other member's frame each cycle and displays a member against the
-    /// wrong present slot (dual-mid residue class). Entries are
-    /// (mapping_id, content_generation at enqueue); bounded by
-    /// [`PRESENT_STORE_FIFO_CAP`] (oldest dropped).
-    pub present_store_fifo: std::collections::VecDeque<(u32, u32)>,
     /// Per-tranche draw-timing breakdown (diagnostic). See [`TrancheStats`].
     pub tranche: TrancheStats,
     /// Aggregated ExecIndirect2 packet telemetry (diagnostic). See [`ExecAggStats`].
@@ -2080,11 +2071,6 @@ pub struct DeviceState {
     /// method that also moves the refcount here.
     deferred_page_refs: std::collections::HashMap<u64, u32>,
 }
-
-/// Bound for [`DeviceState::present_store_fifo`]: the guest pipelines at most
-/// a few frames ahead (double/triple buffer); a deeper backlog means presents
-/// stopped consuming (present-style switch) and old entries are stale.
-pub const PRESENT_STORE_FIFO_CAP: usize = 8;
 
 /// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
 pub const FENCE_DOMAIN_EVENT: u8 = 1;
@@ -2173,7 +2159,6 @@ impl DeviceState {
             type11_memo_scratch: Vec::new(),
             presented_needs_guest_seed: std::collections::BTreeSet::new(),
             store_seq: 0,
-            present_store_fifo: std::collections::VecDeque::new(),
             gva_host_views: Vec::new(),
             tranche: TrancheStats::default(),
             exec_agg: ExecAggStats::default(),
@@ -2494,9 +2479,8 @@ impl DeviceState {
     /// *which* surface to present: the transaction names plane 0's surface id
     /// and that is the only correct capture source.
     ///
-    /// Its readers are the present census and the ClearOnly torn-capture
-    /// substitution in the drain (`stale_present_substitute`), which is measured
-    /// dead on the x86 PCI pathway and unmeasurable on arm64. Nothing on the
+    /// Its only reader is the present census (`dense_retention_gap` in
+    /// [`crate::runtime::census::present_proxy`]). Nothing on the
     /// guest-named present path reads it: the a/b peer seed used to, and was
     /// deleted once resident unification was shown to make it a copy onto
     /// itself for every target the guest actually displays.
@@ -2734,52 +2718,6 @@ impl DeviceState {
         } else {
             Err(OutputGroupMiss::NoPeer)
         }
-    }
-
-    /// Queue a proven member's Composite full-FB writeback for present↔store
-    /// FIFO pairing (see [`DeviceState::present_store_fifo`]). Consecutive
-    /// writebacks into the same member coalesce (multi-pass stores of one
-    /// frame must not shift the pairing); the queue drops its oldest entry
-    /// past [`PRESENT_STORE_FIFO_CAP`], and says so on the failure channel —
-    /// that entry is a composited frame no present ever paired with. Returns
-    /// false when `mapping_id` is not a member at this geometry (nothing
-    /// queued).
-    pub fn note_member_store(
-        &mut self,
-        mapping_id: u32,
-        width: u32,
-        height: u32,
-        generation: u32,
-    ) -> bool {
-        let Some(member) = self.present.compositor_output_members.get(&mapping_id) else {
-            return false;
-        };
-        if member.width != width || member.height != height {
-            return false;
-        }
-        if let Some(back) = self.present_store_fifo.back_mut() {
-            if back.0 == mapping_id {
-                back.1 = generation;
-                return true;
-            }
-        }
-        if self.present_store_fifo.len() >= PRESENT_STORE_FIFO_CAP {
-            // The dropped entry is a member store that no present ever paired
-            // with — a frame the guest composited and we never showed. The cap
-            // is a depth *assumption* ("the guest pipelines at most a few frames
-            // ahead"), so a drop is either that assumption failing or presents
-            // having genuinely stopped consuming, and both are losses. Silence
-            // here would leave the assumption permanently unfalsifiable.
-            if let Some((lost_mid, lost_gen)) = self.present_store_fifo.pop_front() {
-                crate::observe::fail(format!(
-                    "present_store_fifo_drop lost_mid={lost_mid} lost_gen={lost_gen} \
-                     queued_mid={mapping_id} {width}x{height} cap={PRESENT_STORE_FIFO_CAP} \
-                     (a member store aged out unpaired; no present consumed it)"
-                ));
-            }
-        }
-        self.present_store_fifo.push_back((mapping_id, generation));
-        true
     }
 
     /// Record that `mapping_id` is being presented and report whether a

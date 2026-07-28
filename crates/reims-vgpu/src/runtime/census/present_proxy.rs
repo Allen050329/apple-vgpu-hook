@@ -218,14 +218,13 @@ struct ThrashState {
     /// reported, so a sustained gap fires once per newly-widened episode, never
     /// per present. Pruned lazily (bounded by the live member set).
     dense_gap_active: std::collections::BTreeMap<u32, u64>,
-    /// Distinct torn-capture substitutions: a ClearOnly present's selection (via
-    /// store_fifo ring order or a graph fallback) picked a compositor member
-    /// whose full-frame sequence (`dense_frame_seq`) lagged a same-geometry peer
-    /// by [`RETENTION_GAP_MARGIN`]+ full frames — a member that missed a RUN of
+    /// Distinct torn-capture substitutions reported through
+    /// [`note_stale_present_substitute`]: a capture source whose full-frame
+    /// sequence (`dense_frame_seq`) lagged a same-geometry peer by
+    /// [`RETENTION_GAP_MARGIN`]+ full frames — a member that missed a RUN of
     /// full frames (the fullscreen-transition vertical-strip + checkerboard torn
-    /// frame). The present drain substituted the full-frame-
-    /// freshest peer as the capture source; this counts each save. Steady-state
-    /// alternation stays below the margin and never substitutes.
+    /// frame) — was replaced by that peer. Steady-state alternation stays below
+    /// the margin and never substitutes.
     stale_present_substitute: u64,
     /// Dedup for `stale_present_substitute`: selected_mid → the denser peer's
     /// `dense_frame_seq` last reported, so a sustained lag fires once per
