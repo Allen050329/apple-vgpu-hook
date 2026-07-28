@@ -218,16 +218,6 @@ struct ThrashState {
     /// reported, so a sustained gap fires once per newly-widened episode, never
     /// per present. Pruned lazily (bounded by the live member set).
     dense_gap_active: std::collections::BTreeMap<u32, u64>,
-    /// Distinct per-tile damage-coverage divergence episodes. A presented mid
-    /// holds stale tiles a same-geometry
-    /// peer erased — the residue class (stuck menu dropdown, rubber-band trail)
-    /// that whole-frame `dense_retention_gap` cannot see because the seqs match.
-    /// Measure-only in this increment; the cross-mid tile composite is later.
-    tile_divergence: u64,
-    /// Dedup for `tile_divergence`: presented_mid → the divergent tile COUNT last
-    /// reported, so a sustained residue fires once per changed count, never per
-    /// present (the anti-flood the reverted prototype lacked).
-    tile_divergence_active: std::collections::BTreeMap<u32, u32>,
     /// Distinct torn-capture substitutions: a ClearOnly present's selection (via
     /// store_fifo ring order or a graph fallback) picked a compositor member
     /// whose full-frame sequence (`dense_frame_seq`) lagged a same-geometry peer
@@ -410,8 +400,6 @@ impl ThrashState {
             selected_peer_divergence: 0,
             dense_retention_gap: 0,
             dense_gap_active: std::collections::BTreeMap::new(),
-            tile_divergence: 0,
-            tile_divergence_active: std::collections::BTreeMap::new(),
             stale_present_substitute: 0,
             stale_subst_active: std::collections::BTreeMap::new(),
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
@@ -1448,41 +1436,6 @@ pub fn note_dense_retention_gap(
     thrash_line(&format!(
         "dense_retention_gap presented_mid={presented_mid} presented_seq={presented_seq} peer_mid={peer_mid} peer_seq={peer_seq} lag={} {width}x{height}",
         peer_seq - presented_seq
-    ));
-    true
-}
-
-/// Per-tile damage-coverage divergence proxy, measure-only. `tiles` divergent
-/// cells (peer fresher by the retention
-/// margin) with the divergent-tile grid bbox `[gx0,gy0,gx1,gy1]` on a
-/// `TILE_GEN_GRID_W×TILE_GEN_GRID_H` grid. Emits ONCE per changed divergent count
-/// for a presented mid (deduped, never per present), so a sustained residue is
-/// one line and a healthy/steady frame is silent. `tiles==0` clears the dedup so
-/// the next episode re-fires. Cheap: the caller already did the generation
-/// compare; this only logs. Returns true when a new/widened episode was logged.
-pub fn note_tile_divergence(
-    presented_mid: u32,
-    peer_mid: u32,
-    tiles: u32,
-    bbox: [u32; 4],
-    width: u32,
-    height: u32,
-) -> bool {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if tiles == 0 {
-        // Residue cleared: drop the dedup so a fresh episode re-fires.
-        st.tile_divergence_active.remove(&presented_mid);
-        return false;
-    }
-    if st.tile_divergence_active.get(&presented_mid) == Some(&tiles) {
-        return false;
-    }
-    st.tile_divergence_active.insert(presented_mid, tiles);
-    st.tile_divergence = st.tile_divergence.saturating_add(1);
-    drop(st);
-    thrash_line(&format!(
-        "tile_divergence presented_mid={presented_mid} peer_mid={peer_mid} tiles={tiles} bbox=[{},{},{},{}] {width}x{height}",
-        bbox[0], bbox[1], bbox[2], bbox[3]
     ));
     true
 }
@@ -4695,37 +4648,6 @@ mod tests {
         // A different presented buffer lagging is its own independent episode.
         assert!(note_dense_retention_gap(5, 1, 2, 9, w, h));
         assert_eq!(counters().dense_retention_gap, 3);
-    }
-
-    /// The per-tile residue proxy fires on a new or changed episode, stays quiet
-    /// while the count holds, and re-arms once the residue clears — so a
-    /// sustained residue costs one line rather than one per present, and the next
-    /// episode is still visible.
-    #[test]
-    fn tile_divergence_dedups_per_count_and_rearms_when_it_clears() {
-        let _g = test_lock();
-        reset_for_test();
-        let (w, h) = (1920u32, 1080u32);
-
-        assert!(note_tile_divergence(4, 1, 6, [1, 0, 3, 2], w, h));
-        assert!(
-            !note_tile_divergence(4, 1, 6, [1, 0, 3, 2], w, h),
-            "a stable residue must not re-log every present"
-        );
-        assert!(
-            note_tile_divergence(4, 1, 9, [1, 0, 4, 2], w, h),
-            "a widened residue is a new episode"
-        );
-        assert!(
-            !note_tile_divergence(4, 1, 0, [0; 4], w, h),
-            "clearing the residue only rearms the dedup"
-        );
-        assert!(
-            note_tile_divergence(4, 1, 6, [1, 0, 3, 2], w, h),
-            "the same count after a clear is a fresh episode"
-        );
-        // A different presented buffer keeps its own dedup.
-        assert!(note_tile_divergence(5, 1, 6, [1, 0, 3, 2], w, h));
     }
 
     /// The sample side and the render side of the MRT-mask class had one name

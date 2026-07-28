@@ -928,14 +928,6 @@ pub struct FrameStats {
     pub px0: [u8; 4],
 }
 
-/// Coarse tile grid for the per-mid damage-epoch map ([`PresentState::tile_gen`]).
-/// Deliberately the SAME pitch as the `present_proxy` DAMAGE_GRID (32×18) so one
-/// grid definition governs both damage measurement and cross-mid divergence — a
-/// 1920×1080 target tiles at 60×60 px. Resolution-independent (proportional).
-pub(crate) const TILE_GEN_GRID_W: usize = 32;
-pub(crate) const TILE_GEN_GRID_H: usize = 18;
-pub(crate) const TILE_GEN_TILES: usize = TILE_GEN_GRID_W * TILE_GEN_GRID_H;
-
 /// Present / scanout model state.
 #[derive(Clone, Debug, Default)]
 pub struct PresentState {
@@ -1059,27 +1051,13 @@ pub struct PresentState {
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
-    /// Coarse per-mid per-tile damage-epoch grid.
-    /// `TILE_GEN_GRID_W × TILE_GEN_GRID_H` tiles; each cell holds the
-    /// [`Self::tile_epoch`] at which THIS mid last drew into that tile. Absent
-    /// map entry / cell value 0 = never drawn. Cross-mid comparable because
-    /// every cell is stamped from the single monotonic `tile_epoch` (never the
-    /// per-mid, non-comparable `content_generation`). This is the SPATIAL
-    /// refinement of the whole-frame [`Self::dense_frame_seq`]: a tile the guest
-    /// erased in a peer has a higher epoch there than in a presented mid still
-    /// showing the stale content (the a/b damage-coverage residue). Pruned on
-    /// unmap in [`Self::forget_compositor_mapping`]. Feeds the `tile_divergence`
-    /// proxy, which reports the size of that residue; nothing here selects or
-    /// alters the pixels that get presented.
-    pub tile_gen: BTreeMap<u32, Box<[u64; TILE_GEN_TILES]>>,
-    /// Monotonic frame clock for [`Self::tile_gen`], advanced ONCE PER PRESENT
-    /// cycle (never per draw — a per-draw clock makes an actively-repainted
-    /// video tile look perpetually divergent from a peer 1 draw behind, the
-    /// thrash the reverted pixel-scan prototype hit). So two mids both
-    /// repainting a tile every frame stamp it within ~1 epoch of each other
-    /// (below [`crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN`]), while a
-    /// genuinely stale tile lags many epochs. Never reset except on device reset.
-    pub tile_epoch: u64,
+    /// Monotonic present counter, advanced exactly once per present cycle at the
+    /// present boundary ([`DeviceState::advance_present_epoch`]). Its only
+    /// consumer is the macOS window-publish dedup key, which includes it so that
+    /// every present republishes the frame even when the mapping id and resource
+    /// generation repeat (an in-place update of the same resident). Never reset
+    /// except on device reset.
+    pub present_epoch: u64,
     /// Latest presentFrame retain (PGDisplay +0x188) — most recent DisplaySwap.
     /// Tight packed BGRA8, stride = `frame_width * 4`.
     pub frame_bgra: Vec<u8>,
@@ -2461,95 +2439,11 @@ impl DeviceState {
         self.present.dense_frame_seq.insert(mapping_id, seq);
     }
 
-    /// Advance the per-present tile-epoch clock and return the new value. Call
-    /// EXACTLY ONCE per present cycle (see [`PresentState::tile_epoch`]); draws
-    /// between two presents stamp the value current at draw time.
-    pub fn advance_tile_epoch(&mut self) -> u64 {
-        self.present.tile_epoch = self.present.tile_epoch.saturating_add(1);
-        self.present.tile_epoch
-    }
-
-    /// Stamp every tile a pixel-space damage rect covers on `mid` with the
-    /// current [`PresentState::tile_epoch`]. `rect` = `(x0,y0,x1,y1)` in target
-    /// pixels (half-open); clamped to the `w`×`h` target. No-op on a degenerate
-    /// rect or unknown geometry. Allocates the mid's tile array lazily. O(tiles
-    /// in rect) — a menu strip / tooltip covers a handful; a full-frame store
-    /// covers all [`TILE_GEN_TILES`].
-    pub fn bump_tile_gen(&mut self, mid: u32, rect: (u32, u32, u32, u32), w: u32, h: u32) {
-        if mid == 0 || w == 0 || h == 0 {
-            return;
-        }
-        let (x0, y0, x1, y1) = rect;
-        if x1 <= x0 || y1 <= y0 {
-            return;
-        }
-        let tw = w as usize;
-        let th = h as usize;
-        let x0 = (x0 as usize).min(tw.saturating_sub(1));
-        let y0 = (y0 as usize).min(th.saturating_sub(1));
-        // Half-open [x0,x1): the last covered pixel is x1-1.
-        let xe = (x1 as usize).min(tw).saturating_sub(1);
-        let ye = (y1 as usize).min(th).saturating_sub(1);
-        let gx0 = (x0 * TILE_GEN_GRID_W / tw).min(TILE_GEN_GRID_W - 1);
-        let gx1 = (xe * TILE_GEN_GRID_W / tw).min(TILE_GEN_GRID_W - 1);
-        let gy0 = (y0 * TILE_GEN_GRID_H / th).min(TILE_GEN_GRID_H - 1);
-        let gy1 = (ye * TILE_GEN_GRID_H / th).min(TILE_GEN_GRID_H - 1);
-        let epoch = self.present.tile_epoch;
-        let arr = self
-            .present
-            .tile_gen
-            .entry(mid)
-            .or_insert_with(|| Box::new([0u64; TILE_GEN_TILES]));
-        for gy in gy0..=gy1 {
-            let row = gy * TILE_GEN_GRID_W;
-            for gx in gx0..=gx1 {
-                arr[row + gx] = epoch;
-            }
-        }
-    }
-
-    /// Count the tiles where `peer_mid` is fresher than `presented_mid` by at
-    /// least [`crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN`] epochs — the
-    /// divergent (residue) tiles the guest erased in the peer but our presented
-    /// mid still shows stale. Pure generation compare over [`TILE_GEN_TILES`]
-    /// `u64`s (no pixel scan, no allocation). Returns 0 when either mid has no
-    /// tile map yet (steady-state / bootstrap). Never counts a peer tile the peer
-    /// never drew (epoch 0 ≤ presented) — that is the by-construction guard that a
-    /// damage-only peer can never override the presented mid's good background.
-    /// Returns `(count, [gx0, gy0, gx1, gy1])` — the divergent-tile count and the
-    /// inclusive tile-grid bounding box of the divergent region (all zero when
-    /// count is 0). The bbox lets a proxy confirm the divergence LOCALIZES to the
-    /// visible residue (e.g. the menu strip / a rubber-band trail) rather than
-    /// smearing whole-frame.
-    pub fn divergent_tile_count(&self, presented_mid: u32, peer_mid: u32) -> (u32, [u32; 4]) {
-        if presented_mid == peer_mid {
-            return (0, [0; 4]);
-        }
-        let (Some(pres), Some(peer)) = (
-            self.present.tile_gen.get(&presented_mid),
-            self.present.tile_gen.get(&peer_mid),
-        ) else {
-            return (0, [0; 4]);
-        };
-        let margin = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-        let mut n = 0u32;
-        let (mut gx0, mut gy0, mut gx1, mut gy1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        for i in 0..TILE_GEN_TILES {
-            if peer[i] >= pres[i].saturating_add(margin) {
-                n += 1;
-                let gx = (i % TILE_GEN_GRID_W) as u32;
-                let gy = (i / TILE_GEN_GRID_W) as u32;
-                gx0 = gx0.min(gx);
-                gy0 = gy0.min(gy);
-                gx1 = gx1.max(gx);
-                gy1 = gy1.max(gy);
-            }
-        }
-        if n == 0 {
-            (0, [0; 4])
-        } else {
-            (n, [gx0, gy0, gx1, gy1])
-        }
+    /// Advance the per-present epoch counter and return the new value. Call
+    /// EXACTLY ONCE per present cycle (see [`PresentState::present_epoch`]).
+    pub fn advance_present_epoch(&mut self) -> u64 {
+        self.present.present_epoch = self.present.present_epoch.saturating_add(1);
+        self.present.present_epoch
     }
 
     /// A Composite-class writeback landed on a proven compositor-output member
@@ -2659,62 +2553,6 @@ impl DeviceState {
             .filter_map(|(mid, _)| self.present.dense_frame_seq.get(mid).map(|s| (*mid, *s)))
             .max_by_key(|(_, s)| *s)?;
         (peer_seq > presented_seq).then_some((peer_mid, presented_seq, peer_seq))
-    }
-
-    /// The same-geometry compositor-output peer of `mapping_id` holding the
-    /// freshest full frame (`dense_frame_seq`).
-    ///
-    /// **Measurement only. This must never decide what is presented.** The
-    /// display transaction names plane 0's surface id and that is the capture
-    /// source; a comparison between two of our own bookkeeping counters is not
-    /// evidence that some other buffer is the frame the guest asked for.
-    /// Substituting the "denser" peer shows a buffer one rotation step behind
-    /// what was named — residue when a window closed in between, a stale region
-    /// when one moved, and thrash whenever the ranking oscillates.
-    ///
-    /// What the peer is for is stating the size of that divergence:
-    /// [`Self::tile_divergence_vs_peer`] and [`Self::divergent_tile_count`] read
-    /// it to report how far the presented buffer has drifted from its sibling,
-    /// which is the always-on proxy for the a/b residue class. Unlike
-    /// [`Self::dense_retention_gap`] it does NOT gate on a whole-frame seq lag,
-    /// because tile-level residue is exactly the case where the whole-frame seqs
-    /// match and individual tiles still diverge.
-    pub fn compositor_geometry_peer(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
-        if mapping_id == 0 || w == 0 || h == 0 {
-            return None;
-        }
-        let member = self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != w || member.height != h {
-            return None;
-        }
-        self.present
-            .compositor_output_members
-            .iter()
-            .filter(|(mid, m)| **mid != mapping_id && m.width == w && m.height == h)
-            .map(|(mid, _)| {
-                (
-                    *mid,
-                    self.present.dense_frame_seq.get(mid).copied().unwrap_or(0),
-                )
-            })
-            .max_by_key(|(_, s)| *s)
-            .map(|(mid, _)| mid)
-    }
-
-    /// For a presented `mapping_id`, find its freshest same-geometry peer and
-    /// count the tiles where that peer is fresher by the retention margin — the
-    /// per-tile damage-coverage residue. `Some((peer_mid,
-    /// divergent_count, tile_bbox))` when a peer exists; `None` when there is no
-    /// peer. Pure generation compare, allocation-free.
-    pub fn tile_divergence_vs_peer(
-        &self,
-        mapping_id: u32,
-        w: u32,
-        h: u32,
-    ) -> Option<(u32, u32, [u32; 4])> {
-        let peer = self.compositor_geometry_peer(mapping_id, w, h)?;
-        let (count, bbox) = self.divergent_tile_count(mapping_id, peer);
-        Some((peer, count, bbox))
     }
 
     /// Present/scanout evidence that `mapping_id` was displayed at `w`x`h`
@@ -2988,10 +2826,6 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
-        // Prune the per-mid tile-epoch grid too (mirrors dense_frame_seq): a
-        // recycled mapping id must not inherit a predecessor's tile epochs, or a
-        // logically-unrelated surface would show phantom cross-mid divergence.
-        self.present.tile_gen.remove(&mapping_id);
         // `presented_geoms` is NOT pruned here. It carries the incarnation that
         // presented it, so an unmap (which bumps `map_generation`) invalidates
         // it automatically, while a condemned backing — which keeps the

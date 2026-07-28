@@ -20,8 +20,6 @@ pub use state::{
     TaskMapSpan, TrancheStats, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
     FENCE_DOMAIN_RENDER, PRESENT_STORE_FIFO_CAP,
 };
-#[cfg(test)]
-pub(crate) use state::{TILE_GEN_GRID_H, TILE_GEN_GRID_W};
 
 use crate::backend::Backend;
 use crate::runtime::{self, host::HostOps};

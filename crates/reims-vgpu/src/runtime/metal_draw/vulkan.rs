@@ -5922,53 +5922,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     "m2v_draw_bounds mid={output_mapping} {w}x{h} pipe={} idx={n_idx} b=[{:.1},{:.1},{:.1},{:.1}]",
                     req.pipeline_ref, b[0], b[1], b[2], b[3]
                 ));
-                // Per-mid tile-epoch attribution: stamp the tiles this draw's
-                // damage covers with the
-                // current present epoch, so a peer that later erases a tile shows
-                // a higher epoch there than a presented mid still holding the
-                // stale content. A full-quad draw covers the whole target; a
-                // partial draw is bounded by its pixel-space AABB (NDC values
-                // mapped to pixels, mirroring `draw_full_target_coverage`) and
-                // tightened by the guest scissor.
-                let damage_rect = if full_quad_bounds {
-                    Some((0u32, 0u32, w, h))
-                } else {
-                    // NDC vs pixel: an AABB entirely inside ~[-1.5,1.5] is NDC.
-                    let ndc = b[0] >= -1.5 && b[1] >= -1.5 && b[2] <= 1.5 && b[3] <= 1.5;
-                    let (mut x0, mut y0, mut x1, mut y1) = if ndc {
-                        (
-                            (b[0] + 1.0) * w as f32 * 0.5,
-                            (b[1] + 1.0) * h as f32 * 0.5,
-                            (b[2] + 1.0) * w as f32 * 0.5,
-                            (b[3] + 1.0) * h as f32 * 0.5,
-                        )
-                    } else {
-                        (b[0], b[1], b[2], b[3])
-                    };
-                    x0 = x0.max(0.0);
-                    y0 = y0.max(0.0);
-                    x1 = x1.min(w as f32);
-                    y1 = y1.min(h as f32);
-                    if x1 > x0 && y1 > y0 {
-                        Some((x0 as u32, y0 as u32, x1.ceil() as u32, y1.ceil() as u32))
-                    } else {
-                        None
-                    }
-                };
-                if output_mapping != 0 {
-                    if let Some(mut r) = damage_rect {
-                        if let Some((sx, sy, sw, sh)) = req.scissor {
-                            let ix0 = r.0.max(sx);
-                            let iy0 = r.1.max(sy);
-                            let ix1 = r.2.min(sx.saturating_add(sw));
-                            let iy1 = r.3.min(sy.saturating_add(sh));
-                            if ix1 > ix0 && iy1 > iy0 {
-                                r = (ix0, iy0, ix1, iy1);
-                            }
-                        }
-                        state.bump_tile_gen(output_mapping, r, w, h);
-                    }
-                }
             }
         }
         let t_asm_cov_done = std::time::Instant::now();

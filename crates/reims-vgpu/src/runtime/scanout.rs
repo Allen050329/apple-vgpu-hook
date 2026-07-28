@@ -365,31 +365,6 @@ fn try_capture_from_resident(
     true
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn physical_tile_divergence_vs_peer(
-    state: &crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> Option<(u32, u32, [u32; 4])> {
-    let (peer_mid, tiles, bbox) = state.tile_divergence_vs_peer(mapping_id, width, height)?;
-    let presented_identity =
-        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    let peer_identity =
-        crate::runtime::import_present::surface_identity(state, peer_mid, width, height);
-    (presented_identity != peer_identity).then_some((peer_mid, tiles, bbox))
-}
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn physical_tile_divergence_vs_peer(
-    state: &crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> Option<(u32, u32, [u32; 4])> {
-    state.tile_divergence_vs_peer(mapping_id, width, height)
-}
-
 /// Non-Vulkan backends have no resident registry; capture stays on guest pages.
 #[cfg(not(feature = "backend-vulkan"))]
 fn try_capture_from_resident(
@@ -444,21 +419,7 @@ pub fn capture_present_frame(
              produced this frame went to the other one)"
         ));
     }
-    // Advance the per-present tile-epoch clock, then measure per-tile
-    // damage-coverage divergence against the freshest same-geometry peer.
-    //
-    // Measure-only. Nothing downstream reads these tiles: the capture below and
-    // the direct export both present the surface the display transaction named,
-    // whatever this divergence says. A non-zero count here is therefore a report
-    // of residue reaching the screen, not of residue being corrected.
-    state.advance_tile_epoch();
-    if let Some((peer_mid, tiles, bbox)) =
-        physical_tile_divergence_vs_peer(state, mapping_id, width, height)
-    {
-        crate::runtime::census::present_proxy::note_tile_divergence(
-            mapping_id, peer_mid, tiles, bbox, width, height,
-        );
-    }
+    state.advance_present_epoch();
     // --- Direct-present readback elision (step 2 of the CPU-readback removal) ---
     // When the previous present's window publish carried the frame as a zero-copy
     // dmabuf (route B, `dmabuf_active`), the display reads the GPU resident
@@ -3596,142 +3557,66 @@ mod tests {
         );
     }
 
-    // --- Per-mid tile-generation damage-coverage tracking ----------------------
-
+    /// The display transaction names one surface, and that surface alone is the
+    /// capture source. A second compositor member of identical geometry holding
+    /// different content is not consulted, however fresh it is: the frame that
+    /// comes out is byte-for-byte the named mid's own pixels, and it is the same
+    /// frame the named mid produces when no such peer exists at all.
     #[test]
-    fn tile_gen_divergence_flags_stale_tile_a_peer_erased() {
+    fn capture_reads_only_the_named_surface_never_a_same_geometry_peer() {
+        use crate::runtime::mapping_write::write_bgra8;
+
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        // Two same-geometry compositor members (the a/b double buffer).
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-
-        // Epoch 1: both mids composite the full frame — no divergence.
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        state.bump_tile_gen(5, (0, 0, w, h), w, h);
-        assert_eq!(state.divergent_tile_count(1, 5).0, 0);
-
-        // Stuck-menu case: the peer (mid 5) keeps re-damaging the top menu strip
-        // while the presented mid (1) never re-touches it.
-        let menu = (0u32, 0u32, w, 30u32);
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, menu, w, h);
+        let mut host = FakeHost::new();
+        for (mid, pfn) in [(1u32, 0x40u32), (5u32, 0x41u32)] {
+            let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+            host.map_range(gpa, 0x4000, 0);
+            let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+            assert!(state.map_surface(mid));
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![entry];
+            assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
         }
-        let (count, bbox) = state.divergent_tile_count(1, 5);
-        assert!(count > 0, "peer erased the menu strip; presented is stale");
-        assert_eq!(bbox[1], 0, "divergence localizes to the top row");
-        assert!(bbox[3] <= 1, "localized to the menu strip, not whole-frame");
-        let (peer, c2, _) = state.tile_divergence_vs_peer(1, w, h).unwrap();
-        assert_eq!(peer, 5);
-        assert_eq!(c2, count);
-    }
 
-    #[cfg(feature = "backend-vulkan")]
-    #[test]
-    fn tile_divergence_is_not_physical_after_output_group_unification() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (0, 0, w, 30), w, h);
-        }
+        // The named mid holds grey; the same-geometry peer holds white and is
+        // the fresher of the two by every ordering the model tracks.
+        let grey = [0x55u8; 16];
+        let white = [0xFFu8; 16];
+        assert!(write_bgra8(&mut state, &mut host, 1, &grey, 8, 2, 2));
+        let gen1 = state.mappings.get(&1).unwrap().content_generation;
+        assert!(write_bgra8(&mut state, &mut host, 5, &white, 8, 2, 2));
+
+        // Capture the named mid with no peer published: the baseline frame.
+        assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
+        let alone = state.present.frame_bgra.clone();
+        assert_eq!(&alone[..], &grey[..]);
+
+        // Publish the peer as a same-geometry compositor member and re-capture.
+        state.note_compositor_member_published(1, 2, 2);
+        state.note_compositor_member_published(5, 2, 2);
+        // The arrangement has to be one a peer-reading capture would act on, or
+        // the assertion below passes for the wrong reason: two members of equal
+        // geometry, the peer holding different pixels, and the peer ranking
+        // fresher than the named mid on the write history the model keeps.
+        let peer = state.present.compositor_output_members.get(&5).unwrap();
+        assert_eq!((peer.width, peer.height), (2, 2));
+        assert_ne!(&grey[..], &white[..]);
         assert!(
-            physical_tile_divergence_vs_peer(&state, 1, w, h).is_some(),
-            "distinct Surface residents must expose the bootstrap divergence"
+            state.mappings.get(&5).unwrap().last_store_seq
+                > state.mappings.get(&1).unwrap().last_store_seq,
+            "the peer must be the fresher of the two for this to discriminate"
         );
-
-        state.note_presented_geom(1, w, h);
-        state.note_presented_geom(5, w, h);
-        assert!(
-            physical_tile_divergence_vs_peer(&state, 1, w, h).is_none(),
-            "members resolving to one OutputGroup cannot physically diverge"
+        state.present.frame_bgra.clear();
+        state.present.frame_valid = false;
+        assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
+        assert_eq!(
+            &state.present.frame_bgra[..],
+            &alone[..],
+            "a same-geometry peer must not change the named surface's frame"
         );
-    }
-
-    #[test]
-    fn tile_gen_no_divergence_when_both_mids_repaint_each_frame() {
-        // Video-like: both mids repaint the same rect every present. Their epochs
-        // stay within the retention margin → zero divergence → no thrash. This is
-        // the property (generation-compare, not pixel-compare) that keeps the
-        // steady-state/video path at today's single-blit cost.
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        let video = (100u32, 100u32, 900u32, 700u32);
-        for _ in 0..20 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(1, video, w, h);
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, video, w, h);
-        }
-        assert_eq!(state.divergent_tile_count(1, 5).0, 0);
-        assert_eq!(state.divergent_tile_count(5, 1).0, 0);
-    }
-
-    #[test]
-    fn tile_gen_never_composites_from_a_peer_that_never_drew_the_tile() {
-        // Bootstrap / black-regression guard: the peer only ever damage-drew a
-        // tiny corner; its undrawn tiles are epoch 0 and must NEVER be flagged
-        // divergent, or the later composite would pull black over the presented
-        // mid's good background (the exact failure that killed the prior fix).
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        // Presented mid 1 holds the ONLY full frame.
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        // Peer mid 5 only ever damage-draws one corner tile, many times.
-        for _ in 0..50 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (0, 0, 60, 60), w, h);
-        }
-        let (count, _) = state.divergent_tile_count(1, 5);
-        assert!(count <= 1, "only the corner tile may diverge, got {count}");
-    }
-
-    #[test]
-    fn tile_gen_pruned_on_condemn() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        assert!(state.present.tile_gen.contains_key(&1));
-        state.condemn_surface_backing(1);
-        assert!(
-            !state.present.tile_gen.contains_key(&1),
-            "tile_gen must be pruned on teardown (recycled id must not inherit epochs)"
-        );
-    }
-
-    #[test]
-    fn tile_gen_scissor_and_ndc_map_to_the_same_tiles() {
-        // The bump takes pixel rects; confirm a mid-frame partial rect lands on
-        // the expected interior tiles and not the edges.
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        // Peer re-damages a centered rect only.
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (w / 2 - 60, h / 2 - 60, w / 2 + 60, h / 2 + 60), w, h);
-        }
-        let (count, bbox) = state.divergent_tile_count(1, 5);
-        assert!(count > 0);
-        // Centered → interior tiles, never column 0 or the last column.
-        assert!(bbox[0] > 0 && bbox[2] < (crate::model::TILE_GEN_GRID_W as u32 - 1));
-        assert!(bbox[1] > 0 && bbox[3] < (crate::model::TILE_GEN_GRID_H as u32 - 1));
+        assert_eq!(state.present.frame_mapping, 1);
     }
 
     /// A light capture must leave no frame behind, because everything

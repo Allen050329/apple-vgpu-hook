@@ -133,7 +133,7 @@ type WindowFrameKey = (u32, u32, u64);
 #[cfg(feature = "host-window")]
 fn window_frame_key(present: &crate::model::PresentState) -> WindowFrameKey {
     #[cfg(target_os = "macos")]
-    let present_epoch = present.tile_epoch;
+    let present_epoch = present.present_epoch;
     #[cfg(not(target_os = "macos"))]
     let present_epoch = 0;
     (
@@ -652,14 +652,13 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             p.frame_width,
             p.frame_height,
         );
-        // Route-B present-staleness proxies. Compare the resident we are about
-        // to present (frame_mapping) against the freshest same-geometry
-        // compositor member. A sustained whole-frame seq gap (`routeb_stale`)
-        // means we are presenting a buffer the guest has moved on from — the
-        // "frame rate != rendered" crawl. A per-tile divergence
-        // (`routeb_tile_residue`) is the localized a/b residue. Both are deduped
-        // so a persistent condition logs once, not per present. Measure-only:
-        // the presented surface is the one the display transaction named.
+        // Route-B present-staleness proxy. Compare the resident we are about to
+        // present (frame_mapping) against the freshest same-geometry compositor
+        // member. A sustained whole-frame seq gap (`routeb_stale`) means we are
+        // presenting a buffer the guest has moved on from — the "frame rate !=
+        // rendered" crawl. Deduped, so a persistent condition logs once, not per
+        // present. Measure-only: the presented surface is the one the display
+        // transaction named.
         {
             let fm = p.frame_mapping;
             let fw = p.frame_width;
@@ -681,34 +680,6 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
                 .max_by_key(|&(mid, _, seq)| (seq, mid))
                 .unwrap_or((0, 0, 0));
             let own_seq = state.mappings.get(&fm).map(|m| m.last_store_seq).unwrap_or(0);
-            // Per-tile divergence: the presented buffer (frame_mapping) vs its
-            // same-geometry compositor peer. This is the ACTUAL residue signal
-            // (a tile the peer erased but frame_mapping still shows) — the
-            // seq-gap above is whole-frame and misses it. Nothing masks these
-            // tiles on the way to the screen, so a >0 count here == on-screen
-            // residue.
-            let (div_tiles, div_bbox, tile_peer) = state
-                .compositor_geometry_peer(fm, fw, fh)
-                .map(|peer| {
-                    let (n, bb) = state.divergent_tile_count(fm, peer);
-                    (n, bb, peer)
-                })
-                .unwrap_or((0, [0; 4], 0));
-            if div_tiles > 0 {
-                use std::collections::HashSet;
-                use std::sync::Mutex;
-                static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
-                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                if seen
-                    .get_or_insert_with(HashSet::new)
-                    .insert((fm, tile_peer, div_tiles))
-                {
-                    crate::observe::off(format!(
-                        "routeb_tile_residue frame_mid={fm} peer={tile_peer} div_tiles={div_tiles} bbox=[{},{},{},{}] own_seq={own_seq} own_gen={own_gen}",
-                        div_bbox[0], div_bbox[1], div_bbox[2], div_bbox[3]
-                    ));
-                }
-            }
             if fresh_mid != 0 && fresh_mid != fm && fresh_seq > own_seq {
                 use std::collections::HashSet;
                 use std::sync::Mutex;
@@ -1965,7 +1936,7 @@ mod tests {
         state.present.frame_generation = 11;
         let first = window_frame_key(&state.present);
 
-        state.advance_tile_epoch();
+        state.advance_present_epoch();
         assert_ne!(
             window_frame_key(&state.present),
             first,
