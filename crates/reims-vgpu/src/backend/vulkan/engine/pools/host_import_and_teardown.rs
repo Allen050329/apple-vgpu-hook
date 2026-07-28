@@ -42,6 +42,48 @@ impl ResourcePools {
         first
     }
 
+    /// Record that a resolve asked for `[offset, offset+len)` of the window
+    /// based at `base`. Keyed on the base so the map outlives the region and
+    /// describes the guest's working set rather than the eviction rate.
+    fn mark_host_import_occupancy(&mut self, base: usize, offset: u64, len: u64) {
+        self.host_import_occupancy
+            .entry(base)
+            .or_default()
+            .mark(offset, len);
+    }
+
+    /// Emit how much of each imported window is actually asked for, at the
+    /// window sizes a finer resolver could use.
+    ///
+    /// This is the reading [`HOST_IMPORT_WINDOW_CAP`]'s doc requires before
+    /// either constant moves: `mib` against `windows*1024` is the density, and
+    /// `g<N>` is how many N MiB windows would have had to be resident to carry
+    /// the same traffic — i.e. `g<N> * N` MiB is what that granule would pin.
+    /// Emitted per 64 creates so a thrashing boot reports its progression
+    /// without the line tracking the create rate.
+    fn report_host_import_occupancy(&self) {
+        if !self.host_import_creates.is_multiple_of(64) {
+            return;
+        }
+        let chunks = |granule_mib: usize| -> usize {
+            self.host_import_occupancy
+                .values()
+                .map(|o| o.chunks_touched(granule_mib))
+                .sum()
+        };
+        crate::observe::off(format!(
+            "host_import_density windows={} mib={} g4={} g16={} g64={} g256={} creates={} evictions={}",
+            self.host_import_occupancy.len(),
+            chunks(1),
+            chunks(4),
+            chunks(16),
+            chunks(64),
+            chunks(256),
+            self.host_import_creates,
+            self.host_import_evictions,
+        ));
+    }
+
     pub(crate) unsafe fn host_import_resolve(
         &mut self,
         ctx: &DeviceContext,
@@ -88,7 +130,10 @@ impl ResourcePools {
             r.last_touch = touch;
             r.last_epoch = epoch;
             r.last_touch_ms = now_ms;
-            return Ok((r.buffer, ptr as u64 - r.base as u64));
+            let (base, buffer) = (r.base, r.buffer);
+            let offset = ptr as u64 - base as u64;
+            self.mark_host_import_occupancy(base, offset, len);
+            return Ok((buffer, offset));
         }
         let align = ctx.min_imported_host_pointer_alignment.max(1);
         let mut candidates: Vec<(usize, u64)> = Vec::new();
@@ -190,6 +235,8 @@ impl ResourcePools {
                 last_epoch: self.host_import_epoch,
                 last_touch_ms: self.idle_clock_ms,
             });
+            self.mark_host_import_occupancy(base, ptr as u64 - base as u64, len);
+            self.report_host_import_occupancy();
             let r = self.host_imports.last().unwrap();
             return Ok((r.buffer, ptr as u64 - r.base as u64));
         }

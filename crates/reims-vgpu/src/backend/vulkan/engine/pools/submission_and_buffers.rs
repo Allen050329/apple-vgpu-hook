@@ -55,6 +55,7 @@ impl ResourcePools {
             host_imports: Vec::new(),
             host_import_touch: 0,
             host_import_epoch: 0,
+            host_import_occupancy: std::collections::BTreeMap::new(),
             host_import_creates: 0,
             host_import_evictions: 0,
             host_import_count_cap_logged: false,

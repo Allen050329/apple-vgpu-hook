@@ -48,6 +48,58 @@ pub(super) fn capped_import_window(
     (base as usize, win_end - base)
 }
 
+/// Megabytes per [`WindowOccupancy`] bit. A resolve asks for one page run, so
+/// anything finer measures page geometry rather than window occupancy.
+pub(super) const OCCUPANCY_GRANULE: u64 = 1 << 20;
+
+/// Bits per map: one [`HOST_IMPORT_WINDOW_CAP`] window at [`OCCUPANCY_GRANULE`].
+const OCCUPANCY_BITS: usize = (HOST_IMPORT_WINDOW_CAP / OCCUPANCY_GRANULE) as usize;
+
+/// Which megabytes of an import window a resolve has ever asked for.
+///
+/// The window is 1 GiB but a resolve asks for one page run at a time, so the
+/// share of a window that ever carries DMA decides whether a finer window would
+/// cover the same working set for fewer pinned bytes. That is the question
+/// [`HOST_IMPORT_WINDOW_CAP`]'s doc defers — "a smaller cap **only if** the hot
+/// pages prove sparse within the spread" — and the create/evict census cannot
+/// answer it, because it counts windows and never their occupancy.
+///
+/// Kept per *bucket base*, not per live region, so a re-import continues the
+/// same map: occupancy is a property of what the guest touches, and zeroing it
+/// on eviction would report the thrash rate instead of the working set.
+#[derive(Default)]
+pub(super) struct WindowOccupancy {
+    bits: [u64; OCCUPANCY_BITS / 64],
+}
+
+impl WindowOccupancy {
+    /// Record that `[offset, offset+len)` of the window carries DMA. Offsets at
+    /// or past the map's reach are dropped: a span may extend a window past the
+    /// cap (`capped_import_window` widens for a bucket-crossing span), and the
+    /// tail beyond the cap belongs to the next bucket's map.
+    pub(super) fn mark(&mut self, offset: u64, len: u64) {
+        let first = offset / OCCUPANCY_GRANULE;
+        let last = offset.saturating_add(len.max(1) - 1) / OCCUPANCY_GRANULE;
+        for granule in first..=last.min(OCCUPANCY_BITS as u64 - 1) {
+            let g = granule as usize;
+            self.bits[g / 64] |= 1u64 << (g % 64);
+        }
+    }
+
+    /// How many `granule_mib`-sized chunks of the window hold any marked
+    /// megabyte — i.e. how many windows of that size a finer resolver would
+    /// have had to import to cover the same traffic.
+    pub(super) fn chunks_touched(&self, granule_mib: usize) -> usize {
+        (0..OCCUPANCY_BITS)
+            .step_by(granule_mib)
+            .filter(|&start| {
+                (start..(start + granule_mib).min(OCCUPANCY_BITS))
+                    .any(|g| self.bits[g / 64] & (1u64 << (g % 64)) != 0)
+            })
+            .count()
+    }
+}
+
 /// Bounds of the host mapping containing `ptr`, or `None` if it cannot be
 /// determined.
 ///
@@ -163,6 +215,46 @@ fn vma_bounds_in(maps: &str, ptr: usize) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod window_occupancy_tests {
+    use super::{WindowOccupancy, OCCUPANCY_GRANULE};
+
+    /// The measurement the density line exists to make: a working set of a few
+    /// scattered page runs occupies a handful of megabytes of a 1 GiB window,
+    /// and the coarser counts say how many windows of each size would carry it.
+    #[test]
+    fn scattered_runs_report_their_own_spread_not_the_window() {
+        let mut occ = WindowOccupancy::default();
+        for mib in [0u64, 3, 200, 900] {
+            occ.mark(mib * OCCUPANCY_GRANULE, 16 << 10);
+        }
+        assert_eq!(occ.chunks_touched(1), 4, "four distinct megabytes");
+        assert_eq!(occ.chunks_touched(4), 3, "MiB 0 and 3 share one 4 MiB chunk");
+        assert_eq!(occ.chunks_touched(256), 2, "MiB 0/3/200 share one, 900 alone");
+    }
+
+    /// A run spanning granules marks all of them, and one that would run past
+    /// the window's reach is clipped instead of wrapping into low bits.
+    #[test]
+    fn spans_mark_every_granule_and_clip_at_the_window() {
+        let mut occ = WindowOccupancy::default();
+        occ.mark(0, 4 * OCCUPANCY_GRANULE + 1);
+        assert_eq!(occ.chunks_touched(1), 5);
+        let mut past = WindowOccupancy::default();
+        past.mark(1 << 30, 1 << 20);
+        assert_eq!(past.chunks_touched(1), 0, "past the cap belongs to the next bucket");
+    }
+
+    /// A zero-length resolve still names one granule; the caller refuses it
+    /// upstream, but the map must not underflow computing `offset+len-1`.
+    #[test]
+    fn zero_length_marks_one_granule() {
+        let mut occ = WindowOccupancy::default();
+        occ.mark(0, 0);
+        assert_eq!(occ.chunks_touched(1), 1);
+    }
 }
 
 #[cfg(test)]

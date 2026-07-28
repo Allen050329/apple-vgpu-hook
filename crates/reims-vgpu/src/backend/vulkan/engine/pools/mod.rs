@@ -159,6 +159,10 @@ pub(crate) struct ResourcePools {
     /// "touched since the last submit" needs no begin/end bracketing at the
     /// five `host_import_resolve` call sites.
     host_import_epoch: u64,
+    /// Per-bucket-base occupancy of the windows this pool has imported, kept
+    /// across evict/re-import so it describes the guest's working set rather
+    /// than the thrash rate. Bounded by guest RAM / [`HOST_IMPORT_WINDOW_CAP`].
+    host_import_occupancy: std::collections::BTreeMap<usize, host_import::WindowOccupancy>,
     /// Windowed create/evict census. Equal rates mean the working set does not
     /// fit the budget and the pool is re-importing what it just released.
     host_import_creates: u64,
