@@ -653,11 +653,12 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             p.frame_height,
         );
         // Route-B present-staleness proxy. Compare the resident we are about to
-        // present (frame_mapping) against the freshest same-geometry compositor
-        // member. A sustained whole-frame seq gap (`routeb_stale`) means we are
-        // presenting a buffer the guest has moved on from — the "frame rate !=
-        // rendered" crawl. Deduped, so a persistent condition logs once, not per
-        // present. Measure-only: the presented surface is the one the display
+        // present (frame_mapping) against the freshest surface the guest has
+        // named in a display transaction at the same geometry. A sustained
+        // whole-frame seq gap (`routeb_stale`) means we are presenting a buffer
+        // the guest has moved on from — the "frame rate != rendered" crawl.
+        // Deduped, so a persistent condition logs once, not per present.
+        // Measure-only: the presented surface is the one the display
         // transaction named.
         {
             let fm = p.frame_mapping;
@@ -670,10 +671,11 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
                 .unwrap_or(0);
             let (fresh_mid, fresh_gen, fresh_seq) = state
                 .present
-                .compositor_output_members
-                .iter()
-                .filter(|(_, mem)| mem.width == fw && mem.height == fh)
-                .filter_map(|(&mid, _)| {
+                .presented_geoms
+                .keys()
+                .copied()
+                .filter(|&mid| state.presented_at(mid, fw, fh))
+                .filter_map(|mid| {
                     let m = state.mappings.get(&mid)?;
                     Some((mid, m.content_generation, m.last_store_seq))
                 })

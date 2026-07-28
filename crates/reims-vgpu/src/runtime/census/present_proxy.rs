@@ -178,19 +178,12 @@ pub struct PresentCaptureSample {
     pub from_last_store: bool,
     /// Subsampled mean absolute horizontal edge (luma) — structure thrash proxy.
     pub edge_energy: u32,
-    /// Capture target is a proven compositor-output member (decoded graph
-    /// edge). Member↔member mid switches are guest double-buffer alternation:
-    /// counted separately (`named_sw`) and logged via `mid_switch_named`
-    /// instead of the THRASH `mid_switch` class. nz/structure swings still
-    /// fire on named switches (a sparse member frame is real signal).
-    pub named_peer: bool,
 }
 
 struct ThrashState {
     last: Option<PresentCaptureSample>,
     presents: u64,
     mid_switches: u64,
-    named_switches: u64,
     nz_swings: u64,
     structure_swings: u64,
     sparse: u64,
@@ -206,18 +199,6 @@ struct ThrashState {
     /// so a boot's fail-log shows at a glance whether any real hole occurred.
     damage_hole_bg: u64,
     selected_peer_divergence: u64,
-    /// Distinct a/b inter-buffer retention-gap episodes: a presented compositor
-    /// member whose last full frame lags a same-geometry peer by
-    /// [`RETENTION_GAP_MARGIN`]+ full frames (it received neither a full-frame
-    /// Store nor a seed while the peer advanced). Protocol-structural sibling of
-    /// `selected_peer_divergence` — keyed on the full-frame-Store sequence, not
-    /// nz occupancy, so it cannot be fooled by legitimately-dark content and
-    /// names the structural cause. Measure-only.
-    dense_retention_gap: u64,
-    /// Dedup for `dense_retention_gap`: presented_mid → the peer_seq last
-    /// reported, so a sustained gap fires once per newly-widened episode, never
-    /// per present. Pruned lazily (bounded by the live member set).
-    dense_gap_active: std::collections::BTreeMap<u32, u64>,
     /// Dedup for `secondary_mrt_drop`: (reason_code, width, height) already
     /// reported this boot, so a per-draw MRT-secondary drop fires once per
     /// distinct combo, never per frame. Names which build path silently degraded
@@ -373,7 +354,6 @@ impl ThrashState {
             last: None,
             presents: 0,
             mid_switches: 0,
-            named_switches: 0,
             nz_swings: 0,
             structure_swings: 0,
             sparse: 0,
@@ -385,8 +365,6 @@ impl ThrashState {
             damage_hole: 0,
             damage_hole_bg: 0,
             selected_peer_divergence: 0,
-            dense_retention_gap: 0,
-            dense_gap_active: std::collections::BTreeMap::new(),
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
             secondary_mrt_blend_seen: std::collections::BTreeSet::new(),
             first_dense_seen: false,
@@ -1381,48 +1359,6 @@ pub fn forget_display_store_sample(mapping_id: u32) {
     {
         peers.active = None;
     }
-}
-
-/// A presented compositor member can legitimately lag a same-geometry peer by
-/// ~1 full frame during healthy a/b alternation (the peer got the newest full
-/// frame; this buffer inherits it via the next seed). Only a lag of this many
-/// full frames — the buffer missed BOTH a full-frame Store and the inter-buffer
-/// seed, repeatedly — is the retention-gap regression, not normal alternation.
-pub(crate) const RETENTION_GAP_MARGIN: u64 = 4;
-
-/// Protocol-structural a/b inter-buffer retention-gap guard. `presented_mid` (at
-/// `w`×`h`) holds a full frame `presented_seq` old while a same-geometry
-/// `peer_mid` holds `peer_seq`; fires once per newly-widened episode when the
-/// lag ≥ [`RETENTION_GAP_MARGIN`]. Unlike `selected_peer_divergence` (nz
-/// occupancy) this keys on the full-frame-Store SEQUENCE
-/// ([`crate::model::DeviceState::dense_retention_gap`]), so it names the
-/// structural cause and cannot be fooled by legitimately-dark content.
-/// Measure-only; the caller runs it on the present drain (off the main core).
-pub fn note_dense_retention_gap(
-    presented_mid: u32,
-    peer_mid: u32,
-    presented_seq: u64,
-    peer_seq: u64,
-    width: u32,
-    height: u32,
-) -> bool {
-    if peer_seq < presented_seq.saturating_add(RETENTION_GAP_MARGIN) {
-        return false;
-    }
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    // Dedup: fire once per newly-widened gap for this presented buffer (keyed on
-    // the peer_seq that widened it), never per present while the gap persists.
-    if st.dense_gap_active.get(&presented_mid) == Some(&peer_seq) {
-        return false;
-    }
-    st.dense_gap_active.insert(presented_mid, peer_seq);
-    st.dense_retention_gap = st.dense_retention_gap.saturating_add(1);
-    drop(st);
-    thrash_line(&format!(
-        "dense_retention_gap presented_mid={presented_mid} presented_seq={presented_seq} peer_mid={peer_mid} peer_seq={peer_seq} lag={} {width}x{height}",
-        peer_seq - presented_seq
-    ));
-    true
 }
 
 /// Always-on visibility for a **silently-degraded MRT draw**: a draw whose color
@@ -3017,16 +2953,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
             ));
         }
         if p.mapping_id != sample.mapping_id && p.mapping_id != 0 && sample.mapping_id != 0 {
-            // Both captures on proven compositor-output members: guest
-            // double-buffer alternation (decoded graph provenance), not the
-            // dual-mid thrash class. Counted apart so mid_sw stays a clean
-            // regression signal; content swings below still apply.
-            let named_switch = p.named_peer && sample.named_peer;
-            if named_switch {
-                st.named_switches = st.named_switches.saturating_add(1);
-            } else {
-                st.mid_switches = st.mid_switches.saturating_add(1);
-            }
+            st.mid_switches = st.mid_switches.saturating_add(1);
             if pixels >= MIN_PROXY_PIXELS {
                 // Prefer RGB occupancy so alpha-only black mid2↔mid3 (byte_nz full)
                 // does not hide the dual-mid empty present class.
@@ -3051,7 +2978,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
                         p.from_last_store as u8,
                         sample.from_last_store as u8
                     ));
-                } else if !named_switch {
+                } else {
                     thrash_line(&format!(
                         "mid_switch {}→{} gen {}→{} nz {}→{} rgb_nz {}→{} {}x{}",
                         p.mapping_id,
@@ -3105,11 +3032,10 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
         st.last_summary_ms = now_ms;
         st.last_summary_presents = st.presents;
         thrash_line(&format!(
-            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
+            "summary presents={} present_hz={:.1} mid_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
             st.presents,
             present_hz,
             st.mid_switches,
-            st.named_switches,
             st.nz_swings,
             st.structure_swings,
             st.sparse,
@@ -3121,7 +3047,6 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
             st.damage_hole,
             st.damage_hole_bg,
             st.selected_peer_divergence,
-            st.dense_retention_gap,
             st.first_dense_seen as u8,
             st.post_converge_regress,
             st.stale_online_pending,
@@ -3406,7 +3331,6 @@ pub fn note_capture_fail(mapping_id: u32, width: u32, height: u32, generation: u
 pub struct ThrashCounters {
     pub presents: u64,
     pub mid_switches: u64,
-    pub named_switches: u64,
     pub nz_swings: u64,
     pub structure_swings: u64,
     pub sparse: u64,
@@ -3418,9 +3342,6 @@ pub struct ThrashCounters {
     pub damage_hole: u64,
     pub damage_hole_bg: u64,
     pub selected_peer_divergence: u64,
-    /// Distinct a/b inter-buffer retention-gap episodes (structural sibling of
-    /// `selected_peer_divergence`; see [`note_dense_retention_gap`]).
-    pub dense_retention_gap: u64,
     /// True once a full-size present reached [`CONVERGE_DENSE_FRAC`] occupancy
     /// (the desktop first fully composited this boot).
     pub converged: bool,
@@ -3467,7 +3388,6 @@ pub fn counters() -> ThrashCounters {
     ThrashCounters {
         presents: st.presents,
         mid_switches: st.mid_switches,
-        named_switches: st.named_switches,
         nz_swings: st.nz_swings,
         structure_swings: st.structure_swings,
         sparse: st.sparse,
@@ -3479,7 +3399,6 @@ pub fn counters() -> ThrashCounters {
         damage_hole: st.damage_hole,
         damage_hole_bg: st.damage_hole_bg,
         selected_peer_divergence: st.selected_peer_divergence,
-        dense_retention_gap: st.dense_retention_gap,
         converged: st.first_dense_seen,
         post_converge_regress: st.post_converge_regress,
         stale_online_pending: st.stale_online_pending,
@@ -3795,7 +3714,6 @@ mod tests {
             max_rgb: 255,
             from_last_store: true,
             edge_energy: 10,
-            named_peer: false,
         }
     }
 
@@ -3811,32 +3729,7 @@ mod tests {
             max_rgb: 255,
             from_last_store: true,
             edge_energy: edge,
-            named_peer: false,
         }
-    }
-
-    #[test]
-    fn named_member_switch_is_not_mid_switch_thrash() {
-        let _g = test_lock();
-        reset_for_test();
-        let a = (1440u64 * 1080 * 50 / 100) as usize;
-        let b = (1440u64 * 1080 * 48 / 100) as usize;
-        let named = |mid: u32, px: usize| PresentCaptureSample {
-            named_peer: true,
-            ..sample(mid, px, 1440, 1080)
-        };
-        note_capture_ok(named(1, a));
-        note_capture_ok(named(5, b));
-        note_capture_ok(named(1, a));
-        let c = counters();
-        assert_eq!(
-            c.mid_switches, 0,
-            "member↔member alternation must not count as mid_switch thrash"
-        );
-        assert_eq!(c.named_switches, 2, "named switches counted separately");
-        // A switch to a non-member capture is still the thrash class.
-        note_capture_ok(sample(4, b, 1440, 1080));
-        assert_eq!(counters().mid_switches, 1);
     }
 
     /// `note_stale_online_pending` counts every post-converge stale-ONLINE IRQ but
@@ -3963,26 +3856,6 @@ mod tests {
         }
         assert!(!counters().converged);
         assert_eq!(counters().post_converge_regress, 0);
-    }
-
-    #[test]
-    fn named_member_switch_still_fires_nz_swing() {
-        let _g = test_lock();
-        reset_for_test();
-        let full = (1440u64 * 1080 * 40 / 100) as usize;
-        let logo = (1440u64 * 1080 * 5 / 100) as usize;
-        let named = |mid: u32, px: usize| PresentCaptureSample {
-            named_peer: true,
-            ..sample(mid, px, 1440, 1080)
-        };
-        note_capture_ok(named(1, full));
-        note_capture_ok(named(5, logo));
-        let c = counters();
-        assert_eq!(c.mid_switches, 0);
-        assert_eq!(
-            c.nz_swings, 1,
-            "sparse member frame on alternation is real signal"
-        );
     }
 
     #[test]
@@ -4563,33 +4436,6 @@ mod tests {
         );
         assert!(note_selected_peer_divergence(2, 2, 1920, 1080, 300_000));
         assert_eq!(counters().selected_peer_divergence, 3);
-    }
-
-    #[test]
-    fn dense_retention_gap_fires_above_margin_and_dedups() {
-        let _g = test_lock();
-        reset_for_test();
-        let (w, h) = (1920u32, 1080u32);
-
-        // A 1-frame lag is healthy a/b alternation (below the margin) → quiet.
-        assert!(!note_dense_retention_gap(4, 1, 6, 7, w, h));
-        assert_eq!(counters().dense_retention_gap, 0);
-
-        // Lag == RETENTION_GAP_MARGIN (missed 4 full frames + the seed): fires once.
-        assert!(note_dense_retention_gap(4, 1, 3, 7, w, h));
-        assert_eq!(counters().dense_retention_gap, 1);
-        // Same widened gap (same peer_seq) → deduped, no per-present re-fire.
-        assert!(!note_dense_retention_gap(4, 1, 3, 7, w, h));
-        assert_eq!(counters().dense_retention_gap, 1);
-
-        // A further-widened gap (a newer peer full frame the buffer still missed)
-        // → a new episode fires.
-        assert!(note_dense_retention_gap(4, 1, 3, 9, w, h));
-        assert_eq!(counters().dense_retention_gap, 2);
-
-        // A different presented buffer lagging is its own independent episode.
-        assert!(note_dense_retention_gap(5, 1, 2, 9, w, h));
-        assert_eq!(counters().dense_retention_gap, 3);
     }
 
     /// The sample side and the render side of the MRT-mask class had one name

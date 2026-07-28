@@ -346,7 +346,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             ));
             if pages_ok {
                 if linear_sample {
-                    let _ = crate::runtime::scanout::note_linear_compositor_output(
+                    let _ = crate::runtime::scanout::note_linear_compositor_edge(
                         state,
                         mid,
                         w,
@@ -413,14 +413,13 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.height,
                     );
                     if ok {
-                        // Full-frame publish: same membership proof as the
+                        // Full-frame publish: same completeness proof as the
                         // import-present scatter paths — the write verified
                         // geometry (mw==w, mh==h) and landed the complete
-                        // frame into the mapping's guest pages. Without this
-                        // grant the dense-retention machinery (peer seed /
-                        // stale-present substitute) is structurally dead on
-                        // the CPU-portability Store path: no mapping ever
-                        // becomes a compositor-output member.
+                        // frame into the mapping's guest pages. Without it the
+                        // `present_unbacked` gate is structurally dead on the
+                        // CPU-portability Store path: no mapping's
+                        // `dense_frame_seq` would ever advance.
                         publish_cpu_portability_store(
                             state,
                             host,
@@ -3986,7 +3985,7 @@ fn publish_cpu_portability_store<M: HostMemory + HostOps>(
     format: u16,
 ) {
     state.note_surface_composite(mapping_id);
-    state.note_compositor_member_published(mapping_id, width, height);
+    state.note_dense_frame_published(mapping_id, width, height);
     crate::runtime::scanout::note_front_buffer_writeback(
         state, host, mapping_id, width, height, format,
     );

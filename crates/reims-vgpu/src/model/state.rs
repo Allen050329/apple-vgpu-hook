@@ -864,14 +864,6 @@ pub struct HostLinearTexture {
     pub resident_gen: u32,
 }
 
-/// Geometry proven for a compositor-output mapping (see
-/// [`PresentState::compositor_output_members`]).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CompositorOutputMember {
-    pub width: u32,
-    pub height: u32,
-}
-
 /// Which sub-path `paint_mapping` used to fill the present frame.
 ///
 /// Measure-only provenance for the per-present `paint_us` cost: a deferred-Store
@@ -960,30 +952,6 @@ pub struct PresentState {
     /// the peer there is what makes that split visible in a boot log.
     pub early_front_mapping: u32,
     pub early_front_generation: u32,
-    /// Mapping id of the compositor-output member most recently named by the
-    /// present-side graph: either by a decoded full-geometry edge
-    /// ([`DeviceState::note_compositor_output`],
-    /// [`crate::runtime::scanout::note_linear_compositor_output`]) or by a
-    /// Composite full-frame writeback landing on an already-proven member
-    /// ([`DeviceState::refresh_compositor_output_member`]).
-    ///
-    /// This is change-detection memory and nothing else: the single read
-    /// compares the incoming member against it so the always-on
-    /// `compositor_member_refresh` line fires exactly when the writeback moves
-    /// to a different member, which is the guest's double-buffer alternation.
-    /// No present source, resident or capture decision consults it. Cleared on
-    /// unmap so a recycled mapping id is never compared against its
-    /// predecessor's writeback.
-    pub last_compositor_output_member: u32,
-    /// Mappings proven compositor outputs by a decoded edge (full-coverage
-    /// linear sample or non-self type-11 sample), keyed by mapping id with the
-    /// geometry/source recorded at proof time.  Steady-state WindowServer
-    /// composite passes are damage passes (partial quads) that never re-prove
-    /// full coverage, so membership is sticky: a later Composite-class
-    /// writeback into a member at the proven geometry names that member in
-    /// `last_compositor_output_member`, following the guest's double-buffer
-    /// alternation.  Removed on unmap.
-    pub compositor_output_members: BTreeMap<u32, CompositorOutputMember>,
     /// Present/scanout evidence: mapping → latest geometry it was displayed
     /// at (a `capture_present_frame` action or a retained-frame re-show).
     /// OutputGroup unification requires this — the copy-swap contract is a
@@ -992,34 +960,32 @@ pub struct PresentState {
     /// frames every paint but are never presented; without this gate any two
     /// same-geometry publishers unified and distinct surfaces chained one
     /// resident (the Safari-scroll black-band class).
-    /// Removed on unmap with membership.
     /// Stamped with the mapping lifetime that presented it — see
     /// [`DeviceState::presented_geom_live`], which is the only way to read it.
     pub presented_geoms: BTreeMap<u32, PresentedGeom>,
     /// Display geometries proven to be a multi-buffer compositor swapchain:
-    /// latched `true` the first time two distinct compositor-output members are
-    /// *presented* at that geometry (the same condition `output_group_for`
-    /// arms on). Sticky per boot — a resolution that was ever double-buffered
-    /// stays one. WindowServer recycles swapchain buffers continuously (new mid
-    /// ids, old ones unmapped, so `presented_geoms`/membership churn), which
-    /// dropped the *concurrently* presented member count to one and collapsed
-    /// the group — a fresh or recycled buffer then resolved to a per-mid
-    /// resident that never held the accumulated full frame, so the guest's
-    /// damage-only draw left everything outside the damaged rect black (the
-    /// black-background / desktop-residue class). Latching the geometry keeps
-    /// every presented member at a proven swapchain resolution unified through
-    /// those recycles. Not gated on measured content; the per-mid
-    /// member+`presented_at` checks in `output_group_for` still keep never
-    /// presented publish-only tiles (WebKit content surfaces) out of the group.
+    /// latched `true` the first time two distinct surfaces are *presented* at
+    /// that geometry (the same condition `output_group_for` arms on). Sticky
+    /// per boot — a resolution that was ever double-buffered stays one.
+    /// WindowServer recycles swapchain buffers continuously (new mid ids, old
+    /// ones unmapped, so `presented_geoms` churns), which dropped the
+    /// *concurrently* presented surface count to one and collapsed the group —
+    /// a fresh or recycled buffer then resolved to a per-mid resident that
+    /// never held the accumulated full frame, so the guest's damage-only draw
+    /// left everything outside the damaged rect black (the black-background /
+    /// desktop-residue class). Latching the geometry keeps every presented
+    /// surface at a proven swapchain resolution unified through those recycles.
+    /// Not gated on measured content; the per-mid `presented_at` check in
+    /// `output_group_for` still keeps never presented publish-only tiles
+    /// (WebKit content surfaces) out of the group.
     pub output_group_geoms: std::collections::BTreeSet<(u32, u32)>,
     /// Protocol-structural dense-frame tracking (measure-only, never gates a
-    /// present decision): per compositor-output member, the value of
+    /// present decision): per mapping id, the value of
     /// [`Self::dense_frame_counter`] at the last full-frame (whole-`w`×`h`)
     /// Store **naming that mapping id** — the completeness proof in
-    /// [`Self::note_compositor_member_published`], which is the only site that
-    /// advances it. A presented member whose seq lags a same-geometry peer by a
-    /// margin is the a/b inter-buffer retention gap
-    /// ([`Self::dense_retention_gap`]). Cleared with membership on unmap.
+    /// [`DeviceState::note_dense_frame_published`], which is the only site that
+    /// advances it. Read only by [`DeviceState::note_present_backing`], the
+    /// `present_unbacked` gate. Cleared on unmap.
     ///
     /// **What this is keyed on, and what that means it cannot see.** The advance
     /// is a function of the mapping id the Store named and nothing else; it does
@@ -1028,20 +994,20 @@ pub struct PresentState {
     /// *different* resident than the one that member's present will read, still
     /// advances the seq. That routing failure is the black-desktop mechanism
     /// (§8.80 of the local KB), and the gate below is structurally blind to it —
-    /// `present_identity_flip` is what catches it. It is also keyed per member
-    /// while unified members share ONE resident, so a full frame stored through
-    /// one member does not mark its siblings backed even though they hold the
-    /// same pixels.
+    /// `present_identity_flip` is what catches it. It is also keyed per mapping
+    /// id while unified surfaces share ONE resident, so a full frame stored
+    /// through one of them does not mark its siblings backed even though they
+    /// hold the same pixels.
     pub dense_frame_seq: BTreeMap<u32, u64>,
-    /// Per compositor-output member: the [`Self::dense_frame_seq`] value that
-    /// member held the last time it was PRESENTED.
+    /// Per mapping id: the [`Self::dense_frame_seq`] value that mapping held
+    /// the last time it was PRESENTED.
     ///
-    /// A member whose seq is unchanged across two of its own presents received
+    /// A surface whose seq is unchanged across two of its own presents received
     /// no full-frame Store naming it in between. That is the always-on
     /// `present_unbacked` gate — the loss itself, reported on the mid the guest
-    /// named, rather than a rate at which we papered over it. Keyed per member
-    /// (not globally) so healthy a/b alternation, where each buffer legitimately
-    /// advances on its own turn, stays quiet. Cleared with membership on unmap.
+    /// named, rather than a rate at which we papered over it. Keyed per mapping
+    /// id (not globally) so healthy a/b alternation, where each buffer
+    /// legitimately advances on its own turn, stays quiet. Cleared on unmap.
     ///
     /// The "or an inter-buffer seed" half of this condition is gone: `62587b1`
     /// deleted the a/b peer front seed, because unified members share one
@@ -2349,62 +2315,21 @@ impl DeviceState {
             .insert(mapping_id, SurfaceWriteKind::Composite);
     }
 
-    /// Grant compositor-output membership from a decoded non-self full-geometry
-    /// type-11 edge, and name that member as the latest one seen.
-    pub fn note_compositor_output(
-        &mut self,
-        source_mapping: u32,
-        output_mapping: u32,
-        width: u32,
-        height: u32,
-    ) {
-        if source_mapping == 0
-            || output_mapping == 0
-            || source_mapping == output_mapping
-            || width == 0
-            || height == 0
-        {
-            return;
-        }
-        self.present.last_compositor_output_member = output_mapping;
-        self.present.compositor_output_members.insert(
-            output_mapping,
-            CompositorOutputMember { width, height },
-        );
-    }
-
     /// A draw Store published a **complete** frame for `mapping_id` into guest
-    /// pages (full-frame resident writeback, `import_present ok_runs`): grant
-    /// compositor-output membership at that geometry. Unlike the one-shot
-    /// full-coverage draw edges, this fires on every steady-state composite
-    /// pass, so both halves of a guest double buffer qualify on any boot.
-    /// Grants membership only; naming the latest member is a Composite
-    /// writeback's job (see [`Self::refresh_compositor_output_member`]).
-    pub fn note_compositor_member_published(&mut self, mapping_id: u32, width: u32, height: u32) {
+    /// pages (full-frame resident writeback, `import_present ok_runs`).
+    ///
+    /// Protocol-structural dense marker: this mapping now holds a complete full
+    /// frame, so advance its [`PresentState::dense_frame_seq`] off the global
+    /// [`PresentState::dense_frame_counter`]. A surface presented twice with no
+    /// advance in between received no full frame of its own, which is the
+    /// `present_unbacked` gate in [`Self::note_present_backing`] — the only
+    /// reader. The counter is monotonic per full-frame Store across all
+    /// mappings, so the value is a witness of "something was published for this
+    /// mid", never a staleness measure on its own.
+    pub fn note_dense_frame_published(&mut self, mapping_id: u32, width: u32, height: u32) {
         if mapping_id == 0 || width == 0 || height == 0 {
             return;
         }
-        let member = self
-            .present
-            .compositor_output_members
-            .entry(mapping_id)
-            .or_insert_with(|| {
-                crate::observe::off(format!(
-                    "compositor_member_grant mid={mapping_id} {width}x{height} reason=full_frame_publish"
-                ));
-                CompositorOutputMember { width, height }
-            });
-        // Geometry change (mode switch / re-geom): follow the newly published
-        // geometry.
-        if member.width != width || member.height != height {
-            member.width = width;
-            member.height = height;
-        }
-        // Protocol-structural dense marker: this member now holds a complete
-        // full-frame. Advance its `dense_frame_seq` so a peer that never got a
-        // full frame (nor a seed) shows up as lagging to the peer seed and to
-        // the retention proxies. The counter is monotonic per full-frame Store
-        // across all members.
         self.present.dense_frame_counter = self.present.dense_frame_counter.saturating_add(1);
         let seq = self.present.dense_frame_counter;
         self.present.dense_frame_seq.insert(mapping_id, seq);
@@ -2415,113 +2340,6 @@ impl DeviceState {
     pub fn advance_present_epoch(&mut self) -> u64 {
         self.present.present_epoch = self.present.present_epoch.saturating_add(1);
         self.present.present_epoch
-    }
-
-    /// A Composite-class writeback landed on a proven compositor-output member
-    /// at its proven geometry: name that member as the latest one written.
-    /// Returns `Some(previous_member)` when it differs from the member named
-    /// before — the guest alternated its double buffer — and `None` when the
-    /// same member is written again or `mapping_id` is not a member at this
-    /// geometry.
-    pub fn refresh_compositor_output_member(
-        &mut self,
-        mapping_id: u32,
-        width: u32,
-        height: u32,
-    ) -> Option<u32> {
-        if mapping_id == 0 || width == 0 || height == 0 {
-            return None;
-        }
-        let at_proven_geom = self
-            .present
-            .compositor_output_members
-            .get(&mapping_id)
-            .is_some_and(|member| member.width == width && member.height == height);
-        if !at_proven_geom {
-            return None;
-        }
-        let prev = self.present.last_compositor_output_member;
-        self.present.last_compositor_output_member = mapping_id;
-        (prev != mapping_id).then_some(prev)
-    }
-
-    /// Whether `mapping_id` has been proven a compositor output (any geometry).
-    pub fn is_compositor_output_member(&self, mapping_id: u32) -> bool {
-        self.present
-            .compositor_output_members
-            .contains_key(&mapping_id)
-    }
-
-    /// The same-geometry presented peer of `mapping_id` holding the freshest
-    /// full frame: `(peer_mid, presented_seq, peer_seq)`, when that peer is
-    /// strictly ahead.
-    ///
-    /// The lag this reports is **not** a staleness measure on its own.
-    /// `dense_frame_counter` is a single global counter bumped once per
-    /// full-frame publish by *any* member at *any* geometry, so a member that
-    /// just took its turn already sits a whole turnaround behind the one that
-    /// published last with nothing stale about either. It must never decide
-    /// *which* surface to present: the transaction names plane 0's surface id
-    /// and that is the only correct capture source.
-    ///
-    /// Its only reader is the present census (`dense_retention_gap` in
-    /// [`crate::runtime::census::present_proxy`]). Nothing on the
-    /// guest-named present path reads it: the a/b peer seed used to, and was
-    /// deleted once resident unification was shown to make it a copy onto
-    /// itself for every target the guest actually displays.
-    ///
-    /// The peer set is scoped to same-geometry members that have themselves been
-    /// **presented** at this geometry ([`Self::presented_at`]) — the SAME gate
-    /// [`Self::output_group_for`] uses to keep never-displayed full-frame
-    /// publishers (WebKit content tiles, offscreen scratch surfaces) out of an
-    /// output group. Without it, two *distinct logical outputs* at the same
-    /// resolution — the desktop swapchain and a never-presented publisher that
-    /// happens to composite full 1920×1080 frames — would share one peer set, and
-    /// a publisher's frame could be seeded into a real output on a transition
-    /// (the intermittent a/b residue / stale-tile class). The invariant is
-    /// pathway-independent: a buffer the guest has never chosen to display is
-    /// never a valid seed *source* into one. Genuine swapchain siblings all get
-    /// presented as they alternate as front, so they stay in the set.
-    pub fn dense_retention_gap(&self, mapping_id: u32, w: u32, h: u32) -> Option<(u32, u64, u64)> {
-        if mapping_id == 0 || w == 0 || h == 0 {
-            return None;
-        }
-        let member = self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != w || member.height != h {
-            return None;
-        }
-        // A proven swapchain geometry has no retention gap to report, because its
-        // members are not separate storage. Every presented member at a latched
-        // geometry resolves to the one `TargetIdentity::OutputGroup` resident —
-        // that is what unification means, and `presented_at` (the peer filter
-        // below) is the same admission gate — so a lag between their per-member
-        // full-frame counts cannot correspond to any difference in pixels. The
-        // comparison is not merely weak evidence here; there is nothing for it to
-        // be evidence about.
-        //
-        // Measured before deleting: boot 87 emitted 77 of these, **all** at
-        // 1920x1080, all between mids 2/5/6 — precisely the members that boot's
-        // `resident_identity_shared` lines show sharing one resident — on a boot
-        // whose screen was correct at every capture.
-        if self.output_group_for(mapping_id, w, h).is_some() {
-            return None;
-        }
-        let presented_seq = self
-            .present
-            .dense_frame_seq
-            .get(&mapping_id)
-            .copied()
-            .unwrap_or(0);
-        let (peer_mid, peer_seq) = self
-            .present
-            .compositor_output_members
-            .iter()
-            .filter(|(&mid, m)| {
-                mid != mapping_id && m.width == w && m.height == h && self.presented_at(mid, w, h)
-            })
-            .filter_map(|(mid, _)| self.present.dense_frame_seq.get(mid).map(|s| (*mid, *s)))
-            .max_by_key(|(_, s)| *s)?;
-        (peer_seq > presented_seq).then_some((peer_mid, presented_seq, peer_seq))
     }
 
     /// Present/scanout evidence that `mapping_id` was displayed at `w`x`h`
@@ -2625,7 +2443,7 @@ impl DeviceState {
     /// as plane 0 of a display transaction at this geometry, which is the guest
     /// stating outright that the surface is the scanout source for that frame.
     /// There is no stronger evidence available, and in particular it is stronger
-    /// than `compositor_output_members`, which is *inferred* from our own
+    /// than a compositor-output membership *inferred* from our own
     /// full-frame-publish detector and resource-graph edges. Requiring both
     /// excluded surfaces the guest genuinely scans out but which never tripped
     /// the publish detector: they resolved to a private `Surface` identity with
@@ -2742,7 +2560,6 @@ impl DeviceState {
 
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
         crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
-        self.present.compositor_output_members.remove(&mapping_id);
         // Prune the dense-frame seq: a recycled mapping id must not inherit a
         // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
@@ -2764,12 +2581,6 @@ impl DeviceState {
         // own ready resident — the "background/window content doesn't clear
         // cleanly" residue class.
         self.presented_needs_guest_seed.remove(&mapping_id);
-        // Same rule for the last-named member: a recycled mapping id must not
-        // have its first Composite writeback compared against a predecessor's,
-        // which would silence the `compositor_member_refresh` line for it.
-        if self.present.last_compositor_output_member == mapping_id {
-            self.present.last_compositor_output_member = 0;
-        }
     }
 
     /// Last write class for present keep-prior decisions.

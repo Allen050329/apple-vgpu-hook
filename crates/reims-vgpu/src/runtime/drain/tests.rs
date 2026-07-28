@@ -527,7 +527,6 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
 fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -560,20 +559,17 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     let fresh = vec![0x11u8; need];
     assert!(write_bgra8(&mut state, &mut host, 1, &fresh, stride, w, h));
     state.note_surface_composite(1);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
+    assert!(crate::runtime::scanout::note_linear_compositor_edge(
         &mut state, 1, w, h, 11
     ));
     let stale = vec![0x55u8; need];
     assert!(write_bgra8(&mut state, &mut host, 5, &stale, stride, w, h));
     state.note_surface_composite(5);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
+    assert!(crate::runtime::scanout::note_linear_compositor_edge(
         &mut state, 5, w, h, 12
     ));
     // Both members are genuine swapchain buffers that alternate as the presented
-    // front. Mark mid 1 displayed once at this geometry so the presented-peer gate
-    // in `dense_retention_gap` keeps it eligible as the fresh substitute — a buffer
-    // the guest never displays (a WebKit content tile / offscreen publisher) is NOT
-    // a valid substitute, which is the intermittent-residue guard this gate adds.
+    // front; mid 1 has been displayed once at this geometry.
     state.note_presented_geom(1, w, h);
     state.present.valid = true;
     state.present.width = w;
@@ -599,8 +595,8 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     };
 
     // Healthy alternation: both members publish, the named member is captured.
-    state.note_compositor_member_published(5, w, h);
-    state.note_compositor_member_published(1, w, h);
+    state.note_dense_frame_published(5, w, h);
+    state.note_dense_frame_published(1, w, h);
     present_named(&mut state, &mut host, 5);
     assert_eq!(
         state.present.frame_mapping, 5,
@@ -611,16 +607,16 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     // Drive the named member's full-frame sequence arbitrarily far behind its
     // peer's: mid 1 publishes a long run while mid 5 receives none. The guest
     // still names mid 5, so mid 5 is still what goes on screen.
-    for _ in 0..(RETENTION_GAP_MARGIN * 8 + 2) {
-        state.note_compositor_member_published(1, w, h);
+    let lag_runs = 34u64;
+    for _ in 0..lag_runs {
+        state.note_dense_frame_published(1, w, h);
     }
-    // Read the lag straight out of the per-member counters. It used to be read
-    // through `dense_retention_gap`, which no longer reports one between unified
-    // members — the point of this test is that the lag exists and changes nothing.
+    // Read the lag straight out of the per-mapping counters — the point of this
+    // test is that the lag exists and changes nothing about what is captured.
     let named_seq = state.present.dense_frame_seq[&5];
     let peer_seq = state.present.dense_frame_seq[&1];
     assert!(
-        peer_seq - named_seq > RETENTION_GAP_MARGIN,
+        peer_seq - named_seq >= lag_runs,
         "the lag this test needs is present: {peer_seq} - {named_seq}"
     );
     present_named(&mut state, &mut host, 5);
@@ -1433,7 +1429,6 @@ fn contig_store_dual_mid_incomplete_fires_nz_swing_proxy() {
         max_rgb: 0xCC,
         from_last_store: true,
         edge_energy: 1000,
-        named_peer: false,
     });
     present_proxy::note_capture_ok(PresentCaptureSample {
         mapping_id: 4,
@@ -1446,7 +1441,6 @@ fn contig_store_dual_mid_incomplete_fires_nz_swing_proxy() {
         max_rgb: 0x80,
         from_last_store: true,
         edge_energy: 50,
-        named_peer: false,
     });
     let c = counters();
     assert!(
@@ -2049,7 +2043,6 @@ fn post_converge_display_reinit_self_labels_only_after_converge() {
         max_rgb: 0xCC,
         from_last_store: true,
         edge_energy: 1000,
-        named_peer: false,
     });
     assert!(
         present_proxy::has_converged(),
@@ -2500,7 +2493,7 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
 
 /// `present_unbacked` gate: a member presented twice with no full-frame Store
 /// **naming it** in between is being shown content the guest never sent for it.
-/// `note_compositor_member_published` is the only site that advances
+/// `note_dense_frame_published` is the only site that advances
 /// `dense_frame_seq`, so an unchanged seq across a member's own two presents is
 /// the exact structural witness.
 ///
@@ -2516,7 +2509,7 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     for mid in [1u32, 5u32] {
         state.map_surface(mid);
-        state.note_compositor_member_published(mid, w, h);
+        state.note_dense_frame_published(mid, w, h);
     }
 
     // First present of each member has no prior witness — never a report.
@@ -2526,9 +2519,9 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     // Healthy a/b alternation: each member gets its own full frame before its
     // next present, so the seq advances and the gate stays silent.
     for _ in 0..4 {
-        state.note_compositor_member_published(1, w, h);
+        state.note_dense_frame_published(1, w, h);
         assert_eq!(state.note_present_backing(1), None);
-        state.note_compositor_member_published(5, w, h);
+        state.note_dense_frame_published(5, w, h);
         assert_eq!(state.note_present_backing(5), None);
     }
 
@@ -2536,7 +2529,7 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     // naming mid 5 at present. Each of those presents shows content mid 5 never
     // received, and each is reported (once per present, not once per lifetime).
     for _ in 0..3 {
-        state.note_compositor_member_published(1, w, h);
+        state.note_dense_frame_published(1, w, h);
         assert_eq!(state.note_present_backing(1), None);
         assert!(
             state.note_present_backing(5).is_some(),
@@ -2555,7 +2548,7 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     // A recycled mapping id must not compare against its predecessor's witness.
     state.unmap_surface(5);
     state.map_surface(5);
-    state.note_compositor_member_published(5, w, h);
+    state.note_dense_frame_published(5, w, h);
     assert_eq!(state.note_present_backing(5), None);
 }
 
@@ -2596,10 +2589,10 @@ fn the_backing_gate_answers_the_same_whichever_resident_the_mid_resolves_to() {
         // present in BOTH states — including the one where mid 6 owns a private
         // resident. That silence is about the Store, not about where its pixels
         // landed, and it is the false negative the black-desktop class hides in.
-        state.note_compositor_member_published(6, w, h);
+        state.note_dense_frame_published(6, w, h);
         assert_eq!(state.note_present_backing(6), None);
         // Frames now go to mid 1 only; mid 6 gains nothing.
-        state.note_compositor_member_published(1, w, h);
+        state.note_dense_frame_published(1, w, h);
     }
     let (g, p) = (grouped.note_present_backing(6), private.note_present_backing(6));
     assert!(

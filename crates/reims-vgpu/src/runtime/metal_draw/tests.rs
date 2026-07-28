@@ -142,7 +142,7 @@ fn type11_store_policy_follows_stable_host_import_gate() {
 }
 
 #[test]
-fn cpu_portability_store_publishes_composite_and_refollows_output() {
+fn cpu_portability_store_publishes_composite() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::SurfaceWriteKind;
@@ -165,7 +165,6 @@ fn cpu_portability_store_publishes_composite_and_refollows_output() {
     state.present.width = width;
     state.present.height = height;
     state.present.frame_flush_seen = true;
-    state.note_compositor_output(9, 1, width, height);
 
     publish_cpu_portability_store(
         &mut state,
@@ -177,8 +176,7 @@ fn cpu_portability_store_publishes_composite_and_refollows_output() {
     );
 
     assert_eq!(state.surface_write_kind(mid), SurfaceWriteKind::Composite);
-    assert!(state.is_compositor_output_member(mid));
-    assert_eq!(state.present.last_compositor_output_member, mid);
+    assert_eq!(state.present.early_front_mapping, mid);
 }
 
 #[test]

@@ -165,9 +165,10 @@ fn import_store_timing_line(
 /// Build a protocol-stable resident identity for this mapping at its current
 /// [`crate::model::MappingEntry::map_generation`].
 ///
-/// Compositor-output members at a ≥2-member geometry resolve to the shared
-/// [`TargetIdentity::OutputGroup`] — the guest's copy-swap contract makes the
-/// members alternating storage for one logical framebuffer.
+/// Surfaces the guest has named in a display transaction at a geometry proven
+/// to be double-buffered resolve to the shared [`TargetIdentity::OutputGroup`]
+/// — the guest's copy-swap contract makes them alternating storage for one
+/// logical framebuffer.
 /// Fail-visible when `identity` — the resident a surface just resolved to — is
 /// not keyed by that surface's own mapping id.
 ///
@@ -178,8 +179,8 @@ fn import_store_timing_line(
 /// resident makes every frame a fusion of damage from several buffers — the
 /// mixed-generation frame class, which no other counter detects.
 ///
-/// O(1) on the hot path: the member scan runs only when the line is emitted,
-/// and emission is deduplicated by geometry and member count so a growing
+/// O(1) on the hot path: the peer scan runs only when the line is emitted,
+/// and emission is deduplicated by geometry and peer count so a growing
 /// group reports each new size once rather than per draw.
 fn note_resident_identity_sharing(
     state: &DeviceState,
@@ -193,10 +194,10 @@ fn note_resident_identity_sharing(
     }
     let mids: Vec<u32> = state
         .present
-        .compositor_output_members
-        .iter()
-        .filter(|(_, m)| m.width == width && m.height == height)
-        .map(|(&mid, _)| mid)
+        .presented_geoms
+        .keys()
+        .copied()
+        .filter(|&mid| state.presented_at(mid, width, height))
         .collect();
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<(u32, u32, usize)>>> = Mutex::new(None);
@@ -232,10 +233,10 @@ pub fn surface_identity(
             {
                 let members: Vec<u32> = state
                     .present
-                    .compositor_output_members
-                    .iter()
-                    .filter(|(_, m)| m.width == width && m.height == height)
-                    .map(|(&mid, _)| mid)
+                    .presented_geoms
+                    .keys()
+                    .copied()
+                    .filter(|&mid| state.presented_at(mid, width, height))
                     .collect();
                 crate::observe::fail(format!(
                     "compositor_group_unify {width}x{height} members={members:?} first_mid={mapping_id}"
@@ -1097,7 +1098,7 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     // composite exists — its bytes are just resident-side until flushed.
     let _ = state.mark_mapping_written(mapping_id);
     state.note_surface_composite(mapping_id);
-    state.note_compositor_member_published(mapping_id, width, height);
+    state.note_dense_frame_published(mapping_id, width, height);
     surface_cache::evict(state, mapping_id);
     crate::observe::line(format!(
         "render_writeback_deferred mapping={mapping_id} {width}x{height} gen={map_generation} off={base_off} span_end={span_end}"
@@ -1442,7 +1443,7 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
             // transition events that miss a double-buffer half on snapshot
             // boots (2026-07-16 census: mid 5 stored 41 full frames, zero
             // edges, present pin frozen on mid 1).
-            state.note_compositor_member_published(mapping_id, width, height);
+            state.note_dense_frame_published(mapping_id, width, height);
             surface_cache::evict(state, mapping_id);
             // Success census: the import was used, fires once per fragmented
             // present (~one per present under compositing, ~77k/session under a
@@ -1814,7 +1815,7 @@ fn finish_import(
             state.note_surface_composite(mapping_id);
             // Full-frame publish — same membership grant as the multi-run path
             // (contiguous swap buffers must not re-open the pin-freeze class).
-            state.note_compositor_member_published(mapping_id, width, height);
+            state.note_dense_frame_published(mapping_id, width, height);
             // Capture prefers host_cache over guest pages — must evict so the
             // next paint_mapping reads the DMA'd guest BGRA.
             surface_cache::evict(state, mapping_id);
@@ -2285,13 +2286,8 @@ mod tests {
         use crate::runtime::host::FakeHost;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        let member = |w, h| crate::model::CompositorOutputMember {
-            width: w,
-            height: h,
-        };
         for mid in [1u32, 5u32] {
             state.map_surface(mid);
-            state.present.compositor_output_members.insert(mid, member(1920, 1080));
             state.note_presented_geom(mid, 1920, 1080);
         }
         let group = surface_identity(&state, 1, 1920, 1080);
@@ -2351,16 +2347,8 @@ mod tests {
     fn the_grouped_arm_reports_which_membership_reading_refused() {
         use crate::model::OutputGroupMiss;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let member = |w, h| crate::model::CompositorOutputMember {
-            width: w,
-            height: h,
-        };
         for mid in [1u32, 5u32] {
             state.map_surface(mid);
-            state
-                .present
-                .compositor_output_members
-                .insert(mid, member(1920, 1080));
             state.note_presented_geom(mid, 1920, 1080);
         }
         assert_eq!(state.output_group_resolve(1, 1920, 1080), Ok(1));
@@ -2402,10 +2390,6 @@ mod tests {
         let mut condemned = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         for mid in [2u32, 3u32] {
             condemned.map_surface(mid);
-            condemned
-                .present
-                .compositor_output_members
-                .insert(mid, member(1920, 1080));
             condemned.note_presented_geom(mid, 1920, 1080);
             condemned.mappings.get_mut(&mid).unwrap().page_entries = vec![0x301];
         }
@@ -2515,49 +2499,34 @@ mod tests {
         // And a surface that was NEVER presented stays out however much it
         // publishes — the Safari-scroll black-band guard, unchanged.
         state.map_surface(7);
-        state
-            .present
-            .compositor_output_members
-            .insert(7, crate::model::CompositorOutputMember {
-                width: 1920,
-                height: 1080,
-            });
+        for _ in 0..8 {
+            state.note_dense_frame_published(7, 1920, 1080);
+        }
         assert!(matches!(
             surface_identity(&state, 7, 1920, 1080),
             TargetIdentity::Surface { id: 7, .. }
         ));
     }
 
-    /// Two proven same-geometry compositor members resolve to one shared
-    /// OutputGroup identity.
+    /// Two same-geometry surfaces the guest has presented resolve to one
+    /// shared OutputGroup identity.
     #[test]
-    fn surface_identity_unifies_compositor_members() {
+    fn surface_identity_unifies_presented_siblings() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         for mid in [1u32, 5u32, 7u32] {
             state.map_surface(mid);
         }
-        let member = |w, h| crate::model::CompositorOutputMember {
-            width: w,
-            height: h,
-        };
-        // One member only: per-mid.
-        state
-            .present
-            .compositor_output_members
-            .insert(1, member(1920, 1080));
+        // One presented surface only: per-mid.
         state.note_presented_geom(1, 1920, 1080);
         assert!(matches!(
             surface_identity(&state, 1, 1920, 1080),
             TargetIdentity::Surface { id: 1, .. }
         ));
-        // Second member at the same geometry but publish-only (never
-        // presented): both stay per-mid — the black-band regression guard.
-        // WebKit content tiles satisfy membership by full-frame publishing;
+        // A second surface at the same geometry that publishes full frames but
+        // is never presented: both stay per-mid — the black-band regression
+        // guard. WebKit content tiles publish full frames every paint;
         // unifying them chains DISTINCT surfaces onto one resident.
-        state
-            .present
-            .compositor_output_members
-            .insert(5, member(1920, 1080));
+        state.note_dense_frame_published(5, 1920, 1080);
         assert!(matches!(
             surface_identity(&state, 1, 1920, 1080),
             TargetIdentity::Surface { id: 1, .. }
@@ -2654,19 +2623,7 @@ mod tests {
         for mid in [1u32, 5u32, 9u32] {
             state.map_surface(mid);
         }
-        let member = |w, h| crate::model::CompositorOutputMember {
-            width: w,
-            height: h,
-        };
-        // Two members presented together: the geometry is a proven swapchain.
-        state
-            .present
-            .compositor_output_members
-            .insert(1, member(1920, 1080));
-        state
-            .present
-            .compositor_output_members
-            .insert(5, member(1920, 1080));
+        // Two surfaces presented together: the geometry is a proven swapchain.
         state.note_presented_geom(1, 1920, 1080);
         state.note_presented_geom(5, 1920, 1080);
         assert!(matches!(
@@ -2677,13 +2634,8 @@ mod tests {
         // WindowServer recycles the swapchain: the old buffers are gone and a
         // fresh buffer (mid 9) is the only member presented at the geometry.
         for mid in [1u32, 5u32] {
-            state.present.compositor_output_members.remove(&mid);
             state.present.presented_geoms.remove(&mid);
         }
-        state
-            .present
-            .compositor_output_members
-            .insert(9, member(1920, 1080));
         state.note_presented_geom(9, 1920, 1080);
 
         // The lone fresh buffer still resolves to the shared OutputGroup
@@ -2697,11 +2649,7 @@ mod tests {
         );
 
         // A geometry that was never double-buffered stays per-mid: a lone
-        // member at a fresh resolution must not spuriously unify.
-        state
-            .present
-            .compositor_output_members
-            .insert(9, member(1280, 720));
+        // surface at a fresh resolution must not spuriously unify.
         state.note_presented_geom(9, 1280, 720);
         assert!(matches!(
             surface_identity(&state, 9, 1280, 720),
@@ -2724,12 +2672,7 @@ mod tests {
         for mid in [1u32, 5u32] {
             state.map_surface(mid);
         }
-        let member = crate::model::CompositorOutputMember {
-            width: 1920,
-            height: 1080,
-        };
-        // A lone member stays per-surface: keyed by its own mapping id.
-        state.present.compositor_output_members.insert(1, member);
+        // A lone presented surface stays per-surface: keyed by its own mapping id.
         state.note_presented_geom(1, 1920, 1080);
         assert_eq!(
             surface_identity(&state, 1, 1920, 1080).surface_mapping_id(),
@@ -2737,9 +2680,8 @@ mod tests {
             "a per-surface resident belongs to the surface that asked for it"
         );
 
-        // A second presented member at the same geometry unifies both onto one
+        // A second presented surface at the same geometry unifies both onto one
         // resident, and neither identity names the surface that resolved to it.
-        state.present.compositor_output_members.insert(5, member);
         state.note_presented_geom(5, 1920, 1080);
         let a = surface_identity(&state, 1, 1920, 1080);
         let b = surface_identity(&state, 5, 1920, 1080);
@@ -2755,12 +2697,6 @@ mod tests {
         for mid in [1u32, 5u32] {
             state.map_surface(mid);
         }
-        let member = crate::model::CompositorOutputMember {
-            width: 1920,
-            height: 1080,
-        };
-        state.present.compositor_output_members.insert(1, member);
-        state.present.compositor_output_members.insert(5, member);
         state.note_presented_geom(1, 1920, 1080);
         state.note_presented_geom(5, 1920, 1080);
         assert!(matches!(

@@ -10,7 +10,7 @@ mod state;
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
-    ChannelRing, ChannelStamps, CompositorOutputMember, ComputeStorageResidencyKey, CursorState,
+    ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState,
     DeviceId, DeviceState, DisplayHandshake, ExecAggStats, ExecFault, ExecPacketSample, FailEvent,
     FrameStats, GfxRegs, GuestLinearMemo, GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry,
     GvaHostView, HostLinearTexture, HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture,

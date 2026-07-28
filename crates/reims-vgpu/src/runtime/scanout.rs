@@ -168,7 +168,6 @@ fn run_gpu_stats_oracle(
                             // GPU-sourced: never the deferred-store CPU reuse.
                             from_last_store: false,
                             edge_energy: stats.edge_energy,
-                            named_peer: state.is_compositor_output_member(p.mapping_id),
                         },
                     );
                 } else {
@@ -447,20 +446,6 @@ pub fn capture_present_frame(
     // what tells it there are no CPU pixels to fall back to.
     let display_needs_cpu_frame = !state.present.dmabuf_active;
     if !display_needs_cpu_frame {
-        // Protocol-structural a/b retention-gap guard (cheap map lookup, no pixel
-        // scan): never skipped, so a/b divergence is still caught on light frames.
-        if let Some((peer_mid, presented_seq, peer_seq)) =
-            state.dense_retention_gap(mapping_id, width, height)
-        {
-            crate::runtime::census::present_proxy::note_dense_retention_gap(
-                mapping_id,
-                peer_mid,
-                presented_seq,
-                peer_seq,
-                width,
-                height,
-            );
-        }
         // Publish the new resident (fresh direct export in `publish_window_frame`)
         // and leave `frame_bgra` empty: the window ignores CPU pixels while the
         // resident carries the display. An export miss costs one dropped frame
@@ -596,24 +581,6 @@ pub fn capture_present_frame(
     let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
     let edge = crate::runtime::census::present_proxy::edge_energy_bgra(&buf, width, height);
     let scan_us = scan_started.elapsed().as_micros() as u64;
-    // Protocol-structural a/b retention-gap guard (measure-only, cheap map
-    // lookup — no content scan): this present shows `mapping_id`; if it is a
-    // compositor member whose last full frame lags a same-geometry peer by a
-    // margin (missed both a full-frame Store and the inter-buffer seed), the
-    // undamaged region is stale (the inter-buffer wallpaper-retention class,
-    //). Runs on the present drain, off the QEMU main core.
-    if let Some((peer_mid, presented_seq, peer_seq)) =
-        state.dense_retention_gap(mapping_id, width, height)
-    {
-        crate::runtime::census::present_proxy::note_dense_retention_gap(
-            mapping_id,
-            peer_mid,
-            presented_seq,
-            peer_seq,
-            width,
-            height,
-        );
-    }
     crate::observe::line(format!(
         "scanout capture_present mid={mapping_id} {width}x{height} gen={generation} nz={nz} max={maxb} edge={edge} last_store={} host_cache={}",
         from_last_store as u8,
@@ -684,10 +651,6 @@ pub fn capture_present_frame(
             max_rgb,
             from_last_store,
             edge_energy: edge,
-            // Decoded-protocol provenance: captures of proven compositor-output
-            // members switching mids is guest double-buffer alternation, not
-            // the dual-mid thrash class (present_proxy routes accordingly).
-            named_peer: state.is_compositor_output_member(mapping_id),
         },
     );
     // Measure-only stable black-region proxy (never gates ownership/present).
@@ -1508,8 +1471,9 @@ pub fn present_dims(state: &DeviceState, mapping_id: u32) -> (u32, u32) {
 ///
 /// Both mappings must have the exact render-target geometry and the edge must
 /// be non-self.  This is resource provenance from decoded texture/attachment
-/// bindings, not a content or object-id ranking.  ClearOnly DisplaySwap may use
-/// the latest edge target as a completed compositor-output candidate.
+/// bindings, not a content or object-id ranking.  Measure-only: the edge is
+/// traced on `compositor_edge` and no present, resident or capture decision
+/// reads it.
 pub fn note_compositor_edge(
     state: &mut DeviceState,
     source_mapping: u32,
@@ -1540,13 +1504,9 @@ pub fn note_compositor_edge(
         return false;
     }
 
-    state.note_compositor_output(source_mapping, output_mapping, width, height);
     // Per-present-per-source re-assertion of an already-discovered edge (~2.8k/
     // 25s under a continuously-animating app — the single largest present-path
-    // flood). The always-on compositor-graph signal is the deduplicated
-    // `compositor_member_grant` (new member) + `compositor_member_refresh`
-    // (writeback moved to another member); gate this per-present edge trace
-    // behind REIMS_VGPU_DRAW_LOG.
+    // flood), so gate this edge trace behind REIMS_VGPU_DRAW_LOG.
     crate::observe::line(format!(
         "compositor_edge source_mid={source_mapping} output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
     ));
@@ -1555,10 +1515,11 @@ pub fn note_compositor_edge(
 
 /// Record a successful same-geometry linear-texture → type-11 dependency.
 ///
-/// Type-2/3 textures have no surface mapping id, so source `0` explicitly
-/// denotes the decoded linear-input class. Exact input/output geometry and a
-/// mapped output are required; content occupancy is never inspected.
-pub fn note_linear_compositor_output(
+/// Type-2/3 textures have no surface mapping id, so the traced source is the
+/// decoded linear-input class rather than a mapping id. Exact input/output
+/// geometry and a mapped output are required; content occupancy is never
+/// inspected. Measure-only, like [`note_compositor_edge`].
+pub fn note_linear_compositor_edge(
     state: &mut DeviceState,
     output_mapping: u32,
     width: u32,
@@ -1574,14 +1535,8 @@ pub fn note_linear_compositor_output(
         return false;
     };
 
-    state.present.last_compositor_output_member = output_mapping;
-    state.present.compositor_output_members.insert(
-        output_mapping,
-        crate::model::CompositorOutputMember { width, height },
-    );
     // Per-present linear-source edge re-assertion; gate behind REIMS_VGPU_DRAW_LOG
-    // (see the `note_compositor_output` site — member_grant/refresh carry the
-    // always-on graph signal).
+    // for the same reason as the sampled-source edge above.
     crate::observe::line(format!(
         "compositor_edge source=linear output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
     ));
@@ -1652,20 +1607,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             // here so a later writeback into the same mid refreshes the gen.
             state.present.early_front_mapping = mapping_id;
             state.present.early_front_generation = gen;
-            // Name the proven compositor-output member the guest just finished
-            // writing. Membership is granted only by a decoded full-coverage /
-            // sampled edge or a full-frame publish, so an unproven full-frame
-            // writer at the same geometry is not counted as an alternation.
-            if let Some(prev) = state.refresh_compositor_output_member(mapping_id, width, height) {
-                // Always-on a/b-follow rail: fires only when the writeback moves
-                // to a DIFFERENT proven member (the guest swapped its double
-                // buffer), not on every store — the load-bearing signal for the
-                // a/b divergence class the user tracks. Locked always-on by
-                // `composite_writeback_on_member_refollows_graph_output`.
-                crate::observe::off(format!(
-                    "compositor_member_refresh output_mid={mapping_id} prev_mid={prev} {width}x{height} gen={gen} (Composite store on proven member; graph follows guest buffer alternation)"
-                ));
-            }
         }
         // Offline: only log when writeback mid ≠ present (dual-mid gap class).
         if mapping_id != state.present.present_mapping
@@ -1946,10 +1887,10 @@ mod tests {
         }
     }
 
-    /// The Store-readback capture fast path is byte-exact and tightly guarded:
-    /// it consumes the readback only when id + geometry + live map_generation
-    /// match and the mapping is BGRA8; every mismatch falls back to the guest
-    /// read and always clears the readback (freshness — never carried forward).
+    /// The decoded compositor edge is accepted only when the dependency is
+    /// non-self and BOTH mappings carry the exact render-target geometry the
+    /// edge names — the gating that keeps the `compositor_edge` trace from
+    /// claiming a dependency the guest never expressed.
     #[test]
     fn compositor_edge_proxy_records_only_non_self_matching_geometry() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1964,14 +1905,7 @@ mod tests {
         }
         let pipeline_ref = std::process::id();
         assert!(note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
-        assert!(state.is_compositor_output_member(6));
-        assert!(!state.is_compositor_output_member(5));
-        assert_eq!(state.present.last_compositor_output_member, 6);
-        // The per-present `compositor_edge` line is REIMS_VGPU_DRAW_LOG-gated diagnostic
-        // (2026-07-19); the always-on graph signal is `compositor_member_grant`/
-        // `compositor_member_refresh` (asserted in `member_refresh_...`). This
-        // test owns the graph-state recording + geometry gating below.
-
+        // A self edge is not a dependency.
         assert!(!note_compositor_edge(
             &mut state,
             6,
@@ -1980,6 +1914,7 @@ mod tests {
             48,
             pipeline_ref
         ));
+        // A geometry that is not the mappings' own render-target geometry.
         assert!(!note_compositor_edge(
             &mut state,
             5,
@@ -1988,11 +1923,9 @@ mod tests {
             48,
             pipeline_ref
         ));
-        // Unmapping the output drops membership and the last-named member, so a
-        // recycled id starts from a clean comparison.
+        // An unmapped output has no geometry to match against.
         assert!(state.unmap_surface(6));
-        assert!(!state.is_compositor_output_member(6));
-        assert_eq!(state.present.last_compositor_output_member, 0);
+        assert!(!note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
     }
 
     #[test]
@@ -2007,108 +1940,30 @@ mod tests {
         m.content_generation = 9;
 
         let pipeline_ref = std::process::id();
-        assert!(note_linear_compositor_output(
+        assert!(note_linear_compositor_edge(
             &mut state,
             6,
             64,
             48,
             pipeline_ref
         ));
-        assert!(state.is_compositor_output_member(6));
-        assert_eq!(state.present.last_compositor_output_member, 6);
-        // `compositor_edge` is REIMS_VGPU_DRAW_LOG-gated diagnostic (2026-07-19); this
-        // test owns the linear-source graph-state recording + geometry gating.
-        assert!(!note_linear_compositor_output(
+        // Not the output's own render-target geometry: not this edge.
+        assert!(!note_linear_compositor_edge(
             &mut state,
             6,
             63,
             48,
             pipeline_ref
         ));
-    }
-
-    /// Steady-state WindowServer composite passes are damage passes that never
-    /// re-fire the full-coverage edge. A Composite writeback into a *proven*
-    /// compositor-output member must name that member (guest double-buffer
-    /// alternation) and report the move on the always-on
-    /// `compositor_member_refresh` line; unproven writers must not name one.
-    #[test]
-    fn composite_writeback_on_member_refollows_graph_output() {
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut host = FakeHost::new();
-        let (w, h) = (64u32, 48u32);
-        for mid in [1u32, 5u32, 7u32] {
-            assert!(state.map_surface(mid));
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.has_geom = true;
-            m.width = w;
-            m.height = h;
-            m.format = MTL_FORMAT_BGRA8_UNORM;
-            m.page_entries =
-                vec![((mid as u64) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID as u64) as u32];
-            m.content_generation = 1;
-        }
-        state.present.valid = true;
-        state.present.width = w;
-        state.present.height = h;
-        state.present.frame_flush_seen = true;
-
-        // Prove both double-buffer halves as compositor outputs: mid 1 by a
-        // full-coverage draw edge, mid 5 by a full-frame publish (ok_runs
-        // store) — snapshot boots may never fire a coverage edge for one half.
-        assert!(note_linear_compositor_output(&mut state, 1, w, h, 11));
-        assert_eq!(state.present.last_compositor_output_member, 1);
-        state.note_compositor_member_published(5, w, h);
-        assert!(state.is_compositor_output_member(5));
-        assert_eq!(
-            state.present.last_compositor_output_member, 1,
-            "publish grants membership but must not name the member by itself"
-        );
-        // First Composite writeback on published member 5 names it.
-        state.note_surface_composite(5);
-        state.mappings.get_mut(&5).unwrap().content_generation = 2;
-        note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-        assert_eq!(state.present.last_compositor_output_member, 5);
-
-        // Damage-pass Composite writeback on member 1 → naming follows to 1.
-        state.note_surface_composite(1);
-        state.mappings.get_mut(&1).unwrap().content_generation = 2;
-        note_front_buffer_writeback(&mut state, &mut host, 1, w, h, 0);
-        assert_eq!(state.present.last_compositor_output_member, 1);
-
-        // Alternate back to member 5.
-        state.note_surface_composite(5);
-        state.mappings.get_mut(&5).unwrap().content_generation = 3;
-        note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-        assert_eq!(state.present.last_compositor_output_member, 5);
-
-        // Unproven Composite writer 7 is not a member (early_front only).
-        state.note_surface_composite(7);
-        state.mappings.get_mut(&7).unwrap().content_generation = 4;
-        note_front_buffer_writeback(&mut state, &mut host, 7, w, h, 0);
-        assert_eq!(state.present.last_compositor_output_member, 5);
-        assert_eq!(state.present.early_front_mapping, 7);
-
-        // Unmap drops membership and the last-named member.
-        assert!(state.unmap_surface(5));
-        assert!(!state.is_compositor_output_member(5));
-        assert_eq!(state.present.last_compositor_output_member, 0);
-
-        let body = std::fs::read_to_string(crate::observe::fail_log_path())
-            .expect("reims-vgpu-fail.log readable");
-        assert!(
-            body.lines().any(|line| line
-                .starts_with("OFF compositor_member_refresh output_mid=1 prev_mid=5 64x48 gen=2")),
-            "member refresh must be always-on visible when the writeback moves"
-        );
-        assert!(
-            body.lines().any(|line| line
-                .starts_with("OFF compositor_member_grant mid=5 64x48 reason=full_frame_publish")),
-            "publish membership grant must be always-on visible"
-        );
+        // An unmapped output has no geometry to match against.
+        assert!(state.unmap_surface(6));
+        assert!(!note_linear_compositor_edge(
+            &mut state,
+            6,
+            64,
+            48,
+            pipeline_ref
+        ));
     }
 
     #[test]
@@ -2970,50 +2825,6 @@ mod tests {
         assert_eq!(state.present.height, 1080);
     }
 
-    /// A proven swapchain geometry has no retention gap to report.
-    ///
-    /// `dense_frame_seq` counts full-frame Stores per MAPPING ID. Once two
-    /// surfaces have been presented at a geometry the latch arms, both resolve to
-    /// the one `TargetIdentity::OutputGroup` resident, and they stop being
-    /// separate storage — so their per-member counts can diverge as far as they
-    /// like without any difference in pixels. Boot 87 emitted 77 of these, all at
-    /// 1920x1080 between mids 2/5/6, on a boot whose screen was correct at every
-    /// capture.
-    ///
-    /// The peer filter requires a presented peer, and a presented peer plus a
-    /// presented subject is exactly the latch condition — so at the production
-    /// call site, which runs after the display action, there is no configuration
-    /// left that reports a gap.
-    #[test]
-    fn a_unified_swapchain_has_no_retention_gap_to_report() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (64u32, 48u32);
-
-        state.note_compositor_member_published(1, w, h); // dense_seq[1]=1
-        state.note_compositor_member_published(4, w, h); // dense_seq[4]=2
-        state.note_presented_geom(1, w, h);
-
-        // One presented surface: no peer in the set, nothing to compare against.
-        assert_eq!(state.dense_retention_gap(1, w, h), None);
-
-        // The second present latches the swapchain and unifies both.
-        state.note_presented_geom(4, w, h);
-        assert!(state.output_group_for(1, w, h).is_some());
-        assert!(state.output_group_for(4, w, h).is_some());
-
-        // Let the per-member counts diverge as far as they can. Neither member
-        // reports a gap, because there is only one image behind both of them.
-        for _ in 0..5 {
-            state.note_compositor_member_published(1, w, h);
-        }
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "mid 4 trails mid 1 by 5 full-frame Stores and presents the same pixels"
-        );
-        assert_eq!(state.dense_retention_gap(1, w, h), None);
-    }
-
     /// Inter-buffer retention is STRUCTURAL, not copied — the invariant the a/b
     /// peer seed's deletion rests on.
     ///
@@ -3077,9 +2888,8 @@ mod tests {
         // however dense it is. It stays private, so the desktop's frame is never
         // copied into it.
         for _ in 0..32 {
-            state.note_compositor_member_published(7, w, h);
+            state.note_dense_frame_published(7, w, h);
         }
-        assert!(state.present.compositor_output_members.contains_key(&7));
         assert_eq!(
             state.output_group_for(7, w, h),
             None,
@@ -3095,57 +2905,14 @@ mod tests {
         assert!(!state.presented_at(7, w, h));
     }
 
-    /// Presented-peer gate on the whole-frame retention gap (the intermittent a/b
-    /// residue fix): a same-geometry compositor member that publishes full frames
-    /// but has NEVER been displayed (a WebKit content tile / offscreen scratch
-    /// surface at the desktop resolution) is not a swapchain sibling of the real
-    /// output, so [`DeviceState::dense_retention_gap`] must never name it as the
-    /// fresh peer — seeding from a never-displayed publisher copies its unrelated
-    /// content into a real output. The gate is precisely presented-ness: once the
-    /// publisher is itself displayed it (correctly) rejoins the peer set.
-    #[test]
-    fn dense_retention_gap_excludes_never_presented_same_geometry_publisher() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-
-        // mid 1: the real displayed output. mid 7: a never-presented publisher
-        // that composites full frames far faster (a Safari content layer).
-        state.note_compositor_member_published(1, w, h); // seq[1]=1
-        state.note_presented_geom(1, w, h);
-        for _ in 0..20 {
-            state.note_compositor_member_published(7, w, h); // seq[7] → 21, never presented
-        }
-
-        // The real output does NOT lag a phantom peer: the publisher is excluded.
-        assert_eq!(
-            state.dense_retention_gap(1, w, h),
-            None,
-            "a never-displayed publisher must not be a retention-gap peer"
-        );
-
-        // Once the publisher is itself displayed, the two are genuine siblings —
-        // and that is exactly when they stop being separate storage. A second
-        // presented surface at this geometry latches the swapchain, both resolve
-        // to the one `OutputGroup` resident, and there is no longer any gap to
-        // report: they hold the same pixels.
-        state.note_presented_geom(7, w, h);
-        assert!(state.output_group_for(1, w, h).is_some());
-        assert_eq!(
-            state.dense_retention_gap(1, w, h),
-            None,
-            "unified members share a resident; a lag in their per-member Store \
-             counts cannot mean their pixels differ"
-        );
-    }
-
     /// A surface the guest names in a display transaction joins the output group
     /// on that evidence alone — it does not also have to have tripped our
     /// full-frame-publish detector.
     ///
     /// The transaction's plane-0 surface id is the guest stating that the
-    /// surface is the scanout source for the frame. `compositor_output_members`
-    /// is inferred from our own detectors, and requiring it too excluded
-    /// surfaces the guest genuinely scans out: they resolved to a private
+    /// surface is the scanout source for the frame. A compositor-output
+    /// membership inferred from our own detectors was required too, and that
+    /// excluded surfaces the guest genuinely scans out: they resolved to a private
     /// `Surface` identity with no resident behind it while the group holding the
     /// desktop was ready at the same geometry. Four live x86 boots recorded
     /// exactly that — `export_present_miss outcome=orphan want=surface
@@ -3166,9 +2933,8 @@ mod tests {
         assert_eq!(state.output_group_for(1, w, h), Some(1));
 
         // Mid 9 is a swapchain buffer the guest rotates in and names, but which
-        // never tripped the full-frame-publish detector — it is not in
-        // `compositor_output_members`. It must still resolve to the group.
-        assert!(!state.present.compositor_output_members.contains_key(&9));
+        // never tripped the full-frame-publish detector. It must still resolve
+        // to the group.
         state.note_presented_geom(9, w, h);
         assert_eq!(
             state.output_group_for(9, w, h),
@@ -3178,8 +2944,7 @@ mod tests {
 
         // A full-frame publisher the guest never names stays out, so its
         // unrelated content is never chained onto the desktop's resident.
-        state.note_compositor_member_published(7, w, h);
-        assert!(state.present.compositor_output_members.contains_key(&7));
+        state.note_dense_frame_published(7, w, h);
         assert_eq!(
             state.output_group_for(7, w, h),
             None,
@@ -3214,10 +2979,7 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let (w, h) = (64u32, 48u32);
 
-        // Two same-geometry compositor members, neither presented yet.
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(4, w, h);
-
+        // Two same-geometry swapchain buffers, neither presented yet.
         // mid 1's first present: no presented peer yet, so nothing unifies and
         // its content stays exactly where its draws put it.
         assert_eq!(
@@ -3561,14 +3323,14 @@ mod tests {
         let alone = state.present.frame_bgra.clone();
         assert_eq!(&alone[..], &grey[..]);
 
-        // Publish the peer as a same-geometry compositor member and re-capture.
-        state.note_compositor_member_published(1, 2, 2);
-        state.note_compositor_member_published(5, 2, 2);
+        // Publish a full frame for the peer as well, then re-capture.
+        state.note_dense_frame_published(1, 2, 2);
+        state.note_dense_frame_published(5, 2, 2);
         // The arrangement has to be one a peer-reading capture would act on, or
-        // the assertion below passes for the wrong reason: two members of equal
+        // the assertion below passes for the wrong reason: two surfaces of equal
         // geometry, the peer holding different pixels, and the peer ranking
         // fresher than the named mid on the write history the model keeps.
-        let peer = state.present.compositor_output_members.get(&5).unwrap();
+        let peer = state.mappings.get(&5).unwrap();
         assert_eq!((peer.width, peer.height), (2, 2));
         assert_ne!(&grey[..], &white[..]);
         assert!(
