@@ -1565,6 +1565,21 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
 /// The contig path was added second and stayed a drop for one commit, which is
 /// what a duplicated decision costs: `runs` is the only thing the two sites
 /// disagree about, so it is a parameter and the decision is not.
+///
+/// Confirmed live on an x86/Vulkan boot driven with six heavy pages in separate
+/// windows, scrolls and rubber-band drags, once the thrash signature this exists
+/// for had actually been reached (12 distinct 1 GiB buckets against the budget of
+/// eight, `creates=845 evictions=846`): **14 shortages, 14 absorptions, 1:1, and
+/// zero `deferred_flush_lost reason=host_import_total_byte_cap`**. The absorbed
+/// surfaces were mostly fragmented — three full 1920x1080 scanouts at `runs=505`
+/// among them — and the two losses that remained were `map_generation_drift`,
+/// which is the guest rewiring the pages under a deferred window and is correct
+/// to drop. The comparable pre-fix boot lost seven renders and absorbed none.
+///
+/// Reaching that state is the hard part and it is not a knob on the drive script:
+/// the budget is spent by page *spread*, so it needs several large surfaces live
+/// at once. Sustained frame rate alone does not do it, and a guest sitting at the
+/// login window produces a perfectly healthy-looking log with zero of everything.
 #[allow(
     clippy::too_many_arguments,
     reason = "forwards the import operation's mapping, surface, and row geometry unchanged"
