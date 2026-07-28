@@ -1058,31 +1058,42 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
 fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u64, &'static str)> {
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
-    // Live tasks can advertise one million object-list slots (4,096 x86
-    // pages each). A linear IOSurface scan for every control page turns one
-    // full-frame safety check into ~100 million comparisons. Preserve the
-    // exact collision contract with one page-base membership set.
-    let mapping_pages: std::collections::HashSet<u64> =
-        gpas.iter().map(|&gpa| page_base(gpa)).collect();
-    let contains = |gpa: u64| mapping_pages.contains(&page_base(gpa));
+    // Probe the SURFACE, not the control structures. A live task can advertise a
+    // million object-list slots — 4,096 x86 pages — and an object list is one
+    // contiguous span, so asking "does the surface hold this page?" once per
+    // control page enumerated the whole span page by page. Sorted, the same
+    // question is one range query per task.
+    //
+    // Measured on the x86/Vulkan rail before this shape: 414 µs per call, 71 024
+    // calls in a 120 s arm, 29.4 s of wall clock spent proving a full-screen
+    // IOSurface does not alias a FIFO ring.
+    let mut pages: Vec<u64> = gpas.iter().map(|&gpa| page_base(gpa)).collect();
+    pages.sort_unstable();
+    let holds = |gpa: u64| pages.binary_search(&page_base(gpa)).is_ok();
+    // The lowest surface page in `[start, end)`, if any. Both bounds and every
+    // entry are multiples of `page`, so a hit is exactly one of the pages the
+    // per-page form would have enumerated — same page, same reported gpa.
+    let holds_range = |start: u64, end: u64| -> Option<u64> {
+        let i = pages.partition_point(|&p| p < start);
+        pages.get(i).copied().filter(|&p| p < end)
+    };
 
-    if state.gfx.root_page != 0 && contains((state.gfx.root_page as u64) << state.page_shift) {
+    if state.gfx.root_page != 0 && holds((state.gfx.root_page as u64) << state.page_shift) {
         return Some(((state.gfx.root_page as u64) << state.page_shift, "gfx_root"));
     }
-    if state.gfx.fifo_base_page != 0
-        && contains((state.gfx.fifo_base_page as u64) << state.page_shift)
+    if state.gfx.fifo_base_page != 0 && holds((state.gfx.fifo_base_page as u64) << state.page_shift)
     {
         return Some((
             (state.gfx.fifo_base_page as u64) << state.page_shift,
             "root_fifo",
         ));
     }
-    if state.iosfc.ring_base != 0 && contains(state.iosfc.ring_base) {
+    if state.iosfc.ring_base != 0 && holds(state.iosfc.ring_base) {
         return Some((page_base(state.iosfc.ring_base), "iosfc_ring"));
     }
     for ring in &state.child_rings {
         for &gpa in &ring.page_gpas {
-            if contains(gpa) {
+            if holds(gpa) {
                 return Some((page_base(gpa), "child_fifo"));
             }
         }
@@ -1093,7 +1104,7 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
         }
         if task.directory_pfn != 0 {
             let gpa = (task.directory_pfn as u64) << state.page_shift;
-            if contains(gpa) {
+            if holds(gpa) {
                 return Some((gpa, "task_directory"));
             }
         }
@@ -1101,11 +1112,9 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             let first = (task.object_list_pfn as u64) << state.page_shift;
             let bytes = (task.object_list_count as u64).saturating_mul(16);
             let count = bytes.saturating_add(page - 1) / page;
-            for i in 0..count {
-                let gpa = first.saturating_add(i.saturating_mul(page));
-                if contains(gpa) {
-                    return Some((gpa, "task_object_list"));
-                }
+            let end = first.saturating_add(count.saturating_mul(page));
+            if let Some(gpa) = holds_range(first, end) {
+                return Some((gpa, "task_object_list"));
             }
         }
     }
@@ -2154,5 +2163,102 @@ mod tests {
             Some((0x551_000, "task_object_list"))
         );
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
+    }
+
+    /// The object-list probe is a RANGE query over the surface, and the three
+    /// things a range query can get wrong that a per-page enumeration cannot.
+    ///
+    /// The per-page form walked `first + i*page` for every slot page and returned
+    /// the first one the surface held, so it reported the LOWEST colliding page
+    /// and stopped exactly at `count`. A `partition_point` that is off by one
+    /// entry, or an end bound computed from slots rather than pages, reproduces
+    /// the same `Some(_)`/`None` on a single-page surface and diverges here.
+    #[test]
+    fn object_list_collision_reports_the_lowest_page_and_stops_at_the_span_end() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        assert!(state.define_task(1, 0x4000_0000, 0x440));
+        // 1024 slots x 16 bytes = 16 KiB = pages 0x550..0x554 at a 4 KiB shift.
+        assert!(state.set_object_list(1, 0x550, 1024));
+
+        // Several surface pages inside the span, listed out of order: the answer
+        // is the lowest, not whichever the surface happens to name first.
+        assert_eq!(
+            first_control_page_collision(&state, &[0x553_000, 0x551_000, 0x552_000]),
+            Some((0x551_000, "task_object_list"))
+        );
+        // Both ends of the span are inside it.
+        assert_eq!(
+            first_control_page_collision(&state, &[0x550_000]),
+            Some((0x550_000, "task_object_list"))
+        );
+        assert_eq!(
+            first_control_page_collision(&state, &[0x553_000]),
+            Some((0x553_000, "task_object_list"))
+        );
+        // The page immediately after the span is not part of it.
+        assert_eq!(first_control_page_collision(&state, &[0x554_000]), None);
+        // Nor is the page immediately before.
+        assert_eq!(first_control_page_collision(&state, &[0x54f_000]), None);
+        // A surface that straddles the span without landing in it stays clean —
+        // the query must not report the neighbour it binary-searched past.
+        assert_eq!(
+            first_control_page_collision(&state, &[0x100_000, 0x554_000]),
+            None
+        );
+    }
+
+    /// Priority order survives the rewrite: a surface colliding with several
+    /// control structures at once names the same one it always did. The walk is
+    /// per task and interleaved (task 1's object list before task 2's directory),
+    /// which a flat "collect every control page then sort" would silently lose.
+    #[test]
+    fn a_surface_colliding_with_several_control_structures_names_the_first() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        state.gfx.root_page = 0x120;
+        state.gfx.fifo_base_page = 0x220;
+        state.iosfc.ring_base = 0x300_000;
+        state.child_rings[2].page_gpas = vec![0x330_000];
+        assert!(state.define_task(1, 0x4000_0000, 0x440));
+        assert!(state.set_object_list(1, 0x550, 1024));
+        assert!(state.define_task(2, 0x4000_0000, 0x660));
+
+        let all = [
+            0x660_000, 0x551_000, 0x440_000, 0x330_000, 0x300_000, 0x220_000, 0x120_000,
+        ];
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x120_000, "gfx_root"))
+        );
+        state.gfx.root_page = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x220_000, "root_fifo"))
+        );
+        state.gfx.fifo_base_page = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x300_000, "iosfc_ring"))
+        );
+        state.iosfc.ring_base = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x330_000, "child_fifo"))
+        );
+        state.child_rings[2].page_gpas.clear();
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x440_000, "task_directory"))
+        );
+        // Task 1's object list outranks task 2's directory: the walk is per task.
+        state.tasks[1].directory_pfn = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x551_000, "task_object_list"))
+        );
+        assert!(state.set_object_list(1, 0, 0));
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x660_000, "task_directory"))
+        );
     }
 }
