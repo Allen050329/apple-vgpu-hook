@@ -2561,6 +2561,25 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
+        type_name: "WriteGate",
+        defined_in: "model/state.rs",
+        slug_blocks: &[],
+        // The refusal arm rides `gva_write`; the permissive arms ride
+        // `gva_write_gate`. Both are the gate's own answer rather than a label
+        // the caller picked, which is the point of the type.
+        emission: Emission::At(&[
+            ("runtime/gva_mem.rs", "gva_write"),
+            ("runtime/gva_mem.rs", "gva_write_gate"),
+        ]),
+        slug_calls: &[],
+        slugs: &[
+            "write_gate_exact",
+            "write_gate_aliased",
+            "write_gate_no_spans",
+            "write_gate_outside",
+        ],
+    },
+    DeclineClass {
         type_name: "ViewAliasSite",
         defined_in: "runtime/gva_view.rs",
         slug_blocks: &[],

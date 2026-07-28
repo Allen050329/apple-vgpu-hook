@@ -367,6 +367,42 @@ pub struct TaskEntry {
     pub object_list_count: u32,
 }
 
+/// Why the GVA write gate let a write through — or that it did not.
+///
+/// The gate is the **only** bounds check on host→guest writes, and it has three
+/// separate ways to say yes that a `bool` cannot tell apart. That matters
+/// because `gva_mem.rs` logs `reason=mem_outside_map` on the refusal while
+/// nothing at all reads the allows, so "the gate passed" has never
+/// distinguished *checked and covered* from *nothing to check against*.
+///
+/// `AGENTS.md` names this shape directly: a reason the caller writes is not a
+/// reading, and the collapse regrows wherever a `-> bool` crosses a module
+/// boundary. This carries the answer out of the check that made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteGate {
+    /// A span recorded for this exact task covers the whole range.
+    Exact,
+    /// Only a span recorded for `task >> 1` or `task << 1` covers it.
+    Aliased,
+    /// This task has no recorded spans at all, so the gate allowed by default.
+    /// `delete_task` calls `clear_task_map_spans`, so a write arriving after a
+    /// teardown lands here.
+    NoSpans,
+    /// Spans exist for this task and none covers the range.
+    Outside,
+}
+
+impl crate::observe::Decline for WriteGate {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Exact => "write_gate_exact",
+            Self::Aliased => "write_gate_aliased",
+            Self::NoSpans => "write_gate_no_spans",
+            Self::Outside => "write_gate_outside",
+        }
+    }
+}
+
 /// Guest-declared MapMemory2 span (notify-only; no host PTE invent).
 ///
 /// Used to fail-closed product GVA writes outside any recorded map when the
@@ -3210,20 +3246,42 @@ impl DeviceState {
     /// Product GVA write gate: if this task has any recorded MapMemory2 spans,
     /// `[gva, gva+len)` must be fully covered by one span. Empty registry ⇒ allow
     /// (unit fixtures and pre-Map paths).
-    pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
+    ///
+    /// Returns [`WriteGate`] rather than `bool` so the always-on line can name
+    /// the arm that decided instead of the caller's assumption about it.
+    pub fn gva_write_gate(&self, task_id: u32, gva: u64, len: u64) -> WriteGate {
         if len == 0 {
-            return true;
+            return WriteGate::Exact;
         }
-        let has_any = self.task_map_spans.iter().any(|s| {
-            s.task_id == task_id || s.task_id == (task_id >> 1) || (s.task_id << 1) == task_id
-        });
-        if !has_any {
-            return true;
+        let aliases = |t: u32| t == (task_id >> 1) || (t << 1) == task_id;
+        let mut saw_any = false;
+        let mut aliased_cover = false;
+        for s in &self.task_map_spans {
+            let exact = s.task_id == task_id;
+            if !exact && !aliases(s.task_id) {
+                continue;
+            }
+            saw_any = true;
+            if s.covers(gva, len) {
+                if exact {
+                    return WriteGate::Exact;
+                }
+                aliased_cover = true;
+            }
         }
-        self.task_map_spans.iter().any(|s| {
-            (s.task_id == task_id || s.task_id == (task_id >> 1) || (s.task_id << 1) == task_id)
-                && s.covers(gva, len)
-        })
+        if aliased_cover {
+            return WriteGate::Aliased;
+        }
+        if saw_any {
+            WriteGate::Outside
+        } else {
+            WriteGate::NoSpans
+        }
+    }
+
+    /// Whether the gate permits the write. See [`Self::gva_write_gate`] for why.
+    pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
+        self.gva_write_gate(task_id, gva, len) != WriteGate::Outside
     }
 
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.

@@ -195,14 +195,31 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     if buf.is_empty() {
         return Ok(());
     }
-    if !state.gva_write_allowed(task_id, gva, buf.len() as u64) {
-        let err = MemError::OutsideMap;
-        crate::observe::Emit::decline("gva_write", &err)
+    // The gate's own answer, not a label chosen here. It has three distinct ways
+    // to permit a write and nothing has ever read which one applied: a covered
+    // span, an *aliased* task's span, or no span registry at all. Only the last
+    // of those is a bounds check that did not happen, and `delete_task` clears
+    // the registry, so a write arriving after a teardown takes it.
+    let gate = state.gva_write_gate(task_id, gva, buf.len() as u64);
+    if gate == crate::model::WriteGate::Outside {
+        crate::observe::Emit::decline("gva_write", &gate)
             .field("task", task_id)
             .field("gva", format!("{gva:#x}"))
             .field("len", format!("{:#x}", buf.len()))
             .fail();
-        return Err(err);
+        return Err(MemError::OutsideMap);
+    }
+    // Census the permissive arms, latched per (arm, task). Exact is the arm the
+    // gate is supposed to take; the other two are the reading this exists for.
+    if gate != crate::model::WriteGate::Exact {
+        use crate::observe::Decline;
+        if crate::observe::first_sight(gate.slug(), u64::from(task_id)) {
+            crate::observe::Emit::decline("gva_write_gate", &gate)
+                .field("task", task_id)
+                .field("gva", format!("{gva:#x}"))
+                .field("len", format!("{:#x}", buf.len()))
+                .fail();
+        }
     }
     let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, gva, buf) else {
         return Ok(());
@@ -652,5 +669,49 @@ mod tests {
         state.note_task_unmap(1, 0x2000, 0x1000);
         // Registry empty again → allow.
         assert!(state.gva_write_allowed(1, 0x1000, 0x100));
+    }
+
+    /// The gate's four answers must be distinguishable, because three of them
+    /// are "allowed" and only one of those is a bounds check that happened.
+    ///
+    /// `gva_write_allowed` collapsed all of this to a `bool` and the caller
+    /// supplied the word `mem_outside_map` on the refusal — the shape
+    /// `AGENTS.md` calls out. A census built on the `bool` could not tell a
+    /// covered write from one permitted because the registry was empty, which
+    /// is exactly the state `delete_task` leaves behind.
+    #[test]
+    fn the_write_gate_names_which_arm_permitted_the_write() {
+        use crate::model::WriteGate;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(6, 0x1_0000, 2));
+
+        // Nothing recorded for task 6 or its aliases: allowed by default, and
+        // that is not a bounds check.
+        assert_eq!(
+            state.gva_write_gate(6, 0x2000, 0x100),
+            WriteGate::NoSpans,
+            "an empty registry is a gate that did not run, not a gate that passed"
+        );
+
+        // An exact span covers it.
+        state.note_task_map(6, 0x2000, 0x1000);
+        assert_eq!(state.gva_write_gate(6, 0x2000, 0x100), WriteGate::Exact);
+
+        // Spans exist for this task but none covers the range.
+        assert_eq!(state.gva_write_gate(6, 0x9000, 0x100), WriteGate::Outside);
+        assert!(!state.gva_write_allowed(6, 0x9000, 0x100));
+
+        // Only task 3's span covers it (6 >> 1 == 3), so the write is permitted
+        // on another task's authorisation. Exact must still win when both apply.
+        let mut aliased = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(aliased.define_task(3, 0x1_0000, 2));
+        aliased.note_task_map(3, 0x4000, 0x1000);
+        assert_eq!(
+            aliased.gva_write_gate(6, 0x4000, 0x100),
+            WriteGate::Aliased,
+            "a span recorded by task 3 must not be reported as task 6's own"
+        );
+        aliased.note_task_map(6, 0x4000, 0x1000);
+        assert_eq!(aliased.gva_write_gate(6, 0x4000, 0x100), WriteGate::Exact);
     }
 }
