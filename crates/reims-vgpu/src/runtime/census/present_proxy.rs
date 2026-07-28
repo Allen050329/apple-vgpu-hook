@@ -218,18 +218,6 @@ struct ThrashState {
     /// reported, so a sustained gap fires once per newly-widened episode, never
     /// per present. Pruned lazily (bounded by the live member set).
     dense_gap_active: std::collections::BTreeMap<u32, u64>,
-    /// Distinct torn-capture substitutions reported through
-    /// [`note_stale_present_substitute`]: a capture source whose full-frame
-    /// sequence (`dense_frame_seq`) lagged a same-geometry peer by
-    /// [`RETENTION_GAP_MARGIN`]+ full frames — a member that missed a RUN of
-    /// full frames (the fullscreen-transition vertical-strip + checkerboard torn
-    /// frame) — was replaced by that peer. Steady-state alternation stays below
-    /// the margin and never substitutes.
-    stale_present_substitute: u64,
-    /// Dedup for `stale_present_substitute`: selected_mid → the denser peer's
-    /// `dense_frame_seq` last reported, so a sustained lag fires once per
-    /// newly-widened episode, never per present.
-    stale_subst_active: std::collections::BTreeMap<u32, u64>,
     /// Dedup for `secondary_mrt_drop`: (reason_code, width, height) already
     /// reported this boot, so a per-draw MRT-secondary drop fires once per
     /// distinct combo, never per frame. Names which build path silently degraded
@@ -399,8 +387,6 @@ impl ThrashState {
             selected_peer_divergence: 0,
             dense_retention_gap: 0,
             dense_gap_active: std::collections::BTreeMap::new(),
-            stale_present_substitute: 0,
-            stale_subst_active: std::collections::BTreeMap::new(),
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
             secondary_mrt_blend_seen: std::collections::BTreeSet::new(),
             first_dense_seen: false,
@@ -1435,48 +1421,6 @@ pub fn note_dense_retention_gap(
     thrash_line(&format!(
         "dense_retention_gap presented_mid={presented_mid} presented_seq={presented_seq} peer_mid={peer_mid} peer_seq={peer_seq} lag={} {width}x{height}",
         peer_seq - presented_seq
-    ));
-    true
-}
-
-/// Fullscreen-transition torn-capture guard + regression proxy. The present
-/// drain substituted the full-frame-freshest same-geometry peer (`denser_mid`)
-/// for a selected member (`selected_mid`, via `mode`) whose full-frame sequence
-/// (`dense_frame_seq`) lagged by [`RETENTION_GAP_MARGIN`]+ — a member that missed
-/// a RUN of full frames, whose stale / partially-unwritten pages are the
-/// vertical-strip + checkerboard torn frame. Keyed purely on the decoded
-/// full-frame-Store sequence (protocol state), never pixel content. Fires once
-/// per newly-widened episode (deduped on the denser peer's seq), never per
-/// present. The caller runs it on the present drain (off the QEMU main core).
-pub fn note_stale_present_substitute(
-    selected_mid: u32,
-    selected_seq: u64,
-    denser_mid: u32,
-    denser_seq: u64,
-    width: u32,
-    height: u32,
-    mode: &str,
-    peer_presented: bool,
-) -> bool {
-    if denser_seq <= selected_seq {
-        return false;
-    }
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if st.stale_subst_active.get(&selected_mid) == Some(&denser_seq) {
-        return false;
-    }
-    st.stale_subst_active.insert(selected_mid, denser_seq);
-    st.stale_present_substitute = st.stale_present_substitute.saturating_add(1);
-    drop(st);
-    // `peer_presented` separates the two populations this substitution serves:
-    // a genuine swapchain sibling has itself been presented at this geometry
-    // (`presented_at`), whereas a never-presented full-frame publisher (a WebKit
-    // content tile / offscreen scratch surface) has not — substituting the
-    // latter hands one logical output's frame to another (the residue class).
-    thrash_line(&format!(
-        "stale_present_substitute selected_mid={selected_mid} selected_seq={selected_seq} denser_mid={denser_mid} denser_seq={denser_seq} lag={} mode={mode} peer_presented={} {width}x{height}",
-        denser_seq - selected_seq,
-        peer_presented as u8
     ));
     true
 }
@@ -3161,7 +3105,7 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
         st.last_summary_ms = now_ms;
         st.last_summary_presents = st.presents;
         thrash_line(&format!(
-            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} stale_subst={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
+            "summary presents={} present_hz={:.1} mid_sw={} named_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} dock={} rainbow={} void={} damage_hole={} damage_hole_bg={} peer_divergence={} dense_gap={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
             st.presents,
             present_hz,
             st.mid_switches,
@@ -3178,7 +3122,6 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
             st.damage_hole_bg,
             st.selected_peer_divergence,
             st.dense_retention_gap,
-            st.stale_present_substitute,
             st.first_dense_seen as u8,
             st.post_converge_regress,
             st.stale_online_pending,
