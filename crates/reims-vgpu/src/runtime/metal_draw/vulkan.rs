@@ -2544,44 +2544,55 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     }
     // Same coherence rule as the general loader: land any resident-
     // authoritative writeback aliasing the sampled span before reading it.
+    let t_flush = std::time::Instant::now();
     crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
+    let flush_us = t_flush.elapsed().as_micros() as u64;
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
-    if gva_mem::read_task_gva_by_id(
+    let t_read = std::time::Instant::now();
+    let read = gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
         gva,
         &mut scratch,
         state.page_shift,
-    )
-    .is_err()
-    {
+    );
+    let read_us = t_read.elapsed().as_micros() as u64;
+    if read.is_err() {
+        crate::runtime::census::setup_tex_census::note_lin_memo(flush_us, read_us, 0);
         state.guest_linear_scratch = scratch;
         return None;
     }
     let key = (task_id, gva, w, h, sample_fmt);
-    if let Some(m) = state.guest_linear_memo.get_touch(&key) {
+    let t_cmp = std::time::Instant::now();
+    let hit = state
+        .guest_linear_memo
+        .get_touch(&key)
         // Vec equality is length + byte memcmp with early exit on change.
-        if m.native == scratch {
-            let rgba = m.rgba.clone();
-            let generation = m.generation;
-            let fmt = if m.bgra8 {
-                TexelLayout::Bgra8
-            } else {
-                TexelLayout::Rgba8
-            };
-            state.guest_linear_scratch = scratch;
-            sampled_census::note(sampled_census::Branch::LinMemo, 0);
-            return Some((
-                rgba,
-                Some(LinearSampleIdentity {
-                    key: gva,
-                    generation,
-                }),
-                fmt,
-            ));
-        }
+        .filter(|m| m.native == scratch)
+        .map(|m| (m.rgba.clone(), m.generation, m.bgra8));
+    crate::runtime::census::setup_tex_census::note_lin_memo(
+        flush_us,
+        read_us,
+        t_cmp.elapsed().as_micros() as u64,
+    );
+    if let Some((rgba, generation, bgra8)) = hit {
+        let fmt = if bgra8 {
+            TexelLayout::Bgra8
+        } else {
+            TexelLayout::Rgba8
+        };
+        state.guest_linear_scratch = scratch;
+        sampled_census::note(sampled_census::Branch::LinMemo, 0);
+        return Some((
+            rgba,
+            Some(LinearSampleIdentity {
+                key: gva,
+                generation,
+            }),
+            fmt,
+        ));
     }
     // First sight or native bytes changed: convert fresh, new generation.
     let Some((rgba, fmt)) = native_scratch_to_upload(&scratch, w, h, bpr, sample_fmt, tight) else {

@@ -41,6 +41,11 @@ static ENSURE_US: AtomicU64 = AtomicU64::new(0);
 // engine-side (resident readiness / sample) or object-list-decode side.
 static BIND_US: AtomicU64 = AtomicU64::new(0);
 static BINDS: AtomicU64 = AtomicU64::new(0);
+// `load_linear_guest_memoized`, split three ways. See [`note_lin_memo`].
+static LIN_FLUSH_US: AtomicU64 = AtomicU64::new(0);
+static LIN_READ_US: AtomicU64 = AtomicU64::new(0);
+static LIN_CMP_US: AtomicU64 = AtomicU64::new(0);
+static LIN_CALLS: AtomicU64 = AtomicU64::new(0);
 
 // Snapshot at the previous emit, for window (recent) per-bind deltas.
 static LAST_RESOLVE_US: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +98,22 @@ pub fn note_bind(us: u64) {
     BIND_US.fetch_add(us, Ordering::Relaxed);
 }
 
+/// Record `load_linear_guest_memoized`'s three costs for one call: the aliasing
+/// flush, the full guest read of the sampled span, and the memo compare.
+///
+/// This path is 35 % of all sampled binds and the branch census reports it as
+/// `lin_memo=<n>:0` — zero *upload* bytes, which reads like a free cache hit and
+/// is not one. Declaring the hit re-reads the whole span out of guest memory and
+/// memcmps it against the memo first, and none of that lay inside `ref`, `ensure`
+/// or `bind`. All three of those read under 1 us/bind while `resolve` ran to
+/// 500 us, so this is the largest hole in the split.
+pub fn note_lin_memo(flush_us: u64, read_us: u64, cmp_us: u64) {
+    LIN_FLUSH_US.fetch_add(flush_us, Ordering::Relaxed);
+    LIN_READ_US.fetch_add(read_us, Ordering::Relaxed);
+    LIN_CMP_US.fetch_add(cmp_us, Ordering::Relaxed);
+    LIN_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Cumulative `(resolve_us, stats_us, ref_us, ensure_us, binds)`.
 pub fn snapshot() -> (u64, u64, u64, u64, u64) {
     (
@@ -118,6 +139,7 @@ fn format_line() -> String {
     // WAITING for the global engine mutex (vs doing work under it). A high
     // `eng_wait_per_acq_us` during a dock-hover freeze proves the drain worker
     // is lock-bound behind a present-path holder, not compute-bound.
+    let lin_calls = LIN_CALLS.load(Ordering::Relaxed);
     let (eng_wait_ns, eng_acq, eng_max_ns) = engine_lock_snapshot();
     let w_eng_wait_ns = eng_wait_ns - LAST_ENG_WAIT_NS.swap(eng_wait_ns, Ordering::Relaxed);
     let w_eng_acq = eng_acq - LAST_ENG_ACQ.swap(eng_acq, Ordering::Relaxed);
@@ -125,7 +147,8 @@ fn format_line() -> String {
         "setup_tex_split binds={binds} resolve_per_bind_us={} ref_per_bind_us={} \
          ensure_per_bind_us={} bind_per_bind_us={} stats_per_bind_us={} | \
          win_resolve_us={} win_ref_us={} win_ensure_us={} win_bind_us={} | \
-         eng_wait_per_acq_us={} eng_acq={} eng_max_us={}",
+         eng_wait_per_acq_us={} eng_acq={} eng_max_us={} | \
+         lin_calls={} lin_flush_per_call_us={} lin_read_per_call_us={} lin_cmp_per_call_us={}",
         per(resolve_us, binds),
         per(ref_us, binds),
         per(ensure_us, binds),
@@ -138,6 +161,10 @@ fn format_line() -> String {
         per(w_eng_wait_ns / 1000, w_eng_acq),
         w_eng_acq,
         eng_max_ns / 1000,
+        lin_calls,
+        per(LIN_FLUSH_US.load(Ordering::Relaxed), lin_calls),
+        per(LIN_READ_US.load(Ordering::Relaxed), lin_calls),
+        per(LIN_CMP_US.load(Ordering::Relaxed), lin_calls),
     )
 }
 
