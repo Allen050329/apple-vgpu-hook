@@ -409,19 +409,38 @@ server's composite, which is what the guest believes it is showing. Two captures
 split the only question that matters for a whole class of defects: *is the guest still publishing
 this, or are we still presenting it?*
 
-That split is what finally localized the residue class, after every prior attempt had compared one of
-our frames against another of our frames. Eight windows were opened, the app was killed, its process
-count was polled to zero, and both screens were captured. The guest's screen was **byte-identical**
-to the same round's bare desktop, menu bar reading Finder. Ours held a fully drawn, dead application
-window — half a million pixels above 64/255. Three times. The guest had moved on; we had not. No
-host-only measurement can reach that conclusion, because a host-only measurement cannot tell a stale
-present from a guest that has not repainted.
+Two things make the guest arm attractive. It is **self-consistent by construction** — the reference
+and the measurement are taken with the same instrument in the same round. And it is **independent of
+our code**, which is the entire point: it is the only frame in the comparison that our present path
+did not produce.
 
-Two things make the guest arm trustworthy. It is **self-consistent by construction** — the reference
-and the measurement are taken with the same instrument in the same round, so whatever `screencapture`
-includes or omits (it renders without the Dock here) it does so identically in both. And it is
-**independent of our code**, which is the entire point: it is the only frame in the comparison that
-our present path did not produce.
+**But on this rig `screencapture` does not render application windows at all, and it says nothing
+when it declines to.** Measured directly: TextEdit was opened on a file, its process count read 1,
+and the guest's own capture showed the menu bar correctly switched to **TextEdit** — so the
+instrument is live and tracking the frontmost app — with **no window anywhere in the frame**. Our
+host window at the same instant showed that window, titled, with its text. The same test on Safari
+and on a Finder window gives the same answer. Nine captures across one run were bare desktop, eight
+of them byte-identical.
+
+The cause is TCC: since macOS 10.15 a process without the **Screen Recording** grant gets a
+screenshot containing the desktop picture and the menu bar and nothing else, with **exit code 0 and
+no diagnostic**. This guest's system TCC database holds three rows and not one of them is a screen
+grant, and SIP is enabled, so it cannot be inserted headlessly. An SSH-launched `screencapture` will
+therefore never see a window here.
+
+So the guest arm is valid for exactly what it draws — **wallpaper, desktop, menu bar** — and the
+colour findings above, which are all wallpaper measurements, stand. It is **worthless for anything
+window-shaped**, and any comparison of the form "the guest's screen is bare and ours holds a window"
+is that hole reporting itself. **The residue localization this section used to cite was exactly that
+shape and is retracted**: "eight windows opened, app killed, guest byte-identical to bare desktop,
+ours holding a dead window, three times" is the guaranteed output of an instrument that omits every
+window, whether or not any residue existed.
+
+This is the "establish what each arm renders" rule below, one level worse than the Dock case that
+motivated it: there the arm omitted a strip, here it omits the entire subject. Note how it survived —
+the arm was checked for *liveness* (it tracked the frontmost app, its bytes changed when the scene
+changed) and liveness was read as *coverage*. Before trusting any arm, drive the specific thing you
+intend to measure into it and confirm it appears.
 
 Assert the transition you are measuring across. "Killed the app" must mean a process count read as
 zero, not a keystroke that was sent. A first hand-run of that sequence quit with `meta_l+q`, the app
@@ -495,10 +514,11 @@ answering for every boot after the question that prompted it is closed.
 
 **Establish what each arm of a comparison renders before trusting it.** An arm that omits a region
 does not report "no difference" there — it reports nothing, and the other arm's difference is then
-unopposed. The guest-screen comparison above has exactly this hole: `screencapture` renders without
-the Dock and our host window shows it, so any Dock change scores as a host-only difference with a
-byte-clean guest arm. That is the same reading as "the guest moved on and we did not", produced for
-free, in a region the design cannot see.
+unopposed. The guest-screen comparison above has this hole twice over: `screencapture` renders
+without the Dock, and — far worse, see the retraction there — without **any application window**. So
+both a Dock change and an entire window score as a host-only difference against a byte-clean guest
+arm. That is the same reading as "the guest moved on and we did not", produced for free, in regions
+the design cannot see.
 
 It is not hypothetical. Three "residue reproductions" across two boots were a 61-65 px strip whose
 top edge sat within 4 px of y=616; cropped, the strip is the Dock, and the guest capture at the same
