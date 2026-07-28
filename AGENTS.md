@@ -142,6 +142,27 @@ after the gesture and score the burst, rather than sampling its endpoints. Befor
 sequence does not reproduce, confirm the sampling rate could have caught it — and prefer the
 always-on log, which is continuous by construction and did record the failure the captures missed.
 
+**A live rig is not a live workload — validate the specific thing you drove.** "The log grew and
+presents happened" proves the rig is alive. It does not prove the workload ran, and the two get
+confused because a healthy-looking log is exactly what a validity check is supposed to produce.
+
+Two escalating drives here — 8 heavy pages with gestures, then 12 pages in separate windows plus 60 s
+of sustained animation — each returned zero for the counter under test. A probe-validity check was
+run and passed: 1.9 MB and 10 678 lines appended, 797 presents, 383 exports. A per-boot mechanism was
+inferred from the zeros and written into the KB and a commit body. **The guest was at the login
+window the whole time.** The browser never ran, not one page loaded, and every one of those presents
+was the login screen — which renders a full-screen wallpaper and a cursor and drives the present path
+perfectly well.
+
+Nothing objected, because nothing was asked: `open -a` is silent with no session, ssh answers, QMP
+answers, and the failure channel is genuinely clean when there is no work to fail at. It was caught
+only because the *next* experiment needed the browser to be running and said so out loud.
+
+So a validity check must be specific to the workload: for a browser drive that is "the browser is
+running", not "pixels moved". This is the dead-VM-scores-`0 px` failure one level up — the guard
+written for that proves QEMU exists, and nothing proved a session did. Assert the precondition of the
+thing you are driving, before the drive, and abort rather than score it.
+
 **Exclusions decay, and nobody re-tests them.** The anti-pattern list already forbids claiming a
 class is fixed from one clean boot. Negative results are exactly as fragile and strictly more
 dangerous, because a wrong fix gets found the next time someone looks at the screen while a wrong
