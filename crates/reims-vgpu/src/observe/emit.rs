@@ -141,7 +141,14 @@ impl Emit {
 /// unit-testable without capturing the sink. Unbounded by design: the key space
 /// is (registered slug × a wire value), and a guest that walks enough distinct
 /// values to matter has a bug the log should be shouting about.
-fn first_sight(reason: &'static str, discriminant: u64) -> bool {
+///
+/// Public so a caller on a hot path can take the latch *before* building the
+/// line. [`Emit::field`] renders eagerly, so a census sited inside a per-span
+/// resolver would allocate on every call and keep throwing the result away —
+/// a probe paying a cost proportional to the traffic it is measuring. Callers
+/// that latch here must then send with [`Emit::fail`], not [`Emit::fail_once`]:
+/// this call consumes the latch.
+pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<(&'static str, u64)>>> = OnceLock::new();

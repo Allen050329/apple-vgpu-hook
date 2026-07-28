@@ -46,7 +46,7 @@ mod gate;
 pub mod sink;
 
 pub use decline::{Decline, DeclineClass, Emission, Refusal, REGISTRY};
-pub use emit::Emit;
+pub use emit::{first_sight, Emit};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
 // rather than `observe::sink::fail(…)`. `sink` stays public for the gate and

@@ -121,20 +121,97 @@ pub fn find_covering_view(
     })
 }
 
+/// Which slot a guest access resolved to, when the wire task word could name
+/// more than one of them.
+///
+/// `DefineTask2` (op `0x38`) registers a task under `raw_id >> 1`
+/// ([`crate::model::DEFINE_TASK_ID_SHIFT`]), while `DeleteTask` (`0x20`),
+/// `SetObjectList` (`0x33`), `MapMemory2` (`0x39`), `UnmapMemory` (`0x22`),
+/// `DeleteObject` (`0x25`) and `CursorGlyph` (`0x04`) read a task word at the
+/// same payload offset **unshifted**. Nothing decodes that word canonically;
+/// callers instead try the wire id and then `id >> 1`.
+///
+/// That works while only one of the two slots is live, which is why it has
+/// survived: for an unshifted opcode naming `2n`, slot `2n` is empty and the
+/// fallback lands on the task the guest meant. [`TaskWalkSlot::Shifted`] is
+/// therefore the *ordinary* mode, and on its own it says nothing.
+///
+/// It stops working when both slots are live. Then the wire word `n` names an
+/// active task `n` **and** an active define-task `n >> 1`, the walk takes `n`
+/// because it looks there first, and a guest that meant `n >> 1` is handed
+/// another task's page tables. A read resolved that way returns another task's
+/// bytes; a **write** resolved that way puts host bytes at a GPA the named task
+/// does not own — guest heap corruption rather than a rendering defect.
+///
+/// Ambiguity is a property of `tasks[]` at the moment of the walk, so it is read
+/// from the table rather than counted from events: a count of aliased *walks*
+/// would say how often the fallback ran, never whether the namespace collided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskWalkSlot {
+    /// The wire id named no live task, so the walk used `id >> 1`. Expected for
+    /// every opcode that reads the task word unshifted.
+    Shifted,
+    /// The wire id and `id >> 1` both name live tasks. The walk took the wire
+    /// id; which one the guest meant is not recoverable from the wire.
+    Ambiguous,
+}
+
+impl crate::observe::Decline for TaskWalkSlot {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Shifted => "task_walk_shifted",
+            Self::Ambiguous => "task_walk_ambiguous",
+        }
+    }
+}
+
+/// Record which slot the walk chose, latched per `(named, resolved)` pair.
+///
+/// Latched rather than counted because the pair is the identity that matters and
+/// the first sighting is timestamped — a boot that drives several stages gets a
+/// set difference between them for free. The discriminant is built from the two
+/// ids alone: both are stable identities, not accumulators, so this cannot
+/// repeat the reverted witness whose discriminator read a counter that many
+/// events advanced.
+///
+/// The latch is taken *before* the line is built, not by `fail_once` after it.
+/// This sits inside the resolver every guest read and write goes through, and
+/// `Emit::field` renders eagerly — building and dropping two `String`s per walk
+/// would make the probe cost scale with the traffic it is measuring.
+fn note_task_walk_slot(slot: TaskWalkSlot, named: u32, resolved: u32) {
+    use crate::observe::Decline;
+    let discriminant = (u64::from(named) << 32) | u64::from(resolved);
+    if !crate::observe::first_sight(slot.slug(), discriminant) {
+        return;
+    }
+    crate::observe::Emit::decline("task_walk", &slot)
+        .field("named", named)
+        .field("resolved", resolved)
+        .fail();
+}
+
 /// Resolve which task slot to walk (wire id, then define-task `>> 1`).
+///
+/// Reports which arm answered through [`TaskWalkSlot`]; see that type for why
+/// the interesting reading is ambiguity and not the fallback itself.
 fn resolve_task_for_walk(tasks: &[TaskEntry], task_id: u32) -> Option<(u32, &TaskEntry)> {
+    let shifted = task_id >> 1;
+    let shifted_live = shifted != task_id
+        && (shifted as usize) < tasks.len()
+        && tasks[shifted as usize].active
+        && tasks[shifted as usize].directory_pfn != 0;
     if (task_id as usize) < tasks.len() {
         let t = &tasks[task_id as usize];
         if t.active && t.directory_pfn != 0 {
+            if shifted_live {
+                note_task_walk_slot(TaskWalkSlot::Ambiguous, task_id, task_id);
+            }
             return Some((task_id, t));
         }
     }
-    let shifted = task_id >> 1;
-    if shifted != task_id && (shifted as usize) < tasks.len() {
-        let t = &tasks[shifted as usize];
-        if t.active && t.directory_pfn != 0 {
-            return Some((shifted, t));
-        }
+    if shifted_live {
+        note_task_walk_slot(TaskWalkSlot::Shifted, task_id, shifted);
+        return Some((shifted, &tasks[shifted as usize]));
     }
     None
 }
@@ -821,6 +898,88 @@ mod tests {
         st32(&mut pte, 4);
         host.write_gpa(root_gpa, &pte).unwrap();
         (host, root_gpa, data0, data1, page)
+    }
+
+    /// Read the always-on log from `from` to the end.
+    fn log_tail(from: usize) -> String {
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        body[from.min(body.len())..].to_string()
+    }
+
+    /// Start capturing the always-on log; returns the offset to slice from.
+    fn log_mark() -> usize {
+        crate::observe::redirect_logs_for_tests();
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len()
+    }
+
+    /// A wire task word that names two live tasks at once is not resolvable
+    /// from the wire, and the walk silently prefers one of them.
+    ///
+    /// `DefineTask2` registers under `raw >> 1` while the opcodes that later
+    /// name the task read it unshifted, so slot `n` and slot `n >> 1` can both
+    /// be live. When they are, a write naming `n` translates through slot `n`'s
+    /// page tables — and a guest that meant `n >> 1` has its bytes written into
+    /// a different task's address space.
+    ///
+    /// Ids 9 and 4 rather than 2 and 1: the emission is latched per
+    /// `(slug, named, resolved)` for the life of the process, so a pair that
+    /// another test in this binary also walks would make this test pass or fail
+    /// on ordering.
+    #[test]
+    fn ambiguous_task_word_is_named_when_both_slots_are_live() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(4, page, 2));
+        assert!(state.define_task(9, page, 2));
+        let before = log_mark();
+        assert!(write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4]).is_ok());
+        let tail = log_tail(before);
+        let line = tail
+            .lines()
+            .find(|l| l.contains("task_walk "))
+            .expect("a walk whose wire word names two live tasks is always-on");
+        assert!(
+            line.contains("reason=task_walk_ambiguous"),
+            "both slots live must read as ambiguous, not as the ordinary \
+             fallback: {line}"
+        );
+        assert!(
+            line.contains("named=9") && line.contains("resolved=9"),
+            "the line must say which slot won: {line}"
+        );
+    }
+
+    /// The ordinary case must **not** read as ambiguous, or the census would
+    /// report the fallback's own volume and answer a question nobody asked.
+    ///
+    /// With only slot 4 live, wire word 9 has exactly one meaning and the
+    /// `>> 1` fallback is doing the job it was written for.
+    #[test]
+    fn lone_define_task_slot_is_not_reported_as_ambiguous() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(4, page, 2));
+        let before = log_mark();
+        assert!(write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4]).is_ok());
+        let tail = log_tail(before);
+        assert!(
+            !tail.contains("task_walk_ambiguous"),
+            "one live slot is not an ambiguous wire word: {tail}"
+        );
+        let line = tail
+            .lines()
+            .find(|l| l.contains("task_walk "))
+            .expect("the fallback arm is still recorded, so its volume is readable");
+        assert!(
+            line.contains("reason=task_walk_shifted")
+                && line.contains("named=9")
+                && line.contains("resolved=4"),
+            "the fallback must name both the wire id and the slot it used: {line}"
+        );
     }
 
     /// Guest writes must land where the PT points **now**, not where a
