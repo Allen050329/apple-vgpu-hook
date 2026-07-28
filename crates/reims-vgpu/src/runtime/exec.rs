@@ -8,7 +8,7 @@ use crate::contract::endian::{ld32, ld64};
 use crate::contract::pixel_format::{f64_to_unorm8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
 use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
-use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
+use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind, OP_GENERATE_MIPMAPS};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::event as event_decode;
@@ -569,24 +569,12 @@ fn walk_stream<M: HostMemory + HostOps>(
                 });
             }
             SEGMENT_TYPE_COMPUTE => {
-                let mut cacc = ComputeAccum::default();
-                let mut session: Option<crate::runtime::compute_session::ComputeSession> = None;
-                let mut seq_block: Option<crate::runtime::compute_session::SequencingBlock> = None;
+                let mut compute = crate::runtime::compute_session::ComputeSegment::default();
                 walk_segment_records(stream, &seg, |r| {
-                    handle_compute_record(
-                        state,
-                        host,
-                        task_id,
-                        stream,
-                        r,
-                        out,
-                        &mut cacc,
-                        &mut session,
-                        &mut seq_block,
-                    )
+                    handle_compute_record(state, host, task_id, stream, r, out, &mut compute)
                 });
                 if let Some(st) = crate::runtime::compute_session::finish_session(
-                    &mut session,
+                    &mut compute.session,
                     state,
                     host,
                     task_id,
@@ -602,7 +590,6 @@ fn walk_stream<M: HostMemory + HostOps>(
                         }
                     }
                 }
-                let _ = seq_block;
             }
             SEGMENT_TYPE_EVENT => {
                 walk_segment_records(stream, &seg, |r| {
@@ -703,10 +690,6 @@ fn handle_event_record(
     );
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the dispatcher receives the decoded record and each owning execution context"
-)]
 /// Name a compute refusal at the rail boundary.
 ///
 /// Until this existed the three dispatch/control/ICB arms below only
@@ -739,9 +722,7 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     stream: &[u8],
     rec: &stream::Record,
     out: &mut ExecResult,
-    acc: &mut ComputeAccum,
-    session: &mut Option<crate::runtime::compute_session::ComputeSession>,
-    block: &mut Option<crate::runtime::compute_session::SequencingBlock>,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) {
     let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
     if end > stream.len() {
@@ -786,32 +767,35 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             );
         }
         ComputeKind::BufferBind | ComputeKind::BufferBindAttributeStride => {
-            let before = acc.buffers.len();
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block);
-            if acc.buffers.len() > before {
-                out.compute_buffer_binds += (acc.buffers.len() - before) as u32;
+            let before = seg.acc.buffers.len();
+            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
+            if seg.acc.buffers.len() > before {
+                out.compute_buffer_binds += (seg.acc.buffers.len() - before) as u32;
             } else {
-                out.compute_buffer_binds = out.compute_buffer_binds.max(acc.buffers.len() as u32);
+                out.compute_buffer_binds =
+                    out.compute_buffer_binds.max(seg.acc.buffers.len() as u32);
             }
         }
         ComputeKind::TextureBind => {
-            let before = acc.textures.len();
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block);
-            if acc.textures.len() > before {
-                out.compute_texture_binds += (acc.textures.len() - before) as u32;
+            let before = seg.acc.textures.len();
+            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
+            if seg.acc.textures.len() > before {
+                out.compute_texture_binds += (seg.acc.textures.len() - before) as u32;
             } else {
-                out.compute_texture_binds =
-                    out.compute_texture_binds.max(acc.textures.len() as u32);
+                out.compute_texture_binds = out
+                    .compute_texture_binds
+                    .max(seg.acc.textures.len() as u32);
             }
         }
         ComputeKind::SamplerBind | ComputeKind::SamplerLod => {
-            let before = acc.samplers.len();
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block);
-            if acc.samplers.len() > before {
-                out.compute_sampler_binds += (acc.samplers.len() - before) as u32;
+            let before = seg.acc.samplers.len();
+            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
+            if seg.acc.samplers.len() > before {
+                out.compute_sampler_binds += (seg.acc.samplers.len() - before) as u32;
             } else {
-                out.compute_sampler_binds =
-                    out.compute_sampler_binds.max(acc.samplers.len() as u32);
+                out.compute_sampler_binds = out
+                    .compute_sampler_binds
+                    .max(seg.acc.samplers.len() as u32);
             }
         }
         ComputeKind::Pipeline
@@ -827,14 +811,14 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::UseHeaps
         | ComputeKind::UseResources
         | ComputeKind::CompressedTextureFlush => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block);
+            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
         }
         ComputeKind::DispatchThreadgroups
         | ComputeKind::DispatchThreads
         | ComputeKind::DispatchThreadgroupsIndirect
         | ComputeKind::DispatchThreadsIndirect => {
-            let pipeline_ref = acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block) {
+            let pipeline_ref = seg.acc.pipeline_ref;
+            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 Some(ComputeStatus::Ok) => out.compute_dispatches_ok += 1,
                 Some(st) => {
                     out.compute_dispatches_fail += 1;
@@ -850,8 +834,8 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::ControlStartIf
         | ComputeKind::ControlStartElse
         | ComputeKind::ControlEndIf => {
-            let pipeline_ref = acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block) {
+            let pipeline_ref = seg.acc.pipeline_ref;
+            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 Some(ComputeStatus::Ok) => out.compute_control_ok += 1,
                 Some(st) => {
                     out.compute_control_fail += 1;
@@ -861,8 +845,8 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             }
         }
         ComputeKind::ExecuteCommandsInBuffer | ComputeKind::ExecuteCommandsInBufferIndirect => {
-            let pipeline_ref = acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, acc, session, block) {
+            let pipeline_ref = seg.acc.pipeline_ref;
+            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 Some(ComputeStatus::Ok) => out.compute_icb_ok += 1,
                 Some(st) => {
                     out.compute_icb_fail += 1;

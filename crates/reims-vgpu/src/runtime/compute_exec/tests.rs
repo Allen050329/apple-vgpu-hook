@@ -424,20 +424,15 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    let mut session = None;
-    let mut block = None;
+    let mut seg = crate::runtime::compute_session::ComputeSegment {
+        acc,
+        session: None,
+        block: None,
+    };
     let mut cmd = ComputeCommand::default();
     // Empty start-do-while encodes without a condition buffer.
     cmd.kind = Kind::ControlStartDoWhile;
-    let st = apply_record(
-        &mut state,
-        &mut host,
-        1,
-        &cmd,
-        &mut acc,
-        &mut session,
-        &mut block,
-    );
+    let st = apply_record(&mut state, &mut host, 1, &cmd, &mut seg);
     assert!(
         matches!(
             st,
@@ -449,15 +444,7 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
     );
     cmd.kind = Kind::ExecuteCommandsInBuffer;
     cmd.indirect_command_buffer_ref = 99;
-    let st = apply_record(
-        &mut state,
-        &mut host,
-        1,
-        &cmd,
-        &mut acc,
-        &mut session,
-        &mut block,
-    );
+    let st = apply_record(&mut state, &mut host, 1, &cmd, &mut seg);
     // Missing object-list entry → MissingBuffer; still latches sequencing.
     assert!(
         matches!(
@@ -466,8 +453,8 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
         ),
         "unexpected {st:?}"
     );
-    assert!(block.is_some());
-    if let Some(s) = session.take() {
+    assert!(seg.block.is_some());
+    if let Some(s) = seg.session.take() {
         let _ = s.finish(&mut host, &mut state, 1);
     }
 }

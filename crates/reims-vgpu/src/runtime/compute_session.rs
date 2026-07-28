@@ -427,6 +427,23 @@ impl ComputeSession {
     }
 }
 
+/// The mutable state of one `SEGMENT_TYPE_COMPUTE` segment.
+///
+/// These three share a single lifetime: they come into existence when the
+/// segment opens, every record in the segment reads and mutates them together,
+/// and the session commits when the segment ends. Passing them as one value
+/// keeps that lifetime visible at each call site.
+#[derive(Default)]
+pub struct ComputeSegment {
+    /// Pipeline / bind state accumulated across the segment's records.
+    pub acc: ComputeAccum,
+    /// Multi-record encoder, opened on demand by the first control-flow or ICB
+    /// record and committed at segment end.
+    pub session: Option<ComputeSession>,
+    /// Latched sequencing failure; once set it refuses later dispatches.
+    pub block: Option<SequencingBlock>,
+}
+
 pub fn ensure_session(
     session: &mut Option<ComputeSession>,
     dispatch_type: u32,
@@ -442,11 +459,9 @@ pub fn apply_sequencing<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     cmd: &ComputeCommand,
-    acc: &mut ComputeAccum,
-    session: &mut Option<ComputeSession>,
-    block: &mut Option<SequencingBlock>,
+    seg: &mut ComputeSegment,
 ) -> ComputeStatus {
-    if block.is_some() {
+    if seg.block.is_some() {
         return ComputeStatus::Unsupported("sequencing_block_active");
     }
     match cmd.kind {
@@ -457,32 +472,32 @@ pub fn apply_sequencing<M: HostMemory + HostOps>(
         | Kind::ControlStartIf
         | Kind::ControlStartElse
         | Kind::ControlEndIf => {
-            let sess = match ensure_session(session, acc.dispatch_type) {
+            let sess = match ensure_session(&mut seg.session, seg.acc.dispatch_type) {
                 Ok(s) => s,
                 Err(e) => {
-                    *block = Some(SequencingBlock::ControlFlow);
+                    seg.block = Some(SequencingBlock::ControlFlow);
                     return e;
                 }
             };
             let st = sess.encode_control(state, host, task_id, cmd);
             if !matches!(st, ComputeStatus::Ok) {
-                *block = Some(SequencingBlock::ControlFlow);
+                seg.block = Some(SequencingBlock::ControlFlow);
             }
             st
         }
         Kind::ExecuteCommandsInBuffer | Kind::ExecuteCommandsInBufferIndirect => {
-            let sess = match ensure_session(session, acc.dispatch_type) {
+            let sess = match ensure_session(&mut seg.session, seg.acc.dispatch_type) {
                 Ok(s) => s,
                 Err(e) => {
-                    *block = Some(SequencingBlock::IndirectCommandBuffer);
+                    seg.block = Some(SequencingBlock::IndirectCommandBuffer);
                     return e;
                 }
             };
-            let st = sess.encode_icb(state, host, task_id, cmd, acc);
+            let st = sess.encode_icb(state, host, task_id, cmd, &seg.acc);
             // Latch only on failure so successful materialize+execute does not
             // block later dispatches in the segment.
             if !matches!(st, ComputeStatus::Ok) {
-                *block = Some(SequencingBlock::IndirectCommandBuffer);
+                seg.block = Some(SequencingBlock::IndirectCommandBuffer);
             }
             st
         }
@@ -1491,23 +1506,13 @@ mod tests {
     fn icb_latches_sequencing_block() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut acc = ComputeAccum::default();
-        let mut session = None;
-        let mut block = None;
+        let mut seg = ComputeSegment::default();
         let cmd = ComputeCommand {
             kind: Kind::ExecuteCommandsInBuffer,
             indirect_command_buffer_ref: 1,
             ..ComputeCommand::default()
         };
-        let st = apply_sequencing(
-            &mut state,
-            &mut host,
-            1,
-            &cmd,
-            &mut acc,
-            &mut session,
-            &mut block,
-        );
+        let st = apply_sequencing(&mut state, &mut host, 1, &cmd, &mut seg);
         // Missing list entry → MissingBuffer; latches sequencing block.
         // Non-Apple metal stubs may short-circuit to NoMetal (Linux product).
         assert!(
@@ -1519,8 +1524,8 @@ mod tests {
             ),
             "unexpected {st:?}"
         );
-        assert_eq!(block, Some(SequencingBlock::IndirectCommandBuffer));
-        if let Some(s) = session.take() {
+        assert_eq!(seg.block, Some(SequencingBlock::IndirectCommandBuffer));
+        if let Some(s) = seg.session.take() {
             let _ = s.finish(&mut host, &mut state, 1);
         }
     }

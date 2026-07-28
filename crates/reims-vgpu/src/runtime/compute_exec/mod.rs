@@ -444,49 +444,50 @@ impl std::error::Error for ComputeSpirvDecline {}
 
 /// Apply one decoded compute command to accum, or run a dispatch / sequencing op.
 ///
-/// `session` / `block` are the per-segment multi-record encoder and latched
-/// sequencing failure (ICB / control encode error). Pass `None` from unit tests
-/// that only exercise binds / one-shot dispatch.
+/// `seg` carries the whole segment's mutable state: the accum this record
+/// updates, the multi-record encoder a dispatch encodes onto when one is open,
+/// and the latched sequencing failure (ICB / control encode error) that refuses
+/// later dispatches.
 pub fn apply_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     cmd: &ComputeCommand,
-    acc: &mut ComputeAccum,
-    session: &mut Option<crate::runtime::compute_session::ComputeSession>,
-    block: &mut Option<crate::runtime::compute_session::SequencingBlock>,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
     match cmd.kind {
         Kind::Pipeline => {
-            acc.set_pipeline(cmd.pipeline_ref);
+            seg.acc.set_pipeline(cmd.pipeline_ref);
             None
         }
         Kind::BufferBind | Kind::BufferBindAttributeStride => {
-            acc.bind_buffers(cmd.first, &cmd.buffers);
+            seg.acc.bind_buffers(cmd.first, &cmd.buffers);
             None
         }
         Kind::BufferOffset => {
-            acc.set_buffer_offset(cmd.first, cmd.buffer_offset, None);
+            seg.acc
+                .set_buffer_offset(cmd.first, cmd.buffer_offset, None);
             None
         }
         Kind::BufferOffsetAttributeStride => {
-            acc.set_buffer_offset(cmd.first, cmd.buffer_offset, Some(cmd.attribute_stride));
+            seg.acc
+                .set_buffer_offset(cmd.first, cmd.buffer_offset, Some(cmd.attribute_stride));
             None
         }
         Kind::TextureBind => {
-            acc.bind_textures(cmd.first, &cmd.textures);
+            seg.acc.bind_textures(cmd.first, &cmd.textures);
             None
         }
         Kind::SamplerBind | Kind::SamplerLod => {
-            acc.bind_samplers(cmd.first, &cmd.samplers);
+            seg.acc.bind_samplers(cmd.first, &cmd.samplers);
             None
         }
         Kind::DispatchType => {
-            acc.dispatch_type = cmd.dispatch_type;
+            seg.acc.dispatch_type = cmd.dispatch_type;
             None
         }
         Kind::StageInRegion => {
-            acc.set_stage_in_region(StageInRegion {
+            seg.acc.set_stage_in_region(StageInRegion {
                 origin_x: cmd.stage_in_region.origin.x,
                 origin_y: cmd.stage_in_region.origin.y,
                 origin_z: cmd.stage_in_region.origin.z,
@@ -497,34 +498,36 @@ pub fn apply_record<M: HostMemory + HostOps>(
             None
         }
         Kind::StageInRegionIndirect => {
-            acc.set_stage_in_region_indirect(
+            seg.acc.set_stage_in_region_indirect(
                 cmd.stage_in_indirect_buffer_ref,
                 cmd.stage_in_indirect_buffer_offset,
             );
             None
         }
         Kind::ThreadgroupMemory => {
-            acc.set_threadgroup_memory(cmd.threadgroup_memory_index, cmd.threadgroup_memory_length);
+            seg.acc
+                .set_threadgroup_memory(cmd.threadgroup_memory_index, cmd.threadgroup_memory_length);
             None
         }
         Kind::ImageblockDimensions => {
-            acc.set_imageblock(cmd.imageblock_width, cmd.imageblock_height);
+            seg.acc
+                .set_imageblock(cmd.imageblock_width, cmd.imageblock_height);
             None
         }
         Kind::DispatchThreadgroups
         | Kind::DispatchThreads
         | Kind::DispatchThreadgroupsIndirect
         | Kind::DispatchThreadsIndirect => {
-            if block.is_some() {
+            if seg.block.is_some() {
                 return Some(ComputeStatus::Unsupported("dispatch_in_sequencing_block"));
             }
             // Open multi-record session (control-flow SPI): encode on that encoder.
-            if let Some(sess) = session.as_mut() {
+            if let Some(sess) = seg.session.as_mut() {
                 return Some(execute_dispatch_nested(
-                    state, host, task_id, acc, cmd, sess,
+                    state, host, task_id, &seg.acc, cmd, sess,
                 ));
             }
-            Some(execute_dispatch(state, host, task_id, acc, cmd))
+            Some(execute_dispatch(state, host, task_id, &seg.acc, cmd))
         }
         Kind::UpdateFence | Kind::WaitFence => None,
         // Ordered no-ops at the product one-dispatch boundary.
@@ -543,7 +546,7 @@ pub fn apply_record<M: HostMemory + HostOps>(
         | Kind::ExecuteCommandsInBuffer
         | Kind::ExecuteCommandsInBufferIndirect => {
             Some(crate::runtime::compute_session::apply_sequencing(
-                state, host, task_id, cmd, acc, session, block,
+                state, host, task_id, cmd, seg,
             ))
         }
         Kind::Unknown => None,
