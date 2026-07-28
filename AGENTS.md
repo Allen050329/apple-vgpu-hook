@@ -238,6 +238,31 @@ of the variants it selects among, so rendering each variant on its own establish
 output must fall in. A result outside that range is a defect and not a selection, and that argument
 holds without knowing which variant was selected.
 
+**Capture the guest's screen next to ours — it is the nearest thing to known input this rig has.**
+The host window is our present path's output. The guest's own `screencapture` reads the window
+server's composite, which is what the guest believes it is showing. Two captures of the same instant
+split the only question that matters for a whole class of defects: *is the guest still publishing
+this, or are we still presenting it?*
+
+That split is what finally localized the residue class, after every prior attempt had compared one of
+our frames against another of our frames. Eight windows were opened, the app was killed, its process
+count was polled to zero, and both screens were captured. The guest's screen was **byte-identical**
+to the same round's bare desktop, menu bar reading Finder. Ours held a fully drawn, dead application
+window — half a million pixels above 64/255. Three times. The guest had moved on; we had not. No
+host-only measurement can reach that conclusion, because a host-only measurement cannot tell a stale
+present from a guest that has not repainted.
+
+Two things make the guest arm trustworthy. It is **self-consistent by construction** — the reference
+and the measurement are taken with the same instrument in the same round, so whatever `screencapture`
+includes or omits (it renders without the Dock here) it does so identically in both. And it is
+**independent of our code**, which is the entire point: it is the only frame in the comparison that
+our present path did not produce.
+
+Assert the transition you are measuring across. "Killed the app" must mean a process count read as
+zero, not a keystroke that was sent. A first hand-run of that sequence quit with `meta_l+q`, the app
+did not quit, and the post-close capture scored 391 083 differing pixels — which is "a window is
+present", not residue. It was caught by looking at the image.
+
 ### Fit The Wrong Output Before Naming A Wrong Mechanism
 
 Once known values have been through the path, you hold measured/nominal pairs. **Fit them to a
