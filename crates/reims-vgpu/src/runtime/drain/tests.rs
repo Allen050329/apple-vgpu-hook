@@ -1333,6 +1333,64 @@ fn clear_only_present_pairs_with_store_fifo_order() {
     assert_eq!(state.present.frame_mapping, 1);
 }
 
+/// Aging a member store out of the pairing FIFO is a lost frame, and it must
+/// say so.
+///
+/// `PRESENT_STORE_FIFO_CAP` is a depth *assumption* — its own doc says "the
+/// guest pipelines at most a few frames ahead". The queue enforced it with a
+/// bare `pop_front()`, so the entry it discarded was a frame the guest
+/// composited and no present ever paired with, and it left no trace. A silent
+/// drop makes the assumption permanently unfalsifiable: the log looks identical
+/// whether the cap is generous or routinely overrun.
+#[test]
+fn a_member_store_aged_out_of_the_pairing_fifo_is_reported() {
+    let (w, h) = (1920u32, 1080u32);
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+    // Fill exactly to the cap with distinct members (consecutive stores into
+    // one member coalesce, so they must differ).
+    let cap = crate::model::PRESENT_STORE_FIFO_CAP as u32;
+    for mid in 1..=cap {
+        state.note_compositor_member_published(mid, w, h);
+        assert!(state.note_member_store(mid, w, h, 0), "mid {mid} queues");
+    }
+    assert_eq!(state.present_store_fifo.len(), cap as usize);
+
+    let cap_reached = crate::observe::FailCapture::start();
+    assert!(cap_reached.lines().is_empty(), "nothing dropped at the cap");
+    drop(cap_reached);
+
+    // One more: the oldest pairing is discarded.
+    let overrun = cap + 1;
+    state.note_compositor_member_published(overrun, w, h);
+    let cap_log = crate::observe::FailCapture::start();
+    assert!(state.note_member_store(overrun, w, h, 7));
+    let lines = cap_log.lines();
+
+    let dropped = lines
+        .iter()
+        .find(|l| l.contains("present_store_fifo_drop"))
+        .unwrap_or_else(|| panic!("aging a store out left no trace: {lines:?}"));
+    assert!(
+        dropped.contains("lost_mid=1"),
+        "the line must name the frame that was lost, got {dropped}"
+    );
+    assert!(
+        !dropped.starts_with("OFF "),
+        "an unpaired composited frame is a loss, not census: {dropped}"
+    );
+    assert_eq!(
+        state.present_store_fifo.len(),
+        cap as usize,
+        "the queue stays bounded"
+    );
+    assert_eq!(
+        state.present_store_fifo.front().map(|e| e.0),
+        Some(2),
+        "the OLDEST entry is the one that goes"
+    );
+}
+
 /// Fullscreen-transition torn-capture guard: a store_fifo entry pairs a
 /// present with a member that missed a RUN of full frames (its
 /// `dense_frame_seq` lags a same-geometry peer by >= RETENTION_GAP_MARGIN — a

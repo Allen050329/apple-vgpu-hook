@@ -1777,7 +1777,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                     // (the present rate is `present_import` `used_hz`, thrash is
                     // the `summary`/THRASH proxies).
                     crate::observe::line(format!(
-                        "present_store_fifo output_mid={peer_mid} retain_mid={prior_retain_mid} {w}x{h} gen={peer_gen} depth={} cap={}",
+                        "present_store_fifo output_mid={peer_mid} retain_mid={prior_retain_mid} {w}x{h} gen={peer_gen} depth={} cap={PRESENT_STORE_FIFO_CAP} encoded={}",
                         state.present_store_fifo.len(),
                         encoded as u8
                     ));

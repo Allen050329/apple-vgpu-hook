@@ -2882,8 +2882,10 @@ impl DeviceState {
     /// FIFO pairing (see [`DeviceState::present_store_fifo`]). Consecutive
     /// writebacks into the same member coalesce (multi-pass stores of one
     /// frame must not shift the pairing); the queue drops its oldest entry
-    /// past [`PRESENT_STORE_FIFO_CAP`]. Returns false when `mapping_id` is
-    /// not a member at this geometry (nothing queued).
+    /// past [`PRESENT_STORE_FIFO_CAP`], and says so on the failure channel —
+    /// that entry is a composited frame no present ever paired with. Returns
+    /// false when `mapping_id` is not a member at this geometry (nothing
+    /// queued).
     pub fn note_member_store(
         &mut self,
         mapping_id: u32,
@@ -2904,7 +2906,19 @@ impl DeviceState {
             }
         }
         if self.present_store_fifo.len() >= PRESENT_STORE_FIFO_CAP {
-            self.present_store_fifo.pop_front();
+            // The dropped entry is a member store that no present ever paired
+            // with — a frame the guest composited and we never showed. The cap
+            // is a depth *assumption* ("the guest pipelines at most a few frames
+            // ahead"), so a drop is either that assumption failing or presents
+            // having genuinely stopped consuming, and both are losses. Silence
+            // here would leave the assumption permanently unfalsifiable.
+            if let Some((lost_mid, lost_gen)) = self.present_store_fifo.pop_front() {
+                crate::observe::fail(format!(
+                    "present_store_fifo_drop lost_mid={lost_mid} lost_gen={lost_gen} \
+                     queued_mid={mapping_id} {width}x{height} cap={PRESENT_STORE_FIFO_CAP} \
+                     (a member store aged out unpaired; no present consumed it)"
+                ));
+            }
         }
         self.present_store_fifo.push_back((mapping_id, generation));
         true

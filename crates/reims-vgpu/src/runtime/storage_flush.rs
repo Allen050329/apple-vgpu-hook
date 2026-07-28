@@ -102,11 +102,17 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
 /// pre-Store bytes (boot-18 `m2v_empty_layer reason=linear_sample` poisoning).
 /// Resolve the span's pages, match them against each deferred window's mapping
 /// pages, and flush the mappings that hit before the caller reads.
-/// Spans up to this many pages probe every page; larger spans probe sparsely.
 /// Bound for the per-bind no-intersection memo (`DeviceState::flush_nohit_memo`).
-/// The memo clears on every deferred-signature change, so it only holds the
-/// distinct `(task,gva,span)` binds seen at one signature — dozens in practice.
-/// The cap is a runaway guard: overflow just re-walks (correct, slower).
+///
+/// An entry is *revalidated* on a deferred-signature change, not dropped: the
+/// cached pages are re-checked against the new windows and re-stamped with the
+/// new signature when they still miss. So an entry can outlive arbitrarily many
+/// signature changes, and the live set is every distinct `(task, gva, span)`
+/// bind that has ever missed, not the ones seen at one signature. The cap is a
+/// runaway guard on that set: overflow just re-walks (correct, slower).
+///
+/// The walk this memo skips visits every page of the span — a stride argument
+/// with a sparse mode for large spans used to sit here and is gone.
 const FLUSH_NOHIT_MEMO_CAP: usize = 4096;
 
 pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
@@ -142,9 +148,13 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         return;
     }
     // No-intersection memo. The per-page task-PT walk below only finds work when
-    // a bound buffer span aliases a live deferred window — measured
-    // `zc_flush_hits == 0` over ~59k draws of pure compositing, i.e. it is
-    // detection overhead. Cache each full-walked bind's resolved gpa pages; skip
+    // a bound buffer span aliases a live deferred window, which is rare but NOT
+    // dead: across five x86/Vulkan repro boots it hit once in 408k calls and
+    // 89k walks (boot 89; boots 86, 87, 88 and 90 hit zero), and the fail sink
+    // holds 11 `gva_alias_hit_page` lines lifetime. An earlier reading of
+    // `zc_flush_hits == 0` over ~59k draws is restated here as "hits about once
+    // per boot" rather than "detection overhead" — the walk cannot be removed,
+    // only made cheap. Cache each full-walked bind's resolved gpa pages; skip
     // the walk while the deferred signature is unchanged, and on a signature
     // change re-check the cached pages against the current windows WITHOUT a PT
     // walk (the per-page FFI translate is the expensive part). A 1-in-64 sampled

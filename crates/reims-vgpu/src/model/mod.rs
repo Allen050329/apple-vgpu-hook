@@ -18,7 +18,7 @@ pub use state::{
     PendingWork,
     PresentState, PresentedGeom, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
     TaskMapSpan, TrancheStats, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER,
+    FENCE_DOMAIN_RENDER, PRESENT_STORE_FIFO_CAP,
 };
 #[cfg(test)]
 pub(crate) use state::{TILE_GEN_GRID_H, TILE_GEN_GRID_W};
