@@ -1288,6 +1288,23 @@ fn maybe_enqueue_scanout_gl<H: HostOps>(
 /// IOSurface pages (alias) or disjoint swap surfaces decides the present
 /// ownership contract. This logs decoded page-table facts only and never
 /// selects behavior. One line per (named mid, named map_generation).
+/// Rollup cadence for a running total: every count while the population is
+/// small, then thinning to powers of two, then flat every
+/// [`ROLLUP_STRIDE`]. A pure power-of-two schedule reads fine on a short boot
+/// and then goes silent for the rest of a long one — a session that ends at
+/// 900 presents has its last reading at 512, and recovering the final total
+/// needs arithmetic on a different line that may be counting something else.
+/// The flat tail keeps the denominator readable at any point a run is cut
+/// short.
+fn rollup_due(n: u64) -> bool {
+    n.is_power_of_two() || n.is_multiple_of(ROLLUP_STRIDE)
+}
+
+/// Flat rollup interval once the power-of-two schedule has thinned out. At the
+/// measured steady-state present rate on this rail (~2-3/s through
+/// `present_named_mapping`) this is a line every few minutes.
+const ROLLUP_STRIDE: u64 = 512;
+
 /// Running totals for [`note_present_identity_handoff`].
 #[derive(Default)]
 struct PresentIdentityHandoffCensus {
@@ -1353,7 +1370,7 @@ fn note_present_identity_handoff(state: &DeviceState, mapping: u32, w: u32, h: u
     if name_it {
         c.named_events += 1;
     }
-    if !(name_it || c.presents.is_power_of_two()) {
+    if !(name_it || rollup_due(c.presents)) {
         return;
     }
     let line = format!(

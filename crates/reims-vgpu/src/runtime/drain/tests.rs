@@ -393,6 +393,30 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
     assert_coalesced_paint_action(&host, "named surface, not composite peer");
 }
 
+/// The census rollup schedule must stay readable after the power-of-two
+/// thinning stops, or a long run's final denominator is unrecoverable: a
+/// session ending at 900 has its last reading at 512.
+#[test]
+fn rollup_schedule_keeps_reporting_after_the_powers_of_two_thin_out() {
+    use super::{rollup_due, ROLLUP_STRIDE};
+    // Dense while the population is small — every early count reports.
+    for n in [1u64, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+        assert!(rollup_due(n), "{n} is a power of two");
+    }
+    // The gap a pure power-of-two schedule leaves: nothing between 512 and
+    // 1024 without the flat stride.
+    assert!(!(513u64..1024).any(|n| n.is_power_of_two()));
+    assert!(rollup_due(1024));
+    assert!(rollup_due(1536), "the stride must fill the gap");
+    // And it keeps firing at a bounded interval forever after.
+    for k in 1..=8u64 {
+        assert!(rollup_due(100 * ROLLUP_STRIDE + k * ROLLUP_STRIDE));
+    }
+    // Still quiet between rollups, so this stays safe to leave always-on.
+    assert!(!rollup_due(1025));
+    assert!(!rollup_due(1535));
+}
+
 /// CmdDeleteTask (root 0x20) must clear the task — not flood UnknownRootOpcode.
 #[test]
 fn delete_task_root_clears_active_task() {
