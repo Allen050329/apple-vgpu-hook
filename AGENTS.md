@@ -263,6 +263,28 @@ zero, not a keystroke that was sent. A first hand-run of that sequence quit with
 did not quit, and the post-close capture scored 391 083 differing pixels — which is "a window is
 present", not residue. It was caught by looking at the image.
 
+The same two captures also **rule things out**, in one shot, which is the cheaper direction and the
+one to reach for first. A user-reported colour corruption — the desktop picture rendering as dense
+per-pixel speckle in saturated red while window content on top of it stayed clean — was localized
+this way before any code was read. A pure-wallpaper patch measured, on two boots:
+
+| capture | R | G | B |
+|---|---|---|---|
+| our host window | 255..255 | 0..27 | 0..255 |
+| the guest's `screencapture` | 255..255 | 0..55 | 0..255 |
+
+Two channels pinned to constants and one carrying all the variation, and **the guest's own composite
+has it too**. Since `screencapture` re-executes that composite, the wallpaper was already wrong
+before anything of ours presented it: the present path, the export path and the host window are all
+out, in a single measurement, without a probe. Report the per-channel range rather than "it looks
+noisy" — the pinning is the whole finding, and a zoom confirmed no stride banding, so it is a channel
+defect and not a tiling or dither one.
+
+Stop the write-up there. Two constant channels and one live one is the same shape as the BT.601 fit
+recorded below, and the desktop picture is a HEIC — subsampled YUV, which this rail does carry as
+2-plane `'420f'` surfaces. That is a *lead*, not a mechanism, and the fit-then-mechanism trap below
+has already cost one iteration on this exact class.
+
 **The guest's screen is an oracle. The guest's memory is not.** The distinction is that
 `screencapture` makes the guest *re-execute* the composite; guest memory for a surface we render
 into is our own output one step removed, and on a rail that defers the writeback it is not even
