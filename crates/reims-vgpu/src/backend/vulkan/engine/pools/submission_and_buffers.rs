@@ -20,6 +20,7 @@ impl ResourcePools {
             staging_hits: 0,
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
+            staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
             targets: HashMap::new(),
             target_order: Vec::new(),
             readback_free: HashMap::new(),
@@ -447,7 +448,7 @@ impl ResourcePools {
         let mut buf_trimmed = 0;
         if trim_buffers {
             while buf_trimmed < max {
-                let Some(slot) = pop_any_pool_entry(&mut self.staging_free) else {
+                let Some(slot) = pop_largest_pool_entry(&mut self.staging_free) else {
                     break;
                 };
                 device.destroy_buffer(slot.buffer, None);
@@ -455,7 +456,7 @@ impl ResourcePools {
                 buf_trimmed += 1;
             }
             while buf_trimmed < max {
-                let Some(slot) = pop_any_pool_entry(&mut self.readback_free) else {
+                let Some(slot) = pop_largest_pool_entry(&mut self.readback_free) else {
                     break;
                 };
                 device.destroy_buffer(slot.buffer, None);
@@ -1632,10 +1633,11 @@ impl ResourcePools {
     /// buckets or being emptied behind the hot path, and the aggregate cannot
     /// tell those apart. The miss's own bucket plus the free pool's bucket
     /// histogram at the moment of the miss can.
-    fn note_staging_miss(&mut self, bucket: u64) {
+    fn note_staging_miss(&mut self, bucket: u64, us: u64) {
         self.staging_misses = self.staging_misses.saturating_add(1);
         let log2 = bucket.trailing_zeros().min(STAGING_BUCKET_BINS as u32 - 1) as usize;
         self.staging_miss_bins[log2] = self.staging_miss_bins[log2].saturating_add(1);
+        self.staging_miss_us_bins[log2] = self.staging_miss_us_bins[log2].saturating_add(us);
         if !self.staging_misses.is_multiple_of(STAGING_MISS_EMIT_EVERY) {
             return;
         }
@@ -1661,8 +1663,25 @@ impl ResourcePools {
             }
             s
         };
+        // Mean microseconds per miss in each bucket. Size does not predict
+        // allocation cost across the seven sites (a 1.6 MiB DEVICE_LOCAL image is
+        // 275 us, a 3.6 MiB HOST_VISIBLE readback is 1313 us), so whether a
+        // 64-byte staging miss costs the same as a 4 MiB one decides whether the
+        // fix is fewer misses or fewer VkDeviceMemory objects.
+        let mut us_bins = String::new();
+        for (i, n) in self.staging_miss_bins.iter().enumerate() {
+            if *n != 0 {
+                let _ = write!(
+                    us_bins,
+                    "{}{}:{}",
+                    if us_bins.is_empty() { "" } else { "," },
+                    1u64 << i,
+                    self.staging_miss_us_bins[i] / *n as u64
+                );
+            }
+        }
         crate::observe::off(format!(
-            "staging_pool hits={} misses={} live={} free_slots={free_slots} free_mb={} miss_bins={} free_bins={}",
+            "staging_pool hits={} misses={} live={} free_slots={free_slots} free_mb={} miss_bins={} miss_us_bins={us_bins} free_bins={}",
             self.staging_hits,
             self.staging_misses,
             self.staging_live.len(),
@@ -1697,7 +1716,7 @@ impl ResourcePools {
                 });
             }
         }
-        self.note_staging_miss(bucket);
+        let miss_started = Instant::now();
         let buffer = ctx
             .device
             .create_buffer(
@@ -1754,6 +1773,7 @@ impl ResourcePools {
             memory: slot.memory,
             size: slot.size,
         });
+        self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
         Ok(slot)
     }
 

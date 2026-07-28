@@ -58,6 +58,7 @@ pub(crate) struct ResourcePools {
     staging_hits: u64,
     staging_misses: u64,
     staging_miss_bins: [usize; STAGING_BUCKET_BINS],
+    staging_miss_us_bins: [u64; STAGING_BUCKET_BINS],
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -1073,6 +1074,34 @@ const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 /// pure waste. Minimising idle VRAM is the explicit goal.
 const IDLE_SLAB_KEEP_EMPTY: usize = 0;
 
+/// Pop one entry from the LARGEST non-empty bucket of a size-keyed recycle pool.
+///
+/// The buffer pools are keyed by power-of-two byte size, and the idle trim that
+/// drains them exists to return host memory. Taking an arbitrary bucket returns
+/// an arbitrary number of bytes per destroy, and `HashMap` order is effectively
+/// random, so a pass budgeted at N destroys can spend all of them on 64-byte
+/// slots and return nothing. That is not hypothetical: the staging census put
+/// **11 792 of 26 624** misses in the 64-byte bucket and 1 462 more at 128 bytes
+/// — over half the pool's re-allocations, each costing a ~1.4 ms
+/// `vkAllocateMemory` on the upload hot path, to reclaim 64 bytes.
+///
+/// Largest-first makes each destroy return the most it can, so the trim reaches
+/// its memory target in the fewest destroys and leaves the small, cheap-to-hold,
+/// constantly-reused slots alone.
+fn pop_largest_pool_entry<V>(pool: &mut HashMap<u64, Vec<V>>) -> Option<V> {
+    let key = *pool
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .max_by_key(|(k, _)| **k)
+        .map(|(k, _)| k)?;
+    let bucket = pool.get_mut(&key)?;
+    let item = bucket.pop();
+    if bucket.is_empty() {
+        pool.remove(&key);
+    }
+    item
+}
+
 /// Pop one entry from any non-empty bucket of a keyed recycle pool, removing the
 /// bucket when it empties so the pool does not accumulate empty `Vec`s. `None`
 /// when the whole pool is empty.
@@ -1593,5 +1622,55 @@ mod content_hash_tests {
         let mut b = vec![0xa0u8; 1024];
         b[0] = 0xa1;
         assert_ne!(sampled_content_hash(&a), sampled_content_hash(&b));
+    }
+}
+
+#[cfg(test)]
+mod pool_trim_order_tests {
+    use super::{pop_any_pool_entry, pop_largest_pool_entry};
+    use std::collections::HashMap;
+
+    /// The buffer trim must return the most bytes it can per destroy.
+    ///
+    /// The pools are keyed by power-of-two byte size and the trim's budget is a
+    /// COUNT of destroys, so which bucket it takes from decides how much memory a
+    /// pass reclaims. `HashMap` iteration order is effectively random, so the
+    /// arbitrary-bucket form could spend a whole pass on 64-byte slots — measured
+    /// as 11 792 of 26 624 staging misses in that one bucket, each costing a
+    /// ~1.4 ms `vkAllocateMemory` to recreate, to reclaim 64 bytes.
+    ///
+    /// Asserting the descending ORDER rather than one pop is the point: a single
+    /// pop passes by luck with a random-order pool, which is exactly how the bug
+    /// stayed invisible.
+    #[test]
+    fn buffer_trim_drains_the_largest_buckets_first() {
+        let mut pool: HashMap<u64, Vec<u32>> = HashMap::new();
+        for (bucket, n) in [(64u64, 40), (4096, 3), (1 << 22, 2), (256, 7)] {
+            pool.insert(bucket, vec![bucket as u32; n]);
+        }
+        let mut order = Vec::new();
+        while let Some(v) = pop_largest_pool_entry(&mut pool) {
+            order.push(v as u64);
+        }
+        assert_eq!(order.len(), 52);
+        assert!(
+            order.windows(2).all(|w| w[0] >= w[1]),
+            "trim order is not descending by bucket: {order:?}"
+        );
+        assert_eq!(order[0], 1 << 22);
+        assert_eq!(order[order.len() - 1], 64);
+        assert!(pool.is_empty(), "emptied buckets must be removed");
+
+        // The arbitrary-bucket helper is still used by the image pools, whose
+        // budget is not about bytes; it must keep draining everything.
+        let mut pool: HashMap<u64, Vec<u32>> = HashMap::new();
+        pool.insert(64, vec![1, 2]);
+        pool.insert(4096, vec![3]);
+        let mut n = 0;
+        while pop_any_pool_entry(&mut pool).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert!(pool.is_empty());
     }
 }
