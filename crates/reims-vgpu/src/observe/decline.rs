@@ -2569,7 +2569,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         // one is not.
         emission: Emission::At(&[("runtime/gva_view.rs", "view_alias")]),
         slug_calls: &[],
-        slugs: &["view_alias_lookup", "view_alias_retire"],
+        slugs: &["view_alias_retire"],
     },
     DeclineClass {
         type_name: "TaskWalkAmbiguity",

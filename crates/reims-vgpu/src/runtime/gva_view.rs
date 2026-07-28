@@ -61,20 +61,21 @@ pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
     task_match_kind(view_task, wire_task).is_some()
 }
 
-/// Where an *aliased* view match was accepted, and therefore what it cost.
+/// A retire/evict pass dropped a view registered under a *different* task id.
 ///
-/// The two sites differ in kind, not degree, which is why one census would not
-/// do. Dropping an aliased view is conservative — the next access re-walks the
-/// guest page table and rebuilds it. Reading through one is not: the host
-/// pointer belongs to whatever task registered it.
+/// Only one site remains. `find_covering_view` used to share this vocabulary and
+/// no longer aliases at all: reading through another task's view is wrong, and
+/// two boots of `view_alias_lookup` measured zero, so that arm was deleted.
 ///
-/// The wire task namespace collides structurally (see [`TaskWalkAmbiguity`];
-/// measured on three boots), so if the lookup arm can fire it will fire, and a
-/// small nonzero count is not a possible outcome here.
+/// Retiring is the opposite polarity and keeps its aliasing. Dropping a view
+/// that did not need dropping costs one re-walk; *failing* to drop one leaves a
+/// stale host pointer live to be read after the guest recycled its pages, which
+/// is the class `write_span`'s doc comment records as a WindowServer SIGSEGV.
+/// So this stays a tripwire rather than a deletion target: it measured zero on
+/// two boots, and if it ever fires the aliasing here is load-bearing and the
+/// reason will be in the log instead of inferred.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewAliasSite {
-    /// `find_covering_view` returned a view registered under a different task.
-    Lookup,
     /// A retire/evict pass dropped a view registered under a different task.
     Retire,
 }
@@ -82,7 +83,6 @@ pub(crate) enum ViewAliasSite {
 impl crate::observe::Decline for ViewAliasSite {
     fn slug(&self) -> &'static str {
         match self {
-            Self::Lookup => "view_alias_lookup",
             Self::Retire => "view_alias_retire",
         }
     }
@@ -191,19 +191,26 @@ pub fn find_covering_view(
     if length == 0 {
         return None;
     }
-    let hit = state.gva_host_views.iter().find(|v| {
-        task_matches(v.task_id, task_id)
+    // **Exact task id only.** This returns a host pointer the caller reads
+    // through, so accepting a view registered under `task_id >> 1` or
+    // `task_id << 1` would hand one task another task's mapped pages. The
+    // aliased arm was censused over two full boots (`view_alias_lookup`) and
+    // matched zero times, so removing it changes nothing that happened.
+    //
+    // It is also the safe direction independent of that reading: dropping an
+    // arm from a *lookup* can only turn a hit into a miss, and `ensure_gva_view`
+    // answers a miss by walking the guest page table and building a fresh view.
+    // The cost is one extra walk; the alternative was wrong bytes.
+    //
+    // The retire and evict sites keep [`task_matches`] deliberately — see
+    // [`ViewAliasSite`]. Widening is conservative there and narrowing it could
+    // leave a stale view live to be read later.
+    state.gva_host_views.iter().find(|v| {
+        v.task_id == task_id
             && v.gva <= gva
             && gva.saturating_add(length) <= v.gva.saturating_add(v.length)
             && v.ptr != 0
-    })?;
-    // The dangerous polarity: this pointer is about to be read through. Census
-    // the aliased case so the arm can be deleted on a reading rather than an
-    // argument.
-    if task_match_kind(hit.task_id, task_id) == Some(TaskViewMatch::Aliased) {
-        note_view_alias(ViewAliasSite::Lookup, hit.task_id, task_id);
-    }
-    Some(hit)
+    })
 }
 
 /// The wire task word names two live tasks at once, and only one can be meant.
@@ -1002,16 +1009,16 @@ mod tests {
             .len()
     }
 
-    /// The lookup census must fire on an aliased view and stay silent on an
-    /// exact one, or it reports `find_covering_view`'s call volume instead of
-    /// its aliasing and answers nothing.
+    /// `find_covering_view` returns a host pointer the caller reads through, so
+    /// it must match the task id exactly.
     ///
-    /// Ids 20/41 and 21 are chosen to miss the latch that the walk tests and the
-    /// real rail both populate: `41 >> 1 == 20`, so a view registered for task 20
-    /// satisfies a lookup for wire id 41 through the aliased arm, while a lookup
-    /// for 20 itself is exact.
+    /// Before this, a view registered by task 20 satisfied a lookup for wire id
+    /// 41 (`41 >> 1 == 20`) and handed task 41 task 20's mapped pages. The
+    /// aliased arm measured zero over two full boots, so removing it changes
+    /// nothing that happened — but a lookup is also the safe direction to
+    /// narrow, because a miss only costs a fresh page-table walk.
     #[test]
-    fn the_lookup_census_separates_an_aliased_view_from_an_exact_one() {
+    fn a_view_registered_by_another_task_does_not_satisfy_this_tasks_lookup() {
         assert_eq!(task_match_kind(20, 20), Some(TaskViewMatch::Exact));
         assert_eq!(task_match_kind(20, 41), Some(TaskViewMatch::Aliased));
         assert_eq!(task_match_kind(20, 43), None);
@@ -1034,18 +1041,14 @@ mod tests {
             "an exact match is not an alias and must not be reported as one"
         );
 
-        let before = log_mark();
-        assert!(find_covering_view(&state, 41, 0x1000, 0x10).is_some());
-        let tail = log_tail(before);
-        let line = tail
-            .lines()
-            .find(|l| l.contains("view_alias "))
-            .expect("a view returned for a task that did not register it is always-on");
+        // The deletion: wire id 41 aliases onto the view registered for task 20
+        // (41 >> 1 == 20), and the lookup must now refuse it rather than hand
+        // back another task's mapped pages. `ensure_gva_view` answers the miss
+        // by walking the guest page table and building a fresh view, so the
+        // cost of this refusal is one walk.
         assert!(
-            line.contains("reason=view_alias_lookup")
-                && line.contains("view=20")
-                && line.contains("wire=41"),
-            "the line must name both the registering task and the asking one: {line}"
+            find_covering_view(&state, 41, 0x1000, 0x10).is_none(),
+            "a view registered by task 20 must not satisfy a lookup for task 41"
         );
     }
 
