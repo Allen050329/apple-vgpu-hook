@@ -13,6 +13,8 @@ GUI helpers (usb-kbd + usb-tablet on the vmapple machine; cocoa is observability
   scripts/qmp/qmp.py click X Y [--double]     # guest-pixel coords
   scripts/qmp/qmp.py move X Y
   scripts/qmp/qmp.py drag X1 Y1 X2 Y2 [X3 Y3 ...]  # left-button rubber-band drag through points
+      QMP_DRAG_STEPS=N    sub-moves interpolated per segment (default 8)
+      QMP_DRAG_HOLD_S=F   seconds between sub-moves (default 0.02)
   scripts/qmp/qmp.py key NAME[+NAME...] ...   # e.g. key ret, key meta_l+q
   scripts/qmp/qmp.py wheel [up|down] [N] [dt] # N wheel ticks, dt seconds apart (one connection)
   scripts/qmp/qmp.py type TEXT                # ASCII (shift combos handled)
@@ -304,8 +306,14 @@ def main(argv: list[str]) -> int:
         coords = [int(a) for a in args]
         points = list(zip(coords[0::2], coords[1::2]))
         w, h = display_size(qmp)
-        drag(qmp, points, w, h)
-        print(f"drag {points} ok")
+        # Gesture duration and pointer-event count are separately controllable so
+        # a caller can hold one fixed while varying the other. A drag's residue
+        # scales with one or the other, and with duration welded to event count
+        # (steps * hold_s per segment) the two cannot be told apart.
+        steps = int(os.environ.get("QMP_DRAG_STEPS", "8"))
+        hold_s = float(os.environ.get("QMP_DRAG_HOLD_S", "0.02"))
+        drag(qmp, points, w, h, steps=steps, hold_s=hold_s)
+        print(f"drag {points} steps={steps} hold_s={hold_s} ok")
         return 0
 
     if mode == "wheel":
