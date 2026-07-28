@@ -306,6 +306,28 @@ the branch, make that the probe. Prefer a line whose *dedup key is the branch ta
 at one line per outcome per process, which is what makes it safe to leave on forever, and it keeps
 answering for every boot after the question that prompted it is closed.
 
+**Establish what each arm of a comparison renders before trusting it.** An arm that omits a region
+does not report "no difference" there — it reports nothing, and the other arm's difference is then
+unopposed. The guest-screen comparison above has exactly this hole: `screencapture` renders without
+the Dock and our host window shows it, so any Dock change scores as a host-only difference with a
+byte-clean guest arm. That is the same reading as "the guest moved on and we did not", produced for
+free, in a region the design cannot see.
+
+It is not hypothetical. Three "residue reproductions" across two boots were a 61-65 px strip whose
+top edge sat within 4 px of y=616; cropped, the strip is the Dock, and the guest capture at the same
+coordinates is bare wallpaper. Launching and quitting apps changes the Dock — its running-apps
+section grows and shrinks and every icon shifts — so the artifact fires on the exact transition the
+repro is built around. It passed the magnitude rule (max 255, tens of thousands of pixels above 64),
+the two-arm rule, and the process-count assertion. It failed only when the pixels were looked at.
+
+Fix by removing the region from **both** arms, not by masking it out of one: the repro now hides the
+Dock before its first round and aborts if it cannot. Masking needs a hard-coded rect and leaves the
+comparison partial; hiding keeps it whole-frame.
+
+Note which way this cuts. The two-arm design is still the strongest tool here — it is what localized
+the class at all. But "the guest's arm is independent of our code" is a statement about *causation*,
+not about *coverage*, and it says nothing about regions the guest's instrument does not draw.
+
 **A reproduction rate pools whatever you called the same defect.** "Reproduced 3 of 6" is a number
 about a name, and the name was chosen before anything was measured. Print the per-instance shape next
 to the rate and look at whether it is one population.
