@@ -360,8 +360,30 @@ fn decode_type4_plane(desc: &[u8], plane_index: usize) -> Option<Type4Plane> {
 /// offscreen render target, because a WebKit content tile is also 1920x1080
 /// 'BGRA'. Membership is therefore reconstructed downstream by compositor-output
 /// edges, full-frame-publish detection, output groups, presented-ness, and the
-/// a/b seed. Whether any of that can be deleted turns on whether the guest is
-/// already telling us here, in bytes nothing has ever read.
+/// a/b seed.
+///
+/// **Measured: the guest is not telling us here.** Across one 1766 s x86/Vulkan
+/// session with a real GUI login (boot `20260728-163046`), the probe below
+/// emitted exactly two shapes for ≥5983 decodes over 453 distinct surface ids
+/// and 154 distinct geometries — desktop swapchain buffers and never-displayed
+/// content tiles alike:
+///
+/// ```text
+/// type4_desc_shape distinct=1 1920x1080 fmt=0x42475241 planes=1 len=36 undecoded_len=3 undecoded_nz=0
+/// type4_desc_shape distinct=2   320x320 fmt=0x34323066 planes=2 len=52 undecoded_len=3 undecoded_nz=0
+/// ```
+///
+/// `len` is `TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE` exactly, and it is
+/// the *guest's* number — [`read_descriptor`] honours `descriptor_length` with no
+/// clamp. The record ends where the plane array ends; the only bytes we skip are
+/// the three at `+0x11`, and they were zero every time. There is nowhere in this
+/// descriptor for a usage, bind, scanout or role hint to be, so no rule over
+/// surface identity can classify a brand-new buffer before its first draw.
+///
+/// Narrow: this is the type-4 record on the x86 PCI pathway. It says nothing
+/// about type-11 (`decode_iosurface_texture_descriptor`, which does not run
+/// here and whose 0x38/0x58 blobs are still read only to 0x20), and a
+/// create-time record we never read at all would be invisible to it.
 ///
 /// A `plane_count` above [`TYPE4_PLANE_CAP`] is clamped by the decoder, so the
 /// records past the clamp fall into this span too — which is correct: they are
