@@ -154,12 +154,37 @@ mean cannot see it. Report the residual next to the mean whenever the complaint 
 
 **Count what your A/B actually changed.** Swapping the guest's desktop picture from the stock HEIC to
 a PNG extracted from that same HEIC makes the corruption vanish, which reads as a clean isolation of
-one mechanism. It changes three: subsampled YUV becomes packed RGB, Display-P3 becomes sRGB, and a
-dynamic multi-variant picture becomes a static one. Each alone explains the result. The one that gets
-written down is whichever the reader already suspected — here the YUV reading was about to aim the
-next iteration at the biplanar sampling path on the strength of a comparison that never isolated it.
-Enumerate every property the swap changed *before* naming the one you like, then add the control that
-separates them: a static sRGB JPEG is subsampled YUV and splits all three at once.
+one mechanism. It changes *four*: subsampled YUV becomes packed RGB, Display-P3 becomes sRGB, a
+dynamic multi-variant picture becomes a static one, and — the one nobody listed — a 6016x6016 source
+becomes one no larger than the display. Each alone explains the result. The one that gets written
+down is whichever the reader already suspected; here the YUV reading was about to aim an iteration at
+the biplanar sampling path on the strength of a comparison that never isolated it.
+
+Enumerating them and building the grid took one boot and settled it. Every arm below is the same base
+pixels at one geometry per row, pinned through the same `desktoppicture.db` path, Dock hidden, scored
+by the local-median residual with the stock picture re-run twice as a positive control:
+
+| desktop picture | dB, our window | dB, guest capture |
+|---|---|---|
+| PNG / JPEG 4:2:0, sRGB or P3, 1920x1080 | 0.19 - 0.31 | 0.25 - 0.68 |
+| HEIC, static, sRGB or P3, 1920x1080 or 1920x1920 | 0.08 - 0.11 | 0.13 - 0.17 |
+| **PNG, P3, 3840x2160** | **0.31** | **0.68** |
+| **JPEG 4:2:0, P3, 3840x2160** | **0.31** | **0.68** |
+| **HEIC, static, P3, 3840x2160** | **6.80** | **13.65** |
+| **HEIC, static, P3, 6016x6016** | **6.14** | **10.46** |
+| **HEIC, stock dynamic, P3, 6016x6016** | **18.30** | **31.94** |
+
+Subsampled YUV: refuted, a 4:2:0 JPEG is clean at both sizes. Display-P3: refuted, P3 is clean in
+every row it appears in that does not also speckle for another reason. Dynamic multi-variant:
+refuted, a single-image HEIC `sips` wrote in the guest reproduces. Aspect ratio: refuted, 1920x1920
+is clean and 3840x2160 is not. Resolution alone: refuted, PNG and JPEG at 3840x2160 are clean.
+
+What is left is an **interaction** — HEIC *and* a source larger than the display — which no main
+effect would have found and which every single-knob A/B in this investigation had to miss. When a
+swap changes N things, the answer can be a pair of them. Build the grid.
+
+That is where the measurement stops. Which property of an oversized HEIC decode does it is
+**unmeasured**, and no mechanism is named here.
 
 **A transient defect is invisible to a before/after pair.** A repro that captures once before a
 gesture and once after cannot see anything that repairs itself in between, and it will report clean
