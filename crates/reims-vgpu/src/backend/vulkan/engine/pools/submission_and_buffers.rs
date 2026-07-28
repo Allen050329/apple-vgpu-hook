@@ -239,22 +239,28 @@ impl ResourcePools {
         let mut bufs: Vec<(vk::Buffer, u64)> = Vec::with_capacity(runs.len());
         for run in runs {
             match self.host_import_resolve(ctx, run.host_ptr, run.ptr_len) {
-                Some(b) => bufs.push(b),
-                None => {
+                Ok(b) => bufs.push(b),
+                Err(leaf) => {
                     self.host_scatter.fallback_unresolved =
                         self.host_scatter.fallback_unresolved.wrapping_add(1);
-                    // `host_import_resolve` already emitted the exact typed
-                    // leaf (extension, cap, alignment, range, or Vulkan call).
-                    // This line is the aggregate failure counter, so it names
-                    // the class without minting a second coarse reason.
+                    // `host_import_resolve` emits the typed leaf itself, but that
+                    // emission is flood-latched per cause, so after the first
+                    // sighting of each the losses that follow carry no leaf at
+                    // all. This line is not latched and sits immediately before
+                    // the `deferred_flush_lost` its refusal causes, so carrying
+                    // the leaf here is what makes an individual lost render
+                    // attributable: a byte-cap refusal and a driver rejection
+                    // both ended up reading `host_import_resolve` at the loss
+                    // site, and they need opposite fixes.
                     crate::observe::off(format!(
-                        "store_scatter_fallback class=run_unimportable runs={} ptr_len={}",
+                        "store_scatter_fallback class=run_unimportable runs={} ptr_len={} \
+                         leaf={} host_ptr={:#x}",
                         runs.len(),
-                        run.ptr_len
+                        run.ptr_len,
+                        crate::observe::Decline::slug(&leaf),
+                        run.host_ptr,
                     ));
-                    return Err(DrawError::Unsupported(
-                        super::reason::DrawReason::PresentHostImportResolve,
-                    ));
+                    return Err(leaf);
                 }
             }
         }

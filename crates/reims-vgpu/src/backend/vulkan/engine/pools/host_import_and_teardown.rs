@@ -7,8 +7,16 @@ impl ResourcePools {
     /// (see [`host_import::HOST_IMPORT_WINDOW_CAP`] — never the whole QEMU RAMBlock;
     /// importing pins host pages for DMA, so a whole-block import would pin
     /// all guest RAM for the VM lifetime) then the aligned span itself
-    /// (fallback when the driver rejects the window import). `None` = no
-    /// import possible; callers fall back to the CPU byte path.
+    /// (fallback when the driver rejects the window import). `Err` names the
+    /// exact refusal; callers fall back to the CPU byte path.
+    ///
+    /// The error is **returned**, not just logged, because the logging here is
+    /// flood-latched per cause: after the first sighting of each, a caller that
+    /// keeps losing guest work has no record of *which* precondition refused.
+    /// A scatter store that dies on the byte cap and one that dies on a driver
+    /// rejection need opposite fixes, and both used to read `host_import_resolve`
+    /// at the loss site because the eight typed variants collapsed into one
+    /// `None` at this boundary.
     /// One flood latch per distinct cause.
     ///
     /// Keyed on the variant rather than on "have we logged a host-import failure",
@@ -39,7 +47,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         ptr: usize,
         len: u64,
-    ) -> Option<(vk::Buffer, u64)> {
+    ) -> Result<(vk::Buffer, u64), DrawError> {
         // Both of these used to be one unlogged `return None`. They are latched,
         // not per-call: a zero-length span recurs per present and an absent
         // extension refuses every span for the device's lifetime, so an unlatched
@@ -50,7 +58,7 @@ impl ResourcePools {
                     .field("ptr", format!("{ptr:#x}"))
                     .fail();
             }
-            return None;
+            return Err(DrawError::HostImport(HostImportDecline::ZeroLength));
         }
         if ctx.ext_external_memory_host.is_none() {
             if self.host_import_first_time(HostImportDecline::ExtensionAbsent) {
@@ -61,12 +69,12 @@ impl ResourcePools {
                 .field("len", format!("{len:#x}"))
                 .fail();
             }
-            return None;
+            return Err(DrawError::HostImport(HostImportDecline::ExtensionAbsent));
         }
         let Some(end) = (ptr as u64).checked_add(len) else {
             let reason = HostImportDecline::RangeOverflow { host_ptr: ptr, len };
             crate::observe::Emit::decline("host_import_fail", &reason).fail_once(0);
-            return None;
+            return Err(DrawError::HostImport(reason));
         };
         if let Some(i) = self
             .host_imports
@@ -80,7 +88,7 @@ impl ResourcePools {
             r.last_touch = touch;
             r.last_epoch = epoch;
             r.last_touch_ms = now_ms;
-            return Some((r.buffer, ptr as u64 - r.base as u64));
+            return Ok((r.buffer, ptr as u64 - r.base as u64));
         }
         let align = ctx.min_imported_host_pointer_alignment.max(1);
         let mut candidates: Vec<(usize, u64)> = Vec::new();
@@ -131,7 +139,7 @@ impl ResourcePools {
                         .field("cap", format!("{HOST_IMPORT_TOTAL_BYTE_CAP:#x}"))
                         .fail();
                 }
-                return None;
+                return Err(DrawError::HostImport(reason));
             }
             let memory = match ctx.import_host_ptr(base as *mut std::ffi::c_void, region_len) {
                 Ok(memory) => memory,
@@ -183,14 +191,14 @@ impl ResourcePools {
                 last_touch_ms: self.idle_clock_ms,
             });
             let r = self.host_imports.last().unwrap();
-            return Some((r.buffer, ptr as u64 - r.base as u64));
+            return Ok((r.buffer, ptr as u64 - r.base as u64));
         }
         let error = terminal_host_import_error(last_error, ptr, len, align);
         crate::observe::Emit::decline("host_import_fail", &error)
             .field("ptr", format!("{ptr:#x}"))
             .field("len", format!("{len:#x}"))
             .fail_once(0);
-        None
+        Err(error)
     }
 
     /// Release `victims` (indices into `host_imports`, as returned by

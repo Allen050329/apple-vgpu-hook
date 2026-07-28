@@ -95,7 +95,7 @@ unsafe fn stage_buffer_content(
             let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
             let mut dst_offset = 0u64;
             for run in src.runs.iter() {
-                let Some((buffer, src_offset)) =
+                let Ok((buffer, src_offset)) =
                     pools.host_import_resolve(ctx, run.host_ptr, run.len)
                 else {
                     return Err(DrawError::DrawExecution(
@@ -1495,7 +1495,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
                 let mut dst_offset = 0u64;
                 for run in src.runs.iter() {
-                    let Some((buffer, src_offset)) =
+                    let Ok((buffer, src_offset)) =
                         pools.host_import_resolve(ctx, run.host_ptr, run.len)
                     else {
                         return Err(DrawError::DrawExecution(

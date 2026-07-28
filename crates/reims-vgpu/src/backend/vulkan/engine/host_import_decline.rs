@@ -153,6 +153,66 @@ mod tests {
         assert_eq!(before, slugs.len(), "duplicate host-import slug");
     }
 
+    /// `host_import_resolve` returns its refusal so the caller can name it. That
+    /// only buys anything if the wrapped leaf keeps its own identity: the eight
+    /// causes used to collapse into one `None` at that boundary and every loss
+    /// downstream reported the caller's coarse `host_import_resolve`, which is a
+    /// label nobody measured. A byte-cap refusal and a driver rejection need
+    /// opposite fixes, so re-collapsing them to a shared slug must fail here.
+    #[test]
+    fn wrapping_a_leaf_in_draw_error_preserves_its_own_slug() {
+        use crate::backend::vulkan::engine::types::DrawError;
+
+        let all = [
+            HostImportDecline::RegionCount,
+            HostImportDecline::TotalBytes,
+            HostImportDecline::ZeroLength,
+            HostImportDecline::ExtensionAbsent,
+            HostImportDecline::PointerMisaligned {
+                host_ptr: 0x1001,
+                alignment: 4096,
+            },
+            HostImportDecline::SizeMisaligned {
+                size: 0x2001,
+                alignment: 4096,
+            },
+            HostImportDecline::RangeOverflow {
+                host_ptr: usize::MAX,
+                len: 0x1000,
+            },
+            HostImportDecline::NoValidWindow {
+                host_ptr: 0x1000,
+                len: 0x1000,
+                alignment: 4096,
+            },
+        ];
+
+        let mut wrapped: Vec<&'static str> = Vec::new();
+        for leaf in all {
+            let carried = DrawError::HostImport(leaf).slug();
+            assert_eq!(
+                carried,
+                leaf.slug(),
+                "DrawError::HostImport must carry the leaf's slug, not a class name"
+            );
+            // The coarse label the scatter store used to return for all eight.
+            assert_ne!(
+                carried, "host_import_resolve",
+                "leaf collapsed back into the caller's class reason"
+            );
+            wrapped.push(carried);
+        }
+        wrapped.sort_unstable();
+        let before = wrapped.len();
+        wrapped.dedup();
+        assert_eq!(before, 8, "the host-import reason census moved");
+        assert_eq!(
+            before,
+            wrapped.len(),
+            "two causes are indistinguishable once wrapped"
+        );
+    }
+
     #[test]
     fn alignment_contract_names_pointer_and_size_separately() {
         let pointer =

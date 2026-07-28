@@ -675,7 +675,7 @@ pub fn ensure_host_import(ptr: usize, len: u64) -> bool {
             .fail_once(EngineProbe::HostImportPools.discriminant());
         return false;
     }
-    unsafe { pools.host_import_resolve(ctx, ptr, len) }.is_some()
+    unsafe { pools.host_import_resolve(ctx, ptr, len) }.is_ok()
 }
 
 /// Generation of a resident compute storage image, if the engine holds one.
@@ -1382,8 +1382,7 @@ pub unsafe fn present_into_host_ptr_strided(
     // Resolve through the same capped cache as sampled gathers and fragmented
     // Store. Never create a direct uncapped host-pointer import here.
     let (buffer, buffer_offset) =
-        unsafe { pools.host_import_resolve(ctx, host_ptr as usize, import_size) }
-            .ok_or_else(|| DrawError::Unsupported(reason::DrawReason::PresentHostImportResolve))?;
+        unsafe { pools.host_import_resolve(ctx, host_ptr as usize, import_size) }?;
 
     let (cb, fence) = pools.begin_entry_sync(ctx, counters)?;
     // buffer_row_length is in **texels** (not bytes) for VkBufferImageCopy.
