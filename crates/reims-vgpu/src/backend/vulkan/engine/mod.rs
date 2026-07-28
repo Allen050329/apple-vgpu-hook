@@ -996,7 +996,7 @@ pub fn read_resident_storage(
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters)? };
     let (image, key, generation, old_layout) =
-        pools.compute_resident_snapshot(identity).ok_or_else(|| {
+        pools.compute_resident_snapshot(identity).ok_or({
             DrawError::Facade(EngineFacadeDecline::StorageReadResidentAbsent {
                 identity: *identity,
             })
@@ -1161,7 +1161,7 @@ pub unsafe fn present_into_host_ptr_strided(
         ));
     }
     let (width, height, image, generation) = {
-        let slot = pools.registry_get(identity).ok_or_else(|| {
+        let slot = pools.registry_get(identity).ok_or({
             DrawError::Present(reason::HostPresentDecline::HostPtrUnknownIdentity)
         })?;
         if !slot.content_ready {

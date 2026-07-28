@@ -83,7 +83,7 @@ pub(crate) unsafe fn export_bgra_scanout_dmabuf(
     width: u32,
     height: u32,
 ) -> Result<ExportedScanoutImage, DrawError> {
-    let fd_loader = ctx.ext_external_memory_fd.as_ref().ok_or_else(|| {
+    let fd_loader = ctx.ext_external_memory_fd.as_ref().ok_or({
         DrawError::Unsupported(super::reason::DrawReason::DmabufExportUnavailable)
     })?;
     let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;

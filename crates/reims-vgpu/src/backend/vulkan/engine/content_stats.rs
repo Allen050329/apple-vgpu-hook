@@ -65,7 +65,7 @@ pub(super) fn copy_color8_with_stats(src: &[u8], dst: &mut [u8]) -> Color8Conten
     assert_eq!(src.len() % 4, 0, "content copy is not whole RGBA8 pixels");
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        return copy_color8_with_stats_x86(src, dst);
+        copy_color8_with_stats_x86(src, dst)
     }
     #[cfg(not(target_arch = "x86_64"))]
     copy_color8_with_stats_scalar(src, dst)

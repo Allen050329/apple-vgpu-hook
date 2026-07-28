@@ -44,6 +44,10 @@ pub const MIN_SUPPORTED_API: u32 = vk::API_VERSION_1_2;
 /// requires, which is [`MIN_SUPPORTED_API`].
 pub const MAX_USEFUL_API: u32 = vk::API_VERSION_1_3;
 
+/// Inverting the pair would decline every device on earth with a confusing
+/// reason. Both are literals, so the check belongs at compile time.
+const _: () = assert!(MAX_USEFUL_API >= MIN_SUPPORTED_API);
+
 /// Whether a device's `apiVersion` clears the baseline every pathway needs.
 ///
 /// The caller must decline a `false` **by name** rather than degrading — see
@@ -119,11 +123,10 @@ mod tests {
         );
     }
 
-    /// The ceiling is never below the floor — inverting them would decline
-    /// every device on earth with a confusing reason.
+    /// The ceiling itself clears the floor, so clamping to it never produces an
+    /// instance version that would then be declined.
     #[test]
     fn ceiling_is_at_or_above_the_floor() {
-        assert!(MAX_USEFUL_API >= MIN_SUPPORTED_API);
         assert!(meets_floor(instance_api_version(MAX_USEFUL_API)));
     }
 

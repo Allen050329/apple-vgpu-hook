@@ -494,7 +494,7 @@ fn unreachable_declines_really_have_no_caller() {
             // A consumer *handles* the error: matches a variant or propagates
             // it. Merely implementing the trait that returns it does not count.
             if src.contains(&format!("{}::", class.type_name))
-                && !src.contains(&format!("impl Backend for"))
+                && !src.contains(&"impl Backend for".to_string())
             {
                 callers.push(rel);
             }

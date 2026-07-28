@@ -1207,7 +1207,7 @@ fn enqueue_present_scanout<H: HostOps>(
 /// byte layout, which is exactly the exported `B8G8R8A8_UNORM` image (alpha
 /// ignored: the scanned-out desktop is opaque). Modifier is implicit LINEAR.
 #[cfg(feature = "backend-vulkan")]
-const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes([b'X', b'R', b'2', b'4']);
+const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 
 /// Deprecated opt-in toggle for the historical GL/dmabuf scanout bridge probe,
 /// read once from `REIMS_VGPU_SCANOUT_GL=1`. Memoized so the present hot path never

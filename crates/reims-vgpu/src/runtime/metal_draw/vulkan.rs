@@ -4279,7 +4279,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     let _ = &writeback_guest;
     let t_total = std::time::Instant::now();
     let t_load = std::time::Instant::now();
-    let pd = load_render_pipeline(state, host, req.task_id, req.pipeline_ref).ok_or_else(|| {
+    let pd = load_render_pipeline(state, host, req.task_id, req.pipeline_ref).ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::PipelineMissing {
                 task_id: req.task_id,
@@ -4287,7 +4287,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let v_mtlb = load_mtlb(state, host, req.task_id, pd.vertex_func_ref).ok_or_else(|| {
+    let v_mtlb = load_mtlb(state, host, req.task_id, pd.vertex_func_ref).ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::VertexMtlbMissing {
                 task_id: req.task_id,
@@ -4295,7 +4295,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let f_mtlb = load_mtlb(state, host, req.task_id, pd.fragment_func_ref).ok_or_else(|| {
+    let f_mtlb = load_mtlb(state, host, req.task_id, pd.fragment_func_ref).ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::FragmentMtlbMissing {
                 task_id: req.task_id,
@@ -4793,7 +4793,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                         #[cfg(feature = "backend-vulkan")]
                         AttachmentAliasSample::ResidentChain => {
-                            let identity = render_chain_identity(state, req).ok_or_else(|| {
+                            let identity = render_chain_identity(state, req).ok_or({
                                 DrawError::DrawPreparation(
                                     DrawPreparationDecline::AttachmentAliasIdentityMissing {
                                         index,
@@ -5387,7 +5387,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 });
         }
         if let Some(idx) = req.indexed.as_ref() {
-            let index_type = translate::raster::index_type(idx.index_type).ok_or_else(|| {
+            let index_type = translate::raster::index_type(idx.index_type).ok_or({
                 DrawError::DrawPreparation(DrawPreparationDecline::IndexLoad {
                     reason: IndexLoadReason::TypeUnsupported,
                 })

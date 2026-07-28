@@ -69,7 +69,7 @@ impl ResourcePools {
         let req = ctx.device.get_image_memory_requirements(image);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
-            .ok_or_else(|| {
+            .ok_or({
                 DrawError::Unsupported(
                     super::reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
                         memory_type_bits: req.memory_type_bits,
@@ -218,7 +218,7 @@ impl ResourcePools {
         // Reuse the common allocator, then detach its bookkeeping copy from
         // the transient live list: the registry now owns this allocation.
         let slot = self.acquire_storage_image(ctx, key, counters)?;
-        let live = self.storage_image_live.pop().ok_or_else(|| {
+        let live = self.storage_image_live.pop().ok_or({
             DrawError::ComputeExecution(ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
                 identity,
                 width: key.width,

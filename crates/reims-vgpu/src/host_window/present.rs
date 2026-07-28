@@ -932,7 +932,6 @@ impl ApplicationHandler for App {
         // before the device's join returns.
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
-            return;
         }
         #[cfg(target_os = "macos")]
         if let Some(window) = self.window.as_ref() {

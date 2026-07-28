@@ -141,7 +141,7 @@ mod tests {
 
         let without = FdDupDecline::new(
             FdDupRail::ExportPresent,
-            &std::io::Error::new(std::io::ErrorKind::Other, "x"),
+            &std::io::Error::other("x"),
         );
         assert_eq!(without.errno, None);
         let line = crate::observe::Emit::decline("export_present", &without).render();

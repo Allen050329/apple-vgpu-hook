@@ -785,7 +785,7 @@ impl DeviceContext {
         host_ptr: *mut std::ffi::c_void,
         size: u64,
     ) -> Result<vk::DeviceMemory, DrawError> {
-        let ext = self.ext_external_memory_host.as_ref().ok_or_else(|| {
+        let ext = self.ext_external_memory_host.as_ref().ok_or({
             DrawError::Unsupported(super::reason::DrawReason::HostPointerImportUnavailable)
         })?;
         super::host_import_decline::validate_host_import_alignment(
@@ -808,7 +808,7 @@ impl DeviceContext {
         // HOST_VISIBLE|HOST_COHERENT (GPU writes must land in guest RAM directly).
         let mt = self
             .memory_type_for(ptr_props.memory_type_bits, MemoryClass::HostImport)
-            .ok_or_else(|| {
+            .ok_or({
                 DrawError::Unsupported(super::reason::DrawReason::NoImportableHostMemoryType {
                     memory_type_bits: ptr_props.memory_type_bits,
                 })

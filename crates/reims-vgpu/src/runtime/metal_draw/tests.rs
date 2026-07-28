@@ -56,6 +56,7 @@ fn rb(
 /// - Dropping it to the small-bind band (scroll glyphs ~3.6 KiB; small-UI /
 ///   gva_copy ~21–34 KiB) trades cheap CPU copies for many tiny GPU gathers +
 ///   host-import windows.
+///
 /// Vulkan-arm only: pins the `backend-vulkan` zero-copy byte floors.
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -4552,7 +4553,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     // inheriting slot 0's — there is no `or_else(first())` fallback here.
     let unblended = RenderPipelineDescriptor {
         color_attachments: vec![
-            pipeline.color_attachments[0].clone(),
+            pipeline.color_attachments[0],
             PipelineColorAttachment {
                 slot: 1,
                 blending_enabled: false,

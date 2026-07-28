@@ -416,7 +416,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let element_end = attribute.offset.checked_add(format_size).ok_or_else(|| {
+        let element_end = attribute.offset.checked_add(format_size).ok_or({
             DrawError::DrawValidation(DrawValidationDecline::VertexOffsetOverflow {
                 location: attribute.location,
             })
@@ -441,7 +441,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     };
                     first_record
                         .checked_add(last_record as usize)
-                        .ok_or_else(|| {
+                        .ok_or({
                             DrawError::DrawValidation(DrawValidationDecline::VertexRangeOverflow {
                                 location: attribute.location,
                             })
@@ -456,7 +456,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     };
                     req.base_instance
                         .checked_add(relative_element)
-                        .ok_or_else(|| {
+                        .ok_or({
                             DrawError::DrawValidation(
                                 DrawValidationDecline::InstanceRangeOverflow {
                                     location: attribute.location,
@@ -470,7 +470,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             .checked_mul(last_element)
             .and_then(|span| (attribute.offset as usize).checked_add(span))
             .and_then(|end| end.checked_add(format_size as usize))
-            .ok_or_else(|| {
+            .ok_or({
                 DrawError::DrawValidation(DrawValidationDecline::VertexByteRangeOverflow {
                     location: attribute.location,
                 })
@@ -1018,7 +1018,7 @@ pub(crate) unsafe fn execute_draw_inner(
             };
             let prefix = (req.base_instance as usize)
                 .checked_mul(resource.stride as usize)
-                .ok_or_else(|| {
+                .ok_or({
                     DrawError::DrawExecution(
                         DrawExecutionDecline::ConstantVertexBaseInstanceOverflow {
                             base_instance: req.base_instance,

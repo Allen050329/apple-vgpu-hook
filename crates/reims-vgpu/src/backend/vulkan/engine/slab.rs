@@ -454,7 +454,7 @@ impl SlabPool {
         }
         let mem_type = ctx
             .memory_type_for(ireq.memory_type_bits, MemoryClass::DeviceLocal)
-            .ok_or_else(|| {
+            .ok_or({
                 super::types::DrawError::Unsupported(
                     super::reason::DrawReason::NoDeviceLocalMemoryForSlab {
                         memory_type_bits: ireq.memory_type_bits,

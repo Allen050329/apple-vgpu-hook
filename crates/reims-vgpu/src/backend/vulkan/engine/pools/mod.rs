@@ -382,7 +382,7 @@ fn terminal_host_import_error(
     len: u64,
     alignment: u64,
 ) -> DrawError {
-    last_error.unwrap_or_else(|| {
+    last_error.unwrap_or({
         DrawError::HostImport(HostImportDecline::NoValidWindow {
             host_ptr,
             len,

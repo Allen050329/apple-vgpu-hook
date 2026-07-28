@@ -849,12 +849,16 @@ mod tests {
 
     #[test]
     fn snapshot_delta_saturates_after_a_counter_reset() {
-        let mut earlier = CounterSnapshot::default();
-        earlier.creates = 10;
-        earlier.readback_bytes = 4096;
-        let mut later = CounterSnapshot::default();
-        later.creates = 13;
-        later.readback_bytes = 1024;
+        let earlier = CounterSnapshot {
+            creates: 10,
+            readback_bytes: 4096,
+            ..Default::default()
+        };
+        let later = CounterSnapshot {
+            creates: 13,
+            readback_bytes: 1024,
+            ..Default::default()
+        };
 
         let delta = later.delta_since(&earlier);
         assert_eq!(delta.creates, 3);

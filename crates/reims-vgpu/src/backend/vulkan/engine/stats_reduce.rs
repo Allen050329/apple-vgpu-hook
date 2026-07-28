@@ -294,7 +294,7 @@ impl StatsReducePool {
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, MemoryClass::Readback)
-            .ok_or_else(|| {
+            .ok_or({
                 DrawError::Unsupported(super::reason::DrawReason::NoHostVisibleMemoryForStats {
                     memory_type_bits: req.memory_type_bits,
                 })

@@ -656,7 +656,7 @@ mod tests {
             Err(MemError::QemuWriteGpaCallbackMissing)
         );
         assert_eq!(
-            host.read_kva(0xfffffe00_1000, &mut [0; 1]),
+            host.read_kva(0xffff_fe00_1000, &mut [0; 1]),
             Err(MemError::QemuReadKvaCallbackMissing)
         );
         assert_eq!(
@@ -683,7 +683,7 @@ mod tests {
             Err(MemError::QemuWriteGpaCallbackFailed(-8))
         );
         assert_eq!(
-            host.read_kva(0xfffffe00_1000, &mut [0; 1]),
+            host.read_kva(0xffff_fe00_1000, &mut [0; 1]),
             Err(MemError::NoCpu),
             "-2 is the no-current-vCPU state, not an unmapped KVA"
         );
@@ -764,12 +764,10 @@ mod tests {
         let mut actions = VecDeque::new();
         let mut host = QemuHost::new(&ops, &mut actions);
         assert_eq!(host.map_pages(&[0x4000], 0x4000), None);
-        drop(host);
 
         ops.map_pages = Some(fail_map_pages);
         let mut host = QemuHost::new(&ops, &mut actions);
         assert_eq!(host.map_pages(&[0x8000], 0x4000), None);
-        drop(host);
 
         ops.map_pages = Some(null_map_pages);
         let mut host = QemuHost::new(&ops, &mut actions);
