@@ -444,11 +444,13 @@ pub fn capture_present_frame(
              produced this frame went to the other one)"
         ));
     }
-    // Advance the per-present tile-epoch clock and measure per-tile
-    // damage-coverage divergence against the freshest same-geometry peer
-    //. The CPU-display capture below
-    // composites those divergent tiles in its GPU readback command; direct
-    // export applies the same rect policy in `export_present_dmabuf`.
+    // Advance the per-present tile-epoch clock, then measure per-tile
+    // damage-coverage divergence against the freshest same-geometry peer.
+    //
+    // Measure-only. Nothing downstream reads these tiles: the capture below and
+    // the direct export both present the surface the display transaction named,
+    // whatever this divergence says. A non-zero count here is therefore a report
+    // of residue reaching the screen, not of residue being corrected.
     state.advance_tile_epoch();
     if let Some((peer_mid, tiles, bbox)) =
         physical_tile_divergence_vs_peer(state, mapping_id, width, height)
