@@ -959,27 +959,40 @@ pub struct PresentState {
     /// presented publish-only tiles (WebKit content surfaces) out of the group.
     pub output_group_geoms: std::collections::BTreeSet<(u32, u32)>,
     /// Protocol-structural dense-frame tracking (measure-only, never gates a
-    /// present decision): per compositor-output member, the monotonic sequence
-    /// number of the last FULL FRAME it actually holds — advanced when the
-    /// member receives a full-frame (whole-`w`×`h`) Store (the completeness
-    /// proof in [`Self::note_compositor_member_published`]). A member that fell
-    /// behind on those Stores has a stale seq: it is presenting content it never
-    /// received. A presented member whose seq lags a same-geometry peer by a
+    /// present decision): per compositor-output member, the value of
+    /// [`Self::dense_frame_counter`] at the last full-frame (whole-`w`×`h`)
+    /// Store **naming that mapping id** — the completeness proof in
+    /// [`Self::note_compositor_member_published`], which is the only site that
+    /// advances it. A presented member whose seq lags a same-geometry peer by a
     /// margin is the a/b inter-buffer retention gap
     /// ([`Self::dense_retention_gap`]). Cleared with membership on unmap.
+    ///
+    /// **What this is keyed on, and what that means it cannot see.** The advance
+    /// is a function of the mapping id the Store named and nothing else; it does
+    /// not consult [`DeviceState::output_group_for`] or any resident handle. So a
+    /// full frame the guest sent for a member, whose draws were routed to a
+    /// *different* resident than the one that member's present will read, still
+    /// advances the seq. That routing failure is the black-desktop mechanism
+    /// (§8.80 of the local KB), and the gate below is structurally blind to it —
+    /// `present_identity_flip` is what catches it. It is also keyed per member
+    /// while unified members share ONE resident, so a full frame stored through
+    /// one member does not mark its siblings backed even though they hold the
+    /// same pixels.
     pub dense_frame_seq: BTreeMap<u32, u64>,
     /// Per compositor-output member: the [`Self::dense_frame_seq`] value that
     /// member held the last time it was PRESENTED.
     ///
-    /// `dense_frame_seq` advances on a full-frame Store and on an inter-buffer
-    /// seed, so a member whose seq is unchanged across two of its own presents
-    /// received neither between them — it is being shown content it never
-    /// received. That is the always-on `present_unbacked` gate for the
-    /// mixed-generation frame class — the loss itself, reported on the mid the
-    /// guest named, rather than a rate at which we papered over it. Keyed
-    /// per member (not globally) so healthy a/b alternation, where each buffer
-    /// legitimately advances on its own turn, stays quiet. Cleared with
-    /// membership on unmap.
+    /// A member whose seq is unchanged across two of its own presents received
+    /// no full-frame Store naming it in between. That is the always-on
+    /// `present_unbacked` gate — the loss itself, reported on the mid the guest
+    /// named, rather than a rate at which we papered over it. Keyed per member
+    /// (not globally) so healthy a/b alternation, where each buffer legitimately
+    /// advances on its own turn, stays quiet. Cleared with membership on unmap.
+    ///
+    /// The "or an inter-buffer seed" half of this condition is gone: `62587b1`
+    /// deleted the a/b peer front seed, because unified members share one
+    /// resident and a seed between them is a copy onto itself. Nothing else
+    /// advances [`Self::dense_frame_counter`].
     pub presented_dense_seq: BTreeMap<u32, u64>,
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
@@ -2881,17 +2894,22 @@ impl DeviceState {
         true
     }
 
-    /// Record that `mapping_id` is being presented and report whether it is
-    /// backed — i.e. whether it received a full-frame Store or an inter-buffer
-    /// seed since its own previous present.
+    /// Record that `mapping_id` is being presented and report whether a
+    /// full-frame Store **named it** since its own previous present.
     ///
     /// Returns `Some(seq)` — the unchanged [`PresentState::dense_frame_seq`] —
-    /// when it did not. That member is being displayed with content it never
-    /// received, which is the mixed-generation frame class: a shared or stale
-    /// resident supplies whatever it happens to hold. `None` on the member's
-    /// first present (no prior witness) and whenever the seq advanced.
+    /// when none did. `None` on the member's first present (no prior witness)
+    /// and whenever the seq advanced.
     ///
-    /// Structural only: decoded Store/seed bookkeeping, never measured content.
+    /// Structural only: decoded Store bookkeeping, never measured content, and
+    /// never the resident. Say what that leaves out, because the name reads
+    /// broader than the check: a `None` here means the guest sent a frame for
+    /// this mid, **not** that the resident this present will read holds it. When
+    /// the two disagree — draws routed to a per-mid resident while the present
+    /// reads the shared one — the seq advances all the same and this stays
+    /// quiet. `present_identity_flip` is the gate for that; see
+    /// [`PresentState::dense_frame_seq`].
+    ///
     /// Records the witness on every call, so a member that stays unbacked
     /// reports once per present rather than once per lifetime.
     pub fn note_present_backing(&mut self, mapping_id: u32) -> Option<u64> {

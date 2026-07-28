@@ -3589,11 +3589,15 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
     assert_eq!(state.mappings[&0x2a].content_generation, 7);
 }
 
-/// `present_unbacked` gate: a member presented twice with neither a full-frame
-/// Store nor an inter-buffer seed in between is being displayed with content it
-/// never received — the mixed-generation frame class. `dense_frame_seq` advances
-/// on both of those events, so an unchanged seq across a member's own two
-/// presents is the exact structural witness.
+/// `present_unbacked` gate: a member presented twice with no full-frame Store
+/// **naming it** in between is being shown content the guest never sent for it.
+/// `note_compositor_member_published` is the only site that advances
+/// `dense_frame_seq`, so an unchanged seq across a member's own two presents is
+/// the exact structural witness.
+///
+/// The gate used to be described as covering "a full-frame Store or an
+/// inter-buffer seed". `62587b1` deleted the peer front seed, so only the first
+/// half survives.
 ///
 /// Healthy alternation must stay quiet: each buffer advances on its own turn.
 #[test]
@@ -3627,7 +3631,7 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
         assert_eq!(state.note_present_backing(1), None);
         assert!(
             state.note_present_backing(5).is_some(),
-            "mid 5 gained neither a full-frame store nor a seed"
+            "no full-frame store named mid 5"
         );
     }
 
@@ -3644,6 +3648,62 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     state.map_surface(5);
     state.note_compositor_member_published(5, w, h);
     assert_eq!(state.note_present_backing(5), None);
+}
+
+/// What the backing gate CANNOT see, pinned so the limitation is executable
+/// rather than a comment someone stops believing.
+///
+/// The gate's answer is a function of Store bookkeeping alone. Two states with
+/// identical publish/present histories give identical answers even when one
+/// resolves the mid to the shared `OutputGroup` resident and the other to a
+/// private per-mid `Surface` — which is precisely the disagreement that blacks
+/// out the desktop: the guest's full frame is stored, so the seq advances and
+/// this gate reports backed, while the present reads a resident that never got
+/// those pixels. `present_identity_flip` is the gate for that, and it is the one
+/// that moved 9 -> 0 across the fix.
+#[test]
+fn the_backing_gate_answers_the_same_whichever_resident_the_mid_resolves_to() {
+    let (w, h) = (1920u32, 1080u32);
+
+    // Grouped: two members presented at this geometry, so the swapchain latches
+    // and both resolve to the shared resident.
+    let mut grouped = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    for mid in [1u32, 6u32] {
+        grouped.map_surface(mid);
+        grouped.note_presented_geom(mid, w, h);
+    }
+    assert!(grouped.output_group_for(6, w, h).is_some());
+
+    // Private: same publish/present history, but nothing was ever presented
+    // here, so mid 6 keeps a per-mid resident.
+    let mut private = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    for mid in [1u32, 6u32] {
+        private.map_surface(mid);
+    }
+    assert!(private.output_group_for(6, w, h).is_none());
+
+    for state in [&mut grouped, &mut private] {
+        // A full frame naming mid 6 was stored. The gate goes quiet on the next
+        // present in BOTH states — including the one where mid 6 owns a private
+        // resident. That silence is about the Store, not about where its pixels
+        // landed, and it is the false negative the black-desktop class hides in.
+        state.note_compositor_member_published(6, w, h);
+        assert_eq!(state.note_present_backing(6), None);
+        // Frames now go to mid 1 only; mid 6 gains nothing.
+        state.note_compositor_member_published(1, w, h);
+    }
+    let (g, p) = (grouped.note_present_backing(6), private.note_present_backing(6));
+    assert!(
+        g.is_some() && p.is_some(),
+        "both arms must actually reach the firing state, or the equality below \
+         proves nothing: grouped={g:?} private={p:?}"
+    );
+    assert_eq!(
+        g.is_some(),
+        p.is_some(),
+        "the gate must not be read as evidence about the resident: it gives the \
+         same answer for a mid on the shared resident and a mid on its own"
+    );
 }
 
 /// The display-transaction probe must key on the payload *shape*, not fire per

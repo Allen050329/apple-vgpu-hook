@@ -1927,13 +1927,19 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // must not recapture here — present boundary only.
         //
         // Always-on backing gate: a member presented twice with no full-frame
-        // Store and no inter-buffer seed in between is being displayed with
-        // content it never received. That is a real loss of guest work and
-        // belongs in the log; nothing here papers over it.
+        // Store naming it in between is being displayed with content the guest
+        // never sent for it. That is a real loss of guest work and belongs in
+        // the log; nothing here papers over it.
+        //
+        // The line says "naming this mid" rather than "received", because that
+        // is the whole of what was read. The peer-seed half of the old wording
+        // named a mechanism `62587b1` deleted, and "received" would claim the
+        // resident was checked, which it is not — see `note_present_backing`.
         if let Some(seq) = state.note_present_backing(mapping) {
             crate::observe::fail(format!(
                 "present_unbacked mid={mapping} {w}x{h} gen={gen} since_seq={seq} \
-                 (no full-frame store and no peer seed since this mid's last present)"
+                 (no full-frame store named this mid since its last present; \
+                 the resident it will read was not checked)"
             ));
         }
         // The transaction payload carries exactly one field: plane 0's surface
