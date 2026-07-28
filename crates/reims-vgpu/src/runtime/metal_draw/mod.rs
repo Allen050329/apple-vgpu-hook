@@ -4505,6 +4505,25 @@ fn load_type11_rgba_static<M: HostMemory + HostOps>(
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
 /// the `t11_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
+/// Size a recycled scratch buffer to `span` for a `filled`-byte rect, without
+/// re-zeroing the rect.
+///
+/// The caller's read overwrites all `filled` bytes and fails the whole bind if it
+/// cannot, so zeroing them first buys nothing. It is not free either: at the
+/// 1920x1080 that dominates this workload the rect is 8.3 MiB, and the memset was
+/// paid on the memo *hit* path — the path whose entire purpose is to avoid
+/// touching the surface.
+///
+/// The `host_alloc_len` padding past the rect is a different case: the read does
+/// not write it, so it is zeroed here. A recycled buffer must not carry a
+/// previous surface's tail into the memo comparison, where it would manufacture a
+/// miss and cost a full conversion.
+fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
+    let filled = filled.min(span);
+    scratch.resize(span, 0);
+    scratch[filled..].fill(0);
+}
+
 fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4527,8 +4546,11 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
     // flush internally). Reuse the scratch so a memo hit costs no allocation.
     let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
-    scratch.clear();
-    scratch.resize(span, 0);
+    prepare_memo_scratch(
+        &mut scratch,
+        span,
+        (stride as usize).saturating_mul(h as usize),
+    );
     if !crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h) {
         state.type11_memo_scratch = scratch;
         return None;
@@ -4596,3 +4618,56 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
 include!("texture_view.rs");
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod memo_scratch_tests {
+    use super::prepare_memo_scratch;
+
+    /// The rect is left alone and only the padding is zeroed.
+    ///
+    /// The first assertion is the change: this buffer is recycled across binds and
+    /// the caller's read overwrites the whole rect, so re-zeroing it was an
+    /// 8.3 MiB memset per bind at 1920x1080 on the memo *hit* path. A `clear()`
+    /// before the resize — which is what this replaced — fails it.
+    ///
+    /// The second is the hazard the first one introduces. `host_alloc_len` rounds
+    /// the allocation up past the rect and the read does not write that tail, so a
+    /// buffer still holding a previous surface's bytes there would differ from the
+    /// memo and manufacture a miss.
+    #[test]
+    fn the_rect_is_not_rezeroed_and_the_padding_is() {
+        let (span, filled) = (4096, 4000);
+        let mut scratch = vec![0xAAu8; span];
+        prepare_memo_scratch(&mut scratch, span, filled);
+        assert_eq!(scratch.len(), span);
+        assert!(
+            scratch[..filled].iter().all(|&b| b == 0xAA),
+            "the rect was re-zeroed; the caller's read overwrites it anyway"
+        );
+        assert!(
+            scratch[filled..].iter().all(|&b| b == 0),
+            "a recycled buffer carried its old tail into the memo comparison"
+        );
+    }
+
+    /// Growing and shrinking both land on exactly `span`, with the tail zeroed.
+    /// The scratch is shared across surfaces, so the geometry changes under it.
+    #[test]
+    fn a_recycled_buffer_resizes_either_way_with_a_clean_tail() {
+        let mut scratch = vec![0xAAu8; 1024];
+        prepare_memo_scratch(&mut scratch, 8192, 8000);
+        assert_eq!(scratch.len(), 8192);
+        assert!(scratch[8000..].iter().all(|&b| b == 0));
+
+        prepare_memo_scratch(&mut scratch, 512, 500);
+        assert_eq!(scratch.len(), 512);
+        assert!(scratch[500..].iter().all(|&b| b == 0));
+
+        // A rect that claims the whole span leaves no tail to zero, and a rect
+        // larger than the span (impossible geometry) must not panic on the slice.
+        prepare_memo_scratch(&mut scratch, 512, 512);
+        assert_eq!(scratch.len(), 512);
+        prepare_memo_scratch(&mut scratch, 512, 9999);
+        assert_eq!(scratch.len(), 512);
+    }
+}
