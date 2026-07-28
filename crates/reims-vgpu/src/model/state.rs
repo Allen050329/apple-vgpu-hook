@@ -2787,11 +2787,11 @@ impl DeviceState {
     /// The geometry latch ([`PresentState::output_group_geoms`]) keeps a surface
     /// unified across buffer recycles that momentarily drop the concurrent peer
     /// count to one and would otherwise re-expose a per-mid resident (the
-    /// black-background class). The latch also *arms* on the very first frame
-    /// two surfaces appear together, because `note_presented_geom` evaluates the
-    /// arming condition immediately after its own insert — so the live peer
-    /// recount below it is not what admits the first pair either. Whether it
-    /// admits anything at all is being measured; see the probe on that branch.
+    /// black-background class). It also *arms* on the very first frame two
+    /// surfaces appear together, because `note_presented_geom` evaluates the
+    /// arming condition immediately after its own insert. It is therefore the
+    /// only thing that decides membership at a geometry: there is no live peer
+    /// recount to disagree with it.
     pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
         self.output_group_resolve(mapping_id, w, h).ok()
     }
@@ -2826,46 +2826,23 @@ impl DeviceState {
                 },
             });
         }
+        // One question, one answer: has this geometry been proven a multi-buffer
+        // swapchain? A live recount of same-geometry peers used to sit under
+        // this, and given the `presented_at` gate above it tested the *identical*
+        // predicate the latch arms on (`presented_count(w, h) >= 2`) — a second
+        // mechanism re-deriving a permanent fact from transient state.
+        //
+        // It could only have admitted anyone the latch had missed, which needs
+        // the arming predicate to become true with no `note_presented_geom`
+        // running to observe it. Its inputs are `presented_geoms` (one insert
+        // site, latch check immediately after) and each mid's `map_generation`,
+        // and evidence never comes back to life
+        // (`a_superseded_presented_entry_never_becomes_live_again`), so the count
+        // rises only inside the call that checks the latch. Measured before
+        // deleting: a probe on that branch emitted nothing across boot 87, whose
+        // `resident_identity_shared` lines show this resolver admitting mids
+        // 2, 4, 5 and 6 at 1920x1080 the whole time.
         if self.present.output_group_geoms.contains(&(w, h)) {
-            return Ok(1);
-        }
-        let peers = self
-            .present
-            .presented_geoms
-            .keys()
-            .filter(|&&mid| mid != mapping_id && self.presented_geom_live(mid) == Some((w, h)))
-            .count();
-        if peers >= 1 {
-            // MEASUREMENT, so that deleting this branch can be a decision rather
-            // than an argument.
-            //
-            // `note_presented_geom` arms the latch on `presented_count(w, h) >= 2`,
-            // and the `presented_at` gate above has already established that
-            // `mapping_id` is one of those, so `peers >= 1` is the *identical*
-            // predicate — evaluated live instead of latched. Two mechanisms
-            // deciding one membership question, which is the state-that-must-agree
-            // the latch was introduced to end.
-            //
-            // Reaching here therefore means the arming predicate became true with
-            // no `note_presented_geom` running to observe it. Its only inputs are
-            // `presented_geoms` (single insert site, latch check immediately after)
-            // and each mid's `map_generation`, so the one remaining path is a dead
-            // entry coming back to life: generations only climb, so this needs the
-            // mapping entry to disappear, taking `map_generation_or_zero` back to
-            // the 0 that an entry recorded before we held any mapping. Admitting on
-            // resurrected evidence is not something we want, so if this line never
-            // fires the branch is redundant and its deletion is a scoreboard win.
-            // Latched per geometry: the question is whether the branch fires at
-            // all, and a hot resolver repeating one line answers it no better.
-            // Zero lines over a boot is a sound reading of "never" precisely
-            // because the first sighting of each geometry is always let through.
-            let geom = ((w as u64) << 32) | h as u64;
-            if crate::observe::first_sight("output_group_unlatched_peer", geom) {
-                crate::observe::off(format!(
-                    "output_group_unlatched_peer mid={mapping_id} geom={w}x{h} peers={peers} \
-                     (admitted by the live recount at a geometry the sticky latch never armed)"
-                ));
-            }
             Ok(1)
         } else {
             Err(OutputGroupMiss::NoPeer)
@@ -3700,33 +3677,34 @@ impl DeviceState {
     }
 }
 
-/// Whether `output_group_resolve`'s live peer recount can ever admit a surface
-/// the sticky latch has not already admitted.
+/// The sticky geometry latch is the only thing that decides output-group
+/// membership.
 ///
-/// Two mechanisms decide one membership question, and the prime directive says
-/// that is one too many. These tests establish the two facts needed to delete
-/// the recount: it CAN fire (so a zero reading off a boot means something), and
-/// the only input that could make it fire ahead of the latch — a dead
-/// `presented_geoms` entry coming back to life — is not reachable.
+/// It used to share that job with a live recount of same-geometry presented
+/// peers, which tested the identical predicate the latch arms on — two
+/// mechanisms answering one question, so one of them had to go. These tests hold
+/// the line: the latch alone admits, and the state the recount used to admit on
+/// is refused.
 #[cfg(test)]
 mod output_group_membership_tests {
     use super::*;
     use crate::model::PAGE_SHIFT_X86;
-    use crate::observe::FailCapture;
     use crate::runtime::import_present::OUTPUT_GROUP_ID;
 
     fn state() -> DeviceState {
         DeviceState::new(DeviceId(1), PAGE_SHIFT_X86)
     }
 
-    /// The probe fires, and it prints the mid, geometry and peer count it read.
+    /// Presented peers with no latch do not make a group.
     ///
-    /// A probe that cannot fire reports zero on a healthy boot and zero on a
-    /// broken one, so this is what makes the rail reading admissible at all. The
-    /// state is built by writing `presented_geoms` directly, because the whole
-    /// claim under test is that `note_presented_geom` cannot produce it.
+    /// This state is not reachable through `note_presented_geom` — it checks the
+    /// latch immediately after its own insert — so it is built by writing
+    /// `presented_geoms` directly. That is the point: the recount's admission
+    /// could only ever come from bookkeeping the arming path never saw, and the
+    /// contract says a swapchain is proven at the moment two surfaces are
+    /// presented together, not inferred from a later recount.
     #[test]
-    fn the_unlatched_peer_probe_prints_the_reading_that_admitted() {
+    fn presented_peers_without_the_latch_are_not_a_group() {
         let mut s = state();
         for mid in [4u32, 9u32] {
             s.present.presented_geoms.insert(
@@ -3738,30 +3716,23 @@ mod output_group_membership_tests {
                 },
             );
         }
-        assert!(
-            !s.present.output_group_geoms.contains(&(1920, 1080)),
-            "the latch must be unarmed or this exercises the wrong branch"
-        );
-
-        let cap = FailCapture::start();
-        assert_eq!(s.output_group_resolve(4, 1920, 1080), Ok(OUTPUT_GROUP_ID));
-        let line = cap.one("OFF");
-        assert!(
-            line.contains("output_group_unlatched_peer mid=4 geom=1920x1080 peers=1"),
-            "the probe must name what it read, got {line:?}"
+        assert!(!s.present.output_group_geoms.contains(&(1920, 1080)));
+        assert_eq!(
+            s.output_group_resolve(4, 1920, 1080),
+            Err(OutputGroupMiss::NoPeer),
+            "a live recount must not admit what the arming path never proved"
         );
     }
 
-    /// Arming the latch the way the guest does keeps the probe silent — the
-    /// recount is not what admitted anyone.
+    /// The guest's own ordering arms the latch before anything can resolve, so
+    /// nothing else is needed to admit the first pair.
     ///
-    /// `note_presented_geom` checks the latch condition immediately after its
-    /// insert, so the second present arms the geometry before anything can
-    /// resolve against it. Both members then take the latch branch.
+    /// `note_presented_geom` checks the arming condition immediately after its
+    /// own insert, which is what made the recount below it unreachable: the
+    /// count cannot pass 2 anywhere else.
     #[test]
-    fn two_presents_arm_the_latch_before_the_recount_is_ever_consulted() {
+    fn the_second_present_arms_the_latch_that_admits_both_members() {
         let mut s = state();
-        let cap = FailCapture::start();
         s.map_surface(4);
         s.note_presented_geom(4, 1920, 1080);
         assert_eq!(
@@ -3778,13 +3749,6 @@ mod output_group_membership_tests {
         for mid in [4u32, 9u32] {
             assert_eq!(s.output_group_resolve(mid, 1920, 1080), Ok(OUTPUT_GROUP_ID));
         }
-        assert!(
-            !cap.lines()
-                .iter()
-                .any(|l| l.contains("output_group_unlatched_peer")),
-            "the latch admitted both, so the recount must not have: {:?}",
-            cap.lines()
-        );
     }
 
     /// The lemma the deletion rests on: presented evidence never comes back to
