@@ -2029,38 +2029,99 @@ fn store_seed_policy_clear_full_load_diff() {
     assert!(store_seed_policy(false, PASS_LOAD_ACTION_LOAD, None).is_none());
 }
 
+/// Every one of the six checks names itself, and the three routes to
+/// `UseCpuSeed` stay distinguishable.
+///
+/// The outcome cannot answer "which check applied" — that is the whole reason
+/// the decision type exists. Asserting the mapping as well as the slugs pins
+/// both halves: a decision that renamed itself but mapped to a different choice
+/// would change behaviour silently, and one that shared a slug would make the
+/// present-boundary arm unmeasurable, which is what it needs to be weighed.
+#[test]
+fn every_type11_load_check_names_itself_and_keeps_its_outcome() {
+    use crate::observe::Decline;
+    use crate::runtime::metal_draw::Type11LoadDecision as D;
+    const ALL: &[(D, Type11LoadChoice)] = &[
+        (D::NonLoadSeeded, Type11LoadChoice::UseCpuSeed),
+        (D::NonLoadBare, Type11LoadChoice::ClearBlack),
+        (D::PresentBoundary, Type11LoadChoice::UseCpuSeed),
+        (D::ResidentReady, Type11LoadChoice::LoadFromTarget),
+        (D::SeedWhileNotReady, Type11LoadChoice::UseCpuSeed),
+        (D::NothingToLoad, Type11LoadChoice::ClearBlack),
+    ];
+    let mut slugs: Vec<&str> = ALL.iter().map(|(d, _)| d.slug()).collect();
+    let n = slugs.len();
+    slugs.sort_unstable();
+    slugs.dedup();
+    assert_eq!(slugs.len(), n, "two type-11 Load checks share a reason slug");
+    for (decision, expected) in ALL {
+        assert_eq!(decision.choice(), *expected, "{decision:?} changed outcome");
+    }
+    // Three checks, one outcome — the collapse the census exists to undo.
+    assert_eq!(
+        ALL.iter()
+            .filter(|(_, c)| *c == Type11LoadChoice::UseCpuSeed)
+            .count(),
+        3
+    );
+}
+
+/// The present-boundary arm is reachable and is the one that **overrides a
+/// ready resident** — the only check here that overrules an authoritative GPU
+/// image, and the only one not derived from a decoded field.
+#[test]
+fn the_present_boundary_check_is_what_overrides_a_ready_resident() {
+    use crate::runtime::metal_draw::Type11LoadDecision as D;
+    let seed = [1u8, 2, 3, 255];
+    assert_eq!(
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, true),
+        D::PresentBoundary,
+        "presented-since-last-draw must win over a ready resident"
+    );
+    // Same inputs without the present: the resident is authoritative.
+    assert_eq!(
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, false),
+        D::ResidentReady
+    );
+    // Presented but nothing to seed from: the resident stands.
+    assert_eq!(
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, None, false, true),
+        D::ResidentReady
+    );
+}
+
 /// Class A zero-copy wipe: LOAD + resident ready must LoadFromTarget even
 /// when host_cache was evicted (no CPU seed) or still holds black.
 #[test]
 fn type11_load_ready_uses_resident_not_clear() {
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, None, false, false),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, None, false, false).choice(),
         Type11LoadChoice::LoadFromTarget
     );
     // CPU seed content never wins over a ready resident image.
     let black = [0u8, 0, 0, 255];
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, Some(&black), false, false),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&black), false, false).choice(),
         Type11LoadChoice::LoadFromTarget
     );
     // First touch: not ready, no seed → Clear (engine default).
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, None, false, false),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, false, None, false, false).choice(),
         Type11LoadChoice::ClearBlack
     );
     // First touch with an all-black CPU seed still uploads that seed;
     // presence, not an RGB census, is the Load contract.
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, Some(&black), false, false),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, false, Some(&black), false, false).choice(),
         Type11LoadChoice::UseCpuSeed
     );
     // CLEAR never LoadFromTarget via this helper.
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_CLEAR, true, Some(&black), false, false),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, Some(&black), false, false).choice(),
         Type11LoadChoice::UseCpuSeed
     );
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_CLEAR, true, None, false, false),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, None, false, false).choice(),
         Type11LoadChoice::ClearBlack
     );
 }
@@ -2073,34 +2134,34 @@ fn type11_load_ready_uses_resident_not_clear() {
 fn type11_load_present_boundary_prefers_guest_seed() {
     let seed = [9u8, 9, 9, 255];
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, true),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, true).choice(),
         Type11LoadChoice::UseCpuSeed
     );
     // GPU boundary seed (resident→target copy armed on the request)
     // counts as seed presence exactly like CPU bytes: it must win over a
     // ready resident at a present boundary.
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, None, true, true),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, None, true, true).choice(),
         Type11LoadChoice::UseCpuSeed
     );
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, None, true, true),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, false, None, true, true).choice(),
         Type11LoadChoice::UseCpuSeed
     );
     // Pages unreadable (no seed): the ready resident is the fallback, not
     // a black clear.
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, None, false, true),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, None, false, true).choice(),
         Type11LoadChoice::LoadFromTarget
     );
     // Boundary + no resident + no seed still clears (first touch).
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, None, false, true),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, false, None, false, true).choice(),
         Type11LoadChoice::ClearBlack
     );
     // Boundary never affects CLEAR semantics.
     assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_CLEAR, true, Some(&seed), false, true),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, Some(&seed), false, true).choice(),
         Type11LoadChoice::UseCpuSeed
     );
 }

@@ -2618,6 +2618,25 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
+        type_name: "Type11LoadDecision",
+        defined_in: "runtime/metal_draw/mod.rs",
+        slug_blocks: &[],
+        // Census, not a refusal: the Load resolved every time. Six checks
+        // collapse into three `Type11LoadChoice` values and `UseCpuSeed` alone
+        // is reached three ways, so all six are registered — the reading is
+        // which check applied, which the outcome cannot say.
+        emission: Emission::At(&[("runtime/metal_draw/vulkan.rs", "t11_load")]),
+        slug_calls: &[],
+        slugs: &[
+            "t11_load_non_load_seeded",
+            "t11_load_non_load_bare",
+            "t11_load_present_boundary",
+            "t11_load_resident_ready",
+            "t11_load_seed_not_ready",
+            "t11_load_nothing",
+        ],
+    },
+    DeclineClass {
         type_name: "ReadRefusal",
         defined_in: "runtime/gva_mem.rs",
         slug_blocks: &[],

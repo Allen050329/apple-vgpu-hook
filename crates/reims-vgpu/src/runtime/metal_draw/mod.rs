@@ -2426,6 +2426,62 @@ pub(crate) enum Type11LoadChoice {
     ClearBlack,
 }
 
+/// **Which check** decided the type-11 Load, not just what it chose.
+///
+/// Six distinct decisions collapse into three [`Type11LoadChoice`] values, and
+/// `UseCpuSeed` alone is reached three different ways. That is the same "one
+/// status for N checks" shape the guest-write gate carried until its arms were
+/// typed: the always-on log could say a seed was uploaded and could not say
+/// *why*, so no reading could separate a normal not-ready seed from the
+/// present-boundary rule.
+///
+/// The present-boundary rule is the one that needs separating. It is documented
+/// from live forensics rather than from a decoded field — the guest sends no
+/// "re-seed from the front buffer" instruction — which makes it a candidate for
+/// deletion, and nothing can weigh that while its decisions are indistinguishable
+/// from the two legitimate seed paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Type11LoadDecision {
+    /// Not a LOAD, and a seed exists: upload it rather than load the target.
+    NonLoadSeeded,
+    /// Not a LOAD and no seed: clear.
+    NonLoadBare,
+    /// LOAD, the mapping presented since the last draw, and a seed exists.
+    /// **The arm derived from observation** — it overrides a ready resident.
+    PresentBoundary,
+    /// LOAD and the resident is authoritative after our Stores.
+    ResidentReady,
+    /// LOAD, resident not ready, but a seed was built.
+    SeedWhileNotReady,
+    /// LOAD with neither a ready resident nor any seed.
+    NothingToLoad,
+}
+
+impl Type11LoadDecision {
+    pub(crate) fn choice(self) -> Type11LoadChoice {
+        match self {
+            Self::NonLoadSeeded | Self::PresentBoundary | Self::SeedWhileNotReady => {
+                Type11LoadChoice::UseCpuSeed
+            }
+            Self::ResidentReady => Type11LoadChoice::LoadFromTarget,
+            Self::NonLoadBare | Self::NothingToLoad => Type11LoadChoice::ClearBlack,
+        }
+    }
+}
+
+impl crate::observe::Decline for Type11LoadDecision {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::NonLoadSeeded => "t11_load_non_load_seeded",
+            Self::NonLoadBare => "t11_load_non_load_bare",
+            Self::PresentBoundary => "t11_load_present_boundary",
+            Self::ResidentReady => "t11_load_resident_ready",
+            Self::SeedWhileNotReady => "t11_load_seed_not_ready",
+            Self::NothingToLoad => "t11_load_nothing",
+        }
+    }
+}
+
 /// Pure resolution for type-11 Load on the Linux product path.
 ///
 /// - CLEAR / non-LOAD: not this helper's concern for LoadFromTarget (caller
@@ -2443,13 +2499,16 @@ pub(crate) enum Type11LoadChoice {
 ///   authoritative after our Stores; host_cache may be empty or stale black).
 /// - LOAD + not ready + some CPU seed: UseCpuSeed.
 /// - LOAD + not ready + no seed: ClearBlack.
-pub(crate) fn resolve_type11_load_choice(
+///
+/// Returns the check that decided rather than only its outcome, so the always-on
+/// census can separate the three routes to `UseCpuSeed`.
+pub(crate) fn resolve_type11_load_decision(
     load_action: u16,
     resident_content_ready: bool,
     cpu_seed: Option<&[u8]>,
     gpu_seed: bool,
     presented_since_last_draw: bool,
-) -> Type11LoadChoice {
+) -> Type11LoadDecision {
     // Presence is the protocol fact. The bytes may legitimately describe a
     // fully black or transparent attachment and must never affect this choice.
     // A GPU boundary seed (engine resident→target copy armed on the request)
@@ -2458,21 +2517,21 @@ pub(crate) fn resolve_type11_load_choice(
     if load_action != PASS_LOAD_ACTION_LOAD {
         // CLEAR / DONT_CARE: never LoadFromTarget via this helper.
         return if has_seed {
-            Type11LoadChoice::UseCpuSeed
+            Type11LoadDecision::NonLoadSeeded
         } else {
-            Type11LoadChoice::ClearBlack
+            Type11LoadDecision::NonLoadBare
         };
     }
     if presented_since_last_draw && has_seed {
-        return Type11LoadChoice::UseCpuSeed;
+        return Type11LoadDecision::PresentBoundary;
     }
     if resident_content_ready {
-        return Type11LoadChoice::LoadFromTarget;
+        return Type11LoadDecision::ResidentReady;
     }
     if has_seed {
-        Type11LoadChoice::UseCpuSeed
+        Type11LoadDecision::SeedWhileNotReady
     } else {
-        Type11LoadChoice::ClearBlack
+        Type11LoadDecision::NothingToLoad
     }
 }
 

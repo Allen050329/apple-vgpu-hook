@@ -5660,13 +5660,35 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         ));
                     }
                 }
-                let choice = resolve_type11_load_choice(
+                let decision = crate::runtime::metal_draw::resolve_type11_load_decision(
                     load_action.unwrap_or(PASS_LOAD_ACTION_DONT_CARE),
                     ready,
                     resources.target_rgba8.as_deref(),
                     gpu_boundary_seed,
                     presented_since_last_draw,
                 );
+                // Six checks decide this and three answers come out, so the
+                // existing `m2v_load_seed` line — verbose-gated, and only for
+                // >=1280x720 — cannot say which one applied. Latched per
+                // (check, pipeline) so the reading is the *set* of pipelines
+                // each arm serves; the present-boundary arm is the one derived
+                // from forensics rather than a decoded field, and nothing can
+                // weigh deleting it while its decisions are indistinguishable
+                // from the two legitimate seed paths.
+                {
+                    use crate::observe::Decline;
+                    let key = (u64::from(req.pipeline_ref) << 8) | u64::from(load_action.unwrap_or(0));
+                    if crate::observe::first_sight(decision.slug(), key) {
+                        crate::observe::Emit::decline("t11_load", &decision)
+                            .field("pipe", req.pipeline_ref)
+                            .field("mid", import_mid)
+                            .field("dims", format!("{w}x{h}"))
+                            .field("ready", u8::from(ready))
+                            .field("presented", u8::from(presented_since_last_draw))
+                            .fail();
+                    }
+                }
+                let choice = decision.choice();
                 match choice {
                     Type11LoadChoice::LoadFromTarget => {
                         resources.load_op =
