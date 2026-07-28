@@ -1671,6 +1671,7 @@ impl ResourcePools {
                 .allocation_size(req.size)
                 .memory_type_index(mt),
             counters,
+            AllocSite::Staging,
         )
         .map_err(|e| {
             ctx.device.destroy_buffer(buffer, None);
@@ -1822,6 +1823,7 @@ impl ResourcePools {
                 .allocation_size(req.size)
                 .memory_type_index(mt),
             counters,
+            AllocSite::Readback,
         )
         .map_err(|e| {
             ctx.device.destroy_buffer(buffer, None);
@@ -1902,6 +1904,7 @@ impl ResourcePools {
                 .allocation_size(req.size)
                 .memory_type_index(mt),
             counters,
+            AllocSite::ReadbackMulti,
         )
         .map_err(|e| {
             ctx.device.destroy_buffer(buffer, None);

@@ -537,6 +537,7 @@ impl SlabPool {
                 .allocation_size(block_size)
                 .memory_type_index(mem_type),
             counters,
+            AllocSite::SlabBlock,
         )
         .map_err(|result| {
             super::types::DrawError::VkCall(super::vk_call::VkCall::new(
@@ -793,7 +794,7 @@ impl SlabPool {
     }
 }
 
-use super::pools::allocate_memory_timed;
+use super::pools::{allocate_memory_timed, AllocSite};
 use crate::backend::vulkan::caps::MemoryClass;
 
 /// A slab allocation/free-list invariant that cannot honestly masquerade as a

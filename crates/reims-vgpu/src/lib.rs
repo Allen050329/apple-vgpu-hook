@@ -1207,6 +1207,63 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     true
 }
 
+/// Wall-clock a drain tranche must exceed to earn the per-tranche detail line.
+const TRANCHE_OUTLIER_US: u64 = 25_000;
+
+/// Windowed census over EVERY drain tranche, emitted once per second of tranche
+/// wall-clock.
+///
+/// The `drain_tranche_us` detail line fires only above [`TRANCHE_OUTLIER_US`],
+/// which is right for reading one hitch and useless for reading a rate: it has
+/// no denominator, so "65 lines in 200 s, 40-91 % of each in
+/// `engine_memory_alloc_us`" cannot say whether allocation is most of the drain's
+/// life or a rounding error that happens to show up when a tranche is already
+/// long. Those are opposite conclusions and the detail line reads identically
+/// either way.
+///
+/// This counts all tranches, so `over25` against `tranches` is the outlier rate
+/// and `alloc_us` against `us` is allocation's share of the whole drain — the two
+/// quantities the threshold discarded.
+fn note_drain_tranche_window(tranche_us: u64, tr: &model::TrancheStats) {
+    use std::sync::atomic::AtomicU64;
+    static TRANCHES: AtomicU64 = AtomicU64::new(0);
+    static US: AtomicU64 = AtomicU64::new(0);
+    static OVER: AtomicU64 = AtomicU64::new(0);
+    static DRAWS: AtomicU64 = AtomicU64::new(0);
+    static ENGINE_US: AtomicU64 = AtomicU64::new(0);
+    static ALLOC_US: AtomicU64 = AtomicU64::new(0);
+    static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    static CREATES: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+
+    let add = |c: &AtomicU64, v: u64| c.fetch_add(v, Ordering::Relaxed) + v;
+    add(&TRANCHES, 1);
+    add(&DRAWS, tr.draws);
+    add(&ENGINE_US, tr.engine_us);
+    add(&ALLOC_US, tr.engine_memory_alloc_us);
+    add(&ALLOCS, tr.engine_allocs);
+    add(&CREATES, tr.engine_creates);
+    if tranche_us > TRANCHE_OUTLIER_US {
+        add(&OVER, 1);
+    }
+    MAX_US.fetch_max(tranche_us, Ordering::Relaxed);
+    if add(&US, tranche_us) < 1_000_000 {
+        return;
+    }
+    observe::off(format!(
+        "drain_tranche_window tranches={} us={} max_us={} over25={} draws={} engine_us={} alloc_us={} allocs={} creates={}",
+        TRANCHES.swap(0, Ordering::Relaxed),
+        US.swap(0, Ordering::Relaxed),
+        MAX_US.swap(0, Ordering::Relaxed),
+        OVER.swap(0, Ordering::Relaxed),
+        DRAWS.swap(0, Ordering::Relaxed),
+        ENGINE_US.swap(0, Ordering::Relaxed),
+        ALLOC_US.swap(0, Ordering::Relaxed),
+        ALLOCS.swap(0, Ordering::Relaxed),
+        CREATES.swap(0, Ordering::Relaxed),
+    ));
+}
+
 /// Worker body: drain pending FIFOs using QEMU GPA callbacks; enqueue HostActions.
 pub fn device_drain(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
@@ -1250,7 +1307,8 @@ pub fn device_drain(id: u64) -> bool {
     // Always drain the per-draw accumulator so it never leaks into the next
     // tranche; attribute the hold only on the >25 ms outlier line.
     let tr = device.state.tranche.take();
-    if tranche_us > 25_000 {
+    note_drain_tranche_window(tranche_us, &tr);
+    if tranche_us > TRANCHE_OUTLIER_US {
         // `other_us` = tranche wall minus every attributed class (draws, compute
         // dispatches, store/flush readbacks) = the residual: FIFO parse, mapper
         // page-table walks, present/scanout capture, iosfc — no per-op timing.

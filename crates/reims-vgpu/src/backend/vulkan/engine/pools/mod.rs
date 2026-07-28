@@ -1116,17 +1116,93 @@ fn sampled_content_hash(bytes: &[u8]) -> u128 {
     ((hi.finish() as u128) << 64) | lo.finish() as u128
 }
 
+/// Which pool asked for a `vkAllocateMemory`.
+///
+/// `engine_memory_alloc_us` is 40-91 % of every drain tranche over the 25 ms
+/// outlier threshold, at ~940 µs an allocation. One fused counter cannot say
+/// which of the seven allocating pools spends it, and they have different fixes:
+/// a staging bucket that misses its free list, a per-frame sampled image, and a
+/// transient depth attachment are three different defects wearing one number.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocSite {
+    StorageImage,
+    ResidentColor,
+    TransientDepth,
+    Staging,
+    Readback,
+    ReadbackMulti,
+    SlabBlock,
+}
+
+const ALLOC_SITE_N: usize = 7;
+
+impl AllocSite {
+    const fn idx(self) -> usize {
+        match self {
+            AllocSite::StorageImage => 0,
+            AllocSite::ResidentColor => 1,
+            AllocSite::TransientDepth => 2,
+            AllocSite::Staging => 3,
+            AllocSite::Readback => 4,
+            AllocSite::ReadbackMulti => 5,
+            AllocSite::SlabBlock => 6,
+        }
+    }
+}
+
+const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
+    "storage_image",
+    "resident_color",
+    "transient_depth",
+    "staging",
+    "readback",
+    "readback_multi",
+    "slab_block",
+];
+
+static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] = [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+static ALLOC_SITE_US: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] = [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+static ALLOC_SITE_BYTES: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] = [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+/// Accumulated allocation wall-clock since the last emit; one line per second of
+/// it, so the rate is self-clocked and an idle boot stays silent.
+static ALLOC_WINDOW_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const ALLOC_WINDOW_EMIT_US: u64 = 1_000_000;
+
 pub(crate) unsafe fn allocate_memory_timed(
     ctx: &DeviceContext,
     info: &vk::MemoryAllocateInfo<'_>,
     counters: &EngineCounters,
+    site: AllocSite,
 ) -> Result<vk::DeviceMemory, vk::Result> {
     let started = Instant::now();
     let result = ctx.device.allocate_memory(info, None);
-    counters
-        .memory_alloc_us
-        .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    counters.memory_alloc_us.fetch_add(us, Ordering::Relaxed);
+    let i = site.idx();
+    ALLOC_SITE_COUNT[i].fetch_add(1, Ordering::Relaxed);
+    ALLOC_SITE_US[i].fetch_add(us, Ordering::Relaxed);
+    ALLOC_SITE_BYTES[i].fetch_add(info.allocation_size, Ordering::Relaxed);
+    if ALLOC_WINDOW_US.fetch_add(us, Ordering::Relaxed) + us >= ALLOC_WINDOW_EMIT_US {
+        ALLOC_WINDOW_US.store(0, Ordering::Relaxed);
+        emit_alloc_site_census();
+    }
     result
+}
+
+/// Cumulative per-site allocation census: `count:microseconds:mebibytes`.
+fn emit_alloc_site_census() {
+    use std::fmt::Write as _;
+    let mut line = String::from("vk_alloc_sites");
+    for (i, name) in ALLOC_SITE_NAMES.iter().enumerate() {
+        let _ = write!(
+            line,
+            " {name}={}:{}:{}",
+            ALLOC_SITE_COUNT[i].load(Ordering::Relaxed),
+            ALLOC_SITE_US[i].load(Ordering::Relaxed),
+            ALLOC_SITE_BYTES[i].load(Ordering::Relaxed) >> 20,
+        );
+    }
+    crate::observe::off(line);
 }
 
 include!("submission_and_buffers.rs");
