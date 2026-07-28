@@ -962,6 +962,38 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         timing.log(
             "contig", mapping_id, width, height, map_us, dma_us, post_us, 1, 0, 0, false,
         );
+        // Same reasoning as the multi-run tail below: the import windows are a
+        // cache, and running out of them is not a reason to drop the render.
+        //
+        // A packed-contig surface needs exactly one window, so this path looks
+        // immune to a budget bound. It is not — the budget is global, so a
+        // single-run surface is refused whenever the *other* surfaces have
+        // already spent it. Covering only the fragmented path left exactly one
+        // loss standing on a live boot, and it was this one: `path=contig
+        // mid=216 43x24 runs=1`, a 43x24 window asking for its single import
+        // against a fully-spent 8 GiB budget.
+        if let ImportPresentResult::Fail(reason) = r {
+            if is_import_window_shortage(reason) {
+                crate::observe::fail(format!(
+                    "import_window_cpu_writeback mid={mapping_id} {width}x{height} \
+                     runs=1 reason={reason} (host-import budget exhausted; \
+                     writing the render back on the CPU instead of dropping it)"
+                ));
+                return try_import_present_cpu_unstable(
+                    state,
+                    host,
+                    identity,
+                    mapping_id,
+                    width,
+                    height,
+                    base_off,
+                    bpr,
+                    guest_before_center,
+                    from_device,
+                    timing,
+                );
+            }
+        }
         return r;
     }
 
