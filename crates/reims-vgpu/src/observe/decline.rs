@@ -2561,15 +2561,15 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
-        type_name: "TaskWalkSlot",
+        type_name: "TaskWalkAmbiguity",
         defined_in: "runtime/gva_view.rs",
         slug_blocks: &[],
-        // Census, not a refusal: the walk succeeded either way. It is registered
-        // here because the vocabulary rule is about lines in the log, not about
+        // Census, not a refusal: the walk resolved. It is registered here
+        // because the vocabulary rule is about lines in the log, not about
         // whether the line reports a failure.
         emission: Emission::At(&[("runtime/gva_view.rs", "task_walk")]),
         slug_calls: &[],
-        slugs: &["task_walk_shifted", "task_walk_ambiguous"],
+        slugs: &["task_walk_ambiguous"],
     },
     DeclineClass {
         type_name: "MemError",
