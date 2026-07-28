@@ -2288,7 +2288,6 @@ mod tests {
         let member = |w, h| crate::model::CompositorOutputMember {
             width: w,
             height: h,
-            source: 13,
         };
         for mid in [1u32, 5u32] {
             state.map_surface(mid);
@@ -2355,7 +2354,6 @@ mod tests {
         let member = |w, h| crate::model::CompositorOutputMember {
             width: w,
             height: h,
-            source: 13,
         };
         for mid in [1u32, 5u32] {
             state.map_surface(mid);
@@ -2523,7 +2521,6 @@ mod tests {
             .insert(7, crate::model::CompositorOutputMember {
                 width: 1920,
                 height: 1080,
-                source: 13,
             });
         assert!(matches!(
             surface_identity(&state, 7, 1920, 1080),
@@ -2542,7 +2539,6 @@ mod tests {
         let member = |w, h| crate::model::CompositorOutputMember {
             width: w,
             height: h,
-            source: 13,
         };
         // One member only: per-mid.
         state
@@ -2605,7 +2601,6 @@ mod tests {
         let member = |w, h| crate::model::CompositorOutputMember {
             width: w,
             height: h,
-            source: 13,
         };
         // Two members presented together: the geometry is a proven swapchain.
         state
@@ -2676,7 +2671,6 @@ mod tests {
         let member = crate::model::CompositorOutputMember {
             width: 1920,
             height: 1080,
-            source: 13,
         };
         // A lone member stays per-surface: keyed by its own mapping id.
         state.present.compositor_output_members.insert(1, member);
@@ -2708,7 +2702,6 @@ mod tests {
         let member = crate::model::CompositorOutputMember {
             width: 1920,
             height: 1080,
-            source: 13,
         };
         state.present.compositor_output_members.insert(1, member);
         state.present.compositor_output_members.insert(5, member);

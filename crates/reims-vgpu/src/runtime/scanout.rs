@@ -1577,11 +1577,7 @@ pub fn note_linear_compositor_output(
     state.present.last_compositor_output_member = output_mapping;
     state.present.compositor_output_members.insert(
         output_mapping,
-        crate::model::CompositorOutputMember {
-            width,
-            height,
-            source: 0,
-        },
+        crate::model::CompositorOutputMember { width, height },
     );
     // Per-present linear-source edge re-assertion; gate behind REIMS_VGPU_DRAW_LOG
     // (see the `note_compositor_output` site — member_grant/refresh carry the

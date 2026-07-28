@@ -864,14 +864,12 @@ pub struct HostLinearTexture {
     pub resident_gen: u32,
 }
 
-/// Geometry/source proven for a compositor-output mapping (see
+/// Geometry proven for a compositor-output mapping (see
 /// [`PresentState::compositor_output_members`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CompositorOutputMember {
     pub width: u32,
     pub height: u32,
-    /// Sampled type-11 source mapping, or `0` for the linear-input class.
-    pub source: u32,
 }
 
 /// Which sub-path `paint_mapping` used to fill the present frame.
@@ -2371,11 +2369,7 @@ impl DeviceState {
         self.present.last_compositor_output_member = output_mapping;
         self.present.compositor_output_members.insert(
             output_mapping,
-            CompositorOutputMember {
-                width,
-                height,
-                source: source_mapping,
-            },
+            CompositorOutputMember { width, height },
         );
     }
 
@@ -2398,18 +2392,13 @@ impl DeviceState {
                 crate::observe::off(format!(
                     "compositor_member_grant mid={mapping_id} {width}x{height} reason=full_frame_publish"
                 ));
-                CompositorOutputMember {
-                    width,
-                    height,
-                    source: 0,
-                }
+                CompositorOutputMember { width, height }
             });
         // Geometry change (mode switch / re-geom): follow the newly published
-        // geometry; keep the proven source edge when unchanged.
+        // geometry.
         if member.width != width || member.height != height {
             member.width = width;
             member.height = height;
-            member.source = 0;
         }
         // Protocol-structural dense marker: this member now holds a complete
         // full-frame. Advance its `dense_frame_seq` so a peer that never got a
