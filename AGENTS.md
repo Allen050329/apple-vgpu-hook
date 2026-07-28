@@ -235,6 +235,32 @@ large margin rather than slightly off. That is not the signature of a format con
 subsampling ratio or a tile boundary — the three things every hypothesis in this class has assumed.
 Measure the geometry of the wrong pixels before assuming a transform produced them.
 
+It is also **fully deterministic**. Three `screencapture` frames taken four seconds apart, with
+nothing driving the guest, have the identical 63 816 outliers — the masks differ in zero pixels and
+the frames are byte-identical, max channel delta 0. So it is not a race, not a read-during-write and
+not a timing window; the wrong value is computed once and then presented consistently.
+
+And the error rate is a **strong function of the correct value**, not of position. Binning the
+outliers by what the pixel should have been:
+
+| correct B | 0-15 | 16-31 | 64-79 | 112-127 | 128-143 | 176-191 | 224-239 | 240-255 |
+|---|---|---|---|---|---|---|---|---|
+| outlier rate | 1.6% | 38.0% | 55.1% | 59.7% | 54.8% | 42.2% | 23.0% | 6.1% |
+
+Near-immune at both extremes, 20-60% wrong through the middle. The whole-frame rate is only 3%
+because 93% of this picture sits in the bottom bin. A defect that spares 0 and 255 and peaks in the
+mid-tones is a different animal from one that corrupts uniformly, and it is the first result in this
+class that points at *what* is being computed rather than what it is being computed from.
+
+**A per-pixel join is a join — check the lengths.** The first run of that table came out flat, 0.2-1.4%
+in every bin, which reads as "no value dependence" and would have closed the question the wrong way.
+The two pixel dumps were `paste`d together and one of them had exactly twice as many lines, because
+the extraction matched both `(0)` and `gray(0)` on each row. `paste` does not complain; it silently
+pairs each value with an unrelated pixel, and randomly-paired data produces a flat rate *by
+construction*. The null result was manufactured by the join, and the corrected table is not
+marginally different from it — it inverts it. Print both input lengths next to any per-pixel
+correlation before reading the correlation.
+
 The always-on sink refutes the YUV lead a second time, independently of the pixels. Slicing this
 boot per arm, the `type4 pages … multi=1` biplanar `'420f'` lines appear in arms F, G and H — four
 each — and in no other arm. **F and G are clean arms.** Biplanar YUV traffic is therefore present
