@@ -704,6 +704,58 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     Ok(())
 }
 
+/// TEMPORARY PROBE — `REIMS_VGPU_DRAW_RECT=1`, off by default, no product
+/// behaviour. Emits one line per draw into a scanout-sized target carrying the
+/// rectangle the draw is actually allowed to write, the identity it writes into
+/// and its load op.
+///
+/// It exists to answer one question about the rubber-band residue class, and the
+/// question is one-sided: after the band fragment at (x,y,w,h) is drawn, does the
+/// guest ever issue a draw whose scissor COVERS that rectangle again? A "yes"
+/// means the guest sent the erase and we lost or misrouted it. A "no" means the
+/// guest believes that rectangle is already correct in the buffer it is drawing,
+/// which puts the defect in what our resident holds when the guest starts a
+/// frame, not in any draw we dropped.
+///
+/// Bounded at 20 000 lines because a compositor under an active gesture issues
+/// thousands of these per second and an unbounded probe stalls the render worker.
+/// The cap is announced when it is hit, so a truncated trace can never read as a
+/// complete one.
+fn log_draw_rect(req: &DrawRequest, scissor: &vk::Rect2D) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("REIMS_VGPU_DRAW_RECT").is_some()) {
+        return;
+    }
+    // Scanout-sized only: the compositor's output is what this class is about,
+    // and every WebKit tile and icon would otherwise drown it.
+    if req.width < 1280 || req.height < 720 {
+        return;
+    }
+    static EMITTED: AtomicU64 = AtomicU64::new(0);
+    static CAPPED: AtomicBool = AtomicBool::new(false);
+    if EMITTED.fetch_add(1, Ordering::Relaxed) >= 20_000 {
+        if !CAPPED.swap(true, Ordering::Relaxed) {
+            crate::observe::off("draw_rect_probe_capped after=20000 (trace is TRUNCATED)");
+        }
+        return;
+    }
+    crate::observe::off(format!(
+        "draw_rect target={:?} {}x{} sc={},{},{}x{} load={:?} seed={:?} vtx={} idx={}",
+        req.target_identity,
+        req.width,
+        req.height,
+        scissor.offset.x,
+        scissor.offset.y,
+        scissor.extent.width,
+        scissor.extent.height,
+        req.load_op,
+        req.seed_from_target,
+        req.vertex_count,
+        req.indexed.as_ref().map(|i| i.index_count).unwrap_or(0),
+    ));
+}
+
 fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     let element_count = req
         .indexed
@@ -2348,6 +2400,7 @@ pub(crate) unsafe fn execute_draw_inner(
         },
     };
     ctx.device.cmd_set_scissor(cb, 0, &[scissor]);
+    log_draw_rect(req, &scissor);
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
     // dynamic state; front/back set separately to honor Metal's split refs.

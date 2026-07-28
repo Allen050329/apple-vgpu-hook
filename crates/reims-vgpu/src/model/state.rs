@@ -2506,6 +2506,18 @@ impl DeviceState {
         w: u32,
         h: u32,
     ) -> Result<u32, OutputGroupMiss> {
+        // TEMPORARY EXPERIMENT SWITCH — `REIMS_VGPU_NO_GROUP=1`, off by default.
+        // Unification makes every scanout buffer the guest names at one geometry
+        // share ONE resident, so a damage draw's `LoadFromTarget` reads the
+        // frame the PREVIOUS buffer left rather than the frame this buffer left.
+        // That is either exactly right (the guest damage-draws against the
+        // current front, which is what the present-boundary seed asserts) or the
+        // rubber-band residue class, and no line this device emits separates the
+        // two. Turning it off for one boot does.
+        static NO_GROUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_GROUP.get_or_init(|| std::env::var_os("REIMS_VGPU_NO_GROUP").is_some()) {
+            return Err(OutputGroupMiss::NoPeer);
+        }
         if !self.presented_at(mapping_id, w, h) {
             let current = self.map_generation_or_zero(mapping_id);
             return Err(match self.present.presented_geoms.get(&mapping_id) {
