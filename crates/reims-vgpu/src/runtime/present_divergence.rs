@@ -177,8 +177,13 @@ fn pending_deferred_windows(state: &DeviceState, mapping_id: u32, lo: u64, hi: u
 /// "no divergence" when what happened is "nothing was compared".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DivergenceSkip {
-    /// Route B: the dmabuf carried the frame, so there are no CPU pixels.
+    /// Route B: the dmabuf carried the frame, so there are no CPU pixels, and
+    /// this present was not the one that pays for a resident readback.
     NoCpuFrame,
+    /// Route B, readback attempted, and the resident the present path would
+    /// have read is not there to read: unknown identity, no ready content, or
+    /// a non-BGRA target.
+    NoResident,
     /// The captured frame is not `w * h * 4` — geometry moved under us.
     FrameGeometry,
     /// No sample window: the mapping carries neither a device descriptor
@@ -194,6 +199,7 @@ impl DivergenceSkip {
     pub fn as_str(self) -> &'static str {
         match self {
             DivergenceSkip::NoCpuFrame => "no_cpu_frame",
+            DivergenceSkip::NoResident => "no_resident",
             DivergenceSkip::FrameGeometry => "frame_geometry",
             DivergenceSkip::NoSampleWindow => "no_sample_window",
             DivergenceSkip::BprBelowTight => "bpr_below_tight",
@@ -202,10 +208,40 @@ impl DivergenceSkip {
     }
 }
 
+/// Which copy of the surface stood in for "what we are showing".
+///
+/// Route A fills `frame_bgra` and the window blits it, so that buffer *is* the
+/// frame. Route B publishes the GPU resident as a dmabuf and
+/// `capture_present_frame` deliberately skips the CPU readback — there, the
+/// resident is the frame and `frame_bgra` holds nothing. A probe that only
+/// read `frame_bgra` would therefore skip every present on the live
+/// x86/Vulkan host-window rail, which is exactly what the first boot of this
+/// line measured: 82 of 82 presents in one window, `skips=[no_cpu_frame:82]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OurSide {
+    /// `state.present.frame_bgra`, already in hand — free to compare.
+    Captured,
+    /// A GPU→host readback of the resident, resolved through the same
+    /// identity the capture path uses. Costs a full-frame readback, so it is
+    /// taken once per window rather than once per present.
+    Resident,
+}
+
+impl OurSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OurSide::Captured => "captured",
+            OurSide::Resident => "resident",
+        }
+    }
+}
+
 /// What one present's comparison found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresentDivergence {
     pub div: RowDivergence,
+    /// Which copy of ours the guest's pages were compared against.
+    pub src: OurSide,
     /// Rows actually compared (0..=`SAMPLE_ROW_NUMERATORS.len()`).
     pub rows: u32,
     /// Deferred render windows intersecting the sampled rows.
@@ -218,23 +254,78 @@ pub struct PresentDivergence {
     pub from_device: bool,
 }
 
-/// Compare the captured present frame against the presented mapping's guest
-/// pages. `None` with the reason when no comparison was possible.
+/// Read the resident the present path would have read for this surface.
+///
+/// Resolves the identity exactly as `scanout::try_capture_from_resident` does,
+/// primary then member, because the comparison is only meaningful against the
+/// same target the present would have shown.
+#[cfg(feature = "backend-vulkan")]
+fn read_resident_frame(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    need: usize,
+) -> Option<Vec<u8>> {
+    use crate::backend::vulkan::engine::read_resident_bgra;
+    let identity =
+        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
+    let member =
+        crate::runtime::import_present::member_surface_identity(state, mapping_id, width, height);
+    read_resident_bgra(&identity, need).or_else(|| {
+        (member != identity)
+            .then(|| read_resident_bgra(&member, need))
+            .flatten()
+    })
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn read_resident_frame(
+    _state: &mut DeviceState,
+    _mapping_id: u32,
+    _width: u32,
+    _height: u32,
+    _need: usize,
+) -> Option<Vec<u8>> {
+    None
+}
+
+/// Compare the frame we are showing against the presented mapping's guest
+/// pages. `Err` with the typed reason when no comparison was possible.
+///
+/// `allow_resident` pays for a full-frame GPU→host readback when route B left
+/// no CPU pixels. The caller takes it once per emission window, not once per
+/// present: on the live rail every present is route B, so without it this
+/// probe reads nothing at all, and with it on every present it would put an
+/// 8 MiB readback under each frame on the path route B exists to keep clear.
 pub fn measure<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
     width: u32,
     height: u32,
+    allow_resident: bool,
 ) -> Result<PresentDivergence, DivergenceSkip> {
-    if state.present.frame_bgra.is_empty() {
-        return Err(DivergenceSkip::NoCpuFrame);
-    }
     let tight = (width as usize).saturating_mul(4);
     let need = tight.saturating_mul(height as usize);
-    if need == 0 || state.present.frame_bgra.len() != need {
+    if need == 0 {
         return Err(DivergenceSkip::FrameGeometry);
     }
+    let (ours, src) = if state.present.frame_bgra.len() == need {
+        (None, OurSide::Captured)
+    } else if !state.present.frame_bgra.is_empty() {
+        return Err(DivergenceSkip::FrameGeometry);
+    } else if !allow_resident {
+        return Err(DivergenceSkip::NoCpuFrame);
+    } else {
+        let Some(px) = read_resident_frame(state, mapping_id, width, height, need) else {
+            return Err(DivergenceSkip::NoResident);
+        };
+        if px.len() != need {
+            return Err(DivergenceSkip::FrameGeometry);
+        }
+        (Some(px), OurSide::Resident)
+    };
     let fmt = state
         .mappings
         .get(&mapping_id)
@@ -259,6 +350,7 @@ pub fn measure<H: HostMemory + HostOps>(
 
     let mut out = PresentDivergence {
         div: RowDivergence::default(),
+        src,
         rows: 0,
         pending: 0,
         from_device,
@@ -274,8 +366,12 @@ pub fn measure<H: HostMemory + HostOps>(
         if !read_guest_span_unflushed(state, host, mapping_id, off, &mut guest_row) {
             return Err(DivergenceSkip::GuestRowUnreadable);
         }
-        let ours = &state.present.frame_bgra[(y as usize) * tight..][..tight];
-        out.div.merge(compare_bgra_rows(ours, &guest_row));
+        let row_at = (y as usize) * tight;
+        let ours_row = match &ours {
+            Some(px) => &px[row_at..][..tight],
+            None => &state.present.frame_bgra[row_at..][..tight],
+        };
+        out.div.merge(compare_bgra_rows(ours_row, &guest_row));
         out.rows += 1;
     }
     if out.rows == 0 {
@@ -300,6 +396,8 @@ struct Window {
     worst_pending: usize,
     invented: u32,
     pending_any: u32,
+    /// Comparisons that read our GPU resident rather than a captured frame.
+    resident_reads: u32,
     skips: Vec<(DivergenceSkip, u32)>,
 }
 
@@ -328,6 +426,7 @@ impl Window {
             return;
         };
         self.compared += 1;
+        self.resident_reads += u32::from(d.src == OurSide::Resident);
         self.invented += u32::from(!d.from_device);
         self.pending_any += u32::from(d.pending > 0);
         self.visible += u32::from(d.div.is_visible());
@@ -353,11 +452,12 @@ impl Window {
     fn line(&self, dt: u128) -> (String, bool) {
         (
             format!(
-                "present_vs_guest window_ms={dt} presents={} compared={} visible={} \
+                "present_vs_guest window_ms={dt} presents={} compared={} resident={} visible={} \
                  worst_mid={} px={} gt1={} gt4={} gt16={} gt64={} max={} max_swapped={} \
                  pending={} pending_presents={} invented={} skips=[{}]",
                 self.presents,
                 self.compared,
+                self.resident_reads,
                 self.visible,
                 self.worst_mid,
                 self.worst.px,
@@ -395,11 +495,20 @@ pub fn note_present<H: HostMemory + HostOps>(
     use std::time::Instant;
     static WINDOW: Mutex<Option<(Instant, Window)>> = Mutex::new(None);
 
-    let measured = measure(state, host, mapping_id, width, height);
     let mut guard = WINDOW.lock().unwrap_or_else(|p| p.into_inner());
-    let (started, w) = guard.get_or_insert_with(|| (Instant::now(), Window::default()));
-    w.note(mapping_id, measured);
-    if started.elapsed().as_millis() < WINDOW_MS {
+    // The window's last present is the one that pays for a resident readback,
+    // so route B gets exactly one comparison per window instead of none.
+    let closing = guard
+        .get_or_insert_with(|| (Instant::now(), Window::default()))
+        .0
+        .elapsed()
+        .as_millis()
+        >= WINDOW_MS;
+    let measured = measure(state, host, mapping_id, width, height, closing);
+    if let Some((_, w)) = guard.as_mut() {
+        w.note(mapping_id, measured);
+    }
+    if !closing {
         return;
     }
     let Some((started, w)) = guard.take() else {
@@ -457,7 +566,7 @@ mod tests {
     #[test]
     fn a_constructed_disagreement_is_reported_with_its_magnitude() {
         let (mut state, mut host) = rig(0x10, 0xf0);
-        let d = super::measure(&mut state, &mut host, 1, W, H).expect("comparison must run");
+        let d = super::measure(&mut state, &mut host, 1, W, H, false).expect("comparison must run");
         assert_eq!(d.rows, 3, "three spread rows must be read");
         assert_eq!(d.div.px, (W as usize) * 3);
         assert_eq!(d.div.max, 0xe0);
@@ -472,7 +581,7 @@ mod tests {
     #[test]
     fn matching_content_reads_clean_on_the_same_rig() {
         let (mut state, mut host) = rig(0x77, 0x77);
-        let d = super::measure(&mut state, &mut host, 1, W, H).expect("comparison must run");
+        let d = super::measure(&mut state, &mut host, 1, W, H, false).expect("comparison must run");
         assert_eq!(d.rows, 3);
         assert_eq!(d.div.max, 0, "identical bytes must not report a deviation");
         assert!(!d.div.is_visible());
@@ -489,7 +598,7 @@ mod tests {
         for b in &mut state.present.frame_bgra[y * tight..(y + 1) * tight] {
             *b = 0xd0;
         }
-        let d = super::measure(&mut state, &mut host, 1, W, H).expect("comparison must run");
+        let d = super::measure(&mut state, &mut host, 1, W, H, false).expect("comparison must run");
         assert_eq!(d.div.max, 0xb0);
         assert_eq!(
             d.div.gt64, W as usize,
@@ -500,14 +609,46 @@ mod tests {
     /// Route B leaves no CPU pixels. The probe must say "nothing was compared"
     /// rather than "no divergence" — the two are not the same reading, and a
     /// silent zero here would report a dmabuf present as agreement.
+    ///
+    /// This is not hypothetical: the first live boot of this line read
+    /// `presents=82 compared=0 skips=[no_cpu_frame:82]`, because every present
+    /// on the x86/Vulkan host-window rail is route B. The `skips=` field is
+    /// the only reason that read as "the probe cannot fire" instead of "the
+    /// present path is clean".
     #[test]
-    fn a_dmabuf_present_is_a_skip_and_not_a_clean_reading() {
+    fn a_dmabuf_present_without_a_readback_budget_is_a_skip_not_a_clean_reading() {
         let (mut state, mut host) = rig(0x10, 0xf0);
         state.present.frame_bgra.clear();
         assert_eq!(
-            super::measure(&mut state, &mut host, 1, W, H),
+            super::measure(&mut state, &mut host, 1, W, H, false),
             Err(DivergenceSkip::NoCpuFrame)
         );
+    }
+
+    /// With the readback budget the probe reaches for the resident instead —
+    /// and when there is no resident to read (no GPU engine in a unit test),
+    /// that is its own typed skip. `no_resident` and `no_cpu_frame` must not
+    /// collapse: the first says the readback was tried and found nothing, the
+    /// second says it was never tried.
+    #[test]
+    fn a_dmabuf_present_with_a_readback_budget_reaches_for_the_resident() {
+        let (mut state, mut host) = rig(0x10, 0xf0);
+        state.present.frame_bgra.clear();
+        assert_eq!(
+            super::measure(&mut state, &mut host, 1, W, H, true),
+            Err(DivergenceSkip::NoResident)
+        );
+    }
+
+    /// A captured frame is used whether or not the readback budget is granted,
+    /// so route A never pays for a readback it does not need — and the line
+    /// says which copy it read.
+    #[test]
+    fn a_captured_frame_is_preferred_over_a_readback() {
+        let (mut state, mut host) = rig(0x10, 0xf0);
+        let d = super::measure(&mut state, &mut host, 1, W, H, true).expect("comparison must run");
+        assert_eq!(d.src, OurSide::Captured);
+        assert_eq!(d.div.max, 0xe0);
     }
 
     /// The window that a visible divergence produces must reach the failure
@@ -517,12 +658,15 @@ mod tests {
     #[test]
     fn a_visible_divergence_closes_the_window_on_the_failure_channel() {
         let (mut state, mut host) = rig(0x10, 0xf0);
-        let measured = super::measure(&mut state, &mut host, 1, W, H);
+        let measured = super::measure(&mut state, &mut host, 1, W, H, false);
         let mut w = Window::default();
         w.note(1, measured);
         let (line, is_fail) = w.line(2001);
         assert!(is_fail, "a visible divergence must be a failure, not census");
-        assert!(line.contains("presents=1 compared=1 visible=1"), "{line}");
+        assert!(
+            line.contains("presents=1 compared=1 resident=0 visible=1"),
+            "{line}"
+        );
         assert!(line.contains("worst_mid=1"), "{line}");
         assert!(line.contains(&format!("gt64={}", (W as usize) * 3)), "{line}");
         assert!(line.contains("max=224"), "{line}");
@@ -535,7 +679,7 @@ mod tests {
     #[test]
     fn agreement_is_census_and_a_skip_is_neither_reading() {
         let (mut state, mut host) = rig(0x77, 0x77);
-        let measured = super::measure(&mut state, &mut host, 1, W, H);
+        let measured = super::measure(&mut state, &mut host, 1, W, H, false);
         let mut w = Window::default();
         w.note(1, measured);
         let (line, is_fail) = w.line(2000);
@@ -562,7 +706,7 @@ mod tests {
         let (mut state, mut host) = rig(0x10, 0xf0);
         state.mappings.get_mut(&1).unwrap().page_entries.clear();
         assert_eq!(
-            super::measure(&mut state, &mut host, 1, W, H),
+            super::measure(&mut state, &mut host, 1, W, H, false),
             Err(DivergenceSkip::GuestRowUnreadable)
         );
     }
