@@ -227,8 +227,6 @@ pub const CURSOR_GLYPH_BPP: u32 = 4;
 pub const CURSOR_MAX_DIM: u32 = 256;
 pub const CURSOR_GLYPH_PAYLOAD_LEN: usize = 0x2c;
 
-pub const DEFAULT_OBJECT_LIST_PFN: u32 = 1;
-pub const DEFAULT_OBJECT_LIST_COUNT: u32 = 0x100_000;
 
 pub const MMIO_U32: u32 = 4;
 pub const MMIO_U64: u32 = 8;

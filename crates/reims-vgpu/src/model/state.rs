@@ -1,7 +1,7 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{
-    LruBytesMemo, DEFAULT_OBJECT_LIST_COUNT, DEFAULT_OBJECT_LIST_PFN, GFX_MMIO_SIZE, MAX_CHANNELS,
+    LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS,
     MAX_MAPPINGS, MAX_TASKS,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -536,13 +536,28 @@ impl TaskMapSpan {
 }
 
 impl TaskEntry {
+    /// A task the guest has defined but not yet given an object list.
+    ///
+    /// `object_list_pfn` and `object_list_count` are **zero** because
+    /// `DefineTask2` does not carry them. `SetObjectList` (`0x33`) does, and
+    /// until it arrives the correct answer to "what object does ref N name" is
+    /// "the guest has not said".
+    ///
+    /// This used to invent `pfn = 1, count = 0x100000` — a page frame the guest
+    /// never named and a list of a million entries. Measured on the x86/Vulkan
+    /// rail: `lookup_list_entry` then computed entry addresses of `0x1000 + off`
+    /// for every task with no list, walked them, and failed with `gva_zero_pfn`
+    /// because nothing is mapped there — after which the guest-read fallback
+    /// walked the *neighbouring task's* page table at the same address and
+    /// decoded whatever it found as this task's object-list entry. Seven such
+    /// substitutions per boot, every boot, all from that one lookup.
     pub fn define(length: u64, directory_pfn: u32) -> Self {
         Self {
             active: true,
             length,
             directory_pfn,
-            object_list_pfn: DEFAULT_OBJECT_LIST_PFN,
-            object_list_count: DEFAULT_OBJECT_LIST_COUNT,
+            object_list_pfn: 0,
+            object_list_count: 0,
         }
     }
 }
