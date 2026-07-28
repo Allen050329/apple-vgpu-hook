@@ -3342,6 +3342,21 @@ impl DeviceState {
         self.task_map_spans.len()
     }
 
+    /// How many spans `task_id` has filed of its own, ignoring every other task.
+    ///
+    /// Separates the two things [`WriteGate::Aliased`] currently collapses. If
+    /// the writing task has registered nothing, the honest reading is that its
+    /// bounds check did not run and a neighbour's span was found by the alias
+    /// search — an ordering fact. If it has spans and none covers, the range is
+    /// one the guest never mapped for it — a bounds fact. Neither is visible
+    /// from the arm alone, and they call for opposite fixes.
+    pub fn task_own_span_count(&self, task_id: u32) -> usize {
+        self.task_map_spans
+            .iter()
+            .filter(|s| s.task_id == task_id)
+            .count()
+    }
+
     /// Whether the gate permits the write. See [`Self::gva_write_gate`] for why.
     pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
         self.gva_write_gate(task_id, gva, len) != WriteGate::Outside

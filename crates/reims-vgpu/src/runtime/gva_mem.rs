@@ -229,12 +229,20 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
             // `spans` is here for the other permissive arm: `no_spans` means "no
             // span for this task or its alias", not "the registry is empty", and
             // only the second of those is a bounds check that did not run.
+            //
+            // `own` separates the two states the aliased arm collapses. The
+            // measured aliased writes both land inside one task's 64 MB span
+            // while the writer's own first span covers neither, so the arm may
+            // simply be rescuing a task that has registered nothing yet — an
+            // ordering fact — rather than expressing an ownership relation. Zero
+            // here says the writer's bounds check never ran.
             let owners = state.tasks_covering(gva, buf.len() as u64);
             crate::observe::Emit::decline("gva_write_gate", &gate)
                 .field("task", task_id)
                 .field("gva", format!("{gva:#x}"))
                 .field("len", format!("{:#x}", buf.len()))
                 .field("owners", format!("{owners:?}"))
+                .field("own", state.task_own_span_count(task_id))
                 .field("spans", state.task_map_span_count())
                 .fail();
         }
@@ -785,6 +793,42 @@ mod tests {
         assert_eq!(state.task_map_span_count(), 3);
         // A zero-length write covers nothing, matching the gate's own early out.
         assert!(state.tasks_covering(0x4000, 0).is_empty());
+    }
+
+    /// `Aliased` is returned in two states that call for opposite fixes, and
+    /// `own` is what tells them apart.
+    ///
+    /// Both writes below are permitted by task 0's oversized span. In the first
+    /// the writer has filed nothing at all, so its bounds check never ran and
+    /// the alias search merely found a neighbour; in the second the writer has a
+    /// registry of its own that does not reach the range. The arm is `Aliased`
+    /// either way — without `own` the log cannot say which happened, and the
+    /// measured rail shows exactly this shape.
+    #[test]
+    fn the_aliased_arm_cannot_say_whether_the_writers_own_bounds_check_ran() {
+        use crate::model::WriteGate;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, 0x1_0000, 2));
+        state.note_task_map(0, 0x101000, 0x400_0000);
+
+        assert_eq!(
+            state.gva_write_gate(1, 0x1ada000, 0x10000),
+            WriteGate::Aliased { by: 0 }
+        );
+        assert_eq!(
+            state.task_own_span_count(1),
+            0,
+            "the writer registered nothing, so its bounds check did not run"
+        );
+
+        state.note_task_map(1, 0x9f9000, 0x20000);
+        assert_eq!(
+            state.gva_write_gate(1, 0x1ada000, 0x10000),
+            WriteGate::Aliased { by: 0 },
+            "the same arm, now for a different reason"
+        );
+        assert_eq!(state.task_own_span_count(1), 1);
+        assert_eq!(state.task_own_span_count(0), 1, "counts are per task, not total");
     }
 
     /// `no_spans` names what the gate searched, not what the registry holds, so
