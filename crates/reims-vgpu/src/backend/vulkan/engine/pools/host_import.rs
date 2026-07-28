@@ -24,7 +24,7 @@ pub(super) const HOST_IMPORT_WINDOW_CAP: u64 = 1 << 30;
 /// imports whole. `align` (the driver's min imported-host-pointer
 /// alignment) divides the result because VMA bounds are page-aligned and
 /// the cap is a page multiple; the caller re-checks before importing.
-pub(super) fn capped_import_window(
+fn capped_import_window(
     vma_base: usize,
     vma_len: u64,
     ptr: usize,
@@ -46,6 +46,46 @@ pub(super) fn capped_import_window(
     let span_end = end.div_ceil(align) * align;
     let win_end = (base + HOST_IMPORT_WINDOW_CAP).max(span_end).min(vma_end);
     (base as usize, win_end - base)
+}
+
+/// The import regions that could carry `[ptr, end)`, best first, or the
+/// budget's refusal.
+///
+/// The budget is asked at `align` — the smallest a candidate can be, since both
+/// are align-rounded covers of a non-empty span — **before** either candidate is
+/// built, and that ordering is the whole point of this function. [`vma_bounds`]
+/// reads and parses all of `/proc/self/maps`; on the x86 rail that file is 3572
+/// lines and 292 µs per call. Once the pool sits at its cap, every resolve of an
+/// unresident span paid that walk only to be declined by a check that never
+/// looked at the answer. One boot spent **228 s of 484 s** of total drain time
+/// there, across 379 639 misses, every one of them declined for `TotalBytes`.
+///
+/// Short-circuiting is sound because [`super::host_import_budget`] only gets
+/// harder as the candidate grows, so a refusal at `align` is the same refusal at
+/// every size a candidate can take. The caller re-asks it per candidate, since
+/// passing at `align` says nothing about passing at a gigabyte.
+pub(super) fn host_import_candidates(
+    region_count: usize,
+    imported_bytes: u64,
+    ptr: usize,
+    end: u64,
+    align: u64,
+) -> Result<Vec<(usize, u64)>, super::HostImportDecline> {
+    super::host_import_budget(region_count, imported_bytes, align)?;
+    let mut candidates = Vec::new();
+    if let Some((vma_base, vma_len)) = vma_bounds(ptr) {
+        candidates.push(capped_import_window(
+            vma_base,
+            vma_len as u64,
+            ptr,
+            end,
+            align,
+        ));
+    }
+    let span_base = ((ptr as u64) / align * align) as usize;
+    let span_len = (end - span_base as u64).div_ceil(align) * align;
+    candidates.push((span_base, span_len));
+    Ok(candidates)
 }
 
 /// Megabytes per [`WindowOccupancy`] bit. A resolve asks for one page run, so
@@ -111,7 +151,7 @@ impl WindowOccupancy {
 /// to be the binding constraint — and every import after that declines, leaving
 /// fresh surfaces at zeros. See [[failure-logging]] for the boot that showed it.
 #[cfg(not(target_os = "macos"))]
-pub(super) fn vma_bounds(ptr: usize) -> Option<(usize, usize)> {
+fn vma_bounds(ptr: usize) -> Option<(usize, usize)> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     vma_bounds_in(&maps, ptr)
 }
@@ -126,7 +166,7 @@ pub(super) fn vma_bounds(ptr: usize) -> Option<(usize, usize)> {
 /// `HOST_IMPORT_WINDOW_CAP` bucket of it containing `ptr`, so a too-wide answer
 /// shifts bucket boundaries without ever growing what gets pinned.
 #[cfg(target_os = "macos")]
-pub(super) fn vma_bounds(ptr: usize) -> Option<(usize, usize)> {
+fn vma_bounds(ptr: usize) -> Option<(usize, usize)> {
     // `mach_vm_region` lives in libSystem; `libc` exposes the task port and the
     // Mach integer types but not this call.
     extern "C" {
@@ -435,5 +475,84 @@ mod vma_bounds_tests {
         assert!(vma_bounds_in(MAPS, 0x7f3a_0000_0000).is_some());
         assert!(vma_bounds_in(MAPS, 0x7f3b_ffff_ffff).is_some());
         assert!(vma_bounds_in(MAPS, 0x7f3c_0000_0000).is_none());
+    }
+}
+
+/// The saturated resolve must not walk the VMA table.
+///
+/// `host_import_candidates` exists to put the budget ahead of [`vma_bounds`],
+/// and on Linux that walk is a `read` of `/proc/self/maps` — so the kernel's own
+/// read-syscall counter for this process measures the ordering directly, with no
+/// product-side probe. One boot spent 228 s of 484 s of drain time on walks whose
+/// answer a saturated budget then discarded.
+///
+/// The admissible arm is not decoration: it is the converse check `AGENTS.md`
+/// requires. A counter that reads zero for the saturated case proves nothing
+/// unless it is also shown to move when the walk *does* happen.
+#[cfg(all(test, target_os = "linux"))]
+mod candidate_walk_tests {
+    use super::super::{HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP};
+    use super::host_import_candidates;
+
+    /// Read syscalls this process has completed, from `/proc/self/io`.
+    fn read_syscalls() -> u64 {
+        let io = std::fs::read_to_string("/proc/self/io").expect("procfs io accounting");
+        io.lines()
+            .find_map(|l| l.strip_prefix("syscr:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("syscr line")
+    }
+
+    /// Reads charged to `body`, over a before/after pair of [`read_syscalls`].
+    ///
+    /// The pair is not free — each sample reads `/proc/self/io` to EOF, and the
+    /// reads that finish the `before` sample land after the value it returns. So
+    /// a delta carries a fixed instrument cost, which [`baseline`] measures
+    /// rather than assumes; comparing raw deltas against zero is what a first cut
+    /// of this test did, and the instrument failed it.
+    fn reads_during(body: impl FnOnce()) -> u64 {
+        let before = read_syscalls();
+        body();
+        read_syscalls() - before
+    }
+
+    /// The instrument's own cost: the same measurement around no work at all.
+    fn baseline() -> u64 {
+        reads_during(|| {})
+    }
+
+    fn walk_cost(region_count: usize, imported_bytes: u64) -> (bool, u64) {
+        let probe = 0u64;
+        let ptr = &probe as *const u64 as usize;
+        let mut admitted = false;
+        let reads = reads_during(|| {
+            admitted =
+                host_import_candidates(region_count, imported_bytes, ptr, ptr as u64 + 8, 0x1000)
+                    .is_ok();
+        });
+        (admitted, reads)
+    }
+
+    #[test]
+    fn a_refused_budget_costs_no_vma_walk_and_an_admitted_one_does() {
+        let base = baseline();
+
+        // Both ways a budget can refuse: the region count and the byte cap.
+        let (admitted, reads) = walk_cost(HOST_IMPORT_REGION_CAP, 0);
+        assert!(!admitted, "the region cap must refuse");
+        assert_eq!(reads, base, "a refused budget must not read /proc/self/maps");
+
+        let (admitted, reads) = walk_cost(0, HOST_IMPORT_TOTAL_BYTE_CAP);
+        assert!(!admitted, "the byte cap must refuse");
+        assert_eq!(reads, base, "a refused budget must not read /proc/self/maps");
+
+        // The converse: the counter does move when the walk happens, so the two
+        // readings above are an ordering result and not a dead probe.
+        let (admitted, reads) = walk_cost(0, 0);
+        assert!(admitted, "an empty pool must admit");
+        assert!(
+            reads > base,
+            "the walk this test measures must be visible to it: {reads} vs baseline {base}"
+        );
     }
 }

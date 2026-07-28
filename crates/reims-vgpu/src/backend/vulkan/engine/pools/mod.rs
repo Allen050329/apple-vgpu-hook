@@ -3,7 +3,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 mod host_import;
-use host_import::{capped_import_window, vma_bounds, HOST_IMPORT_WINDOW_CAP};
+use host_import::{host_import_candidates, HOST_IMPORT_WINDOW_CAP};
 
 use ash::vk;
 use ash::vk::Handle;

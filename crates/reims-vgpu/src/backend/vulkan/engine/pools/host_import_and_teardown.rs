@@ -42,6 +42,22 @@ impl ResourcePools {
         first
     }
 
+    /// Name a budget refusal on the always-on sink, latched per cause.
+    ///
+    /// Both refusal sites share this: the pre-walk ask at the minimum candidate
+    /// size and the per-candidate ask at its real size. `candidate_bytes` is what
+    /// was asked for, so the two read apart in the log.
+    fn note_host_import_budget_decline(&mut self, reason: HostImportDecline, candidate_bytes: u64) {
+        if self.host_import_first_time(reason) {
+            crate::observe::Emit::decline("host_import_fail", &reason)
+                .field("regions", self.host_imports.len())
+                .field("imported_bytes", format!("{:#x}", self.host_import_bytes()))
+                .field("candidate_bytes", format!("{candidate_bytes:#x}"))
+                .field("cap", format!("{HOST_IMPORT_TOTAL_BYTE_CAP:#x}"))
+                .fail();
+        }
+    }
+
     /// Record that a resolve asked for `[offset, offset+len)` of the window
     /// based at `base`. Keyed on the base so the map outlives the region and
     /// describes the guest's working set rather than the eviction rate.
@@ -140,19 +156,37 @@ impl ResourcePools {
             return Ok((buffer, offset));
         }
         let align = ctx.min_imported_host_pointer_alignment.max(1);
-        let mut candidates: Vec<(usize, u64)> = Vec::new();
-        if let Some((vma_base, vma_len)) = vma_bounds(ptr) {
-            candidates.push(capped_import_window(
-                vma_base,
-                vma_len as u64,
-                ptr,
-                end,
-                align,
-            ));
-        }
-        let span_base = ((ptr as u64) / align * align) as usize;
-        let span_len = (end - span_base as u64).div_ceil(align) * align;
-        candidates.push((span_base, span_len));
+        // Admit only when admission is free. A miss here is not a failure — the
+        // caller writes the span through the CPU byte path — so releasing a
+        // resident window to make room trades a few megabytes of `memcpy` for a
+        // whole 1 GiB re-import, and then pays it again next frame because the
+        // window it released is in the same working set.
+        //
+        // That is not a hypothetical LRU argument, it is what the census
+        // recorded: 2247 creates against 2246 evictions over one browsing
+        // session, victims logged `age_ms=0`, 14 one-GiB buckets touched against
+        // a budget of 8. An import measured 19.3 ms — longer than a 60 Hz frame
+        // — and one drain tranche spent 1342 ms of its life inside
+        // `zc_import_us`. The guest's spread is real and no window size closes it
+        // (`host_import_density` put 6.4 GiB of touched pages across those
+        // buckets at 46 % occupancy), so the overflow has to be *served*, not
+        // shuffled.
+        //
+        // Serving it has to be cheap, which is why the budget is asked inside
+        // `host_import_candidates` before the VMA walk rather than after it.
+        let candidates = match host_import_candidates(
+            self.host_imports.len(),
+            self.host_import_bytes(),
+            ptr,
+            end,
+            align,
+        ) {
+            Ok(candidates) => candidates,
+            Err(reason) => {
+                self.note_host_import_budget_decline(reason, align);
+                return Err(DrawError::HostImport(reason));
+            }
+        };
         let mut last_error = None;
         for (base, region_len) in candidates {
             if !(base as u64).is_multiple_of(align)
@@ -162,34 +196,10 @@ impl ResourcePools {
             {
                 continue;
             }
-            let imported_bytes = self.host_import_bytes();
             if let Err(reason) =
-                host_import_budget(self.host_imports.len(), imported_bytes, region_len)
+                host_import_budget(self.host_imports.len(), self.host_import_bytes(), region_len)
             {
-                // Admit only when admission is free. A miss here is not a
-                // failure — the caller writes the span through the CPU byte
-                // path — so releasing a resident window to make room trades a
-                // few megabytes of `memcpy` for a whole 1 GiB re-import, and
-                // then pays it again next frame because the window it released
-                // is in the same working set.
-                //
-                // That is not a hypothetical LRU argument, it is what the census
-                // recorded: 2247 creates against 2246 evictions over one browsing
-                // session, victims logged `age_ms=0`, 14 one-GiB buckets touched
-                // against a budget of 8. An import measured 19.3 ms — longer than
-                // a 60 Hz frame — and one drain tranche spent 1342 ms of its life
-                // inside `zc_import_us`. The guest's spread is real and no window
-                // size closes it (`host_import_density` put 6.4 GiB of touched
-                // pages across those buckets at 46 % occupancy), so the overflow
-                // has to be *served*, not shuffled.
-                if self.host_import_first_time(reason) {
-                    crate::observe::Emit::decline("host_import_fail", &reason)
-                        .field("regions", self.host_imports.len())
-                        .field("imported_bytes", format!("{imported_bytes:#x}"))
-                        .field("candidate_bytes", format!("{region_len:#x}"))
-                        .field("cap", format!("{HOST_IMPORT_TOTAL_BYTE_CAP:#x}"))
-                        .fail();
-                }
+                self.note_host_import_budget_decline(reason, region_len);
                 return Err(DrawError::HostImport(reason));
             }
             let memory = match ctx.import_host_ptr(base as *mut std::ffi::c_void, region_len) {
