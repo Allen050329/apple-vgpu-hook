@@ -30,10 +30,79 @@ pub fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
     a < b_end && b < a_end
 }
 
+/// How a registered view's task id relates to the wire id asking about it.
+///
+/// Split out from [`task_matches`] because the aliased arm is only *safe* at
+/// some of that predicate's call sites, and a bare `bool` cannot say which arm
+/// answered. Retiring or evicting an aliased view costs a re-walk; **looking
+/// one up** hands the caller a host pointer registered for a different task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskViewMatch {
+    /// The view was registered under exactly this wire id.
+    Exact,
+    /// The view was registered under `wire >> 1` or `wire << 1`.
+    Aliased,
+}
+
+/// Which arm matches `view_task` against wire `task_id`, or `None` for neither.
+pub(crate) fn task_match_kind(view_task: u32, wire_task: u32) -> Option<TaskViewMatch> {
+    if view_task == wire_task {
+        return Some(TaskViewMatch::Exact);
+    }
+    if view_task == (wire_task >> 1) || (view_task << 1) == wire_task {
+        return Some(TaskViewMatch::Aliased);
+    }
+    None
+}
+
 /// Task id used when the view was built matches wire `task_id` (or define-task raw id).
 #[inline]
 pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
-    view_task == wire_task || view_task == (wire_task >> 1) || (view_task << 1) == wire_task
+    task_match_kind(view_task, wire_task).is_some()
+}
+
+/// Where an *aliased* view match was accepted, and therefore what it cost.
+///
+/// The two sites differ in kind, not degree, which is why one census would not
+/// do. Dropping an aliased view is conservative — the next access re-walks the
+/// guest page table and rebuilds it. Reading through one is not: the host
+/// pointer belongs to whatever task registered it.
+///
+/// The wire task namespace collides structurally (see [`TaskWalkAmbiguity`];
+/// measured on three boots), so if the lookup arm can fire it will fire, and a
+/// small nonzero count is not a possible outcome here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewAliasSite {
+    /// `find_covering_view` returned a view registered under a different task.
+    Lookup,
+    /// A retire/evict pass dropped a view registered under a different task.
+    Retire,
+}
+
+impl crate::observe::Decline for ViewAliasSite {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Lookup => "view_alias_lookup",
+            Self::Retire => "view_alias_retire",
+        }
+    }
+}
+
+/// Record an accepted aliased view match, latched per `(view_task, wire_task)`.
+///
+/// Same shape as [`note_task_walk_ambiguity`]: the latch is taken before the
+/// line is built, because these sit inside per-access scans and `Emit::field`
+/// renders eagerly.
+fn note_view_alias(site: ViewAliasSite, view_task: u32, wire_task: u32) {
+    use crate::observe::Decline;
+    let discriminant = (u64::from(view_task) << 32) | u64::from(wire_task);
+    if !crate::observe::first_sight(site.slug(), discriminant) {
+        return;
+    }
+    crate::observe::Emit::decline("view_alias", &site)
+        .field("view", view_task)
+        .field("wire", wire_task)
+        .fail();
 }
 
 /// Retire every registered GVA view that overlaps `[gva, gva+length)` under `task_id`.
@@ -85,6 +154,15 @@ pub fn retire_gva_views_for_task(state: &mut DeviceState, task_id: u32) -> u32 {
     let mut i = 0;
     while i < state.gva_host_views.len() {
         if task_matches(state.gva_host_views[i].task_id, task_id) {
+            // The conservative polarity, censused for the opposite reason: if
+            // this fires, the aliasing is what keeps a stale view from being
+            // read after its task is gone, and it must not be deleted with the
+            // lookup arm.
+            if task_match_kind(state.gva_host_views[i].task_id, task_id)
+                == Some(TaskViewMatch::Aliased)
+            {
+                note_view_alias(ViewAliasSite::Retire, state.gva_host_views[i].task_id, task_id);
+            }
             let v = state.gva_host_views.swap_remove(i);
             if v.ptr != 0 && v.ptr_len != 0 {
                 state.retired_views.push((v.ptr, v.ptr_len));
@@ -113,12 +191,19 @@ pub fn find_covering_view(
     if length == 0 {
         return None;
     }
-    state.gva_host_views.iter().find(|v| {
+    let hit = state.gva_host_views.iter().find(|v| {
         task_matches(v.task_id, task_id)
             && v.gva <= gva
             && gva.saturating_add(length) <= v.gva.saturating_add(v.length)
             && v.ptr != 0
-    })
+    })?;
+    // The dangerous polarity: this pointer is about to be read through. Census
+    // the aliased case so the arm can be deleted on a reading rather than an
+    // argument.
+    if task_match_kind(hit.task_id, task_id) == Some(TaskViewMatch::Aliased) {
+        note_view_alias(ViewAliasSite::Lookup, hit.task_id, task_id);
+    }
+    Some(hit)
 }
 
 /// The wire task word names two live tasks at once, and only one can be meant.
@@ -915,6 +1000,53 @@ mod tests {
         std::fs::read_to_string(crate::observe::fail_log_path())
             .unwrap_or_default()
             .len()
+    }
+
+    /// The lookup census must fire on an aliased view and stay silent on an
+    /// exact one, or it reports `find_covering_view`'s call volume instead of
+    /// its aliasing and answers nothing.
+    ///
+    /// Ids 20/41 and 21 are chosen to miss the latch that the walk tests and the
+    /// real rail both populate: `41 >> 1 == 20`, so a view registered for task 20
+    /// satisfies a lookup for wire id 41 through the aliased arm, while a lookup
+    /// for 20 itself is exact.
+    #[test]
+    fn the_lookup_census_separates_an_aliased_view_from_an_exact_one() {
+        assert_eq!(task_match_kind(20, 20), Some(TaskViewMatch::Exact));
+        assert_eq!(task_match_kind(20, 41), Some(TaskViewMatch::Aliased));
+        assert_eq!(task_match_kind(20, 43), None);
+
+        let mut state = state_x86();
+        state.gva_host_views.push(crate::model::GvaHostView {
+            task_id: 20,
+            gva: 0x1000,
+            length: 0x1000,
+            ptr: 0x4000,
+            ptr_len: 0x1000,
+            first_gpa: 0,
+            last_gpa: 0,
+        });
+
+        let before = log_mark();
+        assert!(find_covering_view(&state, 20, 0x1000, 0x10).is_some());
+        assert!(
+            !log_tail(before).contains("view_alias"),
+            "an exact match is not an alias and must not be reported as one"
+        );
+
+        let before = log_mark();
+        assert!(find_covering_view(&state, 41, 0x1000, 0x10).is_some());
+        let tail = log_tail(before);
+        let line = tail
+            .lines()
+            .find(|l| l.contains("view_alias "))
+            .expect("a view returned for a task that did not register it is always-on");
+        assert!(
+            line.contains("reason=view_alias_lookup")
+                && line.contains("view=20")
+                && line.contains("wire=41"),
+            "the line must name both the registering task and the asking one: {line}"
+        );
     }
 
     /// A wire task word that names two live tasks at once is not resolvable
