@@ -319,6 +319,22 @@ pub fn render_deferred_identity(
     }
 }
 
+/// The model-level resident a draw-time [`TargetIdentity`] names.
+///
+/// Takes the identity the DRAW resolved and was carried here, never a fresh
+/// resolve: which resident holds a published frame is settled by where the draws
+/// went, and asking again at store time re-decides it against membership that
+/// may have moved since (`f481e85`).
+pub fn resident_key_of(identity: &TargetIdentity, mapping_id: u32) -> crate::model::ResidentKey {
+    match identity {
+        TargetIdentity::OutputGroup { width, height, .. } => crate::model::ResidentKey::Group {
+            width: *width,
+            height: *height,
+        },
+        _ => crate::model::ResidentKey::Mid { mapping_id },
+    }
+}
+
 /// The single compositor-output group id (`DeviceState::output_group_for`
 /// always returns this; the geometry inside the identity disambiguates).
 pub const OUTPUT_GROUP_ID: u32 = 1;
@@ -926,6 +942,7 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             base_off,
             res_for_finish,
             "ok",
+            resident_key_of(identity, mapping_id),
         );
         if r.used() {
             let guest =
@@ -1081,6 +1098,9 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     let _ = state.mark_mapping_written(mapping_id);
     state.note_surface_composite(mapping_id);
     state.note_compositor_member_published(mapping_id, width, height);
+    // The composite is resident-side until the flush, so the resident this draw
+    // targeted is precisely what holds this frame.
+    state.note_resident_published(resident_key_of(identity, mapping_id));
     surface_cache::evict(state, mapping_id);
     crate::observe::line(format!(
         "render_writeback_deferred mapping={mapping_id} {width}x{height} gen={map_generation} off={base_off} span_end={span_end}"
@@ -1189,6 +1209,7 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
         base_off,
         Ok(()),
         "cpu_unstable",
+        resident_key_of(identity, mapping_id),
     );
     if r.used() {
         let guest =
@@ -1426,6 +1447,7 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
             // boots (2026-07-16 census: mid 5 stored 41 full frames, zero
             // edges, present pin frozen on mid 1).
             state.note_compositor_member_published(mapping_id, width, height);
+            state.note_resident_published(resident_key_of(identity, mapping_id));
             surface_cache::evict(state, mapping_id);
             // Success census: the import was used, fires once per fragmented
             // present (~one per present under compositing, ~77k/session under a
@@ -1654,6 +1676,11 @@ fn finish_import(
     base_off: u64,
     res: Result<(), crate::backend::vulkan::engine::DrawError>,
     ok_reason: &'static str,
+    // The resident the DRAW targeted, resolved by the caller and carried in.
+    // `finish_import` must not re-resolve it: by the time a Store lands, group
+    // membership may have moved, and the frame is in the resident the draws
+    // actually used.
+    resident: crate::model::ResidentKey,
 ) -> ImportPresentResult {
     match res {
         Ok(()) => {
@@ -1680,6 +1707,7 @@ fn finish_import(
             // Full-frame publish — same membership grant as the multi-run path
             // (contiguous swap buffers must not re-open the pin-freeze class).
             state.note_compositor_member_published(mapping_id, width, height);
+            state.note_resident_published(resident);
             // Capture prefers host_cache over guest pages — must evict so the
             // next paint_mapping reads the DMA'd guest BGRA.
             surface_cache::evict(state, mapping_id);

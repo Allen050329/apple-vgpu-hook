@@ -3987,6 +3987,11 @@ fn publish_cpu_portability_store<M: HostMemory + HostOps>(
 ) {
     state.note_surface_composite(mapping_id);
     state.note_compositor_member_published(mapping_id, width, height);
+    // The CPU wrote this frame straight into guest pages: there was no GPU draw,
+    // so no resident ever held it and there is no identity to name. Saying so is
+    // the point — folding it into `Mid` would claim a private resident holds a
+    // frame that only the guest's pages hold.
+    state.note_resident_published(crate::model::ResidentKey::GuestPagesOnly { mapping_id });
     crate::runtime::scanout::note_front_buffer_writeback(
         state, host, mapping_id, width, height, format,
     );

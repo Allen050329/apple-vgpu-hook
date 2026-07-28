@@ -467,6 +467,27 @@ pub fn capture_present_frame(
              produced this frame went to the other one)"
         ));
     }
+    // Resident-keyed backing, read AFTER the display action, because that is the
+    // identity the export resolves and therefore the image that will actually be
+    // scanned out. The mid-keyed `present_unbacked` gate in `drain` asks whether
+    // the guest SENT a frame for this mapping; this asks whether the thing we are
+    // about to show RECEIVED one. They disagree exactly when draws were routed to
+    // one resident while the present reads another, which is the black-desktop
+    // class.
+    //
+    // MEASURE-ONLY (`off`, not `fail`) until a clean boot says what it reports.
+    // If it stays quiet through a healthy session it replaces the mid-keyed gate,
+    // whose blindness and latent false positive both come from that keying; if it
+    // fires on a healthy boot the model behind it is wrong, which is the cheap
+    // thing to learn.
+    let resident = state.present_resident(mapping_id, width, height);
+    if let Some(seq) = state.note_present_resident_backing(resident) {
+        crate::observe::off(format!(
+            "present_resident_unbacked mid={mapping_id} {width}x{height} \
+             resident={resident:?} since_seq={seq} \
+             (no full frame published into this resident since it was last shown)"
+        ));
+    }
     // Advance the per-present tile-epoch clock and measure per-tile
     // damage-coverage divergence against the freshest same-geometry peer
     //. The CPU-display capture below
