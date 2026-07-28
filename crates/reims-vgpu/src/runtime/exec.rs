@@ -6,7 +6,7 @@
 
 use crate::contract::endian::{ld32, ld64};
 use crate::contract::pixel_format::{f64_to_unorm8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP};
-use crate::model::{DeviceState, DEFINE_TASK_ID_SHIFT};
+use crate::model::DeviceState;
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind, OP_GENERATE_MIPMAPS};
@@ -39,6 +39,7 @@ use crate::runtime::metal_draw::{
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
+use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 
 /// Max descriptors per ExecIndirect2 (wire table size), not a byte budget.
 const MAX_CMDBUFS: usize = 16;
@@ -214,12 +215,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
     let raw_task = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
-    let task_id =
-        if (raw_task as usize) < state.tasks.len() && state.tasks[raw_task as usize].active {
-            raw_task
-        } else {
-            raw_task >> DEFINE_TASK_ID_SHIFT
-        };
+    let task_id = resolve_task_word(&state.tasks, TaskWordSite::ExecIndirect2, raw_task);
     out.task_id = task_id;
     if (task_id as usize) >= state.tasks.len() || !state.tasks[task_id as usize].active {
         return out;

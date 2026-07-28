@@ -2602,6 +2602,22 @@ pub const REGISTRY: &[DeclineClass] = &[
         slugs: &["task_walk_ambiguous"],
     },
     DeclineClass {
+        type_name: "TaskWordDecode",
+        defined_in: "runtime/task_slot.rs",
+        slug_blocks: &[],
+        // Census, not a refusal: the decode resolved either way. All four arms
+        // are registered because the reading is the *set* of raw words a site
+        // received, and dropping the healthy arm would truncate that set.
+        emission: Emission::At(&[("runtime/task_slot.rs", "cmd_task")]),
+        slug_calls: &[],
+        slugs: &[
+            "cmd_task_direct",
+            "cmd_task_ambiguous",
+            "cmd_task_shifted",
+            "cmd_task_dead",
+        ],
+    },
+    DeclineClass {
         type_name: "MemError",
         defined_in: "runtime/host.rs",
         slug_blocks: &[],

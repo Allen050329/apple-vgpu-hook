@@ -14,6 +14,7 @@ use crate::runtime::decode::fifo::{
 use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
 use crate::runtime::host::{HostAction, HostMemory, HostOps, MemError};
+use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 
 /// apple-gfx `pending_frames >= 2`: hold further guest presents at FIFO head
 /// until host paint consumes +0x188. Entry-side waitForPendingFrames — not
@@ -399,12 +400,7 @@ fn reply_compute_info<H: HostMemory + HostOps>(
         return false;
     }
     let raw_task = ld32(&payload[0..]);
-    let task_id =
-        if (raw_task as usize) < state.tasks.len() && state.tasks[raw_task as usize].active {
-            raw_task
-        } else {
-            raw_task >> DEFINE_TASK_ID_SHIFT
-        };
+    let task_id = resolve_task_word(&state.tasks, TaskWordSite::ComputeInfo, raw_task);
     let pipeline_ref = ld32(&payload[4..]);
     let max_key = ld32(&payload[8..]);
     let count = ld32(&payload[12..]);
@@ -483,13 +479,7 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             return false;
         }
     };
-    let task_id = if (request.task_id as usize) < state.tasks.len()
-        && state.tasks[request.task_id as usize].active
-    {
-        request.task_id
-    } else {
-        request.task_id >> DEFINE_TASK_ID_SHIFT
-    };
+    let task_id = resolve_task_word(&state.tasks, TaskWordSite::HeapTextureQuery, request.task_id);
     if (task_id as usize) >= state.tasks.len() || !state.tasks[task_id as usize].active {
         Emit::decline("heap_texture_query", &QueryError::BadTask)
             .field("task", request.task_id)

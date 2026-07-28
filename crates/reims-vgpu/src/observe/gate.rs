@@ -999,7 +999,7 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        (71, 1743),
+        (72, 1747),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

@@ -64,6 +64,8 @@ pub mod spirv_vertex_eval;
 pub mod storage_flush;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
+/// The wire task word a command payload carries → a live task slot.
+pub mod task_slot;
 /// Texture / type-11 geometry registration.
 pub mod texture;
 
