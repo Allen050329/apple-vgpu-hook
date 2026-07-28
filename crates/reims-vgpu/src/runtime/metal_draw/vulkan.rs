@@ -4842,9 +4842,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     };
                     loaded
                 };
-                crate::runtime::census::setup_tex_census::note_resolve(
-                    t_resolve.elapsed().as_micros() as u64,
-                );
+                let resolve_us = t_resolve.elapsed().as_micros() as u64;
+                crate::runtime::census::setup_tex_census::note_resolve(resolve_us);
+                sampled_census::note_resolve_us(resolve_us);
                 let t_stats = std::time::Instant::now();
                 if sampled_mid != 0 && tw == w && th == h {
                     display_sample_mids.insert(sampled_mid);

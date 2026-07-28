@@ -121,6 +121,16 @@ const NAMES: [&str; N] = [
 static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static BYTES: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Resolve wall-clock charged to each branch. See [`note_resolve_us`].
+static MICROS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+/// Resolves that ended without any branch naming itself, and their time.
+static UNNAMED: AtomicU64 = AtomicU64::new(0);
+static UNNAMED_US: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Branch noted by the resolve currently on this thread's stack.
+    static PENDING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 
 /// One cumulative census line per this many sampled resolutions.
 const EMIT_EVERY: u64 = 256;
@@ -131,10 +141,37 @@ pub fn note(branch: Branch, copied_bytes: usize) {
     let i = branch.idx();
     COUNTS[i].fetch_add(1, Ordering::Relaxed);
     BYTES[i].fetch_add(copied_bytes as u64, Ordering::Relaxed);
+    PENDING.with(|p| p.set(Some(i)));
     let total = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     if total.is_multiple_of(EMIT_EVERY) {
         crate::observe::off(format_line(&snapshot()));
     }
+}
+
+/// Charge one bind's whole resolve wall-clock to the branch that resolved it.
+///
+/// The count/bytes columns say which branch ran and how many bytes it copied;
+/// neither says what it cost. A mean over all binds cannot answer that either,
+/// because these branches differ by three orders of magnitude in bytes — the
+/// byte-heavy misses are a per-cent of the count and could be most of the time,
+/// or none of it, and the existing line reads identically both ways.
+///
+/// [`note`] runs at each branch terminus and the caller's resolve timer stops
+/// just after, so the branch is known by the time the total is. Attributing here
+/// costs one thread-local instead of a timer at each of the twenty termini, and
+/// it cannot disagree with the counts because it charges the same event.
+///
+/// A resolve that named no branch is charged to `unnamed` rather than to
+/// whichever branch ran last — otherwise a silent path would quietly inflate its
+/// neighbour and the line would look complete while being wrong.
+pub fn note_resolve_us(us: u64) {
+    match PENDING.with(|p| p.take()) {
+        Some(i) => MICROS[i].fetch_add(us, Ordering::Relaxed),
+        None => {
+            UNNAMED.fetch_add(1, Ordering::Relaxed);
+            UNNAMED_US.fetch_add(us, Ordering::Relaxed)
+        }
+    };
 }
 
 /// Cumulative resolution count for one branch (monotonic; never reset). Used by
@@ -160,8 +197,22 @@ fn format_line(&(ref s, total): &([(u64, u64); N], u64)) -> String {
     use std::fmt::Write as _;
     let mut line = format!("sampled_branch_census total={total}");
     for (i, name) in NAMES.iter().enumerate() {
-        let _ = write!(line, " {name}={}:{}", s[i].0, s[i].1);
+        // count:bytes:microseconds — the third column is what the branch cost,
+        // which the first two cannot imply.
+        let _ = write!(
+            line,
+            " {name}={}:{}:{}",
+            s[i].0,
+            s[i].1,
+            MICROS[i].load(Ordering::Relaxed)
+        );
     }
+    let _ = write!(
+        line,
+        " unnamed={}:{}",
+        UNNAMED.load(Ordering::Relaxed),
+        UNNAMED_US.load(Ordering::Relaxed)
+    );
     line
 }
 
@@ -192,5 +243,39 @@ mod tests {
                 "census line missing branch {name}: {line}"
             );
         }
+    }
+
+    /// A resolve's time lands on the branch that resolved it, and a resolve that
+    /// named no branch lands on `unnamed` rather than on whoever ran last.
+    ///
+    /// The second half is the one worth pinning: without it a silent path
+    /// inflates its neighbour, and the line reads as a complete attribution while
+    /// being wrong about which branch is expensive — the exact question this
+    /// column was added to answer.
+    #[test]
+    fn resolve_time_lands_on_its_own_branch_and_a_silent_one_is_named_unnamed() {
+        // Globals are shared with the other tests in this module; drain any
+        // pending branch first so this test measures only its own deltas.
+        note_resolve_us(0);
+        let zc = Branch::LinZeroCopy.idx();
+        let before = MICROS[zc].load(Ordering::Relaxed);
+        let before_unnamed = UNNAMED.load(Ordering::Relaxed);
+        let before_unnamed_us = UNNAMED_US.load(Ordering::Relaxed);
+
+        note(Branch::LinZeroCopy, 0);
+        note_resolve_us(37);
+        assert_eq!(MICROS[zc].load(Ordering::Relaxed) - before, 37);
+        assert_eq!(UNNAMED.load(Ordering::Relaxed), before_unnamed);
+
+        // No `note` this time: the pending slot was consumed above, so the charge
+        // must not fall through to LinZeroCopy again.
+        note_resolve_us(11);
+        assert_eq!(
+            MICROS[zc].load(Ordering::Relaxed) - before,
+            37,
+            "an unnamed resolve was charged to the previous branch"
+        );
+        assert_eq!(UNNAMED.load(Ordering::Relaxed) - before_unnamed, 1);
+        assert_eq!(UNNAMED_US.load(Ordering::Relaxed) - before_unnamed_us, 11);
     }
 }
