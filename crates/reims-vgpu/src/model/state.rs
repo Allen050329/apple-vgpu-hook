@@ -382,8 +382,10 @@ pub struct TaskEntry {
 pub enum WriteGate {
     /// A span recorded for this exact task covers the whole range.
     Exact,
-    /// Only a span recorded for `task >> 1` or `task << 1` covers it.
-    Aliased,
+    /// No span for this task covers the range, but one recorded by task `by`
+    /// does. `by` is the whole point: it says which task's authorisation is
+    /// standing in, and therefore which two key spaces disagree.
+    Aliased { by: u32 },
     /// This task has no recorded spans at all, so the gate allowed by default.
     /// `delete_task` calls `clear_task_map_spans`, so a write arriving after a
     /// teardown lands here.
@@ -393,10 +395,19 @@ pub enum WriteGate {
 }
 
 impl crate::observe::Decline for WriteGate {
+    /// Carries `by` so the aliased arm names the authorising task without the
+    /// call site having to know the arm's shape.
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Aliased { by } => vec![("by", by.to_string())],
+            _ => Vec::new(),
+        }
+    }
+
     fn slug(&self) -> &'static str {
         match self {
             Self::Exact => "write_gate_exact",
-            Self::Aliased => "write_gate_aliased",
+            Self::Aliased { .. } => "write_gate_aliased",
             Self::NoSpans => "write_gate_no_spans",
             Self::Outside => "write_gate_outside",
         }
@@ -3255,7 +3266,7 @@ impl DeviceState {
         }
         let aliases = |t: u32| t == (task_id >> 1) || (t << 1) == task_id;
         let mut saw_any = false;
-        let mut aliased_cover = false;
+        let mut aliased_by: Option<u32> = None;
         for s in &self.task_map_spans {
             let exact = s.task_id == task_id;
             if !exact && !aliases(s.task_id) {
@@ -3266,11 +3277,11 @@ impl DeviceState {
                 if exact {
                     return WriteGate::Exact;
                 }
-                aliased_cover = true;
+                aliased_by.get_or_insert(s.task_id);
             }
         }
-        if aliased_cover {
-            return WriteGate::Aliased;
+        if let Some(by) = aliased_by {
+            return WriteGate::Aliased { by };
         }
         if saw_any {
             WriteGate::Outside

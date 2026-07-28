@@ -213,7 +213,11 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     // gate is supposed to take; the other two are the reading this exists for.
     if gate != crate::model::WriteGate::Exact {
         use crate::observe::Decline;
-        if crate::observe::first_sight(gate.slug(), u64::from(task_id)) {
+        let by = match gate {
+            crate::model::WriteGate::Aliased { by } => by,
+            _ => 0,
+        };
+        if crate::observe::first_sight(gate.slug(), (u64::from(task_id) << 32) | u64::from(by)) {
             crate::observe::Emit::decline("gva_write_gate", &gate)
                 .field("task", task_id)
                 .field("gva", format!("{gva:#x}"))
@@ -708,7 +712,7 @@ mod tests {
         aliased.note_task_map(3, 0x4000, 0x1000);
         assert_eq!(
             aliased.gva_write_gate(6, 0x4000, 0x100),
-            WriteGate::Aliased,
+            WriteGate::Aliased { by: 3 },
             "a span recorded by task 3 must not be reported as task 6's own"
         );
         aliased.note_task_map(6, 0x4000, 0x1000);
