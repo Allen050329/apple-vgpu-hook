@@ -494,11 +494,19 @@ fi
 # to fit a 1280x720 box; ImageMagick's trailing '>' preserves aspect ratio and
 # only ever shrinks, so a window already smaller than 720p is left untouched.
 #
-# Deliberately unconditional -- no flag. A lever here would mean every caller has
-# to remember to pass it, and the full-resolution capture is one `spectacle` away
-# for the rare case that needs it. Runs AFTER the black-frame guard so the guard's
-# max/mean/colors stats describe the pixels actually captured, not resampled ones.
-if [[ -n "$MAGICK" ]]; then
+# No flag: a lever every caller has to remember to pass is a lever most callers
+# will forget, and 720p is the right default for a capture an agent reads.
+# REIMS_SHOT_NATIVE=1 in the environment opts out, for the measurements where the
+# resample is itself the confound -- a downscale averages sparse per-pixel errors
+# into dense speckle and it hides the magnitude distribution the residue and
+# colour classes are judged on (AGENTS.md). Environment rather than a flag so an
+# existing repro can be re-run at native resolution without editing it.
+# Runs AFTER the black-frame guard so the guard's max/mean/colors stats describe
+# the pixels actually captured, not resampled ones.
+if [[ -n "${REIMS_SHOT_NATIVE:-}" ]]; then
+  printf '%s: REIMS_SHOT_NATIVE set — keeping full resolution %s\n' \
+    "$SCRIPT_NAME" "$("$MAGICK" "$OUT" -format '%wx%h' info: 2>/dev/null || echo unknown)" >&2
+elif [[ -n "$MAGICK" ]]; then
   DIM_BEFORE="$("$MAGICK" "$OUT" -format '%wx%h' info: 2>/dev/null || true)"
   if "$MAGICK" "$OUT" -resize '1280x720>' "$OUT" 2>/dev/null; then
     DIM_AFTER="$("$MAGICK" "$OUT" -format '%wx%h' info: 2>/dev/null || true)"
