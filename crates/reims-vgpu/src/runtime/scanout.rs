@@ -239,14 +239,34 @@ fn run_gpu_stats_oracle(
 /// scan out never received this frame — a real loss of guest work that looks on
 /// screen exactly like "the previous frame" or "black outside the damage rect".
 ///
-/// Returns `Some((before, after))` on a flip, so the caller can name it. This is
-/// measure-only and deliberately does NOT suppress the flip: which side is
-/// correct is not established. A surface's first present is genuinely the first
-/// decoded evidence that it is a display plane — the transaction naming it as
-/// plane 0 is the strongest such evidence there is — but that evidence arrives
-/// after the draw that needed it. Neither pinning the old identity (the surface
-/// stays out of the group forever) nor accepting the new one (this frame's draw
-/// is stranded) is derivable from the contract yet.
+/// Returns `Some((before, after, miss))` on a flip, so the caller can name it.
+/// This is measure-only and deliberately does NOT suppress the flip: which side
+/// is correct is not established. A surface's first present is genuinely the
+/// first decoded evidence that it is a display plane — the transaction naming it
+/// as plane 0 is the strongest such evidence there is — but that evidence
+/// arrives after the draw that needed it. Neither pinning the old identity (the
+/// surface stays out of the group forever) nor accepting the new one (this
+/// frame's draw is stranded) is derivable from the contract yet.
+///
+/// `miss` is the refusal [`crate::model::DeviceState::output_group_resolve`]
+/// returned for the BEFORE state, read from the check that refused rather than
+/// assumed by this caller. Without it the line says only "the identity moved",
+/// and the ways it can move want different answers:
+///
+/// - `NotPresentedHere { presented: None }` — no evidence for this id at all.
+///   Either the surface's genuine first present, or the state a wrong prune
+///   manufactured out of a live swapchain member (the black-desktop class).
+/// - `NotPresentedHere { presented: Some(other) }` — the guest last presented
+///   this id at a different geometry.
+/// - `PriorIncarnation` — the id was recycled and its evidence expired with the
+///   mapping, which is what `presented_geom_live` is for.
+///
+/// `NoPeer` cannot appear: it means the id IS presented here, so the insert
+/// below cannot change the count the latch arms on, and evidence never comes
+/// back to life. A `NoPeer` on this line would mean that invariant broke.
+///
+/// Separating those classes in a boot log needed a reconstructed per-mid
+/// generation history until this field existed.
 fn note_display_action(
     state: &mut crate::model::DeviceState,
     mapping_id: u32,
@@ -255,12 +275,21 @@ fn note_display_action(
 ) -> Option<(
     crate::backend::vulkan::engine::types::TargetIdentity,
     crate::backend::vulkan::engine::types::TargetIdentity,
+    crate::model::OutputGroupMiss,
 )> {
+    // Take the refusal before the insert below can change the answer.
+    let miss = state.output_group_resolve(mapping_id, width, height).err();
     let before =
         crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
     state.note_presented_geom(mapping_id, width, height);
     let after = crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    (before != after).then_some((before, after))
+    if before == after {
+        return None;
+    }
+    // `note_presented_geom` only ever adds evidence and arms the latch, so an
+    // identity that moved means the BEFORE state was not a member and the
+    // resolve above returned its reason.
+    miss.map(|miss| (before, after, miss))
 }
 
 /// Rebuild the exact identity a [`crate::model::PendingStats`] was armed with.
@@ -459,10 +488,10 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
-    if let Some((before, after)) = note_display_action(state, mapping_id, width, height) {
+    if let Some((before, after, miss)) = note_display_action(state, mapping_id, width, height) {
         crate::observe::fail(format!(
             "present_identity_flip mid={mapping_id} {width}x{height} \
-             before={before:?} after={after:?} \
+             before={before:?} after={after:?} miss={miss:?} \
              (the display action moved this surface's resident; the draws that \
              produced this frame went to the other one)"
         ));
@@ -3321,7 +3350,7 @@ mod tests {
         // mid 4's first present unifies the pair. Everything drawn into mid 4
         // before this instant went to `Surface { id: 4 }`; everything read after
         // it comes from the group.
-        let (before, after) = note_display_action(&mut state, 4, w, h)
+        let (before, after, miss) = note_display_action(&mut state, 4, w, h)
             .expect("the display action that unifies a member moves where its content lives");
         assert!(
             matches!(before, TargetIdentity::Surface { id: 4, .. }),
@@ -3331,12 +3360,97 @@ mod tests {
             matches!(after, TargetIdentity::OutputGroup { .. }),
             "after it, mid 4 reads the shared group resident, got {after:?}"
         );
+        assert_eq!(
+            miss,
+            crate::model::OutputGroupMiss::NotPresentedHere { presented: None },
+            "mid 4 had never been named in a display transaction, so the refusal \
+             must read as no evidence at all"
+        );
 
         // Steady state: both members are already unified, so presents stop
         // moving anything. A detector that fired here would be useless — the
         // rotation presents on every frame.
         assert_eq!(note_display_action(&mut state, 1, w, h), None);
         assert_eq!(note_display_action(&mut state, 4, w, h), None);
+    }
+
+    /// The flip line must carry the refusal that made the identity move, because
+    /// the refusals mean opposite things and the line reads identically without
+    /// one.
+    ///
+    /// A boot's flips split into "this surface had no evidence at all" and "this
+    /// id was recycled, so its evidence expired with the mapping". The second is
+    /// the designed behaviour of `presented_geom_live`; the first is the state a
+    /// wrong prune manufactured out of a live swapchain member and blacked the
+    /// desktop out. Told apart in a log, they needed a reconstructed per-mid
+    /// `map_generation` history over every flip in the file; told apart here,
+    /// they are one field the check that refused wrote itself.
+    #[test]
+    fn the_flip_line_carries_the_refusal_that_moved_the_identity() {
+        use crate::model::OutputGroupMiss;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 48u32);
+        let (ow, oh) = (32u32, 24u32);
+        for mid in [1u32, 4u32, 7u32] {
+            state.map_surface(mid);
+        }
+
+        // Latch the geometry with a pair, so every later first-present at it
+        // flips rather than staying per-mid.
+        state.note_presented_geom(1, w, h);
+        state.note_presented_geom(4, w, h);
+        assert!(state.output_group_for(1, w, h).is_some());
+
+        // A surface that last presented at ANOTHER geometry: the refusal names
+        // the geometry it holds instead, not "no evidence".
+        state.note_presented_geom(7, ow, oh);
+        let (.., miss) = note_display_action(&mut state, 7, w, h)
+            .expect("mid 7's first present at the latched geometry moves its resident");
+        assert_eq!(
+            miss,
+            OutputGroupMiss::NotPresentedHere {
+                presented: Some((ow, oh))
+            },
+            "the refusal must report the live evidence it read"
+        );
+
+        // A recycled id: the entry survives but belongs to the prior
+        // incarnation, which is what makes the evidence expire.
+        let entry = state.mappings.get_mut(&4).expect("mid 4 was mapped");
+        let before_gen = entry.map_generation;
+        DeviceState::bump_map_generation(4, entry);
+        let after_gen = state.mappings[&4].map_generation;
+        let (.., miss) = note_display_action(&mut state, 4, w, h)
+            .expect("a recycled member re-earns its qualification, so its identity moves again");
+        assert_eq!(
+            miss,
+            OutputGroupMiss::PriorIncarnation {
+                presented: (w, h),
+                entry_gen: before_gen,
+                current_gen: after_gen,
+            },
+            "a recycled id must not read as a surface that was never presented"
+        );
+
+        // And the emitted line says so, on the failure channel: a flip strands
+        // the draws that produced this frame whichever refusal caused it.
+        let cap = crate::observe::FailCapture::start();
+        let entry = state.mappings.get_mut(&4).expect("mid 4 was mapped");
+        DeviceState::bump_map_generation(4, entry);
+        capture_present_frame(&mut state, 4, w, h, 0);
+        let lines = cap.lines();
+        let flip = lines
+            .iter()
+            .find(|l| l.contains("present_identity_flip"))
+            .unwrap_or_else(|| panic!("no flip on the failure channel: {lines:?}"));
+        assert!(
+            flip.contains("miss=PriorIncarnation"),
+            "the flip line must name the refusal, got {flip}"
+        );
+        assert!(
+            !flip.starts_with("OFF "),
+            "a stranded frame belongs on the failure channel, got {flip}"
+        );
     }
 
     /// Regression guard for `present_dims`, the scanout sizing lookup. The
