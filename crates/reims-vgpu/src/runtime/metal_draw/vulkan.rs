@@ -5670,14 +5670,25 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // Six checks decide this and three answers come out, so the
                 // existing `m2v_load_seed` line — verbose-gated, and only for
                 // >=1280x720 — cannot say which one applied. Latched per
-                // (check, pipeline) so the reading is the *set* of pipelines
-                // each arm serves; the present-boundary arm is the one derived
-                // from forensics rather than a decoded field, and nothing can
-                // weigh deleting it while its decisions are indistinguishable
-                // from the two legitimate seed paths.
+                // (check, pipeline, load_action, ready) so the reading is the
+                // *set* of pipelines each arm serves; the present-boundary arm
+                // is the one derived from forensics rather than a decoded field,
+                // and nothing can weigh deleting it while its decisions are
+                // indistinguishable from the two legitimate seed paths.
+                //
+                // `ready` is in the key, not merely in the line. The
+                // present-boundary check runs *before* the resident check, so
+                // its only distinctive power is overruling a ready resident —
+                // with `ready = 0` the fall-through reaches `SeedWhileNotReady`
+                // and the same outcome, and the arm decided nothing. Keyed
+                // without `ready`, a first sighting at `ready = 0` would hide
+                // every later firing at `ready = 1` for the whole process, and
+                // "it never overruled a resident" would be unfalsifiable.
                 {
                     use crate::observe::Decline;
-                    let key = (u64::from(req.pipeline_ref) << 8) | u64::from(load_action.unwrap_or(0));
+                    let key = (u64::from(req.pipeline_ref) << 9)
+                        | (u64::from(load_action.unwrap_or(0)) << 1)
+                        | u64::from(ready);
                     if crate::observe::first_sight(decision.slug(), key) {
                         crate::observe::Emit::decline("t11_load", &decision)
                             .field("pipe", req.pipeline_ref)
