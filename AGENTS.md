@@ -183,6 +183,19 @@ What is left is an **interaction** — HEIC *and* a source larger than the displ
 effect would have found and which every single-knob A/B in this investigation had to miss. When a
 swap changes N things, the answer can be a pair of them. Build the grid.
 
+Bisecting the size on static HEICs puts the step at the display width, not at any texture or codec
+limit, and shows it is a step rather than a ramp — the magnitude barely moves across a 3x range of
+scale factor after it fires:
+
+| static HEIC source | 1920x1080 | 1920x1920 | 2048x1152 | 2560x1440 | 3072x1728 | 3840x2160 | 6016x6016 |
+|---|---|---|---|---|---|---|---|
+| dB, our window | 0.11 | 0.11 | **4.40** | **5.88** | **7.12** | **6.80** | **6.14** |
+
+41x between 1920 and 2048 wide, then flat. 1920x1080 is the guest's display size, so the arm that
+needs no downscale is the only clean one, and *any* downscale is as bad as a large one. Grid tiling
+is not the discriminator either: every one of these files is a tiled HEIC, including the clean
+1920x1080 one, so "it got tiled above some size" does not survive the file itself being read.
+
 The always-on sink refutes the YUV lead a second time, independently of the pixels. Slicing this
 boot per arm, the `type4 pages … multi=1` biplanar `'420f'` lines appear in arms F, G and H — four
 each — and in no other arm. **F and G are clean arms.** Biplanar YUV traffic is therefore present
