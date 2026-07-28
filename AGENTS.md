@@ -306,6 +306,22 @@ the branch, make that the probe. Prefer a line whose *dedup key is the branch ta
 at one line per outcome per process, which is what makes it safe to leave on forever, and it keeps
 answering for every boot after the question that prompted it is closed.
 
+**A reproduction rate pools whatever you called the same defect.** "Reproduced 3 of 6" is a number
+about a name, and the name was chosen before anything was measured. Print the per-instance shape next
+to the rate and look at whether it is one population.
+
+Measured here on one six-round run: three rounds reproduced the residue class, and their bounding
+boxes fall into two groups that share no dimension. One lost a whole window (1251 px wide, 534 tall).
+Two lost a strip 61-65 px tall whose top edge sat at y=614-618 — and a third instance of that strip,
+from a different boot, sat at y=618. A position that repeatable across boots is not the same event as
+losing a window; pooling them into a single rate had been hiding a second sub-class for several
+iterations, and a fix validated against the pooled rate could move one population and be scored by
+the other.
+
+So report the distribution, not just the count, and be suspicious when a "class" has instances that
+differ by an order of magnitude in size. The corollary for a fix: state which sub-class it addresses
+and score that one.
+
 **Deleting a consumer makes its producer's waste audible — listen on the next boot.** When a mechanism
 comes out, the state that fed it usually does not, and it starts reporting. Here, removing the
 resolver left the present↔store pairing queue with nothing draining it: `present_store_fifo_drop` had
