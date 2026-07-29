@@ -1461,6 +1461,56 @@ impl ResourcePools {
         Ok(())
     }
 
+    /// Copy semantic RGBA8 into a mapped staging slot as physical BGRA8.
+    ///
+    /// The R/B exchange a BGRA resident attachment needs used to run over a
+    /// heap copy of the seed, which cost a full-frame allocation, a memcpy to
+    /// fill it, a second pass to swizzle it and a third to write it into the
+    /// mapped span. The exchange is per-pixel and order-independent, so it
+    /// folds into the copy: read RGBA from the caller's borrow, write BGRA
+    /// straight into mapped memory, one pass, no allocation.
+    ///
+    /// Mapped staging is host-visible and written only, never read back, so
+    /// this writes each destination byte exactly once and never loads from
+    /// `ptr` — a read-modify-write in place would fault the write-combined
+    /// case into a far slower path.
+    ///
+    /// A trailing partial pixel (`len % 4 != 0`) is copied through unswizzled;
+    /// a seed is always whole RGBA8 pixels, so the remainder is empty in
+    /// practice and this only keeps the mapped span fully defined.
+    pub(crate) unsafe fn write_staging_rgba_as_bgra(
+        &self,
+        ctx: &DeviceContext,
+        slot: &BufferSlot,
+        rgba: &[u8],
+    ) -> Result<(), DrawError> {
+        let size = rgba.len().max(4) as u64;
+        let ptr = staging_write_ptr(ctx, slot, size)?;
+        unsafe {
+            if rgba.is_empty() {
+                std::ptr::write_bytes(ptr, 0, size as usize);
+                return Ok(());
+            }
+            let whole = rgba.len() / 4 * 4;
+            for i in (0..whole).step_by(4) {
+                let px = rgba.as_ptr().add(i);
+                let dst = ptr.add(i);
+                *dst = *px.add(2);
+                *dst.add(1) = *px.add(1);
+                *dst.add(2) = *px;
+                *dst.add(3) = *px.add(3);
+            }
+            if whole < rgba.len() {
+                std::ptr::copy_nonoverlapping(
+                    rgba.as_ptr().add(whole),
+                    ptr.add(whole),
+                    rgba.len() - whole,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Snapshot guest-run spans directly into a mapped staging slot.
     ///
     /// The deferred-submit snapshot path used to `cpu_bytes()` the runs into a

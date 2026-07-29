@@ -778,45 +778,23 @@ pub(crate) unsafe fn execute_draw_inner(
         bindings: layout_bindings,
     };
     // Resolve load action: explicit load_op > target_rgba8 > Clear.
-    let resolved_load: LoadOp = match &req.load_op {
-        Some(op) => match op {
-            LoadOp::Clear(c) => LoadOp::Clear(*c),
-            LoadOp::LoadFromTarget => LoadOp::LoadFromTarget,
-            LoadOp::LoadSeed(b) => LoadOp::LoadSeed(b.clone()),
-        },
-        None => match &req.target_rgba8 {
-            Some(b) => LoadOp::LoadSeed(b.clone()),
-            None => LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
-        },
-    };
-    let load_uses_gpu_content = matches!(resolved_load, LoadOp::LoadFromTarget);
+    let load_uses_gpu_content = matches!(req.load_op, Some(LoadOp::LoadFromTarget));
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
     // copy lands guest scanout order with no CPU swizzle.
-    // Consumes `resolved_load` — this is its last use, and the seed is a whole
-    // frame. Cloning here made the second full-frame copy of the same pixels in
-    // fifteen lines: `resolved_load` is already a clone (`req` is a shared
-    // reference, so that one is structural), and this produced another only to
-    // own something the `output_bgra` arm could mutate in place. Moving gets the
-    // same buffer with the same mutation and no allocation. At the measured
-    // ~190 MB/s of seed uploads that is ~190 MB/s of memcpy and ~70 multi-MiB
-    // allocations a second removed, on the drain worker that `drain_duty` shows
-    // pinned at duty 0.99.
-    let seed_bytes: Option<Vec<u8>> = match resolved_load {
-        LoadOp::LoadSeed(mut native) => {
-            // LoadSeed is semantic RGBA8. Vulkan buffer→image copies do not
-            // perform format conversion, so a BGRA resident attachment needs
-            // physical B/G/R/A bytes. Otherwise partial draws preserve an
-            // exact R/B-exchanged seed outside their damaged geometry.
-            if output_bgra {
-                for pixel in native.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-            }
-            Some(native)
-        }
-        _ => None,
+    // The seed is borrowed from `req`, never copied to the heap. It is a whole
+    // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
+    // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
+    // multi-MiB allocations a second on the drain worker that `drain_duty`
+    // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
+    // the `output_bgra` arm could swizzle in place; that swizzle now happens
+    // during the single copy into the mapped staging span
+    // (`write_staging_rgba_as_bgra`), so the pixels are touched once either way.
+    let seed_bytes: Option<&[u8]> = match &req.load_op {
+        Some(LoadOp::LoadSeed(native)) => Some(native.as_slice()),
+        Some(_) => None,
+        None => req.target_rgba8.as_deref(),
     };
     let mut pass_key = PassKey::single(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),
@@ -1028,14 +1006,22 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
-    let seed_slot = if let Some(rgba8) = &seed_bytes {
+    let seed_slot = if let Some(rgba8) = seed_bytes {
         let slot = pools.acquire_staging(
             ctx,
             rgba8.len() as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
             counters,
         )?;
-        pools.write_staging(ctx, &slot, rgba8)?;
+        // LoadSeed is semantic RGBA8. Vulkan buffer→image copies do not perform
+        // format conversion, so a BGRA resident attachment needs physical
+        // B/G/R/A bytes — otherwise partial draws preserve an exact
+        // R/B-exchanged seed outside their damaged geometry.
+        if output_bgra {
+            pools.write_staging_rgba_as_bgra(ctx, &slot, rgba8)?;
+        } else {
+            pools.write_staging(ctx, &slot, rgba8)?;
+        }
         counters.note_seed_upload(rgba8.len() as u64);
         Some(slot)
     } else {
