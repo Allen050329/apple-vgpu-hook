@@ -1134,6 +1134,13 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
 /// On Linux, only a **packed** sequential host run succeeds. Fragmented
 /// IOSurface page lists must use [`write_mapping_bytes`] / [`read_mapping_bytes`]
 /// or multi-run import-present.
+/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
+/// whether the verdict was derived or served from `contig_fragmented_gen`.
+/// Reported as `served=` on every `contig_view_fragmented` line so the
+/// magnitude the old per-call line carried survives its deduplication.
+static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1150,6 +1157,15 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
         if m.contig_ptr != 0 {
             return Some((m.contig_ptr, m.contig_len));
         }
+        // The negative verdict caches on exactly the key that makes the
+        // positive one above safe. Re-deriving it per call collected the page
+        // GPAs and rescanned them every time, and said so in the always-on sink
+        // every time: 471 757 lines in one 2 900 s boot, the sole prefix ever to
+        // trip `log_flood_detected`, at up to 1 826 lines in a one-second window.
+        if m.contig_fragmented_gen == Some(m.map_generation) {
+            CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
@@ -1159,8 +1175,17 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     // `qemu_map_pages_callback_failed`.
     let runs = crate::runtime::gva_view::contig_run_count(&gpas, page_sz as u64);
     if runs != 1 {
+        let served = CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let m = state.mappings.get_mut(&mapping_id)?;
+        m.contig_fragmented_gen = Some(m.map_generation);
+        let generation = m.map_generation;
+        // One line per (mapping, page list) rather than per call. The count the
+        // per-call line used to carry moves to `served`, a device-wide
+        // cumulative total of fragmented answers, so a census still reads
+        // magnitude off the newest line while the line count now measures
+        // distinct fragmented page lists — which is what the slug claims.
         crate::observe::off(format!(
-            "contig_view_fragmented mid={mapping_id} pages={} runs={runs}",
+            "contig_view_fragmented mid={mapping_id} pages={} runs={runs} generation={generation} served={served}",
             gpas.len(),
         ));
         return None;
@@ -1642,6 +1667,92 @@ mod revalidate_tests {
         assert_eq!(m.contig_ptr, 0);
         assert!(m.map_generation != gen0);
         assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
+    }
+
+    /// The "cannot pack" verdict is derived once per page list, not once per
+    /// call, and a new page list re-derives it.
+    ///
+    /// Before this cache every call on a fragmented mapping rebuilt the page-GPA
+    /// vector, rescanned it for runs, and emitted a line — 471 757 of them in
+    /// one 2 900 s boot, the only prefix ever to trip `log_flood_detected`. The
+    /// line count is therefore the assertion: repeated calls must add none, and
+    /// the magnitude the old line carried must still be readable as `served=`.
+    #[test]
+    fn fragmented_verdict_is_derived_once_per_page_list() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let entry =
+            |gpa: u64| ((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID;
+        // Non-adjacent guest pages — never one packed run.
+        let (gpa0, gpa1, gpa2) = (0x1000_0000u64, 0x2000_0000u64, 0x3000_0000u64);
+        for gpa in [gpa0, gpa1, gpa2] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mid = 9u32;
+        state.map_surface(mid);
+        state.mappings.get_mut(&mid).unwrap().page_entries = vec![entry(gpa0), entry(gpa1)];
+
+        let cap = crate::observe::FailCapture::start();
+        let lines = || -> Vec<String> {
+            cap.lines()
+                .into_iter()
+                .filter(|l| l.starts_with("OFF contig_view_fragmented"))
+                .collect()
+        };
+        for _ in 0..16 {
+            assert!(
+                ensure_contig_view(&mut state, &mut host, mid).is_none(),
+                "fragmented list must never pack"
+            );
+        }
+        let first = lines();
+        assert_eq!(
+            first.len(),
+            1,
+            "16 calls on one page list must derive (and say) the verdict once: {first:?}"
+        );
+        assert!(
+            first[0].contains(" pages=2 runs=2 "),
+            "the derived line keeps its shape: {}",
+            first[0]
+        );
+
+        // A different page list is a different verdict: the generation bump that
+        // retires `contig_ptr` must also retire this.
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = vec![entry(gpa0), entry(gpa1), entry(gpa2)];
+            DeviceState::bump_map_generation(mid, m);
+        }
+        assert!(ensure_contig_view(&mut state, &mut host, mid).is_none());
+        let after = lines();
+        assert_eq!(
+            after.len(),
+            2,
+            "a new page list must re-derive and re-report: {after:?}"
+        );
+        assert!(
+            after[1].contains(" pages=3 runs=3 "),
+            "the second line describes the second list: {}",
+            after[1]
+        );
+
+        // Magnitude survives deduplication: `served` counts every fragmented
+        // answer, cached ones included, so it advanced by the 16 calls between
+        // the two derivations.
+        let served = |l: &str| -> u64 {
+            l.rsplit_once("served=")
+                .and_then(|(_, v)| v.split_whitespace().next())
+                .and_then(|v| v.parse().ok())
+                .expect("line carries served=")
+        };
+        assert_eq!(
+            served(&after[1]) - served(&after[0]),
+            16,
+            "served must count cached answers too: {after:?}"
+        );
     }
 
     /// Product Linux: full page list is non-packed → ensure_contig_view fails;

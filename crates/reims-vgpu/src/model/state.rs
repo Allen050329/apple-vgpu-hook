@@ -629,6 +629,16 @@ pub struct MappingEntry {
     /// place) whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
+    /// `map_generation` whose page list was measured non-packed, so no
+    /// contiguous view can exist over it. `None` = not measured for the
+    /// current list.
+    ///
+    /// "Packed or not" is a pure function of `page_entries`, and
+    /// `map_generation` names that list — the same key that makes `contig_ptr`
+    /// above safe to cache. Without it every caller on a fragmented mapping
+    /// re-collected the whole page-GPA vector and re-scanned it only to reach
+    /// the answer it reached last time.
+    pub contig_fragmented_gen: Option<u32>,
     /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_type4_surface_ex` probes this task right after task 0 so a
