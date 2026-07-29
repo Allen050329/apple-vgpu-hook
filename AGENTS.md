@@ -314,6 +314,42 @@ the next step has to be a probe, and the census is not where to put it.
 That is where the measurement stops. Which property of an oversized HEIC decode does it is
 **unmeasured**, and no mechanism is named here.
 
+**One candidate found by reading code rather than pixels, and it was invisible for the reason the
+paragraph above gives.** `compute_exec`'s `try_recover_sentinel_grid` fires on a
+`DispatchThreadgroups` whose wire reads `grid = [ceil(ow/tg), u64::MAX, 1]`, `tg = [32, 0, 1]`, and
+**substitutes dispatch dimensions the guest never sent**: both grid axes come from "the largest
+write-capable bound texture by pixel area", and `tg.y` is set to `tg.x` on the assumption that the
+tile is square. Its own doc comment names the driving case as the Live Core Image wallpaper.
+
+Two things make it a suspect for the speckle class rather than a curiosity:
+
+- **It fits the measured signature, which nothing else has.** If the kernel is not square-tiled, or
+  if the guessed texture is not the one being written, every thread computes its coordinates from
+  the wrong grid — which produces errors that are sparse, per-pixel, uniformly scattered with no
+  grid alignment, deterministic run to run, and a function of the value being computed rather than
+  of position. That is the whole list of properties measured on the native frame above, including
+  the two that refuted the entire format/subsampling/tiling family.
+- **It could not appear in any of the evidence.** Its only report was `observe::line`, the
+  `REIMS_VGPU_DRAW_LOG=1` tier, so every boot that took this path said nothing on the channel all of
+  the census work above was read from. "The defect is invisible to every line this device already
+  emits" was true and this is one reason why.
+
+It now emits `compute_sentinel_recover` through `observe::off`, deduped per (threadgroup, texture
+geometry), carrying both the wire values and the invented ones. **So the first thing the next boot of
+the wallpaper repro should do is grep for that slug.** If it fires, this is the probe the section
+above asks for and the lead is live; if it does not fire on a boot that reproduces the speckle, the
+hypothesis is dead and should be struck from here.
+
+State the tradeoff honestly rather than deleting it blind. The heuristic is forbidden by "Do Not
+Overfit Fixes" — it keys on an observed content pattern — and `tg = [32, 0, 1]` is a threadgroup with
+**zero threads** while `grid.y` is `u64::MAX`, so both `y` components are garbage while `x` and `z`
+are sane. That is the signature of a **decode defect**, not of a sentinel the guest is sending on
+purpose, and the real fix is in the decode. But its comment claims that without it "every wallpaper
+VTMTS/CI dispatch hits `BadGrid` and the desktop stays black", and that claim has not been re-tested.
+`u32_dim` already declines both `0` and `u64::MAX` with the typed
+`BadGrid("compute_grid_dim_range")`, so deleting the heuristic leaves the gap fail-visible and named
+— which is what should happen once a boot has established whether it fires at all.
+
 **A transient defect is invisible to a before/after pair.** A repro that captures once before a
 gesture and once after cannot see anything that repairs itself in between, and it will report clean
 runs indefinitely while a human watching the same screen sees the defect plainly. That happened

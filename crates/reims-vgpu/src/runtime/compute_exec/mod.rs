@@ -1591,79 +1591,32 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             } else {
                 (m.width, m.height, m.format)
             }
-        } else if let Some(entry) = objects::lookup_list_entry(state, host, task_id, stage_ref) {
-            if let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) {
-                if let Ok(ResourceDescriptor::IOSurfaceTexture {
-                    width,
-                    height,
-                    pixel_format,
-                    ..
-                }) = crate::runtime::decode::resource::decode_iosurface_texture_descriptor(
-                    &desc_bytes,
-                ) {
-                    let format = if pixel_format != 0 {
-                        pixel_format
-                    } else {
-                        pixel_format::MTL_FORMAT_BGRA8_UNORM
-                    };
-                    (width, height, format)
-                } else {
-                    let m =
-                        state
-                            .mappings
-                            .get(&mapping_id)
-                            .ok_or(ComputeStatus::MissingTexture(
-                                "compute_stage_tex_mapping_gone",
-                            ))?;
-                    if !m.has_geom || m.width == 0 || m.height == 0 {
-                        return Err(ComputeStatus::MissingTexture(
-                            "compute_stage_tex_mapping_no_geom",
-                        ));
-                    }
-                    let format = if m.format != 0 {
-                        m.format
-                    } else {
-                        pixel_format::MTL_FORMAT_BGRA8_UNORM
-                    };
-                    (m.width, m.height, format)
-                }
-            } else {
-                let m = state
-                    .mappings
-                    .get(&mapping_id)
-                    .ok_or(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_mapping_gone",
-                    ))?;
-                if !m.has_geom || m.width == 0 || m.height == 0 {
-                    return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_mapping_no_geom",
-                    ));
-                }
-                let format = if m.format != 0 {
-                    m.format
-                } else {
-                    pixel_format::MTL_FORMAT_BGRA8_UNORM
-                };
-                (m.width, m.height, format)
-            }
         } else {
-            let m = state
-                .mappings
-                .get(&mapping_id)
-                .ok_or(ComputeStatus::MissingTexture(
-                    "compute_stage_tex_mapping_gone",
-                ))?;
-            if !m.has_geom || m.width == 0 || m.height == 0 {
-                return Err(ComputeStatus::MissingTexture(
-                    "compute_stage_tex_mapping_no_geom",
-                ));
+            // Three ways the surface's own IOSurface descriptor can fail to
+            // answer — no list entry, no descriptor bytes, or bytes that do not
+            // decode as an IOSurfaceTexture — and all three fall back to the
+            // mapping's latched geometry. Kept sequential rather than chained so
+            // the `&mut state` the lookups need does not overlap the `&state` the
+            // fallback reads.
+            let mut from_descriptor = None;
+            if let Some(entry) = objects::lookup_list_entry(state, host, task_id, stage_ref) {
+                if let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) {
+                    if let Ok(ResourceDescriptor::IOSurfaceTexture {
+                        width,
+                        height,
+                        pixel_format,
+                        ..
+                    }) = crate::runtime::decode::resource::decode_iosurface_texture_descriptor(
+                        &desc_bytes,
+                    ) {
+                        from_descriptor = Some((width, height, or_bgra8(pixel_format)));
+                    }
+                }
             }
-            let format = if m.format != 0 {
-                m.format
-            } else {
-                pixel_format::MTL_FORMAT_BGRA8_UNORM
-            };
-            (m.width, m.height, format)
+            match from_descriptor {
+                Some(geom) => geom,
+                None => mapping_geom_format(state, mapping_id)?,
+            }
         };
         if width == 0 || height == 0 {
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
@@ -2637,6 +2590,40 @@ fn writeback_buffer<M: HostMemory + HostOps>(
     Ok(())
 }
 
+/// An absent IOSurface pixel format means BGRA8: a type-11 surface the guest
+/// mapped without a format word is scanout-ordered by the display contract, and
+/// this is the one place that default is written down.
+fn or_bgra8(pixel_format: u16) -> u16 {
+    if pixel_format != 0 {
+        pixel_format
+    } else {
+        pixel_format::MTL_FORMAT_BGRA8_UNORM
+    }
+}
+
+/// Latched geometry and pixel format of a type-11 mapping, for a surface whose
+/// own IOSurface descriptor could not be read.
+///
+/// Three separate descriptor failures share this fallback, and spelling it out at
+/// each of them made one block of nineteen lines appear three times in a row.
+fn mapping_geom_format(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> Result<(u32, u32, u16), ComputeStatus> {
+    let m = state
+        .mappings
+        .get(&mapping_id)
+        .ok_or(ComputeStatus::MissingTexture(
+            "compute_stage_tex_mapping_gone",
+        ))?;
+    if !m.has_geom || m.width == 0 || m.height == 0 {
+        return Err(ComputeStatus::MissingTexture(
+            "compute_stage_tex_mapping_no_geom",
+        ));
+    }
+    Ok((m.width, m.height, or_bgra8(m.format)))
+}
+
 fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
     if v == 0 || v > u32::MAX as u64 {
         Err(ComputeStatus::BadGrid("compute_grid_dim_range"))
@@ -2753,9 +2740,23 @@ fn try_recover_sentinel_grid<M: HostMemory + HostOps>(
     if gy > GRID_DIM_MAX {
         gy = GRID_DIM_MAX;
     }
-    crate::observe::line(format!(
-        "compute_sentinel_recover grid=[{gx},{gy},1] tg=[{t0},{ty},1] tex={tw}x{th} wire_g0={g0}"
-    ));
+    // Always-on, deduped per (wire shape, invented dims). This substitutes
+    // dispatch dimensions the guest did not send, so it is a mis-execution of a
+    // decoded command and owes the reader a line on the channel a normal boot
+    // reads — it was on the `REIMS_VGPU_DRAW_LOG` tier, which meant a boot that
+    // took this path said nothing at all. Bounded by the small set of distinct
+    // (threadgroup, texture geometry) combinations one boot produces.
+    if crate::observe::first_sight(
+        "compute_sentinel_recover",
+        u64::from(t0 as u32) << 40 | u64::from(tw) << 20 | u64::from(th),
+    ) {
+        crate::observe::off(format!(
+            "compute_sentinel_recover grid=[{gx},{gy},1] tg=[{t0},{ty},1] tex={tw}x{th} \
+             wire_grid=[{g0},u64::MAX,{g2}] wire_tg=[{t0},{t1},{t2}] \
+             (dispatch dimensions the guest did not send: grid.y and tg.y are \
+             invented from the largest bound texture, tg.y assumes a square tile)"
+        ));
+    }
     Some((gx as u32, gy as u32, 1, t0 as u32, ty as u32, 1))
 }
 
