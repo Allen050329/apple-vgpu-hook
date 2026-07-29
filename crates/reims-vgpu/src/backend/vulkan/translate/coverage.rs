@@ -45,6 +45,13 @@
 //! It changes no behaviour. It is an inventory, and its value is that the
 //! inventory is *checked* — the gaps it records are the input to closing them,
 //! not a substitute for it.
+//!
+//! Because it is only ever read by its own tests, it is declared
+//! `#[cfg(test)]` alongside `translate::gate` and `caps::gate`, the other two
+//! modules here that assert about the source rather than run in it. Nothing
+//! outside names `coverage::`; if a product path ever needs a disposition at
+//! runtime, that is the signal to un-gate it deliberately rather than by
+//! accident.
 
 /// What happens to one decoded Metal command/descriptor field on the Vulkan
 /// pathway.
