@@ -844,7 +844,7 @@ fn export_present_dmabuf(
         )
     };
     match export {
-        Ok((fd, pitch, ew, eh, ring_idx)) if ew == width && eh == height => {
+        Ok((fd, _pitch, ew, eh, ring_idx)) if ew == width && eh == height => {
             // SAFETY: when present, `fd` is a fresh owned dmabuf dup from the
             // engine; wrap it so the window consumes it (import) or the Frame's
             // Drop closes it. `None` means the window has already acknowledged
@@ -852,7 +852,6 @@ fn export_present_dmabuf(
             let owned = fd.map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
             Some(host_window::present::FrameDmabuf {
                 fd: std::sync::Mutex::new(owned),
-                pitch,
                 ring_idx,
                 import_ack: Arc::clone(import_ack),
             })

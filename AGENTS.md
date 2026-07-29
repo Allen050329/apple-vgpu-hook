@@ -370,6 +370,51 @@ first dump to its own capture: it must come out at the scripted sleep for every 
 window disagreeing is a mis-set boundary rather than a finding. Four windows agreeing to 0.3 s is
 what makes the set difference trustworthy.
 
+**A reference-count sweep is a measurement, and its failure mode points at deletion.** The three
+mechanical sweeps this repo runs — unreferenced `pub fn`, write-only `pub` fields, per-file
+reachability — all reduce to "count the uses". When the counter is wrong it is almost always wrong
+*low*, and a low count reads as "safe to delete". Every other measurement here fails toward "no
+finding"; this one fails toward a commit.
+
+The concrete trap, hit once: the field sweep blanks string literals before counting, and the obvious
+way to do that is `re.sub(r'"..."', '""')`. Rust has raw strings (`r#"..."#`) and `'"'` char
+literals, so that regex mis-pairs quotes and silently blanks whole regions of real code. It reported
+nine live `PresentState` fields — `window_active`, `painted_mapping`, the `backpressure_hold_*` trio
+— as never read, and each of them is read three lines from where it is written. Rerun with a
+character-walking scrubber that understands `r#"`, `"`, `'x'` and both comment forms, the same sweep
+returns 36 hits, all of them the `repr(C)` and `runtime/decode/**` rows that are *supposed* to be
+there.
+
+So validate the sweep before believing it, on a field you have already confirmed by hand is read.
+`grep -c` for the bare name next to the sweep's count is enough: raw occurrences far above counted
+reads means the counter is broken, not that the field is dead.
+
+**Round-trip an extraction the host cannot compile.** `backend-metal` is Apple-only and does not
+build on Linux at all, so a refactor of Metal-gated tests gets no compiler check whatsoever. Textual
+extractions are still verifiable: strip the new helper, mechanically inline every call back to the
+lines it replaced, and diff against `git show HEAD:<file>`. Identical means the substitution is
+information-preserving, which is the property actually at issue. Two extractions of 29 and 24 sites
+were landed on that evidence.
+
+When the round trip cannot be exact — a helper taking `&mut T` where the inline block wrote
+`&mut state` — audit the diff content instead: every removed line should appear exactly N times and
+once in the helper, and every varying piece (a message tag, an id) should survive verbatim as an
+argument. Print the deduplicated `-` and `+` line sets and read them.
+
+For a hoisted `use`, the check is the *set of importable names* before and after. That catches the
+specific way this goes wrong: two import blocks that normalise to the same text under whitespace
+folding but differ by one name, so hoisting either one silently drops the other's.
+
+**`#[cfg]` can sit below `#[test]`, and an attribute scan that looks above will miss it.** Twenty-nine
+tests here are gated that way. A scan reporting "no cfg" for every one of them is the tell; the real
+check is whether the Vulkan arm warns `dead_code` on a helper only those tests call.
+
+**An extraction can make the file longer — measure after rustfmt, not before.** A helper whose call
+exceeds 100 columns gets wrapped at every call site. Collapsing 173 two-call pairs into one seven-
+argument call took `icb/tests.rs` from 7824 lines to 8499; dropping one redundant argument to get
+under the limit took it to 7314. Same extraction, opposite sign. Run `rustfmt` on the file — by path,
+never bare `cargo fmt`, which reformats pre-existing drift crate-wide — and re-count.
+
 ### Interleave The Arms Of A Live A/B
 
 A live before/after on the VM rig compares two arms separated by wall-clock time, and neither the

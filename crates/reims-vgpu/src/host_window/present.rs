@@ -89,9 +89,6 @@ pub struct FrameDmabuf {
     /// Exported dmabuf fd for this frame's ring slot; `None` once consumed or
     /// when the slot was already imported for this geometry.
     pub fd: Mutex<Option<std::os::fd::OwnedFd>>,
-    /// LINEAR row pitch of the exported image (currently informational — the
-    /// import re-derives its own subresource layout).
-    pub pitch: u64,
     /// Which engine ring slot this fd backs, so the window caches one import per
     /// slot and re-blits the right one.
     pub ring_idx: usize,
