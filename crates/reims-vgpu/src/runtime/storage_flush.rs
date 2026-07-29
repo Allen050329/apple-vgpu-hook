@@ -806,35 +806,22 @@ fn flush_one<M: HostMemory + HostOps>(
     }
 }
 
-/// The `TargetIdentity` a [`crate::model::DeferredOwner::Render`] window's
-/// pixels live under. `present_identity::surface_identity` derives the
-/// identity's `generation` from the mapping's `map_generation`, which is the
-/// same value the key latched at arm time — so the identity round-trips
-/// through the key with no extra state, and a mapping that has since been
-/// rebound produces a *different* identity, which is what the drift guard in
-/// [`flush_render_one`] then refuses on.
-#[cfg(feature = "backend-vulkan")]
-fn render_window_identity(
-    key: &crate::model::ComputeStorageResidencyKey,
-) -> crate::backend::vulkan::engine::TargetIdentity {
-    crate::backend::vulkan::engine::TargetIdentity::Surface {
-        id: key.mapping_id,
-        width: key.width,
-        height: key.height,
-        generation: key.map_generation as u64,
-    }
-}
-
-/// Land a deferred **type-11 render Store**: read the pinned target resident
-/// and perform the CPU writeback into the mapping's guest pages that the Store
-/// itself skipped.
+/// Land a deferred **type-11 render Store**: perform the CPU writeback into the
+/// mapping's guest pages that the Store itself skipped.
 ///
-/// This is the same work `metal_draw`'s `cpu_portability` route used to do
-/// synchronously on every Store. Deferring it is a win rather than a
-/// rescheduling because the host-window present path never reads these guest
-/// pages — it exports the engine resident directly
-/// (`publish_window_frame` → `export_present_dmabuf`) — so the writeback is
-/// owed only to a guest-side reader that may never come.
+/// The pixels come from `surface_cache`, not from the engine. The Store read
+/// its target back as it always did and refreshed the cache with that frame
+/// before arming; only the guest-page copy was deferred. That is deliberate and
+/// it is what keeps this rail small: the engine resident for a type-11 surface
+/// is not authoritative here, so nothing has to be pinned, no `content_ready`
+/// has to hold across frames, and the Load seed and present capture keep
+/// reading exactly what they read before.
+///
+/// Deferring is a win rather than a rescheduling because nothing on the
+/// host-window present path reads these guest pages — `capture_present_frame`
+/// takes the cache or the resident and states in situ that it "never touches
+/// guest memory" — so the writeback is owed only to a guest-side reader that
+/// may never come.
 #[cfg(feature = "backend-vulkan")]
 fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -842,44 +829,35 @@ fn flush_render_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
 ) -> bool {
     let started = std::time::Instant::now();
-    let identity = render_window_identity(key);
     // Recycled-pages guard, identical in intent to the compute rail's below and
     // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
     // arm time (ReplacePhysical, unmap/remap) points at pages this window's
     // pixels do not belong in, and writing them there lands a framebuffer in
-    // whatever owns that memory now. Unpin and drop rather than write.
+    // whatever owns that memory now. Drop rather than write.
     let current = state
         .mappings
         .get(&key.mapping_id)
         .map(|m| m.map_generation);
     if current != Some(key.map_generation) {
-        crate::backend::vulkan::engine::unpin_resident_target(&identity);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
     }
-    // The window's target is BGRA — the Store sets `output_bgra` where it
-    // defers — so this readback is already in guest scanout order and copies in
-    // with no channel conversion. Handing it to the RGBA writeback instead
-    // would exchange red and blue in the guest's framebuffer.
-    let bgra = match crate::backend::vulkan::engine::read_target(&identity) {
-        Ok(px) => px,
-        Err(e) => {
-            crate::backend::vulkan::engine::unpin_resident_target(&identity);
-            crate::observe::fail(format!(
-                "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} err={e}",
-                key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-            ));
-            return false;
-        }
+    // The cache holds BGRA — guest scanout order — so this copies in with no
+    // channel conversion. A miss means something evicted the frame between arm
+    // and flush; the guest pages then keep their stale-but-coherent bytes and
+    // that is a real loss of the Store.
+    let Some(bgra) = crate::runtime::surface_cache::get(state, key.mapping_id, key.width, key.height)
+        .map(|b| b.to_vec())
+    else {
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=cache_miss",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
     };
-    crate::backend::vulkan::engine::unpin_resident_target(&identity);
-    // `write_bgra8` re-resolves the mapping's pages and refuses a geometry
-    // mismatch, so what the guest ends up with is what the synchronous Store
-    // would have written, just later. It also re-populates `surface_cache`,
-    // which the arm evicted, so a subsequent Load seed reads fresh content.
     let ok = crate::runtime::mapping_write::write_bgra8(
         state,
         host,
@@ -889,21 +867,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.width,
         key.height,
     );
-    if ok {
-        // Same completeness proof the synchronous route stated: the write
-        // verified geometry and landed a whole frame, so the guest-visible
-        // publish milestones advance. Without this the `present_unbacked` gate
-        // is structurally dead on the deferred route, exactly as it would be on
-        // the sync one.
-        crate::runtime::metal_draw::publish_surface_store(
-            state,
-            host,
-            key.mapping_id,
-            key.width,
-            key.height,
-            key.pixel_format,
-        );
-    } else {
+    if !ok {
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
@@ -1080,12 +1044,14 @@ pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
     }
 }
 
-/// Release whichever registry pin a taken window held.
+/// Release whatever a taken window held, according to its rail.
 ///
 /// Every site that takes a window and does not flush it must go through this
-/// rather than calling `unpin_resident_storage` directly: the two rails pin
-/// different registries under different keys, and picking the wrong one both
-/// leaks the real pin and silently succeeds.
+/// rather than calling `unpin_resident_storage` directly. A compute window owns
+/// a storage-registry pin; a render window owns nothing on the GPU — its pixels
+/// are a `surface_cache` entry, which is LRU-managed and shared with the Load
+/// seed, so it must not be evicted here. Unpinning storage for a render window
+/// would name a key the storage registry never held and succeed silently.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn release_window_pin(
     key: &crate::model::ComputeStorageResidencyKey,
@@ -1095,9 +1061,7 @@ pub(crate) fn release_window_pin(
         crate::model::DeferredOwner::Storage { .. } => {
             crate::backend::vulkan::engine::unpin_resident_storage(key)
         }
-        crate::model::DeferredOwner::Render { .. } => {
-            crate::backend::vulkan::engine::unpin_resident_target(&render_window_identity(key))
-        }
+        crate::model::DeferredOwner::Render { .. } => {}
     }
 }
 
