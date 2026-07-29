@@ -98,14 +98,15 @@ pub struct EngineCounters {
     pub sampled_cache_hit_bytes: AtomicU64,
     pub sampled_cache_misses: AtomicU64,
     pub sampled_gpu_binds: AtomicU64,
-    /// Zero-copy guest-run sampled binds (GPU gathered from imported guest RAM).
-    pub sampled_zerocopy_binds: AtomicU64,
-    /// Zero-copy guest-run vertex/storage buffer binds (GPU gathered from
-    /// imported guest RAM into the pooled staging slot the bind then uses).
-    pub buffer_zerocopy_binds: AtomicU64,
     /// Guest-run buffer binds snapshotted on the CPU at record time because
     /// the draw defers its submit (batched CB must not read volatile guest
     /// RAM at flush time).
+    ///
+    /// Its two former siblings, `sampled_zerocopy_binds` and
+    /// `buffer_zerocopy_binds`, counted guest-run binds the device gathered
+    /// itself out of imported guest pages. That mechanism is gone, so both
+    /// were fixed at zero — the shape the counter census calls out as
+    /// unreadable — and they were deleted rather than left reporting nothing.
     pub buffer_snapshot_binds: AtomicU64,
     pub gpu_load_hits: AtomicU64,
     pub target_evicts: AtomicU64,
@@ -281,8 +282,6 @@ impl EngineCounters {
             sampled_cache_hit_bytes: self.sampled_cache_hit_bytes.load(Ordering::Relaxed),
             sampled_cache_misses: self.sampled_cache_misses.load(Ordering::Relaxed),
             sampled_gpu_binds: self.sampled_gpu_binds.load(Ordering::Relaxed),
-            sampled_zerocopy_binds: self.sampled_zerocopy_binds.load(Ordering::Relaxed),
-            buffer_zerocopy_binds: self.buffer_zerocopy_binds.load(Ordering::Relaxed),
             buffer_snapshot_binds: self.buffer_snapshot_binds.load(Ordering::Relaxed),
             gpu_load_hits: self.gpu_load_hits.load(Ordering::Relaxed),
             target_evicts: self.target_evicts.load(Ordering::Relaxed),
@@ -365,8 +364,6 @@ impl EngineCounters {
         self.sampled_cache_hit_bytes.store(0, Ordering::Relaxed);
         self.sampled_cache_misses.store(0, Ordering::Relaxed);
         self.sampled_gpu_binds.store(0, Ordering::Relaxed);
-        self.sampled_zerocopy_binds.store(0, Ordering::Relaxed);
-        self.buffer_zerocopy_binds.store(0, Ordering::Relaxed);
         self.buffer_snapshot_binds.store(0, Ordering::Relaxed);
         self.gpu_load_hits.store(0, Ordering::Relaxed);
         self.target_evicts.store(0, Ordering::Relaxed);
@@ -438,8 +435,6 @@ pub struct CounterSnapshot {
     pub sampled_cache_hit_bytes: u64,
     pub sampled_cache_misses: u64,
     pub sampled_gpu_binds: u64,
-    pub sampled_zerocopy_binds: u64,
-    pub buffer_zerocopy_binds: u64,
     pub buffer_snapshot_binds: u64,
     pub gpu_load_hits: u64,
     pub target_evicts: u64,
@@ -579,12 +574,6 @@ impl CounterSnapshot {
             sampled_gpu_binds: self
                 .sampled_gpu_binds
                 .saturating_sub(earlier.sampled_gpu_binds),
-            sampled_zerocopy_binds: self
-                .sampled_zerocopy_binds
-                .saturating_sub(earlier.sampled_zerocopy_binds),
-            buffer_zerocopy_binds: self
-                .buffer_zerocopy_binds
-                .saturating_sub(earlier.buffer_zerocopy_binds),
             buffer_snapshot_binds: self
                 .buffer_snapshot_binds
                 .saturating_sub(earlier.buffer_snapshot_binds),

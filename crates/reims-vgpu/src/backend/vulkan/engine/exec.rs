@@ -21,25 +21,18 @@ use super::types::{
 };
 use super::vk_call::{VkCall, VkOp};
 
-/// One zero-copy buffer gather recorded into the draw's CB before the render
-/// pass: per-run byte copies from imported guest RAM into the pooled staging
-/// slot the vertex/storage bind then reads.
-struct BufferGather {
-    dst: vk::Buffer,
-    copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
-}
-
 /// Stage one draw-time buffer content into a pooled slot, deduplicating
 /// within the draw: several binds sharing one content (an `Arc`'d byte
-/// allocation, or the same gathered guest span) get ONE slot and, for
-/// `GuestRuns`, ONE gather. Returns a handle copy of the slot.
+/// allocation, or the same gathered guest span) get ONE slot and ONE gather.
+/// Returns a handle copy of the slot.
 ///
-/// `snapshot_volatile` — set for a deferred-submit (batched) draw: a
-/// `GuestRuns` gather recorded into a batched CB would read guest RAM at
-/// flush time, after ack-fast has let the guest repaint the pages; the
-/// snapshot copies the runs on the CPU *now* and stages plain bytes, so the
-/// deferred CB only ever reads stable pool memory (record-time freshness ==
-/// the CPU staging path's encode-time read).
+/// `snapshot_volatile` — set for a deferred-submit (batched) draw — no longer
+/// selects a mechanism. Every `GuestRuns` bind is now copied on the CPU at
+/// preparation time, which is what the snapshot always did and what the
+/// deferred CB needs: a gather recorded into a batched CB would have read guest
+/// RAM at flush time, after ack-fast let the guest repaint the pages. The flag
+/// survives because the counter it feeds distinguishes a batched bind from an
+/// immediate one, which is still a real difference in when the bytes were read.
 #[allow(
     clippy::too_many_arguments,
     reason = "buffer staging carries the Vulkan context, pools, binding, and lifetime sets"
@@ -52,7 +45,6 @@ unsafe fn stage_buffer_content(
     usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
     slots_by_content: &mut std::collections::HashMap<(usize, u64), BufferSlot>,
-    gathers: &mut Vec<BufferGather>,
 ) -> Result<BufferSlot, DrawError> {
     let key = match content {
         BufferContent::Bytes(b) => (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
@@ -70,57 +62,28 @@ unsafe fn stage_buffer_content(
             pools.write_staging(ctx, &slot, b)?;
             slot
         }
-        BufferContent::GuestRuns(src) if snapshot_volatile => {
-            let slot = pools.acquire_staging(ctx, src.total_len, usage, counters)?;
-            // Copy the guest runs straight into the mapped staging span — no
-            // intermediate `cpu_bytes()` heap Vec (the deferred-submit hot path,
-            // ~4.8 binds/draw under compositing).
-            pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
-            counters
-                .buffer_snapshot_binds
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            slot
-        }
+        // Guest runs are gathered by the CPU into the mapped staging span, with
+        // no intermediate `cpu_bytes()` heap Vec (this is the deferred-submit
+        // hot path, ~4.8 binds/draw under compositing).
+        //
+        // There used to be a second arm here that skipped this copy entirely:
+        // it resolved each run through a `VK_EXT_external_memory_host` import
+        // and had the command buffer read the guest pages directly. That is
+        // gone — an imported host pointer is one the GPU can *write*, and the
+        // runs point into guest RAM. `snapshot_volatile` therefore no longer
+        // selects between two mechanisms; it only records that the runtime
+        // asked for a stable snapshot, which is what this arm has always given
+        // it.
         BufferContent::GuestRuns(src) => {
-            let slot = pools.acquire_staging(
-                ctx,
-                src.total_len,
-                usage | vk::BufferUsageFlags::TRANSFER_DST,
-                counters,
-            )?;
-            // Runs were pre-checked by the runtime via ensure_host_imports, so
-            // a missing region here is a genuine failure (the runtime gate
-            // falls back to the CPU staging path only at encode time).
-            let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-            let mut dst_offset = 0u64;
-            for run in src.runs.iter() {
-                let Ok((buffer, src_offset)) =
-                    pools.host_import_resolve(ctx, run.host_ptr, run.len)
-                else {
-                    return Err(DrawError::DrawExecution(
-                        DrawExecutionDecline::BufferGuestRunImportMissing {
-                            host_ptr: run.host_ptr,
-                            len: run.len,
-                        },
-                    ));
-                };
-                let copy = vk::BufferCopy::default()
-                    .src_offset(src_offset)
-                    .dst_offset(dst_offset)
-                    .size(run.len);
-                match copies.last_mut() {
-                    Some((b, list)) if *b == buffer => list.push(copy),
-                    _ => copies.push((buffer, vec![copy])),
-                }
-                dst_offset = dst_offset.saturating_add(run.len);
+            let slot = pools.acquire_staging(ctx, src.total_len, usage, counters)?;
+            pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
+            if snapshot_volatile {
+                counters
+                    .buffer_snapshot_binds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                crate::observe::ZeroCopyLost::BufferGuestRuns.note();
             }
-            counters
-                .buffer_zerocopy_binds
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            gathers.push(BufferGather {
-                dst: slot.buffer,
-                copies,
-            });
             slot
         }
     };
@@ -136,17 +99,18 @@ enum PreparedSampled {
         volume: bool,
         layers: u32,
     },
-    /// Zero-copy guest gather: the CB copies the texel bytes from imported
-    /// guest RAM (per-run byte copies into a pooled scratch, then one
-    /// buffer→image copy). No CPU bytes exist, so the content cache is
-    /// bypassed and the slot is never retained.
+    /// Guest gather: the CPU packs the texel bytes out of the guest runs into a
+    /// pooled scratch, then one buffer→image copy uploads it. No owned CPU byte
+    /// buffer exists, so the content cache is bypassed and the slot is never
+    /// retained — that is what still separates this from [`Self::Upload`].
+    ///
+    /// The gather used to happen on the device, out of per-run host-pointer
+    /// imports of the guest pages, which is why the scratch carried
+    /// `TRANSFER_DST` and a per-source copy list. Both are gone with the import.
     GuestGather {
         binding: u32,
         image: SampledSlot,
         scratch: BufferSlot,
-        /// Byte copies grouped per imported source buffer.
-        copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
-        total_len: u64,
         /// `bufferRowLength` for the buffer→image copy (0 = tight rows).
         row_length_texels: u32,
     },
@@ -970,7 +934,6 @@ pub(crate) unsafe fn execute_draw_inner(
     let no_vertex_fetch = draw_has_no_invocations(req);
     let mut slots_by_content: std::collections::HashMap<(usize, u64), BufferSlot> =
         std::collections::HashMap::new();
-    let mut buffer_gathers: Vec<BufferGather> = Vec::new();
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
@@ -1021,7 +984,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 batch_eligible,
                 &mut slots_by_content,
-                &mut buffer_gathers,
             )?
         };
         vertex_bufs.push((resource.binding, slot));
@@ -1053,7 +1015,6 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::BufferUsageFlags::STORAGE_BUFFER,
             batch_eligible,
             &mut slots_by_content,
-            &mut buffer_gathers,
         )?;
         storage_slots.push((resource.binding, slot));
     }
@@ -1431,45 +1392,25 @@ pub(crate) unsafe fn execute_draw_inner(
                 let scratch = pools.acquire_staging(
                     ctx,
                     src.total_len,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
                     counters,
                 )?;
-                // Runs were pre-checked by the runtime via ensure_host_imports,
-                // so a missing region here is a genuine failure (the draw
-                // gate falls back to the CPU path on the reported error).
-                let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-                let mut dst_offset = 0u64;
-                for run in src.runs.iter() {
-                    let Ok((buffer, src_offset)) =
-                        pools.host_import_resolve(ctx, run.host_ptr, run.len)
-                    else {
-                        return Err(DrawError::DrawExecution(
-                            DrawExecutionDecline::SampledGuestRunImportMissing {
-                                binding: resource.binding,
-                                host_ptr: run.host_ptr,
-                                len: run.len,
-                            },
-                        ));
-                    };
-                    let copy = vk::BufferCopy::default()
-                        .src_offset(src_offset)
-                        .dst_offset(dst_offset)
-                        .size(run.len);
-                    match copies.last_mut() {
-                        Some((b, list)) if *b == buffer => list.push(copy),
-                        _ => copies.push((buffer, vec![copy])),
-                    }
-                    dst_offset = dst_offset.saturating_add(run.len);
-                }
-                counters
-                    .sampled_zerocopy_binds
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The CPU gathers the texel bytes out of the guest runs into
+                // the mapped scratch; the command buffer then does one
+                // buffer→image copy over it.
+                //
+                // The command buffer used to do the gather itself, copying from
+                // per-run `VK_EXT_external_memory_host` imports of the guest
+                // pages. That is the mechanism this removal is about: an
+                // imported host pointer is one the GPU can write, and these
+                // runs are guest RAM. `TRANSFER_DST` came off the scratch usage
+                // with it — nothing on the device writes this buffer any more.
+                pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
+                crate::observe::ZeroCopyLost::SampledGuestRuns.note();
                 sampled.push(PreparedSampled::GuestGather {
                     binding: resource.binding,
                     image: img,
                     scratch,
-                    copies,
-                    total_len: src.total_len,
                     row_length_texels: src.row_length_texels,
                 });
             }
@@ -2009,88 +1950,27 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    // Zero-copy buffer gathers: pull vertex/storage bytes straight from
-    // imported guest RAM into the pooled staging slots the binds read.
-    // Same contract as the sampled gathers below: HOST→TRANSFER availability
-    // first (guest CPU writes are outside Vulkan's sync scope), per-run byte
-    // copies, then one visibility barrier to vertex-input + shader reads.
-    if !buffer_gathers.is_empty() {
-        let host_barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &host_barrier,
-            &[],
-            &[],
-        );
-        for gather in &buffer_gathers {
-            for (src_buffer, regions) in &gather.copies {
-                ctx.device
-                    .cmd_copy_buffer(cb, *src_buffer, gather.dst, regions);
-            }
-        }
-        let visible = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::VERTEX_ATTRIBUTE_READ | vk::AccessFlags::SHADER_READ,
-            )];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_INPUT
-                | vk::PipelineStageFlags::VERTEX_SHADER
-                | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &visible,
-            &[],
-            &[],
-        );
-    }
-
-    // Zero-copy guest gathers: pull the texel bytes straight from imported
-    // guest RAM inside this CB. Guest CPU writes happen outside Vulkan's
-    // sync scope, so the gather starts with a HOST→TRANSFER availability
-    // barrier; then per-run byte copies pack the fragmented runs into the
-    // scratch, and one buffer→image copy uploads it (`row_length_texels`
-    // strides over guest row padding; 0 = tight rows).
+    // Guest gathers: the scratch was packed by `write_staging_from_runs` during
+    // preparation, so this is the same host-staged upload the CPU-origin loop
+    // above performs, differing only in `row_length_texels` striding over guest
+    // row padding (0 = tight rows).
+    //
+    // No HOST→TRANSFER barrier, matching that loop: writes the host made before
+    // `vkQueueSubmit` are automatically visible to the device, and this scratch
+    // is written before the submit like every other staging slot. The two
+    // barriers that used to open this block ordered the *device-side* gather —
+    // per-run copies out of imported guest pages — against the image copy, and
+    // there is no device-side write to order any more.
     for image in &sampled {
         let PreparedSampled::GuestGather {
             image: img,
             scratch,
-            copies,
-            total_len,
             row_length_texels,
             ..
         } = image
         else {
             continue;
         };
-        let host_barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &host_barrier,
-            &[],
-            &[],
-        );
-        for (src_buffer, regions) in copies {
-            ctx.device
-                .cmd_copy_buffer(cb, *src_buffer, scratch.buffer, regions);
-        }
-        let scratch_barrier = [vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .buffer(scratch.buffer)
-            .offset(0)
-            .size(*total_len)];
         let image_barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -2106,11 +1986,11 @@ pub(crate) unsafe fn execute_draw_inner(
             })];
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &[],
-            &scratch_barrier,
+            &[],
             &image_barrier,
         );
         let copy = [vk::BufferImageCopy::default()

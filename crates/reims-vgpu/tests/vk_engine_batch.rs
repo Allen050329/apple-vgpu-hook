@@ -13,7 +13,8 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BufferContent, DrawRequest, GuestRun, GuestRunSource, LoadOp, PrimitiveTopology,
-    SampledImageResource, SampledSource, ScissorResource, StorageBufferResource, TargetIdentity,
+    SampledImageResource, SampledSource, SamplerResource, ScissorResource, StorageBufferResource,
+    TargetIdentity,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -410,10 +411,6 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
         mid.buffer_snapshot_binds, 1,
         "GuestRuns content was CPU-snapshotted"
     );
-    assert_eq!(
-        mid.buffer_zerocopy_binds, 0,
-        "no flush-time gather was recorded"
-    );
 
     let px = engine::read_target(&identity).expect("read_target flushes the batch");
     for y in [0u32, H / 2, H - 1] {
@@ -427,24 +424,36 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
     engine::test_quiesce_ring();
 }
 
-/// A draw sampling `SampledSource::GuestRuns` would have the GPU read guest RAM
-/// when its CB executes. That needs a host-pointer import, which is never
-/// available, so the engine must **refuse the draw by name** rather than sample
-/// something else or silently bind nothing.
+/// **The guest-run sampled rail's first content coverage.**
 ///
-/// This case used to assert the rail's batching behaviour (no open, no join,
-/// because the deferred submit widened the record→execute window over live
-/// guest pages). It is rewritten rather than left in place because its guard —
-/// `ensure_host_imports` — now always answers false, which would have turned a
-/// GPU-executing case into a permanent skip reading as a pass. The batching
-/// property it asserted is moot: the runtime only ever builds a `GuestRuns`
-/// sampled source behind that same gate (`runtime/metal_draw/vulkan.rs`), so the
-/// rail is unreachable from a guest packet and takes the CPU byte upload
-/// instead.
+/// `SampledSource::GuestRuns` names texels that live in guest RAM. The device
+/// used to read them itself, through a `VK_EXT_external_memory_host` import of
+/// the guest pages; it now gathers them on the CPU into pooled staging. What
+/// has to survive that swap is the only thing the rail was ever for: the texels
+/// the guest wrote must be the texels the fragment shader samples.
+///
+/// Nothing tested that before, in either mechanism. Every other sampled case in
+/// the tree builds `SampledSource::Bytes`, so this rail had no executing test at
+/// all — its two counters were the pair the failure-census flagged as
+/// "asserted, never nonzero". The predecessor of this case asserted a *refusal*
+/// by slug and one `== 0` counter, which is the shape that hid the sampled-cache
+/// defect: it passes whether the path works or is entirely broken.
+///
+/// The fixture is what makes the assertion possible. `textured_quad` samples
+/// binding 32 and writes the sampled colour out, so the output pixels *are* the
+/// guest bytes — a full-screen quad over a uniform 2x2 texture means every
+/// covered pixel must equal the one colour written into the host page. The
+/// colour is deliberately not the fragment-shader constant every other case
+/// here checks, so a draw that ignored the sampler could not pass.
+///
+/// The runs are two halves of one page written separately, which also exercises
+/// the multi-run concatenation `write_staging_from_runs` performs: a single-run
+/// case would pass with the offset arithmetic broken.
 #[test]
-fn sampled_guest_runs_draw_is_refused_by_name() {
+fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     let _guard = engine_test_lock().lock().unwrap();
-    let (vert, frag) = triangle_spirv();
+    let vert = translate_words("textured_quad.air", Stage::Vertex);
+    let frag = translate_words("textured_quad.air", Stage::Fragment);
     let identity = TargetIdentity::Surface {
         id: 990_402,
         width: W,
@@ -452,67 +461,120 @@ fn sampled_guest_runs_draw_is_refused_by_name() {
         generation: 1,
     };
 
-    // One x86 guest page, page-aligned: a run the import would have accepted on
-    // every alignment ground, so the refusal below can only be the capability.
+    // One x86 guest page holding a uniform 2x2 RGBA8 texture, written as two
+    // adjacent runs of two texels each.
+    const TEXEL: [u8; 4] = [17, 140, 203, 255];
     let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     assert!(!ptr.is_null());
-    assert!(
-        !engine::ensure_host_imports(&[engine::GuestRun {
-            host_ptr: ptr as usize,
-            len: 4096,
-        }]),
-        "no guest run may be importable"
-    );
+    // SAFETY: `ptr` backs 4096 zeroed bytes; 16 texel bytes fit.
+    unsafe { std::ptr::copy_nonoverlapping(TEXEL.repeat(4).as_ptr(), ptr, 16) };
 
-    let before = engine::counter_snapshot();
-    let mut req = batch_req(
-        &vert,
-        &frag,
-        &identity,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
-        half_scissor(true),
-    );
-    req.sampled_images.push(SampledImageResource {
+    let encode_f32 = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    let quad: [[f32; 4]; 6] = [
+        [-1.0, -1.0, 0.5, 1.0],
+        [1.0, -1.0, 0.5, 1.0],
+        [-1.0, 1.0, 0.5, 1.0],
+        [-1.0, 1.0, 0.5, 1.0],
+        [1.0, -1.0, 0.5, 1.0],
+        [1.0, 1.0, 0.5, 1.0],
+    ];
+    let uvs: [[f32; 2]; 6] = [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 0.0],
+    ];
+
+    let mut req = DrawRequest {
+        vert_spirv: std::sync::Arc::new(vert),
+        frag_spirv: std::sync::Arc::new(frag),
+        width: W,
+        height: H,
+        vertex_count: 6,
+        flip_viewport_y: true,
+        first_vertex: 0,
+        instance_count: Some(1),
+        primitive_topology: PrimitiveTopology::Triangle,
+        target_identity: Some(identity.clone()),
+        load_op: Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0])),
+        skip_readback: true,
+        ..Default::default()
+    };
+    req.storage_buffers.push(StorageBufferResource {
         binding: 0,
-        width: 4,
-        height: 4,
+        content: encode_f32(&quad.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    req.storage_buffers.push(StorageBufferResource {
+        binding: 1,
+        content: encode_f32(&uvs.into_iter().flatten().collect::<Vec<_>>()).into(),
+    });
+    req.sampled_images.push(SampledImageResource {
+        binding: 32,
+        width: 2,
+        height: 2,
         layers: 1,
         arrayed: false,
         volume: false,
         cube: false,
         one_dim: false,
         source: SampledSource::GuestRuns(GuestRunSource {
-            runs: std::sync::Arc::new(vec![GuestRun {
-                host_ptr: ptr as usize,
-                len: 64,
-            }]),
-            total_len: 64,
+            runs: std::sync::Arc::new(vec![
+                GuestRun {
+                    host_ptr: ptr as usize,
+                    len: 8,
+                },
+                GuestRun {
+                    host_ptr: ptr as usize + 8,
+                    len: 8,
+                },
+            ]),
+            total_len: 16,
             row_length_texels: 0,
         }),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
         swizzle: Default::default(),
     });
+    req.samplers.push(SamplerResource::normalized_default(64));
+
     let outcome = engine::execute_draw_request(&req);
-    engine::test_quiesce_ring();
-    // SAFETY: `ptr` is still live here and nothing reads it after this.
-    unsafe { std::alloc::dealloc(ptr, layout) };
-    let msg = match outcome {
-        Ok(_) => panic!("a guest-gather sampled draw executed; the GPU must not read guest RAM"),
-        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+    if let Err(e) = &outcome {
+        if skip_if_no_gpu(&e.to_string()) {
             eprintln!("skipping: {e}");
+            // SAFETY: `ptr` is still live here and nothing reads it after this.
+            unsafe { std::alloc::dealloc(ptr, layout) };
             return;
         }
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        msg.contains("vk_draw_exec_sampled_guest_run_import_missing"),
-        "the refusal must name the missing import, not a driver error: {msg}"
-    );
-    let d = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(
-        d.sampled_zerocopy_binds, 0,
-        "a refused guest gather must bind nothing: {d:?}"
-    );
+    }
+    outcome.expect("a CPU-gathered guest-run sampled draw must execute");
+    let px = engine::read_target(&identity).expect("read_target flushes the batch");
+    engine::test_quiesce_ring();
+    // The gather reads the page during `execute_draw_request`, so the page must
+    // outlive that call and only that call.
+    // SAFETY: `ptr` is still live here and nothing reads it after this.
+    unsafe { std::alloc::dealloc(ptr, layout) };
+
+    // Every pixel of the full-screen quad samples the same uniform texel. ±1 LSB
+    // covers the unorm round-trip through the sampler's filtering.
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 2, W - 1] {
+            let i = ((y * W + x) * 4) as usize;
+            let got = &px[i..i + 4];
+            assert!(
+                got.iter()
+                    .zip(TEXEL.iter())
+                    .all(|(g, w)| (*g as i32 - *w as i32).abs() <= 1),
+                "guest-run texels did not reach the shader at ({x},{y}): \
+                 got {got:?}, wrote {TEXEL:?}"
+            );
+        }
+    }
 }

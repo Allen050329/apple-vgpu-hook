@@ -44,8 +44,10 @@ pub mod emit;
 #[cfg(test)]
 mod gate;
 pub mod sink;
+pub mod zero_copy_lost;
 
 pub use decline::{Decline, Refusal};
+pub use zero_copy_lost::ZeroCopyLost;
 /// The slug registry and its row types are read only by the gates in
 /// [`gate`], which are themselves `#[cfg(test)]`. Nothing in the device
 /// consults the registry at runtime — the typed declines carry their own

@@ -1071,12 +1071,12 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (68, 1528): the eight `iosurface_span_*` slugs were all
-        // written by `plan_span_shift`, a page-span planner with no product
-        // caller — the live walk is `build_table_plan` + `entry_gpa_shift`.
-        // Its own doc claimed "Product paths use this" and none did. Type
-        // count unchanged.
-        (68, 1520),
+        // Up from (68, 1520): `ZeroCopyLost` adds one type and seven slugs,
+        // one per rail that used to give the host GPU a handle on guest RAM
+        // and now runs a CPU copy. The rails it names are being deleted in the
+        // same series of commits, so this number moves *up* while the code
+        // moves out — the vocabulary is what survives the mechanism.
+        (69, 1525),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

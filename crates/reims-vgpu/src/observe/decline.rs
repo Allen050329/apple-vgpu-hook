@@ -763,7 +763,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         emission: Emission::At(&[("runtime/metal_draw/mod.rs", "linux_m2v_draw")]),
         slug_calls: &[],
         slugs: &[
-            "vk_draw_exec_buffer_guest_run_import_missing",
             "vk_draw_exec_constant_vertex_requires_cpu_bytes",
             "vk_draw_exec_constant_vertex_base_instance_overflow",
             "vk_draw_exec_constant_vertex_allocation_overflow",
@@ -775,7 +774,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_draw_exec_sampled_resident_missing",
             "vk_draw_exec_sampled_resident_not_ready",
             "vk_draw_exec_sampled_resident_geometry_mismatch",
-            "vk_draw_exec_sampled_guest_run_import_missing",
             "vk_draw_exec_unsupported_tracked_layout",
         ],
     },
@@ -1140,6 +1138,29 @@ pub const REGISTRY: &[DeclineClass] = &[
         )]),
         slug_calls: &[],
         slugs: &["no_host_pointer_import"],
+    },
+    DeclineClass {
+        // The only row whose type does not live beside its callers, because it
+        // has seven of them across both backends and four subsystems. Splitting
+        // it per owner would make "what did guest-RAM isolation cost" a
+        // seven-grep question; the module's own header argues the exception.
+        type_name: "ZeroCopyLost",
+        defined_in: "observe/zero_copy_lost.rs",
+        slug_blocks: &[],
+        // Emitted by the type's own `note()`, so the site is the definition
+        // file. That is what keeps the seven rails on one line shape: a caller
+        // cannot spell the event differently because it never spells it.
+        emission: Emission::At(&[("observe/zero_copy_lost.rs", "zero_copy_lost")]),
+        slug_calls: &[],
+        slugs: &[
+            "zero_copy_lost_buffer_guest_runs",
+            "zero_copy_lost_sampled_guest_runs",
+            "zero_copy_lost_compute_direct_writeback",
+            "zero_copy_lost_import_present",
+            "zero_copy_lost_scatter_present",
+            "zero_copy_lost_console_scanout",
+            "zero_copy_lost_metal_guest_texture",
+        ],
     },
     DeclineClass {
         type_name: "HandoffDecline",
