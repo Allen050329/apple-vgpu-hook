@@ -159,11 +159,7 @@ fn emit(sink: Sink, msg: &str) {
     #[cfg(test)]
     {
         if matches!(sink, Sink::Fail) {
-            if let Some(buf) = CAPTURED
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .as_mut()
-            {
+            if let Some(buf) = CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
                 buf.push(msg.to_string());
             }
         }

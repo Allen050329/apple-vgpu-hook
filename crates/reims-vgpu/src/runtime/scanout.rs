@@ -1527,7 +1527,14 @@ mod tests {
         ));
         // An unmapped output has no geometry to match against.
         assert!(state.unmap_surface(6));
-        assert!(!note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
+        assert!(!note_compositor_edge(
+            &mut state,
+            5,
+            6,
+            64,
+            48,
+            pipeline_ref
+        ));
     }
 
     #[test]

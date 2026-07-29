@@ -123,12 +123,10 @@ fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &P
     let plen = packet.payload.len();
     let trailer = display_txn_trailer_len(packet.opcode);
     let tail_base = plen.checked_sub(trailer);
-    let word = |off: usize| -> Option<u32> {
-        (off + 4 <= plen).then(|| ld32(&packet.payload[off..]))
-    };
-    let show = |v: Option<u32>| -> String {
-        v.map_or_else(|| "-".to_string(), |w| format!("{w:#010x}"))
-    };
+    let word =
+        |off: usize| -> Option<u32> { (off + 4 <= plen).then(|| ld32(&packet.payload[off..])) };
+    let show =
+        |v: Option<u32>| -> String { v.map_or_else(|| "-".to_string(), |w| format!("{w:#010x}")) };
     let tail = |slot: usize| -> Option<u32> { tail_base.and_then(|base| word(base + slot * 4)) };
 
     let (surface_slot, task_slot) = display_txn_trailer_slots(packet.opcode);
@@ -482,9 +480,11 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     };
     // A live slot or nothing. `resolved_task` is gone with the arm that made the
     // two differ: the only slot this can act on is the one the guest named.
-    let Some(task_id) =
-        resolve_task_word(&state.tasks, TaskWordSite::HeapTextureQuery, request.task_id)
-    else {
+    let Some(task_id) = resolve_task_word(
+        &state.tasks,
+        TaskWordSite::HeapTextureQuery,
+        request.task_id,
+    ) else {
         Emit::decline("heap_texture_query", &QueryError::BadTask)
             .field("task", request.task_id)
             .field("gva", format!("{:#x}", request.reply_gva))

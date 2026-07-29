@@ -156,17 +156,6 @@ pub fn drop_render_deferred_windows(state: &mut DeviceState, mapping_id: u32) ->
     dropped
 }
 
-
-
-
-
-
-
-
-
-
-
-
 /// DMA resident BGRA target into guest mapping pages (stride-correct).
 ///
 /// Preconditions (fail-closed):
@@ -277,14 +266,7 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     // localizes exact R/B-swapped damage before the Store overwrites the row.
     if !host.map_pages_stable() {
         return try_import_present_cpu_unstable(
-            state,
-            host,
-            identity,
-            mapping_id,
-            width,
-            height,
-            base_off,
-            bpr,
+            state, host, identity, mapping_id, width, height, base_off, bpr,
         );
     }
     // --- Path 1: packed contig zero-copy ---
@@ -324,30 +306,13 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         // a budget bound and is not: the budget is global, so one run is refused
         // once the other surfaces have spent it.
         return cpu_writeback_on_window_shortage(
-            r,
-            1,
-            state,
-            host,
-            identity,
-            mapping_id,
-            width,
-            height,
-            base_off,
-            bpr,
+            r, 1, state, host, identity, mapping_id, width, height, base_off, bpr,
         );
     }
 
     // --- Path 2: fragmented multi-run zero-copy (no staging) ---
     try_import_present_multi_run(
-        state,
-        host,
-        identity,
-        mapping_id,
-        width,
-        height,
-        base_off,
-        bpr,
-        need,
+        state, host, identity, mapping_id, width, height, base_off, bpr, need,
     )
 }
 
@@ -390,7 +355,8 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((base_off, bpr, span_end)) = mapping_write::type11_sample_window(m, width, height, fmt)
+    let Some((base_off, bpr, span_end)) =
+        mapping_write::type11_sample_window(m, width, height, fmt)
     else {
         return false;
     };
@@ -506,7 +472,7 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
         log_result(mapping_id, width, height, ImportPresentResult::Fail(reason));
         return ImportPresentResult::Fail(reason);
     }
-    
+
     finish_import(
         state,
         mapping_id,
@@ -743,14 +709,7 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
          writing the render back on the CPU instead of dropping it)"
     ));
     try_import_present_cpu_unstable(
-        state,
-        host,
-        identity,
-        mapping_id,
-        width,
-        height,
-        base_off,
-        bpr,
+        state, host, identity, mapping_id, width, height, base_off, bpr,
     )
 }
 
@@ -764,7 +723,8 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
 fn is_import_window_shortage(reason: &str) -> bool {
     use crate::backend::vulkan::engine::HostImportDecline;
     use crate::observe::Decline;
-    reason == HostImportDecline::TotalBytes.slug() || reason == HostImportDecline::RegionCount.slug()
+    reason == HostImportDecline::TotalBytes.slug()
+        || reason == HostImportDecline::RegionCount.slug()
 }
 
 /// Why the runtime refused a guest-page import before the engine was asked.
@@ -908,10 +868,7 @@ fn finish_import(
                 engine::unpin_resident_target(&render_deferred_identity(key.mapping_id, &entry));
                 crate::observe::off(format!(
                     "render_deferred_superseded mapping={} {}x{} gen={}",
-                    key.mapping_id,
-                    entry.width,
-                    entry.height,
-                    entry.map_generation,
+                    key.mapping_id, entry.width, entry.height, entry.map_generation,
                 ));
             }
             let _ = state.mark_mapping_written(mapping_id);
@@ -978,7 +935,10 @@ mod tests {
         use crate::observe::Decline;
 
         // A retry frees windows and can then succeed: these are *our* limits.
-        for shortage in [HostImportDecline::TotalBytes, HostImportDecline::RegionCount] {
+        for shortage in [
+            HostImportDecline::TotalBytes,
+            HostImportDecline::RegionCount,
+        ] {
             assert!(
                 is_import_window_shortage(shortage.slug()),
                 "{} is a budget bound and must re-route to the CPU writeback",
@@ -991,10 +951,23 @@ mod tests {
         for hard in [
             HostImportDecline::ExtensionAbsent,
             HostImportDecline::ZeroLength,
-            HostImportDecline::PointerMisaligned { host_ptr: 0x1001, alignment: 4096 },
-            HostImportDecline::SizeMisaligned { size: 0x2001, alignment: 4096 },
-            HostImportDecline::RangeOverflow { host_ptr: usize::MAX, len: 0x1000 },
-            HostImportDecline::NoValidWindow { host_ptr: 0x1000, len: 0x1000, alignment: 4096 },
+            HostImportDecline::PointerMisaligned {
+                host_ptr: 0x1001,
+                alignment: 4096,
+            },
+            HostImportDecline::SizeMisaligned {
+                size: 0x2001,
+                alignment: 4096,
+            },
+            HostImportDecline::RangeOverflow {
+                host_ptr: usize::MAX,
+                len: 0x1000,
+            },
+            HostImportDecline::NoValidWindow {
+                host_ptr: 0x1000,
+                len: 0x1000,
+                alignment: 4096,
+            },
         ] {
             assert!(
                 !is_import_window_shortage(hard.slug()),
@@ -1010,10 +983,10 @@ mod tests {
     }
 
     use super::*;
-    use crate::runtime::host::FakeHost;
     use crate::backend::vulkan::engine::reason::{DrawReason, HostPresentDecline};
     use crate::backend::vulkan::engine::DrawError;
     use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_X86};
+    use crate::runtime::host::FakeHost;
 
     /// **The defect this classification replaced.** A host without
     /// `VK_EXT_external_memory_host` refuses the packed-contig import at the
@@ -1202,7 +1175,7 @@ mod tests {
                     width: 8,
                     height: 8,
                     map_generation: 1,
-                            armed_seq,
+                    armed_seq,
                 },
             )
         };
@@ -1225,7 +1198,6 @@ mod tests {
         assert!(state.take_oldest_render_deferred_window().is_none());
     }
 
-
     #[test]
     fn eligible_requires_mid_and_geom() {
         assert!(!eligible(0, 1920, 1080));
@@ -1234,7 +1206,6 @@ mod tests {
         assert!(eligible(1, 1, 1));
         assert!(eligible(1, 1920, 1080));
     }
-
 
     #[test]
     fn surface_identity_tracks_map_generation() {
@@ -1352,18 +1323,7 @@ mod tests {
         let mark = std::fs::metadata(log_path).map(|m| m.len()).unwrap_or(0) as usize;
 
         let mut route = |result| {
-            cpu_writeback_on_window_shortage(
-                result,
-                1,
-                &mut state,
-                &mut host,
-                &id,
-                mid,
-                2,
-                2,
-                0,
-                8,
-            )
+            cpu_writeback_on_window_shortage(result, 1, &mut state, &mut host, &id, mid, 2, 2, 0, 8)
         };
 
         // Not a failure at all: passes through untouched.
@@ -1387,7 +1347,9 @@ mod tests {
 
         let whole = std::fs::read_to_string(log_path).expect("fail log");
         let appended = &whole[mark.min(whole.len())..];
-        let line = |reason: &str| format!("import_window_cpu_writeback mid={mid} 2x2 runs=1 reason={reason}");
+        let line = |reason: &str| {
+            format!("import_window_cpu_writeback mid={mid} 2x2 runs=1 reason={reason}")
+        };
         assert!(
             appended.contains(&line(cap)),
             "the re-route must name itself and the check that refused"

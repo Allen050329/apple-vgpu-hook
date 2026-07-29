@@ -123,12 +123,7 @@ fn is_fence_domain(domain: Domain) -> bool {
 /// stored value reaches the target. Wait-with-timeout is refused outright — there
 /// is no deferred host timer, so honouring the timeout is not possible and
 /// silently treating it as an untimed wait would change the guest's contract.
-pub fn plan_event(
-    kind: EventKind,
-    value: u64,
-    has_timeout: bool,
-    current: Option<u64>,
-) -> Plan {
+pub fn plan_event(kind: EventKind, value: u64, has_timeout: bool, current: Option<u64>) -> Plan {
     match kind {
         EventKind::Signal => match current {
             None => Plan::signal(Reason::SignalFirst, value),

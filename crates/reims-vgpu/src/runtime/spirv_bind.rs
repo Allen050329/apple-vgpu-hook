@@ -1740,17 +1740,7 @@ mod tests {
     fn r32f_write_image_decodes_and_specializes() {
         let mut words = vec![0x0723_0203, 0x0001_0000, 0, 6, 0];
         // OpTypeImage %1 : float 2D depth=0 arrayed=0 ms=0 sampled=2 format=3.
-        words.extend([
-            (9u32 << 16) | OP_TYPE_IMAGE as u32,
-            1,
-            99,
-            1,
-            0,
-            0,
-            0,
-            2,
-            3,
-        ]);
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 2, 3]);
         words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 1]);
         words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
         words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 33]);

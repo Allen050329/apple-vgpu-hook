@@ -37,21 +37,6 @@ pub fn step_indexed(step_function: u32) -> bool {
     )
 }
 
-fn step_function_to_metal(step_function: u32) -> Option<MTLStepFunction> {
-    match step_function {
-        MTL_STEP_THREAD_POS_IN_GRID_X => Some(MTLStepFunction::ThreadPositionInGridX),
-        MTL_STEP_THREAD_POS_IN_GRID_Y => Some(MTLStepFunction::ThreadPositionInGridY),
-        MTL_STEP_THREAD_POS_IN_GRID_X_INDEXED => {
-            // metal-0.33 enum discriminant is wrong; set via raw later if needed.
-            Some(MTLStepFunction::ThreadPositionInGridXIndexed)
-        }
-        MTL_STEP_THREAD_POS_IN_GRID_Y_INDEXED => {
-            Some(MTLStepFunction::ThreadPositionInGridYIndexed)
-        }
-        _ => None,
-    }
-}
-
 pub fn has_indexed_layout(stage_input: Option<&ReimsVgpuComputeStageInputDescriptor>) -> bool {
     let Some(stage_input) = stage_input else {
         return false;

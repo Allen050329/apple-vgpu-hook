@@ -73,17 +73,6 @@ pub struct Command {
     pub raw_payload_length: usize,
 }
 
-pub fn opcode_accepted_by_deserializer(opcode: u32) -> bool {
-    matches!(
-        opcode,
-        OP_WAIT_EVENT | OP_SIGNAL_EVENT | OP_WAIT_EVENT_TIMEOUT
-    )
-}
-
-pub fn opcode_emitted_by_serializer(_opcode: u32) -> bool {
-    false
-}
-
 pub fn opcode_rejected_by_deserializer(opcode: u32) -> bool {
     matches!(
         opcode,
@@ -226,8 +215,6 @@ mod tests {
             decode(&build(0x999, &[])).unwrap_err(),
             DecodeStatus::ErrUnknownOpcode
         );
-        assert!(opcode_accepted_by_deserializer(OP_SIGNAL_EVENT));
-        assert!(!opcode_emitted_by_serializer(OP_SIGNAL_EVENT));
     }
 
     #[test]

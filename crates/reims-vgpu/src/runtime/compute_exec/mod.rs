@@ -505,8 +505,10 @@ pub fn apply_record<M: HostMemory + HostOps>(
             None
         }
         Kind::ThreadgroupMemory => {
-            seg.acc
-                .set_threadgroup_memory(cmd.threadgroup_memory_index, cmd.threadgroup_memory_length);
+            seg.acc.set_threadgroup_memory(
+                cmd.threadgroup_memory_index,
+                cmd.threadgroup_memory_length,
+            );
             None
         }
         Kind::ImageblockDimensions => {
@@ -544,11 +546,9 @@ pub fn apply_record<M: HostMemory + HostOps>(
         | Kind::ControlStartElse
         | Kind::ControlEndIf
         | Kind::ExecuteCommandsInBuffer
-        | Kind::ExecuteCommandsInBufferIndirect => {
-            Some(crate::runtime::compute_session::apply_sequencing(
-                state, host, task_id, cmd, seg,
-            ))
-        }
+        | Kind::ExecuteCommandsInBufferIndirect => Some(
+            crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg),
+        ),
         Kind::Unknown => None,
     }
 }
@@ -1004,8 +1004,6 @@ fn next_mapping_content_generation(current: u32) -> u32 {
         next
     }
 }
-
-
 
 /// Measure storage-image seed traffic by structurally reflected content access.
 ///
@@ -3261,14 +3259,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     preview.len()
                 ));
             }
-            dump_kernel_handoff(
-                acc.pipeline_ref,
-                "probe",
-                &mtlb,
-                air,
-                Some(&spirv),
-                &meta,
-            );
+            dump_kernel_handoff(acc.pipeline_ref, "probe", &mtlb, air, Some(&spirv), &meta);
             dump_kernel_buffers(acc.pipeline_ref, "probe", &staged_bufs);
         }
     }

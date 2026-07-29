@@ -226,9 +226,7 @@ fn arm_bodies(body: &str) -> Vec<(&str, String)> {
         let indent = line.len() - line.trim_start().len();
         let end = lines[i + 1..]
             .iter()
-            .position(|l| {
-                !l.trim().is_empty() && (l.len() - l.trim_start().len()) <= indent
-            })
+            .position(|l| !l.trim().is_empty() && (l.len() - l.trim_start().len()) <= indent)
             .map(|p| i + 1 + p)
             .unwrap_or(lines.len() - 1);
         out.push((line.trim(), lines[i..=end].join("\n")));

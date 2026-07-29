@@ -1606,7 +1606,10 @@ mod tests {
         let _ = host.write_gpa(root_gpa + 4, &pte);
 
         let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-        st32(&mut entry[0..], (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8));
+        st32(
+            &mut entry[0..],
+            (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+        );
         entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
         let _ = host.write_gpa(data_gpa, &entry);
 

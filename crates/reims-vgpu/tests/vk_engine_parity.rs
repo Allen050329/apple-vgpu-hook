@@ -1144,9 +1144,8 @@ fn present_into_host_ptr_writes_frame_zero_copy() {
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
     // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
-    let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0)
-    };
+    let res =
+        unsafe { engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0) };
     match res {
         Ok(_) => {
             let after = engine::counter_snapshot();
@@ -1301,9 +1300,8 @@ fn present_into_host_ptr_bgra_target_lands_guest_byte_order() {
     assert!(!ptr.is_null(), "host alloc failed");
 
     // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
-    let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0)
-    };
+    let res =
+        unsafe { engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0) };
     match res {
         Ok(()) => {
             // SAFETY: ptr backs at least `frame` initialized bytes post-present.
@@ -1974,9 +1972,8 @@ fn present_into_host_ptr_strided_honors_guest_bpr() {
     assert!(!ptr.is_null());
 
     // SAFETY: ptr backs `cap` exclusive bytes for the DMA.
-    let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, bpr)
-    };
+    let res =
+        unsafe { engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, bpr) };
     match res {
         Ok(_) => {
             // SAFETY: GPU wrote `frame` bytes into ptr.

@@ -1,7 +1,7 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
-use crate::contract::endian::{ld16, st16};
 use crate::contract::checked_mul_u64;
+use crate::contract::endian::{ld16, st16};
 
 pub const COMPONENT_COUNT: usize = 4;
 pub const COMPONENT_R: usize = 0;

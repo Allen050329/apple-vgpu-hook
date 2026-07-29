@@ -261,23 +261,11 @@ mod tests {
             FenceStatus::Ok
         );
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::ComputeFence,
-                5,
-                FenceAction::Update,
-            ),
+            execute_fence(&mut state, 1, Domain::ComputeFence, 5, FenceAction::Update,),
             FenceStatus::Ok
         );
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::RenderFence,
-                5,
-                FenceAction::Update,
-            ),
+            execute_fence(&mut state, 1, Domain::RenderFence, 5, FenceAction::Update,),
             FenceStatus::Ok
         );
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 5), Some(1));
@@ -301,13 +289,7 @@ mod tests {
     fn zero_ref_missing() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::RenderFence,
-                0,
-                FenceAction::Update,
-            ),
+            execute_fence(&mut state, 1, Domain::RenderFence, 0, FenceAction::Update,),
             FenceStatus::Missing
         );
         let cmd = event_cmd(OP_SIGNAL_EVENT, 0, 1, None);
@@ -461,14 +443,7 @@ mod tests {
             "a soft-pending wait is re-polled every drain; logging it floods"
         );
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::RenderFence,
-                0,
-                FenceAction::Update,
-            )
-            .refusal(),
+            execute_fence(&mut state, 1, Domain::RenderFence, 0, FenceAction::Update,).refusal(),
             None,
             "ref==0 is the genuinely-unbound case AGENTS.md carves out"
         );

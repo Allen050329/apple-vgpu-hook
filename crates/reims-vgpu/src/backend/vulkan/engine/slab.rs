@@ -340,11 +340,7 @@ pub(crate) struct SlabPool {
     invariant_violations: u64,
 }
 
-
-
-
 impl SlabPool {
-
     pub(crate) fn new() -> Self {
         Self {
             blocks: Vec::new(),

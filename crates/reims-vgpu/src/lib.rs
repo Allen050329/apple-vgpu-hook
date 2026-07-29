@@ -679,7 +679,11 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
                 })
                 .max_by_key(|&(mid, _, seq)| (seq, mid))
                 .unwrap_or((0, 0, 0));
-            let own_seq = state.mappings.get(&fm).map(|m| m.last_store_seq).unwrap_or(0);
+            let own_seq = state
+                .mappings
+                .get(&fm)
+                .map(|m| m.last_store_seq)
+                .unwrap_or(0);
             if fresh_mid != 0 && fresh_mid != fm && fresh_seq > own_seq {
                 use std::collections::HashSet;
                 use std::sync::Mutex;

@@ -1,9 +1,6 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{
-    LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS,
-    MAX_MAPPINGS, MAX_TASKS,
-};
+use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -1690,7 +1687,9 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&pages);
-        self.linear_deferred_flush.0.insert(key, (generation, pages));
+        self.linear_deferred_flush
+            .0
+            .insert(key, (generation, pages));
     }
 
     /// Disarm a linear compute-storage deferred window, keeping the union index
@@ -2744,7 +2743,6 @@ impl DeviceState {
         self.fails.push(ev);
     }
 }
-
 
 #[cfg(test)]
 mod fail_vocabulary_tests {

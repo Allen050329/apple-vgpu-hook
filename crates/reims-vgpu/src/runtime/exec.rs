@@ -233,15 +233,8 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         let mut stream = vec![0u8; stream_len];
         // Product x86 uses page_shift=12; the unshifted helper defaults to arm14
         // and silently fails every stream load on Ventura/Tahoe x86.
-        if gva_mem::read_task_gva_by_id(
-            host,
-            &state.tasks,
-            task_id,
-            gva,
-            &mut stream,
-            page_shift,
-        )
-        .is_err()
+        if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut stream, page_shift)
+            .is_err()
         {
             crate::observe::fail(format!(
                 "exec_cmdbuf gva_fail task={task_id} i={i} gva={gva:#x} len={length} shift={page_shift}"
@@ -600,12 +593,7 @@ fn handle_info_record<M: HostMemory + HostOps>(
     }
 }
 
-fn handle_event_record(
-    state: &mut DeviceState,
-    task_id: u32,
-    stream: &[u8],
-    rec: &stream::Record,
-) {
+fn handle_event_record(state: &mut DeviceState, task_id: u32, stream: &[u8], rec: &stream::Record) {
     let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
     if end > stream.len() {
         return;
@@ -619,7 +607,9 @@ fn handle_event_record(
             // left no line at all; the decoder's own typed refusal names which
             // of its five checks rejected the bytes.
             if let Some(e) = crate::observe::Emit::refusal("event_decode", &status) {
-                e.field("task", task_id).field("len", cmd_bytes.len()).fail();
+                e.field("task", task_id)
+                    .field("len", cmd_bytes.len())
+                    .fail();
             }
             return;
         }
@@ -2066,7 +2056,10 @@ mod tests {
         let mut host = FakeHost::new();
         assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
         assert!(state.tasks[3].active);
-        assert!(!state.tasks[6].active, "slot 6 must be dead for this to bite");
+        assert!(
+            !state.tasks[6].active,
+            "slot 6 must be dead for this to bite"
+        );
 
         let mut payload = vec![0u8; CHILD_EXEC_INDIRECT_HEADER_LEN as usize];
         st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);

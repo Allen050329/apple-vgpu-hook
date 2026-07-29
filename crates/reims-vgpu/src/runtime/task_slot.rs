@@ -122,11 +122,7 @@ fn slot_live(tasks: &[TaskEntry], id: u32) -> bool {
 /// The latch is taken before the line is built. `Emit::field` renders eagerly
 /// and this sits on the command path, so building and dropping the strings on
 /// every decode would make the probe cost scale with the traffic it measures.
-pub(crate) fn resolve_task_word(
-    tasks: &[TaskEntry],
-    site: TaskWordSite,
-    raw: u32,
-) -> Option<u32> {
+pub(crate) fn resolve_task_word(tasks: &[TaskEntry], site: TaskWordSite, raw: u32) -> Option<u32> {
     use crate::observe::Decline;
     let shifted = raw >> DEFINE_TASK_ID_SHIFT;
     let raw_live = slot_live(tasks, raw);
@@ -209,7 +205,10 @@ mod tests {
     #[test]
     fn a_word_naming_no_live_slot_refuses_rather_than_naming_its_neighbour() {
         let tasks = table(&[3]);
-        assert_eq!(resolve_task_word(&tasks, TaskWordSite::ComputeInfo, 6), None);
+        assert_eq!(
+            resolve_task_word(&tasks, TaskWordSite::ComputeInfo, 6),
+            None
+        );
     }
 
     /// Neither slot live: still nothing, and the caller emits its own refusal.

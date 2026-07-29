@@ -2366,7 +2366,9 @@ fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
             "the hold must still be logged, on the census channel: {lines:?}"
         );
         assert!(
-            !lines.iter().any(|l| l.starts_with("translation_order_hold")),
+            !lines
+                .iter()
+                .any(|l| l.starts_with("translation_order_hold")),
             "a resolver saying `not ready yet` is not a failure: {lines:?}"
         );
     }
@@ -2552,7 +2554,10 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
     assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, 2));
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
-    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86), (2, 1));
+    assert_eq!(
+        display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
+        (2, 1)
+    );
     assert_eq!(display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP), (1, 2));
 
     // The swap has to survive the budget key, not just the log line: a gamma
@@ -2614,7 +2619,10 @@ fn display_txn_probe_distinguishes_trailer_only_from_prefixed_payload() {
     trailer_only.extend_from_slice(&0u32.to_le_bytes());
     trailer_only.extend_from_slice(&0x2au32.to_le_bytes());
     trailer_only.extend_from_slice(&7u32.to_le_bytes());
-    assert_eq!(trailer_only.len(), display_txn_trailer_len(CHILD_OP_PRESENT_X86));
+    assert_eq!(
+        trailer_only.len(),
+        display_txn_trailer_len(CHILD_OP_PRESENT_X86)
+    );
 
     // Same trailer behind an 8-byte prefix: offset-zero now reads the prefix.
     let mut prefixed = vec![0xEEu8; 8];

@@ -1086,7 +1086,13 @@ mod tests {
         m.map_generation = 5;
         state.compute_deferred_flush.insert(key(9, 0, 256), 3);
         let cap = crate::observe::FailCapture::start();
-        assert!(!super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX));
+        assert!(!super::flush_intersecting(
+            &mut state,
+            &mut host,
+            9,
+            0,
+            u64::MAX
+        ));
         let line = cap.one("deferred_flush_lost");
         assert!(
             line.contains("reason=map_generation_drift"),
@@ -1129,7 +1135,7 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 2,
-                    armed_seq: 0,
+                armed_seq: 0,
             },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
@@ -1167,7 +1173,7 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 2,
-                    armed_seq: 0,
+                armed_seq: 0,
             },
         );
         // The guest deletes the backing; the window is kept for the fingerprint
@@ -1200,7 +1206,7 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 1,
-                    armed_seq: 0,
+                armed_seq: 0,
             },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
@@ -1220,7 +1226,7 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 1,
-                    armed_seq: 0,
+                armed_seq: 0,
             },
         );
         assert!(super::flush_intersecting(
@@ -1880,7 +1886,11 @@ mod tests {
             &gva_entry(1, 4, 4, &[data0]),
             "gva_alias",
         );
-        assert_eq!(drift_lines(at), 0, "a window that did not move must be quiet");
+        assert_eq!(
+            drift_lines(at),
+            0,
+            "a window that did not move must be quiet"
+        );
 
         // Positive control: same window, armed on a page it no longer maps to.
         let at = mark();

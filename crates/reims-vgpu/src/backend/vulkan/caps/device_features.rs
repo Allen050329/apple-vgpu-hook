@@ -196,11 +196,10 @@ pub unsafe fn query(
     // R32_SFLOAT linear filtering is optional (absent on Apple/MoltenVK); ask
     // rather than assume, so the native float32 sampled LUT rail can decline
     // where the host cannot filter it.
-    let sampled_r32f_linear_filter = unsafe {
-        instance.get_physical_device_format_properties(pd, vk::Format::R32_SFLOAT)
-    }
-    .optimal_tiling_features
-    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+    let sampled_r32f_linear_filter =
+        unsafe { instance.get_physical_device_format_properties(pd, vk::Format::R32_SFLOAT) }
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
 
     // Prefer the 1.2 core feature over the extension: it needs no extension
     // string and it is the spelling the baseline guarantees exists to ask about.

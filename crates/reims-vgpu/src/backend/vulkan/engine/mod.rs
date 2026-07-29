@@ -129,52 +129,20 @@ impl EngineState {
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
 
-// Engine-lock contention census. The single global `ENGINE` mutex serializes all
-// 34 engine entry points across the drain worker AND the QEMU main/present path.
-// Under a heavy-composite burst (dock magnification + a constant-animation tab)
-// the per-bind sample resolver's `resident_content_ready` acquisition can block
-// behind a present-path holder — a wall-clock cost that looks like "resolve work"
-// but is pure lock wait. These accumulators (all-atomic, no extra lock) let the
-// off-main-core census distinguish the two: if `wait_ns` per acquisition spikes
-// during a freeze, the drain worker is lock-bound, not compute-bound.
-static ENGINE_LOCK_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Engine-lock acquisitions. Read only by
+/// `ensure_host_imports_enters_the_engine_once_for_the_whole_run_list`, which
+/// pins the prologue at one entry per call rather than one per span. The
+/// `Instant::now()` pair and wait-time accumulators that used to sit beside it
+/// fed a snapshot nothing read.
 static ENGINE_LOCK_ACQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ENGINE_LOCK_MAX_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Acquire the global engine lock, accumulating acquisition-wait time for the
-/// contention census. One `Instant::now()` pair per lock (~20 ns via the vDSO
-/// clock) — negligible vs the work under the lock, and the whole point is to
-/// catch the case where the *wait* dwarfs the work.
+/// Acquire the global engine lock. The single `ENGINE` mutex serializes all 34
+/// engine entry points across the drain worker and the QEMU main/present path,
+/// so this is on every one of them.
 #[inline]
 fn lock_engine() -> parking_lot::MutexGuard<'static, EngineState> {
-    let t = std::time::Instant::now();
-    let guard = ENGINE.lock();
-    let ns = t.elapsed().as_nanos() as u64;
-    ENGINE_LOCK_WAIT_NS.fetch_add(ns, Ordering::Relaxed);
     ENGINE_LOCK_ACQ.fetch_add(1, Ordering::Relaxed);
-    let mut cur = ENGINE_LOCK_MAX_NS.load(Ordering::Relaxed);
-    while ns > cur {
-        match ENGINE_LOCK_MAX_NS.compare_exchange_weak(
-            cur,
-            ns,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(v) => cur = v,
-        }
-    }
-    guard
-}
-
-/// Cumulative `(total_wait_ns, acquisitions, max_wait_ns)`; the max is reset each
-/// read so the census reports a per-window peak, not a boot-lifetime peak.
-pub fn engine_lock_wait_snapshot() -> (u64, u64, u64) {
-    (
-        ENGINE_LOCK_WAIT_NS.load(Ordering::Relaxed),
-        ENGINE_LOCK_ACQ.load(Ordering::Relaxed),
-        ENGINE_LOCK_MAX_NS.swap(0, Ordering::Relaxed),
-    )
+    ENGINE.lock()
 }
 
 /// Device-reset proxy: guest-derived Vulkan objects evicted at the lifetime boundary.
@@ -487,7 +455,6 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
     let mut guard = lock_engine();
     guard.pools.registry_touch_at(identity, now_ms);
 }
-
 
 /// Which engine entry point's initialization prologue refused, for the
 /// `vk_engine_probe` decline's `probe=` field.
@@ -1039,9 +1006,11 @@ pub unsafe fn present_into_host_ptr_strided(
         ));
     }
     let (width, height, image) = {
-        let slot = pools.registry_get(identity).ok_or({
-            DrawError::Present(reason::HostPresentDecline::HostPtrUnknownIdentity)
-        })?;
+        let slot = pools
+            .registry_get(identity)
+            .ok_or(DrawError::Present(
+                reason::HostPresentDecline::HostPtrUnknownIdentity,
+            ))?;
         if !slot.content_ready {
             return Err(DrawError::Present(
                 reason::HostPresentDecline::HostPtrNoReadyContent,
@@ -1607,7 +1576,6 @@ pub fn cap_pressure_snapshot() -> crate::runtime::census::present_proxy::cap_pre
     }
 }
 
-
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the
 /// currently-presented target (`display`) alive, and reclaim aged non-pinned
 /// residents. Called from the poll heartbeat (so the clock keeps ticking when the
@@ -1778,9 +1746,9 @@ mod probe_visibility_tests {
                 len: PAGE as u64,
             })
             .collect();
-        let (_, before, _) = engine_lock_wait_snapshot();
+        let before = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
         let ok = ensure_host_imports(&runs);
-        let (_, after, _) = engine_lock_wait_snapshot();
+        let after = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
         if !ok {
             eprintln!("SKIP engine-entry count: no device or no VK_EXT_external_memory_host here");
             return;
@@ -1794,9 +1762,9 @@ mod probe_visibility_tests {
         );
 
         // An empty list asks nothing and must not enter at all.
-        let (_, before, _) = engine_lock_wait_snapshot();
+        let before = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
         assert!(ensure_host_imports(&[]));
-        let (_, after, _) = engine_lock_wait_snapshot();
+        let after = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
         assert_eq!(after, before);
     }
 }

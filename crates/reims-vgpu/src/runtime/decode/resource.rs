@@ -211,14 +211,6 @@ pub struct CompactTlv {
     pub has_u32: bool,
 }
 
-/// Legacy alias used by older call sites; tag is u32 for compatibility.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Tlv {
-    pub tag: u32,
-    pub length: u32,
-    pub value_offset: usize,
-}
-
 /// Linear buffer descriptor (type-1): allocation size + guest page handle.
 ///
 /// Contract: `reims_vgpu_resource_format.h` `REIMS_VGPU_RESOURCE_LINEAR_DESC_*`.
@@ -794,32 +786,6 @@ pub enum Descriptor {
     Unknown,
 }
 
-pub fn object_type_name(t: u8) -> &'static str {
-    match t {
-        OBJECT_TYPE_BUFFER => "buffer",
-        OBJECT_TYPE_TEXTURE => "texture",
-        OBJECT_TYPE_TEXTURE_VARIANT => "textureVariant",
-        OBJECT_TYPE_FUNCTION => "function",
-        OBJECT_TYPE_TYPE7 => "type7",
-        OBJECT_TYPE_TEXTURE_VIEW => "textureView",
-        OBJECT_TYPE_IOSURFACE => "iosurfaceTexture",
-        _ => "unknown",
-    }
-}
-
-pub fn object_type_producer_coverage(t: u8) -> ProducerCoverage {
-    match t {
-        OBJECT_TYPE_BUFFER
-        | OBJECT_TYPE_TEXTURE
-        | OBJECT_TYPE_TEXTURE_VARIANT
-        | OBJECT_TYPE_FUNCTION
-        | OBJECT_TYPE_TYPE7
-        | OBJECT_TYPE_TEXTURE_VIEW
-        | OBJECT_TYPE_IOSURFACE => ProducerCoverage::Emitted,
-        _ => ProducerCoverage::Unknown,
-    }
-}
-
 /// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
@@ -867,11 +833,6 @@ pub fn decode_object_entry(bytes: &[u8]) -> Result<ObjectEntry, DecodeStatus> {
         ref_: ld32(&bytes[4..]),
         length: ld32(&bytes[8..]),
     })
-}
-
-/// Prefer live list offset; keep name for callers.
-pub fn object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
-    list_object_entry_offset(ref_, entry_count)
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -1483,16 +1444,6 @@ pub fn parse_color_attachments(
         out.push(parse_one_color_entry(bytes, len, entry, i as u32)?);
     }
     Ok(out)
-}
-
-/// Parse color-attachment[0] only (compat).
-pub fn parse_color_attachment0(
-    bytes: &[u8],
-    len: usize,
-    section_off: usize,
-) -> Result<PipelineColorAttachment0, DecodeStatus> {
-    let all = parse_color_attachments(bytes, len, section_off)?;
-    Ok(all.into_iter().next().unwrap_or_default())
 }
 
 pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescriptor, DecodeStatus> {
@@ -2156,29 +2107,6 @@ pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus>
     }
 }
 
-/// Legacy wide TLV stream (not live type-7). Kept for unit tests of the old shape.
-pub fn decode_pipeline_tlvs(bytes: &[u8]) -> Result<Vec<Tlv>, DecodeStatus> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + 8 <= bytes.len() {
-        let tag = ld32(&bytes[off..]);
-        let length = ld32(&bytes[off + 4..]) as usize;
-        if length < 8 || off + length > bytes.len() {
-            return Err(DecodeStatus::ErrBadLength("res_wide_tlv_bad_length"));
-        }
-        out.push(Tlv {
-            tag,
-            length: length as u32,
-            value_offset: off + 8,
-        });
-        off += length;
-    }
-    if off != bytes.len() {
-        return Err(DecodeStatus::ErrBadLength("res_wide_tlv_trailing_bytes"));
-    }
-    Ok(out)
-}
-
 pub fn decode_descriptor(object_type: u8, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     match object_type {
         OBJECT_TYPE_BUFFER => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
@@ -2238,10 +2166,6 @@ mod tests {
         assert_eq!(
             decode_type7_descriptor(&type7).unwrap_err().slug(),
             "res_type7_subtype_unknown"
-        );
-        assert_eq!(
-            decode_pipeline_tlvs(&[0u8; 8]).unwrap_err().slug(),
-            "res_wide_tlv_bad_length"
         );
     }
 
@@ -2425,7 +2349,6 @@ mod tests {
         assert_eq!(ent.object_type, 1);
         // Live list offset: ref * 12
         assert_eq!(list_object_entry_offset(3, 10), Some(36));
-        assert_eq!(object_entry_offset(3, 10), Some(36));
 
         let mut list = [0u8; 12];
         st32(&mut list[0..], 11u32 | (0x20u32 << 8));
@@ -2473,17 +2396,6 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
-    }
-
-    #[test]
-    fn tlv_stream_legacy_wide() {
-        let mut b = vec![0u8; 16];
-        st32(&mut b[0..], 1);
-        st32(&mut b[4..], 16);
-        st32(&mut b[8..], 0xdead);
-        let tlvs = decode_pipeline_tlvs(&b).unwrap();
-        assert_eq!(tlvs.len(), 1);
-        assert_eq!(tlvs[0].tag, 1);
     }
 
     #[test]
@@ -2654,7 +2566,8 @@ mod tests {
         buf[entry + 13] = COLOR_ATTACHMENT_TAG_DST_RGB;
         buf[entry + 14] = 4;
         st32(&mut buf[entry + 15..], 5); // OneMinusSourceAlpha
-        let c = parse_color_attachment0(&buf, buf.len(), off).unwrap();
+        let all = parse_color_attachments(&buf, buf.len(), off).unwrap();
+        let c = all.first().copied().unwrap_or_default();
         assert!(c.has_pixel_format);
         assert_eq!(c.pixel_format, MTL_FORMAT_BGRA8_UNORM as u32);
         assert!(c.blending_enabled);
@@ -2825,9 +2738,6 @@ mod tests {
         for t in 0u8..16 {
             let bytes = vec![0u8; 128];
             let _ = decode_descriptor(t, &bytes);
-            let _ = object_type_name(t);
-            let _ = object_type_producer_coverage(t);
         }
     }
-
 }

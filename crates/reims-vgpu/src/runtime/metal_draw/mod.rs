@@ -2170,7 +2170,6 @@ pub(crate) fn load_composite_alpha0_holes(draw_rgba: &[u8], seed_rgba: &[u8]) ->
     (composed, filled)
 }
 
-
 /// How Linux/Vulkan should honor a type-11 color attachment Load.
 ///
 /// Metal type-11 Load reads guest-backed attachment bytes (unified). Discrete
@@ -2637,7 +2636,6 @@ fn default_sampler(binding: u32) -> crate::backend::metal::abi::ReimsVgpuSampler
     }
 }
 
-
 /// Fail-visible diagnosis when a bound sample ref does not materialize.
 ///
 /// Kept off the success path; only called after a sampled resolver
@@ -2873,7 +2871,6 @@ fn type11_attachment_from_window(
         window.base_off,
     )
 }
-
 
 /// Sample a type-11 mapping as tight RGBA8 from guest pages.
 ///

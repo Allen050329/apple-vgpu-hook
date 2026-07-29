@@ -1033,7 +1033,6 @@ fn deferred_gva_sample_eligibility_rules() {
     );
 }
 
-
 #[test]
 fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
     let mut state = DeviceState::new(DeviceId(7), PAGE_SHIFT_ARM64E);
@@ -1118,7 +1117,6 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     assert_eq!(actual, seed);
     assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
-
 
     req.colors[0].mapping_id = 9;
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
@@ -1442,7 +1440,6 @@ fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
     assert_eq!(mag.slug(), "draw_prepare_sampler_mag_filter_translation");
 }
 
-
 /// qemu-shim Store policy: Clear/DontCare/force_full full-write; Load+seed
 /// may diff-only. Prevents Clear+partial logo-mid residual.
 #[test]
@@ -1482,7 +1479,11 @@ fn every_type11_load_check_names_itself_and_keeps_its_outcome() {
     let n = slugs.len();
     slugs.sort_unstable();
     slugs.dedup();
-    assert_eq!(slugs.len(), n, "two type-11 Load checks share a reason slug");
+    assert_eq!(
+        slugs.len(),
+        n,
+        "two type-11 Load checks share a reason slug"
+    );
     for (decision, expected) in ALL {
         assert_eq!(decision.choice(), *expected, "{decision:?} changed outcome");
     }
@@ -1530,7 +1531,8 @@ fn type11_load_ready_uses_resident_not_clear() {
     // CPU seed content never wins over a ready resident image.
     let black = [0u8, 0, 0, 255];
     assert_eq!(
-        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&black), false, false).choice(),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&black), false, false)
+            .choice(),
         Type11LoadChoice::LoadFromTarget
     );
     // First touch: not ready, no seed → Clear (engine default).
@@ -1541,12 +1543,14 @@ fn type11_load_ready_uses_resident_not_clear() {
     // First touch with an all-black CPU seed still uploads that seed;
     // presence, not an RGB census, is the Load contract.
     assert_eq!(
-        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, false, Some(&black), false, false).choice(),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, false, Some(&black), false, false)
+            .choice(),
         Type11LoadChoice::UseCpuSeed
     );
     // CLEAR never LoadFromTarget via this helper.
     assert_eq!(
-        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, Some(&black), false, false).choice(),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, Some(&black), false, false)
+            .choice(),
         Type11LoadChoice::UseCpuSeed
     );
     assert_eq!(
@@ -1563,7 +1567,8 @@ fn type11_load_ready_uses_resident_not_clear() {
 fn type11_load_present_boundary_prefers_guest_seed() {
     let seed = [9u8, 9, 9, 255];
     assert_eq!(
-        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, true).choice(),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, true)
+            .choice(),
         Type11LoadChoice::UseCpuSeed
     );
     // GPU boundary seed (resident→target copy armed on the request)
@@ -1590,7 +1595,8 @@ fn type11_load_present_boundary_prefers_guest_seed() {
     );
     // Boundary never affects CLEAR semantics.
     assert_eq!(
-        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, Some(&seed), false, true).choice(),
+        resolve_type11_load_decision(PASS_LOAD_ACTION_CLEAR, true, Some(&seed), false, true)
+            .choice(),
         Type11LoadChoice::UseCpuSeed
     );
 }
@@ -1645,7 +1651,6 @@ fn load_composite_full_covered_black_no_seed() {
     assert_eq!(filled, 0);
     assert_eq!(&out[..], &draw[..]);
 }
-
 
 /// Premult One/OneMinusSrcAlpha Load: transparent draw keeps seed; opaque black wins.
 #[test]
@@ -2778,15 +2783,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
         px[2] = 185;
         px[3] = 255;
     }
-    host_cache_store_gva_layer(
-        &mut state,
-        tex_ref,
-        OBJECT_TYPE_TEXTURE,
-        gva,
-        w,
-        h,
-        &rgba,
-    );
+    host_cache_store_gva_layer(&mut state, tex_ref, OBJECT_TYPE_TEXTURE, gva, w, h, &rgba);
     let cached = crate::runtime::surface_cache::get_texture(&state, tex_ref, w, h)
         .expect("texture_ref encode cache");
     // BGRA storage
@@ -3226,7 +3223,6 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     )
     .expect("exact GVA cache seed");
     assert_eq!(seed, vec![0, 0, 0, 255, 0, 0, 0, 255]);
-
 
     // Without a GVA match, use the texture namespace (green), never the
     // colliding surface namespace (red).

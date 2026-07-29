@@ -1910,8 +1910,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "stream_rec_len_below_header",
             "stream_rec_len_past_segment_end",
             "stream_rec_cursor_overflow",
-            "stream_protection_wrong_segment_type",
-            "stream_protection_payload_len",
         ],
     },
     DeclineClass {
@@ -2725,7 +2723,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         // refusals are constructed. 29 of the 40 sites are `ErrShort`.
         slug_calls: &[
             ("runtime/decode/resource.rs", "DecodeStatus::ErrShort("),
-            ("runtime/decode/resource.rs", "DecodeStatus::ErrBadLength("),
             (
                 "runtime/decode/resource.rs",
                 "DecodeStatus::ErrUnknownType(",
@@ -2774,8 +2771,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "res_vertex_layout_count_oob",
             "res_vertex_layout_entry_oob",
             "res_vertex_layout_offset_oob",
-            "res_wide_tlv_bad_length",
-            "res_wide_tlv_trailing_bytes",
         ],
     },
     // The always-on censuses. They are not declines in the "I refused your

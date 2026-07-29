@@ -1156,8 +1156,10 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "slab_block",
 ];
 
-static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] = [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
-static ALLOC_SITE_BYTES: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] = [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+static ALLOC_SITE_BYTES: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
 /// Allocations since the last emit; one line per this many, so the rate is
 /// self-clocked and an idle boot stays silent.
 static ALLOC_WINDOW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1540,7 +1542,6 @@ mod host_import_budget_tests {
             ]
         );
     }
-
 }
 
 #[cfg(test)]

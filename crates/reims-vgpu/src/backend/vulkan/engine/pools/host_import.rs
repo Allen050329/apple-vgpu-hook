@@ -271,8 +271,16 @@ mod window_occupancy_tests {
             occ.mark(mib * OCCUPANCY_GRANULE, 16 << 10);
         }
         assert_eq!(occ.chunks_touched(1), 4, "four distinct megabytes");
-        assert_eq!(occ.chunks_touched(4), 3, "MiB 0 and 3 share one 4 MiB chunk");
-        assert_eq!(occ.chunks_touched(256), 2, "MiB 0/3/200 share one, 900 alone");
+        assert_eq!(
+            occ.chunks_touched(4),
+            3,
+            "MiB 0 and 3 share one 4 MiB chunk"
+        );
+        assert_eq!(
+            occ.chunks_touched(256),
+            2,
+            "MiB 0/3/200 share one, 900 alone"
+        );
     }
 
     /// A run spanning granules marks all of them, and one that would run past
@@ -284,7 +292,11 @@ mod window_occupancy_tests {
         assert_eq!(occ.chunks_touched(1), 5);
         let mut past = WindowOccupancy::default();
         past.mark(1 << 30, 1 << 20);
-        assert_eq!(past.chunks_touched(1), 0, "past the cap belongs to the next bucket");
+        assert_eq!(
+            past.chunks_touched(1),
+            0,
+            "past the cap belongs to the next bucket"
+        );
     }
 
     /// A zero-length resolve still names one granule; the caller refuses it
@@ -540,11 +552,17 @@ mod candidate_walk_tests {
         // Both ways a budget can refuse: the region count and the byte cap.
         let (admitted, reads) = walk_cost(HOST_IMPORT_REGION_CAP, 0);
         assert!(!admitted, "the region cap must refuse");
-        assert_eq!(reads, base, "a refused budget must not read /proc/self/maps");
+        assert_eq!(
+            reads, base,
+            "a refused budget must not read /proc/self/maps"
+        );
 
         let (admitted, reads) = walk_cost(0, HOST_IMPORT_TOTAL_BYTE_CAP);
         assert!(!admitted, "the byte cap must refuse");
-        assert_eq!(reads, base, "a refused budget must not read /proc/self/maps");
+        assert_eq!(
+            reads, base,
+            "a refused budget must not read /proc/self/maps"
+        );
 
         // The converse: the counter does move when the walk happens, so the two
         // readings above are an ordering result and not a dead probe.

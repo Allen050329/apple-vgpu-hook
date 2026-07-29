@@ -92,7 +92,13 @@ pub fn store_texture(
     height: u32,
     bgra: Vec<u8>,
 ) {
-    store_into(&mut state.host_texture_surfaces, texture_ref, width, height, bgra);
+    store_into(
+        &mut state.host_texture_surfaces,
+        texture_ref,
+        width,
+        height,
+        bgra,
+    );
 }
 
 pub fn get_texture(
@@ -449,7 +455,6 @@ pub fn get_gva_with_owner(
     }
     Some((&e.bgra[..need], e.host_gen, e.producer_object_type))
 }
-
 
 /// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {

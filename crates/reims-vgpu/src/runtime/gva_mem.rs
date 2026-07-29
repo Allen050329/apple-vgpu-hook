@@ -332,7 +332,10 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
         // reached from two sites is two findings, and a latch keyed on
         // `(arm, task, by)` alone would show whichever ran first and hide the
         // other for the whole process.
-        if crate::observe::first_sight(gate.slug(), latch_key(task_id, by, std::panic::Location::caller())) {
+        if crate::observe::first_sight(
+            gate.slug(),
+            latch_key(task_id, by, std::panic::Location::caller()),
+        ) {
             // `by` is the gate's own answer and it is also the only answer the
             // gate's alias predicate can give — it searches `task >> 1` alone,
             // so reading `by == task >> 1` back as a finding measures the
@@ -948,7 +951,11 @@ mod tests {
         assert_ne!(key(1, 0), key(2, 0));
         assert_ne!(key(1, 0), key(1, 1));
         let loc = std::panic::Location::caller();
-        assert_eq!(latch_key(1, 0, loc), latch_key(1, 0, loc), "and it is stable");
+        assert_eq!(
+            latch_key(1, 0, loc),
+            latch_key(1, 0, loc),
+            "and it is stable"
+        );
     }
 
     /// Both refusal arms must keep their own slug. They are the same *decision*
@@ -1008,7 +1015,10 @@ mod tests {
             matches!(err, MemError::Unresolved(_)),
             "task 5's own walk must be what answers, got {err:?}"
         );
-        assert_eq!(buf, [0u8; 4], "and no neighbour's bytes may reach the caller");
+        assert_eq!(
+            buf, [0u8; 4],
+            "and no neighbour's bytes may reach the caller"
+        );
     }
 
     /// When neither task can serve the read, the caller must receive the
@@ -1023,17 +1033,13 @@ mod tests {
         let host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.define_task(6, 0x1_0000, 0));
-        assert!(state.tasks[6].active, "the slot is live; only the walk fails");
+        assert!(
+            state.tasks[6].active,
+            "the slot is live; only the walk fails"
+        );
         let mut buf = [0u8; 4];
-        let err = read_task_gva_by_id(
-            &host,
-            &state.tasks,
-            6,
-            0x1000,
-            &mut buf,
-            PAGE_SHIFT_X86,
-        )
-        .unwrap_err();
+        let err = read_task_gva_by_id(&host, &state.tasks, 6, 0x1000, &mut buf, PAGE_SHIFT_X86)
+            .unwrap_err();
         assert_eq!(
             err,
             MemError::NoTaskDirectory,
@@ -1049,9 +1055,8 @@ mod tests {
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut buf = [0u8; 4];
         let oob = state.tasks.len() as u32 + 4;
-        let err =
-            read_task_gva_by_id(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
-                .unwrap_err();
+        let err = read_task_gva_by_id(&host, &state.tasks, oob, 0x1000, &mut buf, PAGE_SHIFT_X86)
+            .unwrap_err();
         assert_eq!(err, MemError::NoSuchTask);
     }
 
@@ -1088,7 +1093,11 @@ mod tests {
             "the same arm, now for a different reason"
         );
         assert_eq!(state.task_own_span_count(1), 1);
-        assert_eq!(state.task_own_span_count(0), 1, "counts are per task, not total");
+        assert_eq!(
+            state.task_own_span_count(0),
+            1,
+            "counts are per task, not total"
+        );
     }
 
     /// `no_spans` names what the gate searched, not what the registry holds, so
@@ -1104,7 +1113,11 @@ mod tests {
             WriteGate::NoSpans,
             "nothing filed by 11 or 5, so the bounds check did not run"
         );
-        assert_eq!(state.task_map_span_count(), 1, "yet the registry is not empty");
+        assert_eq!(
+            state.task_map_span_count(),
+            1,
+            "yet the registry is not empty"
+        );
         assert_eq!(state.tasks_covering(0x4000, 0x100), vec![7]);
     }
 

@@ -1,6 +1,6 @@
 //! Command-stream framing decoder (port of `host/utils/reims-vgpu-stream-decode`).
 
-use crate::contract::endian::{ld32, ld64};
+use crate::contract::endian::ld32;
 use crate::contract::size_fits_u32;
 
 pub const SEGMENT_TYPE_RENDER: u8 = 0;
@@ -94,10 +94,6 @@ pub fn segment_type_name(type_: u32) -> &'static str {
     }
 }
 
-pub fn segment_type_is_command_family(type_: u32) -> bool {
-    matches!(type_, 0..=3)
-}
-
 /// What the stream walker should do with a segment family.
 ///
 /// This exists so the walker's "everything else" arm is a decision rather than a
@@ -136,14 +132,6 @@ pub fn segment_disposition(type_: u8) -> SegmentDisposition {
         | SEGMENT_TYPE_INFO => SegmentDisposition::Walk,
         SEGMENT_TYPE_PROTECTION_OPTIONS => SegmentDisposition::Envelope,
         _ => SegmentDisposition::Unknown,
-    }
-}
-
-pub fn trace_u32(value: u64) -> u32 {
-    if value > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        value as u32
     }
 }
 
@@ -221,11 +209,6 @@ pub fn decode_next_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, 
     };
     *cursor += segment_len;
     Ok(out)
-}
-
-pub fn decode_first_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, DecodeStatus> {
-    *cursor = 0;
-    decode_next_segment(bytes, cursor)
 }
 
 fn validate_segment(bytes: &[u8], segment: &Segment) -> Result<usize, DecodeStatus> {
@@ -333,26 +316,6 @@ pub fn decode_first_record(
     decode_next_record(bytes, segment, cursor)
 }
 
-pub fn decode_protection_options(
-    bytes: &[u8],
-    segment: &Segment,
-) -> Result<(bool, u64), DecodeStatus> {
-    let _command_end = validate_segment(bytes, segment)?;
-    if segment.type_ != SEGMENT_TYPE_PROTECTION_OPTIONS {
-        return Err(DecodeStatus::ErrArgs(
-            "stream_protection_wrong_segment_type",
-        ));
-    }
-    if segment.command_length == 0 {
-        return Ok((false, 0));
-    }
-    if segment.command_length as usize != PROTECTION_OPTIONS_PAYLOAD_LEN {
-        return Err(DecodeStatus::ErrBadLength("stream_protection_payload_len"));
-    }
-    let value = ld64(&bytes[segment.command_offset as usize..]);
-    Ok((true, value))
-}
-
 /// Iterate all segments.
 pub fn iter_segments(bytes: &[u8]) -> Result<Vec<Segment>, DecodeStatus> {
     let mut cursor = 0usize;
@@ -393,7 +356,7 @@ mod tests {
     fn empty_stream_done() {
         let mut c = 0;
         assert_eq!(
-            decode_first_segment(&[], &mut c).unwrap_err(),
+            decode_next_segment(&[], &mut c).unwrap_err(),
             DecodeStatus::Done
         );
         assert_eq!(c, 0);
@@ -410,7 +373,6 @@ mod tests {
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].type_, SEGMENT_TYPE_BLIT);
         assert_eq!(segs[0].index, 0);
-        assert!(segment_type_is_command_family(segs[0].type_ as u32));
 
         let mut rc = 0;
         let rec = decode_first_record(&stream, &segs[0], &mut rc).unwrap();
@@ -495,24 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn protection_options() {
-        let mut stream = Vec::new();
-        let mut payload = [0u8; 8];
-        crate::contract::endian::st64(&mut payload, 0x1122334455667788);
-        push_segment(&mut stream, SEGMENT_TYPE_PROTECTION_OPTIONS, &payload);
-        let segs = iter_segments(&stream).unwrap();
-        let (has, val) = decode_protection_options(&stream, &segs[0]).unwrap();
-        assert!(has);
-        assert_eq!(val, 0x1122334455667788);
-        // record walker DONE
-        let mut c = 0;
-        assert_eq!(
-            decode_first_record(&stream, &segs[0], &mut c).unwrap_err(),
-            DecodeStatus::Done
-        );
-    }
-
-    #[test]
     fn multi_segment_indices() {
         let mut stream = Vec::new();
         push_segment(&mut stream, SEGMENT_TYPE_RENDER, &[]);
@@ -521,7 +465,6 @@ mod tests {
         assert_eq!(segs[0].index, 0);
         assert_eq!(segs[1].index, 1);
         assert_eq!(segment_type_name(0), "render");
-        assert_eq!(trace_u32(u64::MAX), u32::MAX);
     }
 
     #[test]
@@ -530,7 +473,7 @@ mod tests {
         for n in 0..32usize {
             let bytes = vec![0xAAu8; n];
             let mut c = 0;
-            let _ = decode_first_segment(&bytes, &mut c);
+            let _ = decode_next_segment(&bytes, &mut c);
         }
     }
 }

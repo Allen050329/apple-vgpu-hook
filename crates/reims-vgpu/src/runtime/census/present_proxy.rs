@@ -172,7 +172,6 @@ pub fn note_t11_large_fallback(mid: u32, map_gen: u32, probe: Option<(u64, bool)
 /// Single mutex so unit tests and concurrent presents cannot interleave counters.
 static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 
-
 /// Always-on visibility for a **silently-degraded MRT draw**: a draw whose color
 /// list has >1 attachment (the guest asked for multiple render targets) but whose
 /// secondary attachments could not be built, so `build_secondary_targets`
@@ -254,7 +253,6 @@ pub fn note_mrt_mask_bind_miss(reason: MaskBindMiss, width: u32, height: u32) {
         .fail();
 }
 
-
 /// Test-only isolation: proxy state is process-global, so parallel tests that
 /// reset a device (`lib.rs device_reset` → [`reset_for_device`]) or drive
 /// product note paths mutate counters and anchors out from under a multi-call
@@ -298,7 +296,6 @@ fn reset_state_inner() {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     *st = ThrashState::new();
 }
-
 
 fn append_thrash_file(msg: &str) {
     // Dedicated always-on file for `grep THRASH /tmp/reims-vgpu-thrash.log`.
@@ -610,8 +607,6 @@ pub mod hitch {
     }
 }
 
-
-
 /// Always-on windowed census of where a FULL present capture sourced its frame.
 ///
 /// `capture_present_frame` reads the GPU resident (`read_resident_bgra`: the
@@ -769,8 +764,6 @@ pub mod window_publish {
     }
 }
 
-
-
 /// Always-on census of the render-deferred **window-cap force-flush**
 /// (`import_present::try_defer_present_store` flushing the oldest window when the
 /// live population exceeds `RENDER_DEFERRED_WINDOW_CAP`). The cap bounds the
@@ -866,7 +859,6 @@ pub mod cap_flush {
         }
     }
 }
-
 
 /// Record a failed DisplaySwap capture (retain not updated).
 pub fn note_capture_fail(mapping_id: u32, width: u32, height: u32, generation: u32) {
@@ -1104,8 +1096,6 @@ mod tests {
         hitch::reset();
     }
 
-
-
     /// `note_stale_online_pending` counts every post-converge stale-ONLINE IRQ but
     /// logs its always-on line only once per boot (VBL is ~60 Hz — a per-call line
     /// would flood). The count keeps climbing after the latched line.
@@ -1231,9 +1221,7 @@ mod tests {
             n_other + 1
         );
     }
-
 }
-
 
 /// Cap-pressure census: the always-on signal for the "a cap blew and render fell
 /// off a cliff" class (registry / sampled-cache / graveyard evictions). The
@@ -1476,4 +1464,3 @@ pub mod cap_pressure {
         }
     }
 }
-

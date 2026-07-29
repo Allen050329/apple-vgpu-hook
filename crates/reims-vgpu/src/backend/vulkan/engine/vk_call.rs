@@ -40,7 +40,6 @@ use crate::observe::Decline;
 /// stays distinguishable in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VkOp {
-
     // ---- mod.rs `read_target_inner` — the full-frame CPU readback rail ----
     /// `vkResetCommandBuffer` before recording the readback copy.
     ReadbackResetCb,
@@ -380,7 +379,6 @@ impl Decline for VkCall {
     /// this type's own `Decline` impl.
     fn slug(&self) -> &'static str {
         match self.op {
-
             VkOp::ReadbackResetCb => "vk_readback_reset_cb",
             VkOp::ReadbackBeginCb => "vk_readback_begin_cb",
             VkOp::ReadbackEndCb => "vk_readback_end_cb",
@@ -397,7 +395,6 @@ impl Decline for VkCall {
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
             VkOp::StorageReadSubmit => "vk_storage_read_submit",
             VkOp::StorageReadMap => "vk_storage_read_map",
-
 
             VkOp::ExportPresentResetCb => "vk_export_present_reset_cb",
             VkOp::ExportPresentBeginCb => "vk_export_present_begin_cb",

@@ -151,7 +151,10 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
         let base = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
         st32(&mut device_desc[base + DEVICE_PLANE_OFFSET..], *off);
         st32(&mut device_desc[base + DEVICE_PLANE_SIZE..], *size);
-        st64(&mut device_desc[base + DEVICE_PLANE_DIMS..], plane_dims(*w, *h));
+        st64(
+            &mut device_desc[base + DEVICE_PLANE_DIMS..],
+            plane_dims(*w, *h),
+        );
         st32(&mut device_desc[base + DEVICE_PLANE_BPR..], *bpr);
         st16(&mut device_desc[base + DEVICE_PLANE_BPE..], *bpe);
     }
@@ -163,16 +166,54 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
     let mut type5_desc = vec![0u8; 8];
     st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
     type5_desc.extend_from_slice(&[
-        0x2f, 0, 0, 0, // kind
-        0x30, 0, 0, 0, // blob_len
-        10, 0, 0, 0, // own_ref
-        0x42, 0x01, MTL_FORMAT_R8_UNORM as u8, (MTL_FORMAT_R8_UNORM >> 8) as u8,
-        4, 0, 0, 0, // view width
-        4, 0, 0, 0, // view height
-        1, 0, 0, 0, // depth
-        1, 0, 1, 0, 1, 0, 0x10, 0, // trailer
-        0, 0, 0, 0, 0, 0, 0, 0, // reserved
-        2, 0, 0, 0, // IOSurface plane index = 2 (alpha)
+        0x2f,
+        0,
+        0,
+        0, // kind
+        0x30,
+        0,
+        0,
+        0, // blob_len
+        10,
+        0,
+        0,
+        0, // own_ref
+        0x42,
+        0x01,
+        MTL_FORMAT_R8_UNORM as u8,
+        (MTL_FORMAT_R8_UNORM >> 8) as u8,
+        4,
+        0,
+        0,
+        0, // view width
+        4,
+        0,
+        0,
+        0, // view height
+        1,
+        0,
+        0,
+        0, // depth
+        1,
+        0,
+        1,
+        0,
+        1,
+        0,
+        0x10,
+        0, // trailer
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0, // reserved
+        2,
+        0,
+        0,
+        0, // IOSurface plane index = 2 (alpha)
     ]);
     assert!(gva_mem::write_task_gva(
         &mut host,
@@ -227,7 +268,10 @@ fn handoff_buffer_preview_writes_short_buffers_whole_and_caps_long_ones() {
     let small = vec![0xa5u8; 64];
     assert_eq!(handoff_buffer_preview(&small), &small[..]);
     let exact = vec![0x5au8; HANDOFF_BUFFER_PREVIEW_LEN];
-    assert_eq!(handoff_buffer_preview(&exact).len(), HANDOFF_BUFFER_PREVIEW_LEN);
+    assert_eq!(
+        handoff_buffer_preview(&exact).len(),
+        HANDOFF_BUFFER_PREVIEW_LEN
+    );
     let big = vec![0x11u8; HANDOFF_BUFFER_PREVIEW_LEN * 4 + 7];
     let preview = handoff_buffer_preview(&big);
     assert_eq!(preview.len(), HANDOFF_BUFFER_PREVIEW_LEN);
@@ -701,9 +745,7 @@ fn dispatch_nometal_with_texture_binds() {
         "vulkan path attempts encode, got {st:?}"
     );
     // Nested short-circuit remains NoMetal on Linux (SPI not wired).
-    let mut session = crate::runtime::compute_session::ComputeSession {
-        control_depth: 0,
-    };
+    let mut session = crate::runtime::compute_session::ComputeSession { control_depth: 0 };
     let st2 = execute_dispatch_nested(&mut state, &mut host, 1, &acc, &cmd, &mut session);
     assert_eq!(st2, ComputeStatus::NoMetal("compute_nested_no_vulkan_path"));
 }

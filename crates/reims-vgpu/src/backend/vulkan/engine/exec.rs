@@ -438,13 +438,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     } else {
                         req.first_vertex as usize
                     };
-                    first_record
-                        .checked_add(last_record as usize)
-                        .ok_or({
-                            DrawError::DrawValidation(DrawValidationDecline::VertexRangeOverflow {
-                                location: attribute.location,
-                            })
-                        })?
+                    first_record.checked_add(last_record as usize).ok_or({
+                        DrawError::DrawValidation(DrawValidationDecline::VertexRangeOverflow {
+                            location: attribute.location,
+                        })
+                    })?
                 }
                 VertexStepFunction::PerInstance => {
                     let instance_count = req.instance_count.unwrap_or(1);
@@ -453,15 +451,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     } else {
                         (instance_count - 1) / attribute.step_rate
                     };
-                    req.base_instance
-                        .checked_add(relative_element)
-                        .ok_or({
-                            DrawError::DrawValidation(
-                                DrawValidationDecline::InstanceRangeOverflow {
-                                    location: attribute.location,
-                                },
-                            )
-                        })? as usize
+                    req.base_instance.checked_add(relative_element).ok_or({
+                        DrawError::DrawValidation(DrawValidationDecline::InstanceRangeOverflow {
+                            location: attribute.location,
+                        })
+                    })? as usize
                 }
             }
         };

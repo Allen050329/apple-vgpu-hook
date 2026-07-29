@@ -51,7 +51,6 @@ impl MemoryTopology {
             Self::Discrete => "discrete",
         }
     }
-
 }
 
 /// What a piece of memory is *for*. The engine asks for a class; this module

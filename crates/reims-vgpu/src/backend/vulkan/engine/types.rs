@@ -1129,9 +1129,9 @@ impl Default for TargetIdentity {
 impl TargetIdentity {
     pub fn width(&self) -> u32 {
         match self {
-            Self::Surface { width, .. }
-            | Self::Texture { width, .. }
-            | Self::Gva { width, .. } => *width,
+            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
+                *width
+            }
             Self::Anonymous { .. } => 0,
         }
     }
