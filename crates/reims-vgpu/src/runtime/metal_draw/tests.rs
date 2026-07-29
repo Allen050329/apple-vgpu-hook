@@ -2359,21 +2359,23 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
     assert_eq!(&back[..4], &[30, 20, 10, 255]);
 }
 
-/// The RGBA8 target store reads the MapMemory2 gate **without obeying it yet**.
+/// A render-target Store outside the writing task's MapMemory2 spans still
+/// reaches guest RAM, and that is deliberate.
 ///
-/// `write_gva_rgba8` is the one product writer into guest RAM with no map-span
-/// authorisation, and its sibling `write_task_gva_product` refuses `Outside`.
-/// Making this one refuse too is the intent, but it cannot be done blind: if
-/// render Stores address a GVA space MapMemory2 does not describe, refusing
-/// blanks the screen. So the arm is read and reported first, and this pins the
-/// report-only contract so the flip to refusing is a visible behaviour change
-/// with a failing test rather than a silent one.
+/// `write_task_gva_product` refuses `WriteGate::Outside`, and making
+/// `write_gva_rgba8` match looks like an obvious tidy-up. It was measured
+/// instead: on a driven x86/Vulkan boot the gate read `exact=1155 no_spans=0
+/// outside=893` over 2048 Stores, so refusing here drops 44% of them and blanks
+/// the screen. MapMemory2 does not describe render targets — see the module note
+/// on `write_gva_rgba8` for the span enumeration and for why the `owners=` field
+/// cannot be used as a weaker gate either.
 ///
-/// The fixture declares a span for the writing task that deliberately does *not*
-/// cover the target, which is exactly `WriteGate::Outside` — the arm that will
-/// refuse later and must still write now.
+/// This test exists so that adding the gate fails loudly rather than silently
+/// costing half the frame. The fixture declares a span for the writing task that
+/// deliberately does *not* cover the target, which is exactly the arm that would
+/// refuse.
 #[test]
-fn an_rgba8_store_outside_the_tasks_declared_span_still_writes_and_is_reported() {
+fn an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -2428,7 +2430,8 @@ fn an_rgba8_store_outside_the_tasks_declared_span_still_writes_and_is_reported()
             &rgba,
         )
         .is_ok(),
-        "the gate is report-only here: an Outside store must still reach guest RAM"
+        "this writer is deliberately ungated: an Outside store must still reach \
+         guest RAM, or 44% of render Stores are lost"
     );
 
     // …and the bytes really landed, so this is not passing on a write that

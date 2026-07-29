@@ -308,17 +308,8 @@ pub fn write_task_gva<M: HostMemory>(
 /// Rendered as the repo-relative tail so the field stays short enough to sit on
 /// an always-on line: `runtime/blit_exec.rs:1039`.
 #[track_caller]
-pub(crate) fn via_caller() -> String {
-    via_caller_at(std::panic::Location::caller())
-}
-
-/// Render an already-captured [`std::panic::Location`] the same way.
-///
-/// `#[track_caller]` does not chain through a call body, so a writer that wants
-/// to name *its own* caller has to capture the location itself and hand it over.
-/// Both spellings render identically, which is what keeps the `via=` field
-/// comparable across the lines that use one and the lines that use the other.
-pub(crate) fn via_caller_at(loc: &std::panic::Location<'_>) -> String {
+fn via_caller() -> String {
+    let loc = std::panic::Location::caller();
     let file = loc.file();
     let tail = file.rfind("/src/").map_or(file, |i| &file[i + 5..]);
     format!("{tail}:{}", loc.line())
@@ -335,7 +326,7 @@ pub(crate) fn via_caller_at(loc: &std::panic::Location<'_>) -> String {
 /// neither has a bound worth relying on. This is a set key for suppressing
 /// repeats, not a value anything reads back. Takes the `Location` rather than
 /// its rendering so callers on a per-row path can key without allocating.
-pub(crate) fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
+fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     task_id.hash(&mut h);
