@@ -1192,6 +1192,16 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
 fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     use crate::runtime::census::srgb_census;
     srgb_census::reset_for_tests();
+    // The sink is append-only and shared with every other test in the binary,
+    // so this asserts a delta, not an absolute count.
+    // Count LINES, not substring hits: the slug appears twice per line, once as
+    // the event prefix and once as `reason=`.
+    let downgrade_lines = || {
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .map(|l| l.lines().filter(|l| l.starts_with("srgb_downgraded ")).count())
+            .unwrap_or(0)
+    };
+    let before = downgrade_lines();
 
     // Native-upload rail: sRGB resolves exactly as its linear sibling.
     assert_eq!(
@@ -1223,10 +1233,18 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         "channel swap still applied"
     );
 
-    let (total, per_site) = srgb_census::counts();
-    assert_eq!(total, 3, "every downgrade counted, none swallowed");
-    assert_eq!(per_site[srgb_census::site::LINEAR_NATIVE_UPLOAD], 2);
-    assert_eq!(per_site[srgb_census::site::TIGHT_LINEAR_LOAD], 1);
+    // Three distinct (site, format) pairs were downgraded above — two on the
+    // native-upload rail (RGBA8 and BGRA8 sRGB) and one on the tight-load rail
+    // — so the sink must carry three lines and name both rails. Read off the
+    // log rather than a counter: the line is what a boot has to show.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert_eq!(
+        downgrade_lines() - before,
+        3,
+        "every downgrade named, none swallowed"
+    );
+    assert!(log.contains(&format!("site={}", srgb_census::site::LINEAR_NATIVE_UPLOAD)));
+    assert!(log.contains(&format!("site={}", srgb_census::site::TIGHT_LINEAR_LOAD)));
 
     // A linear source must never touch the census, or the proxy floods and
     // stops distinguishing anything.
@@ -1236,7 +1254,11 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         dst.copy_from_slice(&native);
         true
     });
-    assert_eq!(srgb_census::counts().0, 0);
+    assert_eq!(
+        downgrade_lines() - before,
+        3,
+        "a linear source must add no line"
+    );
     srgb_census::reset_for_tests();
 }
 
