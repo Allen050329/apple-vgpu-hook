@@ -3803,19 +3803,34 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             let generation = next_mapping_content_generation(candidate.seed_generation);
             // Superseded stale windows intersecting this one are dead content:
             // drop them (never flush over the newer output) and release their
-            // pins — except our own identity, which the engine re-pinned.
-            for (victim, victim_generation) in
+            // pins — except our own *storage* identity, which the engine
+            // re-pinned.
+            //
+            // The `victim != key` exemption is about that re-pin, so it applies
+            // only to a compute window. A render window can sit at the very same
+            // key — same mapping, geometry, format and plane window — while its
+            // pixels are in a target resident the engine has not touched, so
+            // skipping it there would leak a display-sized pin for the boot.
+            // `release_window_pin` picks the registry from the owner.
+            for (victim, victim_owner) in
                 state.take_deferred_flush_windows(*mapping_id, key.surface_offset, key.span_end)
             {
-                if victim != key {
+                let ours = victim == key
+                    && matches!(victim_owner, crate::model::DeferredOwner::Storage { .. });
+                if !ours {
                     crate::observe::off(format!(
-                        "compute_writeback_deferred supersede mapping={mapping_id} victim={}x{} fmt={:#x} gen={victim_generation}",
-                        victim.width, victim.height, victim.pixel_format
+                        "compute_writeback_deferred supersede mapping={mapping_id} victim={}x{} fmt={:#x} owner={}",
+                        victim.width,
+                        victim.height,
+                        victim.pixel_format,
+                        crate::runtime::storage_flush::owner_slug(victim_owner)
                     ));
-                    crate::backend::vulkan::engine::unpin_resident_storage(&victim);
+                    crate::runtime::storage_flush::release_window_pin(&victim, victim_owner);
                 }
             }
-            state.compute_deferred_flush.insert(key, generation);
+            state
+                .compute_deferred_flush
+                .insert(key, crate::model::DeferredOwner::Storage { generation });
             state.index_deferred_alias_pages(*mapping_id);
             let _ = state.mark_mapping_written(*mapping_id);
             note_storage_residency_writeback(state, t);

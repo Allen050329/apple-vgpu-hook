@@ -162,6 +162,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // GVA Store landed as a deferred-writeback window (resident authoritative).
     #[cfg(feature = "backend-vulkan")]
     let mut gva_store_armed = false;
+    // Type-11 Store landed as a mapping-keyed deferred window (same contract).
+    #[cfg(feature = "backend-vulkan")]
+    let mut surface_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
@@ -212,6 +215,32 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
+            #[cfg(feature = "backend-vulkan")]
+            Ok(M2vDrawSpan::ResidentSurfaceStore) => {
+                if arm_surface_deferred_store(state, host, req) {
+                    note_type11_store_route("surface_deferred");
+                    surface_store_armed = true;
+                    crate::observe::line(format!(
+                        "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={}",
+                        req.pipeline_ref,
+                        req.width,
+                        req.height,
+                        req.colors.first().map(|c| c.mapping_id).unwrap_or(0)
+                    ));
+                } else {
+                    // Arm gate failed (a window that would not land, or a pin
+                    // refusal): land the Store now from the resident the draw
+                    // just produced.
+                    //
+                    // Unlike the GVA fallback this cannot route through
+                    // `draw_rgba`. That target is BGRA (`output_bgra` above), so
+                    // `read_target` returns physical B/G/R/A, and the Store block
+                    // below would hand those bytes to the RGBA writeback and
+                    // exchange red and blue in the guest's framebuffer.
+                    note_type11_store_route("surface_deferred_sync");
+                    surface_store_armed = land_surface_store_sync(state, host, req);
+                }
+            }
             Ok(M2vDrawSpan::None) => {
                 crate::observe::line(format!(
                     "linux_m2v_draw skip pipe={} (no color0 geom)",
@@ -245,6 +274,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // authoritative pixels — the contract Store lands on first access.
     #[cfg(feature = "backend-vulkan")]
     if gva_store_armed {
+        return (EncodeStatus::Ok, None);
+    }
+
+    // Deferred type-11 Store: the mapping-keyed window is armed and the target
+    // resident holds the authoritative pixels — the contract Store lands on
+    // first guest-side access.
+    #[cfg(feature = "backend-vulkan")]
+    if surface_store_armed {
         return (EncodeStatus::Ok, None);
     }
 
@@ -311,7 +348,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // `present_unbacked` gate is structurally dead on the
                         // CPU-portability Store path: no mapping's
                         // `dense_frame_seq` would ever advance.
-                        publish_cpu_portability_store(
+                        publish_surface_store(
                             state,
                             host,
                             c0.mapping_id,
@@ -2497,6 +2534,13 @@ enum M2vDrawSpan {
     /// land on first access (`storage_flush::flush_gva_one`).
     #[cfg(feature = "backend-vulkan")]
     ResidentGvaStore,
+    /// Final/single record of a type-11 (surface) render Store executed into
+    /// the registry resident with `skip_readback`: the caller arms a
+    /// mapping-keyed deferred window instead of the sync readback + CPU
+    /// writeback into the mapping's guest pages; those bytes land on first
+    /// guest-side access (`storage_flush::flush_render_one`).
+    #[cfg(feature = "backend-vulkan")]
+    ResidentSurfaceStore,
 }
 
 /// Name the guest-Store route this record actually took, once per distinct
@@ -2543,7 +2587,17 @@ fn note_type11_store_route(route: &'static str) {
     crate::observe::fail(format!("type11_store_route route={route}"));
 }
 
-fn publish_cpu_portability_store<M: HostMemory + HostOps>(
+/// Advance the guest-visible publish milestones for a type-11 Store whose
+/// pixels have landed in the mapping's guest pages.
+///
+/// Route-independent: the synchronous `cpu_portability` Store calls it inline,
+/// and the deferred render rail calls it from the flush that finally performs
+/// the same write (`storage_flush::flush_render_one`). Both have just proved
+/// the same thing — `write_rgba8_image_changed` verified geometry and landed a
+/// complete frame — and without it the `present_unbacked` gate is structurally
+/// dead on whichever route skips it, because no mapping's `dense_frame_seq`
+/// would advance.
+pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     mapping_id: u32,
@@ -3611,6 +3665,54 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
+        // Cross-pass resident Load for the type-11 rail — the mapping-keyed
+        // mirror of the GVA block above, and not optional. Arming a deferred
+        // Store evicts `surface_cache` for the mapping (a hit there would serve
+        // the pre-Store frame), so without this the seed arm below would find
+        // nothing and the composite would load from an undefined attachment.
+        // The two halves land together or not at all.
+        #[cfg(feature = "backend-vulkan")]
+        if !chain_load_from_target && gpu_only_content_allowed {
+            if let Some(c0) = req.colors.first() {
+                if c0.load_action == PASS_LOAD_ACTION_LOAD
+                    && c0.mapping_id != 0
+                    && c0.target_seed_rgba.is_none()
+                    && req.target_seed_rgba.is_none()
+                {
+                    let identity =
+                        crate::runtime::present_identity::surface_identity(state, c0.mapping_id, w, h);
+                    // The window has to be the *render* kind at this exact
+                    // identity: a compute window on the same mapping holds its
+                    // pixels in a storage resident that `LoadFromTarget` cannot
+                    // read, and must go down the flush path instead.
+                    let render_window_here = state.compute_deferred_flush.iter().any(|(k, o)| {
+                        k.mapping_id == c0.mapping_id
+                            && k.width == w
+                            && k.height == h
+                            && matches!(o, crate::model::DeferredOwner::Render { .. })
+                    });
+                    let will_target_registry = c0.store_action == PASS_STORE_ACTION_STORE
+                        && (!writeback_guest
+                            || surface_store_defer_eligible(state, req).is_some());
+                    if render_window_here
+                        && will_target_registry
+                        && crate::backend::vulkan::engine::resident_content_ready(&identity)
+                    {
+                        chain_load_from_target = true;
+                    } else {
+                        // Any mismatch lands every window on the mapping first,
+                        // so the seed arm below reads fresh guest/cache bytes.
+                        crate::runtime::storage_flush::flush_intersecting(
+                            state,
+                            host,
+                            c0.mapping_id,
+                            0,
+                            u64::MAX,
+                        );
+                    }
+                }
+            }
+        }
         if let Some(c0) = req.colors.first() {
             match c0.load_action {
                 #[cfg(feature = "backend-vulkan")]
@@ -3798,6 +3900,30 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     resources.skip_readback = true;
                     gva_resident_store = true;
                 }
+            }
+        }
+        // Deferred type-11 Store rail: same shape as the GVA one above, for the
+        // route `store_routes` names `cpu_portability`. That route reads the
+        // whole target back and CPU-copies it into the mapping's guest pages on
+        // every composite Store; the resident is authoritative instead, and the
+        // copy happens only if a guest-side reader asks for those bytes.
+        #[cfg(feature = "backend-vulkan")]
+        let mut surface_resident_store = false;
+        #[cfg(feature = "backend-vulkan")]
+        if store_is_store && writeback_guest && surface_store_defer_eligible(state, req).is_some() {
+            if let Some(identity) = render_chain_identity(state, req) {
+                resources.target_identity = Some(identity);
+                resources.skip_readback = true;
+                // BGRA output is not an optimization here, it is what makes the
+                // rail work. With the readback deferred, the host window's frame
+                // comes from `scanout::try_capture_from_resident`, and
+                // `engine::read_resident_bgra` refuses any slot whose `bgra` flag
+                // is false — an RGBA resident would capture nothing and the
+                // window would hold a stale frame. It also means the eventual
+                // flush copies image→buffer straight into guest scanout order
+                // with no CPU swizzle.
+                resources.output_bgra = true;
+                surface_resident_store = true;
             }
         }
         #[cfg(feature = "backend-vulkan")]
@@ -4345,6 +4471,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if gva_resident_store {
             return Ok(M2vDrawSpan::ResidentGvaStore);
         }
+        #[cfg(feature = "backend-vulkan")]
+        if surface_resident_store {
+            return Ok(M2vDrawSpan::ResidentSurfaceStore);
+        }
         Ok(M2vDrawSpan::Rgba(pixels))
     }
     #[cfg(not(feature = "backend-vulkan"))]
@@ -4449,6 +4579,221 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 /// count lands the oldest window first so pinned pressure stays bounded.
 #[cfg(feature = "backend-vulkan")]
 const GVA_DEFERRED_WINDOW_CAP: usize = 16;
+
+/// Bound on live type-11 render windows. Each one pins a display-sized target
+/// resident, so an unbounded population is the "~260 stale residents
+/// (~516 MiB) pinned for the guest lifetime" shape. Sized like the GVA cap: a
+/// composite touches a handful of layers, so this is headroom, not a working
+/// set the guest routinely exceeds.
+#[cfg(feature = "backend-vulkan")]
+const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
+
+/// Defer gate for a type-11 (surface) render Store.
+///
+/// All gates are protocol-shape checks, never content: the later flush has to
+/// be able to replay the synchronous Store *exactly*, so anything the sync
+/// route would have needed must be resolvable now. In particular the mapping's
+/// plane window must resolve, because the deferred window's guest byte range —
+/// which is what every reader intersects against to decide whether to flush —
+/// comes from it. A window with no range would be armed and then never found
+/// by a reader, which is the silent-stale-read failure this rail exists to
+/// avoid.
+#[cfg(feature = "backend-vulkan")]
+fn surface_store_defer_eligible(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+) -> Option<crate::model::ComputeStorageResidencyKey> {
+    let c0 = req.colors.first()?;
+    if c0.mapping_id == 0 {
+        return None;
+    }
+    if !crate::backend::vulkan::engine::deferred_gpu_only_content_allowed() {
+        return None;
+    }
+    let (w, h) = if req.width > 0 && req.height > 0 {
+        (req.width, req.height)
+    } else {
+        (c0.width, c0.height)
+    };
+    if w == 0 || h == 0 || w != c0.width || h != c0.height {
+        return None;
+    }
+    let m = state.mappings.get(&c0.mapping_id)?;
+    // The sync route calls `write_rgba8_image_changed`, which refuses unless
+    // the mapping's latched geometry equals the draw's. Deferring a Store that
+    // is going to be refused just moves the refusal somewhere it reads as a
+    // lost flush, so gate on the same thing up front.
+    let (surface_offset, surface_bpr, span_end) =
+        crate::runtime::mapping_write::type11_sample_window(m, w, h, c0.format)?;
+    Some(crate::model::ComputeStorageResidencyKey {
+        mapping_id: c0.mapping_id,
+        map_generation: m.map_generation,
+        surface_offset,
+        surface_bpr,
+        span_end,
+        width: w,
+        height: h,
+        pixel_format: c0.format,
+        texture_ref: 0,
+    })
+}
+
+/// Arm the deferred window for a type-11 render Store whose pixels the engine
+/// left on a pinned target resident.
+///
+/// Mirrors `arm_gva_deferred_store`, but the index is the mapping-keyed one the
+/// compute rail already uses, so every guest-page reader drains this window
+/// through the `flush_intersecting` choke point it already calls — no new
+/// trigger sites, and no way to cover one rail and miss the other.
+#[cfg(feature = "backend-vulkan")]
+fn arm_surface_deferred_store<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+) -> bool {
+    let Some(key) = surface_store_defer_eligible(state, req) else {
+        return false;
+    };
+    let identity = crate::backend::vulkan::engine::TargetIdentity::Surface {
+        id: key.mapping_id,
+        width: key.width,
+        height: key.height,
+        generation: key.map_generation as u64,
+    };
+    // Land any window this Store's pixels supersede before pinning. Unlike the
+    // compute supersede, this one *flushes* rather than drops: an intersecting
+    // window may cover guest bytes outside this Store's own range (a different
+    // plane window on the same mapping), and dropping it would lose those.
+    // `flush_intersecting` takes entries up front, so the pin below cannot race
+    // a flush of the identity we are about to claim.
+    if !crate::runtime::storage_flush::flush_intersecting(
+        state,
+        host,
+        key.mapping_id,
+        key.surface_offset,
+        key.span_end,
+    ) {
+        // A window that would not land is a window whose guest bytes are now
+        // unknown; arming over it would attribute its loss to this Store.
+        return false;
+    }
+    if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
+        return false;
+    }
+    // Land oldest-first through the normal choke point rather than taking the
+    // entry directly: `flush_intersecting` runs the fixpoint that drags in
+    // siblings overlapping the same guest bytes, and taking one window out from
+    // under that would leave those siblings holding stale ranges.
+    while render_window_count(state) >= SURFACE_DEFERRED_WINDOW_CAP {
+        let Some((mid, lo, hi)) = oldest_render_window_range(state) else {
+            break;
+        };
+        let before = render_window_count(state);
+        crate::runtime::storage_flush::flush_intersecting(state, host, mid, lo, hi);
+        // A window can legitimately survive a flush call — a condemned backing
+        // holds its obligation for the mapper to resolve. Stop rather than spin.
+        if render_window_count(state) >= before {
+            break;
+        }
+    }
+    // Stale encodes must not serve while the resident is authoritative — the
+    // Load seed below asks `surface_cache::get` first, and a hit there would
+    // hand the pre-Store frame back as if it were current.
+    crate::runtime::surface_cache::evict(state, key.mapping_id);
+    state.surface_deferred_seq = state.surface_deferred_seq.wrapping_add(1);
+    let armed_seq = state.surface_deferred_seq;
+    state.compute_deferred_flush.insert(
+        key,
+        crate::model::DeferredOwner::Render { armed_seq },
+    );
+    // Raw task-GVA reads that alias these physical pages flush through
+    // `flush_intersecting_task_gva`, which finds the mapping via this index.
+    state.index_deferred_alias_pages(key.mapping_id);
+    crate::observe::line(format!(
+        "surface_writeback_deferred mapping={} {}x{} fmt={:#x} pipe={} windows={}",
+        key.mapping_id,
+        key.width,
+        key.height,
+        key.pixel_format,
+        req.pipeline_ref,
+        state.compute_deferred_flush.len()
+    ));
+    true
+}
+
+/// Live [`crate::model::DeferredOwner::Render`] windows, for the population cap.
+#[cfg(feature = "backend-vulkan")]
+fn render_window_count(state: &DeviceState) -> usize {
+    state
+        .compute_deferred_flush
+        .values()
+        .filter(|o| matches!(o, crate::model::DeferredOwner::Render { .. }))
+        .count()
+}
+
+/// Land a type-11 render Store immediately from its BGRA target resident.
+///
+/// The fallback when the deferred window will not arm. The draw has already run
+/// with `skip_readback`, so the pixels exist only on the resident and there is
+/// no second source: a failure here is a lost Store and says so.
+///
+/// Returns whether the Store was handled — `false` lets the caller fall through
+/// to the generic no-pixels reporting.
+#[cfg(feature = "backend-vulkan")]
+fn land_surface_store_sync<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+) -> bool {
+    let Some(c0) = req.colors.first() else {
+        return false;
+    };
+    let (w, h) = if req.width > 0 && req.height > 0 {
+        (req.width, req.height)
+    } else {
+        (c0.width, c0.height)
+    };
+    // `read_resident_chain` names the same identity and fail-logs a lost
+    // resident; the bytes are BGRA because the draw set `output_bgra`.
+    let Some(bgra) = read_resident_chain(state, req) else {
+        return false;
+    };
+    let ok = crate::runtime::mapping_write::write_bgra8(
+        state,
+        host,
+        c0.mapping_id,
+        &bgra,
+        w.saturating_mul(4),
+        w,
+        h,
+    );
+    if ok {
+        publish_surface_store(state, host, c0.mapping_id, w, h, c0.format);
+    } else {
+        crate::observe::fail(format!(
+            "linux_m2v_store mid={} {w}x{h} pipe={} reason=surface_sync_write_fail fmt={:#x}",
+            c0.mapping_id, req.pipeline_ref, c0.format
+        ));
+    }
+    ok
+}
+
+/// Guest byte range of the oldest live render window, for the cap's
+/// oldest-first eviction. Compute windows are never chosen — they are bounded
+/// by their own dispatches, and evicting one here would land content this cap
+/// was not sized for.
+#[cfg(feature = "backend-vulkan")]
+fn oldest_render_window_range(state: &DeviceState) -> Option<(u32, u64, u64)> {
+    state
+        .compute_deferred_flush
+        .iter()
+        .filter_map(|(k, o)| match o {
+            crate::model::DeferredOwner::Render { armed_seq } => Some((*armed_seq, k)),
+            _ => None,
+        })
+        .min_by_key(|(seq, _)| *seq)
+        .map(|(_, k)| (k.mapping_id, k.surface_offset, k.span_end))
+}
 
 /// Defer gate for the final/single record of a GVA render Store: the record
 /// may keep its pixels on the engine registry resident and land guest bytes
@@ -4663,7 +5008,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     ));
     let wrote = mapping_write::write_rgba8_image_changed(state, host, mapping_id, rgba, None, w, h);
     if wrote {
-        publish_cpu_portability_store(state, host, mapping_id, w, h, fmt);
+        publish_surface_store(state, host, mapping_id, w, h, fmt);
     }
     wrote
 }

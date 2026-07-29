@@ -150,7 +150,7 @@ fn cpu_portability_store_publishes_composite() {
     state.present.height = height;
     state.present.frame_flush_seen = true;
 
-    publish_cpu_portability_store(
+    publish_surface_store(
         &mut state,
         &mut host,
         mid,

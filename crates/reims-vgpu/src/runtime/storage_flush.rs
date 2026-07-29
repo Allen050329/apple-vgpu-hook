@@ -80,8 +80,8 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
         pending.extend(state.take_deferred_flush_windows(mapping_id, span_lo, span_hi));
     }
     let mut ok = true;
-    for (key, generation) in pending {
-        ok &= flush_one(state, host, &key, generation);
+    for (key, owner) in pending {
+        ok &= flush_one(state, host, &key, owner);
     }
     ok
 }
@@ -789,8 +789,157 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
+/// Land one taken mapping-keyed window, dispatching on which rail holds its
+/// pixels. The key names the guest side identically for both; only the read
+/// differs (see [`crate::model::DeferredOwner`]).
 fn flush_one<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+    owner: crate::model::DeferredOwner,
+) -> bool {
+    match owner {
+        crate::model::DeferredOwner::Storage { generation } => {
+            flush_storage_one(state, host, key, generation)
+        }
+        crate::model::DeferredOwner::Render { .. } => flush_render_one(state, host, key),
+    }
+}
+
+/// The `TargetIdentity` a [`crate::model::DeferredOwner::Render`] window's
+/// pixels live under. `present_identity::surface_identity` derives the
+/// identity's `generation` from the mapping's `map_generation`, which is the
+/// same value the key latched at arm time — so the identity round-trips
+/// through the key with no extra state, and a mapping that has since been
+/// rebound produces a *different* identity, which is what the drift guard in
+/// [`flush_render_one`] then refuses on.
+#[cfg(feature = "backend-vulkan")]
+fn render_window_identity(
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Surface {
+        id: key.mapping_id,
+        width: key.width,
+        height: key.height,
+        generation: key.map_generation as u64,
+    }
+}
+
+/// Land a deferred **type-11 render Store**: read the pinned target resident
+/// and perform the CPU writeback into the mapping's guest pages that the Store
+/// itself skipped.
+///
+/// This is the same work `metal_draw`'s `cpu_portability` route used to do
+/// synchronously on every Store. Deferring it is a win rather than a
+/// rescheduling because the host-window present path never reads these guest
+/// pages — it exports the engine resident directly
+/// (`publish_window_frame` → `export_present_dmabuf`) — so the writeback is
+/// owed only to a guest-side reader that may never come.
+#[cfg(feature = "backend-vulkan")]
+fn flush_render_one<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> bool {
+    let started = std::time::Instant::now();
+    let identity = render_window_identity(key);
+    // Recycled-pages guard, identical in intent to the compute rail's below and
+    // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
+    // arm time (ReplacePhysical, unmap/remap) points at pages this window's
+    // pixels do not belong in, and writing them there lands a framebuffer in
+    // whatever owns that memory now. Unpin and drop rather than write.
+    let current = state
+        .mappings
+        .get(&key.mapping_id)
+        .map(|m| m.map_generation);
+    if current != Some(key.map_generation) {
+        crate::backend::vulkan::engine::unpin_resident_target(&identity);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
+    // The window's target is BGRA — the Store sets `output_bgra` where it
+    // defers — so this readback is already in guest scanout order and copies in
+    // with no channel conversion. Handing it to the RGBA writeback instead
+    // would exchange red and blue in the guest's framebuffer.
+    let bgra = match crate::backend::vulkan::engine::read_target(&identity) {
+        Ok(px) => px,
+        Err(e) => {
+            crate::backend::vulkan::engine::unpin_resident_target(&identity);
+            crate::observe::fail(format!(
+                "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} err={e}",
+                key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+            ));
+            return false;
+        }
+    };
+    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+    // `write_bgra8` re-resolves the mapping's pages and refuses a geometry
+    // mismatch, so what the guest ends up with is what the synchronous Store
+    // would have written, just later. It also re-populates `surface_cache`,
+    // which the arm evicted, so a subsequent Load seed reads fresh content.
+    let ok = crate::runtime::mapping_write::write_bgra8(
+        state,
+        host,
+        key.mapping_id,
+        &bgra,
+        key.width.saturating_mul(4),
+        key.width,
+        key.height,
+    );
+    if ok {
+        // Same completeness proof the synchronous route stated: the write
+        // verified geometry and landed a whole frame, so the guest-visible
+        // publish milestones advance. Without this the `present_unbacked` gate
+        // is structurally dead on the deferred route, exactly as it would be on
+        // the sync one.
+        crate::runtime::metal_draw::publish_surface_store(
+            state,
+            host,
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+        );
+    } else {
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+    }
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::observe::line(format!(
+        "render_deferred_flush mapping={} {}x{} fmt={:#x} ok={} bytes={} us={}",
+        key.mapping_id,
+        key.width,
+        key.height,
+        key.pixel_format,
+        ok as u8,
+        bgra.len(),
+        started.elapsed().as_micros()
+    ));
+    ok
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn flush_render_one<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    _host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> bool {
+    // No engine ⇒ nothing can have deferred; drop the obligation fail-visibly.
+    let _ = state;
+    crate::observe::fail(format!(
+        "deferred_flush_lost kind=render mapping={} reason=no_backend",
+        key.mapping_id
+    ));
+    false
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn flush_storage_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
@@ -894,7 +1043,7 @@ fn flush_one<M: HostMemory + HostOps>(
 }
 
 #[cfg(not(feature = "backend-vulkan"))]
-fn flush_one<M: HostMemory + HostOps>(
+fn flush_storage_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     _host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
@@ -913,13 +1062,49 @@ fn flush_one<M: HostMemory + HostOps>(
 /// without host access). Each drop is fail-visible.
 pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
     let dropped = state.take_deferred_flush_windows(mapping_id, 0, u64::MAX);
-    for (key, generation) in dropped {
+    for (key, owner) in dropped {
         crate::observe::fail(format!(
-            "deferred_flush_dropped mapping={} reason={reason} {}x{} fmt={:#x} gen={generation}",
-            key.mapping_id, key.width, key.height, key.pixel_format
+            "deferred_flush_dropped mapping={} reason={reason} {}x{} fmt={:#x} owner={}",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            owner_slug(owner)
         ));
+        // The two rails pin different registries, so the release has to follow
+        // the owner. Unpinning storage for a render window would leave the
+        // target resident pinned for the life of the boot — the "~260 stale
+        // residents (~516 MiB)" shape — while reporting a clean teardown.
         #[cfg(feature = "backend-vulkan")]
-        crate::backend::vulkan::engine::unpin_resident_storage(&key);
+        release_window_pin(&key, owner);
+    }
+}
+
+/// Release whichever registry pin a taken window held.
+///
+/// Every site that takes a window and does not flush it must go through this
+/// rather than calling `unpin_resident_storage` directly: the two rails pin
+/// different registries under different keys, and picking the wrong one both
+/// leaks the real pin and silently succeeds.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn release_window_pin(
+    key: &crate::model::ComputeStorageResidencyKey,
+    owner: crate::model::DeferredOwner,
+) {
+    match owner {
+        crate::model::DeferredOwner::Storage { .. } => {
+            crate::backend::vulkan::engine::unpin_resident_storage(key)
+        }
+        crate::model::DeferredOwner::Render { .. } => {
+            crate::backend::vulkan::engine::unpin_resident_target(&render_window_identity(key))
+        }
+    }
+}
+
+pub(crate) fn owner_slug(owner: crate::model::DeferredOwner) -> &'static str {
+    match owner {
+        crate::model::DeferredOwner::Storage { .. } => "compute",
+        crate::model::DeferredOwner::Render { .. } => "render",
     }
 }
 
@@ -1030,7 +1215,7 @@ mod tests {
         // the mapping is at 5, and the content generation is 3. Only one pair
         // of those is what the guard compares.
         m.map_generation = 5;
-        state.compute_deferred_flush.insert(key(9, 0, 256), 3);
+        state.compute_deferred_flush.insert(key(9, 0, 256), crate::model::DeferredOwner::Storage { generation: 3 });
         let cap = crate::observe::FailCapture::start();
         assert!(!super::flush_intersecting(
             &mut state,
@@ -1077,7 +1262,7 @@ mod tests {
             m.map_generation = 2;
             m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
-        state.compute_deferred_flush.insert(k, 3);
+        state.compute_deferred_flush.insert(k, crate::model::DeferredOwner::Storage { generation: 3 });
         // The guest deletes the backing; the window is kept for the fingerprint
         // decision and the page list moves to `condemned_entries`.
         assert!(state.condemn_surface_backing(9));
@@ -1097,7 +1282,7 @@ mod tests {
         let mut host = FakeHost::new();
         // Window over an unmapped mapping: the flush must fail closed
         // (fail-visible loss), remove the window, and return false.
-        state.compute_deferred_flush.insert(key(9, 0, 4096), 3);
+        state.compute_deferred_flush.insert(key(9, 0, 4096), crate::model::DeferredOwner::Storage { generation: 3 });
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
         assert!(!ok, "lost window must report failure");
         assert!(
@@ -1105,7 +1290,7 @@ mod tests {
             "taken windows never return to the map"
         );
         // Disjoint mapping id: untouched.
-        state.compute_deferred_flush.insert(key(10, 0, 4096), 3);
+        state.compute_deferred_flush.insert(key(10, 0, 4096), crate::model::DeferredOwner::Storage { generation: 3 });
         assert!(super::flush_intersecting(
             &mut state,
             &mut host,
@@ -1156,8 +1341,8 @@ mod tests {
             m.page_entries = vec![page_entry(pfn)];
         }
         let ckey = |mapping_id: u32| key(mapping_id, 0, 0x1000);
-        state.compute_deferred_flush.insert(ckey(9), 3);
-        state.compute_deferred_flush.insert(ckey(10), 3);
+        state.compute_deferred_flush.insert(ckey(9), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(ckey(10), crate::model::DeferredOwner::Storage { generation: 3 });
         // Product defer sites index pages at defer time.
         state.index_deferred_alias_pages(9);
         state.index_deferred_alias_pages(10);
@@ -1199,9 +1384,9 @@ mod tests {
             m.mapped = true;
             m.page_entries = vec![page_entry(pfn)];
         }
-        state.compute_deferred_flush.insert(key(9, 0, 256), 3);
+        state.compute_deferred_flush.insert(key(9, 0, 256), crate::model::DeferredOwner::Storage { generation: 3 });
         let disjoint = key(10, 0, 0x1000);
-        state.compute_deferred_flush.insert(disjoint, 3);
+        state.compute_deferred_flush.insert(disjoint, crate::model::DeferredOwner::Storage { generation: 3 });
         // Linear windows never name the mapping: one aliases mapping 9's
         // physical page, one sits on a disjoint page.
         let mut lin_aliased = key(0, 0, 0x1000);
@@ -1916,9 +2101,9 @@ mod tests {
     #[test]
     fn take_deferred_windows_is_exact_intersection() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        state.compute_deferred_flush.insert(key(7, 0, 256), 3);
-        state.compute_deferred_flush.insert(key(7, 256, 512), 4);
-        state.compute_deferred_flush.insert(key(8, 0, 256), 5);
+        state.compute_deferred_flush.insert(key(7, 0, 256), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(key(7, 256, 512), crate::model::DeferredOwner::Storage { generation: 4 });
+        state.compute_deferred_flush.insert(key(8, 0, 256), crate::model::DeferredOwner::Storage { generation: 5 });
 
         // Disjoint range takes nothing.
         assert!(state.take_deferred_flush_windows(7, 512, 1024).is_empty());

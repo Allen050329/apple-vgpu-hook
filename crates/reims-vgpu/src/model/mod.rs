@@ -10,8 +10,8 @@ mod state;
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
-    ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeviceId, DeviceState,
-    DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GuestRunMemoEntry,
+    ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
+    DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GuestRunMemoEntry,
     GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
     LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc,
     PendingWork, PresentState, PresentedGeom, StampSlot, SurfaceWriteKind, TaskEntry, TaskMapSpan,

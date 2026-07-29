@@ -726,6 +726,44 @@ impl ComputeStorageResidencyKey {
     }
 }
 
+/// Which rail holds the authoritative pixels of a mapping-keyed deferred
+/// window, and therefore how a flush must read them.
+///
+/// Both kinds live in one map — [`DeviceState::compute_deferred_flush`] — and
+/// that is the point. The dangerous half of any deferred rail is the set of
+/// guest-page readers that must drain it first; a reader that misses one window
+/// makes the guest read stale pixels with nothing logged. Sharing the key type
+/// means both kinds share the range scan
+/// ([`DeviceState::take_deferred_flush_windows`]), the raw-GVA alias index
+/// ([`DeviceState::deferred_alias_pages`]), the teardown drop and every
+/// existing trigger, so a rail cannot be covered for one kind and missed for
+/// the other. A second map keyed the same way would have had to re-derive
+/// "does any window still name this mapping" in
+/// [`DeviceState::prune_alias_index`], and getting that wrong drops the alias
+/// index out from under a live window.
+///
+/// What genuinely differs is only where the pixels are. Everything else the
+/// flush needs — mapping id, geometry, format, guest byte range — is already in
+/// the key, which is why neither variant carries geometry of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredOwner {
+    /// Compute rail: a *storage* resident keyed by this same
+    /// `ComputeStorageResidencyKey`, read with
+    /// `engine::read_resident_storage(key, generation)`. The generation is the
+    /// resident's **content** generation, unrelated to `key.map_generation`.
+    Storage { generation: u32 },
+    /// Type-11 render Store rail: a *target* resident keyed by
+    /// `TargetIdentity::Surface { id: mapping_id, width, height, generation }`,
+    /// read with `engine::read_target`. The storage key cannot name a target
+    /// resident, which is the whole reason this is an enum and not a flag —
+    /// `flush_one` had one read and now needs two.
+    ///
+    /// The identity is reconstructible from the key alone: `map_generation` is
+    /// exactly what `present_identity::surface_identity` puts in the target
+    /// identity's `generation`.
+    Render { armed_seq: u64 },
+}
+
 /// Everything a later flush needs to land a deferred **GVA render Store**
 /// (type-2/3 color0 with `target_gva != 0`): the engine resident
 /// `TargetIdentity::Gva { gva, width, height, generation: 0 }` holds the
@@ -1305,12 +1343,17 @@ pub struct DeviceState {
     /// storage-image writeback for an exact type-11 view. This does not select
     /// engine behavior; it measures safe residency opportunities.
     pub compute_storage_residency: BTreeMap<ComputeStorageResidencyKey, u32>,
-    /// Deferred compute writebacks: windows whose guest pages are STALE — the
-    /// pinned engine resident at this generation is the authoritative content.
-    /// Every host-side read or write of intersecting mapping bytes must flush
-    /// first (`runtime::storage_flush::flush_intersecting`). Value = the
-    /// engine resident generation to flush.
-    pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, u32>,
+    /// Deferred mapping-keyed writebacks: windows whose guest pages are STALE —
+    /// a pinned engine resident is the authoritative content. Every host-side
+    /// read or write of intersecting mapping bytes must flush first
+    /// (`runtime::storage_flush::flush_intersecting`). The value says which
+    /// rail owns the pixels; see [`DeferredOwner`].
+    pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, DeferredOwner>,
+    /// Arm order for [`DeferredOwner::Render`] windows, so the population cap
+    /// can evict oldest-first. Compute windows are bounded by the dispatches
+    /// that create them; render windows are armed once per composite Store and
+    /// each one pins a display-sized image, so they need their own bound.
+    pub surface_deferred_seq: u64,
     /// Physical page bases of each mapping with live deferred windows, for the
     /// raw task-GVA sampling guard (`storage_flush::flush_intersecting_task_gva`).
     /// Built at defer time from the just-resolved `page_entries`
@@ -1499,6 +1542,7 @@ impl DeviceState {
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
+            surface_deferred_seq: 0,
             deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
             present: PresentState::default(),
@@ -2295,7 +2339,7 @@ impl DeviceState {
         mapping_id: u32,
         lo: u64,
         hi: u64,
-    ) -> Vec<(ComputeStorageResidencyKey, u32)> {
+    ) -> Vec<(ComputeStorageResidencyKey, DeferredOwner)> {
         let keys: Vec<ComputeStorageResidencyKey> = self
             .compute_deferred_flush
             .keys()
@@ -2304,12 +2348,12 @@ impl DeviceState {
             })
             .cloned()
             .collect();
-        let taken: Vec<(ComputeStorageResidencyKey, u32)> = keys
+        let taken: Vec<(ComputeStorageResidencyKey, DeferredOwner)> = keys
             .into_iter()
             .filter_map(|key| {
                 self.compute_deferred_flush
                     .remove(&key)
-                    .map(|gen| (key, gen))
+                    .map(|owner| (key, owner))
             })
             .collect();
         if !taken.is_empty() {
