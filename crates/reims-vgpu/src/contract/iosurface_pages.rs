@@ -205,15 +205,6 @@ pub struct PageTablePlan {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PageFragment {
-    pub surface_offset: u64,
-    pub gpa: u64,
-    pub page_index: u32,
-    pub page_offset: u32,
-    pub length: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceSurfaceRecord {
     pub pixel_format: u32,
     pub base_offset: u32,
@@ -783,74 +774,6 @@ pub fn build_table_plan(
         )))
 }
 
-/// **Arm64e only.** Prefer [`plan_span_shift`] with device page_shift.
-pub fn plan_span_arm64e(
-    mem: &dyn PagesMemory,
-    table: &PageTablePlan,
-    offset: u64,
-    length: u32,
-) -> Result<Vec<PageFragment>, Status> {
-    plan_span_shift(mem, table, offset, length, PAGE_SHIFT_ARM64E)
-}
-
-/// Explicit page_shift (12 = x86, 14 = arm64e). Product paths use this.
-pub fn plan_span_shift(
-    mem: &dyn PagesMemory,
-    table: &PageTablePlan,
-    offset: u64,
-    length: u32,
-    page_shift: u32,
-) -> Result<Vec<PageFragment>, Status> {
-    if page_shift == 0 || page_shift > 30 {
-        return Err(Status::ErrArgs("iosurface_span_page_shift_invalid"));
-    }
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    let page_size = page_size_of(page_shift);
-    let off_mask = page_offset_mask(page_shift);
-    let end = checked_add_u64(offset, length as u64)
-        .ok_or(Status::ErrOverflow("iosurface_span_end_overflow"))?;
-    let table_bytes = (table.entries.len() as u64) * page_size;
-    if end > table_bytes {
-        return Err(Status::ErrSpanRange("iosurface_span_out_of_range"));
-    }
-    let mut fragments = Vec::new();
-    let mut pos = offset;
-    while pos < end {
-        let page = (pos >> page_shift) as u32;
-        let page_off = (pos & off_mask) as u32;
-        if page as usize >= table.entries.len() {
-            return Err(Status::ErrPageEntry(
-                "iosurface_span_page_index_out_of_range",
-            ));
-        }
-        let page_gpa = entry_gpa_shift(table.entries[page as usize], page_shift)
-            .ok_or(Status::ErrPageEntry("iosurface_span_page_entry_invalid"))?;
-        if !mem.is_ram_gpa(page_gpa) {
-            return Err(Status::ErrPageEntry("iosurface_span_gpa_not_ram"));
-        }
-        let mut chunk = page_size - page_off as u64;
-        if chunk > end - pos {
-            chunk = end - pos;
-        }
-        if chunk > u32::MAX as u64 {
-            return Err(Status::ErrOverflow("iosurface_span_chunk_length_overflow"));
-        }
-        let gpa = checked_add_u64(page_gpa, page_off as u64)
-            .ok_or(Status::ErrOverflow("iosurface_span_gpa_overflow"))?;
-        fragments.push(PageFragment {
-            surface_offset: pos,
-            gpa,
-            page_index: page,
-            page_offset: page_off,
-            length: chunk as u32,
-        });
-        pos += chunk;
-    }
-    Ok(fragments)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,23 +915,6 @@ mod tests {
             span_page_count_shift(PAGE_SIZE_ARM64E + 1, PAGE_SHIFT_ARM64E),
             2
         );
-    }
-
-    #[test]
-    fn plan_span_fragments() {
-        let e = (9 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        let table = PageTablePlan {
-            entries: vec![e, e],
-            page_table_kva: 0,
-            min_size: 0,
-            required_pages: 2,
-            cached: false,
-        };
-        let mem = MapMem::new();
-        let frags = plan_span_arm64e(&mem, &table, PAGE_SIZE_ARM64E - 16, 32).unwrap();
-        assert_eq!(frags.len(), 2);
-        assert_eq!(frags[0].length, 16);
-        assert_eq!(frags[1].length, 16);
     }
 
     #[test]

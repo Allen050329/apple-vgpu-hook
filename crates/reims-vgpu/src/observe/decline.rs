@@ -2216,9 +2216,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         // vocabulary is written at construction sites; `Refusal::refusal`
         // forwards the carried slug.
         slug_calls: &[
-            ("contract/iosurface_pages.rs", "Status::ErrArgs("),
             ("contract/iosurface_pages.rs", "Status::ErrShortDescriptor("),
-            ("contract/iosurface_pages.rs", "Status::ErrOverflow("),
             ("contract/iosurface_pages.rs", "Status::ErrNotKernelVa("),
             ("contract/iosurface_pages.rs", "Status::ErrInternalRead("),
             ("contract/iosurface_pages.rs", "Status::ErrInternalOwner("),
@@ -2232,7 +2230,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("contract/iosurface_pages.rs", "Status::ErrPageTableRead("),
             ("contract/iosurface_pages.rs", "Status::ErrPageEntry("),
             ("contract/iosurface_pages.rs", "Status::ErrNoPageTable("),
-            ("contract/iosurface_pages.rs", "Status::ErrSpanRange("),
         ],
         slugs: &[
             "iosurface_mapper_device_desc_pointer_invalid",
@@ -2259,14 +2256,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "iosurface_page_table_pointer_48_read",
             "iosurface_page_table_pointer_50_invalid",
             "iosurface_page_table_pointer_50_read",
-            "iosurface_span_chunk_length_overflow",
-            "iosurface_span_end_overflow",
-            "iosurface_span_gpa_not_ram",
-            "iosurface_span_gpa_overflow",
-            "iosurface_span_out_of_range",
-            "iosurface_span_page_entry_invalid",
-            "iosurface_span_page_index_out_of_range",
-            "iosurface_span_page_shift_invalid",
             "iosurface_texture_descriptor_short",
             "iosurface_validate_internal_kva_invalid",
             "iosurface_validate_internal_owner_mismatch",

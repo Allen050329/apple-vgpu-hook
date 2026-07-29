@@ -999,14 +999,12 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (68, 1536): the eight `compute_restage_*` slugs left with
-        // `restage_lost_residents`, a retry whose trigger matched the engine
-        // error text against `compute_resident_{seed,sample}_lost` — names no
-        // emitter in this crate produces, so the retry could never run and its
-        // vocabulary could never be written. The engine's real refusals are the
-        // `vk_compute_exec_resident_*` slugs, which remain. Type count
-        // unchanged.
-        (68, 1528),
+        // Down from (68, 1528): the eight `iosurface_span_*` slugs were all
+        // written by `plan_span_shift`, a page-span planner with no product
+        // caller — the live walk is `build_table_plan` + `entry_gpa_shift`.
+        // Its own doc claimed "Product paths use this" and none did. Type
+        // count unchanged.
+        (68, 1520),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );
