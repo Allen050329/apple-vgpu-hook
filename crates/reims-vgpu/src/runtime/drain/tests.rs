@@ -1833,6 +1833,69 @@ fn display_lifecycle_events_are_always_logged() {
     );
 }
 
+/// The VBL census reports the delivered rate, and separates the two ways it can
+/// deliver nothing.
+///
+/// VBL paces the guest compositor, so the rate we deliver caps guest frame rate
+/// however fast the present path is — and nothing measured it: a driven boot
+/// emitted zero lines matching `vbl` anywhere in the always-on channel. The
+/// three properties that make the new line readable are asserted here, because
+/// each one is a way the reading could have been wrong:
+///
+/// - only deliveries report, so the line's cadence is the thing it measures;
+/// - the rate is over the window since the last report, not the process
+///   lifetime, so an early stall does not depress it forever;
+/// - `not_online` and `not_claimed` stay separate, because "the display never
+///   came up" and "the 8 ms limiter is working correctly at 125 Hz" are opposite
+///   conclusions from the same low delivered count.
+#[test]
+fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
+    use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_CLAIMED, VBL_NOT_ONLINE};
+    let c = VblCensus::default();
+
+    // The silent arms never report, however many times they are taken.
+    for i in 0..5000u64 {
+        assert!(c.note(VBL_NOT_ONLINE, i).is_none());
+        assert!(c.note(VBL_NOT_CLAIMED, i).is_none());
+    }
+
+    // 1024 deliveries at the 8 ms grid: one report, and the rate is the grid.
+    let mut lines = Vec::new();
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
+            lines.push(l);
+        }
+    }
+    assert_eq!(lines.len(), 1, "exactly one report per 1024 deliveries");
+    let line = &lines[0];
+    assert!(line.contains("delivered=1024"), "{line}");
+    assert!(
+        line.contains("window_hz=125.0"),
+        "1024 deliveries spanning 8192 ms is 125 Hz: {line}"
+    );
+    assert!(
+        line.contains("not_online=5000") && line.contains("not_claimed=5000"),
+        "the silent arms must stay separable and counted: {line}"
+    );
+
+    // A second window at half the rate must read half, not an average dragged
+    // toward the first window — this is the property that makes a live reading
+    // of a *current* stall possible at all.
+    let base = 1024 * 8;
+    let mut second = None;
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, base + i * 16) {
+            second = Some(l);
+        }
+    }
+    let second = second.expect("second window must report");
+    assert!(second.contains("delivered=2048"), "{second}");
+    assert!(
+        second.contains("window_hz=62.5"),
+        "the window rate must not be a lifetime average: {second}"
+    );
+}
+
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated
 /// `post_converge_display_reinit` line — the smoking gun for the intermittent

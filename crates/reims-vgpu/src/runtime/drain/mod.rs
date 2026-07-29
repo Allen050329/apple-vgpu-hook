@@ -2877,6 +2877,79 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
     signal_display_vbl_at(state, host, last_ms, crate::observe::elapsed_ms() as u64);
 }
 
+/// Delivered-VBL rate, reported from the branch that decides it.
+///
+/// VBL is what paces the guest's compositor: WindowServer produces a frame off
+/// its display-link callback, so whatever rate we deliver here is a ceiling on
+/// guest frame rate no matter how fast the present path runs. Nothing measured
+/// it. A driven boot emitted **zero** lines matching `vbl` anywhere in the
+/// always-on channel, so "are we starving the display link" could not be
+/// answered from a log, only guessed at from the constants.
+///
+/// The three arms are counted separately because a single "delivered" tally
+/// cannot tell the two silences apart, and they have opposite meanings:
+/// `not_online` is the display never having come up (no VBL is owed at all),
+/// while `not_claimed` is the 8 ms limiter doing its job at a healthy 125 Hz.
+/// Reading a low delivered count without them would license both conclusions.
+///
+/// One line per 1024 deliveries — about 8 s at the grid rate, and it costs three
+/// relaxed increments per poll otherwise.
+/// Which way the VBL path went. Indices into [`VblCensus`].
+pub(crate) const VBL_NOT_ONLINE: usize = 0;
+pub(crate) const VBL_NOT_CLAIMED: usize = 1;
+pub(crate) const VBL_DELIVERED: usize = 2;
+
+/// One report per this many deliveries — about 8 s at the grid rate.
+const VBL_REPORT_EVERY: u64 = 1024;
+
+#[derive(Default)]
+pub(crate) struct VblCensus {
+    arms: [std::sync::atomic::AtomicU64; 3],
+    last_report_ms: std::sync::atomic::AtomicU64,
+    last_report_n: std::sync::atomic::AtomicU64,
+}
+
+impl VblCensus {
+    /// Count one traversal and return the line to emit when a report is due.
+    ///
+    /// Returns the line rather than emitting it so the reporting rule is
+    /// testable without a log sink: the interesting properties are "only
+    /// deliveries report", "the rate is measured over the window and not the
+    /// process lifetime", and "the two silent arms stay separable", and all
+    /// three are assertions about this return value.
+    pub(crate) fn note(&self, arm: usize, now_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.arms[arm].fetch_add(1, Relaxed) + 1;
+        if arm != VBL_DELIVERED || !n.is_multiple_of(VBL_REPORT_EVERY) {
+            return None;
+        }
+        let since_ms = now_ms.saturating_sub(self.last_report_ms.swap(now_ms, Relaxed));
+        let since_n = n.saturating_sub(self.last_report_n.swap(n, Relaxed));
+        // Window rate, not a lifetime average: the lifetime figure carries the
+        // pre-online stretch forever and would read low long after the display
+        // came up.
+        let hz = if since_ms > 0 {
+            (since_n * 1000) as f64 / since_ms as f64
+        } else {
+            0.0
+        };
+        Some(format!(
+            "display_vbl delivered={n} not_claimed={} not_online={} window_hz={hz:.1} \
+             grid_hz={:.1}",
+            self.arms[VBL_NOT_CLAIMED].load(Relaxed),
+            self.arms[VBL_NOT_ONLINE].load(Relaxed),
+            1000.0 / DISPLAY_VBL_MIN_INTERVAL_MS as f64,
+        ))
+    }
+}
+
+pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
+    static VBL: std::sync::LazyLock<VblCensus> = std::sync::LazyLock::new(VblCensus::default);
+    if let Some(line) = VBL.note(arm, now_ms) {
+        crate::observe::off(line);
+    }
+}
+
 fn signal_display_vbl_at<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2884,11 +2957,14 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     now_ms: u64,
 ) {
     if state.display.shared_gpa == 0 || !state.display.online_acked {
+        note_vbl(VBL_NOT_ONLINE, now_ms);
         return;
     }
     if !claim_display_vbl(last_ms, now_ms) {
+        note_vbl(VBL_NOT_CLAIMED, now_ms);
         return;
     }
+    note_vbl(VBL_DELIVERED, now_ms);
     let gpa = state.display.shared_gpa;
     let mut pending_le = [0u8; 4];
     let pending = if host

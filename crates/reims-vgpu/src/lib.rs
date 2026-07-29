@@ -1333,16 +1333,22 @@ pub fn device_poll(id: u64) -> bool {
 fn vbl_contended_pulse(slot: &BoundDevice) {
     use crate::runtime::host::HostMemory;
     let gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
+    let now = crate::observe::elapsed_ms() as u64;
     if gpa == 0 || !slot.vbl_online.load(Ordering::Acquire) {
+        runtime::drain::note_vbl(runtime::drain::VBL_NOT_ONLINE, now);
         return;
     }
     let Some(ops) = slot.ops else {
         return;
     };
-    let now = crate::observe::elapsed_ms() as u64;
+    // Both poll paths share one limiter, so both have to report into one census
+    // or the delivered rate reads low by whatever share of polls found the
+    // device lock contended.
     if !runtime::drain::claim_display_vbl(&slot.vbl_last_ms, now) {
+        runtime::drain::note_vbl(runtime::drain::VBL_NOT_CLAIMED, now);
         return;
     }
+    runtime::drain::note_vbl(runtime::drain::VBL_DELIVERED, now);
     let mut scratch = VecDeque::new();
     let mut host = QemuHost::with_prompt(&ops, &mut scratch, &slot.prompt_actions);
     let mut buf = [0u8; 4];
