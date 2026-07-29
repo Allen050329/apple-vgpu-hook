@@ -2659,6 +2659,7 @@ mod tests {
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_MIN_LEN, LINEAR_DESC_SIZE,
         OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
     };
+    use crate::runtime::gva_mem::write_task_gva_arm64e;
     use crate::runtime::host::FakeHost;
     use crate::runtime::objects;
 
@@ -2749,13 +2750,13 @@ mod tests {
         st64(&mut desc[LINEAR_DESC_SIZE..], size);
         st64(&mut desc[LINEAR_DESC_HANDLE..], handle as u64);
         let desc_gva = 0x100u64 + (obj_ref as u64) * 0x20;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(obj_ref, 16).unwrap();
         let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_BUFFER as u32) | ((LINEAR_DESC_MIN_LEN as u32) << 8);
         st32(&mut entry[0..], packed);
         entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &entry);
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("entry");
         assert_eq!(e.object_type, OBJECT_TYPE_BUFFER);
     }
@@ -2887,12 +2888,7 @@ mod tests {
         install_buffer(&mut host, &mut state, 2, 2, 256);
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
         let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        crate::runtime::gva_mem::write_task_gva_arm64e(
-            &mut host,
-            &state.tasks[1],
-            src_gva + 4,
-            &pat,
-        );
+        write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva + 4, &pat);
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
         cmd.copy_kind = CopyKind::BufferToBuffer;
@@ -2948,7 +2944,7 @@ mod tests {
         install_buffer(&mut host, &mut state, 1, 1, 256);
         let pat = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
         // Type-11 object ref 3 → mapping 9, 2x2 BGRA.
         let mapping_id = 9u32;
@@ -2973,18 +2969,13 @@ mod tests {
         st32(&mut desc[0x18..], 2);
         st32(&mut desc[0x1c..], 2);
         let desc_gva = 0x180u64;
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(3, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_IOSURFACE as u32) | (0x20u32 << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(
-            &mut host,
-            &state.tasks[1],
-            off,
-            &list_entry,
-        );
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
@@ -3168,13 +3159,13 @@ mod tests {
         st32(&mut desc[0x18..], 2);
         st32(&mut desc[0x1c..], 2);
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(obj_ref, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_IOSURFACE as u32) | (0x20u32 << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
     }
 
     /// Shared biplanar mapping: plane0 Y 4×2 R8 @512 bpr=64; plane1 UV 2×1 RG8 @1024 bpr=64.
@@ -3238,13 +3229,13 @@ mod tests {
         st32(&mut desc[0x18..], width);
         st32(&mut desc[0x1c..], height);
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(obj_ref, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_IOSURFACE as u32) | (0x20u32 << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
     }
 
     /// Install a type-5 RefTexture (object_type=5) that names an IOSurface
@@ -3291,13 +3282,13 @@ mod tests {
         st32(&mut desc[rec + objects::TYPE5_RECORD_HEIGHT..], height);
         st32(&mut desc[rec + objects::TYPE5_RECORD_DEPTH..], 1);
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(obj_ref, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((desc_len as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
         assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
     }
@@ -3353,7 +3344,7 @@ mod tests {
         // Corrupt the record tag to an unknown value in-place.
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
         let bad = [0x99u8];
-        crate::runtime::gva_mem::write_task_gva_arm64e(
+        write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             desc_gva + objects::TYPE5_ARG_RECORD as u64,
@@ -3404,25 +3395,15 @@ mod tests {
             st64(&mut bdesc[0..], 64);
             st32(&mut bdesc[8..], 2); // handle 2
             let bgva = 0x300u64;
-            crate::runtime::gva_mem::write_task_gva_arm64e(
-                &mut host,
-                &state.tasks[1],
-                bgva,
-                &bdesc,
-            );
+            write_task_gva_arm64e(&mut host, &state.tasks[1], bgva, &bdesc);
             let off = list_object_entry_offset(1, 16).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&bgva.to_le_bytes());
-            crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
             let buf_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-            crate::runtime::gva_mem::write_task_gva_arm64e(
-                &mut host,
-                &state.tasks[1],
-                buf_gva,
-                &y_pat,
-            );
+            write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &y_pat);
         }
 
         let mut cmd = Command::default();
@@ -3477,12 +3458,7 @@ mod tests {
         let uv_pat = [0xaau8, 0xbb, 0xcc, 0xdd];
         {
             let buf_gva = 2u64 << crate::runtime::decode::resource::RESOURCE_PAGE_SHIFT;
-            crate::runtime::gva_mem::write_task_gva_arm64e(
-                &mut host,
-                &state.tasks[1],
-                buf_gva,
-                &uv_pat,
-            );
+            write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &uv_pat);
         }
         cmd.destination = 11;
         cmd.source_bytes_per_row = 4;
@@ -3568,13 +3544,13 @@ mod tests {
             desc[TEXTURE_VIEW_DESC_SWIZZLE..TEXTURE_VIEW_DESC_SWIZZLE + 4].copy_from_slice(&sw);
         }
         let desc_gva = 0x280u64 + (view_ref as u64) * 0x40;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(view_ref, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
     }
 
     #[test]
@@ -3589,7 +3565,7 @@ mod tests {
         install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
         let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
         cmd.copy_kind = CopyKind::BufferToTexture;
@@ -3742,18 +3718,13 @@ mod tests {
         let pf_off = TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
         st16(&mut desc[pf_off..], MTL_FORMAT_RGBA8_UNORM);
         let desc_gva = 0x300u64;
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(4, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(
-            &mut host,
-            &state.tasks[1],
-            off,
-            &list_entry,
-        );
+        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
         // View: level_base=0, level_count=2 over texture ref 4.
         install_type8_view(&mut host, &mut state, 8, 4, MTL_FORMAT_RGBA8_UNORM, 0, None);
@@ -3773,18 +3744,13 @@ mod tests {
             )
             .is_ok());
             st64(&mut v[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 2);
-            crate::runtime::gva_mem::write_task_gva_arm64e(
-                &mut host,
-                &state.tasks[1],
-                view_gva,
-                &v,
-            );
+            write_task_gva_arm64e(&mut host, &state.tasks[1], view_gva, &v);
         }
 
         // Seed buffer with 2 RGBA pixels for L1 (2x1).
         let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
@@ -3942,14 +3908,14 @@ mod tests {
             MTL_FORMAT_RGBA8_UNORM,
         );
         let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         assert!(state.set_object_list(1, 0, 16));
         let off = list_object_entry_offset(obj_ref, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
     }
 
     #[test]
@@ -3967,7 +3933,7 @@ mod tests {
         for (i, b) in pat.iter_mut().enumerate() {
             *b = i as u8;
         }
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
@@ -4014,7 +3980,7 @@ mod tests {
         for (i, b) in pat.iter_mut().enumerate() {
             *b = (0xA0 + i) as u8;
         }
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
 
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
@@ -4062,7 +4028,7 @@ mod tests {
         for (i, b) in pat.iter_mut().enumerate() {
             *b = (0x10 + i) as u8;
         }
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
         // Copy column x=0 (4 rows) to column x=2 within the same texture.
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
@@ -4166,24 +4132,14 @@ mod tests {
             let pf_off = TEXTURE_DESC_PIXEL_FORMAT + TEXTURE_DESC_MIP_LEVEL_RECORD_LEN;
             st16(&mut desc[pf_off..], MTL_FORMAT_RGBA8_UNORM);
             let desc_gva = 0x200u64 + (obj_ref as u64) * 0x100;
-            crate::runtime::gva_mem::write_task_gva_arm64e(
-                &mut host,
-                &state.tasks[1],
-                desc_gva,
-                &desc,
-            );
+            write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
             assert!(state.set_object_list(1, 0, 16));
             let off = list_object_entry_offset(obj_ref, 16).unwrap();
             let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8);
             st32(&mut list_entry[0..], packed);
             list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-            crate::runtime::gva_mem::write_task_gva_arm64e(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &list_entry,
-            );
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
         }
 
         // Seed L0 and L1 on source handle 2.
@@ -4193,14 +4149,9 @@ mod tests {
             17u8, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
         ];
         let l1 = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], base, &l0);
-        crate::runtime::gva_mem::write_task_gva_arm64e(
-            &mut host,
-            &state.tasks[1],
-            base + 16,
-            &l0_row1,
-        );
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], base + 32, &l1);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], base, &l0);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], base + 16, &l0_row1);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], base + 32, &l1);
 
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
@@ -4271,14 +4222,14 @@ mod tests {
             MTL_FORMAT_RGBA8_UNORM,
         );
         let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
         assert!(state.set_object_list(1, 0, 16));
         let off = list_object_entry_offset(obj_ref, 16).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        crate::runtime::gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
     }
 
     #[test]
@@ -4295,7 +4246,7 @@ mod tests {
         for (i, b) in vol.iter_mut().enumerate() {
             *b = (i as u8).wrapping_add(1);
         }
-        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &vol);
+        write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &vol);
 
         let mut cmd = Command::default();
         cmd.kind = Kind::Copy;
