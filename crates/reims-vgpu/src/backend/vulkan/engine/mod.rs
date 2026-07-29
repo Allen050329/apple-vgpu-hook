@@ -128,19 +128,11 @@ impl EngineState {
 
 static ENGINE: Lazy<Mutex<EngineState>> = Lazy::new(|| Mutex::new(EngineState::new()));
 
-/// Engine-lock acquisitions. Read only by
-/// `ensure_host_imports_enters_the_engine_once_for_the_whole_run_list`, which
-/// pins the prologue at one entry per call rather than one per span. The
-/// `Instant::now()` pair and wait-time accumulators that used to sit beside it
-/// fed a snapshot nothing read.
-static ENGINE_LOCK_ACQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Acquire the global engine lock. The single `ENGINE` mutex serializes all 34
 /// engine entry points across the drain worker and the QEMU main/present path,
 /// so this is on every one of them.
 #[inline]
 fn lock_engine() -> parking_lot::MutexGuard<'static, EngineState> {
-    ENGINE_LOCK_ACQ.fetch_add(1, Ordering::Relaxed);
     ENGINE.lock()
 }
 
@@ -394,19 +386,6 @@ pub fn deferred_gpu_only_content_allowed() -> bool {
         .is_some_and(|ctx| !ctx.caps.quirks.guest_pages_stay_authoritative)
 }
 
-/// Whether the selected device enabled `VK_EXT_external_memory_host`.
-///
-/// This is distinct from `deferred_gpu_only_content_allowed`: a portability
-/// device may synchronously DMA a completed Store into stable guest pages even
-/// though it must not leave those pages stale across packet boundaries.
-pub fn external_memory_host_available() -> bool {
-    lock_engine()
-        .owner
-        .ctx
-        .as_ref()
-        .is_some_and(|ctx| ctx.ext_external_memory_host.is_some())
-}
-
 /// Pin a content-ready resident render target against LRU eviction (deferred
 /// render Store — the GPU image is the only copy until flush-on-access lands
 /// it in guest pages). Returns false when the identity is absent or not
@@ -439,15 +418,16 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
 /// `vk_engine_probe` decline's `probe=` field.
 ///
 /// [`EngineProbe::discriminant`] is the `fail_once` dedup key, so it is a
-/// stable numbering and not an index: 1, 2 and 3 are retired holes. They named
-/// the present-proxy GPU stats oracle's context / pool / take prologues
-/// (`present_stats_context`, `present_stats_pools`, `take_stats_context`),
-/// which no longer exist. Do not reuse them — a fail-log line already carrying
-/// one of those keys must not be conflated with a new probe's.
+/// stable numbering and not an index: 1 through 6 are retired holes. 1, 2 and 3
+/// named the present-proxy GPU stats oracle's context / pool / take prologues
+/// (`present_stats_context`, `present_stats_pools`, `take_stats_context`); 4 and
+/// 5 named the host-pointer import prologues (`host_import_context`,
+/// `host_import_pools`), which went out with the import subsystem; 6 was
+/// `compute_writeback_alignment`, which went out with the GPU-direct compute
+/// writeback. Do not reuse them — a fail-log line already carrying one of those
+/// keys must not be conflated with a new probe's.
 #[derive(Clone, Copy, Debug)]
 enum EngineProbe {
-    HostImportContext,
-    HostImportPools,
     StorageWriteWithoutFormat,
     ComputeCapable,
     SampledR32fLinearFilter,
@@ -456,22 +436,16 @@ enum EngineProbe {
 impl EngineProbe {
     fn name(self) -> &'static str {
         match self {
-            Self::HostImportContext => "host_import_context",
-            Self::HostImportPools => "host_import_pools",
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::ComputeCapable => "compute_capable",
             Self::SampledR32fLinearFilter => "sampled_r32f_linear_filter",
         }
     }
 
-    /// 1, 2, 3 and 6 are retired (see the type's docs); the rest keep the
-    /// numbers they were first logged under. 6 was
-    /// `compute_writeback_alignment`, whose probe went out with the GPU-direct
-    /// compute writeback.
+    /// 1 through 6 are retired (see the type's docs); the rest keep the numbers
+    /// they were first logged under.
     fn discriminant(self) -> u64 {
         match self {
-            Self::HostImportContext => 4,
-            Self::HostImportPools => 5,
             Self::StorageWriteWithoutFormat => 7,
             Self::ComputeCapable => 8,
             Self::SampledR32fLinearFilter => 9,
@@ -481,48 +455,6 @@ impl EngineProbe {
 
 fn engine_probe_decline(probe: EngineProbe, error: &DrawError) -> crate::observe::Emit {
     crate::observe::Emit::decline("vk_engine_probe", error).field("probe", probe.name())
-}
-
-/// Ensure every run's guest-RAM host span is covered by a cached
-/// VK_EXT_external_memory_host import (creating one on first sight — a 1 GiB-capped
-/// window of the containing VMA, aligned span fallback; see AGENTS.md). The
-/// zero-copy gates call this with the whole coalesced run list BEFORE choosing
-/// [`SampledSource::GuestRuns`]; a `false` means the caller must stay on the CPU
-/// byte path.
-///
-/// Takes the run list rather than one span because the engine prologue — global
-/// lock, device-context ensure, pool-init check — is per *entry*, not per span,
-/// while the question it guards is per *window*. A fragmented full-screen
-/// IOSurface coalesces to ~77 runs that all resolve against the same handful of
-/// 1 GiB windows, so the per-span form paid that prologue 77 times per bind:
-/// measured at 14.8 µs a call and 18 324 calls over 237 binds, it was 271 ms of
-/// the 453 ms those binds spent resolving.
-pub fn ensure_host_imports(runs: &[GuestRun]) -> bool {
-    if runs.is_empty() {
-        return true;
-    }
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = match owner.ensure(counters) {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            engine_probe_decline(EngineProbe::HostImportContext, &error)
-                .fail_once(EngineProbe::HostImportContext.discriminant());
-            return false;
-        }
-    };
-    if let Err(error) = unsafe { pools.ensure_init(ctx, counters) } {
-        engine_probe_decline(EngineProbe::HostImportPools, &error)
-            .fail_once(EngineProbe::HostImportPools.discriminant());
-        return false;
-    }
-    runs.iter()
-        .all(|r| unsafe { pools.host_import_resolve(ctx, r.host_ptr, r.len) }.is_ok())
 }
 
 /// Generation of a resident compute storage image, if the engine holds one.
@@ -1644,62 +1576,13 @@ mod probe_visibility_tests {
     fn each_engine_probe_preserves_the_typed_initialization_reason() {
         let error = vk_call::exec_submit_device_lost_fixture();
         for probe in [
-            EngineProbe::HostImportContext,
-            EngineProbe::HostImportPools,
             EngineProbe::StorageWriteWithoutFormat,
             EngineProbe::ComputeCapable,
+            EngineProbe::SampledR32fLinearFilter,
         ] {
             let line = engine_probe_decline(probe, &error).render();
             assert!(line.starts_with("vk_engine_probe reason=vk_exec_submit "));
             assert!(line.ends_with(&format!(" probe={}", probe.name())));
         }
-    }
-
-    /// No guest run is importable, however well-formed it is.
-    ///
-    /// The spans below are real, page-aligned, mapped host memory of exactly one
-    /// page each — the shape the import accepted on every alignment and range
-    /// ground when it existed. So the refusal can only be the capability, which
-    /// is the property the removal has to hold: a run this device could import
-    /// is a run the GPU could write.
-    ///
-    /// **The per-span regression gate this case used to carry is gone, and not
-    /// by choice.** It asserted one engine entry per run list — global lock,
-    /// device-context ensure, pool-init check are per entry while the coverage
-    /// question is per import window, and a fragmented full-screen IOSurface
-    /// coalesces to ~77 runs against a handful of windows. Counting lock
-    /// acquisitions was the only assertion that failed if the call regressed to
-    /// a loop of single-span calls. It only worked because the runs *resolved*:
-    /// `all` short-circuits, so with every run refusing, the per-span shape also
-    /// takes exactly one entry and the count proves nothing. Asserting it here
-    /// anyway would be a gate that cannot fail. Restoring it needs a resolvable
-    /// span, which needs an import, which is what was removed.
-    ///
-    /// Skipping instead was the other option and is worse: this case executed on
-    /// the GPU before the removal, and a skip reads as a pass.
-    #[test]
-    fn no_well_formed_guest_run_is_importable() {
-        crate::observe::redirect_logs_for_tests();
-        const PAGE: usize = 4096;
-        let buf = vec![0u8; PAGE * 24];
-        let base = (buf.as_ptr() as usize).next_multiple_of(PAGE);
-        let runs: Vec<GuestRun> = (0..8)
-            .map(|i| GuestRun {
-                host_ptr: base + i * PAGE,
-                len: PAGE as u64,
-            })
-            .collect();
-        assert!(
-            !ensure_host_imports(&runs),
-            "a page-aligned, mapped, page-sized run must still be refused"
-        );
-
-        // An empty list asks nothing and must not enter the engine at all —
-        // still a real assertion, because it is decided before any import is
-        // attempted.
-        let before = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
-        assert!(ensure_host_imports(&[]));
-        let after = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
-        assert_eq!(after, before);
     }
 }

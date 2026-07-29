@@ -1405,8 +1405,7 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
 /// legitimately prefers the CPU byte path (small-UI / gva_copy binds measured at
 /// ~21–34 KiB, and scroll glyphs at ~3.6 KiB served by the memo) and ~3.7×
 /// below the video surfaces, so the band it opens to zero-copy is exactly those
-/// per-frame video composites. Import windows are 1 GiB-bucketed and cached, so
-/// lowering the floor does not multiply host imports.
+/// per-frame video composites.
 #[cfg(feature = "backend-vulkan")]
 const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 
@@ -1659,9 +1658,9 @@ fn slice_runs_to_engine(
 /// and reads at execute time (at least as fresh as the CPU path).
 ///
 /// Gates (any miss → `None`, caller stays on the CPU staging read): span ≥
-/// the buffer zero-copy floor, every page walkable into mappable runs, and
-/// every run covered by a host import. Deferred stores intersecting the
-/// span are landed first, exactly like the CPU path.
+/// the buffer zero-copy floor and every page walkable into mappable runs.
+/// Deferred stores intersecting the span are landed first, exactly like the
+/// CPU path.
 #[cfg(feature = "backend-vulkan")]
 fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1704,9 +1703,6 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         Some(runs) => runs,
         None => task_gva_guest_runs(state, host, task_id, gva + offset, span)?,
     };
-    if !engine::ensure_host_imports(&runs) {
-        return None;
-    }
     Some(engine::BufferContent::GuestRuns(engine::GuestRunSource {
         runs: std::sync::Arc::new(runs),
         total_len: span,
@@ -1752,8 +1748,7 @@ fn load_buffer_content<M: HostMemory + HostOps>(
 /// Gates (any miss → `None`, caller stays on the CPU byte paths): native
 /// texel layout Vulkan samples identically (BGRA8/RGBA8 UNORM), tight rows,
 /// window inside the allocation, span ≥ the zero-copy floor, every page
-/// walkable, packed-contiguous runs mappable, and every run covered by a
-/// host import.
+/// walkable, and packed-contiguous runs mappable.
 #[cfg(feature = "backend-vulkan")]
 fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1844,9 +1839,6 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
         Some(runs) => runs,
         None => task_gva_guest_runs(state, host, task_id, gva, span)?,
     };
-    if !engine::ensure_host_imports(&runs) {
-        return None;
-    }
     Some((
         w,
         h,
@@ -1961,9 +1953,6 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         i = j;
     }
     if consumed != span {
-        return Err(Reason::ImportFail);
-    }
-    if !{ engine::ensure_host_imports(&runs) } {
         return Err(Reason::ImportFail);
     }
     let row_length_texels = if bpr == tight {
@@ -2087,9 +2076,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         i = j;
     }
     if consumed != span {
-        return None;
-    }
-    if !engine::ensure_host_imports(&runs) {
         return None;
     }
     let row_length_texels = if bpr == tight {
