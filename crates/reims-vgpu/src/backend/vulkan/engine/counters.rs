@@ -82,12 +82,10 @@ pub struct EngineCounters {
     /// RAM at flush time).
     pub buffer_snapshot_binds: AtomicU64,
     pub gpu_load_hits: AtomicU64,
-    pub seed_imports: AtomicU64,
     pub target_evicts: AtomicU64,
     /// Descriptor-arena growth events: a new pool block was appended because
     /// every existing block was exhausted (cap-pressure signal; 0 = no growth).
     pub desc_pool_grow: AtomicU64,
-    pub target_stale_import: AtomicU64,
     pub gen_mismatch: AtomicU64,
     /// Present-boundary frames copied straight into imported guest memory via
     /// VK_EXT_external_memory_host (workstream E) — zero CPU readback copy.
@@ -261,10 +259,8 @@ impl EngineCounters {
             buffer_zerocopy_binds: self.buffer_zerocopy_binds.load(Ordering::Relaxed),
             buffer_snapshot_binds: self.buffer_snapshot_binds.load(Ordering::Relaxed),
             gpu_load_hits: self.gpu_load_hits.load(Ordering::Relaxed),
-            seed_imports: self.seed_imports.load(Ordering::Relaxed),
             target_evicts: self.target_evicts.load(Ordering::Relaxed),
             desc_pool_grow: self.desc_pool_grow.load(Ordering::Relaxed),
-            target_stale_import: self.target_stale_import.load(Ordering::Relaxed),
             gen_mismatch: self.gen_mismatch.load(Ordering::Relaxed),
             import_presents: self.import_presents.load(Ordering::Relaxed),
             compute_post_wait_skips: self.compute_post_wait_skips.load(Ordering::Relaxed),
@@ -347,10 +343,8 @@ impl EngineCounters {
         self.buffer_zerocopy_binds.store(0, Ordering::Relaxed);
         self.buffer_snapshot_binds.store(0, Ordering::Relaxed);
         self.gpu_load_hits.store(0, Ordering::Relaxed);
-        self.seed_imports.store(0, Ordering::Relaxed);
         self.target_evicts.store(0, Ordering::Relaxed);
         self.desc_pool_grow.store(0, Ordering::Relaxed);
-        self.target_stale_import.store(0, Ordering::Relaxed);
         self.gen_mismatch.store(0, Ordering::Relaxed);
         self.import_presents.store(0, Ordering::Relaxed);
         self.compute_post_wait_skips.store(0, Ordering::Relaxed);
@@ -422,10 +416,8 @@ pub struct CounterSnapshot {
     pub buffer_zerocopy_binds: u64,
     pub buffer_snapshot_binds: u64,
     pub gpu_load_hits: u64,
-    pub seed_imports: u64,
     pub target_evicts: u64,
     pub desc_pool_grow: u64,
-    pub target_stale_import: u64,
     pub gen_mismatch: u64,
     pub import_presents: u64,
     pub compute_post_wait_skips: u64,
@@ -571,12 +563,8 @@ impl CounterSnapshot {
                 .buffer_snapshot_binds
                 .saturating_sub(earlier.buffer_snapshot_binds),
             gpu_load_hits: self.gpu_load_hits.saturating_sub(earlier.gpu_load_hits),
-            seed_imports: self.seed_imports.saturating_sub(earlier.seed_imports),
             target_evicts: self.target_evicts.saturating_sub(earlier.target_evicts),
             desc_pool_grow: self.desc_pool_grow.saturating_sub(earlier.desc_pool_grow),
-            target_stale_import: self
-                .target_stale_import
-                .saturating_sub(earlier.target_stale_import),
             gen_mismatch: self.gen_mismatch.saturating_sub(earlier.gen_mismatch),
             import_presents: self.import_presents.saturating_sub(earlier.import_presents),
             compute_post_wait_skips: self
