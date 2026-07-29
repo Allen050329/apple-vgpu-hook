@@ -446,10 +446,48 @@ the eventual *DMA*; the deferral itself did not. The flush here is the CPU write
 exists (`mapping_write::write_rgba8_image_changed`) — the win is doing it once on demand instead of
 ~70 times a second unconditionally.
 
-Worth checking before building: the model already carries mapping-keyed deferred windows for the
-*compute* rail (`ComputeStorageResidencyKey`'s "Surface window (`mapping_id != 0`)" kind, landed by
-`storage_flush`'s `flush_one` and its `compute_deferred_flush mapping=` line). The render Store may be
-able to arm one of those rather than growing a fourth window kind.
+**The hard part of that is already built, and it is the flush-trigger backbone.** The reason a
+deferred rail is dangerous is that every reader of the deferred pages must be made to flush first, and
+a missed reader means the guest silently reads stale pixels. For type-11 mappings that set is already
+closed and already wired, because the *compute* rail keeps mapping-keyed deferred windows
+(`ComputeStorageResidencyKey`'s "Surface window (`mapping_id != 0`)" kind) and every guest-page reader
+already drains them through `storage_flush::flush_intersecting(mapping_id, lo, hi)`:
+
+| reader | flushes first? |
+|---|---|
+| `mapper::write_mapping_bytes` | yes |
+| `mapper::read_mapping_bytes` | yes |
+| `flush_mapping_for_guest_read` (guest `SynchronizeResources`) | yes |
+| `scanout::capture_display_frame` | yes |
+| `flush_intersecting_task_gva` (raw task-GVA aliasing the mapping) | yes |
+| mapping teardown / unmap / delete-backing / replace-physical | drops the window (pages unreachable) |
+
+And the decisive one: **the host-window present path never reads the mapping's guest pages at all.**
+`publish_window_frame` → `export_present_dmabuf` → `export_present_from_resident_fd_policy` exports the
+engine resident directly. `note_front_buffer_writeback`, `note_dense_frame_published` and
+`note_surface_composite` only record metadata and enqueue a `HostAction` — none of them touches a guest
+page. So the ~70 Stores a second are writing bytes that, on the present path, nothing reads. That is
+what makes the deferral a win rather than a rescheduling.
+
+What is genuinely missing, and is the work:
+
+- **Pinning.** The render rail pins by `TargetIdentity` (`pin_resident_target`); the compute rail pins
+  by `ComputeStorageResidencyKey` (`pin_resident_storage`). A type-11 render window needs a resident
+  pinned under `TargetIdentity::Surface` — which `render_chain_identity` already produces for
+  `mapping_id != 0` — while being *indexed* for flushing in the mapping-keyed range map. Those two
+  are different keys for the same image and joining them is the substance of the change.
+- **Load-seed suppression.** The GVA Load skips its CPU seed when a deferred window exists at matching
+  geometry. The type-11 Load has no such check and always tries `surface_cache::get`, so without it
+  only half the traffic goes away.
+- **Supersede.** `supersede_gva_window`'s equivalent for re-arm, geometry change and clear-Store at the
+  same mapping range.
+- **The write gate.** The GVA flush checks `gva_write_allowed` before touching guest pages; the type-11
+  flush needs the mapping-side equivalent — and the drift guard, since this is a deferred window and
+  `deferred_pages_still_ours` exists for exactly this hazard.
+
+Do not assume `flush_one` can be called as-is: the compute flush reads a *storage* resident by
+`ComputeStorageResidencyKey`, and a render Store's pixels live in a *target* resident by
+`TargetIdentity`. The index and the triggers are reusable; the read is not.
 
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
