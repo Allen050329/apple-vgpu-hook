@@ -202,6 +202,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             #[cfg(feature = "backend-vulkan")]
             Ok(M2vDrawSpan::ResidentGvaStore) => {
                 if arm_gva_deferred_store(state, host, req) {
+                    note_type11_store_route("gva_deferred");
                     gva_store_armed = true;
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x}",
@@ -214,6 +215,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // Arm gate failed (unwalkable span / pin refusal): land
                     // synchronously from the resident the draw just produced.
                     // read_resident_chain fail-logs a lost resident.
+                    note_type11_store_route("gva_deferred_sync");
                     draw_rgba = read_resident_chain(state, req);
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store_sync_fallback pipe={} {}x{} gva={:#x} rgba={}",
@@ -282,6 +284,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             use crate::runtime::import_present::{
                 try_defer_present_store, try_import_present_store, ImportPresentResult,
             };
+            note_type11_store_route("import");
             // Ack-fast rung: keep the composite resident-side and flush on
             // access instead of a ~7 ms synchronous DMA on the stamp path.
             let deferred =
@@ -387,6 +390,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 );
                 let cpu_fallback_allowed = type11_cpu_store_fallback_allowed(import_allowed);
                 if cpu_fallback_allowed {
+                    note_type11_store_route("cpu_portability");
                     let ok = mapping_write::write_rgba8_image_changed(
                         state,
                         host,
@@ -439,6 +443,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // import-present (ResidentBgra). Landing here means the draw
                     // returned CPU pixels — fail closed to preserve the zero-copy
                     // invariant on that pathway.
+                    note_type11_store_route("rgba_not_import");
                     crate::observe::line(format!(
                         "linux_m2v_store mid={} {}x{} pipe={} reason=rgba_not_import (zero-copy only; no write_bgra8) rgb_nz={} max={}",
                         c0.mapping_id,
@@ -2618,6 +2623,43 @@ fn type11_import_allowed(
 #[inline]
 fn type11_cpu_store_fallback_allowed(import_allowed: bool) -> bool {
     !import_allowed
+}
+
+/// Name the guest-Store route this record actually took, once per distinct
+/// route per process.
+///
+/// Every other record of these branches is `observe::line`, which writes
+/// nothing unless `REIMS_VGPU_DRAW_LOG=1` — the only always-on `linux_m2v_store`
+/// arm is the CPU write *failure*. So an always-on log could not tell "the CPU
+/// Store ran" from "no Store happened at all", which is the branch-vs-arm hole:
+/// a probe placed inside one of these arms cannot separate "the condition was
+/// false" from "the outcome never occurred". This line names the branch itself,
+/// at the point the branch is taken, so a zero for one route is readable
+/// against the other routes' presence.
+///
+/// The dedup key is the route, so this is bounded at one line per outcome per
+/// process — after the first record of each kind it costs a `BTreeSet` lookup
+/// and a return, which is what makes it safe to leave on permanently.
+///
+/// Reachability is not uniform and must be read that way. `import` requires the
+/// engine to have enabled a host-pointer import, which
+/// [`crate::backend::vulkan::engine::external_memory_host_available`] now always
+/// refuses, and `rgba_not_import` is its complement's complement — with
+/// `import_allowed` always false, `type11_cpu_store_fallback_allowed` is always
+/// true and that arm cannot be entered. Both are kept as call sites so their
+/// absence is a *denominator* against the routes that do fire, not an
+/// acquittal; if either ever appears, the extension came back.
+#[cfg(feature = "backend-vulkan")]
+fn note_type11_store_route(route: &'static str) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::BTreeSet<&'static str>>> = Mutex::new(None);
+    {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if !guard.get_or_insert_with(Default::default).insert(route) {
+            return;
+        }
+    }
+    crate::observe::fail(format!("type11_store_route route={route}"));
 }
 
 fn publish_cpu_portability_store<M: HostMemory + HostOps>(
@@ -4960,6 +5002,39 @@ mod vulkan_split_tests {
              prim=0 first=0 idx=0 colors=[] vbuf=[] fbuf=[] vtex=[] ftex=[] \
              viewport=None scissor=None"
         );
+    }
+
+    /// The branch line is only worth leaving on forever if it is bounded, and
+    /// the bound is the dedup: one line per distinct route per process, however
+    /// many Stores take that route.
+    ///
+    /// The load-bearing assertion is the dedup, not the text — a per-Store line
+    /// on this path is a flood (thousands per session under compositing) and
+    /// would have to be removed again, which is how the tree ended up with no
+    /// always-on record of this branch in the first place.
+    #[test]
+    fn the_store_route_line_is_one_per_route_per_process() {
+        crate::observe::redirect_logs_for_tests();
+        let path = crate::observe::fail_log_path();
+        let mark = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) as usize;
+
+        // Routes distinct from every product route so this test cannot be
+        // satisfied by a line some other case in this binary emitted.
+        note_type11_store_route("test_route_a");
+        note_type11_store_route("test_route_a");
+        note_type11_store_route("test_route_a");
+        note_type11_store_route("test_route_b");
+
+        let whole = std::fs::read_to_string(path).expect("fail log");
+        let appended = &whole[mark.min(whole.len())..];
+        let count = |route: &str| {
+            appended
+                .lines()
+                .filter(|l| l.contains(&format!("type11_store_route route={route}")))
+                .count()
+        };
+        assert_eq!(count("test_route_a"), 1, "three calls, one line");
+        assert_eq!(count("test_route_b"), 1, "a second route still reports");
     }
 
     #[test]

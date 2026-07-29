@@ -707,14 +707,24 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
 /// windows, rather than something the CPU writeback would hit as well.
 ///
 /// Compared against the typed slugs rather than string literals so that renaming
-/// a cause moves both sides together. The two admitted here are the budget
+/// a cause moves both sides together. The three admitted here are the budget
 /// bounds; every other [`HostImportDecline`] is a capability, alignment, or
 /// range fact that a retry cannot change.
+///
+/// `EpochAdmitted` belongs with the other two and was missing. It is the
+/// per-submission admission throttle — "this epoch already paid for a region
+/// import" — so it refuses a span the *next* epoch would admit, which is the
+/// definition of a shortage of our own windows rather than a fact about the
+/// span. Without it the chain ran `host_import_epoch_admission` →
+/// `present_scatter_gpu` → `DrawError::HostImport` → this predicate saying no →
+/// `deferred_flush_lost kind=render`, and the guest render was dropped when a
+/// CPU writeback would have landed it.
 fn is_import_window_shortage(reason: &str) -> bool {
     use crate::backend::vulkan::engine::HostImportDecline;
     use crate::observe::Decline;
     reason == HostImportDecline::TotalBytes.slug()
         || reason == HostImportDecline::RegionCount.slug()
+        || reason == HostImportDecline::EpochAdmitted { epoch: 0 }.slug()
 }
 
 /// Why the runtime refused a guest-page import before the engine was asked.
@@ -1335,6 +1345,16 @@ mod tests {
             "a shortage of our own windows must re-route to the CPU writeback"
         );
 
+        // The per-submission admission throttle is the same kind of shortage:
+        // the next epoch would admit this span, so dropping the render instead
+        // of writing it back on the CPU is a loss of guest work.
+        let epoch = HostImportDecline::EpochAdmitted { epoch: 0 }.slug();
+        assert_ne!(
+            route(ImportPresentResult::Fail(epoch)),
+            ImportPresentResult::Fail(epoch),
+            "an epoch-admission refusal must re-route to the CPU writeback"
+        );
+
         let whole = std::fs::read_to_string(log_path).expect("fail log");
         let appended = &whole[mark.min(whole.len())..];
         let line = |reason: &str| {
@@ -1343,6 +1363,10 @@ mod tests {
         assert!(
             appended.contains(&line(cap)),
             "the re-route must name itself and the check that refused"
+        );
+        assert!(
+            appended.contains(&line(epoch)),
+            "the epoch re-route must name itself and the check that refused"
         );
         assert!(
             !appended.contains(&line(hard)),

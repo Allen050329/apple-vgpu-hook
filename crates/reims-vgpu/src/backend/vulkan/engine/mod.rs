@@ -1679,23 +1679,30 @@ mod probe_visibility_tests {
         }
     }
 
-    /// One engine entry per run list, whatever its length.
+    /// No guest run is importable, however well-formed it is.
     ///
-    /// The prologue this guards — global lock, device-context ensure, pool-init
-    /// check — is per entry, while the coverage question is per import window. A
-    /// fragmented full-screen IOSurface coalesces to ~77 runs that all resolve
-    /// against the same handful of windows, so a per-span form pays the prologue
-    /// 77 times to answer one question. Counting acquisitions is the only
-    /// assertion that fails if this regresses to a loop of single-span calls;
-    /// the returned bool is identical either way.
+    /// The spans below are real, page-aligned, mapped host memory of exactly one
+    /// page each — the shape the import accepted on every alignment and range
+    /// ground when it existed. So the refusal can only be the capability, which
+    /// is the property the removal has to hold: a run this device could import
+    /// is a run the GPU could write.
     ///
-    /// The runs must be spans that actually RESOLVE. `all` short-circuits, so a
-    /// list of unbacked pointers refuses on the first run and takes exactly one
-    /// engine entry in the per-span shape too. A first draft used unbacked spans,
-    /// passed against a deliberately reintroduced per-span loop, and was no gate
-    /// at all — hence real, page-aligned, mapped host memory here.
+    /// **The per-span regression gate this case used to carry is gone, and not
+    /// by choice.** It asserted one engine entry per run list — global lock,
+    /// device-context ensure, pool-init check are per entry while the coverage
+    /// question is per import window, and a fragmented full-screen IOSurface
+    /// coalesces to ~77 runs against a handful of windows. Counting lock
+    /// acquisitions was the only assertion that failed if the call regressed to
+    /// a loop of single-span calls. It only worked because the runs *resolved*:
+    /// `all` short-circuits, so with every run refusing, the per-span shape also
+    /// takes exactly one entry and the count proves nothing. Asserting it here
+    /// anyway would be a gate that cannot fail. Restoring it needs a resolvable
+    /// span, which needs an import, which is what was removed.
+    ///
+    /// Skipping instead was the other option and is worse: this case executed on
+    /// the GPU before the removal, and a skip reads as a pass.
     #[test]
-    fn ensure_host_imports_enters_the_engine_once_for_the_whole_run_list() {
+    fn no_well_formed_guest_run_is_importable() {
         crate::observe::redirect_logs_for_tests();
         const PAGE: usize = 4096;
         let buf = vec![0u8; PAGE * 24];
@@ -1706,22 +1713,14 @@ mod probe_visibility_tests {
                 len: PAGE as u64,
             })
             .collect();
-        let before = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
-        let ok = ensure_host_imports(&runs);
-        let after = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
-        if !ok {
-            eprintln!("SKIP engine-entry count: no device or no VK_EXT_external_memory_host here");
-            return;
-        }
-        assert_eq!(
-            after - before,
-            1,
-            "{} resolvable runs took {} engine entries; the prologue is per entry, not per span",
-            runs.len(),
-            after - before
+        assert!(
+            !ensure_host_imports(&runs),
+            "a page-aligned, mapped, page-sized run must still be refused"
         );
 
-        // An empty list asks nothing and must not enter at all.
+        // An empty list asks nothing and must not enter the engine at all —
+        // still a real assertion, because it is decided before any import is
+        // attempted.
         let before = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);
         assert!(ensure_host_imports(&[]));
         let after = ENGINE_LOCK_ACQ.load(Ordering::Relaxed);

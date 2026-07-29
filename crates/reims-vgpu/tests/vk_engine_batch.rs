@@ -427,13 +427,22 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
     engine::test_quiesce_ring();
 }
 
-/// A draw sampling `SampledSource::GuestRuns` reads guest RAM when its CB
-/// executes, so it must NOT defer its submit (no open, no join) — the
-/// immediate submit keeps the record→execute window at its validated
-/// pre-batching size. Requires a real host-pointer import; skips if the ICD
-/// refuses the heap allocation.
+/// A draw sampling `SampledSource::GuestRuns` would have the GPU read guest RAM
+/// when its CB executes. That needs a host-pointer import, which is never
+/// available, so the engine must **refuse the draw by name** rather than sample
+/// something else or silently bind nothing.
+///
+/// This case used to assert the rail's batching behaviour (no open, no join,
+/// because the deferred submit widened the record→execute window over live
+/// guest pages). It is rewritten rather than left in place because its guard —
+/// `ensure_host_imports` — now always answers false, which would have turned a
+/// GPU-executing case into a permanent skip reading as a pass. The batching
+/// property it asserted is moot: the runtime only ever builds a `GuestRuns`
+/// sampled source behind that same gate (`runtime/metal_draw/vulkan.rs`), so the
+/// rail is unreachable from a guest packet and takes the CPU byte upload
+/// instead.
 #[test]
-fn sampled_guest_runs_draw_does_not_batch() {
+fn sampled_guest_runs_draw_is_refused_by_name() {
     let _guard = engine_test_lock().lock().unwrap();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
@@ -443,18 +452,18 @@ fn sampled_guest_runs_draw_does_not_batch() {
         generation: 1,
     };
 
-    // Page-aligned backing so VK_EXT_external_memory_host can import it.
+    // One x86 guest page, page-aligned: a run the import would have accepted on
+    // every alignment ground, so the refusal below can only be the capability.
     let layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     assert!(!ptr.is_null());
-    if !engine::ensure_host_imports(&[engine::GuestRun {
-        host_ptr: ptr as usize,
-        len: 4096,
-    }]) {
-        eprintln!("skipping: ICD refused host-pointer import of heap memory");
-        unsafe { std::alloc::dealloc(ptr, layout) };
-        return;
-    }
+    assert!(
+        !engine::ensure_host_imports(&[engine::GuestRun {
+            host_ptr: ptr as usize,
+            len: 4096,
+        }]),
+        "no guest run may be importable"
+    );
 
     let before = engine::counter_snapshot();
     let mut req = batch_req(
@@ -485,27 +494,25 @@ fn sampled_guest_runs_draw_does_not_batch() {
         identity: None,
         swizzle: Default::default(),
     });
-    match engine::execute_draw_request(&req) {
-        Ok(_) => {}
-        Err(e) => {
-            let msg = e.to_string();
-            if skip_if_no_gpu(&msg) {
-                eprintln!("skipping: {msg}");
-                unsafe { std::alloc::dealloc(ptr, layout) };
-                return;
-            }
-            panic!("zc-sampled draw: {msg}");
+    let outcome = engine::execute_draw_request(&req);
+    engine::test_quiesce_ring();
+    // SAFETY: `ptr` is still live here and nothing reads it after this.
+    unsafe { std::alloc::dealloc(ptr, layout) };
+    let msg = match outcome {
+        Ok(_) => panic!("a guest-gather sampled draw executed; the GPU must not read guest RAM"),
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("skipping: {e}");
+            return;
         }
-    }
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("vk_draw_exec_sampled_guest_run_import_missing"),
+        "the refusal must name the missing import, not a driver error: {msg}"
+    );
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        d.batch_opens, 0,
-        "zc-sampled draw must not open a batch: {d:?}"
+        d.sampled_zerocopy_binds, 0,
+        "a refused guest gather must bind nothing: {d:?}"
     );
-    assert_eq!(
-        d.batch_joins, 0,
-        "zc-sampled draw must not join a batch: {d:?}"
-    );
-    engine::test_quiesce_ring();
-    unsafe { std::alloc::dealloc(ptr, layout) };
 }

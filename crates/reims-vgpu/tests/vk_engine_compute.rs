@@ -1578,17 +1578,31 @@ fn compute_linear_resident_deferred_chain() {
     }
 }
 
-/// GPU-direct writeback (VK_EXT_external_memory_host): the post-dispatch copy
-/// lands strided in the caller's imported host window, the readback entry
-/// stays empty with `images_direct` set, and row padding is untouched.
+/// A storage image carrying a guest writeback window must **not** be written by
+/// the GPU. `VK_EXT_external_memory_host` is the only mechanism for it and is
+/// never requested, so the dispatch falls back to the pooled readback: the
+/// caller's window is left untouched, the image comes back through
+/// `out.images`, and the refusal is counted and named.
+///
+/// This case used to assert the opposite — strided GPU DMA landing in the
+/// window — and it executed on the GPU on any host advertising the extension.
+/// It is kept executing rather than skipped: `compute_host_writeback_alignment`
+/// answers `None` for *both* "no device" and "no extension", so leaving it as
+/// the guard would have turned a live GPU case into a permanent skip that reads
+/// as a pass. `engine_or_skip` is the suite's GPU guard and is the one used
+/// here.
 #[test]
-fn compute_storage_image_direct_writeback_lands_in_host_window() {
+fn compute_storage_image_writeback_window_is_never_written_by_the_gpu() {
     let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     engine::test_reset_engine();
-    let Some(align) = engine::compute_host_writeback_alignment() else {
-        eprintln!("SKIP direct writeback: no GPU or VK_EXT_external_memory_host unavailable");
-        return;
-    };
+    assert!(
+        engine::compute_host_writeback_alignment().is_none(),
+        "the device must not advertise a host-pointer writeback alignment"
+    );
+    // One x86 guest page. Nothing imports this window, so its alignment is not
+    // load-bearing — it is page-sized and page-aligned only so the request keeps
+    // the shape of a real guest surface backing.
+    let align = 4096u64;
     // Same red-fill kernel as compute_storage_image_rgba8unorm_known_result.
     let spvasm = r#"
                OpCapability Shader
@@ -1637,7 +1651,7 @@ fn compute_storage_image_direct_writeback_lands_in_host_window() {
     // Strided guest window: 64-byte surface offset, 32-byte rows (16 tight).
     let buffer_offset = 64u64;
     let row_bytes = 32u32;
-    let window_len = usize::try_from(align.max(4096)).unwrap();
+    let window_len = usize::try_from(align).unwrap();
     let layout = std::alloc::Layout::from_size_align(window_len, align as usize).unwrap();
     // SAFETY: layout is nonzero; freed at the end of the test.
     let window = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -1678,34 +1692,41 @@ fn compute_storage_image_direct_writeback_lands_in_host_window() {
         }
     };
     assert_eq!(out.images.len(), 1);
-    assert!(out.images[0].is_empty(), "direct image must not read back");
-    assert_eq!(out.images_direct, vec![true]);
-    let snap = engine::counter_snapshot();
-    assert_eq!(snap.compute_direct_writebacks, 1);
     assert_eq!(
-        snap.compute_direct_writeback_bytes,
-        (w * h * 4) as u64,
-        "direct bytes count the image payload"
+        out.images_direct,
+        vec![false],
+        "no image may be written straight into the caller's window"
     );
-    assert_eq!(snap.compute_direct_writeback_fallbacks, 0);
-    // Rows land red at the strided offsets; inter-row padding stays zero.
-    let view = unsafe { std::slice::from_raw_parts(window, window_len) };
-    for y in 0..h as usize {
-        let row = &view[buffer_offset as usize + y * row_bytes as usize..];
-        for p in row[..(w * 4) as usize].chunks_exact(4) {
-            assert!(
-                p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
-                "row {y} texel {p:?}"
-            );
-        }
+    let snap = engine::counter_snapshot();
+    assert_eq!(
+        snap.compute_direct_writebacks, 0,
+        "no direct writeback may happen"
+    );
+    assert_eq!(snap.compute_direct_writeback_bytes, 0);
+    assert_eq!(
+        snap.compute_direct_writeback_fallbacks, 1,
+        "the refusal must be counted, not silent"
+    );
+    // The dispatch still produced the red fill — it came back through the
+    // pooled readback, which is what the caller copies from.
+    assert_eq!(out.images[0].len(), (w * h * 4) as usize);
+    for p in out.images[0].chunks_exact(4) {
         assert!(
-            row[(w * 4) as usize..row_bytes as usize]
-                .iter()
-                .all(|b| *b == 0),
-            "row {y} padding disturbed"
+            p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
+            "readback texel {p:?}"
         );
     }
+    // The whole window — payload rows, row padding and the surface offset —
+    // is byte-identical to the zeroed allocation. Nothing the GPU touched
+    // reached it.
+    // SAFETY: `window` backs `window_len` initialized bytes and is still live.
+    let view = unsafe { std::slice::from_raw_parts(window, window_len) };
+    let untouched = view.iter().all(|b| *b == 0);
     unsafe { std::alloc::dealloc(window, layout) };
+    assert!(
+        untouched,
+        "the GPU wrote the caller's window; guest memory must stay unwritable"
+    );
 }
 
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.

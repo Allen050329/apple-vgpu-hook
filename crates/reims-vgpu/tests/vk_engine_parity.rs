@@ -1160,13 +1160,23 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
 }
 
-/// Workstream E: present a resident target straight into imported host memory
-/// (VK_EXT_external_memory_host) — the GPU DMAs the frame into caller pages with
-/// no CPU readback copy. Off-VM stand-in for guest scanout pages: we supply our
-/// own page-aligned buffer and assert the GPU-written bytes appear through the
-/// raw pointer. Skips if the ICD lacks the extension.
+/// The engine must refuse to DMA a resident target into caller pages, because
+/// the only mechanism for it — `VK_EXT_external_memory_host` — is never
+/// requested. A host pointer this device can import over guest RAM is a host
+/// GPU that can write the guest VM's memory.
+///
+/// This is the behavioural gate on that refusal and it executes on the GPU: the
+/// cold draw below establishes a ready resident, so the refusal cannot come
+/// from an absent target, an unready one, or a missing device. Before the
+/// extension was refused this call returned `Ok` on any ICD advertising it, and
+/// the case asserted the GPU-written bytes instead — see git history for the
+/// content assertions, which cannot run again while the import is refused.
+///
+/// The refusal is *typed*, which is why the assertion reads the slug rather
+/// than prose: the caller does not supply the word, `present_into_host_ptr_strided`
+/// does, from the check that refused.
 #[test]
-fn present_into_host_ptr_writes_frame_zero_copy() {
+fn present_into_host_ptr_is_refused_without_the_extension() {
     use std::alloc::{alloc_zeroed, dealloc, Layout};
     let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     engine::test_reset_engine();
@@ -1209,34 +1219,42 @@ fn present_into_host_ptr_writes_frame_zero_copy() {
     // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
     let res =
         unsafe { engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0) };
-    match res {
-        Ok(_) => {
-            let after = engine::counter_snapshot();
-            let d = after.delta_since(&before);
-            assert_eq!(d.import_presents, 1, "import_present counter: {d:?}");
-            assert_eq!(
-                d.readbacks, 0,
-                "import present must not do a CPU readback: {d:?}"
-            );
-            // Read the frame back through the raw host pointer — these bytes were
-            // written by the GPU with no CPU copy.
-            // SAFETY: ptr backs at least `frame` initialized bytes post-present.
-            let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
-            assert_fullscreen_fragment_color("import_present_host_ptr", seen, w, h);
-        }
-        Err(e)
-            if e.to_string().contains("external_memory_host") || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP present_into_host_ptr (unsupported): {e}");
-        }
-        Err(e) => {
-            // SAFETY: same ptr/layout from the alloc above.
-            unsafe { dealloc(ptr, layout) };
-            panic!("present_into_host_ptr: {e}");
-        }
-    }
-    // SAFETY: same ptr/layout from the alloc above.
+    let after = engine::counter_snapshot();
+    // SAFETY: ptr backs `frame` initialized (zeroed) bytes and is still live.
+    let untouched = unsafe { std::slice::from_raw_parts(ptr, frame) }
+        .iter()
+        .all(|b| *b == 0);
+    // SAFETY: same ptr/layout from the alloc above. Nothing reads it after this.
     unsafe { dealloc(ptr, layout) };
+
+    let err = match res {
+        Ok(_) => panic!(
+            "present_into_host_ptr_strided imported a host pointer; the GPU must \
+             not be able to write guest RAM"
+        ),
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP present_into_host_ptr: {e}");
+            return;
+        }
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        "vk_engine_unsupported: reason=present_host_ptr_import_unavailable",
+        "the refusal must name the missing capability, not a driver error"
+    );
+    // Nothing was presented and nothing was read back to stand in for it, and
+    // the caller's pages are untouched — which is what the refusal has to mean.
+    let d = after.delta_since(&before);
+    assert_eq!(
+        d.import_presents, 0,
+        "a refused import presents nothing: {d:?}"
+    );
+    assert_eq!(d.readbacks, 0, "a refused import must not read back: {d:?}");
+    assert!(
+        untouched,
+        "the refused import must leave the caller's pages untouched"
+    );
 }
 
 /// Deferred render Stores pin their resident target: the registry LRU sweep
@@ -1319,76 +1337,6 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     // the unpin API keeps the slot registered right now).
     engine::unpin_resident_target(&pinned);
     assert!(engine::resident_content_ready(&pinned));
-}
-
-/// Workstream E: a BGRA resident target lands guest scanout byte order directly
-/// (no CPU RGBA→BGRA swizzle), so import-present writes correct bytes. Same
-/// triangle as the RGBA test, but the center pixel bytes are the byte-swap:
-/// RGBA ~(64,128,191,255) stored as BGRA ~(191,128,64,255).
-#[test]
-fn present_into_host_ptr_bgra_target_lands_guest_byte_order() {
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
-    let (v, f) = triangle_spirv();
-    let w = 16u32;
-    let h = 16u32;
-    let identity = TargetIdentity::Surface {
-        id: 78,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    // Resident BGRA target, no readback (content_ready set regardless).
-    let mut req = engine_req(&v, &f, w, h);
-    req.target_identity = Some(identity.clone());
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
-    req.output_bgra = true;
-    req.skip_readback = true;
-    match engine::execute_draw_request(&req) {
-        Ok(_) => {}
-        Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP bgra import-present: {e}");
-            return;
-        }
-        Err(e) => panic!("bgra resident draw: {e}"),
-    }
-
-    let frame = (w * h * 4) as usize;
-    let align = 65536usize;
-    let cap = frame.div_ceil(align) * align;
-    let layout = Layout::from_size_align(cap, align).unwrap();
-    // SAFETY: non-zero layout; freed below with the same layout.
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "host alloc failed");
-
-    // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
-    let res =
-        unsafe { engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0) };
-    match res {
-        Ok(()) => {
-            // SAFETY: ptr backs at least `frame` initialized bytes post-present.
-            let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
-            let i = ((h / 2) * w + w / 2) as usize * 4;
-            let (b, g, r, a) = (seen[i], seen[i + 1], seen[i + 2], seen[i + 3]);
-            assert!(
-                near(b, 191) && near(g, 128) && near(r, 64) && near(a, 255),
-                "bgra import-present center BGRA=({b},{g},{r},{a}); expected ~(191,128,64,255)"
-            );
-        }
-        Err(e)
-            if e.to_string().contains("external_memory_host") || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP bgra import-present (unsupported): {e}");
-        }
-        Err(e) => {
-            // SAFETY: same ptr/layout from the alloc above.
-            unsafe { dealloc(ptr, layout) };
-            panic!("bgra present_into_host_ptr: {e}");
-        }
-    }
-    // SAFETY: same ptr/layout from the alloc above.
-    unsafe { dealloc(ptr, layout) };
 }
 
 /// Direct-present zero-copy export (host-window route B, B2): a content-ready
@@ -1992,82 +1940,6 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         &[seed_rgba[2], seed_rgba[1], seed_rgba[0], seed_rgba[3]],
         "untouched semantic RGBA seed must remain correct in native BGRA storage"
     );
-}
-
-/// Strided import-present: guest IOSurface BPR > width*4 (live mids 1/5 class).
-/// GPU must honor buffer_row_length so row N starts at N*bpr, not N*tight.
-#[test]
-fn present_into_host_ptr_strided_honors_guest_bpr() {
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
-    let (v, f) = triangle_spirv();
-    let w = 16u32;
-    let h = 8u32;
-    let tight = w * 4;
-    let bpr = tight + 16; // 16 bytes pad per row (matches padded scanout class)
-    let identity = TargetIdentity::Surface {
-        id: 79,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    let mut req = engine_req(&v, &f, w, h);
-    req.target_identity = Some(identity.clone());
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
-    req.output_bgra = true;
-    req.skip_readback = true;
-    match engine::execute_draw_request(&req) {
-        Ok(_) => {}
-        Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP strided import-present: {e}");
-            return;
-        }
-        Err(e) => panic!("strided resident draw: {e}"),
-    }
-
-    let frame = (bpr * h) as usize;
-    let align = 65536usize;
-    let cap = frame.div_ceil(align) * align;
-    let layout = Layout::from_size_align(cap, align).unwrap();
-    // SAFETY: non-zero layout; freed below.
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null());
-
-    // SAFETY: ptr backs `cap` exclusive bytes for the DMA.
-    let res =
-        unsafe { engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, bpr) };
-    match res {
-        Ok(_) => {
-            // SAFETY: GPU wrote `frame` bytes into ptr.
-            let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
-            // Pad region at end of row 0 must stay zero (not spilled image bytes).
-            let pad0 = &seen[tight as usize..bpr as usize];
-            assert!(
-                pad0.iter().all(|&b| b == 0),
-                "row pad must stay zero under strided DMA; got {pad0:?}"
-            );
-            // Center of image (row h/2, col w/2) via guest BPR layout.
-            let row = (h / 2) as usize;
-            let col = (w / 2) as usize;
-            let i = row * (bpr as usize) + col * 4;
-            let (b, g, r, a) = (seen[i], seen[i + 1], seen[i + 2], seen[i + 3]);
-            assert!(
-                near(b, 191) && near(g, 128) && near(r, 64) && near(a, 255),
-                "strided center BGRA=({b},{g},{r},{a}); expected ~(191,128,64,255)"
-            );
-        }
-        Err(e)
-            if e.to_string().contains("external_memory_host") || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP strided import-present (unsupported): {e}");
-        }
-        Err(e) => {
-            unsafe { dealloc(ptr, layout) };
-            panic!("strided present_into_host_ptr: {e}");
-        }
-    }
-    unsafe { dealloc(ptr, layout) };
 }
 
 /// Premult One/OMSA: GPU Load+blend matches the retired software composite oracle.

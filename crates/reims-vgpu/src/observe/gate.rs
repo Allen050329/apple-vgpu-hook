@@ -32,14 +32,17 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Byte offsets of `Result<Success, String>` spellings in Rust code.
+/// `src` with every comment and every ordinary string/char literal replaced by
+/// spaces, byte-for-byte, so offsets and line numbers survive the mask.
 ///
-/// This is intentionally a small lexical scan rather than a same-line grep:
-/// rustfmt can wrap either generic argument, and nested generic `>` tokens must
-/// not be mistaken for the outer result. Comments and ordinary string/char
-/// literals are masked so the gate can explain the forbidden shape and test
-/// itself without creating a false source hit.
-fn result_string_error_offsets(src: &str) -> Vec<usize> {
+/// Shared by every source gate in this file, because a gate that greps raw
+/// source cannot tell code from prose: a doc comment quoting the shape it
+/// forbids, or a fail-log format string naming the very symbol under test, both
+/// read as source hits. Raw strings with any hash count, escaped string
+/// literals, `'x'`/`'\''` char literals and nested block comments are all
+/// handled here rather than in each caller — hand-rolling a second scrubber is
+/// how a sweep silently starts reporting live code as dead.
+fn mask_comments_and_literals(src: &str) -> Vec<u8> {
     #[derive(Clone, Copy)]
     enum State {
         Code,
@@ -196,7 +199,18 @@ fn result_string_error_offsets(src: &str) -> Vec<usize> {
             }
         };
     }
+    masked
+}
 
+/// Byte offsets of `Result<Success, String>` spellings in Rust code.
+///
+/// This is intentionally a small lexical scan rather than a same-line grep:
+/// rustfmt can wrap either generic argument, and nested generic `>` tokens must
+/// not be mistaken for the outer result. Comments and ordinary string/char
+/// literals are masked so the gate can explain the forbidden shape and test
+/// itself without creating a false source hit.
+fn result_string_error_offsets(src: &str) -> Vec<usize> {
+    let masked = mask_comments_and_literals(src);
     let mut hits = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = masked[from..]
@@ -266,6 +280,64 @@ fn the_result_string_scanner_reads_wrapped_types_and_only_the_error_slot() {
     "#;
     let hits = result_string_error_offsets(source);
     assert_eq!(hits.len(), 2, "wrapped/direct string errors: {hits:?}");
+}
+
+/// `VK_EXT_external_memory_host` must never be asked for.
+///
+/// Importing a host pointer over guest RAM gives the host GPU write access to
+/// the guest VM's memory. That is a property of the mechanism, not of how much
+/// of it is used, so the bound is "never requested" rather than any budget.
+///
+/// This is a **source** assertion and not a behavioural one, and it is here
+/// because the behavioural form cannot be built: what the flip changes is what
+/// `DeviceContext::create` asks the driver for, and every fixture that reads
+/// that answer needs `instance.create_device` to succeed — which on a driverless
+/// host degenerates into a skip, i.e. a green summary that is produced whether
+/// or not the code is right. A source gate has no such arm.
+///
+/// The needle is the *name constant*, because that is what a request is made of:
+/// `has_device_extension(…NAME)` and `enabled_device_extensions.push(…NAME…)`
+/// are the only two ways this crate can ask. The loader type
+/// (`ash::ext::external_memory_host::Device`) and the `ext_external_memory_host`
+/// field are deliberately **not** matched — they still exist and are hard-`None`,
+/// which is what keeps the rails that read the handle in the tree, declining by
+/// name, instead of disappearing.
+///
+/// Comments and string literals are masked, so the paragraph above and the
+/// `e.to_string().contains("external_memory_host")` guard in
+/// `runtime::import_present` are not hits. Whitespace is folded so a rustfmt
+/// wrap inside the path cannot hide a request.
+#[test]
+fn the_host_pointer_import_extension_is_never_requested() {
+    let root = crate_src();
+    let mut hits = Vec::new();
+    for path in rust_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = mask_comments_and_literals(&src);
+        let folded: String = masked
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        for needle in [
+            "external_memory_host::NAME",
+            "EXT_EXTERNAL_MEMORY_HOST_NAME",
+        ] {
+            if folded.contains(needle) {
+                hits.push(format!(
+                    "{} names {needle}",
+                    path.strip_prefix(&root).unwrap_or(&path).to_string_lossy()
+                ));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "VK_EXT_external_memory_host is requested; the GPU must not be able to \
+         write guest RAM:\n  {}",
+        hits.join("\n  ")
+    );
 }
 
 /// Free-text `Result` errors cannot return. A typed decline may preserve an

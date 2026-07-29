@@ -242,9 +242,15 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
-    /// VK_EXT_external_memory_host present-import capability (workstream E:
-    /// render the frame directly into imported guest pages, no CPU copy).
-    /// Loader present iff the extension was enabled at device create.
+    /// VK_EXT_external_memory_host present-import capability: render the frame
+    /// directly into imported guest pages, no CPU copy.
+    ///
+    /// **Always `None`.** The extension is never requested (see the comment at
+    /// the `external_memory_host` binding in `create`), because a host pointer
+    /// imported over guest RAM is a host GPU that can write the guest VM's
+    /// memory. Every reader of this field is therefore a decline site: it stays
+    /// an `Option` so those sites keep naming the missing capability by its own
+    /// typed reason instead of the rails disappearing silently.
     pub ext_external_memory_host: Option<ash::ext::external_memory_host::Device>,
     /// dmabuf EXPORT loader (`vkGetMemoryFdKHR`), present iff
     /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` were both
@@ -421,7 +427,32 @@ impl DeviceContext {
         let enabled = features.enabled_features();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
-        let external_memory_host = has_device_extension(ash::ext::external_memory_host::NAME);
+        // VK_EXT_external_memory_host is deliberately never requested, however
+        // the driver advertises it. Importing a host pointer over guest RAM
+        // hands the host GPU the ability to *write* the guest VM's memory, and
+        // no budget, granule, window policy or residency scheme bounds that —
+        // only not importing does.
+        //
+        // Every rail that used it has a CPU replacement, and each one names its
+        // own degradation rather than going quiet: the profile below resolves to
+        // `GuestRead::StagingCopy` / `GuestWrite::CpuReadback` and emits
+        // `vk_caps_zero_copy_declined rail=… reason=no_host_pointer_import` on
+        // the always-on path at every device create, the compute writeback
+        // declines `vk_compute_exec_direct_writeback_capability_lost`, and the
+        // present/scatter sites decline `host_import_extension_absent`.
+        //
+        // This is the hinge. `ext_external_memory_host` stays `None` from here,
+        // which is what every downstream check reads, and the rails that read
+        // the handle are left in the tree declining by name rather than deleted.
+        //
+        // Restoring the import takes **two** edits, not one: this binding *and*
+        // the `enabled_device_extensions` push below, which was removed with it.
+        // Restoring only this one loads `ash::ext::external_memory_host::Device`
+        // against a device that never enabled the extension, so its function
+        // pointers are null and the first import aborts inside ash. Measured:
+        // `present_into_host_ptr_is_refused_without_the_extension` panics in
+        // `extensions_generated.rs` rather than failing an assertion.
+        let external_memory_host = false;
         // dmabuf EXPORT capability (workstream: GL/dmabuf scanout export — hand
         // the finished present image to QEMU as a dmabuf fd so the frame never
         // leaves the GPU). Needs the fd export loader + the DMA_BUF handle-type
@@ -489,9 +520,6 @@ impl DeviceContext {
         }
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
-        }
-        if external_memory_host {
-            enabled_device_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
         if dmabuf_export {
             enabled_device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME.as_ptr());
