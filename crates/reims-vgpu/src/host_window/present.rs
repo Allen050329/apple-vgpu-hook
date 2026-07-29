@@ -46,7 +46,13 @@ use crate::runtime::host::HostAction;
 /// cause (verified: staging stays frozen across fullscreen/video transitions),
 /// so a trip means a real regression, not a transient.
 const REVERT_ALARM_RUN: u32 = 240;
-#[cfg(target_os = "macos")]
+/// How often the window looks for a new guest frame.
+///
+/// 2 ms (500 Hz) is well above any guest refresh, so the poll adds at most one
+/// tick of latency to a frame the guest has already published, and a tick that
+/// finds no new seq costs a mutex lock and an integer compare. It is not a
+/// present rate: [`needs_engine_present`] decides that, and on a still screen
+/// nothing is presented at all.
 const ENGINE_WINDOW_REDRAW_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
@@ -137,7 +143,13 @@ fn needs_staging_upload(staged: Option<u64>, incoming: u64) -> bool {
     staged != Some(incoming)
 }
 
-#[cfg(target_os = "macos")]
+/// Whether the window must present at all.
+///
+/// A present is an acquire, a full-frame blit into the swapchain image, a submit
+/// and a `queue_present`. None of that produces a different picture when the
+/// guest has not produced a different frame, so the only reasons to pay it are a
+/// new frame seq or a drawable that must be rebuilt (first frame, resize,
+/// suboptimal swapchain).
 fn needs_engine_present(
     presented: Option<u64>,
     redraw_required: bool,
@@ -590,11 +602,8 @@ pub fn run(
         first_engine_guest_logged: false,
         #[cfg(target_os = "macos")]
         engine_error_logged: false,
-        #[cfg(target_os = "macos")]
         next_engine_redraw: std::time::Instant::now(),
-        #[cfg(target_os = "macos")]
         last_engine_seq: None,
-        #[cfg(target_os = "macos")]
         engine_redraw_required: true,
         #[cfg(target_os = "macos")]
         guest_extent: None,
@@ -749,11 +758,16 @@ struct App {
     first_engine_guest_logged: bool,
     #[cfg(target_os = "macos")]
     engine_error_logged: bool,
-    #[cfg(target_os = "macos")]
+    /// When the event loop should next look for a new guest frame. The loop
+    /// sleeps until then rather than re-requesting a redraw immediately, which
+    /// is what made the window present continuously while the guest sat at a
+    /// handful of frames per second.
     next_engine_redraw: std::time::Instant,
-    #[cfg(target_os = "macos")]
+    /// Frame seq the drawable currently holds, or `None` before the first
+    /// present.
     last_engine_seq: Option<u64>,
-    #[cfg(target_os = "macos")]
+    /// Force the next present regardless of seq: first frame, resize, or a
+    /// swapchain that reported suboptimal.
     engine_redraw_required: bool,
     /// Last guest DisplaySwap geometry the window observed. Drives the
     /// once-per-mode-change native resize request and the pointer-to-guest
@@ -869,6 +883,10 @@ impl ApplicationHandler for App {
                 #[cfg(not(target_os = "macos"))]
                 if let Some(vk) = self.vk.as_mut() {
                     unsafe { vk.recreate_swapchain(size.width.max(1), size.height.max(1)) };
+                    // Fresh swapchain images hold nothing; the seq gate would
+                    // otherwise skip until the guest happened to produce a new
+                    // frame, leaving the resized window blank.
+                    self.engine_redraw_required = true;
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -897,10 +915,6 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
-                #[cfg(not(target_os = "macos"))]
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
             }
             _ => {}
         }
@@ -923,13 +937,31 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // The device sets `stop` on VM teardown. The window redraws every frame
-        // (throttled by the FIFO swapchain to vblank), so this runs ~per frame
-        // and picks the request up within one frame — then the loop exits and
-        // `VkState::drop` tears the window's Vulkan objects down on this thread
-        // before the device's join returns.
+        // The device sets `stop` on VM teardown. The loop wakes at least once
+        // per [`ENGINE_WINDOW_REDRAW_POLL`], so the request is picked up within
+        // one poll — then the loop exits and `VkState::drop` tears the window's
+        // Vulkan objects down on this thread before the device's join returns.
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
+        }
+        // Same pacing on both window rails: wake on a fixed poll, ask for a
+        // redraw, and let `draw`'s seq gate decide whether anything is actually
+        // presented. Linux used to re-request a redraw from inside
+        // `RedrawRequested`, which is a spin: measured on x86/Vulkan it held
+        // **510 presents/s** — a full-frame swapchain blit and submit each —
+        // while the guest was producing 4.5-8 frames/s. FIFO does not throttle
+        // it, and every one of those presents produced the picture already on
+        // screen.
+        #[cfg(not(target_os = "macos"))]
+        if let Some(window) = self.window.as_ref() {
+            let now = std::time::Instant::now();
+            if now >= self.next_engine_redraw {
+                window.request_redraw();
+                self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                self.next_engine_redraw,
+            ));
         }
         #[cfg(target_os = "macos")]
         if let Some(window) = self.window.as_ref() {
@@ -1013,11 +1045,31 @@ impl App {
             return;
         };
         #[cfg(not(target_os = "macos"))]
-        let frame = self.frames.lock().ok().and_then(|g| g.clone());
-        #[cfg(not(target_os = "macos"))]
-        if let Err(e) = unsafe { vk.present(frame.as_deref()) } {
-            crate::observe::Emit::decline("host_window_present", &e).fail_once(0);
-            eprintln!("reims-vgpu-window: present failed: {e}");
+        {
+            let frame = self.frames.lock().ok().and_then(|g| g.clone());
+            let incoming_seq = frame.as_ref().map(|frame| frame.seq);
+            if !needs_engine_present(
+                self.last_engine_seq,
+                self.engine_redraw_required,
+                incoming_seq,
+            ) {
+                return;
+            }
+            match unsafe { vk.present(frame.as_deref()) } {
+                Ok(()) => {
+                    self.last_engine_seq = incoming_seq;
+                    self.engine_redraw_required = false;
+                }
+                Err(e) => {
+                    // The drawable is in an unknown state — an acquire that
+                    // failed, a swapchain that was recreated mid-present. Hold
+                    // the force flag so the next tick presents rather than
+                    // waiting for a guest frame that may be seconds away.
+                    self.engine_redraw_required = true;
+                    crate::observe::Emit::decline("host_window_present", &e).fail_once(0);
+                    eprintln!("reims-vgpu-window: present failed: {e}");
+                }
+            }
         }
     }
 
@@ -2602,6 +2654,63 @@ impl Drop for VkState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run of redraws over one unchanged guest frame presents exactly once.
+    ///
+    /// This is the spin the Linux rail shipped: `RedrawRequested` called
+    /// `request_redraw()` again unconditionally, so the loop re-entered
+    /// immediately and presented whatever was already on screen. Measured on
+    /// x86/Vulkan it ran at 510 presents/s — each a full-frame swapchain blit
+    /// and submit — against a guest producing 4.5-8 frames/s. FIFO does not
+    /// throttle it, so nothing else in the stack was going to.
+    ///
+    /// The property that stops it is this predicate, and it now guards both
+    /// rails. Driving it with the poll sequence rather than the truth table is
+    /// deliberate: the table version passes even if a caller ignores the answer.
+    #[test]
+    fn repeated_polls_of_one_frame_present_once() {
+        let mut presented: Option<u64> = None;
+        let mut redraw_required = true;
+        let mut presents = 0;
+        // 300 polls — a couple of seconds at the 2 ms poll — over three guest
+        // frames, the middle one held for most of them.
+        for tick in 0..300u64 {
+            let incoming = Some(match tick {
+                0..=9 => 1,
+                10..=289 => 2,
+                _ => 3,
+            });
+            if needs_engine_present(presented, redraw_required, incoming) {
+                presents += 1;
+                presented = incoming;
+                redraw_required = false;
+            }
+        }
+        assert_eq!(
+            presents, 3,
+            "one present per distinct guest frame, not one per poll"
+        );
+    }
+
+    /// The first poll presents even though no guest frame exists yet, and a
+    /// resize presents again into the fresh swapchain images without waiting
+    /// for the guest — both are `redraw_required`, and both are why the gate
+    /// cannot be a bare seq comparison.
+    #[test]
+    fn forced_redraw_presents_without_a_new_frame() {
+        assert!(
+            needs_engine_present(None, true, None),
+            "the first present has no frame and must still happen"
+        );
+        assert!(
+            !needs_engine_present(None, false, None),
+            "and must not repeat once the flag is cleared"
+        );
+        assert!(
+            needs_engine_present(Some(7), true, Some(7)),
+            "a resize must repaint the same frame into new swapchain images"
+        );
+    }
 
     /// Every window bring-up check names itself, its slug is namespaced to the
     /// window rail and distinct, and — the property no crate-wide gate can see —
