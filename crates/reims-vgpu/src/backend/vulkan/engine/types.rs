@@ -562,8 +562,13 @@ impl BufferContent {
 
     /// CPU view of the content. `Bytes` borrows; `GuestRuns` copies the runs
     /// out of guest RAM (same freshness as the CPU staging path's encode-time
-    /// read). Callers are runtime diagnostics/coverage proofs — the hot draw
-    /// path never materializes a `GuestRuns` span on the CPU.
+    /// read).
+    ///
+    /// Every `GuestRuns` bind is a CPU gather now — the GPU has no way to reach
+    /// guest pages — but the hot path does that gather straight into mapped
+    /// staging with `write_staging_from_runs`, which is what avoids the
+    /// intermediate heap `Vec` this builds. Callers here are diagnostics and
+    /// coverage proofs, which want the bytes as a slice.
     pub fn cpu_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match self {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
