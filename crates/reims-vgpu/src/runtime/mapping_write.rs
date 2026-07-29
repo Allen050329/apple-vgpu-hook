@@ -659,7 +659,38 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // SAFETY: contig covers span_end.
+        // Same bound the write side enforces (`writeback_overrun`), and for the
+        // same reason: `contig_for_span` guarantees the view covers `span_end`
+        // and nothing more, while both branches below reach the last texel of
+        // the last row — `base_off + (origin_y+height-1)*bpr + x_off + rb`. A
+        // geometry that exceeds what `span_end` allows therefore reads past the
+        // view, and past the host mapping it reads whatever is next in the QEMU
+        // process: sampled texture content sourced from unrelated memory, or a
+        // SIGSEGV that takes the VM down with no guest-side trace.
+        //
+        // The write side was hardened for this and the read side was not, which
+        // is the asymmetry to watch for — a raw-pointer fast path added beside a
+        // checked slow path inherits none of its bounds. The fragmented branch
+        // below goes through `mapper::read_mapping_bytes`, which is bounded.
+        //
+        // A correctly-sized read satisfies this exactly (dense tight read:
+        // `read_end == span_end`), so this drops ONLY a genuine overrun.
+        let read_end = base_off
+            .saturating_add(
+                (origin_y as u64)
+                    .saturating_add(height as u64)
+                    .saturating_sub(1)
+                    .saturating_mul(bpr as u64),
+            )
+            .saturating_add(x_off)
+            .saturating_add(rb as u64);
+        if read_end > span_end {
+            crate::observe::fail(format!(
+                "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
+            ));
+            return false;
+        }
+        // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
             // Dense rows: identical byte range as the loop, one copy.
@@ -1465,6 +1496,69 @@ mod tests {
         assert_eq!(dst, src);
         // Read does not bump generation.
         assert_eq!(state.mappings.get(&4).unwrap().content_generation, gen);
+    }
+
+    /// The read side of the same bound. A rect read whose geometry exceeds what
+    /// `span_end` allows must be REJECTED, not run past the contig view.
+    ///
+    /// `contig_for_span` guarantees the view covers `span_end` and nothing more,
+    /// so an oversized `height` reads whatever is next in the QEMU process —
+    /// unrelated memory sampled into a texture, or a SIGSEGV that takes the VM
+    /// down with no guest-side trace. The write side has carried this guard for a
+    /// while; the read side did not, which is the asymmetry to watch for when a
+    /// raw-pointer fast path is added beside a checked slow path.
+    ///
+    /// A correctly-sized read (read_end == span_end) still succeeds.
+    #[test]
+    fn oversized_height_rect_read_is_rejected_not_overrun() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x23u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        // A full 16 KiB page, so `contig_for_span` succeeds and the guard — not
+        // the view length — is what has to stop the overrun.
+        host.map_range(gpa, 0x4000, 0xCC);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(11);
+        {
+            let m = state.mappings.get_mut(&11).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![entry];
+        }
+        // The source allows exactly 2 rows of bpr=8.
+        let bpr = 8u32;
+        let (width, bpp) = (2u32, 4u32); // row_bytes = 8 == bpr (dense path)
+        let span_end = 16u64;
+
+        // 100 rows: read_end = (100-1)*8 + 8 = 800 > 16.
+        let mut big = vec![0u8; 100 * bpr as usize];
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !read_rect_raw_at(
+                &mut state, &mut host, 11, 0, bpr, span_end, 0, 0, width, 100, bpp, &mut big, bpr,
+            ),
+            "an oversized-height read must be rejected"
+        );
+        assert!(
+            cap.one("mapping_read").contains("reason=read_overrun"),
+            "the refusal must name itself"
+        );
+        assert!(
+            big.iter().all(|&b| b == 0),
+            "a rejected read must not have copied anything into the caller's buffer"
+        );
+        drop(cap);
+
+        // A correctly-sized 2-row read (read_end == span_end) still succeeds.
+        let mut ok = vec![0u8; 2 * bpr as usize];
+        assert!(
+            read_rect_raw_at(
+                &mut state, &mut host, 11, 0, bpr, span_end, 0, 0, width, 2, bpp, &mut ok, bpr,
+            ),
+            "a read whose extent equals span_end must succeed"
+        );
+        assert_eq!(ok, vec![0xCC; 2 * bpr as usize], "and must read the page");
     }
 
     /// A writeback whose source `height` exceeds what the destination `span_end`
