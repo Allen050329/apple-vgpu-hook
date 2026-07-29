@@ -2,14 +2,14 @@
 //!
 //! This is all that survives of `import_present`, which owned three ways of
 //! landing a Vulkan composite Store in guest IOSurface pages without a CPU
-//! copy: a packed-contig strided DMA through `present_into_host_ptr_strided`, a
-//! fragmented multi-run scatter DMA through `present_into_host_runs`, and an
-//! ack-fast deferred rung that pinned the resident and replayed the Store on
+//! copy: a packed-contig strided DMA, a fragmented multi-run scatter DMA, and
+//! an ack-fast deferred rung that pinned the resident and replayed the Store on
 //! first access.
 //!
 //! All three needed `VK_EXT_external_memory_host` — a host pointer over the
-//! guest's own pages, which is a pointer the GPU can write. It is no longer
-//! requested, so type-11 Stores take the CPU writeback
+//! guest's own pages, which is a pointer the GPU can write. Neither the
+//! extension nor the two engine entry points exist any more, so type-11 Stores
+//! take the CPU writeback
 //! (`mapping_write::write_rgba8_image_changed`), which every one of those rails
 //! already fell back to whenever an import was refused.
 //!

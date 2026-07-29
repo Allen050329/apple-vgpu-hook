@@ -295,18 +295,23 @@ fn the_result_string_scanner_reads_wrapped_types_and_only_the_error_slot() {
 /// host degenerates into a skip, i.e. a green summary that is produced whether
 /// or not the code is right. A source gate has no such arm.
 ///
-/// The needle is the *name constant*, because that is what a request is made of:
-/// `has_device_extension(…NAME)` and `enabled_device_extensions.push(…NAME…)`
-/// are the only two ways this crate can ask. The loader type
-/// (`ash::ext::external_memory_host::Device`) and the `ext_external_memory_host`
-/// field are deliberately **not** matched — they still exist and are hard-`None`,
-/// which is what keeps the rails that read the handle in the tree, declining by
-/// name, instead of disappearing.
+/// The needles are the whole API surface of the mechanism, not just the request.
+/// The name constant is how a device *asks* for it
+/// (`has_device_extension(…NAME)`, `enabled_device_extensions.push(…NAME…)`);
+/// the loader type, the two import structs, the properties entry point and the
+/// `HOST_ALLOCATION_EXT` handle type are how it would then be *used*. A
+/// reintroduction has to name at least one of them, and matching all six means
+/// the gate does not depend on which end someone starts from.
 ///
-/// Comments and string literals are masked, so the paragraph above and the
-/// `e.to_string().contains("external_memory_host")` guard in
-/// `runtime::import_present` are not hits. Whitespace is folded so a rustfmt
-/// wrap inside the path cannot hide a request.
+/// Earlier this gate matched only the two name constants, on the reasoning that
+/// the loader type and the `ext_external_memory_host` field should stay in the
+/// tree as hard-`None` decline sites. That subsystem is deleted now — the
+/// resolver, its window budget, the scatter pool and both present entry points
+/// went with it — so nothing legitimate names any of these, and the narrower
+/// gate would no longer notice a whole rail coming back.
+///
+/// Comments and string literals are masked, so the paragraph above is not a hit.
+/// Whitespace is folded so a rustfmt wrap inside a path cannot hide a request.
 #[test]
 fn the_host_pointer_import_extension_is_never_requested() {
     let root = crate_src();
@@ -323,6 +328,10 @@ fn the_host_pointer_import_extension_is_never_requested() {
         for needle in [
             "external_memory_host::NAME",
             "EXT_EXTERNAL_MEMORY_HOST_NAME",
+            "ash::ext::external_memory_host",
+            "ImportMemoryHostPointerInfoEXT",
+            "get_memory_host_pointer_properties_ext",
+            "ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT",
         ] {
             if folded.contains(needle) {
                 hits.push(format!(
@@ -1071,17 +1080,23 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // (69, 1510) -> (67, 1493). Two types and seventeen slugs left with the
-        // rails that wrote them: `ImportDecline` (12 slugs) was the runtime
-        // import-present rail's own vocabulary and its file is deleted, and
-        // `Type11LoadDecision` (6 slugs) named which of six checks decided a
-        // type-11 Load — a question only asked when a Store landed by import and
-        // left the attachment resident-only. `ZeroCopyLost` (+1 type, 7 slugs)
-        // is the vocabulary that replaced them.
+        // (67, 1493) -> (66, 1437). One type and fifty-six slugs left with the
+        // host-pointer import subsystem: `HostImportDecline` (9 slugs) was the
+        // resolver's own vocabulary and its file is deleted;
+        // `HostPresentDecline` became `TargetReadDecline` and dropped 22 of its
+        // 24 slugs, which were the layout, bounds and ordering checks the two
+        // guest-page DMA entry points applied; `DrawReason` lost 6 (the two
+        // host-pointer memory-type refusals and the four present/scatter import
+        // refusals); `VkCall` lost 16 (the packed host-present CB rail, the two
+        // context import calls, the eight host-scatter calls and the two
+        // host-import buffer binds); `EngineFacadeDecline` lost the 2 scatter
+        // present state checks; and `ZeroCopyLost` lost 1, `scatter_present`,
+        // which never had an emission site — the fragmented and packed present
+        // rails share one decision point and one `import_present` notice.
         //
         // Down is the right direction here. A registered slug for a check the
         // crate can no longer make reads as an available refusal when it is not.
-        (67, 1493),
+        (66, 1437),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

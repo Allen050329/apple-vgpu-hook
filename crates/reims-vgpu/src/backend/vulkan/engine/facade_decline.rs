@@ -29,12 +29,6 @@ pub enum EngineFacadeDecline {
     ExportPresentNotReady {
         identity: TargetIdentity,
     },
-    ScatterPresentUnknownIdentity {
-        identity: TargetIdentity,
-    },
-    ScatterPresentNotReady {
-        identity: TargetIdentity,
-    },
     WindowSourceDisappearedBeforePin {
         identity: TargetIdentity,
     },
@@ -52,10 +46,6 @@ impl Decline for EngineFacadeDecline {
                 "vk_engine_export_present_unknown_identity"
             }
             Self::ExportPresentNotReady { .. } => "vk_engine_export_present_not_ready",
-            Self::ScatterPresentUnknownIdentity { .. } => {
-                "vk_engine_scatter_present_unknown_identity"
-            }
-            Self::ScatterPresentNotReady { .. } => "vk_engine_scatter_present_not_ready",
             Self::WindowSourceDisappearedBeforePin { .. } => {
                 "vk_engine_window_source_disappeared_before_pin"
             }
@@ -80,8 +70,6 @@ impl Decline for EngineFacadeDecline {
             }
             Self::ExportPresentUnknownIdentity { identity }
             | Self::ExportPresentNotReady { identity }
-            | Self::ScatterPresentUnknownIdentity { identity }
-            | Self::ScatterPresentNotReady { identity }
             | Self::WindowSourceDisappearedBeforePin { identity } => identity_fields(identity),
         }
     }
@@ -133,12 +121,6 @@ mod tests {
             EngineFacadeDecline::ExportPresentNotReady {
                 identity: identity(),
             },
-            EngineFacadeDecline::ScatterPresentUnknownIdentity {
-                identity: identity(),
-            },
-            EngineFacadeDecline::ScatterPresentNotReady {
-                identity: identity(),
-            },
             EngineFacadeDecline::WindowSourceDisappearedBeforePin {
                 identity: identity(),
             },
@@ -159,7 +141,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 8, "the engine façade reason census moved");
+        assert_eq!(before, 6, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 
@@ -179,11 +161,11 @@ mod tests {
     }
 
     #[test]
-    fn scatter_present_state_failures_keep_identity_and_readiness_distinct() {
-        let unknown = EngineFacadeDecline::ScatterPresentUnknownIdentity {
+    fn export_present_state_failures_keep_identity_and_readiness_distinct() {
+        let unknown = EngineFacadeDecline::ExportPresentUnknownIdentity {
             identity: identity(),
         };
-        let not_ready = EngineFacadeDecline::ScatterPresentNotReady {
+        let not_ready = EngineFacadeDecline::ExportPresentNotReady {
             identity: identity(),
         };
         assert_ne!(unknown.slug(), not_ready.slug());

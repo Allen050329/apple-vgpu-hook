@@ -13,12 +13,11 @@
 //! | [`GuestWrite`] — results back into guest memory | GPU writes the guest's own pages | CPU readback into those pages |
 //! | [`super::FrameHandoff`] — finished frame to the display | same-device swapchain, or dmabuf to the window's device | host-visible copy into the window's staging image |
 //!
-//! The rails are independent: MoltenVK reaches the top rung on all three
-//! without dmabuf existing at all (it imports host pointers and the engine
-//! device owns the window surface), while a Linux host with dmabuf but no
-//! `VK_EXT_external_memory_host` reaches the top rung on the display rail and
-//! the bottom rung on both memory rails. Collapsing them into one flag would
-//! report either host as "half zero-copy" and name neither half.
+//! The rails are independent, and on this backend they are also permanently
+//! split: `VK_EXT_external_memory_host` is never requested, so both memory
+//! rails sit on their copy rung on every host while the display rail still
+//! reaches dmabuf or a same-device swapchain. Collapsing them into one flag
+//! would report every host as "half zero-copy" and name neither half.
 //!
 //! # Why the axis is still binary in the matrix
 //!
@@ -28,14 +27,16 @@
 //! log line names which rung each rail landed on so "why is this host slow" is
 //! answerable without a debugger.
 //!
-//! # The pinning constraint (standing directive, 2026-07-18)
+//! # Why the memory rails have no zero-copy rung any more
 //!
-//! `VK_EXT_external_memory_host` *registers* — pins — every page it imports for
-//! the lifetime of the import. Importing the QEMU RAMBlock's whole VMA would
-//! therefore pin all guest RAM on the host, which is why imports are bucketed
-//! into `HOST_IMPORT_WINDOW_CAP`-sized windows rather than taken whole. The
-//! top rung on the memory rails means "the GPU addresses guest pages in place",
-//! never "all of guest RAM is one GPU allocation".
+//! `VK_EXT_external_memory_host` *registers* — pins — every page it imports,
+//! and a page the GPU can read is one it can write. Bounding that with windows,
+//! byte caps and an idle sweep was tried and is gone: the mechanism was removed
+//! rather than tuned, because no residency policy changes what the GPU is
+//! allowed to do with a page it holds. [`GuestRead::ImportedPages`] and
+//! [`GuestWrite::GpuDirect`] therefore name rungs this backend cannot select;
+//! they are kept so the log line and the matrix can say which rung was *lost*
+//! rather than reporting the copy as if it were the only shape that existed.
 
 use crate::observe::Decline;
 
@@ -45,13 +46,6 @@ use crate::observe::Decline;
 /// These are *different boundaries*, not alternatives — see the module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DmaMechanisms {
-    /// `VK_EXT_external_memory_host`: import a host virtual address range (the
-    /// pages QEMU allocated for guest RAM) as `VkDeviceMemory`, so the GPU
-    /// reads and writes guest memory in place.
-    ///
-    /// Present on MoltenVK, Mesa, and NVIDIA. This is the mechanism both memory
-    /// rails ride on.
-    pub host_pointer_import: bool,
     /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf`: export a
     /// GPU allocation as a kernel dma-buf fd another device or process imports.
     ///
@@ -66,18 +60,21 @@ pub struct DmaMechanisms {
 impl DmaMechanisms {
     /// Stable slug naming which mechanisms are present, for the selection line.
     pub fn slug(self) -> &'static str {
-        match (self.host_pointer_import, self.dmabuf_share) {
-            (true, true) => "host_pointer+dmabuf",
-            (true, false) => "host_pointer",
-            (false, true) => "dmabuf",
-            (false, false) => "none",
+        if self.dmabuf_share {
+            "dmabuf"
+        } else {
+            "none"
         }
     }
 
     /// True when at least one mechanism exists, i.e. some crossing can avoid a
     /// copy. This is the matrix axis.
+    ///
+    /// Only the display rail can answer yes. Both memory rails lost their
+    /// mechanism with the host-pointer import, so a host reaching [`DmaSupport::Dma`]
+    /// does so on dmabuf alone — see [`ZeroCopyProfile::resolve`].
     pub fn any(self) -> bool {
-        self.host_pointer_import || self.dmabuf_share
+        self.dmabuf_share
     }
 }
 
@@ -158,8 +155,11 @@ impl GuestWrite {
 /// cause, per the never-drop-silently rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ZeroCopyDecline {
-    /// `VK_EXT_external_memory_host` is not advertised, so no host pointer can
-    /// become `VkDeviceMemory` and both memory rails fall to a copy.
+    /// No host pointer can become `VkDeviceMemory`, so both memory rails fall
+    /// to a copy. Unconditional: `VK_EXT_external_memory_host` is never
+    /// requested, however the driver advertises it, because a host pointer
+    /// imported over guest RAM is a host GPU that can write the guest VM's
+    /// memory.
     NoHostPointerImport,
 }
 
@@ -187,25 +187,27 @@ pub struct ZeroCopyProfile {
 impl ZeroCopyProfile {
     /// Resolve every rail against the mechanisms this device advertises.
     ///
-    /// Both memory rails currently ride on the same mechanism, so they decline
-    /// together. They are kept separate anyway because they fail separately in
-    /// practice — a read import can succeed on a span a write import rejects
-    /// (alignment, window cap) — and because a future device could expose one
-    /// direction only.
+    /// Both memory rails land on their copy rung on **every** device, because
+    /// the only mechanism either ever had was `VK_EXT_external_memory_host` and
+    /// this backend no longer requests it. That is a degradation, not expected
+    /// control flow, so it is declined by name here — one
+    /// `vk_caps_zero_copy_declined reason=no_host_pointer_import` per rail per
+    /// device create, which is where "why does this host copy every guest
+    /// texture" is answered.
+    ///
+    /// The two rails stay separate entries rather than one, because they cost
+    /// different things (a per-bind staging gather vs a per-store readback) and
+    /// a reader chasing one should not have to know they were ever the same
+    /// mechanism.
     pub fn resolve(mechanisms: DmaMechanisms) -> Self {
-        let mut declined = Vec::new();
-        let (guest_read, guest_write) = if mechanisms.host_pointer_import {
-            (GuestRead::ImportedPages, GuestWrite::GpuDirect)
-        } else {
-            declined.push(("guest_read", ZeroCopyDecline::NoHostPointerImport));
-            declined.push(("guest_write", ZeroCopyDecline::NoHostPointerImport));
-            (GuestRead::StagingCopy, GuestWrite::CpuReadback)
-        };
         Self {
             mechanisms,
-            guest_read,
-            guest_write,
-            declined,
+            guest_read: GuestRead::StagingCopy,
+            guest_write: GuestWrite::CpuReadback,
+            declined: vec![
+                ("guest_read", ZeroCopyDecline::NoHostPointerImport),
+                ("guest_write", ZeroCopyDecline::NoHostPointerImport),
+            ],
         }
     }
 
@@ -222,7 +224,6 @@ impl ZeroCopyProfile {
     pub fn display_only(dmabuf_import: bool) -> Self {
         Self {
             mechanisms: DmaMechanisms {
-                host_pointer_import: false,
                 dmabuf_share: dmabuf_import,
             },
             guest_read: GuestRead::StagingCopy,
@@ -270,32 +271,24 @@ impl ZeroCopyProfile {
 mod tests {
     use super::*;
 
-    /// MoltenVK: host-pointer import, no dmabuf. Both memory rails reach their
-    /// zero-copy rung, and the host lands in the DMA column — the display rail
-    /// needs no external-memory handle there because the engine device owns the
-    /// window surface.
+    /// The arm64 pathway after the import removal: MoltenVK has no dmabuf and
+    /// no host-pointer import, so every crossing costs a copy and the host
+    /// lands in the non-DMA column. Supported, just slower.
     #[test]
-    fn moltenvk_is_dma_through_host_pointer_import_alone() {
-        let profile = ZeroCopyProfile::resolve(DmaMechanisms {
-            host_pointer_import: true,
-            dmabuf_share: false,
-        });
-        assert_eq!(profile.support(), DmaSupport::Dma);
-        assert_eq!(profile.guest_read, GuestRead::ImportedPages);
-        assert_eq!(profile.guest_write, GuestWrite::GpuDirect);
-        assert_eq!(profile.declined_summary(), "");
-        assert_eq!(profile.mechanisms.slug(), "host_pointer");
+    fn no_mechanism_resolves_every_rail_to_its_fallback() {
+        let profile = ZeroCopyProfile::resolve(DmaMechanisms::default());
+        assert_eq!(profile.support(), DmaSupport::NoDma);
+        assert!(!profile.guest_read.is_zero_copy());
+        assert!(!profile.guest_write.is_zero_copy());
+        assert_eq!(profile.mechanisms.slug(), "none");
     }
 
-    /// A Linux host with dmabuf but no host-pointer import is still DMA — the
-    /// display rail is zero-copy — but BOTH memory rails must name why they
-    /// degraded. Reporting a bare "dma" here is the failure this test locks out.
+    /// A Linux host with dmabuf is still DMA — the display rail is zero-copy —
+    /// but BOTH memory rails must name why they degraded. Reporting a bare
+    /// "dma" here is the failure this test locks out.
     #[test]
-    fn dmabuf_without_host_pointer_import_names_both_degraded_rails() {
-        let profile = ZeroCopyProfile::resolve(DmaMechanisms {
-            host_pointer_import: false,
-            dmabuf_share: true,
-        });
+    fn dmabuf_still_names_both_degraded_memory_rails() {
+        let profile = ZeroCopyProfile::resolve(DmaMechanisms { dmabuf_share: true });
         assert_eq!(profile.support(), DmaSupport::Dma);
         assert_eq!(profile.guest_read, GuestRead::StagingCopy);
         assert_eq!(profile.guest_write, GuestWrite::CpuReadback);
@@ -306,75 +299,54 @@ mod tests {
         assert_eq!(profile.mechanisms.slug(), "dmabuf");
     }
 
-    /// The copy-only host: every rail on its fallback rung, and the matrix puts
-    /// it in the non-DMA column. This row is supported, not declined.
+    /// The memory rails decline **whatever** the device advertises. This is the
+    /// property the removal has to hold, and it is stated over the whole
+    /// mechanism space rather than on one fixture: no input reaches
+    /// [`GuestRead::ImportedPages`] or [`GuestWrite::GpuDirect`].
+    ///
+    /// It is also why the display rail is checked in the same loop — a change
+    /// that accidentally pinned *every* rail to its fallback would still pass a
+    /// test that only asserted the memory rails, and it would silently cost the
+    /// dmabuf handoff.
     #[test]
-    fn no_mechanism_resolves_every_rail_to_its_fallback() {
-        let profile = ZeroCopyProfile::resolve(DmaMechanisms::default());
-        assert_eq!(profile.support(), DmaSupport::NoDma);
-        assert!(!profile.guest_read.is_zero_copy());
-        assert!(!profile.guest_write.is_zero_copy());
-        assert_eq!(profile.mechanisms.slug(), "none");
-    }
-
-    /// Exhaustive over the mechanism cross product: the axis is exactly "any
-    /// mechanism", and every combination resolves both rails to a real rung.
-    #[test]
-    fn every_mechanism_combination_resolves_and_agrees_with_the_axis() {
-        for bits in 0u8..4 {
-            let mechanisms = DmaMechanisms {
-                host_pointer_import: bits & 1 != 0,
-                dmabuf_share: bits & 2 != 0,
-            };
+    fn no_device_shape_reaches_a_zero_copy_memory_rung() {
+        for dmabuf_share in [false, true] {
+            let mechanisms = DmaMechanisms { dmabuf_share };
             let profile = ZeroCopyProfile::resolve(mechanisms);
-            let expected = if mechanisms.any() {
-                DmaSupport::Dma
-            } else {
-                DmaSupport::NoDma
-            };
-            assert_eq!(profile.support(), expected, "{mechanisms:?}");
-            // A rail is zero-copy exactly when its mechanism is present.
+            assert!(!profile.guest_read.is_zero_copy(), "{mechanisms:?}");
+            assert!(!profile.guest_write.is_zero_copy(), "{mechanisms:?}");
             assert_eq!(
-                profile.guest_read.is_zero_copy(),
-                mechanisms.host_pointer_import,
-                "{mechanisms:?}"
-            );
-            assert_eq!(
-                profile.guest_write.is_zero_copy(),
-                mechanisms.host_pointer_import,
-                "{mechanisms:?}"
+                profile.support(),
+                if dmabuf_share {
+                    DmaSupport::Dma
+                } else {
+                    DmaSupport::NoDma
+                },
+                "the axis must track the display rail alone: {mechanisms:?}"
             );
         }
     }
 
-    /// Every mechanism combination has a distinct slug, so the selection line
-    /// distinguishes "no dmabuf" from "no zero-copy at all" — two very
-    /// different hosts that a shared slug would render identical.
+    /// Each mechanism combination has a distinct slug, so the selection line
+    /// distinguishes "no dmabuf" from "dmabuf" on the summary line.
     #[test]
     fn mechanism_slugs_are_distinct() {
-        let mut slugs: Vec<_> = (0u8..4)
-            .map(|bits| {
-                DmaMechanisms {
-                    host_pointer_import: bits & 1 != 0,
-                    dmabuf_share: bits & 2 != 0,
-                }
-                .slug()
-            })
+        let mut slugs: Vec<_> = [false, true]
+            .into_iter()
+            .map(|dmabuf_share| DmaMechanisms { dmabuf_share }.slug())
             .collect();
         slugs.sort_unstable();
         slugs.dedup();
-        assert_eq!(slugs.len(), 4);
+        assert_eq!(slugs.len(), 2);
     }
 
     /// A degraded rail NEVER degrades silently — the rule the whole module
-    /// exists to serve.
+    /// exists to serve. Both memory rails are degraded on every host now, so
+    /// both must be named on every host.
     #[test]
     fn every_degraded_rail_is_named() {
-        for bits in 0u8..4 {
-            let mechanisms = DmaMechanisms {
-                host_pointer_import: bits & 1 != 0,
-                dmabuf_share: bits & 2 != 0,
-            };
+        for dmabuf_share in [false, true] {
+            let mechanisms = DmaMechanisms { dmabuf_share };
             let profile = ZeroCopyProfile::resolve(mechanisms);
             let degraded = usize::from(!profile.guest_read.is_zero_copy())
                 + usize::from(!profile.guest_write.is_zero_copy());
@@ -384,6 +356,7 @@ mod tests {
                 .filter(|s| !s.is_empty())
                 .count();
             assert_eq!(named, degraded, "{mechanisms:?} left a rail unnamed");
+            assert_eq!(named, 2, "both memory rails degrade on every host");
         }
     }
 }

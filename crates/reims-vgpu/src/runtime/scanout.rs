@@ -451,6 +451,10 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     if dst.len() < need {
         return ScanoutCopyResult::Failed;
     }
+    // Every console frame from here on is a CPU copy into QEMU's buffer. It used
+    // to be a GPU copy into that buffer's imported pages; say so once per
+    // process, at the site that now pays for it.
+    crate::observe::ZeroCopyLost::ConsoleScanout.note();
 
     // PGDisplay encodeCurrentFrame always re-shows +0x188 when the retain
     // matches paint geom — frozen at presentFrame (present boundary only).

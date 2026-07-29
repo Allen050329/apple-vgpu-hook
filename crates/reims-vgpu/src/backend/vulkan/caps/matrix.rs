@@ -211,28 +211,25 @@ mod tests {
     ); 4] {
         [
             (
-                // The main pathway: MoltenVK imports host pointers but has no
-                // dmabuf — which is why the axis is the capability, not the
-                // Linux mechanism's name.
+                // A Mesa iGPU: unified memory plus dmabuf. Since the
+                // host-pointer import was removed, dmabuf is the only mechanism
+                // left that reaches a zero-copy rung, so this is what a unified
+                // `Dma` host looks like.
                 SupportCell::UnifiedDma,
-                fixtures::apple_m3_max(),
-                DmaMechanisms {
-                    host_pointer_import: true,
-                    dmabuf_share: false,
-                },
+                fixtures::intel_igpu(),
+                DmaMechanisms { dmabuf_share: true },
             ),
             (
+                // Apple/MoltenVK: unified memory, no dmabuf, and no import —
+                // every crossing is a copy. Fully supported, just slower.
                 SupportCell::UnifiedNoDma,
-                fixtures::intel_igpu(),
+                fixtures::apple_m3_max(),
                 DmaMechanisms::default(),
             ),
             (
                 SupportCell::DiscreteDma,
                 fixtures::nvidia_discrete_rebar(),
-                DmaMechanisms {
-                    host_pointer_import: true,
-                    dmabuf_share: true,
-                },
+                DmaMechanisms { dmabuf_share: true },
             ),
             (
                 SupportCell::DiscreteNoDma,
@@ -332,7 +329,7 @@ mod tests {
                 MemoryClass::Upload,
                 MemoryClass::Readback,
                 MemoryClass::DeviceLocal,
-                MemoryClass::HostImport,
+                MemoryClass::DeviceLocalPreferred,
             ] {
                 let req = profile.topology.request(class);
                 assert!(

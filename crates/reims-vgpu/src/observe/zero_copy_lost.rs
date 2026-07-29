@@ -38,10 +38,9 @@ pub enum ZeroCopyLost {
     /// Falls back to the readback-and-copy writeback.
     ComputeDirectWriteback,
     /// Present that used to DMA the finished frame into the guest's scanout
-    /// pages. Falls back to the CPU writeback.
+    /// pages — packed-contiguous and fragmented-scatter alike, which shared one
+    /// decision point in the runtime. Falls back to the CPU writeback.
     ImportPresent,
-    /// Present into fragmented guest runs — the scatter form of the above.
-    ScatterPresent,
     /// Console scanout that used to hand QEMU pixels the GPU wrote in place.
     /// Falls back to the CPU capture copy.
     ConsoleScanout,
@@ -75,7 +74,6 @@ impl Decline for ZeroCopyLost {
             Self::SampledGuestRuns => "zero_copy_lost_sampled_guest_runs",
             Self::ComputeDirectWriteback => "zero_copy_lost_compute_direct_writeback",
             Self::ImportPresent => "zero_copy_lost_import_present",
-            Self::ScatterPresent => "zero_copy_lost_scatter_present",
             Self::ConsoleScanout => "zero_copy_lost_console_scanout",
             Self::MetalGuestTexture => "zero_copy_lost_metal_guest_texture",
         }
@@ -94,7 +92,7 @@ impl ZeroCopyLost {
         match self {
             Self::BufferGuestRuns | Self::SampledGuestRuns => "staging_gather",
             Self::ComputeDirectWriteback => "readback_copy",
-            Self::ImportPresent | Self::ScatterPresent => "cpu_writeback",
+            Self::ImportPresent => "cpu_writeback",
             Self::ConsoleScanout => "cpu_capture_copy",
             Self::MetalGuestTexture => "copied_upload",
         }
@@ -110,7 +108,6 @@ mod tests {
         ZeroCopyLost::SampledGuestRuns,
         ZeroCopyLost::ComputeDirectWriteback,
         ZeroCopyLost::ImportPresent,
-        ZeroCopyLost::ScatterPresent,
         ZeroCopyLost::ConsoleScanout,
         ZeroCopyLost::MetalGuestTexture,
     ];

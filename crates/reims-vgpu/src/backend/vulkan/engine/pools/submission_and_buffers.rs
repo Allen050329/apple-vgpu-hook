@@ -57,120 +57,11 @@ impl ResourcePools {
             target_recycle_cap_drops: 0,
             storage_recycle_admits: 0,
             storage_recycle_cap_drops: 0,
-            host_imports: Vec::new(),
-            host_import_touch: 0,
-            host_import_epoch: 0,
-            host_import_admit_epoch: None,
-            host_import_occupancy: std::collections::BTreeMap::new(),
-            host_import_creates: 0,
-            host_import_evictions: 0,
-            host_import_count_cap_logged: false,
-            host_import_epoch_admitted_logged: false,
-            host_import_deferrals: 0,
-            host_import_zero_len_logged: false,
-            host_import_no_ext_logged: false,
-            host_import_byte_cap_logged: false,
-            host_scatter: host_scatter::HostScatterPool::default(),
             open_batch: None,
             slab: super::slab::SlabPool::new(),
             initialized: false,
         }
     }
-    /// Scatter a resident present straight into imported guest pages, with no
-    /// full-frame CPU copy anywhere in the path.
-    ///
-    /// `Ok(())` means the guest pages hold the frame. `Err` names the exact
-    /// setup/record/submit/state refusal. The caller fails the Store rather than
-    /// publishing a possibly partial guest-page write; hosts without
-    /// `VK_EXT_external_memory_host` select the CPU path before entering this
-    /// rail.
-    pub(crate) unsafe fn present_scatter_gpu(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        identity: &TargetIdentity,
-        runs: &[host_scatter::ScatterRun],
-        spans: &[host_scatter::ScatterSpan],
-    ) -> Result<(), DrawError> {
-        if spans.is_empty() {
-            return Err(DrawError::Present(
-                super::reason::HostPresentDecline::RunsEmpty,
-            ));
-        }
-        if ctx.ext_external_memory_host.is_none() {
-            return Err(DrawError::Unsupported(
-                super::reason::DrawReason::PresentHostPtrImportUnavailable,
-            ));
-        }
-        // Same ordering rule as the prefetch pool: this submits on its own CB,
-        // so flush any open draw batch or the copy would be queued ahead of the
-        // draws producing this frame.
-        self.batch_flush(ctx, counters)?;
-
-        // Resolve every run up front: a partial scatter would leave the guest
-        // surface torn, so this is all-or-nothing.
-        let mut bufs: Vec<(vk::Buffer, u64)> = Vec::with_capacity(runs.len());
-        for run in runs {
-            match self.host_import_resolve(ctx, run.host_ptr, run.ptr_len) {
-                Ok(b) => bufs.push(b),
-                Err(leaf) => {
-                    // `host_import_resolve` emits the typed leaf itself, but that
-                    // emission is flood-latched per cause, so after the first
-                    // sighting of each the losses that follow carry no leaf at
-                    // all. This line is not latched and sits immediately before
-                    // the `deferred_flush_lost` its refusal causes, so carrying
-                    // the leaf here is what makes an individual lost render
-                    // attributable: a byte-cap refusal and a driver rejection
-                    // both ended up reading `host_import_resolve` at the loss
-                    // site, and they need opposite fixes.
-                    crate::observe::off(format!(
-                        "store_scatter_fallback class=run_unimportable runs={} ptr_len={} \
-                         leaf={} host_ptr={:#x}",
-                        runs.len(),
-                        run.ptr_len,
-                        crate::observe::Decline::slug(&leaf),
-                        run.host_ptr,
-                    ));
-                    return Err(leaf);
-                }
-            }
-        }
-
-        let (image, old_layout, width, height) = {
-            let slot = self.registry.get(identity).ok_or_else(|| {
-                DrawError::Facade(
-                    super::facade_decline::EngineFacadeDecline::ScatterPresentUnknownIdentity {
-                        identity: identity.clone(),
-                    },
-                )
-            })?;
-            if !slot.content_ready {
-                return Err(DrawError::Facade(
-                    super::facade_decline::EngineFacadeDecline::ScatterPresentNotReady {
-                        identity: identity.clone(),
-                    },
-                ));
-            }
-            if !slot.bgra {
-                return Err(DrawError::Unsupported(
-                    super::reason::DrawReason::PresentScatterResidentNotBgra,
-                ));
-            }
-            (slot.image, slot.layout, slot.width, slot.height)
-        };
-
-        let regions = resolve_scatter_regions(runs, spans, &bufs, width, height)
-            .map_err(DrawError::Present)?;
-
-        let cmd_pool = self.cmd_pool;
-        // A failed scatter may have partially landed, so the caller must fail the
-        // Store rather than publish those guest pages as complete.
-        self.host_scatter
-            .scatter(ctx, cmd_pool, image, old_layout, &regions)?;
-        self.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        Ok(())
-    }
-
     /// Advance the wall-clock idle-drain clock to `now_ms`, keep the presented
     /// target alive (`display`), and — if an idle pass is due — select a bounded
     /// set of aged non-pinned residents to reclaim. Pure — no GPU work — so the
@@ -550,18 +441,6 @@ impl ResourcePools {
         // release fires to trigger their free). Down to one spare.
         self.slab
             .trim_empty_blocks(&ctx.device, IDLE_SLAB_KEEP_EMPTY);
-        // …and the host-import windows, the only remaining pool whose memory is
-        // pinned *host* RAM rather than VRAM. These get their OWN, far longer age
-        // cutoff (`HOST_IMPORT_IDLE_AGE_MS`, not the `sampled_cutoff` shared by
-        // the VRAM pools above): a window costs 100–290 ms to re-pin, and route-B
-        // presentation legitimately leaves the hot working set untouched for
-        // seconds, so releasing it on the 2 s VRAM cutoff evicted the whole set
-        // mid-session and the next import-present re-pinned all of it at once — a
-        // multi-second app-switch freeze. Without any sweep the budget only ever
-        // ratchets to its high-water mark and holds pinned host RAM until
-        // teardown; this releases it once the VM is genuinely quiescent.
-        let cold = self.plan_host_import_idle_sweep(self.idle_clock_ms, IDLE_RECYCLE_TRIM_PER_PASS);
-        self.evict_host_imports(ctx, cold, "idle");
     }
 
     /// Count of registry residents NOT held by a deferred-write pin — the
@@ -1146,12 +1025,6 @@ impl ResourcePools {
         );
         self.slots[self.cur].pending = Some(cleanup);
         self.in_flight += 1;
-        // Close the host-import epoch: every buffer resolved for this CB is now
-        // recorded, so those windows stop being un-evictable by the epoch pin
-        // and fall back to `dispose`'s in-flight deferral. This is the only
-        // place a CB goes in flight, which is why the pin needs no bracketing at
-        // the resolve call sites.
-        self.host_import_epoch = self.host_import_epoch.wrapping_add(1);
     }
 
     /// The open batch's (CB, fence) when a draw at (identity, geometry, bgra)

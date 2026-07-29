@@ -326,8 +326,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "instance_rate_divisor_unsupported",
             "instance_rate_divisor_over_limit",
             "no_combined_graphics_compute_queue",
-            "host_pointer_import_unavailable",
-            "no_importable_host_memory_type",
             "no_host_visible_memory_for_staging",
             "no_host_visible_memory_for_readback",
             "no_host_visible_memory_for_stats",
@@ -340,10 +338,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "dmabuf_export_unavailable",
             "present_export_unavailable",
             "present_export_resident_not_bgra",
-            "present_host_ptr_import_unavailable",
-            "host_import_resolve",
-            "runs_unstable",
-            "present_scatter_resident_not_bgra",
             "swapchain_unavailable",
             "queue_cannot_present",
             "swapchain_lacks_transfer_dst",
@@ -442,55 +436,33 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
-        type_name: "HostPresentDecline",
+        type_name: "TargetReadDecline",
         defined_in: "backend/vulkan/engine/reason.rs",
         slug_blocks: &[],
-        // The import-present rail that used to classify on this type and emit it
-        // through `import_present` is gone, so the only path left to the sink is
-        // the Metal→Vulkan draw boundary, which renders whatever `DrawError` it
-        // gets back and lets it delegate its slug here.
+        // Both remaining checks are produced by `read_target_inner`. Its two
+        // callers reach the sink differently: `read_resident_bgra` renders the
+        // error under `present_capture`, and `read_target` hands it to the
+        // Metal→Vulkan draw boundary, which renders whatever `DrawError` it gets
+        // back and lets it delegate its slug here.
         //
-        // That path is currently unreachable in practice: this type is produced
-        // only by `resolve_scatter_regions`, reached only from
-        // `present_into_host_runs`, which has no product caller left. It is not
-        // registered `Unreachable` because the engine entry point still exists
-        // and the gate correctly refuses the claim while it does. Retire this
-        // row when the scatter rail itself is deleted.
-        emission: Emission::At(&[("runtime/metal_draw/mod.rs", "linux_m2v_draw")]),
+        // This row used to carry twenty-two more slugs, naming every layout and
+        // bounds check the two guest-page DMA entry points applied. Those entry
+        // points are gone with the host-pointer import, and so are their checks.
+        emission: Emission::At(&[
+            ("backend/vulkan/engine/mod.rs", "present_capture"),
+            ("runtime/metal_draw/mod.rs", "linux_m2v_draw"),
+        ]),
         slug_calls: &[],
         slugs: &[
             "read_target_unknown_identity",
             "read_target_no_ready_content",
-            "host_ptr_unknown_identity",
-            "host_ptr_no_ready_content",
-            "host_ptr_bad_row_bytes",
-            "host_ptr_short",
-            "host_runs_empty",
-            "host_runs_tight_row_overflow",
-            "host_runs_bad_row_bytes",
-            "host_runs_null_or_empty",
-            "host_runs_len_exceeds_ptr",
-            "host_runs_end_overflow",
-            "host_runs_out_of_order",
-            "host_runs_row_offset_overflow",
-            "host_runs_sample_offset_overflow",
-            "host_runs_row_end_overflow",
-            "host_runs_scatter_oob",
-            "host_runs_scatter_run_index_oob",
-            "host_runs_scatter_buffer_index_oob",
-            "host_runs_scatter_zero_texels",
-            "host_runs_scatter_source_oob",
-            "host_runs_scatter_span_end_overflow",
-            "host_runs_scatter_buffer_offset_overflow",
-            "host_runs_uncovered_row",
         ],
     },
     DeclineClass {
         type_name: "DrawError",
         defined_in: "backend/vulkan/engine/types.rs",
         slug_blocks: &[],
-        // `import_present` classifies a failed present on the `DrawError` it
-        // gets back. `linux_m2v_draw` is the Metal→Vulkan draw boundary in
+        // `linux_m2v_draw` is the Metal→Vulkan draw boundary in
         // `runtime/metal_draw/mod.rs`: `try_metal2vulkan_draw` returns `DrawError`
         // now (its pipeline/stage preparation failures and the engine's own
         // draw failures propagate as typed variants; the remaining staging
@@ -503,14 +475,10 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("backend/vulkan/engine/mod.rs", "vk_device_recreate"),
             ("runtime/metal_draw/mod.rs", "linux_m2v_draw"),
             ("runtime/compute_exec/mod.rs", "compute_linux_engine"),
-            (
-                "backend/vulkan/engine/pools/host_import_and_teardown.rs",
-                "host_import_fail",
-            ),
         ]),
         slug_calls: &[],
-        // `Present` and `Unsupported` are absent on purpose: they forward to
-        // `HostPresentDecline` and `DrawReason` rather than minting a second
+        // `TargetRead` and `Unsupported` are absent on purpose: they forward to
+        // `TargetReadDecline` and `DrawReason` rather than minting a second
         // name for one event, and those slugs are counted on their own rows.
         //
         // Every payload delegates to its typed decline. Fence timeout is the
@@ -831,8 +799,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_engine_storage_read_generation_mismatch",
             "vk_engine_export_present_unknown_identity",
             "vk_engine_export_present_not_ready",
-            "vk_engine_scatter_present_unknown_identity",
-            "vk_engine_scatter_present_not_ready",
             "vk_engine_window_source_disappeared_before_pin",
         ],
     },
@@ -851,11 +817,10 @@ pub const REGISTRY: &[DeclineClass] = &[
         // The stats pool used to swallow these with `.is_err()`/`.ok()`, so a
         // reduction that could not build its buffers went blind with no line;
         // `arm`/`pick_slot` now emit the typed decline at those swallow points.
-        // The `mod.rs` readback (`read_target`/`read_target_inner`) and packed-
-        // contig host-present (`present_into_host_ptr_strided`) rails already
-        // reach the sink through `runtime/import_present.rs`'s
-        // `Emit::decline("import_present", &e)` — `DrawError` delegates its slug
-        // and fields here, so those calls render `reason=vk_...` there for free.
+        // The `mod.rs` readback (`read_target`/`read_target_inner`) reaches the
+        // sink through `present_capture` and the draw boundary — `DrawError`
+        // delegates its slug and fields here, so those calls render
+        // `reason=vk_...` there for free.
         // The storage-flush rail (`read_resident_storage`) reaches
         // `runtime/storage_flush.rs`'s `deferred_flush_lost` line, which the same
         // migration converted from a bare-string `err={e}` to `Emit::decline`.
@@ -881,7 +846,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         // `caches.rs`'s seven object-cache creates (`get_or_create_shader` …
         // `get_or_create_compute_pipeline`) cache their failure *negatively* as
         // a `DrawError`, so both the create and the cheap re-attempt replay the
-        // same typed reason. `context.rs` (guest host-pointer import),
+        // same typed reason. `context.rs` (pipeline-cache persistence),
         // `desc_arena.rs` (descriptor-set arena), `exec.rs` (the draw
         // command-buffer record/submit/readback rail) and `exec_compute.rs`
         // (the compute one — a distinct queue submission) add the rest of the
@@ -890,12 +855,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         // `metal_draw.rs` boundary (`linux_m2v_draw`), which now propagates the
         // engine's `DrawError` unchanged and emits `Emit::decline`, so a VkCall
         // slug delegated through `DrawError::VkCall` renders there as the primary
-        // `reason=vk_...`. `exec.rs`'s `vk_exec_map_readback` and the `mod.rs`
-        // readback rail also reach `import_present` directly.
-        // `host_scatter.rs` adds the eight setup/record/submit/wait calls on the
-        // GPU-direct Store rail. They propagate through `present_into_host_runs`
-        // to `runtime/import_present.rs` without a boolean/coarse wrapper.
-        // `pools/mod.rs`'s resource pools contribute the command-buffer/fence
+        // `reason=vk_...`. `pools/mod.rs`'s resource pools contribute the command-buffer/fence
         // machinery, batch submit, and staging + readback buffer rails
         // (`vk_pools_*`); its `wait_error` fence helper now takes a `VkOp` so a
         // timeout still maps to `FenceTimeout` but a real wait/status failure
@@ -919,7 +879,7 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("backend/vulkan/engine/context.rs", "vk_pipeline_cache_save"),
             ("backend/vulkan/engine/desc_arena.rs", "desc_arena_free"),
             (
-                "backend/vulkan/engine/pools/host_import_and_teardown.rs",
+                "backend/vulkan/engine/pools/teardown.rs",
                 "vk_pools_destroy",
             ),
             ("backend/vulkan/engine/mod.rs", "vulkan_guest_reset"),
@@ -931,10 +891,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("lib.rs", "export_present"),
             ("host_window/present.rs", "host_window_present"),
             ("runtime/metal_draw/mod.rs", "linux_m2v_draw"),
-            (
-                "backend/vulkan/engine/pools/host_import_and_teardown.rs",
-                "host_import_fail",
-            ),
         ]),
         slug_calls: &[],
         slugs: &[
@@ -943,10 +899,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_readback_end_cb",
             "vk_readback_submit",
             "vk_readback_map",
-            "vk_host_present_reset_cb",
-            "vk_host_present_begin_cb",
-            "vk_host_present_end_cb",
-            "vk_host_present_submit",
             "vk_storage_read_reset_cb",
             "vk_storage_read_begin_cb",
             "vk_storage_read_end_cb",
@@ -971,8 +923,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_caches_create_sampler",
             "vk_caches_create_graphics_pipelines",
             "vk_caches_create_compute_pipelines",
-            "vk_context_host_ptr_props",
-            "vk_context_import_host_ptr_alloc",
             "vk_context_pipeline_cache_get_data",
             "vk_desc_arena_create_pool",
             "vk_desc_arena_alloc_sets",
@@ -989,14 +939,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_compute_exec_submit",
             "vk_compute_exec_map_storage_readback",
             "vk_compute_exec_map_image_readback",
-            "vk_host_scatter_alloc_command_buffer",
-            "vk_host_scatter_create_fence",
-            "vk_host_scatter_reset_fence",
-            "vk_host_scatter_reset_command_buffer",
-            "vk_host_scatter_begin_command_buffer",
-            "vk_host_scatter_end_command_buffer",
-            "vk_host_scatter_queue_submit",
-            "vk_host_scatter_wait_fence",
             "vk_guest_reset_device_wait_idle",
             "vk_slab_allocate_memory",
             "vk_pools_create_command_pool",
@@ -1009,8 +951,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_pools_reset_fences_retire",
             "vk_pools_end_cb_batch",
             "vk_pools_submit_batch",
-            "vk_pools_host_import_create_buffer",
-            "vk_pools_host_import_bind_buffer",
             "vk_pools_create_staging",
             "vk_pools_alloc_staging",
             "vk_pools_bind_staging",
@@ -1107,7 +1047,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         defined_in: "observe/zero_copy_lost.rs",
         slug_blocks: &[],
         // Emitted by the type's own `note()`, so the site is the definition
-        // file. That is what keeps the seven rails on one line shape: a caller
+        // file. That is what keeps the six rails on one line shape: a caller
         // cannot spell the event differently because it never spells it.
         emission: Emission::At(&[("observe/zero_copy_lost.rs", "zero_copy_lost")]),
         slug_calls: &[],
@@ -1116,7 +1056,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "zero_copy_lost_sampled_guest_runs",
             "zero_copy_lost_compute_direct_writeback",
             "zero_copy_lost_import_present",
-            "zero_copy_lost_scatter_present",
             "zero_copy_lost_console_scanout",
             "zero_copy_lost_metal_guest_texture",
         ],
@@ -1213,27 +1152,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "spirv_format_specialize_malformed",
             "spirv_format_specialize_missing_binding",
             "spirv_format_specialize_ambiguous_binding",
-        ],
-    },
-    DeclineClass {
-        type_name: "HostImportDecline",
-        defined_in: "backend/vulkan/engine/host_import_decline.rs",
-        slug_blocks: &[],
-        emission: Emission::At(&[(
-            "backend/vulkan/engine/pools/host_import_and_teardown.rs",
-            "host_import_fail",
-        )]),
-        slug_calls: &[],
-        slugs: &[
-            "host_import_region_count_cap",
-            "host_import_total_byte_cap",
-            "host_import_epoch_admitted",
-            "host_import_zero_length_span",
-            "host_import_extension_absent",
-            "host_import_pointer_misaligned",
-            "host_import_size_misaligned",
-            "host_import_range_overflow",
-            "host_import_no_valid_window",
         ],
     },
     DeclineClass {

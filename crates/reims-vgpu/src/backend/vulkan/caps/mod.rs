@@ -120,15 +120,6 @@ impl HostGpuCaps {
         self.memory.topology.request(class)
     }
 
-    /// Whether the GPU can read and write the guest's own pages in place.
-    ///
-    /// Call sites ask this instead of re-checking whether
-    /// `VK_EXT_external_memory_host` is enabled, so the answer cannot drift
-    /// between the rails that depend on it.
-    pub fn imports_guest_pages(&self) -> bool {
-        self.zero_copy.guest_read.is_zero_copy()
-    }
-
     /// One-shot, fail-visible summary of the classification. Load-bearing for
     /// portability debugging: it names the matrix cell, the signal that decided
     /// the memory topology, the rung each zero-copy rail landed on, and why any
@@ -205,34 +196,28 @@ mod tests {
         }
     }
 
-    const HOST_PTR_ONLY: DmaMechanisms = DmaMechanisms {
-        host_pointer_import: true,
-        dmabuf_share: false,
-    };
-    const BOTH: DmaMechanisms = DmaMechanisms {
-        host_pointer_import: true,
-        dmabuf_share: true,
-    };
+    const DMABUF: DmaMechanisms = DmaMechanisms { dmabuf_share: true };
     const NEITHER: DmaMechanisms = DmaMechanisms {
-        host_pointer_import: false,
         dmabuf_share: false,
     };
 
     /// The four matrix cells are reachable from real device shapes, and the API
     /// version does NOT participate: the same 1.2 device lands in whichever
     /// cell its topology and mechanisms put it in.
+    ///
+    /// The unified rows changed sides when the host-pointer import went away.
+    /// A unified host reaches `Dma` only through dmabuf now, so the Mesa iGPU
+    /// carries `UnifiedDma` and Apple/MoltenVK — which has no dmabuf and no
+    /// longer has an import — carries `UnifiedNoDma`. That is the real
+    /// classification of the arm64 pathway, not a fixture convenience.
     #[test]
     fn every_matrix_cell_is_reachable_from_a_real_device_shape() {
         let cells = [
-            (
-                fixtures::apple_m3_max(),
-                HOST_PTR_ONLY,
-                SupportCell::UnifiedDma,
-            ),
-            (fixtures::intel_igpu(), NEITHER, SupportCell::UnifiedNoDma),
+            (fixtures::intel_igpu(), DMABUF, SupportCell::UnifiedDma),
+            (fixtures::apple_m3_max(), NEITHER, SupportCell::UnifiedNoDma),
             (
                 fixtures::nvidia_discrete_rebar(),
-                BOTH,
+                DMABUF,
                 SupportCell::DiscreteDma,
             ),
             (
@@ -254,14 +239,14 @@ mod tests {
     /// "has dmabuf" in under "is 1.3".
     #[test]
     fn the_api_version_does_not_change_the_cell() {
-        let props = fixtures::apple_m3_max();
+        let props = fixtures::intel_igpu();
         for api in [
             vk::API_VERSION_1_2,
             vk::API_VERSION_1_3,
             vk::make_api_version(0, 1, 4, 334),
         ] {
             assert_eq!(
-                caps(api, &props, HOST_PTR_ONLY).cell(),
+                caps(api, &props, DMABUF).cell(),
                 SupportCell::UnifiedDma,
                 "api {}",
                 api_floor::version_str(api)
@@ -273,16 +258,24 @@ mod tests {
     /// the handoff — what a portability bug report needs.
     #[test]
     fn selection_line_carries_the_diagnosis() {
-        let c = caps(vk::API_VERSION_1_3, &fixtures::nvidia_discrete(), BOTH);
+        let c = caps(vk::API_VERSION_1_3, &fixtures::nvidia_discrete(), DMABUF);
         let line = c.selection_line("NVIDIA GeForce RTX 5080");
         assert!(line.contains("cell=discrete_dma"), "{line}");
         assert!(line.contains("memory_signal=separate_host_heap"), "{line}");
+        assert!(line.contains("dma_mechanisms=dmabuf"), "{line}");
+        // The memory rails read as degraded even on the most capable host in
+        // the fixture set — that is the classification after the host-pointer
+        // import removal, and the line has to say so rather than reporting a
+        // bare `dma=dma` that a reader would take for zero-copy throughout.
+        assert!(line.contains("guest_read=staging_copy"), "{line}");
+        assert!(line.contains("guest_write=cpu_readback"), "{line}");
         assert!(
-            line.contains("dma_mechanisms=host_pointer+dmabuf"),
+            line.contains(
+                "zero_copy_declined=[guest_read:no_host_pointer_import,\
+                 guest_write:no_host_pointer_import]"
+            ),
             "{line}"
         );
-        assert!(line.contains("guest_read=imported_pages"), "{line}");
-        assert!(line.contains("guest_write=gpu_direct"), "{line}");
         assert!(line.contains("handoff=dmabuf_fd"), "{line}");
         assert!(line.contains("device_local_mb=16384"), "{line}");
         // The baseline is stated on every line so no reader mistakes the
@@ -295,9 +288,9 @@ mod tests {
     #[test]
     fn selection_line_always_names_the_host_window_sink() {
         for (props, mechanisms) in [
-            (fixtures::apple_m3_max(), HOST_PTR_ONLY),
-            (fixtures::intel_igpu(), NEITHER),
-            (fixtures::nvidia_discrete_rebar(), BOTH),
+            (fixtures::apple_m3_max(), NEITHER),
+            (fixtures::intel_igpu(), DMABUF),
+            (fixtures::nvidia_discrete_rebar(), DMABUF),
             (fixtures::nvidia_discrete(), NEITHER),
         ] {
             let line = caps(vk::API_VERSION_1_2, &props, mechanisms).selection_line("dev");
@@ -322,16 +315,28 @@ mod tests {
             ),
             "{line}"
         );
-        assert!(!c.imports_guest_pages());
     }
 
-    /// `imports_guest_pages` is the one question call sites ask, and it tracks
-    /// the mechanism rather than the driver.
+    /// Both memory rails decline on **every** device, including one that
+    /// advertises every sharing mechanism it can. The dmabuf host below reaches
+    /// the top rung on the display rail and still copies both memory
+    /// crossings — which is the whole point of keeping the rails separate.
     #[test]
-    fn imports_guest_pages_tracks_the_mechanism() {
-        let props = fixtures::apple_m3_max();
-        assert!(caps(vk::API_VERSION_1_2, &props, HOST_PTR_ONLY).imports_guest_pages());
-        assert!(!caps(vk::API_VERSION_1_2, &props, NEITHER).imports_guest_pages());
+    fn the_memory_rails_decline_even_on_a_fully_capable_host() {
+        let c = caps(
+            vk::API_VERSION_1_3,
+            &fixtures::nvidia_discrete_rebar(),
+            DMABUF,
+        );
+        assert_eq!(c.zero_copy.guest_read, GuestRead::StagingCopy);
+        assert_eq!(c.zero_copy.guest_write, GuestWrite::CpuReadback);
+        let rails: Vec<&str> = c.zero_copy.declined().iter().map(|(r, _)| *r).collect();
+        assert_eq!(rails, vec!["guest_read", "guest_write"]);
+        assert_eq!(
+            c.cell(),
+            SupportCell::DiscreteDma,
+            "the display rail still has dmabuf"
+        );
     }
 
     /// Quirks are derived from portability-subset in ONE place, so no other

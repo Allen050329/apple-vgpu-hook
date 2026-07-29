@@ -19,8 +19,6 @@ pub enum DrawError {
     /// Engine façade or host-window presenter state changed under a valid
     /// request, or a façade input cannot describe a scanout.
     Facade(super::facade_decline::EngineFacadeDecline),
-    /// A host-pointer import violated its non-driver preconditions.
-    HostImport(super::host_import_decline::HostImportDecline),
     /// Runtime pipeline/MTLB/AIR preparation failed before an engine request
     /// could be validated.
     DrawPreparation(super::draw_preparation::DrawPreparationDecline),
@@ -32,9 +30,9 @@ pub enum DrawError {
     ComputeValidation(super::compute_validation::ComputeValidationDecline),
     /// A validated compute request lost or mismatched resident execution state.
     ComputeExecution(super::compute_execution::ComputeExecutionDecline),
-    /// A host-present request that violated the guest-mapping layout contract.
-    /// See [`super::reason::HostPresentDecline`].
-    Present(super::reason::HostPresentDecline),
+    /// A resident-target readback could not find its content.
+    /// See [`super::reason::TargetReadDecline`].
+    TargetRead(super::reason::TargetReadDecline),
     /// A specific Vulkan call that returned an error, typed by *(rail,
     /// operation)*. Former `Vulkan(String)` sites move here so the log names
     /// which call refused.
@@ -59,13 +57,12 @@ impl std::fmt::Display for DrawError {
             Self::Init(d) => write!(f, "vk_engine_init: {d}"),
             Self::Unsupported(r) => write!(f, "vk_engine_unsupported: {r}"),
             Self::Facade(d) => write!(f, "vk_engine_facade: {d}"),
-            Self::HostImport(d) => write!(f, "vk_engine_host_import: {d}"),
             Self::DrawPreparation(d) => write!(f, "vk_engine_draw_preparation: {d}"),
             Self::DrawValidation(d) => write!(f, "vk_engine_draw_validation: {d}"),
             Self::DrawExecution(d) => write!(f, "vk_engine_draw_execution: {d}"),
             Self::ComputeValidation(d) => write!(f, "vk_engine_compute_validation: {d}"),
             Self::ComputeExecution(d) => write!(f, "vk_engine_compute_execution: {d}"),
-            Self::Present(d) => write!(f, "vk_engine_present: {d}"),
+            Self::TargetRead(d) => write!(f, "vk_engine_target_read: {d}"),
             Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
             Self::FdDup(d) => write!(f, "vk_engine_fd_dup: {d}"),
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
@@ -82,7 +79,7 @@ impl crate::observe::Decline for DrawError {
     /// one event has one reason at every layer.
     fn slug(&self) -> &'static str {
         match self {
-            Self::Present(d) => d.slug(),
+            Self::TargetRead(d) => d.slug(),
             Self::Unsupported(r) => r.slug(),
             // Delegates like the two typed variants above: the call names itself,
             // so one event has one name whether it is read here or on `VkCall`.
@@ -92,7 +89,6 @@ impl crate::observe::Decline for DrawError {
             Self::FenceTimeout => "vk_engine_fence_timeout",
             Self::Init(d) => d.slug(),
             Self::Facade(d) => d.slug(),
-            Self::HostImport(d) => d.slug(),
             Self::DrawPreparation(d) => d.slug(),
             Self::DrawValidation(d) => d.slug(),
             Self::DrawExecution(d) => d.slug(),
@@ -104,7 +100,7 @@ impl crate::observe::Decline for DrawError {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Present(d) => d.fields(),
+            Self::TargetRead(d) => d.fields(),
             Self::Unsupported(r) => r.fields(),
             Self::VkCall(c) => c.fields(),
             Self::FdDup(d) => d.fields(),
@@ -117,7 +113,6 @@ impl crate::observe::Decline for DrawError {
             Self::DeviceLost(d) => d.fields(),
             Self::FenceTimeout => Vec::new(),
             Self::Facade(d) => d.fields(),
-            Self::HostImport(d) => d.fields(),
             Self::DrawPreparation(d) => d.fields(),
         }
     }

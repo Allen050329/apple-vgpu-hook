@@ -242,24 +242,11 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
-    /// VK_EXT_external_memory_host present-import capability: render the frame
-    /// directly into imported guest pages, no CPU copy.
-    ///
-    /// **Always `None`.** The extension is never requested (see the comment at
-    /// the `external_memory_host` binding in `create`), because a host pointer
-    /// imported over guest RAM is a host GPU that can write the guest VM's
-    /// memory. Every reader of this field is therefore a decline site: it stays
-    /// an `Option` so those sites keep naming the missing capability by its own
-    /// typed reason instead of the rails disappearing silently.
-    pub ext_external_memory_host: Option<ash::ext::external_memory_host::Device>,
     /// dmabuf EXPORT loader (`vkGetMemoryFdKHR`), present iff
     /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` were both
     /// enabled at device create. Backs the GL/dmabuf scanout export path
     /// (`dmabuf_export`).
     pub ext_external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
-    /// Required alignment (bytes) for an imported host pointer + allocation size;
-    /// 0 when the extension is unavailable.
-    pub min_imported_host_pointer_alignment: u64,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -427,32 +414,6 @@ impl DeviceContext {
         let enabled = features.enabled_features();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
-        // VK_EXT_external_memory_host is deliberately never requested, however
-        // the driver advertises it. Importing a host pointer over guest RAM
-        // hands the host GPU the ability to *write* the guest VM's memory, and
-        // no budget, granule, window policy or residency scheme bounds that —
-        // only not importing does.
-        //
-        // Every rail that used it has a CPU replacement, and each one names its
-        // own degradation rather than going quiet: the profile below resolves to
-        // `GuestRead::StagingCopy` / `GuestWrite::CpuReadback` and emits
-        // `vk_caps_zero_copy_declined rail=… reason=no_host_pointer_import` on
-        // the always-on path at every device create, the compute writeback
-        // declines `vk_compute_exec_direct_writeback_capability_lost`, and the
-        // present/scatter sites decline `host_import_extension_absent`.
-        //
-        // This is the hinge. `ext_external_memory_host` stays `None` from here,
-        // which is what every downstream check reads, and the rails that read
-        // the handle are left in the tree declining by name rather than deleted.
-        //
-        // Restoring the import takes **two** edits, not one: this binding *and*
-        // the `enabled_device_extensions` push below, which was removed with it.
-        // Restoring only this one loads `ash::ext::external_memory_host::Device`
-        // against a device that never enabled the extension, so its function
-        // pointers are null and the first import aborts inside ash. Measured:
-        // `present_into_host_ptr_is_refused_without_the_extension` panics in
-        // `extensions_generated.rs` rather than failing an assertion.
-        let external_memory_host = false;
         // dmabuf EXPORT capability (workstream: GL/dmabuf scanout export — hand
         // the finished present image to QEMU as a dmabuf fd so the frame never
         // leaves the GPU). Needs the fd export loader + the DMA_BUF handle-type
@@ -486,15 +447,6 @@ impl DeviceContext {
             // silently guessing an unsupported format.
             vk::Format::D32_SFLOAT_S8_UINT
         };
-        // Query the min host-pointer alignment (properties2) when the extension
-        // is present — it bounds which guest surfaces we can import for present.
-        let mut min_imported_host_pointer_alignment = 0u64;
-        if external_memory_host {
-            let mut emh_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
-            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut emh_props);
-            instance.get_physical_device_properties2(pd, &mut properties);
-            min_imported_host_pointer_alignment = emh_props.min_imported_host_pointer_alignment;
-        }
         let mut divisor_features = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
         let mut divisor_properties =
             vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR::default();
@@ -564,8 +516,6 @@ impl DeviceContext {
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
-        let ext_external_memory_host = external_memory_host
-            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         let ext_external_memory_fd =
             dmabuf_export.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let props = instance.get_physical_device_properties(pd);
@@ -576,11 +526,11 @@ impl DeviceContext {
         let engine_swapchain = false;
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
-            // Both memory rails ride on VK_EXT_external_memory_host; the display
-            // rail rides on dmabuf. Classified together here so no later site
-            // re-derives either answer from the device context's booleans.
+            // The display rail rides on dmabuf; both memory rails have no
+            // mechanism left and decline unconditionally inside `resolve`.
+            // Classified in one place so no later site re-derives either answer
+            // from the device context's booleans.
             zero_copy: ZeroCopyProfile::resolve(DmaMechanisms {
-                host_pointer_import: external_memory_host,
                 dmabuf_share: dmabuf_export,
             }),
             handoff: HandoffLadder::resolve(&HandoffInputs {
@@ -689,9 +639,7 @@ impl DeviceContext {
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
-            ext_external_memory_host,
             ext_external_memory_fd,
-            min_imported_host_pointer_alignment,
             depth_stencil_format,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
@@ -796,61 +744,6 @@ impl DeviceContext {
 
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
-    }
-
-    /// Import a host pointer range as `VkDeviceMemory` via
-    /// `VK_EXT_external_memory_host` (the Vulkan analog of Apple's
-    /// `commitIntoGPUPageTable` — the GPU addresses the pages in place, no copy).
-    ///
-    /// The caller owns the underlying host allocation; freeing the returned
-    /// `VkDeviceMemory` does **not** free the host pages. `host_ptr` must be
-    /// aligned to [`Self::min_imported_host_pointer_alignment`] and `size` an
-    /// integer multiple of it (both are Vulkan valid-usage). The imported memory
-    /// must be HOST_VISIBLE|HOST_COHERENT so a GPU DMA is immediately visible to
-    /// the guest CPU that owns the pages.
-    pub(crate) unsafe fn import_host_ptr(
-        &self,
-        host_ptr: *mut std::ffi::c_void,
-        size: u64,
-    ) -> Result<vk::DeviceMemory, DrawError> {
-        let ext = self.ext_external_memory_host.as_ref().ok_or({
-            DrawError::Unsupported(super::reason::DrawReason::HostPointerImportUnavailable)
-        })?;
-        super::host_import_decline::validate_host_import_alignment(
-            host_ptr as usize,
-            size,
-            self.min_imported_host_pointer_alignment,
-        )
-        .map_err(DrawError::HostImport)?;
-        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
-        let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
-        (ext.fp().get_memory_host_pointer_properties_ext)(
-            self.device.handle(),
-            handle_type,
-            host_ptr,
-            &mut ptr_props,
-        )
-        .result()
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ContextHostPtrProps, e)))?;
-        // memory_type_bits: driver-allowed types for this pointer; intersect with
-        // HOST_VISIBLE|HOST_COHERENT (GPU writes must land in guest RAM directly).
-        let mt = self
-            .memory_type_for(ptr_props.memory_type_bits, MemoryClass::HostImport)
-            .ok_or({
-                DrawError::Unsupported(super::reason::DrawReason::NoImportableHostMemoryType {
-                    memory_type_bits: ptr_props.memory_type_bits,
-                })
-            })?;
-        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
-            .handle_type(handle_type)
-            .host_pointer(host_ptr);
-        let ai = vk::MemoryAllocateInfo::default()
-            .allocation_size(size)
-            .memory_type_index(mt)
-            .push_next(&mut import);
-        self.device
-            .allocate_memory(&ai, None)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ContextImportHostPtrAlloc, e)))
     }
 }
 

@@ -69,10 +69,6 @@ pub enum MemoryClass {
     /// host-memory placement is slower but still correct. Distinct from
     /// [`MemoryClass::DeviceLocal`], which is a hard requirement.
     DeviceLocalPreferred,
-    /// Backing for `VK_EXT_external_memory_host` guest-page imports. The GPU
-    /// writes must be immediately visible to the guest CPU that owns the pages,
-    /// so `HOST_COHERENT` is required, not preferred.
-    HostImport,
 }
 
 /// A memory-type query: the flags that MUST be present, plus a ranked list of
@@ -127,10 +123,6 @@ impl MemoryTopology {
             (MemoryClass::DeviceLocalPreferred, _) => MemoryRequest {
                 required: F::empty(),
                 preferred: vec![F::DEVICE_LOCAL],
-            },
-            (MemoryClass::HostImport, _) => MemoryRequest {
-                required: host,
-                preferred: Vec::new(),
             },
         }
     }
@@ -527,7 +519,7 @@ mod tests {
             MemoryClass::Upload,
             MemoryClass::Readback,
             MemoryClass::DeviceLocal,
-            MemoryClass::HostImport,
+            MemoryClass::DeviceLocalPreferred,
         ];
         for (name, props) in &devices {
             for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {

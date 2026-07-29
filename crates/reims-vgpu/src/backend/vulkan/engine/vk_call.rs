@@ -52,17 +52,6 @@ pub enum VkOp {
     /// `vkMapMemory` of the readback buffer to copy the pixels out.
     ReadbackMap,
 
-    // ---- mod.rs `present_into_host_ptr_strided` — the packed-contig host
-    //      present rail (guest page imported, GPU DMA straight into it) ----
-    /// `vkResetCommandBuffer` before recording the host-ptr present copy.
-    HostPresentResetCb,
-    /// `vkBeginCommandBuffer` for the host-ptr present copy.
-    HostPresentBeginCb,
-    /// `vkEndCommandBuffer` closing the host-ptr present copy.
-    HostPresentEndCb,
-    /// `vkQueueSubmit` of the host-ptr present copy.
-    HostPresentSubmit,
-
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
     /// `vkResetCommandBuffer` before recording the storage flush copy.
@@ -130,12 +119,6 @@ pub enum VkOp {
     /// `vkCreateComputePipelines` for a dispatch pipeline.
     CachesCreateComputePipelines,
 
-    // ---- context.rs — the guest host-pointer import rail (VK_EXT_external_
-    //      memory_host: address the guest RAM window in place) ----
-    /// `vkGetMemoryHostPointerPropertiesEXT` for an imported host pointer.
-    ContextHostPtrProps,
-    /// `vkAllocateMemory` importing that host pointer as device memory.
-    ContextImportHostPtrAlloc,
     /// `vkGetPipelineCacheData` before persisting a grown pipeline cache.
     ContextPipelineCacheGetData,
 
@@ -176,24 +159,6 @@ pub enum VkOp {
     /// `vkMapMemory` of the storage-image readback after the dispatch.
     ComputeExecMapImageReadback,
 
-    // ---- host_scatter.rs — the GPU-direct resident → guest-page Store rail ----
-    /// `vkAllocateCommandBuffers` for the private scatter command buffer.
-    HostScatterAllocCommandBuffer,
-    /// `vkCreateFence` for synchronous scatter completion.
-    HostScatterCreateFence,
-    /// `vkResetFences` before one scatter submission.
-    HostScatterResetFence,
-    /// `vkResetCommandBuffer` before recording one scatter.
-    HostScatterResetCommandBuffer,
-    /// `vkBeginCommandBuffer` for one scatter.
-    HostScatterBeginCommandBuffer,
-    /// `vkEndCommandBuffer` after recording one scatter.
-    HostScatterEndCommandBuffer,
-    /// `vkQueueSubmit` of one scatter.
-    HostScatterQueueSubmit,
-    /// `vkWaitForFences` that makes the guest-page write synchronous.
-    HostScatterWaitFence,
-
     // ---- mod.rs guest reset — quiesce before dropping guest-owned state ----
     /// `vkDeviceWaitIdle` before a guest reset destroys device-derived objects.
     GuestResetDeviceWaitIdle,
@@ -224,10 +189,6 @@ pub enum VkOp {
     PoolsEndCbBatch,
     /// `vkQueueSubmit` of a submit batch.
     PoolsSubmitBatch,
-    /// `vkCreateBuffer` over a cached host-import window.
-    PoolsHostImportCreateBuffer,
-    /// `vkBindBufferMemory` over a cached host-import window.
-    PoolsHostImportBindBuffer,
     /// `vkCreateBuffer` for a staging slot.
     PoolsCreateStaging,
     /// `vkAllocateMemory` for a staging slot.
@@ -381,11 +342,6 @@ impl Decline for VkCall {
             VkOp::ReadbackSubmit => "vk_readback_submit",
             VkOp::ReadbackMap => "vk_readback_map",
 
-            VkOp::HostPresentResetCb => "vk_host_present_reset_cb",
-            VkOp::HostPresentBeginCb => "vk_host_present_begin_cb",
-            VkOp::HostPresentEndCb => "vk_host_present_end_cb",
-            VkOp::HostPresentSubmit => "vk_host_present_submit",
-
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
@@ -415,8 +371,6 @@ impl Decline for VkCall {
             VkOp::CachesCreateGraphicsPipelines => "vk_caches_create_graphics_pipelines",
             VkOp::CachesCreateComputePipelines => "vk_caches_create_compute_pipelines",
 
-            VkOp::ContextHostPtrProps => "vk_context_host_ptr_props",
-            VkOp::ContextImportHostPtrAlloc => "vk_context_import_host_ptr_alloc",
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
@@ -437,15 +391,6 @@ impl Decline for VkCall {
             VkOp::ComputeExecMapStorageReadback => "vk_compute_exec_map_storage_readback",
             VkOp::ComputeExecMapImageReadback => "vk_compute_exec_map_image_readback",
 
-            VkOp::HostScatterAllocCommandBuffer => "vk_host_scatter_alloc_command_buffer",
-            VkOp::HostScatterCreateFence => "vk_host_scatter_create_fence",
-            VkOp::HostScatterResetFence => "vk_host_scatter_reset_fence",
-            VkOp::HostScatterResetCommandBuffer => "vk_host_scatter_reset_command_buffer",
-            VkOp::HostScatterBeginCommandBuffer => "vk_host_scatter_begin_command_buffer",
-            VkOp::HostScatterEndCommandBuffer => "vk_host_scatter_end_command_buffer",
-            VkOp::HostScatterQueueSubmit => "vk_host_scatter_queue_submit",
-            VkOp::HostScatterWaitFence => "vk_host_scatter_wait_fence",
-
             VkOp::GuestResetDeviceWaitIdle => "vk_guest_reset_device_wait_idle",
 
             VkOp::SlabAllocateMemory => "vk_slab_allocate_memory",
@@ -460,8 +405,6 @@ impl Decline for VkCall {
             VkOp::PoolsResetFencesRetire => "vk_pools_reset_fences_retire",
             VkOp::PoolsEndCbBatch => "vk_pools_end_cb_batch",
             VkOp::PoolsSubmitBatch => "vk_pools_submit_batch",
-            VkOp::PoolsHostImportCreateBuffer => "vk_pools_host_import_create_buffer",
-            VkOp::PoolsHostImportBindBuffer => "vk_pools_host_import_bind_buffer",
             VkOp::PoolsCreateStaging => "vk_pools_create_staging",
             VkOp::PoolsAllocStaging => "vk_pools_alloc_staging",
             VkOp::PoolsBindStaging => "vk_pools_bind_staging",
@@ -564,10 +507,6 @@ mod tests {
         VkOp::ReadbackEndCb,
         VkOp::ReadbackSubmit,
         VkOp::ReadbackMap,
-        VkOp::HostPresentResetCb,
-        VkOp::HostPresentBeginCb,
-        VkOp::HostPresentEndCb,
-        VkOp::HostPresentSubmit,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,
@@ -592,8 +531,6 @@ mod tests {
         VkOp::CachesCreateSampler,
         VkOp::CachesCreateGraphicsPipelines,
         VkOp::CachesCreateComputePipelines,
-        VkOp::ContextHostPtrProps,
-        VkOp::ContextImportHostPtrAlloc,
         VkOp::ContextPipelineCacheGetData,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,
@@ -610,14 +547,6 @@ mod tests {
         VkOp::ComputeExecSubmit,
         VkOp::ComputeExecMapStorageReadback,
         VkOp::ComputeExecMapImageReadback,
-        VkOp::HostScatterAllocCommandBuffer,
-        VkOp::HostScatterCreateFence,
-        VkOp::HostScatterResetFence,
-        VkOp::HostScatterResetCommandBuffer,
-        VkOp::HostScatterBeginCommandBuffer,
-        VkOp::HostScatterEndCommandBuffer,
-        VkOp::HostScatterQueueSubmit,
-        VkOp::HostScatterWaitFence,
         VkOp::GuestResetDeviceWaitIdle,
         VkOp::SlabAllocateMemory,
         VkOp::PoolsCreateCommandPool,
@@ -630,8 +559,6 @@ mod tests {
         VkOp::PoolsResetFencesRetire,
         VkOp::PoolsEndCbBatch,
         VkOp::PoolsSubmitBatch,
-        VkOp::PoolsHostImportCreateBuffer,
-        VkOp::PoolsHostImportBindBuffer,
         VkOp::PoolsCreateStaging,
         VkOp::PoolsAllocStaging,
         VkOp::PoolsBindStaging,
@@ -722,12 +649,12 @@ mod tests {
     #[test]
     fn the_line_carries_the_driver_result_code() {
         let c = VkCall::new(
-            VkOp::HostScatterCreateFence,
+            VkOp::PoolsCreateFence,
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
         );
-        let line = crate::observe::Emit::decline("host_scatter", &c).render();
+        let line = crate::observe::Emit::decline("vk_pools", &c).render();
         assert!(
-            line.starts_with("host_scatter reason=vk_host_scatter_create_fence vk_result="),
+            line.starts_with("vk_pools reason=vk_pools_create_fence vk_result="),
             "{line}"
         );
         assert!(

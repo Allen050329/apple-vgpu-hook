@@ -106,9 +106,6 @@ pub struct EngineCounters {
     /// every existing block was exhausted (cap-pressure signal; 0 = no growth).
     pub desc_pool_grow: AtomicU64,
     pub gen_mismatch: AtomicU64,
-    /// Present-boundary frames copied straight into imported guest memory via
-    /// VK_EXT_external_memory_host (workstream E) — zero CPU readback copy.
-    pub import_presents: AtomicU64,
     // timing splits (microseconds, cumulative between resets)
     /// Post-submit fence waits skipped by all-deferred compute dispatches.
     pub compute_post_wait_skips: AtomicU64,
@@ -140,10 +137,6 @@ impl EngineCounters {
     pub fn note_readback(&self, bytes: u64) {
         self.readbacks.fetch_add(1, Ordering::Relaxed);
         self.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    pub fn note_import_present(&self) {
-        self.import_presents.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn note_seed_upload(&self, bytes: u64) {
@@ -260,7 +253,6 @@ impl EngineCounters {
             target_evicts: self.target_evicts.load(Ordering::Relaxed),
             desc_pool_grow: self.desc_pool_grow.load(Ordering::Relaxed),
             gen_mismatch: self.gen_mismatch.load(Ordering::Relaxed),
-            import_presents: self.import_presents.load(Ordering::Relaxed),
             compute_post_wait_skips: self.compute_post_wait_skips.load(Ordering::Relaxed),
             render_post_wait_skips: self.render_post_wait_skips.load(Ordering::Relaxed),
             ring_retire_blocks: self.ring_retire_blocks.load(Ordering::Relaxed),
@@ -337,7 +329,6 @@ impl EngineCounters {
         self.target_evicts.store(0, Ordering::Relaxed);
         self.desc_pool_grow.store(0, Ordering::Relaxed);
         self.gen_mismatch.store(0, Ordering::Relaxed);
-        self.import_presents.store(0, Ordering::Relaxed);
         self.compute_post_wait_skips.store(0, Ordering::Relaxed);
         self.render_post_wait_skips.store(0, Ordering::Relaxed);
         self.ring_retire_blocks.store(0, Ordering::Relaxed);
@@ -405,7 +396,6 @@ pub struct CounterSnapshot {
     pub target_evicts: u64,
     pub desc_pool_grow: u64,
     pub gen_mismatch: u64,
-    pub import_presents: u64,
     pub compute_post_wait_skips: u64,
     pub render_post_wait_skips: u64,
     pub ring_retire_blocks: u64,
@@ -537,7 +527,6 @@ impl CounterSnapshot {
             target_evicts: self.target_evicts.saturating_sub(earlier.target_evicts),
             desc_pool_grow: self.desc_pool_grow.saturating_sub(earlier.desc_pool_grow),
             gen_mismatch: self.gen_mismatch.saturating_sub(earlier.gen_mismatch),
-            import_presents: self.import_presents.saturating_sub(earlier.import_presents),
             compute_post_wait_skips: self
                 .compute_post_wait_skips
                 .saturating_sub(earlier.compute_post_wait_skips),
