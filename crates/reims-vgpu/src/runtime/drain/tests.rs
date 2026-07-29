@@ -1925,7 +1925,10 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
         }
     }
     let line = line.expect("a full second must report");
-    assert!(line.contains("tranches=11"), "the arming call counts: {line}");
+    assert!(
+        line.contains("tranches=11"),
+        "the arming call counts: {line}"
+    );
     assert!(
         line.contains("duty=0.900"),
         "900 ms busy in a 1000 ms window is duty 0.9: {line}"
@@ -2458,6 +2461,57 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
     state.map_surface(5);
     state.note_dense_frame_published(5, w, h);
     assert_eq!(state.note_present_backing(5), None);
+}
+
+/// The other half of the gate: a surface presented for the first time since it
+/// was created, with no full-frame Store ever naming it, is **uninitialized** —
+/// so the screen goes black, not stale.
+///
+/// The seq comparison above cannot see this. It checks for a *repeat* — this
+/// present's seq against the previous present's — while "never written" is a
+/// *state*, and `forget_compositor_mapping` prunes both witnesses on teardown so
+/// a re-created surface arrives with neither. Measured on a live boot: the guest
+/// idled, slept its display, re-created its scanout surfaces and presented mid 6
+/// at `gen=0` with `px0=[0,0,0,0]`; the screen stayed black for 18.9 s and
+/// `present_unbacked` fired **zero** times for the whole boot.
+#[test]
+fn present_backing_gate_reports_a_surface_nothing_ever_stored() {
+    let w = 1920u32;
+    let h = 1080u32;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.map_surface(6);
+
+    // Never Stored, first present: the black-screen case.
+    assert_eq!(
+        state.note_present_backing(6),
+        Some(crate::model::PresentBacking::NeverStored),
+        "an uninitialized surface must not be presented silently"
+    );
+
+    // Reported once per lifetime, not once per present: the witness is recorded
+    // on every call, so the next present of the same unbacked surface is the
+    // `Restaled` case and carries that reason instead.
+    assert_eq!(
+        state.note_present_backing(6),
+        Some(crate::model::PresentBacking::Restaled { seq: 0 }),
+        "the second present of the same surface is a restale, and says so"
+    );
+
+    // A surface the guest did Store into is quiet on its first present — this is
+    // what keeps the new arm from firing on every healthy mapping.
+    state.map_surface(7);
+    state.note_dense_frame_published(7, w, h);
+    assert_eq!(state.note_present_backing(7), None);
+
+    // And re-creation re-arms it: the teardown prunes the witness, so the next
+    // incarnation is judged on its own Stores, not its predecessor's.
+    state.unmap_surface(7);
+    state.map_surface(7);
+    assert_eq!(
+        state.note_present_backing(7),
+        Some(crate::model::PresentBacking::NeverStored),
+        "a re-created surface is uninitialized again until something Stores it"
+    );
 }
 
 /// An AIR-load hold is control flow; a hold that outlives the device is the

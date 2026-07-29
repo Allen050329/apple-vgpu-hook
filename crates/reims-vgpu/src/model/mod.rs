@@ -11,11 +11,12 @@ pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
     ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
-    DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GuestRunMemoEntry,
-    GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
-    LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc,
-    PendingWork, PresentState, PresentedGeom, StampSlot, SurfaceWriteKind, TaskEntry, TaskMapSpan,
-    WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
+    DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
+    GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface,
+    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, ObjectEntry,
+    PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState, PresentedGeom, StampSlot,
+    SurfaceWriteKind, TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
+    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;

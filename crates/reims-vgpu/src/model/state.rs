@@ -726,6 +726,22 @@ impl ComputeStorageResidencyKey {
     }
 }
 
+/// Why a present is not backed by guest work, as reported by
+/// [`DeviceState::note_present_backing`].
+///
+/// Two distinct losses, and the callee names which so the caller cannot supply
+/// the word. They differ in what the viewer sees: `Restaled` shows the previous
+/// frame again, `NeverStored` shows an uninitialized surface — a black screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentBacking {
+    /// Presented again with no full-frame Store naming this mapping since its
+    /// own previous present. Carries the unchanged `dense_frame_seq`.
+    Restaled { seq: u64 },
+    /// First present since this mapping was created, and no full-frame Store has
+    /// ever named it. The surface is uninitialized.
+    NeverStored,
+}
+
 /// Which rail holds the authoritative pixels of a mapping-keyed deferred
 /// window, and therefore how a flush must read them.
 ///
@@ -1881,12 +1897,8 @@ impl DeviceState {
         );
     }
 
-    /// Record that `mapping_id` is being presented and report whether a
-    /// full-frame Store **named it** since its own previous present.
-    ///
-    /// Returns `Some(seq)` — the unchanged [`PresentState::dense_frame_seq`] —
-    /// when none did. `None` on the member's first present (no prior witness)
-    /// and whenever the seq advanced.
+    /// Record that `mapping_id` is being presented and report whether the guest
+    /// ever sent a full-frame Store **naming it** for what is about to be shown.
     ///
     /// Structural only: decoded Store bookkeeping, never measured content, and
     /// never the resident. Say what that leaves out, because the name reads
@@ -1895,8 +1907,10 @@ impl DeviceState {
     /// [`PresentState::dense_frame_seq`].
     ///
     /// Records the witness on every call, so a member that stays unbacked
-    /// reports once per present rather than once per lifetime.
-    pub fn note_present_backing(&mut self, mapping_id: u32) -> Option<u64> {
+    /// reports once per present rather than once per lifetime — except
+    /// [`PresentBacking::NeverStored`], which by construction can only be
+    /// reported on a mapping's first present since it was created.
+    pub fn note_present_backing(&mut self, mapping_id: u32) -> Option<PresentBacking> {
         if mapping_id == 0 {
             return None;
         }
@@ -1908,7 +1922,27 @@ impl DeviceState {
             .unwrap_or(0);
         let previous = self.present.presented_dense_seq.insert(mapping_id, seq);
         match previous {
-            Some(prev) if prev == seq => Some(seq),
+            Some(prev) if prev == seq => Some(PresentBacking::Restaled { seq }),
+            // First present since this mapping was created. `dense_frame_seq` is
+            // pruned by `forget_compositor_mapping`, so a *re-created* surface
+            // arrives here with no witness and no seq — and this arm is the only
+            // thing that can see it.
+            //
+            // It matters because that is the worst version of this class rather
+            // than a corner of it: a surface nothing has ever Stored into is
+            // uninitialized, so presenting it shows a fully black screen, not a
+            // stale one. Measured on a live boot — the guest idled, slept its
+            // display, re-created its scanout surfaces, and presented mid 6 at
+            // `gen=0` with `px0=[0,0,0,0]`; the screen stayed black for 18.9 s
+            // until the guest painted `gen=1`. `present_unbacked` fired **zero**
+            // times during that whole boot.
+            //
+            // The old shape could not have caught it. It compared this present's
+            // seq against the previous present's, which is a check for a
+            // *repeat* — a transition — while "this surface has never been
+            // written" is a *state*. The state was sitting in `dense_frame_seq`
+            // the whole time as an absent key.
+            None if seq == 0 => Some(PresentBacking::NeverStored),
             _ => None,
         }
     }

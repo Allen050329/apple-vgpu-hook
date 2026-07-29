@@ -1513,12 +1513,22 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // is the whole of what was read. The peer-seed half of the old wording
         // named a mechanism `62587b1` deleted, and "received" would claim the
         // resident was checked, which it is not — see `note_present_backing`.
-        if let Some(seq) = state.note_present_backing(mapping) {
-            crate::observe::fail(format!(
-                "present_unbacked mid={mapping} {w}x{h} gen={gen} since_seq={seq} \
-                 (no full-frame store named this mid since its last present; \
-                 the resident it will read was not checked)"
-            ));
+        match state.note_present_backing(mapping) {
+            Some(crate::model::PresentBacking::Restaled { seq }) => {
+                crate::observe::fail(format!(
+                    "present_unbacked mid={mapping} {w}x{h} gen={gen} reason=restaled \
+                     since_seq={seq} (no full-frame store named this mid since its last \
+                     present; the resident it will read was not checked)"
+                ));
+            }
+            Some(crate::model::PresentBacking::NeverStored) => {
+                crate::observe::fail(format!(
+                    "present_unbacked mid={mapping} {w}x{h} gen={gen} reason=never_stored \
+                     (first present since this mapping was created and no full-frame store \
+                     has ever named it; the surface is uninitialized, so this shows black)"
+                ));
+            }
+            None => {}
         }
         // The transaction payload carries exactly one field: plane 0's surface
         // id. So the capture source is the surface the guest named, and no
@@ -3187,7 +3197,9 @@ static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static
 
 pub fn note_store_route(route: &'static str) {
     if let Ok(mut g) = STORE_ROUTES.lock() {
-        *g.get_or_insert_with(Default::default).entry(route).or_default() += 1;
+        *g.get_or_insert_with(Default::default)
+            .entry(route)
+            .or_default() += 1;
     }
 }
 
