@@ -1,4 +1,30 @@
 //! Always-on create/alloc and cache hit/miss counters (reuse-gate proxies).
+//!
+//! # A field with no named reader is not dead
+//!
+//! [`CounterSnapshot`] is consumed only by the integration tests in `tests/`.
+//! No product code reads it and no log line emits it, so a sweep for "fields
+//! nobody references" reports most of this struct. Twenty-seven of the
+//! seventy-one came back that way. Do not act on that sweep: the struct derives
+//! `Debug` and every assertion in those tests prints the *whole* snapshot on
+//! failure (`"...: {d:?}"`), so the unasserted fields are the diagnostic context
+//! that makes a failing assertion readable.
+//!
+//! That is not hypothetical. The ring-wrap defect in the sampled content cache
+//! was diagnosed from `sampled_free_allocs` and `sampled_recycle_cap_drops` in
+//! one such dump — neither is asserted by any test, and both named the
+//! mechanism. Deleting them would have cost more than the lines saved.
+//!
+//! The exception, and the only thing removed on those grounds, is a field **no
+//! code path increments**: it is zero by construction, so it carries no
+//! information in a dump either. `seed_imports` and `target_stale_import` were
+//! removed for exactly that. Before deleting any other field here, check that
+//! something can still make it nonzero.
+//!
+//! Adding one is still governed by the census-versus-decline rule in
+//! `AGENTS.md`: a counter must not be the only record that guest work was lost.
+//! These are reuse and cache proxies — tallies of successful work — and the
+//! refusal paths they sit near report themselves with typed declines.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
