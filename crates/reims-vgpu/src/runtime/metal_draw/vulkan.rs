@@ -4673,22 +4673,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         height,
         std::sync::Arc::clone(&frame),
     );
-    // Land oldest-first through the normal choke point rather than taking the
-    // entry directly: `flush_intersecting` runs the fixpoint that drags in
-    // siblings overlapping the same guest bytes, and taking one window out from
-    // under that would leave those siblings holding stale ranges.
-    while render_window_count(state) >= SURFACE_DEFERRED_WINDOW_CAP {
-        let Some((mid, lo, hi)) = oldest_render_window_range(state) else {
-            break;
-        };
-        let before = render_window_count(state);
-        crate::runtime::storage_flush::flush_intersecting(state, host, mid, lo, hi);
-        // A window can legitimately survive a flush call — a condemned backing
-        // holds its obligation for the mapper to resolve. Stop rather than spin.
-        if render_window_count(state) >= before {
-            break;
-        }
-    }
+    evict_render_windows_to_cap(state, host);
     state.surface_deferred_seq = state.surface_deferred_seq.wrapping_add(1);
     let armed_seq = state.surface_deferred_seq;
     state.compute_deferred_flush.insert(
@@ -4731,21 +4716,60 @@ fn render_window_count(state: &DeviceState) -> usize {
         .count()
 }
 
-/// Guest byte range of the oldest live render window, for the cap's
-/// oldest-first eviction. Compute windows are never chosen — they are bounded
-/// by their own dispatches, and evicting one here would land content this cap
-/// was not sized for.
+/// Land render windows oldest-first until the population is back under
+/// [`SURFACE_DEFERRED_WINDOW_CAP`].
+///
+/// Through the normal choke point rather than taking entries directly:
+/// `flush_intersecting` runs the fixpoint that drags in siblings overlapping the
+/// same guest bytes, and taking one window out from under that would leave those
+/// siblings holding stale ranges.
+///
+/// A window can legitimately survive its flush — a condemned backing holds its
+/// obligation for `mapper::resolve` to settle — so this steps over it and tries
+/// the next oldest. Stopping there would wedge the cap behind one stuck mapping
+/// for every other mapping, and a window owns the frame it deferred, so the
+/// leak would be a full framebuffer per stuck key.
+///
+/// The order is taken once and walked. Re-deriving "the oldest" after a refusal
+/// returns the same stuck window forever, which is the bug this replaced.
 #[cfg(feature = "backend-vulkan")]
-fn oldest_render_window_range(state: &DeviceState) -> Option<(u32, u64, u64)> {
-    state
+fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    for (mid, lo, hi) in render_windows_oldest_first(state) {
+        if render_window_count(state) < SURFACE_DEFERRED_WINDOW_CAP {
+            return;
+        }
+        crate::runtime::storage_flush::flush_intersecting(state, host, mid, lo, hi);
+    }
+}
+
+/// Guest byte ranges of the live render windows, oldest first, for the cap's
+/// eviction order. Compute windows are never chosen — they are bounded by their
+/// own dispatches, and evicting one here would land content this cap was not
+/// sized for.
+///
+/// The whole order rather than just the minimum, because a window can
+/// legitimately refuse to land: a condemned backing holds its obligation for
+/// `mapper::resolve` to settle, and one boot held one for 121 s. Stopping at the
+/// oldest would wedge the cap behind it for *every other mapping*, and since a
+/// window now owns the frame it deferred that is a full framebuffer per stuck
+/// key — the "~260 stale residents pinned for the guest lifetime" shape. Step
+/// over it instead.
+#[cfg(feature = "backend-vulkan")]
+fn render_windows_oldest_first(state: &DeviceState) -> Vec<(u32, u64, u64)> {
+    let mut live: Vec<(u64, u32, u64, u64)> = state
         .compute_deferred_flush
         .iter()
         .filter_map(|(k, o)| match o {
-            crate::model::DeferredOwner::Render { armed_seq, .. } => Some((*armed_seq, k)),
+            crate::model::DeferredOwner::Render { armed_seq, .. } => {
+                Some((*armed_seq, k.mapping_id, k.surface_offset, k.span_end))
+            }
             _ => None,
         })
-        .min_by_key(|(seq, _)| *seq)
-        .map(|(_, k)| (k.mapping_id, k.surface_offset, k.span_end))
+        .collect();
+    live.sort_unstable_by_key(|(seq, ..)| *seq);
+    live.into_iter()
+        .map(|(_, mid, lo, hi)| (mid, lo, hi))
+        .collect()
 }
 
 /// Defer gate for the final/single record of a GVA render Store: the record
@@ -4971,6 +4995,75 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// One window that refuses to land must not wedge the cap for every other
+    /// mapping.
+    ///
+    /// A condemned backing holds its obligation for `mapper::resolve` to settle —
+    /// one boot held one for 121 s across 13015 flush attempts — and the eviction
+    /// loop used to re-derive "the oldest" each pass and stop when it did not
+    /// shrink. That returns the same stuck window forever, so the population
+    /// grows without bound past the cap. It was survivable while a window was
+    /// just a key; now that a window owns the frame it deferred, it leaks a whole
+    /// framebuffer per stuck key.
+    #[test]
+    fn a_stuck_oldest_window_does_not_wedge_the_cap_for_the_others() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+
+        let arm = |state: &mut DeviceState, mid: u32, seq: u64| {
+            let gpa = 0xA000_0000u64 + (mid as u64) * 0x10_0000;
+            state.map_surface(mid);
+            {
+                let m = state.mappings.get_mut(&mid).unwrap();
+                m.mapped = true;
+                m.map_generation = 1;
+                m.page_entries = vec![
+                    (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                ];
+            }
+            state.compute_deferred_flush.insert(
+                crate::model::ComputeStorageResidencyKey {
+                    mapping_id: mid,
+                    map_generation: 1,
+                    surface_offset: 0,
+                    surface_bpr: 64,
+                    span_end: 256,
+                    width: 4,
+                    height: 4,
+                    pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                    texture_ref: 0,
+                },
+                crate::model::DeferredOwner::Render {
+                    armed_seq: seq,
+                    bgra: std::sync::Arc::new(vec![0u8; 4 * 4 * 4]),
+                },
+            );
+        };
+
+        // The oldest window sits on a condemned backing, so its flush is held.
+        arm(&mut state, 1, 1);
+        assert!(state.condemn_surface_backing(1), "mapping 1 must condemn");
+        assert!(state.mapping_backing_condemned(1));
+        // Fill past the cap with windows that can land.
+        for i in 0..SURFACE_DEFERRED_WINDOW_CAP {
+            arm(&mut state, 2 + i as u32, 2 + i as u64);
+        }
+        let before = render_window_count(&state);
+        assert!(before > SURFACE_DEFERRED_WINDOW_CAP);
+
+        evict_render_windows_to_cap(&mut state, &mut host);
+
+        assert!(
+            render_window_count(&state) < before,
+            "the stuck oldest must be stepped over, not stopped on"
+        );
+        assert!(
+            state.mapping_backing_condemned(1),
+            "and the held window's mapping is left for the resolve to settle"
+        );
+    }
 
     #[test]
     fn m2v_draw_runtime_failure_returns_a_typed_decline() {
