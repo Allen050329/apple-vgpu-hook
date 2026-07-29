@@ -485,6 +485,32 @@ are worth knowing because they are the generic hazards of any deferred rail:
   `surface_cache`, so storing the new frame first makes an older window at a different geometry miss
   the cache and report a loss for a window that was perfectly landable.
 
+**That second one was a symptom, and fixing the ordering only narrowed it. The window must own its
+pixels.** `surface_cache` holds exactly **one entry per mapping**, and a window is armed against a
+*geometry*. So any later Store at a different size replaces the entry the older window was pointing
+at, and no ordering rule inside the arm can help — the two events are frames apart. Measured on one
+boot, after the ordering fix: **15** `deferred_flush_lost … reason=cache_miss`, every one
+`kind=render`, and the geometries name what was lost — a 1920x1080 desktop surface, a 1920x24 menu
+bar, a 1225x70 toolbar, several window-sized rects. Two mappings appear in that list *twice at two
+different geometries*, which is the mechanism stating itself.
+
+On screen that is a whole compositing layer rendering **solid black**. The user-reported screenshot
+for this class is the tell and it is worth reading the shape rather than the pixels: every black
+region is a sharp **axis-aligned rectangle at a layer boundary** — the desktop wallpaper, a Safari
+tab-bar strip, a window content sublayer, while the window chrome around it renders perfectly. That
+is whole layers failing to land, and it rules out the entire per-pixel family (format conversion,
+subsampling, tiling) before any code is read.
+
+`DeferredOwner::Render` now carries an `Arc<Vec<u8>>` of the frame it deferred, shared with the
+cache entry the same readback stored — a refcount at arm time, no copy. `cache_miss` is not a
+narrower failure now, it is unreachable. It also *dissolves* the ordering rule above rather than
+restating it: the arm no longer cares whether it refreshes the cache before or after landing
+intersecting windows, because those windows are not reading the cache.
+
+Generalise it. **A deferred obligation that names its data indirectly is only as durable as the
+indirection**, and every cache in this tree is keyed loosely enough to be replaced under a live
+window. Prefer owning the bytes; with `Arc` it is free.
+
 The counter that separates those two worlds is `surface_flush` on the `store_routes` line: an arm
 count cannot tell "the writeback was skipped" from "the writeback happened a millisecond later", and
 `surface_flush / surface_deferred` is the ratio that can.
@@ -516,7 +542,28 @@ already drains them through `storage_flush::flush_intersecting(mapping_id, lo, h
 | `flush_mapping_for_guest_read` (guest `SynchronizeResources`) | yes |
 | `scanout::capture_display_frame` | yes |
 | `flush_intersecting_task_gva` (raw task-GVA aliasing the mapping) | yes |
+| `mapping_write::read_rect_raw_at` | yes — **but only after 2026-07-29; see below** |
 | mapping teardown / unmap / delete-backing / replace-physical | drops the window (pages unreachable) |
+
+**That table was wrong, and the way it was wrong is the reusable part: a function is not a choke
+point if its own branches disagree.** `read_rect_raw_at` has two paths. The fragmented one ends in
+`mapper::read_mapping_bytes`, which flushes and is on the list above. The contiguous one is a raw
+`copy_nonoverlapping` out of the mapped span and flushed nothing. So whether a type-11 surface read
+observed a deferred Store depended on **whether its guest pages happened to be contiguous** — which
+is not a property anybody was reasoning about, and is exactly the kind of condition that makes a
+defect intermittent and unreproducible.
+
+Three callers read guest pages through it with no flush of their own: the type-5 view loader
+(`metal_draw/vulkan.rs`), a blit reading a type-11 texture backing (`blit_exec.rs`), and the compute
+sample stage (`compute_exec`). The fix is one `flush_intersecting` at the top of `read_rect_raw_at`,
+matching `read_mapping_bytes` — at the choke point, so all three are covered and so is the next
+caller. It is cheap: `flush_intersecting` returns immediately when nothing is armed.
+
+So when auditing a flush-on-access contract, **enumerate the paths inside each reader, not the
+readers**. "This function flushes" is a claim about a function; the guest reads through a *branch*.
+Note also that this one was found by an adversarial subagent sweep and then confirmed by hand at the
+two call sites — the confirmation is not optional, since AGENTS.md already records a subagent audit
+on this same rail that was flatly wrong about `map_generation`.
 
 And the decisive one: **the host-window present path never reads the mapping's guest pages at all.**
 `publish_window_frame` → `export_present_dmabuf` → `export_present_from_resident_fd_policy` exports the
@@ -552,10 +599,9 @@ this fix.** `grep -rn output_bgra crates/reims-vgpu` finds it read in five place
 req.target_identity.is_some()` is permanently false and the engine's "BGRA output, so a raw
 image→buffer copy lands guest scanout order with **no CPU swizzle**" path never runs.
 
-That matters twice over. It is why the runtime still pays `swap_rb_channels` on every type-11 Load
-seed — the cache holds BGRA, `LoadSeed` is defined as semantic RGBA8, and the pooled target is RGBA,
-so the swap is a real conversion and *not* independently removable. And it means the swizzle-free
-resident path already exists with six GPU-executing parity tests behind it
+That mattered twice over. It *was* why the runtime paid `swap_rb_channels` on every type-11 Load seed
+— see the seed-order work below, which removed that half without touching the flag. And it means the
+swizzle-free resident path already exists with six GPU-executing parity tests behind it
 (`partial_draw_preserves_rgba_seed_on_bgra_target`,
 `sampled_rgba_upload_to_bgra_target_preserves_semantic_channels`,
 `a_view_swizzle_is_performed_by_the_image_view_not_the_cpu` and three more, all `grep -c SKIP` of 0
@@ -578,27 +624,51 @@ Count the rest before claiming the round trip is cheap. Under a browser workload
 **readback 448 MB/s ≈ seed 461 MB/s** with `drain_duty` at duty 0.948 and ~1142 chains/s, and each
 type-11 composite pass touches its frame five times:
 
-| side | pass | removable? |
+| side | pass | status |
 |---|---|---|
-| seed | `swap_rb_channels(bgra)` in `metal_draw/vulkan.rs` — alloc + copy + swizzle | only with `output_bgra` |
+| seed | `swap_rb_channels(bgra)` in `metal_draw/vulkan.rs` — alloc + copy + swizzle | **gone** — the seed states its order |
 | seed | `write_staging` into the mapped span | no — this is the upload |
 | readback | mapped buffer → `vec![0u8; rb_size]` | no — this is the download |
-| readback | `swap_rb_channels(&rgba)` back to BGRA for `surface_cache` | only with `output_bgra` |
-| readback | `surface_cache::store` (+ a `.clone()` when `texture_ref != 0`) | yes, independently |
+| readback | `swap_rb_channels(&rgba)` back to BGRA for `surface_cache` | still there; needs `output_bgra` |
+| readback | `surface_cache::store` (+ a `.clone()` when `texture_ref != 0`) | **gone** — the cache holds an `Arc` |
+| return | `rgba.clone()` at each exit of the Store block | **gone** — the block takes rather than borrows |
 
-So ~450 MB/s × 5 ≈ **2.2 GB/s of CPU memory traffic**, which explains a drain worker pinned at 0.95
-far better than the 900 MB/s headline does. The two `swap_rb_channels` are the same conversion in
-opposite directions, and they exist only because the cache holds BGRA while the pooled target is
-RGBA — which is exactly what `req.output_bgra` changes. Beware the trap when acting on that: simply
-setting the flag makes the *engine* swizzle instead of the runtime and wins nothing. The win needs
-the runtime to stop converting too, i.e. a way to hand the cache's BGRA bytes through as already
-being in the attachment's physical order.
+That was ~450 MB/s × 5 ≈ **2.2 GB/s of CPU memory traffic**, which explains a drain worker pinned at
+0.95 far better than the 900 MB/s headline does. Three of the six are now deleted.
+
+**How the seed one came out, because the trap is real and the way round it is not obvious.** Simply
+setting `output_bgra` makes the *engine* swizzle instead of the runtime and wins nothing — the
+runtime keeps converting, because `LoadSeed` was *defined* as semantic RGBA8 and the cache holds
+BGRA. The fix is to stop defining it: `DrawRequest.target_seed_order` (`SeedOrder::{Rgba8, Bgra8}`)
+names what is actually in the bytes, the attachment's order is `output_bgra`, and the R/B exchange
+happens exactly when they disagree — inside the copy into the mapped staging span that has to happen
+regardless. `write_staging_rgba_as_bgra` is now `write_staging_swap_rb`, which is what it always was:
+the exchange is an involution, so one routine serves both directions.
+
+`target_rgba8` is an `Arc<Vec<u8>>` and `surface_cache::get_shared` hands the cache's own buffer
+over, so a type-11 Load seeds a draw with a refcount. `get_shared` requires the stored length to be
+*exactly* the geometry and misses otherwise — a handle cannot be truncated the way `get`'s slice is,
+and the engine rejects a seed of the wrong length, so serving a buffer with slop would turn a working
+draw into a declined one.
+
+**`output_bgra` is still not set anywhere in `src/`** — the above changes no attachment format. But
+the remaining readback swizzle is now the *only* thing it buys, and turning it on makes that
+conversion disappear rather than move, because the seed condition simply goes false. Before flipping
+it, note the blast radius: `read_resident_bgra` returns `None` unless `slot.bgra` and
+`export_present_from_resident_fd_policy` refuses with `PresentExportResidentNotBgra`, so making
+type-11 residents BGRA *enables* two present paths that currently never fire. That is a display-path
+change and wants a live boot, not a test run.
 
 Also note what the same line says about batching: `batch_opens == batch_flushes` **exactly**, in
 every window measured (912/912, 2036/2036, 504/504, 733/733, 517/517, 1000/1000), at ~1.7
 `batch_flush_draws` per batch. Draw batching is barely engaging, and the reason is the seed:
-`joins` requires `req.target_rgba8.is_none()`, and a CPU-seeded type-11 Load always sets it. The seed
-and the batching are one problem, not two.
+`joins` requires `req.target_rgba8.is_none()`, and a CPU-seeded type-11 Load always sets it.
+
+**Do not read that as "fix the seed and batching follows" — it does not, and the same line says so.**
+`joins` also requires `req.skip_readback`, and a type-11 composite Store reads back by construction,
+so those draws could never batch whatever the seed did. The batching that is being lost belongs to
+the *chain intermediates*, which is a different population from the Stores the seed cost was measured
+on. Two problems that share a predicate are still two problems.
 
 **`us_per_draw` has a 1.8x boot-to-boot spread and drifts upward within a session, so it cannot score
 a change sequentially.** This is the interleaving rule above, restated for the perf metric, and it is
