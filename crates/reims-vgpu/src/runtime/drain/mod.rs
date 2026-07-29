@@ -2215,17 +2215,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     "unmapped"
                 };
                 crate::runtime::mapper::flush_retired_views(state, host);
-                // Count into the always-on teardown-churn proxy (periodic ~1 s
-                // summary); the per-event census floods to ~48k/session under a
-                // continuously-animating app, so it moves behind REIMS_VGPU_DRAW_LOG.
-                use crate::runtime::census::present_proxy::lifecycle_churn::{
-                    note_delete, DeleteMode,
-                };
-                note_delete(match mode {
-                    "dead" => DeleteMode::Dead,
-                    "condemn" => DeleteMode::Condemn,
-                    _ => DeleteMode::Unmapped,
-                });
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
                         "map_family op=DeleteIOSurfaceBacking2 ch={channel_id} object={object_id} task={task_id} plen={plen} mode={mode}"
@@ -2271,7 +2260,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         }
                     }
                 }
-                crate::runtime::census::present_proxy::lifecycle_churn::note_replace();
                 // Per-op echo of a routine lifecycle op — the always-on rate is
                 // the `teardown_churn ... replace=` window summary
                 // (lifecycle_churn). Keep the per-op detail (inv/condemn split)
@@ -2314,7 +2302,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         let flags = rec0.map(|r| r.flags).unwrap_or(0);
                         let ops = rec0.map(|r| r.ops).unwrap_or_default();
                         let pageon = flags == CHILD_INVALIDATE_PAGEON_FLAGS;
-                        crate::runtime::census::present_proxy::lifecycle_churn::note_invalidate();
                         // ~11k/boot of routine guest cache-coherence ops — the
                         // always-on rate is the `teardown_churn ... invalidate=`
                         // window summary (lifecycle_churn). Gate the per-op decode
@@ -2400,9 +2387,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // per-event census floods to ~49k/session under a
                         // continuously-animating app, so it moves behind
                         // REIMS_VGPU_DRAW_LOG below.
-                        crate::runtime::census::present_proxy::lifecycle_churn::note_synchronize(
-                            flushed,
-                        );
                         // A deferred guest-read flush that did NOT land right
                         // before the guest CPU-reads these pages is a genuine
                         // black/stale-content drop — previously buried in the

@@ -692,36 +692,11 @@ impl ResourcePools {
             registry_len: self.registry_order.len(),
             registry_cap: REGISTRY_CAP,
             registry_pinned: pinned,
-            desc_blocks: self.desc_arena.block_count(),
             sampled_len: self.sampled_cache.len(),
             sampled_cap: SAMPLED_CACHE_CAP,
             sampled_bytes: self.sampled_cache_bytes,
             sampled_byte_cap: SAMPLED_CACHE_BYTE_CAP,
             graveyard_len: self.graveyard.len(),
-            slab: self.slab.occupancy(),
-            target_free_imgs: self.target_free.values().map(Vec::len).sum(),
-            sampled_free_imgs: self.sampled_free.values().map(Vec::len).sum(),
-            storage_free_imgs: self.storage_image_free.values().map(Vec::len).sum(),
-            storage_recycle_admits: self.storage_recycle_admits,
-            storage_recycle_cap_drops: self.storage_recycle_cap_drops,
-            storage_resident: self.compute_storage_registry.len(),
-            storage_resident_pinned: self
-                .compute_storage_registry
-                .values()
-                .filter(|r| r.pinned)
-                .count(),
-            staging_free_bytes: self
-                .staging_free
-                .values()
-                .flat_map(|v| v.iter())
-                .map(|s| s.size)
-                .sum(),
-            readback_free_bytes: self
-                .readback_free
-                .values()
-                .flat_map(|v| v.iter())
-                .map(|s| s.size)
-                .sum(),
         }
     }
 

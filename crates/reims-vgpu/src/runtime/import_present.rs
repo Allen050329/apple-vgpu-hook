@@ -775,13 +775,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
                 present.scatter_us,
                 mapped.len()
             ));
-            // Always-on store-path census: the GPU-direct scatter is now the
-            // only writeback, so a rise in decline counters is a hard failure
-            // (the store returns Err), not a silent degrade.
-            let (gpu_stores, fb_unres, fb_submit) = engine::host_scatter_snapshot();
-            crate::runtime::census::present_proxy::store_scatter::note(
-                true, gpu_stores, fb_unres, fb_submit,
-            );
             let _ = state.mark_mapping_written(mapping_id);
             state.note_surface_composite(mapping_id);
             // Full-frame publish: the entire resident target was scattered into
@@ -799,7 +792,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
             // continuously-animating app). Count into the windowed
             // `present_import` summary and gate the per-present line behind
             // REIMS_VGPU_DRAW_LOG — the `used=0 reason=<slug>` fallbacks stay fail-visible.
-            crate::runtime::census::present_proxy::present_import::note(true, false);
             if crate::observe::draw_log_enabled() {
                 crate::observe::line(format!(
                     "import_present used=1 reason=ok_runs mid={mapping_id} {width}x{height} runs={}",
@@ -1038,7 +1030,6 @@ impl crate::observe::Decline for ImportDecline {
 /// and the returned one drift apart silently. One argument now feeds both.
 fn import_fail(mid: u32, w: u32, h: u32, d: ImportDecline) -> ImportPresentResult {
     use crate::observe::Decline as _;
-    crate::runtime::census::present_proxy::present_import::note(false, true);
     crate::observe::Emit::decline("import_present", &d)
         .field("used", 0)
         .field("mid", mid)
@@ -1134,8 +1125,6 @@ fn log_result(mid: u32, w: u32, h: u32, r: ImportPresentResult) {
     // raw flood on both schedulers, redundant with the summary count — so gate
     // its per-present census behind REIMS_VGPU_DRAW_LOG. Skip/Fail (`used=0`) stay
     // fail-visible with their reason.
-    let is_fail = matches!(r, ImportPresentResult::Fail(_));
-    crate::runtime::census::present_proxy::present_import::note(r.used(), is_fail);
     if r.used() {
         if crate::observe::draw_log_enabled() {
             crate::observe::line(format!(

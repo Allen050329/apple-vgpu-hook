@@ -152,14 +152,12 @@ fn try_capture_from_resident(
     let identity =
         crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
     let Some(bgra) = crate::backend::vulkan::engine::read_resident_bgra(&identity, need) else {
-        crate::runtime::census::present_proxy::capture_source::note(false);
         return false;
     };
     debug_assert_eq!(bgra.len(), need);
     // Move (not copy) the readback in; the untouched scratch returns to the pool.
     state.present.capture_scratch = std::mem::replace(buf, bgra);
     state.present.last_paint_src = crate::model::PaintSrc::Resident;
-    crate::runtime::census::present_proxy::capture_source::note(true);
     true
 }
 

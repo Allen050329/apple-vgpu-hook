@@ -1342,9 +1342,7 @@ pub unsafe fn export_present_from_resident_fd_policy(
     // for our own export blit. Timing them apart tells whether the ~50ms/present at
     // 4K is ours to optimize before the hard async-export work — see
     // present_proxy::export_present::note_phases.
-    let drain_started = std::time::Instant::now();
     let (cb, fence) = pools.begin_entry_sync(ctx, counters)?;
-    let drain_us = drain_started.elapsed().as_micros() as u64;
     ctx.device
         .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentResetCb, e)))?;
@@ -1369,10 +1367,7 @@ pub unsafe fn export_present_from_resident_fd_policy(
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentSubmit, e)))?;
     let sealed = pools.seal_entry(Vec::new(), Vec::new());
     pools.finish_entry_async(sealed);
-    let blit_started = std::time::Instant::now();
     pools.retire_all(ctx, counters)?;
-    let blit_us = blit_started.elapsed().as_micros() as u64;
-    crate::runtime::census::present_proxy::export_present::note_phases(drain_us, blit_us);
     // record_blit leaves the resident in TRANSFER_SRC_OPTIMAL — keep the tracked
     // layout in sync so the next draw/readback barriers from the right layout.
     pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -1648,40 +1643,6 @@ pub fn cap_pressure_snapshot() -> crate::runtime::census::present_proxy::cap_pre
     }
 }
 
-/// Snapshot the slab pool's physical VkDeviceMemory footprint + the recycle-pool
-/// image counts for the always-on `vram` census (`present_proxy::vram`). Unlike
-/// `cap_pressure_snapshot` (gated on eviction/reupload pressure, so silent at
-/// idle) this drives a line even on a static page, so post-burst VRAM return is
-/// visible and a fragmentation stall (`resident` flat with `blocks` full of
-/// `free` bytes) is diagnosable. Pure read under the engine lock.
-pub fn vram_occupancy() -> crate::runtime::census::present_proxy::vram::Sample {
-    let guard = lock_engine();
-    let occ = guard.pools.cap_pressure_occupancy();
-    crate::runtime::census::present_proxy::vram::Sample {
-        slab_blocks: occ.slab.blocks,
-        slab_empty_blocks: occ.slab.empty_blocks,
-        slab_resident_bytes: occ.slab.resident_bytes,
-        slab_free_bytes: occ.slab.free_bytes,
-        slab_live_subs: occ.slab.live_subs,
-        block_allocs: occ.slab.block_allocs,
-        block_frees: occ.slab.block_frees,
-        max_block_free_bytes: occ.slab.max_block_free_bytes,
-        size_buckets: occ.slab.size_buckets,
-        registry_len: occ.registry_len,
-        registry_pinned: occ.registry_pinned,
-        desc_blocks: occ.desc_blocks,
-        sampled_len: occ.sampled_len,
-        target_free_imgs: occ.target_free_imgs,
-        sampled_free_imgs: occ.sampled_free_imgs,
-        storage_free_imgs: occ.storage_free_imgs,
-        storage_recycle_admits: occ.storage_recycle_admits,
-        storage_recycle_cap_drops: occ.storage_recycle_cap_drops,
-        storage_resident: occ.storage_resident,
-        storage_resident_pinned: occ.storage_resident_pinned,
-        staging_free_bytes: occ.staging_free_bytes,
-        readback_free_bytes: occ.readback_free_bytes,
-    }
-}
 
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the
 /// currently-presented target (`display`) alive, and reclaim aged non-pinned

@@ -876,51 +876,11 @@ pub(crate) struct CapPressureOccupancy {
     pub registry_len: usize,
     pub registry_cap: usize,
     pub registry_pinned: usize,
-    /// Live descriptor-arena pool blocks (1 = the pool never grew). A value > 1
-    /// means a draw/dispatch burst exhausted a block and the arena grew rather
-    /// than dropping the draw — the descriptor cap-pressure signal.
-    pub desc_blocks: usize,
     pub sampled_len: usize,
     pub sampled_cap: usize,
     pub sampled_bytes: usize,
     pub sampled_byte_cap: usize,
     pub graveyard_len: usize,
-    /// Physical VkDeviceMemory the slab holds from the driver, and how much of it
-    /// is unbound — the direct VRAM footprint + fragmentation signal.
-    pub slab: crate::backend::vulkan::engine::slab::SlabOccupancy,
-    /// Images cached in the resident-target / sampled recycle pools (each pins a
-    /// live slab sub-allocation, so they keep blocks from emptying).
-    pub target_free_imgs: usize,
-    pub sampled_free_imgs: usize,
-    /// Transient compute-storage images cached in `storage_image_free`. Each is a
-    /// standalone (non-slab) VkDeviceMemory, so — unlike the two pools above — it
-    /// does NOT show up in the slab `resident_mb`/`live_subs` census; surfaced
-    /// separately (`stfree`) so a compute-storage recycle leak is visible.
-    pub storage_free_imgs: usize,
-    /// Cumulative compute-storage recycle admits / cap-drops (`st_admit`/`st_drop`
-    /// on the census). A rising `st_drop` under a flat `stfree` is a cap-bounded
-    /// leak — the workload keeps producing new-geometry storage images the cap
-    /// destroys rather than a genuinely reused working set.
-    pub storage_recycle_admits: u64,
-    pub storage_recycle_cap_drops: u64,
-    /// Live compute-storage RESIDENTS (`compute_storage_registry`) and how many are
-    /// pinned (deferred-writeback, only-copy-on-GPU). Bounded by
-    /// `COMPUTE_STORAGE_REGISTRY_CAP=64` with LRU eviction AND a render-registry-style
-    /// idle-age drain ([`ResourcePools::trim_aged_compute_storage`]) that returns
-    /// non-pinned residents `IDLE_TARGET_AGE_MS` after last use — each resident is a
-    /// standalone (non-slab) VkDeviceMemory invisible to the slab census, so without
-    /// the drain a settled compute-heavy session would pin up to 64 whole allocations
-    /// for the guest lifetime. Surfaced (`st_res`/`st_pin`) so the drain's effect (and
-    /// any pinned-resident leak it cannot reclaim) stays visible at idle.
-    pub storage_resident: usize,
-    pub storage_resident_pinned: usize,
-    /// HOST_VISIBLE staging/readback buffers cached for reuse. System RAM on a
-    /// discrete GPU, but shared-with-the-guest RAM on an iGPU (portability
-    /// target), so their bytes are the "least host memory" signal there. Bucketed
-    /// by size, so bounded by concurrency — measured to confirm no unbounded
-    /// growth under many large (4K-frame) uploads.
-    pub staging_free_bytes: u64,
-    pub readback_free_bytes: u64,
 }
 
 /// Cap on the **non-pinned** (LRU-evictable) resident-target population — the

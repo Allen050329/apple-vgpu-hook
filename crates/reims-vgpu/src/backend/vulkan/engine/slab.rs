@@ -340,87 +340,10 @@ pub(crate) struct SlabPool {
     invariant_violations: u64,
 }
 
-/// Live VRAM-occupancy snapshot of the slab pool, for the always-on
-/// `cap_pressure` census. `resident_bytes` is the physical `VkDeviceMemory` the
-/// pool holds from the driver (`blocks * SLAB_SIZE` for shared blocks plus each
-/// dedicated block's size); `free_bytes` is how much of that is unbound. A large
-/// `free_bytes` with `empty_blocks` low and `block_frees` flat is the
-/// **fragmentation** signature — the pool is holding blocks whose sub-allocations
-/// have mostly left but which each still pin ≥1 live image, so none can be freed.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SlabOccupancy {
-    pub blocks: u64,
-    pub empty_blocks: u64,
-    pub resident_bytes: u64,
-    pub free_bytes: u64,
-    pub live_subs: u64,
-    pub block_allocs: u64,
-    pub block_frees: u64,
-    /// Free bytes of the *most-empty* shared block — the block closest to being
-    /// freeable. A large value here with `empty_blocks==0` and `block_frees`
-    /// flat is the fragmentation signature: a block is mostly free but one live
-    /// sub-allocation pins its whole `SLAB_SIZE` resident.
-    pub max_block_free_bytes: u64,
-    /// Live sub-allocations bucketed by size, `SIZE_BUCKET_EDGES` boundaries.
-    /// Reveals whether the working set is a few big targets or many small
-    /// textures — which decides whether size-class segregation would let blocks
-    /// empty (small textures cluster, big targets cluster, each frees together).
-    pub size_buckets: [u64; SIZE_BUCKET_COUNT],
-}
 
-/// Upper edges (bytes) of the live-sub-allocation size histogram; the final
-/// bucket catches everything at/above the last edge. Chosen around the image
-/// sizes this device actually binds: sub-4 KiB glyphs, small/medium sampled
-/// textures, then full-HD (8.3 MiB) and 4K (33 MiB) compositor targets.
-pub(crate) const SIZE_BUCKET_EDGES: [u64; 7] = [
-    4 << 10,   // 4 KiB
-    64 << 10,  // 64 KiB
-    256 << 10, // 256 KiB
-    1 << 20,   // 1 MiB
-    4 << 20,   // 4 MiB
-    16 << 20,  // 16 MiB (> full-HD BGRA, < 4K)
-    64 << 20,  // 64 MiB (> 4K BGRA)
-];
-pub(crate) const SIZE_BUCKET_COUNT: usize = SIZE_BUCKET_EDGES.len() + 1;
 
-/// Index of `size` in the histogram: first edge it is strictly below, else the
-/// overflow bucket.
-pub(crate) fn size_bucket(size: u64) -> usize {
-    for (i, &edge) in SIZE_BUCKET_EDGES.iter().enumerate() {
-        if size < edge {
-            return i;
-        }
-    }
-    SIZE_BUCKET_EDGES.len()
-}
 
 impl SlabPool {
-    /// Snapshot current block occupancy for the VRAM census. Pure read.
-    pub(crate) fn occupancy(&self) -> SlabOccupancy {
-        let mut occ = SlabOccupancy {
-            block_allocs: self.block_allocs,
-            block_frees: self.block_frees,
-            live_subs: self.live.len() as u64,
-            ..Default::default()
-        };
-        for b in self.blocks.iter().flatten() {
-            occ.blocks += 1;
-            occ.resident_bytes += b.plan.size();
-            let free = b.plan.free_bytes();
-            occ.free_bytes += free;
-            if b.plan.is_empty() {
-                occ.empty_blocks += 1;
-            } else if !b.dedicated && free > occ.max_block_free_bytes {
-                // Only shared, non-empty blocks: a dedicated block is whole-image
-                // (never fragmented), an empty block is already counted separately.
-                occ.max_block_free_bytes = free;
-            }
-        }
-        for token in self.live.values() {
-            occ.size_buckets[size_bucket(token.size)] += 1;
-        }
-        occ
-    }
 
     pub(crate) fn new() -> Self {
         Self {
@@ -1269,21 +1192,6 @@ mod tests {
         // keep >= empties: nothing to free.
         assert!(pool.empty_block_victims(3).is_empty());
         assert!(pool.empty_block_victims(9).is_empty());
-    }
-
-    #[test]
-    fn size_bucket_places_images_by_size_class() {
-        // Boundaries are exclusive-below: a value equal to an edge lands in the
-        // next bucket up. Full-HD BGRA (8.3 MiB) and 4K (33 MiB) must separate.
-        assert_eq!(size_bucket(0), 0);
-        assert_eq!(size_bucket(4095), 0);
-        assert_eq!(size_bucket(4 << 10), 1);
-        assert_eq!(size_bucket(200 << 10), 2);
-        assert_eq!(size_bucket(1 << 20), 4); // 1 MiB is the edge → bucket 4
-        assert_eq!(size_bucket(1920 * 1080 * 4), 5); // full-HD (7.9 MiB) → 4..16
-        assert_eq!(size_bucket(3840 * 2160 * 4), 6); // 4K (31.6 MiB) → 16..64
-        assert_eq!(size_bucket(64 << 20), 7); // >= 64 MiB → overflow
-        assert_eq!(size_bucket(SIZE_BUCKET_COUNT as u64), 0);
     }
 
     #[test]
