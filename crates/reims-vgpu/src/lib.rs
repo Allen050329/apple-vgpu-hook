@@ -87,7 +87,7 @@ pub use backend::Backend;
 pub use contract::pixel_format;
 // Convenience re-exports used by qemu ABI and tests
 pub use model::{Device, DeviceId};
-pub use runtime::{FakeHost, HostAction, HostOps};
+pub use runtime::{HostAction, HostOps};
 
 // --- Device lifecycle registry (used by qemu::abi) ---------------------------
 

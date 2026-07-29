@@ -567,6 +567,7 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     clippy::too_many_arguments,
     reason = "the mapping API mirrors the decoded texture rectangle"
 )]
+#[cfg(test)]
 pub fn read_rect_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

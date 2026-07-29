@@ -254,6 +254,7 @@ pub fn define_task_pages_arm64e(
 ///
 /// **Tests / fixtures only.** Product paths must use [`write_task_gva_product`]
 /// (contig HostOps view). Do not call from product encode/blit/compute.
+#[cfg(test)]
 pub fn write_task_gva<M: HostMemory>(
     host: &mut M,
     task: &TaskEntry,
