@@ -624,8 +624,8 @@ pub(crate) unsafe fn execute_compute_inner(
         let img = pools.acquire_storage_image(ctx, key, counters)?;
         let (upload, resident_src, reinterpret) = if let Some(bind) = resource.resident_bind {
             // The caller skipped the guest read; the placeholder bytes must
-            // never reach the GPU. Every mismatch is the named failure the
-            // caller restages on.
+            // never reach the GPU. Every mismatch names the check that
+            // refused.
             let Some((src_image, src_key, generation, src_layout)) =
                 pools.compute_resident_snapshot(&bind.identity)
             else {
@@ -747,8 +747,7 @@ pub(crate) unsafe fn execute_compute_inner(
             if !generation_match {
                 // The caller verified the resident generation at stage time
                 // and skipped the guest read; seeding the zero placeholder now
-                // would silently corrupt the chain. Named failure — caller
-                // restages.
+                // would silently corrupt the chain. Named failure instead.
                 return Err(DrawError::ComputeExecution(
                     ComputeExecutionDecline::ResidentSeedGenerationLost {
                         binding: resource.binding,

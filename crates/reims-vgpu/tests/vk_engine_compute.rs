@@ -608,7 +608,8 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
 /// `seed_skipped` contract: a generation-matching resident dispatch renders
 /// from the GPU-resident content while `bytes` is a zero placeholder (no seed
 /// upload); once the resident is gone the same request must fail with
-/// `compute_resident_seed_lost` — never silently seed the placeholder.
+/// `vk_compute_exec_resident_seed_generation_lost` — never silently seed the
+/// placeholder.
 #[test]
 fn compute_storage_image_seed_skip_and_lost_resident() {
     let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -725,7 +726,8 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     let err = engine::execute_compute_request(&make([1, 1, 1], 3, 4, true))
         .expect_err("lost resident must fail");
     assert!(
-        err.to_string().contains("compute_resident_seed_lost"),
+        err.to_string()
+            .contains("vk_compute_exec_resident_seed_generation_lost"),
         "unexpected error: {err}"
     );
 }
@@ -895,7 +897,7 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
 /// resident storage image is seeded by a device-local copy (zero-placeholder
 /// `bytes` never uploaded, `compute_sampled_uploads == 0`) and fetches the
 /// resident content; a stale generation or evicted resident fails with
-/// `compute_resident_sample_lost` — never a silent zero seed.
+/// `vk_compute_exec_resident_sample_*` — never a silent zero seed.
 #[test]
 fn compute_sampled_resident_copy_and_lost_resident() {
     let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -1110,7 +1112,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     let err =
         engine::execute_compute_request(&make_fetch(9)).expect_err("stale generation must fail");
     assert!(
-        err.to_string().contains("compute_resident_sample_lost"),
+        err.to_string()
+            .contains("vk_compute_exec_resident_sample_generation_mismatch"),
         "unexpected error: {err}"
     );
 
@@ -1118,7 +1121,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     engine::reset_guest_state();
     let err = engine::execute_compute_request(&make_fetch(2)).expect_err("lost resident must fail");
     assert!(
-        err.to_string().contains("compute_resident_sample_lost"),
+        err.to_string()
+            .contains("vk_compute_exec_resident_sample_absent"),
         "unexpected error: {err}"
     );
 }
@@ -1345,7 +1349,8 @@ fn compute_sampled_resident_reinterpret_copy() {
     let err = engine::execute_compute_request(&make_fetch(2))
         .expect_err("height mismatch must stay a shape loss");
     assert!(
-        err.to_string().contains("compute_resident_sample_lost"),
+        err.to_string()
+            .contains("vk_compute_exec_resident_sample_byte_shape_mismatch"),
         "unexpected error: {err}"
     );
 }

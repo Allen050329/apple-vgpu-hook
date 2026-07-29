@@ -950,7 +950,7 @@ pub struct ComputeStorageImageResource {
     /// The caller skipped reading guest pages into `bytes` because the
     /// resident generation matched at stage time. The engine must fail
     /// visibly (never seed the zero placeholder) if the resident image is
-    /// gone by acquire time — the caller restages and retries.
+    /// gone by acquire time.
     pub seed_skipped: bool,
     /// GPU-direct writeback window (VK_EXT_external_memory_host): when set
     /// and importable, the post-dispatch copy lands in this guest-memory
@@ -974,7 +974,8 @@ pub struct ComputeStorageImageResource {
 /// of uploading `bytes` (which is a zero placeholder and must never reach the
 /// GPU): the copy never aliases the live resident, so the same dispatch may
 /// also storage-write that identity. A missing/mismatched resident fails
-/// visibly (`compute_resident_sample_lost`) — the caller restages and retries.
+/// visibly with a `vk_compute_exec_resident_sample_*` decline naming the check
+/// that refused.
 #[derive(Clone, Copy, Debug)]
 pub struct ComputeResidentSampleBind {
     pub identity: crate::model::ComputeStorageResidencyKey,

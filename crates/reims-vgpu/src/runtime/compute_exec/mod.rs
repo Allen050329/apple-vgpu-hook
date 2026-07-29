@@ -1799,8 +1799,8 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // generation may have advanced via disjoint sibling windows
         // (ping-pong canvases), so the gate pairs mirror↔engine directly.
         // The zero placeholder is never seeded — the engine fails visibly
-        // (`compute_resident_seed_lost`) if the resident vanishes by acquire
-        // time and the caller restages.
+        // with `vk_compute_exec_resident_seed_generation_lost` if the resident
+        // vanishes by acquire time.
         let mut seed_skipped = false;
         #[cfg(feature = "backend-vulkan")]
         if is_storage {
@@ -3625,7 +3625,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
-    let mut req = ComputeRequest {
+    let req = ComputeRequest {
         spirv,
         entry: "main".into(),
         grid: [wg_x, wg_y, wg_z],
@@ -3644,20 +3644,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         engine_done.store(true, std::sync::atomic::Ordering::Release);
         out
     };
-    let mut out_result = run_engine(&req);
-    if let Err(e) = &out_result {
-        let s = e.to_string();
-        if s.contains("compute_resident_seed_lost") || s.contains("compute_resident_sample_lost") {
-            // A resident vanished between the stage-time generation check and
-            // engine acquire (same-request registry eviction). Re-read every
-            // skipped seed and sampled resident window from guest pages and
-            // retry once.
-            if let Err(status) = restage_lost_residents(state, host, &mut req, acc.pipeline_ref) {
-                return status;
-            }
-            out_result = run_engine(&req);
-        }
-    }
+    let out_result = run_engine(&req);
     let out = match out_result {
         Ok(o) => o,
         Err(e) => {
@@ -3935,181 +3922,6 @@ fn plan_direct_writeback<M: HostMemory + HostOps>(
         buffer_offset: surface_offset,
         row_bytes: surface_bpr,
     })
-}
-
-/// Re-read every seed-skipped storage image from guest pages after the engine
-/// reported `compute_resident_seed_lost` (the resident vanished between the
-/// stage-time generation check and acquire — same-request registry eviction).
-/// Guest pages still hold the last writeback for that generation, so the
-/// re-read reconstructs exactly the seed the skip elided. Clears the skip
-/// flags so the retry seeds normally. Fail-visible on every exit: seed loss is
-/// rare, and a flood of restage lines means the stage-time gate and the engine
-/// registry disagree.
-#[cfg(feature = "backend-vulkan")]
-fn restage_lost_residents<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &mut crate::backend::vulkan::engine::ComputeRequest,
-    pipeline_ref: u32,
-) -> Result<(), ComputeStatus> {
-    // bytes was allocated as exactly tight*height at stage time, so the
-    // identity key recovers the read geometry for both resource kinds.
-    let read_window = |state: &mut DeviceState,
-                       host: &mut M,
-                       key: &crate::model::ComputeStorageResidencyKey,
-                       bytes: &mut Vec<u8>| {
-        let rows = key.height.max(1) as u64;
-        let tight = (bytes.len() as u64 / rows) as u32;
-        let bpp = tight / key.width.max(1);
-        bpp != 0
-            && mapping_write::read_rect_raw_at(
-                state,
-                host,
-                key.mapping_id,
-                key.surface_offset,
-                key.surface_bpr,
-                key.span_end,
-                0,
-                0,
-                key.width,
-                key.height,
-                bpp,
-                bytes,
-                tight,
-            )
-    };
-    let mut restaged_storage = 0u32;
-    for resource in req.storage_images.iter_mut().filter(|r| r.seed_skipped) {
-        let Some(residency) = resource.residency else {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=skip_without_identity pipe={pipeline_ref} bind={}",
-                resource.binding
-            ));
-            return Err(ComputeStatus::MetalFailed(
-                "compute_restage_skip_without_identity",
-            ));
-        };
-        let key = residency.identity;
-        // A linear window's deferred content lives only in the lost resident —
-        // there is no mapping to re-read (guest pages hold the pre-chain
-        // seed and may be unmapped). Terminal, named.
-        if key.is_linear() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=linear_resident_lost pipe={pipeline_ref} bind={} task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.surface_offset,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed("compute_restage_linear_lost"));
-        }
-        // Heap textures have no guest-memory backing. Their contents exist
-        // only in the engine resident created for the heap allocation.
-        if key.is_heap() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=heap_resident_lost pipe={pipeline_ref} bind={} task={} ref={} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed("compute_restage_heap_lost"));
-        }
-        // The resident is gone; if its window was writeback-deferred the guest
-        // pages hold PRE-chain bytes — the deferred content is lost with it.
-        // Name the loss and fall back to the coherent stale seed.
-        if let Some(generation) = state.compute_deferred_flush.remove(&key) {
-            crate::observe::fail(format!(
-                "deferred_flush_lost mapping={} reason=restage gen={generation} {}x{} fmt={:#x}",
-                key.mapping_id, key.width, key.height, key.pixel_format
-            ));
-        }
-        if !read_window(state, host, &key, &mut resource.bytes) {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=read pipe={pipeline_ref} bind={} mapping={} {}x{} off={} bpr={} span_end={}",
-                resource.binding,
-                key.mapping_id,
-                key.width,
-                key.height,
-                key.surface_offset,
-                key.surface_bpr,
-                key.span_end
-            ));
-            return Err(ComputeStatus::GuestIo("compute_restage_read"));
-        }
-        resource.seed_skipped = false;
-        restaged_storage += 1;
-    }
-    let mut restaged_sampled = 0u32;
-    for resource in req.sampled_images.iter_mut() {
-        let Some(bind) = resource.resident_bind else {
-            continue;
-        };
-        let key = bind.identity;
-        if key.is_linear() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=linear_resident_lost pipe={pipeline_ref} bind={} task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.surface_offset,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed(
-                "compute_restage_sampled_linear_lost",
-            ));
-        }
-        if key.is_heap() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=heap_resident_lost pipe={pipeline_ref} bind={} task={} ref={} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed(
-                "compute_restage_sampled_heap_lost",
-            ));
-        }
-        if !read_window(state, host, &key, &mut resource.bytes) {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=sampled_read pipe={pipeline_ref} bind={} mapping={} {}x{} off={} bpr={} span_end={}",
-                resource.binding,
-                key.mapping_id,
-                key.width,
-                key.height,
-                key.surface_offset,
-                key.surface_bpr,
-                key.span_end
-            ));
-            return Err(ComputeStatus::GuestIo("compute_restage_sampled_read"));
-        }
-        resource.resident_bind = None;
-        restaged_sampled += 1;
-    }
-    if restaged_storage == 0 && restaged_sampled == 0 {
-        // The engine claimed a lost resident but no resource was skipped —
-        // contract breach between stage and acquire; do not retry blind.
-        crate::observe::fail(format!(
-            "compute_restage fail reason=no_skipped_resource pipe={pipeline_ref}"
-        ));
-        return Err(ComputeStatus::MetalFailed(
-            "compute_restage_no_skipped_resource",
-        ));
-    }
-    crate::observe::fail(format!(
-        "compute_resident_seed_restage pipe={pipeline_ref} n={restaged_storage} sampled={restaged_sampled}"
-    ));
-    Ok(())
 }
 
 /// Measurement-only watchdog for backend calls that cannot be bounded by a
