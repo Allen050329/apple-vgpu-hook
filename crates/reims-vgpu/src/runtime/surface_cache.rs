@@ -101,12 +101,15 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
 /// borrow of `state` — a Load seed does, and taking it this way costs a refcount
 /// rather than a full-framebuffer copy.
 ///
-/// A handle cannot be truncated the way [`get`]'s slice is, so this additionally
-/// requires the stored buffer to be *exactly* `width * height * 4`. A store with
-/// slop past that is served by [`get`] and misses here, which is the safe way
-/// round: the engine rejects a seed whose length is not exactly the geometry
-/// (`TargetSeedLength`), so handing one out would turn a working draw into a
-/// declined one.
+/// Hits exactly when [`get`] hits. A handle cannot be truncated the way [`get`]'s
+/// slice is, so the refcount is only taken when the stored buffer is *exactly*
+/// `width * height * 4`; a store carrying slop past that is copied instead.
+///
+/// The copy is not reachable today — every producer of `host_surfaces` allocates
+/// exactly that — but returning `None` there would be a silent seed loss, and a
+/// missing Load seed renders the pass onto a cleared target, which is a
+/// compositing layer going solid black. Matching [`get`] means a future producer
+/// with slop costs a copy rather than a defect.
 pub fn get_shared(
     state: &DeviceState,
     surface_id: u32,
@@ -115,7 +118,11 @@ pub fn get_shared(
 ) -> Option<std::sync::Arc<Vec<u8>>> {
     let need = get_from(&state.host_surfaces, surface_id, width, height)?.len();
     let e = state.host_surfaces.get(&surface_id)?;
-    (e.bgra.len() == need).then(|| std::sync::Arc::clone(&e.bgra))
+    Some(if e.bgra.len() == need {
+        std::sync::Arc::clone(&e.bgra)
+    } else {
+        std::sync::Arc::new(e.bgra[..need].to_vec())
+    })
 }
 
 /// Type-2/3 encode cache by texture object ref (not surface_id).
@@ -833,5 +840,40 @@ mod tests {
             None,
             "under-`need` bytes must not be served",
         );
+    }
+
+    /// `get_shared` must hit exactly when `get` hits, including for a stored
+    /// buffer carrying slop past `width * height * 4`.
+    ///
+    /// Returning `None` there would be a silent seed loss, and a missing Load
+    /// seed renders the pass onto a cleared target — a compositing layer going
+    /// solid black. The shared handle cannot be truncated the way `get`'s slice
+    /// is, so the slop case pays a copy instead of missing.
+    #[test]
+    fn get_shared_hits_wherever_get_hits_and_never_serves_slop() {
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let (w, h) = (4u32, 4u32);
+        let need = (w * h * 4) as usize;
+
+        // Exact: shared, and the same bytes `get` serves.
+        store(&mut state, 7, w, h, vec![0xA1u8; need]);
+        let exact = get_shared(&state, 7, w, h).expect("exact store must hit");
+        assert_eq!(exact.len(), need);
+        assert_eq!(&exact[..], get(&state, 7, w, h).unwrap());
+
+        // Slop: still hits, truncated to the geometry the caller matched on —
+        // the engine rejects a seed whose length is not exactly that.
+        let mut slop = vec![0xB2u8; need + 16];
+        slop[need] = 0xCD;
+        state.host_surfaces.get_mut(&7).unwrap().bgra = std::sync::Arc::new(slop);
+        let got = get_shared(&state, 7, w, h).expect("a store with slop must still hit");
+        assert_eq!(got.len(), need, "must truncate to width*height*BPP");
+        assert!(got.iter().all(|&b| b == 0xB2), "no slop byte leaks in");
+        assert_eq!(&got[..], get(&state, 7, w, h).unwrap());
+
+        // Geometry mismatch misses in both, identically.
+        assert!(get_shared(&state, 7, w + 1, h).is_none());
+        assert!(get(&state, 7, w + 1, h).is_none());
     }
 }
