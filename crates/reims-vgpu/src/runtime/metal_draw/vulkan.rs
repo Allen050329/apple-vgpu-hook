@@ -62,6 +62,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     host: &mut M,
     req: &mut DrawEncodeRequest,
     writeback_guest: bool,
+    // Inert on this arm, and by construction rather than by omission: the Metal
+    // arm consults it in `store_seed_policy` to suppress a scissor-local store,
+    // and this rail has no scissor-local store to suppress — `req.scissor` only
+    // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
     let colors: Vec<ColorRtRequest> = if req.colors.is_empty() {
@@ -1070,39 +1074,29 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
 
-    // Linear / view path returns only RGBA; recover geom from texture descriptor.
+    // Linear / view path returns only RGBA; the geometry comes from the decoded
+    // texture descriptor and from nowhere else. A payload shorter than the
+    // descriptor's own `width * height * 4` is not a geometry this call may
+    // invent one for: the caller turns `None` into a typed
+    // `DrawPreparationDecline::TextureResolveMissing`, which names the ref and
+    // the stage.
     let mut rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
     let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
     let desc = objects::read_descriptor(state, host, task_id, &entry)?;
-    if let Ok(td) = decode_texture_descriptor(&desc) {
-        let w = td.width.max(1);
-        let h = td.height.max(1);
-        let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-        if rgba.len() >= need {
-            rgba.truncate(need);
-            return Some((
-                w,
-                h,
-                0,
-                SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
-            ));
-        }
-    }
-    // Fall back: assume square-ish from byte length.
-    let px = rgba.len() / 4;
-    if px == 0 {
+    let td = decode_texture_descriptor(&desc).ok()?;
+    let w = td.width.max(1);
+    let h = td.height.max(1);
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if rgba.len() < need {
         return None;
     }
-    let side = (px as f64).sqrt() as u32;
-    if side > 0 && (side as usize) * (side as usize) * 4 == rgba.len() {
-        return Some((
-            side,
-            side,
-            0,
-            SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
-        ));
-    }
-    None
+    rgba.truncate(need);
+    Some((
+        w,
+        h,
+        0,
+        SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
+    ))
 }
 
 #[inline]
