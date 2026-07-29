@@ -3,8 +3,7 @@
 #![cfg(feature = "backend-metal")]
 
 use reims_vgpu::backend::metal::abi::{
-    ReimsVgpuBuffer, ReimsVgpuMetalCacheStats, REIMS_VGPU_ERR_ARGS, REIMS_VGPU_ERR_EXECUTE,
-    REIMS_VGPU_OK,
+    ReimsVgpuBuffer, REIMS_VGPU_ERR_ARGS, REIMS_VGPU_ERR_EXECUTE, REIMS_VGPU_OK,
 };
 use reims_vgpu::backend::metal::c_abi;
 use reims_vgpu::backend::metal::{hash_bytes, MetalRuntime};
@@ -44,30 +43,6 @@ fn hash_and_device() {
     isolate_logs();
     assert_ne!(hash_bytes(b"a"), hash_bytes(b"b"));
     assert!(MetalRuntime::device().is_some());
-}
-
-#[test]
-fn cache_stats_api() {
-    isolate_logs();
-    let mut stats = ReimsVgpuMetalCacheStats {
-        function_hits: 0,
-        function_misses: 0,
-        render_pso_hits: 0,
-        render_pso_misses: 0,
-        compute_pso_hits: 0,
-        compute_pso_misses: 0,
-        sampler_hits: 0,
-        sampler_misses: 0,
-        depth_stencil_hits: 0,
-        depth_stencil_misses: 0,
-        compute_reflect_hits: 0,
-        compute_reflect_misses: 0,
-    };
-    unsafe {
-        c_abi::reims_vgpu_backend_metal_cache_stats_reset();
-        c_abi::reims_vgpu_backend_metal_cache_stats(&mut stats);
-    }
-    let _ = (stats.function_hits, stats.function_misses);
 }
 
 #[test]

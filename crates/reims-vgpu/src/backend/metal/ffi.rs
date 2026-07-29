@@ -1,7 +1,6 @@
 //! C ABI exports (`reims_vgpu_backend_*`) with catch_unwind.
 
 use crate::backend::metal::abi::*;
-use crate::backend::metal::cache::{cache_stats, cache_stats_reset};
 use crate::backend::metal::compute::{compute_core, reflect_compute_textures_mtlb};
 use crate::backend::metal::error::write_err;
 use crate::backend::metal::render::render_core;
@@ -121,26 +120,6 @@ pub extern "C" fn reims_vgpu_backend_begin_native_color_format(pixel_format: u32
 #[no_mangle]
 pub extern "C" fn reims_vgpu_backend_end_native_color_format() {
     run_void("end_native_color_format", end_native_color_format);
-}
-
-#[no_mangle]
-pub extern "C" fn reims_vgpu_backend_metal_cache_stats(out: *mut ReimsVgpuMetalCacheStats) {
-    if out.is_null() {
-        let status = Status::args("metal_ffi_cache_stats_output_null");
-        Emit::refusal("metal_ffi", &status)
-            .expect("null output is a refusal")
-            .field("entry", "metal_cache_stats")
-            .fail_once(entry_discriminant("metal_cache_stats"));
-        return;
-    }
-    run_void("metal_cache_stats", || unsafe {
-        *out = cache_stats();
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn reims_vgpu_backend_metal_cache_stats_reset() {
-    run_void("metal_cache_stats_reset", cache_stats_reset);
 }
 
 // --- compute MTLB ---

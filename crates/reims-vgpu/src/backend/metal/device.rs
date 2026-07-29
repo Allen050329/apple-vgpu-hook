@@ -34,14 +34,10 @@ impl MetalBackend {
         "metal"
     }
 
-    pub fn reset(&mut self) {
-        crate::backend::metal::cache::cache_stats_reset();
-    }
 }
 
 impl Backend for MetalBackend {
     fn reset(&mut self) {
-        MetalBackend::reset(self);
         crate::runtime::icb::clear_icb_cache();
         crate::backend::metal::runtime::type11_guest_texture_invalidate_all();
     }

@@ -74,18 +74,6 @@ pub mod c_abi {
     pub extern "C" fn reims_vgpu_backend_end_native_color_format() {}
 
     #[no_mangle]
-    pub extern "C" fn reims_vgpu_backend_metal_cache_stats(out: *mut ReimsVgpuMetalCacheStats) {
-        if !out.is_null() {
-            unsafe {
-                *out = std::mem::zeroed();
-            }
-        }
-    }
-
-    #[no_mangle]
-    pub extern "C" fn reims_vgpu_backend_metal_cache_stats_reset() {}
-
-    #[no_mangle]
     pub extern "C" fn reims_vgpu_backend_dispatch_compute_mtlb(
         _mtlb: *const u8,
         _mtlb_len: usize,

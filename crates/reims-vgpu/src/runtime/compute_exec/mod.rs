@@ -3797,8 +3797,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_engine_run");
         }
     };
-    let engine_after = vk_engine::counter_snapshot();
-
     if out.buffers.len() != buffer_writable_count
         || out.images.len() != storage_count
         || out.images_direct.len() != storage_count
@@ -3996,20 +3994,19 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         note_storage_residency_writeback(state, t);
     }
 
-    let snap = engine_after;
     // A dispatch that completed is expected control flow; every refusal on this
-    // path emits its own typed decline.
+    // path emits its own typed decline. The fields are this dispatch's own
+    // shape — process-cumulative engine totals belong to the parity tests that
+    // take a snapshot around a known workload, not to a per-dispatch line that
+    // would pay a global engine lock to print them.
     crate::observe::line(format!(
-        "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={} vk_engine_dispatches={} creates={} allocs={}",
+        "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={}",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
         buffer_writable_count,
         buffer_unused_count,
         staged_tex.len(),
-        snap.dispatches,
-        snap.creates,
-        snap.allocs
     ));
     ComputeStatus::Ok
 }

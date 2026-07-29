@@ -1458,7 +1458,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "metal_compute_writeback_buffer_count_mismatch",
             "metal_compute_writeback_image_count_mismatch",
             "metal_compute_writeback_storage_format_unsupported",
-            "metal_ffi_cache_stats_output_null",
             "metal_ffi_slice_pointer_null",
             "metal_ffi_status_entry_panicked",
             "metal_ffi_void_entry_panicked",

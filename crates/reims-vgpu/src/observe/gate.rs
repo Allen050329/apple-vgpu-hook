@@ -999,12 +999,11 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (68, 1546): removing the decode helpers whose only caller
-        // was their own test retired four `DecodeStatus` slugs —
-        // `stream_protection_*` with `decode_protection_options`, and
-        // `res_wide_tlv_*` with the legacy wide-TLV walker. The type count is
+        // Down from (68, 1542): the Metal cache-stats C ABI went away with the
+        // twelve hit/miss tallies it reported, taking its null-output refusal
+        // `metal_ffi_cache_stats_output_null` with it. The type count is
         // unchanged.
-        (68, 1542),
+        (68, 1541),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

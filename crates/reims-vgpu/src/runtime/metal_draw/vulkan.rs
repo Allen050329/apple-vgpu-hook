@@ -4583,32 +4583,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             resources.secondary_targets = secs;
         }
-        let before = crate::backend::vulkan::engine::counter_snapshot();
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
-        let after = crate::backend::vulkan::engine::counter_snapshot();
-        let d = after.delta_since(&before);
-        crate::observe::line(format!(
-            "linux_m2v_draw vk_engine_creates={} vk_engine_allocs={} pipe_hit={} pipe_miss={} sampled_reuploads={} sampled_reupload_bytes={} sampled_cache_hits={} sampled_cache_hit_bytes={} sampled_identity_hits={} sampled_cache_misses={} sampled_gpu_binds={} sampled_free_hits={} sampled_free_allocs={} sampled_recycle_admits={} sampled_recycle_cap_drops={}",
-            d.creates,
-            d.allocs,
-            d.pipeline_hits,
-            d.pipeline_misses,
-            d.sampled_reuploads,
-            d.sampled_reupload_bytes,
-            d.sampled_cache_hits,
-            d.sampled_cache_hit_bytes,
-            d.sampled_identity_hits,
-            d.sampled_cache_misses,
-            d.sampled_gpu_binds,
-            d.sampled_free_hits,
-            d.sampled_free_allocs,
-            d.sampled_recycle_admits,
-            d.sampled_recycle_cap_drops
-        ));
         // Measure-only: RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
         // Resident/import path uses skip_readback → empty `out.pixels` is **expected**
         // and must not be read as "GPU drew black" (use import_content res_rgb_nz).

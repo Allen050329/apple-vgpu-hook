@@ -55,8 +55,6 @@ pub mod c_abi {
     extern "C" {
         pub fn reims_vgpu_backend_begin_native_color_format(pixel_format: u32);
         pub fn reims_vgpu_backend_end_native_color_format();
-        pub fn reims_vgpu_backend_metal_cache_stats(out: *mut ReimsVgpuMetalCacheStats);
-        pub fn reims_vgpu_backend_metal_cache_stats_reset();
         pub fn reims_vgpu_backend_dispatch_compute_mtlb(
             mtlb: *const u8,
             mtlb_len: usize,
