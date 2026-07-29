@@ -67,9 +67,12 @@ would a dropped guest command become invisible?*
   source served a capture, microseconds per sub-step — never had a claim under this rule.
 
 Two tells make this cheap to check. A census that carries no typed decline slug is almost always a
-tally: the decline registry baseline in `observe/gate.rs` did not move across four separate commits
-that removed nine such modules. And a line whose text says `ok`, `stage_ok`, `resident_ready=1` or
-`retain` is narrating the success path, whatever sink it was written to.
+tally: the crate's registered-slug count did not move across four separate commits that removed nine
+such modules — nine censuses deleted, zero refusals lost with them. (That count was read off a
+`#[cfg(test)] REGISTRY` table in `observe/decline.rs`, since deleted; the equivalent reading today is
+`observe::gate::declared_slugs().len()`, which scans the `Decline`/`Refusal` impls directly.) And a
+line whose text says `ok`, `stage_ok`, `resident_ready=1` or `retain` is narrating the success path,
+whatever sink it was written to.
 
 **Cost hides behind "measure-only".** The proxies here were not free, and the comments admitted it
 in situ: "2-3 ms per display-sized storage image on the stamp path", "the full-frame stats scan
@@ -77,6 +80,45 @@ exists only for the verbose line". Removed in this family: a GPU compute reducti
 present, a SIMD census fused into every readback, an O(w·h) scan of every bound texture on every
 draw, and a full read-back of the guest window on every Store. Before writing `// Measure-only` on
 something, price it at the rate it will actually run.
+
+### A Table That Restates The Code Adds No Invariant
+
+The census family above is one shape of safeguard-that-isn't. The other is a hand-maintained table
+that mirrors what the code already says, plus a source scanner whose job is to check that the mirror
+still matches. It reads as rigour, and it can only ever agree or disagree with its source: agreeing
+adds nothing the source did not already carry, and disagreeing gets reported as "the table drifted"
+rather than as a defect in the code.
+
+The one that was here was 2 746 lines. `observe/decline.rs` carried a `#[cfg(test)] REGISTRY` naming,
+for each of 67 decline types, its defining file, its `Emit` call sites, its delegate impl blocks and
+all 1 425 of its slugs as literals; eleven of `observe/gate.rs`'s eighteen tests existed to lex the
+crate and confirm the table. The properties it enforced were real, and *all but one of them were
+already enforced by the `slug()` arms it was copying*.
+
+The exception is the test worth keeping, and it is the tell for which part of a mirror to save: **the
+property no single site can see.** Slug uniqueness is crate-wide, so nothing in `translate`'s impl can
+notice a collision with `engine`'s. That one now reads the impls directly —
+`gate::declared_slugs()` anchors on each `impl Decline for` / `impl Refusal for` and then on the
+`fn slug` body inside it (not the whole impl: `fields()` keys are lowercase snake_case too), returning
+644 pairs. A scan of the code cannot drift from the code, and it needs no baseline.
+
+Two costs are worth naming because they are what make this class expensive rather than merely large:
+
+- **A hand-bumped baseline taxes every deletion.** `the_registry_is_what_the_last_migration_recorded`
+  pinned `(66, 1425)` and had accumulated forty lines of changelog prose inside the test body
+  explaining the last three bumps. Any commit that removed a decline had to edit the table, re-count,
+  and justify the direction. That is a toll on exactly the work this file asks for.
+- **A mirror hides what it does not list.** `every_registered_type_reaches_the_sink` checked that each
+  registered type named a real `Emit::decline(` site — a claim about the table's accuracy, not about
+  the code's coverage. A decline type with *no row at all* was invisible to it, and one was:
+  `BlitOptionError`, which the registry's own trailing comment admits it declined to certify.
+
+So when a table and a scanner appear together, ask which properties survive deleting the table. Keep
+the ones no single site can see; delete the rest, and say plainly which coverage went with them. Note
+what does *not* qualify: `translate/coverage.rs` looks like the same shape and is not. It enforces
+that every `pub` field under `runtime/decode/` has a *disposition* — completeness over a set the code
+cannot enumerate about itself — and its 23 `DroppedSilently` rows are a defect list under a
+shrink-only ceiling, not a restatement. Audited and kept.
 
 ### Measure Before Fixing
 
