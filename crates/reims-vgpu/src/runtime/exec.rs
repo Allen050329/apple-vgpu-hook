@@ -29,7 +29,7 @@ use crate::runtime::decode::stream::{
     self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
     SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
-use crate::runtime::fence_exec::{self, FenceStatus};
+use crate::runtime::fence_exec;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapping_write;
@@ -127,9 +127,6 @@ pub struct ExecResult {
     /// Immutable shader translation is still running off the FIFO scheduler.
     /// The caller must keep this packet at the channel head and retry it.
     pub deferred: bool,
-    /// Info-segment `0x1d1` ICB backing associations applied.
-    pub icb_backing_ok: u32,
-    pub icb_backing_fail: u32,
     pub texture_refs: Vec<u32>,
     pub type11_mappings: Vec<u32>,
     pub color_targets: Vec<u32>,
@@ -144,56 +141,22 @@ pub struct ExecResult {
     /// Multi-draw records stay resident; one pass must not full-frame import
     /// the same attachment after every draw.
     pub render_guest_stores: u32,
-    pub buffer_binds: u32,
-    pub texture_binds: u32,
     /// Explicit nil entries in render bind ranges. These must remove prior
     /// slot state rather than silently retaining a stale resource.
     pub buffer_unbinds: u32,
     pub texture_unbinds: u32,
     pub sampler_unbinds: u32,
-    pub mipmaps_ok: u32,
-    pub mipmaps_fail: u32,
-    pub blit_fills_ok: u32,
-    pub blit_copies_ok: u32,
-    pub blit_fail: u32,
-    pub blit_fences_ok: u32,
-    pub blit_fences_pending: u32,
-    pub blit_fences_fail: u32,
-    pub compute_fences_ok: u32,
-    pub compute_fences_pending: u32,
-    pub compute_fences_fail: u32,
-    pub compute_dispatches_ok: u32,
-    pub compute_dispatches_fail: u32,
-    pub compute_buffer_binds: u32,
-    pub compute_texture_binds: u32,
-    pub compute_sampler_binds: u32,
-    /// Control-flow SPI encode ok / fail (`0xdc`–`0xe2`).
-    pub compute_control_ok: u32,
+    /// Control-flow SPI encode failures (`0xdc`–`0xe2`).
     pub compute_control_fail: u32,
-    /// ICB materialize+execute ok / fail (`0xe4`/`0xe5`).
-    pub compute_icb_ok: u32,
+    /// ICB materialize+execute failures (`0xe4`/`0xe5`).
     pub compute_icb_fail: u32,
     /// Render ICB execute ok / fail (`0x14`/`0x15`).
     pub render_icb_ok: u32,
     pub render_icb_fail: u32,
-    pub render_fences_ok: u32,
-    pub render_fences_pending: u32,
-    pub render_fences_fail: u32,
-    pub event_ops_ok: u32,
-    pub event_ops_pending: u32,
-    pub event_ops_fail: u32,
     /// Wall-clock for the whole synchronous packet body. A packet holding the
     /// device lock past `SYNC_EXEC_STALL_US` starves the guest's read-to-clear
     /// completion registers; the drain reports that as a typed TRANSPORT line.
     pub total_us: u64,
-}
-
-fn tally_fence(st: FenceStatus, ok: &mut u32, pending: &mut u32, fail: &mut u32) {
-    match st {
-        FenceStatus::Ok => *ok += 1,
-        FenceStatus::Pending => *pending += 1,
-        FenceStatus::Missing | FenceStatus::Unsupported(_) => *fail += 1,
-    }
 }
 
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
@@ -552,7 +515,7 @@ fn walk_stream<M: HostMemory + HostOps>(
             }
             SEGMENT_TYPE_BLIT => {
                 walk_segment_records(stream, &seg, |r| {
-                    handle_blit_record(state, host, task_id, stream, r, out)
+                    handle_blit_record(state, host, task_id, stream, r)
                 });
             }
             SEGMENT_TYPE_COMPUTE => {
@@ -580,12 +543,12 @@ fn walk_stream<M: HostMemory + HostOps>(
             }
             SEGMENT_TYPE_EVENT => {
                 walk_segment_records(stream, &seg, |r| {
-                    handle_event_record(state, task_id, stream, r, out)
+                    handle_event_record(state, task_id, stream, r)
                 });
             }
             SEGMENT_TYPE_INFO => {
                 walk_segment_records(stream, &seg, |r| {
-                    handle_info_record(state, host, task_id, stream, r, out)
+                    handle_info_record(state, host, task_id, stream, r)
                 });
             }
             // Unreachable: `segment_disposition` already answered `Walk` for
@@ -601,7 +564,6 @@ fn handle_info_record<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
     rec: &stream::Record,
-    out: &mut ExecResult,
 ) {
     use crate::runtime::icb::{
         apply_icb_host_resource_info, decode_icb_host_resource_info, INFO_OP_ICB_HOST_RESOURCE,
@@ -619,14 +581,13 @@ fn handle_info_record<M: HostMemory + HostOps>(
         // for the same buffer, so an unlatched line would be one per frame.
         match decode_icb_host_resource_info(bytes) {
             Ok(info) => match apply_icb_host_resource_info(state, host, task_id, &info) {
-                Ok(_) => out.icb_backing_ok = out.icb_backing_ok.saturating_add(1),
+                Ok(_) => {}
                 Err(e) => {
                     crate::observe::Emit::decline("icb_backing", &e)
                         .field("task", task_id)
                         .field("icb", info.icb_ref)
                         .field("buffer", info.buffer_ref)
                         .fail_once(info.icb_ref as u64);
-                    out.icb_backing_fail = out.icb_backing_fail.saturating_add(1);
                 }
             },
             Err(e) => {
@@ -634,7 +595,6 @@ fn handle_info_record<M: HostMemory + HostOps>(
                     .field("task", task_id)
                     .field("len", bytes.len())
                     .fail_once(rec.length as u64);
-                out.icb_backing_fail = out.icb_backing_fail.saturating_add(1);
             }
         }
     }
@@ -645,7 +605,6 @@ fn handle_event_record(
     task_id: u32,
     stream: &[u8],
     rec: &stream::Record,
-    out: &mut ExecResult,
 ) {
     let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
     if end > stream.len() {
@@ -654,18 +613,20 @@ fn handle_event_record(
     let cmd_bytes = &stream[rec.bytes_offset as usize..end];
     let cmd = match event_decode::decode(cmd_bytes) {
         Ok(c) => c,
-        Err(_) => {
-            out.event_ops_fail += 1;
+        Err(status) => {
+            // A malformed event record drops a guest signal or wait outright.
+            // The `Err(_)` here used to feed a counter nothing read, so the loss
+            // left no line at all; the decoder's own typed refusal names which
+            // of its five checks rejected the bytes.
+            if let Some(e) = crate::observe::Emit::refusal("event_decode", &status) {
+                e.field("task", task_id).field("len", cmd_bytes.len()).fail();
+            }
             return;
         }
     };
-    let st = fence_exec::execute_event(state, task_id, &cmd);
-    tally_fence(
-        st,
-        &mut out.event_ops_ok,
-        &mut out.event_ops_pending,
-        &mut out.event_ops_fail,
-    );
+    // Refusals are emitted by `execute_event` itself, against the ref that
+    // failed; there is nothing left for this caller to report.
+    fence_exec::execute_event(state, task_id, &cmd);
 }
 
 /// Name a compute refusal at the rail boundary.
@@ -729,51 +690,22 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             } else {
                 FenceAction::Wait
             };
-            let st = fence_exec::execute_fence(
+            fence_exec::execute_fence(
                 state,
                 task_id,
                 FenceDomain::ComputeFence,
                 cmd.fence_ref,
                 action,
             );
-            tally_fence(
-                st,
-                &mut out.compute_fences_ok,
-                &mut out.compute_fences_pending,
-                &mut out.compute_fences_fail,
-            );
         }
         ComputeKind::BufferBind | ComputeKind::BufferBindAttributeStride => {
-            let before = seg.acc.buffers.len();
             let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-            if seg.acc.buffers.len() > before {
-                out.compute_buffer_binds += (seg.acc.buffers.len() - before) as u32;
-            } else {
-                out.compute_buffer_binds =
-                    out.compute_buffer_binds.max(seg.acc.buffers.len() as u32);
-            }
         }
         ComputeKind::TextureBind => {
-            let before = seg.acc.textures.len();
             let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-            if seg.acc.textures.len() > before {
-                out.compute_texture_binds += (seg.acc.textures.len() - before) as u32;
-            } else {
-                out.compute_texture_binds = out
-                    .compute_texture_binds
-                    .max(seg.acc.textures.len() as u32);
-            }
         }
         ComputeKind::SamplerBind | ComputeKind::SamplerLod => {
-            let before = seg.acc.samplers.len();
             let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-            if seg.acc.samplers.len() > before {
-                out.compute_sampler_binds += (seg.acc.samplers.len() - before) as u32;
-            } else {
-                out.compute_sampler_binds = out
-                    .compute_sampler_binds
-                    .max(seg.acc.samplers.len() as u32);
-            }
         }
         ComputeKind::Pipeline
         | ComputeKind::BufferOffset
@@ -796,12 +728,11 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::DispatchThreadsIndirect => {
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                Some(ComputeStatus::Ok) => out.compute_dispatches_ok += 1,
-                Some(st) => {
-                    out.compute_dispatches_fail += 1;
-                    note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
-                }
-                None => out.compute_dispatches_fail += 1,
+                // `None` is an accumulator-only record kind, not a loss: the
+                // record was applied, `apply_record` simply had no execution
+                // status to report for it.
+                None | Some(ComputeStatus::Ok) => {}
+                Some(st) => note_compute_refusal(st, task_id, pipeline_ref, cmd.kind),
             }
         }
         ComputeKind::ControlStartDoWhile
@@ -813,23 +744,21 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::ControlEndIf => {
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                Some(ComputeStatus::Ok) => out.compute_control_ok += 1,
+                None | Some(ComputeStatus::Ok) => {}
                 Some(st) => {
                     out.compute_control_fail += 1;
                     note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
                 }
-                None => out.compute_control_fail += 1,
             }
         }
         ComputeKind::ExecuteCommandsInBuffer | ComputeKind::ExecuteCommandsInBufferIndirect => {
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                Some(ComputeStatus::Ok) => out.compute_icb_ok += 1,
+                None | Some(ComputeStatus::Ok) => {}
                 Some(st) => {
                     out.compute_icb_fail += 1;
                     note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
                 }
-                None => out.compute_icb_fail += 1,
             }
         }
         _ => {}
@@ -842,7 +771,6 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     task_id: u32,
     stream: &[u8],
     rec: &stream::Record,
-    out: &mut ExecResult,
 ) {
     let end = (rec.bytes_offset as usize).saturating_add(rec.length as usize);
     if end > stream.len() {
@@ -867,9 +795,8 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     match cmd.kind {
         BlitKind::Resource if cmd.opcode == OP_GENERATE_MIPMAPS => {
             match mipmap::generate_mipmaps_linear(state, host, task_id, cmd.resource) {
-                MipmapStatus::Ok => out.mipmaps_ok += 1,
+                MipmapStatus::Ok => {}
                 st => {
-                    out.mipmaps_fail += 1;
                     // Was `st={st:?}` with no `reason=` at all, so none of the
                     // eight outcomes was greppable and the Debug spelling was
                     // the only handle on which check refused.
@@ -891,34 +818,11 @@ fn handle_blit_record<M: HostMemory + HostOps>(
             if let Some(e) = crate::observe::Emit::refusal("blit_fence_fail", &blit_st) {
                 e.field("opcode", format!("{:#x}", cmd.opcode)).fail();
             }
-            let st = match blit_st {
-                BlitStatus::Ok => FenceStatus::Ok,
-                BlitStatus::FencePending => FenceStatus::Pending,
-                BlitStatus::MissingResource => FenceStatus::Missing,
-                // Carry the blit rail's reason into the status instead of
-                // dropping it: this arm covers six blit checks and the tally
-                // below cannot tell them apart otherwise. The slug is owned by
-                // the blit reason channel, not registered here.
-                _ => FenceStatus::Unsupported(blit_exec::blit_fail_reason()),
-            };
-            tally_fence(
-                st,
-                &mut out.blit_fences_ok,
-                &mut out.blit_fences_pending,
-                &mut out.blit_fences_fail,
-            );
         }
         BlitKind::FillBuffer | BlitKind::Copy => {
             match blit_exec::execute_blit(state, host, task_id, &cmd) {
-                BlitStatus::Ok | BlitStatus::ZeroExtent => {
-                    if cmd.kind == BlitKind::FillBuffer {
-                        out.blit_fills_ok += 1;
-                    } else {
-                        out.blit_copies_ok += 1;
-                    }
-                }
+                BlitStatus::Ok | BlitStatus::ZeroExtent => {}
                 st => {
-                    out.blit_fail += 1;
                     // Icon/upload path often uses blit copies; fail-visible for RE.
                     // The reason names the specific failing site inside blit_exec
                     // that produced the coarse `st` — 177 checks collapse into
@@ -1038,7 +942,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     _ => {}
                 }
             }
-            out.buffer_binds = (acc.vertex_buffers.len() + acc.fragment_buffers.len()) as u32;
         }
         RenderKind::SetBufferOffset => {
             // Archive apply_buffer_offset: update offset on an already-bound slot.
@@ -1101,7 +1004,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     }
                 }
             }
-            out.texture_binds = (acc.vertex_textures.len() + acc.fragment_textures.len()) as u32;
         }
         RenderKind::SetSampler => {
             let refs: Vec<u32> = if !cmd.ref_binds.is_empty() {
@@ -1315,23 +1217,24 @@ fn handle_render_record<M: HostMemory + HostOps>(
             let action = match cmd.opcode {
                 RENDER_OP_UPDATE_FENCE => FenceAction::Update,
                 RENDER_OP_WAIT_FENCE => FenceAction::Wait,
-                _ => {
-                    out.render_fences_fail += 1;
+                opcode => {
+                    // A render fence record whose opcode is neither update nor
+                    // wait drops the guest's encoder synchronisation. The
+                    // counter that stood here had no reader, so this was silent.
+                    crate::observe::fail(format!(
+                        "render_fence_opcode reason=render_fence_opcode_unknown \
+                         task={task_id} opcode={opcode:#x} fence={}",
+                        cmd.fence_ref
+                    ));
                     return;
                 }
             };
-            let st = fence_exec::execute_fence(
+            fence_exec::execute_fence(
                 state,
                 task_id,
                 FenceDomain::RenderFence,
                 cmd.fence_ref,
                 action,
-            );
-            tally_fence(
-                st,
-                &mut out.render_fences_ok,
-                &mut out.render_fences_pending,
-                &mut out.render_fences_fail,
             );
         }
         RenderKind::OtherAccepted => {
@@ -2442,9 +2345,9 @@ mod tests {
         let mut acc = StreamAccum::default();
         walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
 
-        assert_eq!(out.event_ops_ok, 2);
-        assert_eq!(out.event_ops_pending, 1);
-        assert_eq!(out.event_ops_fail, 0);
+        // The signal landed, and the pending wait for 8 left it alone. The
+        // three per-op counters this used to assert had no product reader; the
+        // generation store is what the next wait actually reads.
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 11), Some(7));
     }
 
@@ -2568,7 +2471,6 @@ mod tests {
             &mut acc,
         );
         assert_eq!(acc.fragment_buffers.len(), 1);
-        assert_eq!(out.buffer_binds, 2);
 
         // viewport
         let mut vp = vec![0u8; HEADER_LEN + 48];

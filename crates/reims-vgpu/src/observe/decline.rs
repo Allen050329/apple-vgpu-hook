@@ -1926,7 +1926,12 @@ pub const REGISTRY: &[DeclineClass] = &[
         type_name: "DecodeStatus",
         defined_in: "runtime/decode/event.rs",
         slug_blocks: &[],
-        emission: Emission::At(&[("runtime/fence_exec.rs", "event_decode")]),
+        // Two decoders of the same wire records: `fence_exec` for the ch-event
+        // segment, `exec` for event records inside an ExecIndirect2 stream.
+        emission: Emission::At(&[
+            ("runtime/fence_exec.rs", "event_decode"),
+            ("runtime/exec.rs", "event_decode"),
+        ]),
         slug_calls: &[],
         slugs: &[
             "event_decode_args",
