@@ -2919,12 +2919,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         ],
     );
 
-    crate::observe::line(format!(
-        "linux_m2v_pair pipe={} v_spv={} f_spv={}",
-        req.pipeline_ref,
-        v_shader.spirv.len(),
-        f_shader.spirv.len()
-    ));
     let (w, h) = if req.width > 0 && req.height > 0 {
         (req.width, req.height)
     } else if let Some(c0) = req.colors.first() {
@@ -3757,13 +3751,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .first()
             .map(|c| c.store_action == PASS_STORE_ACTION_STORE)
             .unwrap_or(true);
-        // Measure-only: how often Store targets guest-visible backings (D4 proxy).
-        if store_is_store {
-            crate::observe::line(format!(
-                "linux_m2v_store_freq pipe={} store=1 (writeback-before-stamp class)",
-                req.pipeline_ref
-            ));
-        }
         resources.target_rgba8 = target_rgba8;
         // A Store reads back; anything else skips it.
         //
