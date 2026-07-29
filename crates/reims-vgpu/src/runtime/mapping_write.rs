@@ -26,28 +26,12 @@ pub fn type11_sample_window(
     height: u32,
     format: u16,
 ) -> Option<(u64, u32, u64)> {
-    type11_sample_window_ex(m, width, height, format).map(|(o, b, e, _)| (o, b, e))
-}
-
-/// Like [`type11_sample_window`], plus `from_device` (true = guest device
-/// descriptor plane/surface window; false = invent packed fallback).
-///
-/// The flag distinguishes a window the guest's own `sIOSurfaceDeviceDescriptor`
-/// described from one this device invented, which is what separates a stale or
-/// rejected descriptor from a genuinely packed surface. No caller reads it
-/// today; [`type11_sample_window`] is the form the paths use.
-pub fn type11_sample_window_ex(
-    m: &MappingEntry,
-    width: u32,
-    height: u32,
-    format: u16,
-) -> Option<(u64, u32, u64, bool)> {
     let desc = if m.device_desc.len() >= DEVICE_DESC_LEN {
         Some(m.device_desc.as_slice())
     } else {
         None
     };
-    sample_window_prefer_device(desc, None, format, width, height)
+    sample_window_prefer_device(desc, None, format, width, height).map(|(o, b, e, _)| (o, b, e))
 }
 
 /// Sample window for a type-5 serialized view, which — unlike type-11 —

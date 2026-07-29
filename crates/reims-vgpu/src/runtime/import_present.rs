@@ -779,8 +779,7 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((base_off, bpr, span_end, _)) =
-        mapping_write::type11_sample_window_ex(m, width, height, fmt)
+    let Some((base_off, bpr, span_end)) = mapping_write::type11_sample_window(m, width, height, fmt)
     else {
         return false;
     };
