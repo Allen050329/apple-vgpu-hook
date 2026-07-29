@@ -141,6 +141,7 @@ impl InvalidateValidityOps {
         }
     }
 
+    #[cfg(test)]
     pub fn to_le_dword(self) -> u32 {
         u32::from_le_bytes([
             self.clear_host_valid,
