@@ -379,10 +379,6 @@ pub struct TaskEntry {
 pub enum WriteGate {
     /// A span recorded for this exact task covers the whole range.
     Exact,
-    /// No span for this task covers the range, but one recorded by task `by`
-    /// does. `by` is the whole point: it says which task's authorisation is
-    /// standing in, and therefore which two key spaces disagree.
-    Aliased { by: u32 },
     /// This task has no recorded spans at all, so the gate allowed by default.
     /// `delete_task` calls `clear_task_map_spans`, so a write arriving after a
     /// teardown lands here.
@@ -392,19 +388,9 @@ pub enum WriteGate {
 }
 
 impl crate::observe::Decline for WriteGate {
-    /// Carries `by` so the aliased arm names the authorising task without the
-    /// call site having to know the arm's shape.
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::Aliased { by } => vec![("by", by.to_string())],
-            _ => Vec::new(),
-        }
-    }
-
     fn slug(&self) -> &'static str {
         match self {
             Self::Exact => "write_gate_exact",
-            Self::Aliased { .. } => "write_gate_aliased",
             Self::NoSpans => "write_gate_no_spans",
             Self::Outside => "write_gate_outside",
         }
@@ -2099,37 +2085,25 @@ impl DeviceState {
         if len == 0 {
             return WriteGate::Exact;
         }
-        // One candidate, and the code now says so. This read `t == (task_id >> 1)
-        // || (t << 1) == task_id`, which looks like a two-way search and is not:
-        // for even `task_id` the clauses are the same set, and for odd `task_id`
-        // the second can never hold because `t << 1` is even. The only inputs it
-        // added were `t >= 0x8000_0000`, where `t << 1` wraps — a span filed by
-        // task 0x8000_0001 authorising a write by task 2, which is not an
-        // ownership relation but arithmetic overflow, and which fails open
-        // whenever the writer has spans of its own that do not cover the range.
-        //
-        // This matters beyond the dead branch: `WriteGate::Aliased { by }` can
-        // therefore only ever carry `task_id >> 1`, so "`by == task >> 1` in
-        // every observed case" is forced by this predicate and measures nothing
-        // about the guest. See the unfiltered owner readout at the emission site.
-        let aliases = |t: u32| t == (task_id >> 1);
+        // Spans filed by `task_id` and nothing else. This used to also accept a
+        // span filed under `task_id >> 1`, which is the wire-word halving that
+        // `runtime::task_slot` already refuted and removed from the command
+        // resolvers: `MapMemory2` files spans under slot ids (`0x5`, `0x7`,
+        // `0x9`), which the `DefineTask2` wire space does not contain, so
+        // halving a slot id names a **different task**. The gate was therefore
+        // authorising a write with a different task's map — and the write that
+        // followed walked the *named* task's page tables, because
+        // `gva_view::resolve_task_for_walk` never halves. Authorisation and
+        // destination came from two different address spaces.
         let mut saw_any = false;
-        let mut aliased_by: Option<u32> = None;
         for s in &self.task_map_spans {
-            let exact = s.task_id == task_id;
-            if !exact && !aliases(s.task_id) {
+            if s.task_id != task_id {
                 continue;
             }
             saw_any = true;
             if s.covers(gva, len) {
-                if exact {
-                    return WriteGate::Exact;
-                }
-                aliased_by.get_or_insert(s.task_id);
+                return WriteGate::Exact;
             }
-        }
-        if let Some(by) = aliased_by {
-            return WriteGate::Aliased { by };
         }
         if saw_any {
             WriteGate::Outside
@@ -2142,12 +2116,14 @@ impl DeviceState {
     /// deduplicated. **Readout only** — [`Self::gva_write_gate`] does not call
     /// this and nothing may branch on it.
     ///
-    /// This exists because the gate's own `by` field cannot answer the question
-    /// it appears to. The gate only ever considers spans filed under
-    /// `task_id >> 1`, so `WriteGate::Aliased { by }` is guaranteed to report
-    /// that value and nothing else — the search space, printed back as though it
-    /// were an observation. What is genuinely unknown is who *else* has a
-    /// covering span, and the only way to see it is to look without the filter.
+    /// This exists because the gate cannot answer it. The gate considers spans
+    /// filed under the writing task and no other, which is the whole point of
+    /// it; what a refusal leaves unknown is whether some *other* task declared
+    /// this range, and the only way to see that is to look without the filter.
+    /// A refused write whose `owners` names one specific other task every time
+    /// is a decode question about which key space that opcode's word is in — it
+    /// is not licence to write through the named task's page tables anyway,
+    /// which is what the removed alias arm did.
     ///
     /// Ambiguity is a property of the registry at the instant of the write, so
     /// it is read from the registry rather than counted from map/unmap events: a

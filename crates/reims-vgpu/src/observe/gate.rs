@@ -1159,9 +1159,18 @@ fn the_registry_is_what_the_last_migration_recorded() {
         // color attachment now always renders into a host RT. `Status` keeps
         // its row for the rest of the Metal surface.
         //
+        //
+        // (66, 1426) -> (66, 1425). `WriteGate::Aliased` and its
+        // `write_gate_aliased` slug are gone: the arm authorised a guest write
+        // with a span filed under `task_id >> 1`, which is the wire-word
+        // halving `runtime::task_slot` already refuted and removed from the
+        // command resolvers. A write it permitted was then walked through the
+        // *named* task's page tables, so the authorisation and the destination
+        // came from different address spaces.
+        //
         // Down is the right direction here. A registered slug for a check the
         // crate can no longer make reads as an available refusal when it is not.
-        (66, 1426),
+        (66, 1425),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

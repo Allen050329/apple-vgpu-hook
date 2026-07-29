@@ -363,62 +363,43 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
         return Ok(());
     }
     let via = via_caller();
-    // The gate's own answer, not a label chosen here. It has three distinct ways
-    // to permit a write and nothing has ever read which one applied: a covered
-    // span, an *aliased* task's span, or no span registry at all. Only the last
-    // of those is a bounds check that did not happen, and `delete_task` clears
-    // the registry, so a write arriving after a teardown takes it.
+    // The gate's own answer, not a label chosen here. A refusal carries the
+    // unfiltered owner readout with it: `owners` is every task whose declared
+    // span covers this range, which is what says whether the range is unmapped
+    // outright or mapped by a task other than the one the opcode named. The
+    // second is a decode question and its answer is not "write it anyway".
     let gate = state.gva_write_gate(task_id, gva, buf.len() as u64);
     if gate == crate::model::WriteGate::Outside {
+        let owners = state.tasks_covering(gva, buf.len() as u64);
         crate::observe::Emit::decline("gva_write", &gate)
             .field("task", task_id)
             .field("gva", format!("{gva:#x}"))
             .field("len", format!("{:#x}", buf.len()))
+            .field("owners", format!("{owners:?}"))
+            .field("own", state.task_own_span_count(task_id))
             .field("via", via)
             .fail();
         return Err(MemError::OutsideMap);
     }
-    // Census the permissive arms, latched per (arm, task). Exact is the arm the
-    // gate is supposed to take; the other two are the reading this exists for.
-    if gate != crate::model::WriteGate::Exact {
+    // The one remaining permissive arm, latched per (task, caller). `no_spans`
+    // means this task declared nothing at all — its bounds check did not run —
+    // and `delete_task` clears the registry, so a write arriving after a
+    // teardown lands here.
+    if gate == crate::model::WriteGate::NoSpans {
         use crate::observe::Decline;
-        let by = match gate {
-            crate::model::WriteGate::Aliased { by } => by,
-            _ => 0,
-        };
         // The caller is part of the identity, not decoration. The same arm
-        // reached from two sites is two findings, and a latch keyed on
-        // `(arm, task, by)` alone would show whichever ran first and hide the
-        // other for the whole process.
+        // reached from two sites is two findings, and a latch keyed on the task
+        // alone would show whichever ran first and hide the other for the whole
+        // process.
         if crate::observe::first_sight(
             gate.slug(),
-            latch_key(task_id, by, std::panic::Location::caller()),
+            latch_key(task_id, 0, std::panic::Location::caller()),
         ) {
-            // `by` is the gate's own answer and it is also the only answer the
-            // gate's alias predicate can give — it searches `task >> 1` alone,
-            // so reading `by == task >> 1` back as a finding measures the
-            // predicate. `owners` is the unfiltered version of the same
-            // question: every task whose span actually covers this range, with
-            // no relation assumed. If it ever holds an id that is not
-            // `task >> 1`, the halving is not the relationship.
-            //
-            // `spans` is here for the other permissive arm: `no_spans` means "no
-            // span for this task or its alias", not "the registry is empty", and
-            // only the second of those is a bounds check that did not run.
-            //
-            // `own` separates the two states the aliased arm collapses. The
-            // measured aliased writes both land inside one task's 64 MB span
-            // while the writer's own first span covers neither, so the arm may
-            // simply be rescuing a task that has registered nothing yet — an
-            // ordering fact — rather than expressing an ownership relation. Zero
-            // here says the writer's bounds check never ran.
-            let owners = state.tasks_covering(gva, buf.len() as u64);
             crate::observe::Emit::decline("gva_write_gate", &gate)
                 .field("task", task_id)
                 .field("gva", format!("{gva:#x}"))
                 .field("len", format!("{:#x}", buf.len()))
-                .field("owners", format!("{owners:?}"))
-                .field("own", state.task_own_span_count(task_id))
+                .field("owners", format!("{:?}", state.tasks_covering(gva, buf.len() as u64)))
                 .field("spans", state.task_map_span_count())
                 .field("via", via)
                 .fail();
@@ -901,55 +882,43 @@ mod tests {
         assert_eq!(state.gva_write_gate(6, 0x9000, 0x100), WriteGate::Outside);
         assert!(!state.gva_write_allowed(6, 0x9000, 0x100));
 
-        // Only task 3's span covers it (6 >> 1 == 3), so the write is permitted
-        // on another task's authorisation. Exact must still win when both apply.
-        let mut aliased = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        assert!(aliased.define_task(3, 0x1_0000, 2));
-        aliased.note_task_map(3, 0x4000, 0x1000);
+        // A span recorded by task 3 does not authorise a write by task 6, even
+        // though `6 >> 1 == 3`. That halving is the wire-word relation
+        // `runtime::task_slot` refuted; the write that follows this gate walks
+        // task 6's page tables regardless, so accepting task 3's map would put
+        // the authorisation and the destination in different address spaces.
+        let mut other = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(other.define_task(3, 0x1_0000, 2));
+        other.note_task_map(3, 0x4000, 0x1000);
         assert_eq!(
-            aliased.gva_write_gate(6, 0x4000, 0x100),
-            WriteGate::Aliased { by: 3 },
-            "a span recorded by task 3 must not be reported as task 6's own"
+            other.gva_write_gate(6, 0x4000, 0x100),
+            WriteGate::NoSpans,
+            "task 6 declared nothing; task 3's span is not task 6's authorisation"
         );
-        aliased.note_task_map(6, 0x4000, 0x1000);
-        assert_eq!(aliased.gva_write_gate(6, 0x4000, 0x100), WriteGate::Exact);
+        // …and once task 6 has a registry of its own, the same range is a
+        // refusal rather than a permissive default.
+        other.note_task_map(6, 0x9000, 0x1000);
+        assert_eq!(other.gva_write_gate(6, 0x4000, 0x100), WriteGate::Outside);
+        assert!(!other.gva_write_allowed(6, 0x4000, 0x100));
+        other.note_task_map(6, 0x4000, 0x1000);
+        assert_eq!(other.gva_write_gate(6, 0x4000, 0x100), WriteGate::Exact);
     }
 
-    /// The alias predicate has exactly **one** candidate, and `by` therefore
-    /// cannot report anything except `task >> 1`.
-    ///
-    /// It used to read `t == (task_id >> 1) || (t << 1) == task_id`, which reads
-    /// as a search over two relations. Over every id the task table can hold
-    /// those clauses accept exactly the same set — so `by == task >> 1` was
-    /// forced by the predicate, not measured from the guest, and two rounds of
-    /// notes read it as evidence of a factor of two on the write path.
-    #[test]
-    fn the_alias_predicate_never_had_a_second_candidate() {
-        use crate::model::MAX_TASKS;
-        for task_id in 0..MAX_TASKS as u32 {
-            for t in 0..MAX_TASKS as u32 {
-                assert_eq!(
-                    t == (task_id >> 1),
-                    t == (task_id >> 1) || (t << 1) == task_id,
-                    "the deleted clause changed the answer for t={t} task={task_id}"
-                );
-            }
-        }
-    }
 
-    /// The unfiltered owner scan sees what the gate's one-candidate search
-    /// cannot, and it does not change what the gate decides.
+    /// The unfiltered owner scan sees what the gate does not, and it does not
+    /// change what the gate decides.
     ///
-    /// Task 9's span covers the range and task 5's does not, so a write by task
-    /// 11 (`11 >> 1 == 5`) is refused — and the log line must be able to say
-    /// that a *different* task, unrelated by halving, held the covering span.
-    /// With `owners` reporting only what `by` could, "the covering owner is
-    /// always `task >> 1`" would be true by construction on every boot.
+    /// The gate searches task 11's own spans and nothing else, so the range is
+    /// refused — and the log line must still be able to say that *other* tasks
+    /// held a covering span, including ones unrelated by halving. Without that
+    /// readout, "the covering owner is always `task >> 1`" would be true by
+    /// construction on every boot.
     #[test]
     fn the_owner_readout_sees_covering_tasks_the_gate_never_considered() {
         use crate::model::WriteGate;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.define_task(11, 0x1_0000, 2));
+        state.note_task_map(11, 0xc000, 0x1000);
         state.note_task_map(5, 0x8000, 0x1000);
         state.note_task_map(9, 0x4000, 0x1000);
         state.note_task_map(4, 0x4000, 0x1000);
@@ -964,7 +933,7 @@ mod tests {
             vec![4, 9],
             "both covering owners, ascending, and neither is 11 >> 1"
         );
-        assert_eq!(state.task_map_span_count(), 3);
+        assert_eq!(state.task_map_span_count(), 4);
         // A zero-length write covers nothing, matching the gate's own early out.
         assert!(state.tasks_covering(0x4000, 0).is_empty());
     }
@@ -1118,37 +1087,52 @@ mod tests {
         assert_eq!(err, MemError::NoSuchTask);
     }
 
-    /// `Aliased` is returned in two states that call for opposite fixes, and
-    /// `own` is what tells them apart.
+    /// No span filed by any task other than the writer can authorise a write.
     ///
-    /// Both writes below are permitted by task 0's oversized span. In the first
-    /// the writer has filed nothing at all, so its bounds check never ran and
-    /// the alias search merely found a neighbour; in the second the writer has a
-    /// registry of its own that does not reach the range. The arm is `Aliased`
-    /// either way — without `own` the log cannot say which happened, and the
-    /// measured rail shows exactly this shape.
+    /// This is the removed alias arm, stated as a property over the whole task
+    /// table rather than one example. The gate used to accept a span filed
+    /// under `task >> 1`, so a write by task 1 landed inside task 0's 64 MB map
+    /// and was permitted — while `gva_view::resolve_task_for_walk` resolved the
+    /// destination through task 1's page tables, which never halves. Measured
+    /// on the x86/Vulkan rail the permissive arm fired from
+    /// `compute_exec` and `blit_exec`, and the guest reported it as
+    /// WindowServer aborting inside `malloc_zone_error` — its own heap written
+    /// through by a surface store that had been authorised against a different
+    /// address space.
     #[test]
-    fn the_aliased_arm_cannot_say_whether_the_writers_own_bounds_check_ran() {
+    fn only_the_writing_tasks_own_spans_authorise_a_write() {
         use crate::model::WriteGate;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert!(state.define_task(1, 0x1_0000, 2));
+        // Task 0 declares a span that swallows the address the measured
+        // aliased writes used.
         state.note_task_map(0, 0x101000, 0x400_0000);
 
-        assert_eq!(
-            state.gva_write_gate(1, 0x1ada000, 0x10000),
-            WriteGate::Aliased { by: 0 }
-        );
-        assert_eq!(
-            state.task_own_span_count(1),
-            0,
-            "the writer registered nothing, so its bounds check did not run"
-        );
+        // Every other task is refused inside it, whatever its numeric relation
+        // to task 0 — the halving was never an ownership relation.
+        for task_id in 1..64u32 {
+            assert_ne!(
+                state.gva_write_gate(task_id, 0x1ada000, 0x10000),
+                WriteGate::Exact,
+                "task {task_id} has no span of its own and must not inherit task 0's"
+            );
+            assert!(
+                !state.gva_write_allowed(task_id, 0x1ada000, 0x10000)
+                    || state.task_own_span_count(task_id) == 0,
+                "only the no-registry default may permit, and only while it holds"
+            );
+        }
 
+        // The readout still sees who does hold the covering span, so a refusal
+        // says whether the range is unmapped or mapped by someone else.
+        assert_eq!(state.tasks_covering(0x1ada000, 0x10000), vec![0]);
+
+        // Once the writer files its own non-covering span the default is gone
+        // and the same range is a hard refusal.
         state.note_task_map(1, 0x9f9000, 0x20000);
         assert_eq!(
             state.gva_write_gate(1, 0x1ada000, 0x10000),
-            WriteGate::Aliased { by: 0 },
-            "the same arm, now for a different reason"
+            WriteGate::Outside
         );
         assert_eq!(state.task_own_span_count(1), 1);
         assert_eq!(

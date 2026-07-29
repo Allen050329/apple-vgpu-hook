@@ -2186,7 +2186,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         type_name: "WriteGate",
         defined_in: "model/state.rs",
         slug_blocks: &[],
-        // The refusal arm rides `gva_write`; the permissive arms ride
+        // The refusal arm rides `gva_write`; the one permissive arm rides
         // `gva_write_gate`. Both are the gate's own answer rather than a label
         // the caller picked, which is the point of the type.
         emission: Emission::At(&[
@@ -2196,7 +2196,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         slug_calls: &[],
         slugs: &[
             "write_gate_exact",
-            "write_gate_aliased",
             "write_gate_no_spans",
             "write_gate_outside",
         ],
