@@ -93,17 +93,13 @@ impl<B: Backend> Device<B> {
         runtime::mmio::iosfc_write(&mut self.state, host, offset, data, size);
     }
 
-    /// BH body: drain pending work, then bind type-11 texture refs onto the backend.
+    /// BH body: drain pending work.
+    ///
+    /// `state.texture_to_mapping` is the authoritative type-11 ref → mapping
+    /// table and is read directly by `runtime/metal_draw`. This used to also
+    /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {
         runtime::drain::drain_pending(&mut self.state, host);
-        for (&(_task, ref_), &mapping_id) in &self.state.texture_to_mapping {
-            self.backend.bind_texture_mapping(ref_, mapping_id);
-        }
-    }
-
-    /// Bind texture object ref → mapping_id on the backend (type-11).
-    pub fn bind_type11_texture(&mut self, ref_: u32, mapping_id: u32) {
-        self.backend.bind_texture_mapping(ref_, mapping_id);
     }
 
     /// Write BGRA8 into a guest mapping (contig HostOps view) and bump generation.

@@ -83,7 +83,7 @@ pub mod qemu;
 #[cfg(feature = "host-window")]
 pub mod host_window;
 
-pub use backend::{Backend, BackendError, ComputeDispatch, RenderDraw, TextureDesc};
+pub use backend::Backend;
 pub use contract::pixel_format;
 // Convenience re-exports used by qemu ABI and tests
 pub use model::{Device, DeviceId};

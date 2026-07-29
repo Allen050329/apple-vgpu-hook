@@ -110,7 +110,7 @@ pub enum Emission {
 /// and every slug it can produce.
 #[derive(Clone, Copy, Debug)]
 pub struct DeclineClass {
-    /// The Rust type name, e.g. `"BackendError"`.
+    /// The Rust type name, e.g. `"BlitOptionError"`.
     pub type_name: &'static str,
     /// Defining file, relative to `src/`. Checked to exist and to contain the
     /// type.
@@ -118,10 +118,10 @@ pub struct DeclineClass {
     /// Where — or whether — a value of this type reaches the sink.
     pub emission: Emission,
     /// Extra `(file, anchor)` blocks the gate must also read, for a vocabulary
-    /// delegated to a helper — `BackendError::Unsupported` forwards its nine
-    /// slugs to `BackendOp::slug`, so the gate is told to read `impl BackendOp`
-    /// as well. `anchor` is the text that opens the block; the gate walks its
-    /// braces.
+    /// delegated to a helper — a variant that forwards `slug()` to another
+    /// type's impl leaves nothing for the gate to read in its own file, so that
+    /// impl is named here as well. `anchor` is the text that opens the block;
+    /// the gate walks its braces.
     ///
     /// Empty is the normal case: the slugs are written in the type's own
     /// `Decline`/`Refusal` impl in [`Self::defined_in`], which the gate always
@@ -148,43 +148,6 @@ pub struct DeclineClass {
 /// refuse and which are still silent — the latter being, as of this phase, the
 /// remaining work rather than a claim of completeness.
 pub const REGISTRY: &[DeclineClass] = &[
-    DeclineClass {
-        type_name: "BackendError",
-        defined_in: "backend/mod.rs",
-        // `Unsupported` forwards its nine slugs to `BackendOp::slug`.
-        slug_blocks: &[("backend/mod.rs", "impl BackendOp")],
-        // Measured 2026-07-25: nothing in the crate calls a fallible `Backend`
-        // method. `Device<B>` invokes only `reset()`, which returns `()`; the
-        // runtime drives `engine::execute_draw_request` directly rather than
-        // going through this trait. So the type `AGENTS.md` cites as the
-        // canonical silent-failure example turns out to sit on a dead path —
-        // typing it removes the payload-free variant, but no emission can be
-        // exercised until the trait is driven or its fallible surface deleted.
-        emission: Emission::Unreachable(
-            "no caller: Device<B> uses only Backend::reset(); the fallible \
-             trait surface is vestigial",
-        ),
-        slug_calls: &[],
-        slugs: &[
-            // One per declined operation — the 19 construction sites of the
-            // old payload-free `Unsupported` collapse to these nine checks,
-            // disambiguated by the `backend=` field.
-            "unsupported_write_texture",
-            "unsupported_read_texture",
-            "unsupported_set_pipeline_library",
-            "unsupported_execute_blit",
-            "unsupported_execute_compute",
-            "unsupported_execute_render",
-            "unsupported_render_draw",
-            "unsupported_present",
-            "unsupported_encode_simple_draw",
-            "backend_invalid_argument",
-            "backend_resource_missing",
-            "backend_shader_error",
-            "backend_device_lost",
-            "backend_other",
-        ],
-    },
     DeclineClass {
         type_name: "FailEvent",
         defined_in: "model/state.rs",

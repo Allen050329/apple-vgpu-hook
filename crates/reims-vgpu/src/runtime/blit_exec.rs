@@ -2662,7 +2662,6 @@ mod tests {
     };
     use crate::runtime::host::FakeHost;
     use crate::runtime::objects;
-    use crate::runtime::plan::blit::{plan_from_bytes, PlannedBlit};
 
     /// The channel is the whole diagnostic for this rail: 177 checks collapse
     /// into eight statuses, so a refusal that reaches the dispatch line without a
@@ -2797,13 +2796,6 @@ mod tests {
         assert_eq!(cmd.range_location, 0x10);
         assert_eq!(cmd.range_length, 8);
         assert_eq!(cmd.fill_value, 0xa5);
-        match plan_from_bytes(&v).unwrap() {
-            PlannedBlit::Fill(f) => {
-                assert_eq!(f.buffer, 3);
-                assert_eq!(f.fill_value, 0xa5);
-            }
-            _ => panic!("expected fill"),
-        }
     }
 
     #[test]

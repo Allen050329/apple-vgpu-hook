@@ -999,7 +999,7 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        (71, 1609),
+        (70, 1595),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );
@@ -1049,53 +1049,6 @@ fn draw_error_has_no_untyped_carrier_or_constructors() {
             }
         }
     }
-}
-
-/// A registry row that lists a slug the type cannot produce, or omits one it
-/// can, is a census that lies. Checked against the real `slug()` for every
-/// constructible variant.
-#[test]
-fn the_registry_lists_exactly_the_slugs_backend_error_produces() {
-    use crate::backend::{BackendError, BackendKind, BackendOp};
-    use crate::observe::Decline;
-
-    const OPS: &[BackendOp] = &[
-        BackendOp::WriteTexture,
-        BackendOp::ReadTexture,
-        BackendOp::SetPipelineLibrary,
-        BackendOp::ExecuteBlit,
-        BackendOp::ExecuteCompute,
-        BackendOp::ExecuteRender,
-        BackendOp::RenderDraw,
-        BackendOp::Present,
-        BackendOp::EncodeSimpleDraw,
-    ];
-    let mut produced: Vec<&'static str> = OPS
-        .iter()
-        .map(|op| BackendError::Unsupported(*op, BackendKind::Vulkan).slug())
-        .collect();
-    for e in [
-        BackendError::InvalidArgument,
-        BackendError::ResourceMissing,
-        BackendError::ShaderError,
-        BackendError::DeviceLost,
-        BackendError::Other("x"),
-    ] {
-        produced.push(e.slug());
-    }
-    produced.sort_unstable();
-
-    let row = REGISTRY
-        .iter()
-        .find(|c| c.type_name == "BackendError")
-        .expect("BackendError is registered");
-    let mut listed = row.slugs.to_vec();
-    listed.sort_unstable();
-
-    assert_eq!(
-        produced, listed,
-        "BackendError's registry row is out of date"
-    );
 }
 
 /// Not every payload-free `Unsupported` is a defect, and the difference is
@@ -1199,7 +1152,7 @@ fn no_error_enum_carries_a_payload_free_unsupported() {
     assert!(
         bare.is_empty(),
         "a payload-free Unsupported cannot say which check refused — give it a \
-         reason type, as BackendError and DrawError have:\n  {}",
+         reason type, as DrawError does:\n  {}",
         bare.join("\n  ")
     );
 }
