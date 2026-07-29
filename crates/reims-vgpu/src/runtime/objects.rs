@@ -19,7 +19,7 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT,
     PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, ObjectEntry, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{DeviceState, MappingEntry, MAX_MAPPINGS, MAX_TASKS};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
@@ -667,16 +667,9 @@ pub fn resolve_type11_ref<M: HostMemory>(
         );
         return None;
     };
-    // Cache in the sparse object table (model ObjectEntry).
-    let _ = state.insert_object(
-        task_id,
-        ref_,
-        ObjectEntry {
-            object_type: entry.object_type,
-            desc_gva: entry.descriptor_gva,
-            desc_len: entry.descriptor_length,
-        },
-    );
+    // Record the ref as live; the type and descriptor come from the guest's own
+    // list at every use, never from here.
+    let _ = state.insert_object(task_id, ref_);
     if entry.object_type != OBJECT_TYPE_IOSURFACE {
         // Legitimate: this ref is a different object type, not a texture. Normal
         // control flow (resolve_type11_refs skips it) — never a failure.
@@ -1059,15 +1052,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             );
             continue;
         };
-        let _ = state.insert_object(
-            task_id,
-            surface_id,
-            ObjectEntry {
-                object_type: entry.object_type,
-                desc_gva: entry.descriptor_gva,
-                desc_len: entry.descriptor_length,
-            },
-        );
+        let _ = state.insert_object(task_id, surface_id);
         let Some(surf) = decode_type4_surface(&desc) else {
             note_type4_fail(
                 surface_id,

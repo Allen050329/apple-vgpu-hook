@@ -545,14 +545,6 @@ impl TaskEntry {
     }
 }
 
-/// Object-list entry (type + descriptor GVA) keyed by (task, ref).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ObjectEntry {
-    pub object_type: u8,
-    pub desc_gva: u64,
-    pub desc_len: u32,
-}
-
 /// Directed mapper capture from guest xregs at iosfc producer write.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MapperCapture {
@@ -1280,8 +1272,17 @@ pub struct DeviceState {
     /// Live MapMemory2 spans per task (wire notify ranges). Cleared on Unmap /
     /// delete_task / redefine. Product GVA writes check coverage when non-empty.
     pub task_map_spans: Vec<TaskMapSpan>,
-    /// Sparse object table: (task_id, ref) -> entry.
-    pub objects: BTreeMap<(u32, u32), ObjectEntry>,
+    /// Live object refs per task, as `(task_id, ref)`.
+    ///
+    /// Membership only — deliberately carries no descriptor payload. Every
+    /// consumer that needs an object's type or descriptor reads the guest's own
+    /// list through `objects::lookup_list_entry`, which walks guest memory at
+    /// use time; a cached copy here would be a second source of truth for
+    /// something the guest can rewrite under us. What the set *is* load-bearing
+    /// for is [`Self::delete_object`], which gates the host-side resource
+    /// teardown (`host_texture_surfaces`, `host_linear_textures`,
+    /// `texture_to_mapping`) on whether the ref was live.
+    pub objects: std::collections::BTreeSet<(u32, u32)>,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -1534,7 +1535,7 @@ impl DeviceState {
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
             task_map_spans: Vec::new(),
-            objects: BTreeMap::new(),
+            objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2012,7 +2013,7 @@ impl DeviceState {
             return false;
         }
         // Drop objects for this task on redefine.
-        self.objects.retain(|&(t, _), _| t != task_id);
+        self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
@@ -2191,7 +2192,7 @@ impl DeviceState {
         if !self.tasks[task_id as usize].active {
             return false;
         }
-        self.objects.retain(|&(t, _), _| t != task_id);
+        self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
@@ -2231,7 +2232,7 @@ impl DeviceState {
         true
     }
 
-    pub fn insert_object(&mut self, task_id: u32, ref_: u32, entry: ObjectEntry) -> bool {
+    pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let discriminant = (u64::from(task_id) << 32) | u64::from(ref_);
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::InsertObjectTaskIdRange {
@@ -2249,12 +2250,12 @@ impl DeviceState {
             .emit(discriminant);
             return false;
         }
-        self.objects.insert((task_id, ref_), entry);
+        self.objects.insert((task_id, ref_));
         true
     }
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
-        let removed = self.objects.remove(&(task_id, ref_)).is_some();
+        let removed = self.objects.remove(&(task_id, ref_));
         if removed {
             self.host_texture_surfaces.remove(&ref_);
             if let Some(e) = self.host_linear_textures.remove(&(task_id, ref_)) {

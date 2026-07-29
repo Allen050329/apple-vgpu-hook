@@ -13,10 +13,9 @@ pub use state::{
     ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
     DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
     GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface,
-    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, ObjectEntry,
-    PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState, StampSlot, SurfaceWriteKind,
-    TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER,
+    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, PacketFault, PaintSrc,
+    PendingWork, PresentBacking, PresentState, StampSlot, SurfaceWriteKind, TaskEntry, TaskMapSpan,
+    WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;
@@ -348,27 +347,11 @@ mod tests {
         let mut d = dev();
         assert!(d.state.define_task(2, 0x2000, 9));
         assert!(d.state.set_object_list(2, 3, 64));
-        assert!(d.state.insert_object(
-            2,
-            10,
-            ObjectEntry {
-                object_type: 11,
-                desc_gva: 0x1000,
-                desc_len: 0x20,
-            },
-        ));
-        assert_eq!(d.state.objects.get(&(2, 10)).unwrap().object_type, 11);
+        assert!(d.state.insert_object(2, 10));
+        assert!(d.state.objects.contains(&(2, 10)));
         assert!(d.state.delete_object(2, 10));
-        assert!(!d.state.objects.contains_key(&(2, 10)));
-        d.state.insert_object(
-            2,
-            1,
-            ObjectEntry {
-                object_type: 2,
-                desc_gva: 0,
-                desc_len: 0,
-            },
-        );
+        assert!(!d.state.objects.contains(&(2, 10)));
+        d.state.insert_object(2, 1);
         d.state.define_task(2, 0x2000, 9);
         assert!(d.state.objects.is_empty());
     }

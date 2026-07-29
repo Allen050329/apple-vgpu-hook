@@ -647,7 +647,7 @@ mod tests {
         );
 
         st.define_task(6, 0x1000, 1);
-        st.insert_object(6, 21, crate::model::ObjectEntry::default());
+        st.insert_object(6, 21);
         assert!(note_linear_texture_resident(
             &mut st,
             6,
@@ -665,7 +665,7 @@ mod tests {
         // Non-resident entries retire nothing.
         st.retired_linear_residents.clear();
         let px = vec![0u8; 4 * 2 * 8];
-        st.insert_object(6, 22, crate::model::ObjectEntry::default());
+        st.insert_object(6, 22);
         assert!(store_linear_texture(
             &mut st,
             6,
