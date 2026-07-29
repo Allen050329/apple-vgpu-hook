@@ -572,6 +572,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // the resident and deferred windows stay live (black-band class). A
         // different plan is a genuine new incarnation.
         let condemned = m.condemned_entries.take();
+        let prev_pages = m.page_entries.len();
         (pages_changed, incarnation_changed, reprieved) =
             plan_adoption_decision(condemned.as_deref(), &m.page_entries, &plan.entries);
         // New page table ⇒ the contiguous view (and any Metal texture aliasing
@@ -600,12 +601,33 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // so this is bounded by how often the guest rewires a surface and is
         // safe to leave on. min/max over the entries is O(pages) once per
         // incarnation, against an O(pages) table build that just ran.
-        if pages_changed {
-            if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
+        // Keyed on the ADOPTION, not on `pages_changed`. Two earlier cuts of
+        // this line were silent for entire boots, and both were the
+        // instrument-the-branch trap from AGENTS.md committed by a change that
+        // cites it. The first logged only when a span resolved, so it could not
+        // distinguish "no span" from "never ran". The second moved to
+        // `pages_changed` on the reasoning that `map_gen` climbing past 100
+        // proved that branch ran — but `bump_map_generation` has five other
+        // call sites, so the generation was never evidence about this one.
+        //
+        // `pages_changed` is genuinely false here even on a first population:
+        // the reprieve path (`condemned` holds the fingerprint, the plan
+        // matches it) repopulates an emptied `page_entries` with
+        // `pages_changed == false`. The adoption below is what every write is
+        // then bounded by, so that is what has to be reported.
+        //
+        // Dedup is `first_sight` on the span itself, which keeps it bounded by
+        // *distinct footprints* rather than by resolve rate — a mapping
+        // re-resolved every frame to the same pages logs once.
+        if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
+            let key = (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20);
+            if crate::observe::first_sight("mapping_gpa_span", key) {
                 crate::observe::off(format!(
-                    "mapping_gpa_span mid={mapping_id} gen={} pages={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
+                    "mapping_gpa_span mid={mapping_id} gen={} pages={} prev_pages={prev_pages} \
+                     changed={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
                     m.map_generation,
                     plan.entries.len(),
+                    pages_changed as u8,
                     hi + (1u64 << page_shift),
                     lo >> page_shift,
                     hi >> page_shift,
@@ -803,7 +825,7 @@ fn fail_closed_surface_page_collision(
 /// not the end of it — so a caller reporting a range must add one page. The
 /// page list is not sorted and is not contiguous, so `[lo, hi]` is a hull and
 /// not a promise that every page inside it belongs to this surface.
-fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u64)> {
+pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u64)> {
     let (mut lo, mut hi) = (u64::MAX, 0u64);
     for &e in entries {
         if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
@@ -2115,10 +2137,28 @@ mod tests {
 
         state.mapper_device_kva = mapper;
         assert!(state.attach_mapping_internal(3, internal));
+        // The adopted page list is what bounds every mapping-rail guest write,
+        // so a successful resolve must report its guest-physical footprint. An
+        // earlier cut of `mapping_gpa_span` keyed on `pages_changed` and was
+        // silent for whole live boots while page lists were plainly being
+        // adopted; asserting it here is what makes that failure loud in the
+        // suite instead of only in a log nobody diffed.
+        let cap = crate::observe::sink::FailCapture::start();
         assert!(resolve_mapping_backing(&mut state, &host, 3));
         let m = state.mappings.get(&3).unwrap();
         assert_eq!(m.page_entries.len(), 1);
         assert_eq!(m.page_entries[0], entry);
+        let span = cap.one("OFF");
+        assert!(
+            span.contains("mapping_gpa_span mid=3") && span.contains("pages=1"),
+            "resolve must report its adopted footprint, got {span:?}"
+        );
+        // The page number is what a guest panic prints (`pmap_page_protect()
+        // ... pn=0x...`), so it has to be readable without arithmetic.
+        assert!(
+            span.contains(&format!("pn_lo={pfn:#x}")),
+            "span must name the adopted PFN as a page number, got {span:?}"
+        );
     }
 
     struct FailingKvaHost {

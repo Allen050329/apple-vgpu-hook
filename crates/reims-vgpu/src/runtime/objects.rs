@@ -890,6 +890,7 @@ fn apply_type4_backing<M: HostMemory>(
     // Device desc from type-4 wire only (single- or multi-plane). No BGRA invent.
     let device_desc = synthesize_device_desc_from_type4(surf);
 
+    let state_page_shift = state.page_shift;
     if let Some(m) = state.mappings.get_mut(&surface_id) {
         // `map_surface` above stashed the prior bindings as the incarnation
         // fingerprint (the notify-vs-eager-resolve rule): compare the fresh
@@ -920,6 +921,26 @@ fn apply_type4_backing<M: HostMemory>(
             // Pruning it unconditionally is what the identical-plan path used
             // to do via `map_surface`, and that demoted a surface the compare
             // had just called the SAME incarnation.
+        }
+        // The guest-physical footprint this incarnation authorises us to write.
+        // See `mapper::entry_gpa_span`; this is the type-4 adoption site and, on
+        // a live x86 boot, the one that actually runs — the mapper's own
+        // adoption stayed silent for whole boots while surfaces plainly had
+        // 2040 pages each, because the page list arrives here.
+        if let Some((lo, hi)) = crate::runtime::mapper::entry_gpa_span(&entries, state_page_shift) {
+            let key = (u64::from(surface_id) << 40) ^ (lo >> state_page_shift) ^ (hi << 20);
+            if crate::observe::first_sight("mapping_gpa_span", key) {
+                crate::observe::off(format!(
+                    "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 changed={} \
+                     lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
+                    m.map_generation,
+                    entries.len(),
+                    changed as u8,
+                    hi + (1u64 << state_page_shift),
+                    lo >> state_page_shift,
+                    hi >> state_page_shift,
+                ));
+            }
         }
         m.page_entries = entries;
         m.mapped = true;
