@@ -415,6 +415,29 @@ fn put_object(
 /// mapped by hand because `map_surface` alone leaves it without page entries,
 /// which is the state a real `MapMemory2` would have already left behind.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// The one-triangle draw every ICB pixel test issues into [`map_draw_target`]'s
+/// surface: pipeline 6, three vertices, one instance, triangles, over a
+/// zero-filled 4x4 BGRA8 seed.
+///
+/// A test that needs a different shape spells its own literal; this is only the
+/// two dozen that wanted exactly this one.
+fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
+    DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    }
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn map_draw_target(host: &mut FakeHost, state: &mut DeviceState, pfn: u32) -> u32 {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
@@ -996,19 +1019,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x38);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -1146,19 +1157,7 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x39);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -1477,19 +1476,7 @@ fn fill_render_draw_mesh_threads_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x3a);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -1587,19 +1574,7 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x3b);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -1812,19 +1787,7 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x37);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -2598,19 +2561,7 @@ fn wire_backed_draw_patches_tessellation_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x3c);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -2774,19 +2725,7 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x48);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -2901,19 +2840,7 @@ fn fill_render_object_mesh_threadgroups_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x3e);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3044,19 +2971,7 @@ fn wire_backed_dual_export_object_mesh_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x4b);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3184,19 +3099,7 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x3f);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3333,19 +3236,7 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x47);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3458,19 +3349,7 @@ fn fill_render_mesh_buffer_bind_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x40);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3582,19 +3461,7 @@ fn fill_render_object_buffer_bind_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x41);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3730,19 +3597,7 @@ fn wire_backed_mesh_buffer_bind_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x42);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -3878,19 +3733,7 @@ fn wire_backed_object_buffer_bind_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x43);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -4157,19 +4000,7 @@ fn fill_render_object_tg_memory_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x45);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -4296,19 +4127,7 @@ fn wire_backed_object_tg_memory_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x46);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -4431,19 +4250,7 @@ fn wire_backed_mesh_threads_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x3d);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -4566,19 +4373,7 @@ fn wire_backed_mesh_threadgroups_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x44);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -5232,19 +5027,7 @@ fn wire_backed_draw_primitives_stagein_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x49);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -5472,19 +5255,7 @@ fn fill_render_attribute_stride_stagein_execute() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x36);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
@@ -5641,19 +5412,7 @@ fn wire_backed_attribute_stride_stagein_e2e() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x4a);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
@@ -6764,19 +6523,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x34);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
@@ -6943,19 +6690,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x35);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
