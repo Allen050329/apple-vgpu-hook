@@ -1179,6 +1179,7 @@ pub fn device_drain(id: u64) -> bool {
     // wake this worker before that BH runs; do not reacquire the lock and hide
     // the queued scanout behind another synchronous render/compute tranche.
     if slot.present_action_pending.load(Ordering::Acquire) {
+        runtime::drain::note_drain_skipped();
         return true;
     }
     let mut d = lock_for_drain(&slot);
@@ -1200,6 +1201,10 @@ pub fn device_drain(id: u64) -> bool {
     {
         device.state.present.window_active = false;
     }
+    // Split the tranche's two phases: guest work, then our host-window export.
+    // Both hold the device lock, and which one owns the worker's wall clock is
+    // the question `drain_duty` exists to answer.
+    let tranche_started = std::time::Instant::now();
     device.drain(&mut host);
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
@@ -1207,10 +1212,13 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "backend-vulkan")]
     backend::vulkan::engine::flush_batched_draws();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
+    let drain_us = tranche_started.elapsed().as_micros() as u64;
+    let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
     #[cfg(feature = "host-window")]
     publish_window_frame(&slot, &mut device.state);
+    runtime::drain::note_drain_tranche(drain_us, publish_started.elapsed().as_micros() as u64);
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `device_scanout_copy` — the only other

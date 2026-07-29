@@ -2950,6 +2950,104 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
     }
 }
 
+/// Report at most this often. One line per second is bounded enough to leave on
+/// for the life of the device and dense enough to see a stall move.
+const DRAIN_DUTY_REPORT_MS: u64 = 1000;
+
+/// Where the drain worker's wall clock goes.
+///
+/// The worker is the device's only executor: `device_drain` holds the device
+/// lock for a whole tranche, so every guest FIFO packet, every GPU encode and
+/// the host-window export are serialised behind it, and the guest's composite
+/// rate cannot exceed the rate at which this thread finishes tranches.
+///
+/// Nothing else measures that. `sync_exec_lock_hold` is a per-packet threshold
+/// line that only fires above `SYNC_EXEC_STALL_US`, so a worker pinned at 100%
+/// by a steady stream of 200 ms tranches is completely silent — which is the
+/// "an event count is not a state" trap, applied to a cost. This reads the
+/// state: what fraction of wall clock the worker spends holding the lock, split
+/// by the two phases that can own it.
+///
+/// The split is the point. `drain_us` is guest work (FIFO decode, draws, compute,
+/// guest writeback); `publish_us` is our host-window export, which quiesces the
+/// whole GPU twice per present. A duty near 1 says the ~2 Hz composite rate is
+/// ours and names which half to attack; a duty near 0 says the worker is idle
+/// and the guest is blocked on something upstream of us. No other line separates
+/// those two readings.
+///
+/// `skipped` counts tranches that returned before taking the lock at all
+/// (`present_action_pending`): a worker that keeps bailing looks identical to an
+/// idle one in the duty figure alone, and it is not the same fault.
+#[derive(Default)]
+pub(crate) struct DrainDutyCensus {
+    tranches: std::sync::atomic::AtomicU64,
+    skipped: std::sync::atomic::AtomicU64,
+    drain_us: std::sync::atomic::AtomicU64,
+    publish_us: std::sync::atomic::AtomicU64,
+    max_tranche_us: std::sync::atomic::AtomicU64,
+    last_report_ms: std::sync::atomic::AtomicU64,
+}
+
+impl DrainDutyCensus {
+    /// Count one skipped tranche (lock never taken).
+    pub(crate) fn note_skipped(&self) {
+        self.skipped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Accumulate one completed tranche and return the line when a report is
+    /// due. Returns the line rather than emitting it so the reporting rule is
+    /// testable without a log sink: that the window resets on report (so the
+    /// figure is a rate over the window, not a lifetime average), and that duty
+    /// is busy time over elapsed time.
+    pub(crate) fn note(&self, drain_us: u64, publish_us: u64, now_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tranches.fetch_add(1, Relaxed);
+        self.drain_us.fetch_add(drain_us, Relaxed);
+        self.publish_us.fetch_add(publish_us, Relaxed);
+        self.max_tranche_us
+            .fetch_max(drain_us.saturating_add(publish_us), Relaxed);
+        let last = self.last_report_ms.load(Relaxed);
+        // First call arms the window; it does not report a duty against a zero
+        // origin, which would divide the whole boot's idle time into one tranche.
+        if last == 0 {
+            self.last_report_ms.store(now_ms, Relaxed);
+            return None;
+        }
+        let win_ms = now_ms.saturating_sub(last);
+        if win_ms < DRAIN_DUTY_REPORT_MS {
+            return None;
+        }
+        self.last_report_ms.store(now_ms, Relaxed);
+        let tranches = self.tranches.swap(0, Relaxed);
+        let skipped = self.skipped.swap(0, Relaxed);
+        let drain = self.drain_us.swap(0, Relaxed);
+        let publish = self.publish_us.swap(0, Relaxed);
+        let max = self.max_tranche_us.swap(0, Relaxed);
+        let busy = drain.saturating_add(publish);
+        let duty = busy as f64 / (win_ms as f64 * 1000.0);
+        Some(format!(
+            "drain_duty win_ms={win_ms} tranches={tranches} skipped={skipped} busy_us={busy} \
+             duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max}"
+        ))
+    }
+}
+
+static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
+    std::sync::LazyLock::new(DrainDutyCensus::default);
+
+/// Accumulate one completed drain tranche; emits at most once per second.
+pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
+    if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
+        crate::observe::off(line);
+    }
+}
+
+/// Count a drain wake-up that returned before taking the device lock.
+pub fn note_drain_skipped() {
+    DRAIN_DUTY.note_skipped();
+}
+
 fn signal_display_vbl_at<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,

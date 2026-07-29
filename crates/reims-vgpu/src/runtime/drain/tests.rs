@@ -1896,6 +1896,65 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
     );
 }
 
+/// The drain-duty census answers "is the worker saturated, and by which phase",
+/// which requires three properties the return value can be asserted on:
+///
+/// - duty is busy time over *elapsed* time, so a worker holding the lock for
+///   most of the window reads near 1 and an idle one reads near 0 — the two
+///   readings that point at opposite halves of the ~2 Hz question;
+/// - the two phases stay separate, because "guest work is slow" and "our export
+///   is slow" are different fixes drawn from the same high duty;
+/// - each report resets the window, so a live reading tracks the current stall
+///   instead of a lifetime average.
+#[test]
+fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases() {
+    use crate::runtime::drain::DrainDutyCensus;
+    let c = DrainDutyCensus::default();
+
+    // The first call only arms the window: reporting here would divide the whole
+    // pre-drain idle stretch into one tranche and read an absurd duty. Its own
+    // work is still counted — it is real time the worker spent — so it lands in
+    // the window it opens.
+    assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
+
+    // A saturated second: ten 90 ms tranches, 60 ms of it our export.
+    let mut line = None;
+    for i in 1..=10u64 {
+        if let Some(l) = c.note(30_000, 60_000, 5_000 + i * 100) {
+            line = Some(l);
+        }
+    }
+    let line = line.expect("a full second must report");
+    assert!(line.contains("tranches=11"), "the arming call counts: {line}");
+    assert!(
+        line.contains("duty=0.900"),
+        "900 ms busy in a 1000 ms window is duty 0.9: {line}"
+    );
+    assert!(
+        line.contains("drain_us=300000") && line.contains("publish_us=600000"),
+        "the phases must stay separable — this is which half to attack: {line}"
+    );
+    assert!(line.contains("max_tranche_us=90000"), "{line}");
+
+    // An idle window must read near zero rather than inheriting the busy one,
+    // and `skipped` must survive as its own arm: a worker that keeps bailing
+    // before the lock looks identical to an idle one in the duty alone.
+    c.note_skipped();
+    c.note_skipped();
+    let mut idle = None;
+    for i in 1..=10u64 {
+        if let Some(l) = c.note(500, 0, 6_000 + i * 100) {
+            idle = Some(l);
+        }
+    }
+    let idle = idle.expect("second window must report");
+    assert!(
+        idle.contains("duty=0.005"),
+        "the window must not average in the previous busy one: {idle}"
+    );
+    assert!(idle.contains("skipped=2"), "{idle}");
+}
+
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated
 /// `post_converge_display_reinit` line — the smoking gun for the intermittent
