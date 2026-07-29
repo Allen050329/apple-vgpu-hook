@@ -1569,19 +1569,22 @@ impl ResourcePools {
         }
     }
 
-    pub(crate) unsafe fn acquire_readback(
-        &mut self,
+    /// Create one `TRANSFER_DST` host-visible buffer of exactly `bucket` bytes.
+    ///
+    /// The two readback acquires differ only in where they stash the slot and in
+    /// which `VkOp`/`AllocSite` names each step, so the Vulkan sequence lives
+    /// here once. The names stay per-caller: `vk_pools_alloc_readback` and
+    /// `vk_pools_alloc_readback_extra` are different exhaustion sites, and a
+    /// shared slug could not say which pool ran out.
+    unsafe fn create_readback_buffer(
         ctx: &DeviceContext,
-        size: u64,
+        bucket: u64,
         counters: &EngineCounters,
+        site: AllocSite,
+        create_op: VkOp,
+        alloc_op: VkOp,
+        bind_op: VkOp,
     ) -> Result<BufferSlot, DrawError> {
-        let bucket = Self::bucket(size.max(4));
-        if let Some(list) = self.readback_free.get_mut(&bucket) {
-            if let Some(slot) = list.pop() {
-                self.readback_live = Some(slot);
-                return Ok(slot);
-            }
-        }
         let buffer = ctx
             .device
             .create_buffer(
@@ -1591,7 +1594,7 @@ impl ResourcePools {
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateReadback, e)))?;
+            .map_err(|e| DrawError::VkCall(VkCall::new(create_op, e)))?;
         counters.note_create();
         let req = ctx.device.get_buffer_memory_requirements(buffer);
         let mt = ctx
@@ -1606,11 +1609,11 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mt),
-            AllocSite::Readback,
+            site,
         )
         .map_err(|e| {
             ctx.device.destroy_buffer(buffer, None);
-            DrawError::VkCall(VkCall::new(VkOp::PoolsAllocReadback, e))
+            DrawError::VkCall(VkCall::new(alloc_op, e))
         })?;
         counters.note_alloc();
         ctx.device
@@ -1618,14 +1621,38 @@ impl ResourcePools {
             .map_err(|e| {
                 ctx.device.free_memory(memory, None);
                 ctx.device.destroy_buffer(buffer, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsBindReadback, e))
+                DrawError::VkCall(VkCall::new(bind_op, e))
             })?;
-        let slot = BufferSlot {
+        Ok(BufferSlot {
             buffer,
             memory,
             size: bucket,
             mapped: 0,
-        };
+        })
+    }
+
+    pub(crate) unsafe fn acquire_readback(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+    ) -> Result<BufferSlot, DrawError> {
+        let bucket = Self::bucket(size.max(4));
+        if let Some(list) = self.readback_free.get_mut(&bucket) {
+            if let Some(slot) = list.pop() {
+                self.readback_live = Some(slot);
+                return Ok(slot);
+            }
+        }
+        let slot = Self::create_readback_buffer(
+            ctx,
+            bucket,
+            counters,
+            AllocSite::Readback,
+            VkOp::PoolsCreateReadback,
+            VkOp::PoolsAllocReadback,
+            VkOp::PoolsBindReadback,
+        )?;
         self.readback_live = Some(slot);
         Ok(slot)
     }
@@ -1655,50 +1682,15 @@ impl ResourcePools {
                 return Ok(slot);
             }
         }
-        let buffer = ctx
-            .device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bucket)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateReadbackExtra, e)))?;
-        counters.note_create();
-        let req = ctx.device.get_buffer_memory_requirements(buffer);
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, MemoryClass::Readback)
-            .ok_or({
-                DrawError::Unsupported(super::reason::DrawReason::NoHostVisibleMemoryForReadback {
-                    memory_type_bits: req.memory_type_bits,
-                })
-            })?;
-        let memory = allocate_memory_timed(
+        let slot = Self::create_readback_buffer(
             ctx,
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mt),
+            bucket,
+            counters,
             AllocSite::ReadbackMulti,
-        )
-        .map_err(|e| {
-            ctx.device.destroy_buffer(buffer, None);
-            DrawError::VkCall(VkCall::new(VkOp::PoolsAllocReadbackExtra, e))
-        })?;
-        counters.note_alloc();
-        ctx.device
-            .bind_buffer_memory(buffer, memory, 0)
-            .map_err(|e| {
-                ctx.device.free_memory(memory, None);
-                ctx.device.destroy_buffer(buffer, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsBindReadbackExtra, e))
-            })?;
-        let slot = BufferSlot {
-            buffer,
-            memory,
-            size: bucket,
-            mapped: 0,
-        };
+            VkOp::PoolsCreateReadbackExtra,
+            VkOp::PoolsAllocReadbackExtra,
+            VkOp::PoolsBindReadbackExtra,
+        )?;
         self.readback_multi_live.push(slot);
         Ok(slot)
     }

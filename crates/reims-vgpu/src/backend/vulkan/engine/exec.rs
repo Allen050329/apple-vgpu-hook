@@ -661,6 +661,98 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     Ok(())
 }
 
+/// Stage a host-written buffer into a freshly created sampled image and leave it
+/// shader-readable.
+///
+/// Both sampled upload rails do exactly this: transition `UNDEFINED` →
+/// `TRANSFER_DST_OPTIMAL`, one `vkCmdCopyBufferToImage`, then
+/// `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL` against both shader
+/// stages. Keeping one copy means the barrier masks cannot drift apart between
+/// them, which is the failure this shape invites: a missing `SHADER_READ` on one
+/// rail is invisible on a driver that happens not to need it.
+///
+/// No HOST→TRANSFER barrier on either rail — writes the host made before
+/// `vkQueueSubmit` are automatically visible to the device, and every staging
+/// slot here is written before the submit. The guest-gather rail once opened with
+/// two barriers ordering a *device-side* gather against this copy; there is no
+/// device-side write to order any more.
+///
+/// `row_length_texels` is `VkBufferImageCopy::bufferRowLength`, where 0 means
+/// "rows are tightly packed" — the CPU-origin rail always packs tightly, the
+/// guest-gather rail may stride over guest row padding.
+#[allow(clippy::too_many_arguments)]
+unsafe fn upload_buffer_to_sampled_image(
+    ctx: &super::context::DeviceContext,
+    cb: vk::CommandBuffer,
+    src: vk::Buffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    array_layers: u32,
+    extent_depth: u32,
+    row_length_texels: u32,
+) {
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: array_layers,
+    };
+    let to_transfer = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .image(image)
+        .subresource_range(range)];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_transfer,
+    );
+    let copy = [vk::BufferImageCopy::default()
+        .buffer_row_length(row_length_texels)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: array_layers,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: extent_depth,
+        })];
+    ctx.device.cmd_copy_buffer_to_image(
+        cb,
+        src,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &copy,
+    );
+    let to_shader = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image(image)
+        .subresource_range(range)];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_shader,
+    );
+}
+
 fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     let element_count = req
         .indexed
@@ -1882,70 +1974,16 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        let array_layers = if *volume { 1 } else { *layers };
-        let extent_depth = if *volume { *layers } else { 1 };
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: array_layers,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-        let copy = [vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: array_layers,
-            })
-            .image_extent(vk::Extent3D {
-                width: img.width,
-                height: img.height,
-                depth: extent_depth,
-            })];
-        ctx.device.cmd_copy_buffer_to_image(
+        upload_buffer_to_sampled_image(
+            ctx,
             cb,
             st.buffer,
             img.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy,
-        );
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: array_layers,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
+            img.width,
+            img.height,
+            if *volume { 1 } else { *layers },
+            if *volume { *layers } else { 1 },
+            0,
         );
     }
 
@@ -1970,69 +2008,16 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        let image_barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &image_barrier,
-        );
-        let copy = [vk::BufferImageCopy::default()
-            .buffer_row_length(*row_length_texels)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(vk::Extent3D {
-                width: img.width,
-                height: img.height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_buffer_to_image(
+        upload_buffer_to_sampled_image(
+            ctx,
             cb,
             scratch.buffer,
             img.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy,
-        );
-        let to_shader = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &to_shader,
+            img.width,
+            img.height,
+            1,
+            1,
+            *row_length_texels,
         );
     }
 
