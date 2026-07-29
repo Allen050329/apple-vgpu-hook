@@ -1,41 +1,42 @@
-//! Always-on proxies and censuses — the measurement half of the ground rules.
+//! Always-on declines whose reason needs state the raising site does not hold.
 //!
-//! # Why these are together, and why the sink is not
+//! # What is here, and what is deliberately not
 //!
-//! "You cannot fix what you cannot measure" means every bug class earns a
-//! log- or test-level proxy that says *this class is happening* without anyone
-//! staring at a screenshot. Each module here is one such class, added with the
-//! fix it made possible. That is why there are ten of them, and it is correct.
-//!
-//! What was not correct is where they lived: each arrived as a new sibling of
-//! `metal_draw.rs`, so `runtime/` read as though measurement modules were peers
-//! of the execution path. They are not — the execution path calls them, never
-//! the reverse.
-//!
-//! [`crate::observe`] deliberately stays outside this directory. It is the
-//! **sink**, not a census: `observe::fail` and `observe::off` are the
-//! always-on outputs that everything here writes to, and the execution path
+//! [`crate::observe`] is the **sink**: `observe::fail`, `observe::off` and
+//! `observe::Emit` are where every always-on line lands, and the execution path
 //! calls them directly for its own declines. Filing the sink under `census/`
 //! would suggest a draw decline is a measurement, which is the distinction the
-//! ground rules turn on — a decline must be logged, a measurement must not gate
-//! behaviour.
+//! ground rules turn on.
+//!
+//! These four modules are the cases where the *reason* needs state the raising
+//! site does not have — a dedup set spanning draws, or a slug vocabulary shared
+//! by several call sites — so the line is written here instead. They are still
+//! declines. The execution path calls them, never the reverse.
 //!
 //! # The rule these all obey
 //!
-//! **Measuring is allowed; branching on the measurement is not.** These modules
-//! may count nonzero pixels, sparsity, format volume, cache churn and geometry,
-//! and they may write those counts to the always-on log. Nothing in the device
-//! or backend may read one back to decide what to present, decode or execute.
-//! A proxy that changes behaviour has become a content heuristic.
+//! **Measuring is allowed; branching on the measurement is not.** Nothing in
+//! the device or backend may read one of these back to decide what to present,
+//! decode or execute. A proxy that changes behaviour has become a content
+//! heuristic, which the ground rules forbid outright.
 //!
-//! # What each one measures
+//! # What each one reports
 //!
-//! | Module | Class it measures |
+//! | Module | Class it reports |
 //! |---|---|
-//! | [`present_proxy`] | present-path health: `capture_fail`, `stale_online_pending`, `t11_large_fallback`, `empty_sample`, the secondary-MRT drop/blend census, and the windowed cadence/publish/import/pressure submodules |
-//! | [`srgb_census`] | which rails drop the sRGB transfer function, and how often |
-//! | [`view_swizzle_census`] | type-8 view swizzle plans actually bound |
-//! | [`t11_decline`] | type-11 IOSurface resolution declines, by reason |
+//! | [`present_proxy`] | `secondary_mrt_drop` / `mrt_mask_bind_miss` — a multi-RT draw degraded to single-RT, or a rendered mask that failed to bind at sample time — plus `stale_online_pending` and [`present_proxy::window_publish`], the sole record that a captured frame never reached the host window |
+//! | [`srgb_census`] | which rails drop the sRGB transfer function |
+//! | [`view_swizzle_census`] | type-8 view swizzles dropped, or served by rewriting texels on the CPU |
+//! | [`t11_decline`] | why the type-11 sampled rail declined its zero-copy gather, by reason |
+//!
+//! # Adding one
+//!
+//! A module belongs here only when the loss it names is otherwise invisible. If
+//! the refusal already emits a typed decline at the point it refuses, a second
+//! count of its *rate* has no claim under the fail-visible rule — and a tally of
+//! successful work never had one. Modules and rate-halves have been deleted on
+//! exactly that test more often than they have been added; run it before writing
+//! the next one.
 
 pub mod present_proxy;
 pub mod srgb_census;

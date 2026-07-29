@@ -228,18 +228,6 @@ fn reset_state_inner() {
     *st = ThrashState::new();
 }
 
-/// Always-on windowed census of where a FULL present capture sourced its frame.
-///
-/// `capture_present_frame` reads the GPU resident (`read_resident_bgra`: the
-/// readback alone, no guest-page scatter). `resident` counts successful reads;
-/// `guest` is retained in the log schema as a legacy counter and remains zero
-/// because there is deliberately no guest-page fallback. Both are COUNT-based,
-/// so they are trustworthy under the SCHED_IDLE agent boot where the `*_us`
-/// buckets are not.
-///
-/// Read it as the CPU-fallback capture source: any full capture that succeeds
-/// should report `resident_frac=1.0`. A missing resident fails visibly instead
-/// of silently switching to guest-page scatter. Measure-only; never gates.
 /// Window-publish outcome: did the captured guest frame actually reach the host
 /// window, or was it dropped before the window ever saw it?
 ///
