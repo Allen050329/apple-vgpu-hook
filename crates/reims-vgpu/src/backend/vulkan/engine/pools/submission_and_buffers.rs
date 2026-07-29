@@ -1042,6 +1042,35 @@ impl ResourcePools {
         // reader/compute/prefetch path (and prevents ring wrap from resetting
         // the still-recording batch CB).
         self.batch_flush(ctx, counters)?;
+        // Reap the oldest contiguous run of already-signaled slots before
+        // claiming one. A slot's cleanup carries the sampled-cache admissions
+        // it owes (`drain_cleanup` -> `admit_sampled_slot`), and the readback
+        // path deliberately waits the fence without retiring (see
+        // `wait_entry_fence`). Retiring only the slot about to be reused
+        // therefore parked every admission until the ring wrapped, so an
+        // unchanged texture re-uploaded and re-allocated for RING_DEPTH - 1
+        // draws before the content cache could serve it.
+        //
+        // `break` on the first unsignaled slot is load-bearing: reaping out of
+        // order can drop `in_flight` to 0 while later slots still run, which
+        // would let `gpu_work_open()` admit a graveyard drain under live work.
+        let n = self.slots.len();
+        for step in 1..=n {
+            let index = (self.cur + step) % n;
+            if self.slots[index].pending.is_none() {
+                continue;
+            }
+            let signaled = ctx
+                .device
+                .get_fence_status(self.slots[index].fence)
+                .map_err(|e| {
+                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
+                })?;
+            if !signaled {
+                break;
+            }
+            self.retire_slot(ctx, counters, index)?;
+        }
         let next = (self.cur + 1) % self.slots.len();
         if self.slots[next].pending.is_some() {
             // Count as a "block" only when the fence is genuinely unsignaled

@@ -767,6 +767,69 @@ fn sampled_and_sampler_still_renders() {
     }
 }
 
+/// An unchanging sampled texture uploads exactly once, no matter how many
+/// draws follow.
+///
+/// Cache admission is parked on a ring slot's deferred cleanup, so this is the
+/// gate on *when* that cleanup runs. Retiring only the slot about to be reused
+/// held every admission until the ring wrapped, which re-uploaded and
+/// re-allocated the same bytes for `RING_DEPTH - 1` draws. The two-draw tests
+/// above cannot see that: they pass as soon as one extra slot is reaped. This
+/// one drives more draws than the ring is deep, so it fails for any policy that
+/// does not reap the whole signaled run.
+#[test]
+fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
+    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    engine::test_reset_engine();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 8, 8);
+    req.sampled_images.push(SampledImageResource {
+        binding: 1,
+        width: 2,
+        height: 2,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ])),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    req.samplers.push(SamplerResource::normalized_default(2));
+
+    // Comfortably past RING_DEPTH so the ring wraps several times.
+    const DRAWS: u32 = 24;
+    let before = engine::counter_snapshot();
+    match engine::execute_draw_request(&req) {
+        Ok(first) => {
+            for _ in 1..DRAWS {
+                let out = engine::execute_draw_request(&req).expect("repeat sampled draw");
+                assert_eq!(out.pixels, first.pixels, "every redraw is byte-identical");
+            }
+            let d = engine::counter_snapshot().delta_since(&before);
+            assert_eq!(
+                d.sampled_reuploads, 1,
+                "one upload for {DRAWS} identical draws: {d:?}"
+            );
+            assert_eq!(
+                d.sampled_cache_hits,
+                u64::from(DRAWS - 1),
+                "every draw after the first is served by the cache: {d:?}"
+            );
+            assert_eq!(
+                d.sampled_cache_misses, 1,
+                "only the cold draw misses: {d:?}"
+            );
+        }
+        Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP sampled ring reuse: {e}"),
+        Err(e) => panic!("unexpected sampled path error: {e}"),
+    }
+}
+
 /// A resident type-11 sample stays on the GPU: no source readback, staging
 /// upload, or temporary sampled image. The tracked layout must still permit a
 /// later LoadFromTarget draw on the source identity.
