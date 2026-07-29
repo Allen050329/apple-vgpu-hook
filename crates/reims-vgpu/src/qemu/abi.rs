@@ -22,11 +22,10 @@ use crate::{
     device_destroy, device_drain, device_early_scanout_target, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
     device_pop_action, device_present_boundary_seen, device_reset, device_scanout_copy,
-    device_scanout_gpu_copy, device_scanout_host_alignment, device_window_run_main,
-    device_window_set_early_fb, device_window_start, device_window_stop, unwind_safe,
-    CursorGlyphInfo,
+    device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
+    unwind_safe, CursorGlyphInfo,
 };
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int};
 use std::slice;
 
 /// Bump when breaking the C shim contract.
@@ -628,64 +627,6 @@ pub unsafe extern "C" fn reims_vgpu_qemu_scanout_copy(
                 ScanoutCopyResult::Unchanged => REIMS_VGPU_QEMU_EMPTY,
                 ScanoutCopyResult::Failed => REIMS_VGPU_QEMU_ERR_STATE,
             }
-        },
-        REIMS_VGPU_QEMU_ERR_PANIC,
-    )
-}
-
-/// GPU-copy a completed present into an aligned, stable QEMU display buffer.
-///
-/// SAFETY: `dst` must cover `dst_len` bytes and remain valid until device
-/// teardown because the engine caches its external-host-memory import.
-#[no_mangle]
-pub unsafe extern "C" fn reims_vgpu_qemu_scanout_gpu_copy(
-    handle: u64,
-    mapping_id: u32,
-    dst: *mut c_void,
-    dst_len: u64,
-    dst_stride: u32,
-    width: u32,
-    height: u32,
-    generation: u32,
-) -> c_int {
-    use crate::runtime::scanout::ScanoutCopyResult;
-    unwind_safe(
-        || {
-            if handle == 0 || dst.is_null() || dst_len == 0 {
-                return REIMS_VGPU_QEMU_ERR_ARGS;
-            }
-            match unsafe {
-                device_scanout_gpu_copy(
-                    handle, mapping_id, dst, dst_len, dst_stride, width, height, generation,
-                )
-            } {
-                ScanoutCopyResult::Painted => REIMS_VGPU_QEMU_OK,
-                ScanoutCopyResult::Unchanged => REIMS_VGPU_QEMU_EMPTY,
-                ScanoutCopyResult::Failed => REIMS_VGPU_QEMU_ERR_STATE,
-            }
-        },
-        REIMS_VGPU_QEMU_ERR_PANIC,
-    )
-}
-
-/// Required pointer/size alignment for `reims_vgpu_qemu_scanout_gpu_copy`.
-#[no_mangle]
-pub unsafe extern "C" fn reims_vgpu_qemu_scanout_host_alignment(
-    handle: u64,
-    out_alignment: *mut u64,
-) -> c_int {
-    unwind_safe(
-        || {
-            if handle == 0 || out_alignment.is_null() {
-                return REIMS_VGPU_QEMU_ERR_ARGS;
-            }
-            let Some(alignment) = device_scanout_host_alignment() else {
-                return REIMS_VGPU_QEMU_ERR_STATE;
-            };
-            unsafe {
-                *out_alignment = alignment;
-            }
-            REIMS_VGPU_QEMU_OK
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
     )

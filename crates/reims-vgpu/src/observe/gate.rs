@@ -1071,12 +1071,18 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Up from (68, 1520): `ZeroCopyLost` adds one type and seven slugs,
-        // one per rail that used to give the host GPU a handle on guest RAM
-        // and now runs a CPU copy. The rails it names are being deleted in the
-        // same series of commits, so this number moves *up* while the code
-        // moves out — the vocabulary is what survives the mechanism.
-        (69, 1525),
+        // Up one type from (68, 1520), down fifteen slugs. `ZeroCopyLost`
+        // adds seven, one per rail that used to give the host GPU a handle on
+        // guest RAM and now runs a CPU copy. Twenty-two leave with the rails
+        // themselves: two `vk_draw_exec_*_guest_run_import_missing`, twelve
+        // `vk_compute_exec_direct_writeback_*`, two
+        // `vk_compute_direct_writeback_*` VkOps, and the runtime's
+        // `compute_vk_direct_non_type11`.
+        //
+        // The vocabulary is what survives the mechanism, and it shrinks: a slug
+        // for a check the crate can no longer make is a refusal that reads as
+        // available when it is not.
+        (69, 1510),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

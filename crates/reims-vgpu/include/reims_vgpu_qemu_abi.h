@@ -277,18 +277,6 @@ int reims_vgpu_qemu_scanout_copy(uint64_t handle, uint32_t mapping_id, uint8_t *
                           uint32_t generation);
 
 /*
- * GPU-copy a completed resident into an aligned stable QEMU display buffer.
- * The buffer remains valid until device teardown because Vulkan caches the
- * external-host-memory import. OK = copied, EMPTY = hold prior, ERR_STATE =
- * direct path unavailable and the current CPU snapshot may be used.
- */
-int reims_vgpu_qemu_scanout_gpu_copy(uint64_t handle, uint32_t mapping_id, void *dst,
-                              uint64_t dst_len, uint32_t dst_stride,
-                              uint32_t width, uint32_t height,
-                              uint32_t generation);
-int reims_vgpu_qemu_scanout_host_alignment(uint64_t handle, uint64_t *out_alignment);
-
-/*
  * Pre-boundary early console: guest-programmed EFI FB (MMIO 0x1210 start +
  * 0x1228 stride), contract path for boot.efi / kernel console after it leaves
  * BAR1 linear GOP (serial: "console relocated to 0x…").

@@ -388,7 +388,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };
@@ -433,7 +432,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
                 output_generation: 3,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };
@@ -470,7 +468,6 @@ fn compute_storage_image_rgba8unorm_known_result() {
                 output_generation: 10,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };
@@ -587,7 +584,6 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };
@@ -694,7 +690,6 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
                     output_generation,
                 }),
                 seed_skipped: skipped,
-                host_writeback: None,
                 defer_readback: false,
             }],
         }
@@ -820,7 +815,6 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
                 output_generation,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: true,
         }],
     };
@@ -834,7 +828,6 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
         "deferred image must not read back"
     );
     assert_eq!(out.images_deferred, vec![true]);
-    assert_eq!(out.images_direct, vec![false]);
     let snap = engine::counter_snapshot();
     assert_eq!(snap.readbacks, 0, "no device→host copy on the stamp path");
     assert_eq!(snap.readback_bytes, 0);
@@ -1046,7 +1039,6 @@ fn compute_sampled_resident_copy_and_lost_resident() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };
@@ -1280,7 +1272,6 @@ fn compute_sampled_resident_reinterpret_copy() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };
@@ -1497,7 +1488,6 @@ fn compute_linear_resident_deferred_chain() {
                 output_generation: 2,
             }),
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: true,
         }],
     };
@@ -1576,157 +1566,6 @@ fn compute_linear_resident_deferred_chain() {
             "flush must return the dispatch output: {p:?}"
         );
     }
-}
-
-/// A storage image carrying a guest writeback window must **not** be written by
-/// the GPU. `VK_EXT_external_memory_host` is the only mechanism for it and is
-/// never requested, so the dispatch falls back to the pooled readback: the
-/// caller's window is left untouched, the image comes back through
-/// `out.images`, and the refusal is counted and named.
-///
-/// This case used to assert the opposite — strided GPU DMA landing in the
-/// window — and it executed on the GPU on any host advertising the extension.
-/// It is kept executing rather than skipped: `compute_host_writeback_alignment`
-/// answers `None` for *both* "no device" and "no extension", so leaving it as
-/// the guard would have turned a live GPU case into a permanent skip that reads
-/// as a pass. `engine_or_skip` is the suite's GPU guard and is the one used
-/// here.
-#[test]
-fn compute_storage_image_writeback_window_is_never_written_by_the_gpu() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
-    assert!(
-        engine::compute_host_writeback_alignment().is_none(),
-        "the device must not advertise a host-pointer writeback alignment"
-    );
-    // One x86 guest page. Nothing imports this window, so its alignment is not
-    // load-bearing — it is page-sized and page-aligned only so the request keeps
-    // the shape of a real guest surface backing.
-    let align = 4096u64;
-    // Same red-fill kernel as compute_storage_image_rgba8unorm_known_result.
-    let spvasm = r#"
-               OpCapability Shader
-               OpCapability StorageImageWriteWithoutFormat
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %img
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %img DescriptorSet 0
-               OpDecorate %img Binding 0
-               OpDecorate %img NonReadable
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-        %int = OpTypeInt 32 1
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-      %v2int = OpTypeVector %int 2
-    %v4float = OpTypeVector %float 4
-    %float_1 = OpConstant %float 1
-    %float_0 = OpConstant %float 0
-     %red = OpConstantComposite %v4float %float_1 %float_0 %float_0 %float_1
-%img_ty = OpTypeImage %float 2D 0 0 0 2 Rgba8
-%_ptr_img = OpTypePointer UniformConstant %img_ty
-        %img = OpVariable %_ptr_img UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-          %y = OpCompositeExtract %uint %gid_val 1
-         %xi = OpBitcast %int %x
-         %yi = OpBitcast %int %y
-       %coord = OpCompositeConstruct %v2int %xi %yi
-      %img_l = OpLoad %img_ty %img
-               OpImageWrite %img_l %coord %red
-               OpReturn
-               OpFunctionEnd
-"#;
-    let Some(words) = assemble_spvasm(spvasm, "simg_direct_wb") else {
-        return;
-    };
-    let w = 4u32;
-    let h = 4u32;
-    // Strided guest window: 64-byte surface offset, 32-byte rows (16 tight).
-    let buffer_offset = 64u64;
-    let row_bytes = 32u32;
-    let window_len = usize::try_from(align).unwrap();
-    let layout = std::alloc::Layout::from_size_align(window_len, align as usize).unwrap();
-    // SAFETY: layout is nonzero; freed at the end of the test.
-    let window = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!window.is_null());
-    let req = ComputeRequest {
-        spirv: words,
-        entry: "main".into(),
-        grid: [w, h, 1],
-        storage_buffers: vec![],
-        sampled_images: vec![],
-        samplers: vec![],
-        storage_images: vec![ComputeStorageImageResource {
-            binding: 0,
-            format: StorageImageFormat::Rgba8Unorm,
-            width: w,
-            height: h,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
-            bytes: vec![0u8; (w * h * 4) as usize],
-            residency: None,
-            seed_skipped: false,
-            host_writeback: Some(engine::ComputeHostWriteback {
-                ptr: window as usize,
-                len: window_len,
-                buffer_offset,
-                row_bytes,
-            }),
-            defer_readback: false,
-        }],
-    };
-    let out = match engine_or_skip("direct writeback", &req) {
-        Some(o) => o,
-        None => {
-            unsafe { std::alloc::dealloc(window, layout) };
-            return;
-        }
-    };
-    assert_eq!(out.images.len(), 1);
-    assert_eq!(
-        out.images_direct,
-        vec![false],
-        "no image may be written straight into the caller's window"
-    );
-    let snap = engine::counter_snapshot();
-    assert_eq!(
-        snap.compute_direct_writebacks, 0,
-        "no direct writeback may happen"
-    );
-    assert_eq!(snap.compute_direct_writeback_bytes, 0);
-    assert_eq!(
-        snap.compute_direct_writeback_fallbacks, 1,
-        "the refusal must be counted, not silent"
-    );
-    // The dispatch still produced the red fill — it came back through the
-    // pooled readback, which is what the caller copies from.
-    assert_eq!(out.images[0].len(), (w * h * 4) as usize);
-    for p in out.images[0].chunks_exact(4) {
-        assert!(
-            p[0] >= 254 && p[1] == 0 && p[2] == 0 && p[3] >= 254,
-            "readback texel {p:?}"
-        );
-    }
-    // The whole window — payload rows, row padding and the surface offset —
-    // is byte-identical to the zeroed allocation. Nothing the GPU touched
-    // reached it.
-    // SAFETY: `window` backs `window_len` initialized bytes and is still live.
-    let view = unsafe { std::slice::from_raw_parts(window, window_len) };
-    let untouched = view.iter().all(|b| *b == 0);
-    unsafe { std::alloc::dealloc(window, layout) };
-    assert!(
-        untouched,
-        "the GPU wrote the caller's window; guest memory must stay unwritable"
-    );
 }
 
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.
@@ -2036,7 +1875,6 @@ fn compute_storage_image_r16float_if_supported() {
             bytes: seed,
             residency: None,
             seed_skipped: false,
-            host_writeback: None,
             defer_readback: false,
         }],
     };

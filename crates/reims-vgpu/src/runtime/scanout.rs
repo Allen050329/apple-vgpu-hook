@@ -53,30 +53,6 @@ pub enum ScanoutCopyResult {
 }
 
 #[cfg(feature = "backend-vulkan")]
-mod gpu_direct_census {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static PRESENTS: AtomicU64 = AtomicU64::new(0);
-    static FALLBACKS: AtomicU64 = AtomicU64::new(0);
-    static BYTES: AtomicU64 = AtomicU64::new(0);
-
-    pub(super) fn note_success(bytes: u64) {
-        let presents = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
-        let total = BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        if presents == 1 || presents.is_multiple_of(256) {
-            crate::observe::off(format!(
-                "console_gpu_direct presents={presents} fallbacks={} gpu_mb={}",
-                FALLBACKS.load(Ordering::Relaxed),
-                total / (1024 * 1024)
-            ));
-        }
-    }
-
-    pub(super) fn note_fallback() {
-        FALLBACKS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// Read mapping pages into `dst` without updating present/paint generation.
 ///
 /// Used by draw bind materialization (sampled type-11 textures). Returns true
@@ -434,104 +410,19 @@ fn blit_present_snapshot(
     blit_bgra_buffer(&state.present.frame_bgra, dst, dst_stride, width, height)
 }
 
-/// Copy the retained resident directly into a stable host display buffer.
-///
-/// The caller owns an aligned `ptr_len`-byte buffer that remains valid for the
-/// device lifetime. The engine imports it through `VK_EXT_external_memory_host`
-/// and records a resident-to-buffer GPU copy, so no framebuffer bytes pass
-/// through the CPU. Early EFI/GOP remains on the software console path.
-///
-/// # Safety
-///
-/// `host_ptr` must point to a writable `ptr_len`-byte allocation that remains
-/// valid for the duration of the call and satisfies the active Vulkan
-/// implementation's host-pointer import alignment.
-#[cfg(feature = "backend-vulkan")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the GPU copy API mirrors its host buffer and present geometry"
-)]
-pub unsafe fn copy_to_host_ptr_gpu(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    host_ptr: *mut std::ffi::c_void,
-    ptr_len: u64,
-    dst_stride: u32,
-    width: u32,
-    height: u32,
-    expected_generation: u32,
-) -> ScanoutCopyResult {
-    if host_ptr.is_null()
-        || width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || dst_stride < width.saturating_mul(RGBA8_BPP)
-    {
-        return ScanoutCopyResult::Failed;
-    }
-    if !state.present.frame_valid
-        || !state.present.frame_flush_seen
-        || state.present.frame_width != width
-        || state.present.frame_height != height
-    {
-        return ScanoutCopyResult::Failed;
-    }
-    if !state.present.frame_encode_pending
-        && state.present.painted_mapping == state.present.frame_mapping
-        && state.present.painted_generation == state.present.frame_generation
-    {
-        return ScanoutCopyResult::Unchanged;
-    }
-
-    let shown_mid = state.present.frame_mapping;
-    let shown_gen = state.present.frame_generation;
-    let identity =
-        crate::runtime::import_present::surface_identity(state, shown_mid, width, height);
-    let result = unsafe {
-        crate::backend::vulkan::engine::present_into_host_ptr_strided(
-            &identity, host_ptr, ptr_len, dst_stride,
-        )
-    };
-    if let Err(err) = result {
-        gpu_direct_census::note_fallback();
-        crate::observe::fail(format!(
-            "console_gpu_direct status=fallback reason=resident_to_host_failed \
-             action_mid={mapping_id} shown_mid={shown_mid} {width}x{height} \
-             action_gen={expected_generation} shown_gen={shown_gen} err={err}"
-        ));
-        // After direct presentation starts, `frame_bgra` deliberately contains
-        // no current frame. Hold the already displayed snapshot and force the
-        // next capture back onto the full path; never paint stale CPU bytes.
-        if state.present.dmabuf_active {
-            state.present.dmabuf_active = false;
-            return ScanoutCopyResult::Unchanged;
-        }
-        return ScanoutCopyResult::Failed;
-    }
-
-    state.present.valid = true;
-    state.present.mapping_id = shown_mid;
-    state.present.width = width;
-    state.present.height = height;
-    state.present.generation = shown_gen;
-    state.present.painted_mapping = shown_mid;
-    state.present.painted_generation = shown_gen;
-    state.present.frame_encode_pending = false;
-    // Reuse the direct-present light-capture gate: the QEMU surface now carries
-    // the display, so later captures need only the 32-byte GPU stats oracle.
-    state.present.dmabuf_active = true;
-    state.present.frame_bgra.clear();
-    gpu_direct_census::note_success((dst_stride as u64).saturating_mul(height as u64));
-    ScanoutCopyResult::Painted
-}
-
 /// Fill `dst` (BGRA8, `dst_stride` bytes/row) for the named mapping.
 ///
 /// `expected_generation` is from the HostAction (0 = always paint).
 /// After DisplaySwap, the first copy **encodes** the stable snapshot from live
 /// pages (host paint time); later copies re-show that snapshot
 /// (`hostPresentCount`) without re-reading guest pages.
+///
+/// This is now the only console paint. `copy_to_host_ptr_gpu` used to get first
+/// refusal on a QEMU-allocated, alignment-negotiated display buffer: the engine
+/// imported it and recorded a resident→buffer GPU copy, so no framebuffer bytes
+/// crossed the CPU. It went out with the host-pointer import that made it
+/// possible — the mechanism is the same one that can address guest RAM, and it
+/// is not requested any more, whichever allocation is on the other end.
 #[allow(
     clippy::too_many_arguments,
     reason = "the scanout copy API mirrors its destination and present geometry"

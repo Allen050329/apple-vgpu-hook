@@ -56,14 +56,6 @@ pub struct EngineCounters {
     /// Compute storage-image seed bytes staged for host→device upload.
     pub compute_storage_seed_uploads: AtomicU64,
     pub compute_storage_seed_upload_bytes: AtomicU64,
-    /// Compute storage images the GPU copied straight into the caller's
-    /// imported guest window (VK_EXT_external_memory_host) — no host-visible
-    /// readback buffer, no CPU writeback copy.
-    pub compute_direct_writebacks: AtomicU64,
-    pub compute_direct_writeback_bytes: AtomicU64,
-    /// Requested direct writebacks that fell back to the readback path
-    /// (import/bind failure at exec time).
-    pub compute_direct_writeback_fallbacks: AtomicU64,
     /// Sampled inputs seeded by a device-local copy of a resident storage
     /// image (copy-on-sample) — bytes are the elided host upload size.
     pub compute_sampled_resident_copies: AtomicU64,
@@ -178,18 +170,6 @@ impl EngineCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn note_compute_direct_writeback(&self, bytes: u64) {
-        self.compute_direct_writebacks
-            .fetch_add(1, Ordering::Relaxed);
-        self.compute_direct_writeback_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    pub fn note_compute_direct_writeback_fallback(&self) {
-        self.compute_direct_writeback_fallbacks
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn note_compute_sampled_resident_copy(&self, bytes: u64) {
         self.compute_sampled_resident_copies
             .fetch_add(1, Ordering::Relaxed);
@@ -243,13 +223,6 @@ impl EngineCounters {
             compute_storage_seed_uploads: self.compute_storage_seed_uploads.load(Ordering::Relaxed),
             compute_storage_seed_upload_bytes: self
                 .compute_storage_seed_upload_bytes
-                .load(Ordering::Relaxed),
-            compute_direct_writebacks: self.compute_direct_writebacks.load(Ordering::Relaxed),
-            compute_direct_writeback_bytes: self
-                .compute_direct_writeback_bytes
-                .load(Ordering::Relaxed),
-            compute_direct_writeback_fallbacks: self
-                .compute_direct_writeback_fallbacks
                 .load(Ordering::Relaxed),
             compute_sampled_resident_copies: self
                 .compute_sampled_resident_copies
@@ -332,11 +305,6 @@ impl EngineCounters {
             .store(0, Ordering::Relaxed);
         self.compute_storage_seed_upload_bytes
             .store(0, Ordering::Relaxed);
-        self.compute_direct_writebacks.store(0, Ordering::Relaxed);
-        self.compute_direct_writeback_bytes
-            .store(0, Ordering::Relaxed);
-        self.compute_direct_writeback_fallbacks
-            .store(0, Ordering::Relaxed);
         self.compute_sampled_resident_copies
             .store(0, Ordering::Relaxed);
         self.compute_sampled_resident_copy_bytes
@@ -411,9 +379,6 @@ pub struct CounterSnapshot {
     pub compute_sampled_upload_bytes: u64,
     pub compute_storage_seed_uploads: u64,
     pub compute_storage_seed_upload_bytes: u64,
-    pub compute_direct_writebacks: u64,
-    pub compute_direct_writeback_bytes: u64,
-    pub compute_direct_writeback_fallbacks: u64,
     pub compute_sampled_resident_copies: u64,
     pub compute_sampled_resident_copy_bytes: u64,
     pub compute_sampled_reinterpret_copies: u64,
@@ -510,15 +475,6 @@ impl CounterSnapshot {
             compute_storage_seed_upload_bytes: self
                 .compute_storage_seed_upload_bytes
                 .saturating_sub(earlier.compute_storage_seed_upload_bytes),
-            compute_direct_writebacks: self
-                .compute_direct_writebacks
-                .saturating_sub(earlier.compute_direct_writebacks),
-            compute_direct_writeback_bytes: self
-                .compute_direct_writeback_bytes
-                .saturating_sub(earlier.compute_direct_writeback_bytes),
-            compute_direct_writeback_fallbacks: self
-                .compute_direct_writeback_fallbacks
-                .saturating_sub(earlier.compute_direct_writeback_fallbacks),
             compute_sampled_resident_copies: self
                 .compute_sampled_resident_copies
                 .saturating_sub(earlier.compute_sampled_resident_copies),
@@ -636,7 +592,6 @@ mod tests {
         counters.note_alloc();
         counters.note_readback(4096);
         counters.note_seed_upload(1024);
-        counters.note_compute_direct_writeback(512);
 
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.creates, 1);
@@ -645,13 +600,6 @@ mod tests {
         assert_eq!(
             (snapshot.seed_uploads, snapshot.seed_upload_bytes),
             (1, 1024)
-        );
-        assert_eq!(
-            (
-                snapshot.compute_direct_writebacks,
-                snapshot.compute_direct_writeback_bytes
-            ),
-            (1, 512)
         );
     }
 

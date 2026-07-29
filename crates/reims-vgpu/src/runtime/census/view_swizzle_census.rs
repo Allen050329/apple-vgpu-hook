@@ -143,7 +143,10 @@ mod tests {
         reset_for_tests();
         assert!(first_sight("swizzle_cpu_remap", 7));
         assert!(!first_sight("swizzle_cpu_remap", 7));
-        assert!(first_sight("swizzle_cpu_remap", 8), "a new ref is a new event");
+        assert!(
+            first_sight("swizzle_cpu_remap", 8),
+            "a new ref is a new event"
+        );
         assert!(
             first_sight("swizzle_resident_direct_bind", 7),
             "a new reason on the same ref is a new event"

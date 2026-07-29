@@ -175,10 +175,6 @@ pub enum VkOp {
     ComputeExecMapStorageReadback,
     /// `vkMapMemory` of the storage-image readback after the dispatch.
     ComputeExecMapImageReadback,
-    /// `vkCreateBuffer` over imported guest memory for direct compute writeback.
-    ComputeDirectWritebackCreateBuffer,
-    /// `vkBindBufferMemory` over imported guest memory for direct compute writeback.
-    ComputeDirectWritebackBindBuffer,
 
     // ---- host_scatter.rs — the GPU-direct resident → guest-page Store rail ----
     /// `vkAllocateCommandBuffers` for the private scatter command buffer.
@@ -440,8 +436,6 @@ impl Decline for VkCall {
             VkOp::ComputeExecSubmit => "vk_compute_exec_submit",
             VkOp::ComputeExecMapStorageReadback => "vk_compute_exec_map_storage_readback",
             VkOp::ComputeExecMapImageReadback => "vk_compute_exec_map_image_readback",
-            VkOp::ComputeDirectWritebackCreateBuffer => "vk_compute_direct_writeback_create_buffer",
-            VkOp::ComputeDirectWritebackBindBuffer => "vk_compute_direct_writeback_bind_buffer",
 
             VkOp::HostScatterAllocCommandBuffer => "vk_host_scatter_alloc_command_buffer",
             VkOp::HostScatterCreateFence => "vk_host_scatter_create_fence",
@@ -616,8 +610,6 @@ mod tests {
         VkOp::ComputeExecSubmit,
         VkOp::ComputeExecMapStorageReadback,
         VkOp::ComputeExecMapImageReadback,
-        VkOp::ComputeDirectWritebackCreateBuffer,
-        VkOp::ComputeDirectWritebackBindBuffer,
         VkOp::HostScatterAllocCommandBuffer,
         VkOp::HostScatterCreateFence,
         VkOp::HostScatterResetFence,

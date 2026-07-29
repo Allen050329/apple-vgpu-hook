@@ -43,4 +43,3 @@ pub(crate) mod util;
 
 #[cfg(target_os = "macos")]
 pub use device::{system_device_name, MetalBackend, MetalRuntime};
-

@@ -57,223 +57,17 @@ struct ReinterpretHop {
 enum ComputeImageDst {
     /// Pooled host-visible buffer; the CPU reads it back and the runtime
     /// writes guest pages itself.
+    ///
+    /// This is now the only non-deferred destination. A third variant,
+    /// `Direct`, bound a transfer-dst buffer over an imported view of the
+    /// caller's guest window so the dispatch's own copy landed there and no
+    /// bytes crossed device→host. It is gone with the import: a buffer the GPU
+    /// can write, backed by guest pages, is the exposure this removal is about.
     Readback(BufferSlot),
-    /// Transfer-dst buffer bound over the caller's imported guest window
-    /// (VK_EXT_external_memory_host) — the GPU copy IS the writeback. The
-    /// imported memory handle lives in [`DirectWritebackAllocs`].
-    Direct {
-        buffer: vk::Buffer,
-        offset: u64,
-        row_length_texels: u32,
-    },
     /// No post-dispatch copy at all: the pinned resident storage image stays
     /// the authoritative content until the caller flushes it to guest pages
     /// (`read_resident_storage`). Requires a residency identity.
     Deferred,
-}
-
-/// Owns the direct-writeback buffers + imported memory for one dispatch and
-/// destroys them on scope exit, covering every early error return between
-/// import and readback. (Freeing the import handle never frees guest pages.)
-struct DirectWritebackAllocs {
-    device: ash::Device,
-    items: Vec<(vk::Buffer, vk::DeviceMemory)>,
-}
-
-impl Drop for DirectWritebackAllocs {
-    fn drop(&mut self) {
-        for (buffer, memory) in self.items.drain(..) {
-            unsafe {
-                self.device.destroy_buffer(buffer, None);
-                self.device.free_memory(memory, None);
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DirectWritebackPlan {
-    import_size: u64,
-    row_length_texels: u32,
-}
-
-fn direct_writeback_plan(
-    resource: &super::types::ComputeStorageImageResource,
-    hw: super::types::ComputeHostWriteback,
-    alignment: u64,
-) -> Result<DirectWritebackPlan, ComputeExecutionDecline> {
-    let binding = resource.binding;
-    if resource.layers != 1 || resource.volume || resource.arrayed || resource.one_dim {
-        return Err(ComputeExecutionDecline::DirectWritebackShapeMismatch {
-            binding,
-            layers: resource.layers,
-            one_dim: resource.one_dim,
-            arrayed: resource.arrayed,
-            volume: resource.volume,
-        });
-    }
-    let texel_bytes = resource.format.bytes_per_texel() as u64;
-    if !(u64::from(hw.row_bytes)).is_multiple_of(texel_bytes) {
-        return Err(
-            ComputeExecutionDecline::DirectWritebackRowBytesNotTexelAligned {
-                binding,
-                row_bytes: hw.row_bytes,
-                texel_bytes,
-            },
-        );
-    }
-    let minimum_row_bytes = u64::from(resource.width) * texel_bytes;
-    if u64::from(hw.row_bytes) < minimum_row_bytes {
-        return Err(ComputeExecutionDecline::DirectWritebackRowBytesTooShort {
-            binding,
-            row_bytes: hw.row_bytes,
-            minimum_row_bytes,
-        });
-    }
-    if !hw.buffer_offset.is_multiple_of(texel_bytes) {
-        return Err(
-            ComputeExecutionDecline::DirectWritebackBufferOffsetNotTexelAligned {
-                binding,
-                buffer_offset: hw.buffer_offset,
-                texel_bytes,
-            },
-        );
-    }
-    if !hw.buffer_offset.is_multiple_of(4) {
-        return Err(
-            ComputeExecutionDecline::DirectWritebackBufferOffsetNotFourAligned {
-                binding,
-                buffer_offset: hw.buffer_offset,
-            },
-        );
-    }
-    if hw.ptr == 0 {
-        return Err(ComputeExecutionDecline::DirectWritebackNullPointer { binding });
-    }
-    let alignment = alignment.max(1);
-    if !(hw.ptr as u64).is_multiple_of(alignment) {
-        return Err(ComputeExecutionDecline::DirectWritebackPointerMisaligned {
-            binding,
-            pointer: hw.ptr,
-            alignment,
-        });
-    }
-
-    // `validate_compute` has already proved non-zero geometry. The remaining
-    // arithmetic describes the last byte Vulkan may write through the imported
-    // buffer and is checked independently so each contract drift has a name.
-    let last_row_offset = u64::from(hw.row_bytes) * u64::from(resource.height.saturating_sub(1));
-    let last_row_start = hw.buffer_offset.checked_add(last_row_offset).ok_or(
-        ComputeExecutionDecline::DirectWritebackRowStartOverflow {
-            binding,
-            buffer_offset: hw.buffer_offset,
-            last_row_offset,
-        },
-    )?;
-    let required = last_row_start.checked_add(minimum_row_bytes).ok_or(
-        ComputeExecutionDecline::DirectWritebackRequiredSpanOverflow {
-            binding,
-            last_row_start,
-            row_bytes_required: minimum_row_bytes,
-        },
-    )?;
-    let import_size = required.div_ceil(alignment).checked_mul(alignment).ok_or(
-        ComputeExecutionDecline::DirectWritebackImportSizeOverflow {
-            binding,
-            required_bytes: required,
-            alignment,
-        },
-    )?;
-    if (hw.len as u64) < import_size {
-        return Err(ComputeExecutionDecline::DirectWritebackWindowTooShort {
-            binding,
-            window_bytes: hw.len,
-            import_bytes: import_size,
-        });
-    }
-    Ok(DirectWritebackPlan {
-        import_size,
-        row_length_texels: hw.row_bytes / texel_bytes as u32,
-    })
-}
-
-/// Import the caller's guest window and bind a transfer-dst buffer over it.
-/// Every rejection falls back to the pooled readback path (counted, never an
-/// error) — the CPU writeback stays correct, just slower.
-unsafe fn prepare_direct_dst(
-    ctx: &super::context::DeviceContext,
-    resource: &super::types::ComputeStorageImageResource,
-    allocs: &mut DirectWritebackAllocs,
-    counters: &EngineCounters,
-) -> Option<ComputeImageDst> {
-    let hw = resource.host_writeback?;
-    let fallback = || {
-        counters.note_compute_direct_writeback_fallback();
-        None
-    };
-    let report_attempt_failure = |error: &dyn crate::observe::Decline| {
-        crate::observe::Emit::decline("compute_direct_writeback", error)
-            .field("binding", resource.binding)
-            // `fail_once` keys on `(reason, discriminant)`: the reason
-            // distinguishes failure classes and the binding distinguishes
-            // separate descriptor events.
-            .fail_once(resource.binding as u64);
-    };
-    // The guest-write rail's classification, not a second reading of the raw
-    // extension handle — so this site and the selection line can never disagree
-    // about whether the GPU can write guest pages.
-    if !ctx.caps.imports_guest_pages() {
-        let decline = ComputeExecutionDecline::DirectWritebackCapabilityLost {
-            binding: resource.binding,
-        };
-        report_attempt_failure(&decline);
-        return fallback();
-    }
-    let align = ctx.min_imported_host_pointer_alignment.max(1);
-    let plan = match direct_writeback_plan(resource, hw, align) {
-        Ok(plan) => plan,
-        Err(decline) => {
-            report_attempt_failure(&decline);
-            return fallback();
-        }
-    };
-    let import_size = plan.import_size;
-    let memory = match ctx.import_host_ptr(hw.ptr as *mut std::ffi::c_void, import_size) {
-        Ok(m) => m,
-        Err(error) => {
-            report_attempt_failure(&error);
-            return fallback();
-        }
-    };
-    let info = vk::BufferCreateInfo::default()
-        .size(import_size)
-        .usage(vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = match ctx.device.create_buffer(&info, None) {
-        Ok(b) => b,
-        Err(result) => {
-            ctx.device.free_memory(memory, None);
-            let error = DrawError::VkCall(VkCall::new(
-                VkOp::ComputeDirectWritebackCreateBuffer,
-                result,
-            ));
-            report_attempt_failure(&error);
-            return fallback();
-        }
-    };
-    if let Err(result) = ctx.device.bind_buffer_memory(buffer, memory, 0) {
-        ctx.device.destroy_buffer(buffer, None);
-        ctx.device.free_memory(memory, None);
-        let error = DrawError::VkCall(VkCall::new(VkOp::ComputeDirectWritebackBindBuffer, result));
-        report_attempt_failure(&error);
-        return fallback();
-    }
-    allocs.items.push((buffer, memory));
-    Some(ComputeImageDst::Direct {
-        buffer,
-        offset: hw.buffer_offset,
-        row_length_texels: plan.row_length_texels,
-    })
 }
 
 pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
@@ -699,14 +493,8 @@ pub(crate) unsafe fn execute_compute_inner(
         sampler_handles.push((sampler.binding, handle));
     }
 
-    // Storage images: device-local + staging seed upload + readback buffer
-    // (or a direct transfer-dst buffer over the caller's imported guest
-    // window). The guard destroys direct allocations on every exit.
+    // Storage images: device-local + staging seed upload + readback buffer.
     let mut simg_slots = Vec::new();
-    let mut direct_allocs = DirectWritebackAllocs {
-        device: ctx.device.clone(),
-        items: Vec::new(),
-    };
     for resource in &req.storage_images {
         let key = StorageImageKey {
             width: resource.width,
@@ -773,14 +561,16 @@ pub(crate) unsafe fn execute_compute_inner(
         let dst = if resource.defer_readback && resource.residency.is_some() {
             ComputeImageDst::Deferred
         } else {
-            match prepare_direct_dst(ctx, resource, &mut direct_allocs, counters) {
-                Some(direct) => direct,
-                None => ComputeImageDst::Readback(pools.acquire_readback_extra(
-                    ctx,
-                    resource.bytes.len() as u64,
-                    counters,
-                )?),
-            }
+            // The dispatch's output crosses device→host and the runtime writes
+            // the guest pages. `prepare_direct_dst` used to get first refusal
+            // here, importing the caller's guest window so the copy landed in
+            // it directly; that is the rail this reports as lost.
+            crate::observe::ZeroCopyLost::ComputeDirectWriteback.note();
+            ComputeImageDst::Readback(pools.acquire_readback_extra(
+                ctx,
+                resource.bytes.len() as u64,
+                counters,
+            )?)
         };
         simg_slots.push(PreparedStorageImage {
             binding: resource.binding,
@@ -1275,18 +1065,17 @@ pub(crate) unsafe fn execute_compute_inner(
             &[],
             &barrier,
         );
-        let (dst_buffer, buffer_offset, row_length_texels) = match &prepared.dst {
-            ComputeImageDst::Readback(slot) => (slot.buffer, 0u64, 0u32),
-            ComputeImageDst::Direct {
-                buffer,
-                offset,
-                row_length_texels,
-            } => (*buffer, *offset, *row_length_texels),
+        let dst_buffer = match &prepared.dst {
+            ComputeImageDst::Readback(slot) => slot.buffer,
             // Deferred: no copy at all — the barrier above still lands the
             // image in TRANSFER_SRC_OPTIMAL, matching the layout the registry
             // records post-fence (mark_resident_storage_image).
             ComputeImageDst::Deferred => continue,
         };
+        // The pooled readback is always tightly packed from texel zero. The
+        // offset and row length were the imported window's, and it had a
+        // `buffer_offset` into the guest surface and a guest row stride.
+        let (buffer_offset, row_length_texels) = (0u64, 0u32);
         let copy = [vk::BufferImageCopy::default()
             .buffer_offset(buffer_offset)
             .buffer_row_length(row_length_texels)
@@ -1414,19 +1203,9 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
     let mut images = Vec::with_capacity(simg_slots.len());
-    let mut images_direct = Vec::with_capacity(simg_slots.len());
     let mut images_deferred = Vec::with_capacity(simg_slots.len());
     for prepared in &simg_slots {
         let readback = match &prepared.dst {
-            ComputeImageDst::Direct { .. } => {
-                // The GPU copy already landed in the caller's guest window —
-                // nothing crosses the device→host boundary here.
-                counters.note_compute_direct_writeback(prepared.len as u64);
-                images.push(Vec::new());
-                images_direct.push(true);
-                images_deferred.push(false);
-                continue;
-            }
             ComputeImageDst::Deferred => {
                 // The pinned resident stays authoritative; the caller flushes
                 // it to guest pages on access (read_resident_storage).
@@ -1435,7 +1214,6 @@ pub(crate) unsafe fn execute_compute_inner(
                 }
                 counters.note_compute_deferred_writeback(prepared.len as u64);
                 images.push(Vec::new());
-                images_direct.push(false);
                 images_deferred.push(true);
                 continue;
             }
@@ -1455,7 +1233,6 @@ pub(crate) unsafe fn execute_compute_inner(
         ctx.device.unmap_memory(readback.memory);
         counters.note_readback(prepared.len as u64);
         images.push(out);
-        images_direct.push(false);
         images_deferred.push(false);
     }
 
@@ -1469,7 +1246,6 @@ pub(crate) unsafe fn execute_compute_inner(
     Ok(ComputeOutput {
         buffers,
         images,
-        images_direct,
         images_deferred,
     })
 }
@@ -1531,34 +1307,6 @@ mod tests {
             }),
         }
     }
-
-    fn direct_writeback_resource() -> ComputeStorageImageResource {
-        ComputeStorageImageResource {
-            binding: 34,
-            format: StorageImageFormat::Rgba8Unorm,
-            width: 4,
-            height: 2,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
-            bytes: vec![0; 32],
-            residency: None,
-            seed_skipped: false,
-            host_writeback: None,
-            defer_readback: false,
-        }
-    }
-
-    fn direct_writeback_window() -> super::super::types::ComputeHostWriteback {
-        super::super::types::ComputeHostWriteback {
-            ptr: 4096,
-            len: 4096,
-            buffer_offset: 0,
-            row_bytes: 16,
-        }
-    }
-
     fn resident_sample_key() -> StorageImageKey {
         StorageImageKey {
             width: 1,
@@ -1678,116 +1426,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_writeback_contract_drift_names_every_fallback_check() {
-        let base = direct_writeback_resource();
-        let window = direct_writeback_window();
-        assert_eq!(
-            direct_writeback_plan(&base, window, 4096).unwrap(),
-            DirectWritebackPlan {
-                import_size: 4096,
-                row_length_texels: 4,
-            }
-        );
-
-        let slug = |resource: &ComputeStorageImageResource,
-                    window: super::super::types::ComputeHostWriteback,
-                    alignment| {
-            direct_writeback_plan(resource, window, alignment)
-                .unwrap_err()
-                .slug()
-        };
-
-        let mut shape = direct_writeback_resource();
-        shape.layers = 2;
-        assert_eq!(
-            slug(&shape, window, 4096),
-            "vk_compute_exec_direct_writeback_shape_mismatch"
-        );
-
-        let mut row_unaligned = window;
-        row_unaligned.row_bytes = 17;
-        assert_eq!(
-            slug(&base, row_unaligned, 4096),
-            "vk_compute_exec_direct_writeback_row_bytes_not_texel_aligned"
-        );
-
-        let mut row_short = window;
-        row_short.row_bytes = 12;
-        assert_eq!(
-            slug(&base, row_short, 4096),
-            "vk_compute_exec_direct_writeback_row_bytes_too_short"
-        );
-
-        let mut offset_texel = window;
-        offset_texel.buffer_offset = 2;
-        assert_eq!(
-            slug(&base, offset_texel, 4096),
-            "vk_compute_exec_direct_writeback_buffer_offset_not_texel_aligned"
-        );
-
-        let mut two_byte_texel = direct_writeback_resource();
-        two_byte_texel.format = StorageImageFormat::Rg8Unorm;
-        two_byte_texel.bytes.resize(16, 0);
-        let mut offset_four = window;
-        offset_four.buffer_offset = 2;
-        offset_four.row_bytes = 8;
-        assert_eq!(
-            slug(&two_byte_texel, offset_four, 4096),
-            "vk_compute_exec_direct_writeback_buffer_offset_not_four_aligned"
-        );
-
-        let mut null = window;
-        null.ptr = 0;
-        assert_eq!(
-            slug(&base, null, 4096),
-            "vk_compute_exec_direct_writeback_null_pointer"
-        );
-
-        let mut pointer_unaligned = window;
-        pointer_unaligned.ptr = 4097;
-        assert_eq!(
-            slug(&base, pointer_unaligned, 4096),
-            "vk_compute_exec_direct_writeback_pointer_misaligned"
-        );
-
-        let mut row_start = window;
-        row_start.buffer_offset = u64::MAX - 3;
-        assert_eq!(
-            slug(&base, row_start, 4),
-            "vk_compute_exec_direct_writeback_row_start_overflow"
-        );
-
-        let mut one_row = direct_writeback_resource();
-        one_row.height = 1;
-        one_row.bytes.resize(16, 0);
-        let mut required = window;
-        required.buffer_offset = u64::MAX - 3;
-        assert_eq!(
-            slug(&one_row, required, 4),
-            "vk_compute_exec_direct_writeback_required_span_overflow"
-        );
-
-        let mut one_texel = direct_writeback_resource();
-        one_texel.width = 1;
-        one_texel.height = 1;
-        one_texel.bytes.resize(4, 0);
-        let mut roundup = window;
-        roundup.buffer_offset = u64::MAX - 7;
-        roundup.row_bytes = 4;
-        assert_eq!(
-            slug(&one_texel, roundup, 8),
-            "vk_compute_exec_direct_writeback_import_size_overflow"
-        );
-
-        let mut short = window;
-        short.len = 4095;
-        assert_eq!(
-            slug(&base, short, 4096),
-            "vk_compute_exec_direct_writeback_window_too_short"
-        );
-    }
-
-    #[test]
     fn sampled_and_storage_images_keep_distinct_descriptor_access() {
         let mut req = ComputeRequest {
             spirv: vec![0x0723_0203],
@@ -1818,7 +1456,6 @@ mod tests {
                 bytes: vec![0; 4],
                 residency: None,
                 seed_skipped: false,
-                host_writeback: None,
                 defer_readback: false,
             }],
             ..Default::default()

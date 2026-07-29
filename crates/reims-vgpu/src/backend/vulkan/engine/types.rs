@@ -903,14 +903,13 @@ pub struct ComputeOutput {
     /// device→host boundary after dispatch.
     pub buffers: Vec<ComputeBufferOutput>,
     /// Image readbacks in request order (same length as `storage_images`).
-    /// Empty for images the GPU copied straight into the caller's imported
-    /// host window (see `images_direct`).
+    /// Empty only for a deferred image (see `images_deferred`).
+    ///
+    /// A third case used to leave this empty too: the dispatch copied into an
+    /// imported view of the caller's guest window and `images_direct` said so,
+    /// so the caller skipped its own writeback. That window is gone, and with
+    /// it the flag — every non-deferred image now comes back through here.
     pub images: Vec<Vec<u8>>,
-    /// Per image (request order): true when the GPU copy landed in the
-    /// caller's `host_writeback` window — the caller must skip its own CPU
-    /// writeback for that image. False = the readback in `images` is
-    /// authoritative and the caller writes back as before.
-    pub images_direct: Vec<bool>,
     /// Per image (request order): true when the readback was deferred — the
     /// pinned resident storage image is authoritative, no bytes crossed the
     /// device→host boundary, and the caller owns flushing it to guest pages
@@ -952,12 +951,6 @@ pub struct ComputeStorageImageResource {
     /// visibly (never seed the zero placeholder) if the resident image is
     /// gone by acquire time.
     pub seed_skipped: bool,
-    /// GPU-direct writeback window (VK_EXT_external_memory_host): when set
-    /// and importable, the post-dispatch copy lands in this guest-memory
-    /// window instead of the host-visible readback buffer, and the matching
-    /// `ComputeOutput::images` entry stays empty with `images_direct` true.
-    /// Import failure falls back to the readback path (never an error).
-    pub host_writeback: Option<ComputeHostWriteback>,
     /// Deferred writeback: skip the post-dispatch GPU→host readback entirely —
     /// the resident storage image (requires `residency`) stays the
     /// authoritative copy, pinned against LRU eviction until the caller
@@ -981,21 +974,6 @@ pub struct ComputeResidentSampleBind {
     pub identity: crate::model::ComputeStorageResidencyKey,
     /// Generation the caller verified against the registry at stage time.
     pub generation: u32,
-}
-
-/// Imported-host-pointer writeback target for one storage image. `ptr` is the
-/// contig host view of the destination mapping (base of the mapping, not of
-/// the surface) and must stay valid for `len` bytes across the engine call;
-/// `buffer_offset` / `row_bytes` describe the guest surface window inside it.
-#[derive(Clone, Copy, Debug)]
-pub struct ComputeHostWriteback {
-    pub ptr: usize,
-    pub len: usize,
-    /// Byte offset of texel (0,0) inside the imported window; must be a
-    /// multiple of the texel size and of 4 (Vulkan bufferOffset VUs).
-    pub buffer_offset: u64,
-    /// Guest row stride in bytes (>= width * texel size, texel-size multiple).
-    pub row_bytes: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

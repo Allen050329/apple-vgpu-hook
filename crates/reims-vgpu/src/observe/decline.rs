@@ -519,10 +519,6 @@ pub const REGISTRY: &[DeclineClass] = &[
                 "backend/vulkan/engine/pools/host_import_and_teardown.rs",
                 "host_import_fail",
             ),
-            (
-                "backend/vulkan/engine/exec_compute.rs",
-                "compute_direct_writeback",
-            ),
         ]),
         slug_calls: &[],
         // `Present` and `Unsupported` are absent on purpose: they forward to
@@ -813,13 +809,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         // The Vulkan compute boundary emits the delegated `DrawError` reason;
         // the direct-writeback rail emits its exact structural degradation
         // before taking the correct-but-slower readback fallback.
-        emission: Emission::At(&[
-            (
-                "backend/vulkan/engine/exec_compute.rs",
-                "compute_direct_writeback",
-            ),
-            ("runtime/compute_exec/mod.rs", "compute_linux_engine"),
-        ]),
+        emission: Emission::At(&[("runtime/compute_exec/mod.rs", "compute_linux_engine")]),
         slug_calls: &[],
         slugs: &[
             "vk_compute_exec_resident_sample_absent",
@@ -833,18 +823,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_compute_exec_seed_skipped_without_residency",
             "vk_compute_exec_resident_seed_generation_lost",
             "vk_compute_exec_resident_allocator_live_slot_missing",
-            "vk_compute_exec_direct_writeback_capability_lost",
-            "vk_compute_exec_direct_writeback_shape_mismatch",
-            "vk_compute_exec_direct_writeback_row_bytes_not_texel_aligned",
-            "vk_compute_exec_direct_writeback_row_bytes_too_short",
-            "vk_compute_exec_direct_writeback_buffer_offset_not_texel_aligned",
-            "vk_compute_exec_direct_writeback_buffer_offset_not_four_aligned",
-            "vk_compute_exec_direct_writeback_null_pointer",
-            "vk_compute_exec_direct_writeback_pointer_misaligned",
-            "vk_compute_exec_direct_writeback_row_start_overflow",
-            "vk_compute_exec_direct_writeback_required_span_overflow",
-            "vk_compute_exec_direct_writeback_import_size_overflow",
-            "vk_compute_exec_direct_writeback_window_too_short",
         ],
     },
     DeclineClass {
@@ -970,10 +948,6 @@ pub const REGISTRY: &[DeclineClass] = &[
                 "backend/vulkan/engine/pools/host_import_and_teardown.rs",
                 "host_import_fail",
             ),
-            (
-                "backend/vulkan/engine/exec_compute.rs",
-                "compute_direct_writeback",
-            ),
         ]),
         slug_calls: &[],
         slugs: &[
@@ -1028,8 +1002,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_compute_exec_submit",
             "vk_compute_exec_map_storage_readback",
             "vk_compute_exec_map_image_readback",
-            "vk_compute_direct_writeback_create_buffer",
-            "vk_compute_direct_writeback_bind_buffer",
             "vk_host_scatter_alloc_command_buffer",
             "vk_host_scatter_create_fence",
             "vk_host_scatter_reset_fence",
@@ -1260,16 +1232,10 @@ pub const REGISTRY: &[DeclineClass] = &[
         type_name: "HostImportDecline",
         defined_in: "backend/vulkan/engine/host_import_decline.rs",
         slug_blocks: &[],
-        emission: Emission::At(&[
-            (
-                "backend/vulkan/engine/pools/host_import_and_teardown.rs",
-                "host_import_fail",
-            ),
-            (
-                "backend/vulkan/engine/exec_compute.rs",
-                "compute_direct_writeback",
-            ),
-        ]),
+        emission: Emission::At(&[(
+            "backend/vulkan/engine/pools/host_import_and_teardown.rs",
+            "host_import_fail",
+        )]),
         slug_calls: &[],
         slugs: &[
             "host_import_region_count_cap",
@@ -1799,7 +1765,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "compute_vk_air_extract",
             "compute_vk_deferred_identity",
             "compute_vk_deferred_linear_note",
-            "compute_vk_direct_non_type11",
             "compute_vk_engine_run",
             "compute_vk_mtlb_load",
             "compute_vk_pipeline_load",

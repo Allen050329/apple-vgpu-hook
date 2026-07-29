@@ -3428,9 +3428,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }) {
         crate::runtime::spirv_bind::ensure_storage_write_without_format_capability(&mut spirv);
     }
-    // GPU-direct writeback support is a per-device constant; `None` disables
-    // planning for this dispatch (extension absent or engine init failed).
-    let direct_align = vk_engine::compute_host_writeback_alignment();
     // Compute-side analog of the render resident gates: a deferred storage
     // writeback leaves guest-visible bytes GPU-resident-only until a flush
     // choke point lands them, so it requires the device's
@@ -3535,11 +3532,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     TextureWriteback::Type11 { .. } | TextureWriteback::Linear { .. }
                 ),
             );
-            let host_writeback = if defer_readback {
-                None
-            } else {
-                plan_direct_writeback(state, host, t, direct_align)
-            };
             storage_images.push(ComputeStorageImageResource {
                 binding: t.binding,
                 format: shader_fmt,
@@ -3560,7 +3552,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     }
                 }),
                 seed_skipped: t.seed_skipped,
-                host_writeback,
                 defer_readback,
             });
         } else {
@@ -3660,17 +3651,14 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     };
     if out.buffers.len() != buffer_writable_count
         || out.images.len() != storage_count
-        || out.images_direct.len() != storage_count
         || out.images_deferred.len() != storage_count
     {
         crate::observe::fail(format!(
-            "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{} direct={}/{} deferred={}/{}",
+            "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{} deferred={}/{}",
             acc.pipeline_ref,
             out.buffers.len(),
             buffer_writable_count,
             out.images.len(),
-            storage_count,
-            out.images_direct.len(),
             storage_count,
             out.images_deferred.len(),
             storage_count
@@ -3680,7 +3668,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let vk_engine::ComputeOutput {
         buffers: output_buffers,
         images: output_images,
-        images_direct: output_images_direct,
         images_deferred: output_images_deferred,
     } = out;
     for buffer in output_buffers {
@@ -3708,11 +3695,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return e;
         }
     }
-    for (((t, bytes), direct), deferred) in staged_tex
+    for ((t, bytes), deferred) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
         .zip(output_images)
-        .zip(output_images_direct)
         .zip(output_images_deferred)
     {
         if deferred {
@@ -3826,28 +3812,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ));
             continue;
         }
-        if direct {
-            // The engine DMA'd the dispatch output straight into the guest
-            // window; keep the protocol bookkeeping the CPU write would do
-            // (exact-window residency invalidation + generation bump).
-            let TextureWriteback::Type11 {
-                mapping_id,
-                surface_offset,
-                span_end,
-                ..
-            } = &t.writeback
-            else {
-                crate::observe::fail(format!(
-                    "compute_direct_writeback fail reason=non_type11_direct pipe={} bind={}",
-                    acc.pipeline_ref, t.binding
-                ));
-                return ComputeStatus::MetalFailed("compute_vk_direct_non_type11");
-            };
-            state.invalidate_storage_residency_window(*mapping_id, *surface_offset, *span_end);
-            let _ = state.mark_mapping_written(*mapping_id);
-            note_storage_residency_writeback(state, t);
-            continue;
-        }
         t.bytes = bytes;
         if let Err(e) = writeback_texture(state, host, task_id, t) {
             return e;
@@ -3874,55 +3838,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
 
 #[cfg(feature = "backend-vulkan")]
 const COMPUTE_ENGINE_STALL_PROXY_MS: u64 = 2_000;
-
-/// Resolve a GPU-direct writeback window for a staged type-11 storage image:
-/// the contig host view of the destination mapping plus the surface window,
-/// for the engine to import (VK_EXT_external_memory_host) and copy into
-/// instead of the host-visible readback buffer. `None` keeps the CPU
-/// writeback path — correct, just slower. Texel-size/stride checks live
-/// engine-side (it knows the view format); the host-pointer conditions are
-/// checked here where the mapping is nameable.
-#[cfg(feature = "backend-vulkan")]
-fn plan_direct_writeback<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    tex: &StagedTexture,
-    align: Option<u64>,
-) -> Option<crate::backend::vulkan::engine::ComputeHostWriteback> {
-    let align = align?;
-    let TextureWriteback::Type11 {
-        mapping_id,
-        surface_offset,
-        surface_bpr,
-        span_end,
-        ..
-    } = &tex.writeback
-    else {
-        return None;
-    };
-    let (mapping_id, surface_offset, surface_bpr, span_end) =
-        (*mapping_id, *surface_offset, *surface_bpr, *span_end);
-    let Some((ptr, len)) = mapping_write::contig_ptr_for_span(state, host, mapping_id, span_end)
-    else {
-        // Fragmented mapping: the CPU multi-import writeback stays in charge.
-        crate::observe::off(format!(
-            "compute_direct_writeback skip reason=no_contig mid={mapping_id} span_end={span_end}"
-        ));
-        return None;
-    };
-    if !(ptr as u64).is_multiple_of(align) {
-        crate::observe::off(format!(
-            "compute_direct_writeback skip reason=ptr_align mid={mapping_id} ptr={ptr:#x} align={align}"
-        ));
-        return None;
-    }
-    Some(crate::backend::vulkan::engine::ComputeHostWriteback {
-        ptr,
-        len,
-        buffer_offset: surface_offset,
-        row_bytes: surface_bpr,
-    })
-}
 
 /// Measurement-only watchdog for backend calls that cannot be bounded by a
 /// Vulkan fence timeout (notably pipeline creation and some driver submits).

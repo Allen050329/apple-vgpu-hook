@@ -51,16 +51,15 @@ pub use init_decline::InitDecline;
 pub use reason::DrawReason;
 pub use types::{
     BlendFactor, BlendOp, BlendStateResource, BufferContent, ComputeBufferOutput,
-    ComputeBufferResource, ComputeHostWriteback, ComputeOutput, ComputeRequest,
-    ComputeResidentSampleBind, ComputeSampledImageResource, ComputeStorageImageResource,
-    ComputeStorageResidency, CullMode, DepthState, DrawError, DrawOutput, DrawRequest, DrawTicket,
-    GuestRun, GuestRunSource, IndexType, IndexedDrawResource, LoadOp, PrimitiveTopology,
-    SampledContentIdentity, SampledImageResource, SampledSource, SamplerAddressMode,
-    SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource,
-    ScissorResource, SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState,
-    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
-    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
-    COLOR_INPUT_BINDING,
+    ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
+    ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
+    DepthState, DrawError, DrawOutput, DrawRequest, DrawTicket, GuestRun, GuestRunSource,
+    IndexType, IndexedDrawResource, LoadOp, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
+    SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
+    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    StorageImageFormat, TargetIdentity, VertexAttributeFormat, VertexAttributeResource,
+    VertexStepFunction, ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
 };
 pub use vk_call::{VkCall, VkOp};
 #[cfg(all(feature = "host-window", target_os = "macos"))]
@@ -449,7 +448,6 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
 enum EngineProbe {
     HostImportContext,
     HostImportPools,
-    ComputeWritebackAlignment,
     StorageWriteWithoutFormat,
     ComputeCapable,
     SampledR32fLinearFilter,
@@ -460,19 +458,20 @@ impl EngineProbe {
         match self {
             Self::HostImportContext => "host_import_context",
             Self::HostImportPools => "host_import_pools",
-            Self::ComputeWritebackAlignment => "compute_writeback_alignment",
             Self::StorageWriteWithoutFormat => "storage_write_without_format",
             Self::ComputeCapable => "compute_capable",
             Self::SampledR32fLinearFilter => "sampled_r32f_linear_filter",
         }
     }
 
-    /// 1, 2 and 3 are retired (see the type's docs); numbering resumes at 4.
+    /// 1, 2, 3 and 6 are retired (see the type's docs); the rest keep the
+    /// numbers they were first logged under. 6 was
+    /// `compute_writeback_alignment`, whose probe went out with the GPU-direct
+    /// compute writeback.
     fn discriminant(self) -> u64 {
         match self {
             Self::HostImportContext => 4,
             Self::HostImportPools => 5,
-            Self::ComputeWritebackAlignment => 6,
             Self::StorageWriteWithoutFormat => 7,
             Self::ComputeCapable => 8,
             Self::SampledR32fLinearFilter => 9,
@@ -561,28 +560,6 @@ pub fn compute_resident_sample_source(
 pub fn unpin_resident_storage(identity: &crate::model::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
     guard.pools.pin_resident_storage(identity, false);
-}
-
-/// Minimum imported-host-pointer alignment for GPU-direct compute writeback,
-/// or `None` when `VK_EXT_external_memory_host` is unavailable. Ensures the
-/// device (first caller pays context creation, like any dispatch would).
-pub fn compute_host_writeback_alignment() -> Option<u64> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = match owner.ensure(counters) {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            engine_probe_decline(EngineProbe::ComputeWritebackAlignment, &error)
-                .fail_once(EngineProbe::ComputeWritebackAlignment.discriminant());
-            return None;
-        }
-    };
-    ctx.ext_external_memory_host.as_ref()?;
-    Some(ctx.min_imported_host_pointer_alignment.max(1))
 }
 
 /// True when the device supports format-less storage-image writes
@@ -1669,7 +1646,6 @@ mod probe_visibility_tests {
         for probe in [
             EngineProbe::HostImportContext,
             EngineProbe::HostImportPools,
-            EngineProbe::ComputeWritebackAlignment,
             EngineProbe::StorageWriteWithoutFormat,
             EngineProbe::ComputeCapable,
         ] {
