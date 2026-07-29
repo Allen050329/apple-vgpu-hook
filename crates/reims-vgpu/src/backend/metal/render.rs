@@ -11,9 +11,7 @@ use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask, set_line_width,
 };
-use crate::backend::metal::runtime::{
-    new_buffer_from_host, system_device, take_native_color_format, thread_queue,
-};
+use crate::backend::metal::runtime::{new_buffer_from_host, system_device, thread_queue};
 use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
 use crate::backend::metal::util::{
     bytes_of, clear_err, f32_from_bits, image_len, rgba_len, sampler_index, set_err, texture_index,
@@ -1447,97 +1445,6 @@ mod attachment_decline_tests {
             "metal_attachment_test reason=metal_render_stencil_store_action_unsupported class=args store_action=4294967295"
         );
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn render_core(
-    vert_mtlb: &[u8],
-    frag_mtlb: &[u8],
-    width: u32,
-    height: u32,
-    vertex_count: usize,
-    first_vertex: usize,
-    instance_count: usize,
-    base_instance: usize,
-    primitive_type: u32,
-    primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
-    indexed: Option<&ReimsVgpuIndexedDraw>,
-    attrs: &[ReimsVgpuVertexAttr],
-    buffers: &[ReimsVgpuBuffer],
-    frag_buffers: &[ReimsVgpuBuffer],
-    vertex_images: &[ReimsVgpuSampledImage],
-    vertex_samplers: &[ReimsVgpuSampler],
-    images: &[ReimsVgpuSampledImage],
-    samplers: &[ReimsVgpuSampler],
-    viewports: &[ReimsVgpuViewport],
-    scissors: &[ReimsVgpuScissor],
-    raster: Option<&ReimsVgpuRasterState>,
-    depth_bias: Option<&ReimsVgpuDepthBiasState>,
-    depth_stencil: Option<&ReimsVgpuDepthStencilState>,
-    stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
-    depth_attachment: Option<&mut ReimsVgpuDepthAttachment>,
-    stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
-    blend: Option<&ReimsVgpuBlendState>,
-    mut color_pixel_format: u32,
-    target_rgba8: Option<&[u8]>,
-    out_rgba: Option<&mut [u8]>,
-    err: ErrOut<'_>,
-) -> Status {
-    if color_pixel_format == 0 {
-        let tl = take_native_color_format();
-        if tl != 0 {
-            color_pixel_format = tl;
-        }
-    }
-    let mut single = ColorRt {
-        slot: 0,
-        pixel_format: color_pixel_format,
-        seed_rgba8: target_rgba8,
-        out_rgba8: out_rgba,
-        clear_r: 0.0,
-        clear_g: 0.0,
-        clear_b: 0.0,
-        clear_a: 0.0,
-        // Single-RT helper: Load when seeded, else Clear (legacy callers).
-        load_action: if target_rgba8.is_some() {
-            crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD
-        } else {
-            crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_CLEAR
-        },
-        blend: blend.copied(),
-        guest_tex: None,
-    };
-    render_core_mrt(
-        vert_mtlb,
-        frag_mtlb,
-        width,
-        height,
-        vertex_count,
-        first_vertex,
-        instance_count,
-        base_instance,
-        primitive_type,
-        primitive_indirect,
-        indexed,
-        attrs,
-        buffers,
-        frag_buffers,
-        vertex_images,
-        vertex_samplers,
-        images,
-        samplers,
-        viewports,
-        scissors,
-        raster,
-        depth_bias,
-        depth_stencil,
-        stencil_reference,
-        depth_attachment,
-        stencil_attachment,
-        blend,
-        std::slice::from_mut(&mut single),
-        err,
-    )
 }
 
 /// Multi-render-target encode: one Metal pass with color attachments at given slots.

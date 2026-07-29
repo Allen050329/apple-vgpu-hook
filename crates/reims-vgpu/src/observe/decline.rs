@@ -1393,12 +1393,10 @@ pub const REGISTRY: &[DeclineClass] = &[
         type_name: "Status",
         defined_in: "backend/metal/error.rs",
         slug_blocks: &[],
-        // `ffi.rs` emits the status directly. The product render and compute
-        // rails call the same helpers without crossing C: they retain Status
-        // inside EncodeStatus / ComputeStatus, whose final record boundaries
-        // delegate its exact slug and structured fields to the sink.
+        // The product render and compute rails never cross C: they retain
+        // Status inside EncodeStatus / ComputeStatus, whose final record
+        // boundaries delegate its exact slug and structured fields to the sink.
         emission: Emission::At(&[
-            ("backend/metal/ffi.rs", "metal_ffi"),
             ("runtime/exec.rs", "draw_encode_fail"),
             ("runtime/exec.rs", "compute_record"),
             ("backend/metal/runtime.rs", "metal_buffer_copy_fallback"),
@@ -1417,8 +1415,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         slug_calls: &[
             ("backend/metal/compute.rs", "Status::args"),
             ("backend/metal/compute.rs", "Status::execute"),
-            ("backend/metal/ffi.rs", "Status::args"),
-            ("backend/metal/ffi.rs", "Status::execute"),
             ("backend/metal/function.rs", "Status::args"),
             ("backend/metal/function.rs", "Status::execute"),
             ("backend/metal/render.rs", "Status::args"),
@@ -1486,9 +1482,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "metal_compute_writeback_buffer_count_mismatch",
             "metal_compute_writeback_image_count_mismatch",
             "metal_compute_writeback_storage_format_unsupported",
-            "metal_ffi_slice_pointer_null",
-            "metal_ffi_status_entry_panicked",
-            "metal_ffi_void_entry_panicked",
             "metal_function_count_not_one",
             "metal_function_library_create_failed",
             "metal_function_lookup_failed",

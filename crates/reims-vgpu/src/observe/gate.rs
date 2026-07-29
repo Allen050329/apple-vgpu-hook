@@ -999,12 +999,13 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (68, 1540): `compute_dispatch_no_backend` was written only
-        // inside a block whose cfg is `all(not(backend-vulkan), backend-vulkan)`
-        // — a contradiction, so no configuration ever compiled it. The gates
-        // below cannot see that: they grep for the slug literal in the source,
-        // and the literal was there. The type count is unchanged.
-        (68, 1539),
+        // Down from (68, 1539): the three `metal_ffi_*` slugs left with
+        // `backend/metal/ffi.rs`, the Metal C ABI whose 15 `#[no_mangle]`
+        // entry points no caller outside the crate ever named. They guarded
+        // the C boundary itself — a null slice pointer, a panic unwinding into
+        // C — so with no boundary there is no refusal left to make. `Status`
+        // keeps its other emission sites; the type count is unchanged.
+        (68, 1536),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

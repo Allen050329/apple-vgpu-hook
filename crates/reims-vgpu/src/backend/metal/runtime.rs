@@ -42,7 +42,6 @@ struct GuestBackedTex {
 
 thread_local! {
     static QUEUE: RefCell<Option<CommandQueue>> = const { RefCell::new(None) };
-    static COLOR_PIXEL_FORMAT: RefCell<u32> = const { RefCell::new(0) };
 }
 
 /// Texture aliasing the guest surface bytes for `mapping_id`.
@@ -199,18 +198,6 @@ pub fn thread_queue(device: &Device) -> CommandQueue {
         *q.borrow_mut() = Some(queue.clone());
         queue
     })
-}
-
-pub fn begin_native_color_format(pixel_format: u32) {
-    COLOR_PIXEL_FORMAT.with(|c| *c.borrow_mut() = pixel_format);
-}
-
-pub fn end_native_color_format() {
-    COLOR_PIXEL_FORMAT.with(|c| *c.borrow_mut() = 0);
-}
-
-pub fn take_native_color_format() -> u32 {
-    COLOR_PIXEL_FORMAT.with(|c| *c.borrow())
 }
 
 fn no_copy_buffer_length_status(requested_len: usize, actual_len: u64) -> Status {

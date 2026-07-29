@@ -5,8 +5,9 @@
 //!   [`vulkan::engine`]).
 //! - Draws, compute and blits do **not** come through this module. The live
 //!   seams are `runtime/metal_draw::try_metal2vulkan_draw` → [`vulkan::engine`]
-//!   on the Vulkan rail and the C ABI in `metal::ffi` on the Metal rail; the
-//!   runtime drives them directly.
+//!   on the Vulkan rail and `metal::render::render_core_mrt` /
+//!   `metal::compute::compute_core` on the Metal rail; the runtime drives them
+//!   directly.
 //!
 //! Metal indices/semantics are canonical (guest wire is serialized Metal).
 //! Vulkan-only binding rewrites live only in [`vulkan`].

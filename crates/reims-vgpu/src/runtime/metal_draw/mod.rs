@@ -2,7 +2,7 @@
 //!
 //! Loads per-function MTLB containers from the object list, materializes stream
 //! binds (vertex/fragment buffers, optional index buffer, viewport/scissor),
-//! calls [`crate::backend::metal::render::render_core`], and writes the RGBA
+//! calls [`crate::backend::metal::render::render_core_mrt`], and writes the RGBA
 //! result into the type-11 mapping via [`mapping_write`].
 
 #[cfg(feature = "backend-vulkan")]
@@ -1859,7 +1859,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         &mut color_rts,
         err,
     );
-    // Keep owned storage live through render_core (ReimsVgpu* hold raw pointers).
+    // Keep owned storage live through render_core_mrt (ReimsVgpu* hold raw pointers).
     let _ = (
         &vtx_storage,
         &frag_storage,
