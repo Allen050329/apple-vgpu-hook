@@ -78,8 +78,9 @@ pub mod runtime;
 pub mod backend;
 pub mod qemu;
 
-/// Host-owned presentation window (winit + VkSurfaceKHR). Off by default; see
-/// [[host-window]] and `.agents/host-window-plan.md`.
+/// Host-owned presentation window (winit + VkSurfaceKHR) — see
+/// [[host-window]]. The `host-window` feature implies `backend-vulkan`, and is
+/// enabled for every verification command the x86 pathway is checked with.
 #[cfg(feature = "host-window")]
 pub mod host_window;
 

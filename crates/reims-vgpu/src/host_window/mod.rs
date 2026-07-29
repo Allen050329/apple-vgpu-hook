@@ -2,17 +2,20 @@
 //! window with its own `VkSurfaceKHR`/swapchain that replaces QEMU's built-in UI
 //! and presents the engine frame directly, keeping the C/QEMU side thin.
 //!
-//! Gated behind the `host-window` cargo feature (off by default, so the QEMU
-//! staticlib link is unchanged until the window is proven).
+//! Gated behind the `host-window` cargo feature, which implies `backend-vulkan`.
+//! It is the display path the x86 pathway is verified on, so the feature is
+//! enabled in every command under "Verification" in `AGENTS.md`.
 //!
-//! Layers, built incrementally (see `.agents/host-window-plan.md`):
-//! - [`input_map`] — pure winit-event → neutral input mapping (this file's
-//!   sibling). No window needed; unit-tested off-VM. **Landed.**
-//! - present thread — winit event loop on a dedicated thread, `VkSurfaceKHR` on
-//!   the engine `VkInstance`, swapchain acquire → blit latest frame → present.
-//!   *Next.*
-//! - producer glue — feed [`input_map`] output onto the prompt action queue via
-//!   the thread-safe `notify_actions` path.
+//! Three pieces:
+//! - [`input_map`] — winit event → neutral [`crate::runtime::HostAction`]. Pure
+//!   mapping, no window state, unit-tested off-VM.
+//! - [`present`] — the window itself: event loop, surface, swapchain, and the
+//!   acquire → blit → present loop. It also drives [`input_map`] and hands each
+//!   action to an `InputSink`; `lib.rs` wires that to the device's prompt action
+//!   queue through QEMU's thread-safe `notify_actions` callback.
+//! - [`viewport`] — letterbox/scale arithmetic mapping guest framebuffer extent
+//!   to window extent, shared by the blit and by input coordinate translation so
+//!   a click lands where the pixel was drawn.
 
 pub mod input_map;
 pub mod present;

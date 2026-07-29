@@ -56,9 +56,8 @@
 /// What happens to one decoded Metal command/descriptor field on the Vulkan
 /// pathway.
 ///
-/// The plan that produced this module sketched three states and typed the
-/// declining one as a `TranslateReason`. Writing it out found that wrong twice
-/// over. The fail-visible declines on this path are `observe` slugs, not
+/// Three states, with the declining one typed as a `TranslateReason`, is the
+/// obvious shape and it is wrong twice over. The fail-visible declines on this path are `observe` slugs, not
 /// translation failures — the field translated fine, the *rail* cannot carry
 /// it — and, more importantly, there turned out to be a fourth state the sketch
 /// had no room for: decoded, dropped, and **silent**. Forcing those into
@@ -1224,10 +1223,8 @@ pub const MANIFEST: &[DescriptorFamily] = &[
 /// Whole decode structs that are transport envelopes rather than guest GPU
 /// state.
 ///
-/// The Phase-6 audit found 43 public structs and 21 public enums under
-/// `runtime/decode/` (the plan's earlier “63 structs” shorthand combined the
-/// two categories and predates `DisplayTimingEntry`). Every struct not named
-/// here is field-exhaustive in [`MANIFEST`].
+/// `runtime/decode/` holds 43 public structs and 21 public enums. Every struct
+/// not named here is field-exhaustive in [`MANIFEST`].
 pub const DECODE_STRUCT_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "stream::Segment",

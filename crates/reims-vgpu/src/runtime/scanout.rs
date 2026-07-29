@@ -209,7 +209,7 @@ pub fn capture_present_frame(
     }
     note_display_action(state, mapping_id, width, height);
     state.advance_present_epoch();
-    // --- Direct-present readback elision (step 2 of the CPU-readback removal) ---
+    // --- Direct-present readback elision ---
     // When the previous present's window publish carried the frame as a zero-copy
     // dmabuf (route B, `dmabuf_active`), the display reads the GPU resident
     // directly and does NOT consume this CPU capture. The ~8-12 ms guest-page

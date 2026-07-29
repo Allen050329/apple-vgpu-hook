@@ -2,13 +2,15 @@
 //! own `VkSurfaceKHR`/swapchain that presents the guest frame, replacing QEMU's
 //! UI ([[host-window]]).
 //!
-//! v1 scope (this file): open the window, build a swapchain, and drive an
-//! acquire → clear/blit → present loop; translate window input via
-//! [`super::input_map`] and hand each [`HostAction`] to the [`InputSink`] (the
-//! device wires that to the prompt action queue). The frame source is a
-//! CPU-BGRA [`FrameSlot`] the device fills from its present capture — a working
-//! window first; sharing the engine's `VkDevice` to present its resident image
-//! with zero copy is the direct-present increment (see the plan).
+//! This file opens the window, builds a swapchain, and drives an acquire →
+//! clear/blit → present loop; it translates window input via
+//! [`super::input_map`] and hands each [`HostAction`] to the [`InputSink`] (the
+//! device wires that to the prompt action queue).
+//!
+//! The frame source is a CPU-BGRA [`FrameSlot`] the device fills from its
+//! present capture, so a frame crosses host memory once on its way to the
+//! window. Presenting the engine's resident image directly on a shared
+//! `VkDevice` would remove that copy and is not implemented.
 //!
 //! Linux owns the event loop on a dedicated thread. macOS requires AppKit work
 //! on the process main thread, so QEMU creates it through
