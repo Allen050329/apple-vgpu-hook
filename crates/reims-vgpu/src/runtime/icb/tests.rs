@@ -440,12 +440,48 @@ fn assert_target_is_shader_solid(
     mapping_id: u32,
     what: &str,
 ) {
+    assert_target_texels(state, host, mapping_id, [34, 68, 102, 255], 2, what);
+}
+
+/// Same readback for the stage-in shaders, whose blue channel carries the
+/// surface id so a test can tell which surface the stage-in attributes came
+/// from. Tolerance is +/-1 rather than +/-2 because these write exact byte
+/// values rather than a float4 that has to round.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn assert_stagein_solid(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    sid: u8,
+    what: &str,
+) {
+    assert_target_texels(
+        state,
+        host,
+        mapping_id,
+        [0x22, 0x44, 0x60 + sid, 0xff],
+        1,
+        what,
+    );
+}
+
+/// Read back [`map_draw_target`]'s 4x4 surface and assert every texel is `want`
+/// within `tol` per channel. `what` names the command shape under test so a
+/// failure says which of the twenty-nine callers produced the wrong pixels.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn assert_target_texels(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    want: [u8; 4],
+    tol: i32,
+    what: &str,
+) {
     let mut back = vec![0u8; 4 * 4 * 4];
     assert!(mapping_write::read_rect_raw(
         state, host, mapping_id, 0, 0, 4, 4, &mut back, 16
     ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= tol;
     for (p, px) in back.chunks_exact(4).enumerate() {
         assert!(
             near(px[0], want[0])
@@ -1762,21 +1798,7 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
         "negative baseVertex stage_in DrawIndexed"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (baseVertex=-1)"
-        );
-    }
+    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "baseVertex=-1");
 }
 
 #[test]
@@ -2189,21 +2211,13 @@ fn fill_render_draw_indexed_execute_oracle() {
     );
 
     // BGRA writeback: B=0x22 G=0x44 R=0x67 A=0xff (oracle sid=7).
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (ICB DrawIndexed oracle)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "ICB DrawIndexed oracle",
+    );
 }
 
 /// Buffer-backed DrawIndexed: encode slot → 0x1d1 associate → execute re-fill.
@@ -2336,21 +2350,13 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (buffer-backed DrawIndexed)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "buffer-backed DrawIndexed",
+    );
 }
 
 /// Wire-backed E2E: DrawPatches tessellation.
@@ -3880,21 +3886,13 @@ fn inherit_buffers_encoder_fragment_color() {
         "inheritBuffers encoder fragment path"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (inheritBuffers encoder)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "inheritBuffers encoder",
+    );
 }
 
 /// inheritPipelineState=true: ICB slot records only buffers+draw; PSO
@@ -4039,21 +4037,13 @@ fn inherit_pipeline_encoder_fragment_color() {
         "inheritPipelineState encoder fragment path"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (inheritPipelineState encoder)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "inheritPipelineState encoder",
+    );
 }
 
 #[test]
@@ -4207,21 +4197,7 @@ fn fill_render_stagein_draw_execute_oracle() {
         "stage_in ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (ICB stage_in)"
-        );
-    }
+    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "ICB stage_in");
 }
 
 /// Dedicated wire-backed E2E: classic Draw (`0x1`) with stage_in vertex
@@ -4326,21 +4302,13 @@ fn wire_backed_draw_primitives_stagein_e2e() {
         "wire-backed Draw primitives execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed Draw stage_in)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "wire-backed Draw stage_in",
+    );
 }
 
 #[test]
@@ -4536,21 +4504,13 @@ fn fill_render_attribute_stride_stagein_execute() {
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (attributeStride stage_in)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "attributeStride stage_in",
+    );
 }
 
 /// Dedicated wire-backed E2E: vertex attributeStride=16 through command
@@ -4660,21 +4620,13 @@ fn wire_backed_attribute_stride_stagein_e2e() {
         "wire-backed attributeStride execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed attributeStride)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "wire-backed attributeStride",
+    );
 }
 
 #[test]
@@ -5727,21 +5679,13 @@ fn fill_render_nonzero_bind_offset_oracle() {
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (nonzero bind offset)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "nonzero bind offset",
+    );
     let _ = (index_base, color_base);
 }
 
@@ -5859,19 +5803,5 @@ fn buffer_backed_nonzero_wire_va_offset() {
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire_va offset)"
-        );
-    }
+    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "wire_va offset");
 }
