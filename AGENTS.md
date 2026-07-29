@@ -50,6 +50,34 @@ so `/tmp/reims-vgpu-fail.log` explains what happened.
 Expected control flow should stay quiet. A resolver saying "not ready yet" or an intentionally
 unbound `ref == 0` is not a failure. A real loss of guest work is.
 
+**A census is not a decline, and the difference is whether anything else reports the loss.** This
+codebase grew a large family of "always-on proxies" that summarised how often each path ran, and the
+rule above is what they cited for existing. Most of them were not reporting losses at all. The test
+that separates them, applied to twelve such modules, is one question: *if this census were deleted,
+would a dropped guest command become invisible?*
+
+- If the refusal already emits a typed decline at the point it refuses, the census only tracked its
+  *rate*. `present_import::note(false, true)` sat on the line directly above
+  `Emit::decline("import_present", &d).fail()`. Delete the census; the decline is the report.
+- If the census is the only record, it must stay — or better, become a typed decline.
+  `window_publish::note(false)` is the sole evidence that a captured frame never reached the window,
+  and its own comment says the interesting signal is a sustained run. Deleting that manufactures the
+  silent failure this section forbids.
+- A tally of *successful* work — residents released by the idle sweep, teardowns counted, which
+  source served a capture, microseconds per sub-step — never had a claim under this rule.
+
+Two tells make this cheap to check. A census that carries no typed decline slug is almost always a
+tally: the decline registry baseline in `observe/gate.rs` did not move across four separate commits
+that removed nine such modules. And a line whose text says `ok`, `stage_ok`, `resident_ready=1` or
+`retain` is narrating the success path, whatever sink it was written to.
+
+**Cost hides behind "measure-only".** The proxies here were not free, and the comments admitted it
+in situ: "2-3 ms per display-sized storage image on the stamp path", "the full-frame stats scan
+exists only for the verbose line". Removed in this family: a GPU compute reduction dispatched every
+present, a SIMD census fused into every readback, an O(w·h) scan of every bound texture on every
+draw, and a full read-back of the guest window on every Store. Before writing `// Measure-only` on
+something, price it at the rate it will actually run.
+
 ### Measure Before Fixing
 
 You cannot fix what you cannot measure. If we do not know what class of failure we are fixing, we
