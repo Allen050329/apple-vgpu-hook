@@ -659,7 +659,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::Unsupported, "t11_fmt_bpp"));
         };
         let Some((surface_offset, surface_bpr, span_end)) =
-            mapping_write::type11_sample_window(m, tex_w, tex_h, format)
+            mapping_write::type11_sample_window(m, mapping_id, tex_w, tex_h, format)
         else {
             return Err(br(BlitStatus::Bounds, "t11_sample_window"));
         };
@@ -720,7 +720,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             return Err(br(BlitStatus::Unsupported, "t5_fmt_bpp"));
         };
         let Some((surface_offset, surface_bpr, span_end)) =
-            mapping_write::type11_sample_window(m, view.width, view.height, format)
+            mapping_write::type11_sample_window(m, sid, view.width, view.height, format)
         else {
             return Err(br(BlitStatus::Bounds, "t5_sample_window"));
         };

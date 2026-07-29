@@ -1694,7 +1694,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         (offset, bpr, end)
                     })
             }
-            None => mapping_write::type11_sample_window(m, width, height, stage_fmt),
+            None => mapping_write::type11_sample_window(m, mapping_id, width, height, stage_fmt),
         };
         let (surface_offset, surface_bpr, span_end) = match window {
             Some(w) => w,

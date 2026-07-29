@@ -20,8 +20,27 @@ use crate::runtime::mapper;
 /// dims and bpe match the texture (`sample_window_prefer_device`). Falls back
 /// to packed invent `ALIGN_UP(w×bpp, 128)` when the descriptor is missing or
 /// rejects. Returns `(surface_offset, bytes_per_row, span_end)`.
+///
+/// # The invent fallback is reported
+///
+/// Type-11 is the case with **no wire plane index** — unlike
+/// [`type5_sample_window`], nothing on the wire names which plane the texture
+/// wants, so a multi-plane surface is resolved by matching width, height and
+/// bytes-per-element. That scan takes the plane only when **exactly one**
+/// matches; zero matches and two-or-more matches both fall through to the
+/// invented packed window, which is plane 0's bytes at offset 0. On a
+/// multi-plane surface that is a bind of the wrong plane, and it is the case the
+/// geometry scan cannot detect by construction.
+///
+/// So the fallback is not silent. `type11_window_invent` is emitted through the
+/// always-on channel, deduped per (mapping, geometry, format), carrying the
+/// surface's plane count so a reader can tell "no descriptor yet" (plane_count
+/// unknown) from "the scan could not pick a plane" (plane_count > 1). The three
+/// `mapper.rs` callers of `sample_window_prefer_device` legitimately ignore this
+/// — they want `span_end` only, as a floor on how many pages to map.
 pub fn type11_sample_window(
     m: &MappingEntry,
+    mapping_id: u32,
     width: u32,
     height: u32,
     format: u16,
@@ -31,7 +50,28 @@ pub fn type11_sample_window(
     } else {
         None
     };
-    sample_window_prefer_device(desc, None, format, width, height).map(|(o, b, e, _)| (o, b, e))
+    let (offset, bpr, end, from_device) =
+        sample_window_prefer_device(desc, None, format, width, height)?;
+    if !from_device
+        && crate::observe::first_sight(
+            "type11_window_invent",
+            u64::from(mapping_id) << 48
+                | u64::from(width) << 32
+                | u64::from(height) << 16
+                | u64::from(format),
+        )
+    {
+        let planes = desc
+            .and_then(crate::contract::iosurface_pages::decode_device_surface)
+            .map(|s| i64::from(s.plane_count))
+            .unwrap_or(-1);
+        crate::observe::off(format!(
+            "type11_window_invent mapping={mapping_id} {width}x{height} fmt={format:#x} \
+             planes={planes} offset={offset} bpr={bpr} span_end={end} (no wire plane index and \
+             the device descriptor did not resolve one; this window is plane 0 packed)"
+        ));
+    }
+    Some((offset, bpr, end))
 }
 
 /// Sample window for a type-5 serialized view, which — unlike type-11 —
@@ -119,7 +159,8 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     if mw != width || mh != height {
         return false;
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
+    else {
         return false;
     };
     // Deferred-writeback flush-on-access: land pending resident content in
@@ -275,7 +316,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     if mw != width || mh != height {
         return false;
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
+    else {
         return false;
     };
     let bpr = bpr_u32 as u64;
@@ -578,7 +620,9 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, m.width, m.height, format) else {
+    let Some((base_off, bpr, span_end)) =
+        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    else {
         return false;
     };
     let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
@@ -796,7 +840,9 @@ pub fn write_rect_raw<M: HostMemory + HostOps>(
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, m.width, m.height, format) else {
+    let Some((base_off, bpr, span_end)) =
+        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    else {
         return false;
     };
     let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
@@ -1777,6 +1823,7 @@ mod tests {
             let m = state.mappings.get(&mid).unwrap();
             type11_sample_window(
                 m,
+                mid,
                 4,
                 4,
                 crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,

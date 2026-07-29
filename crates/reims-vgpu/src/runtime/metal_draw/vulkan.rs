@@ -1960,7 +1960,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             _ => return Err(Reason::BadFormat),
         };
         let (base_off, bpr_u32, _span_end) =
-            type11_sample_window(m, w, h, format).ok_or(Reason::NoWindow)?;
+            type11_sample_window(m, mid, w, h, format).ok_or(Reason::NoWindow)?;
         (native, base_off, bpr_u32 as u64)
     };
     let tight = (w as u64)
@@ -4578,7 +4578,7 @@ fn surface_store_defer_eligible(
     // is going to be refused just moves the refusal somewhere it reads as a
     // lost flush, so gate on the same thing up front.
     let (surface_offset, surface_bpr, span_end) =
-        crate::runtime::mapping_write::type11_sample_window(m, w, h, c0.format)?;
+        crate::runtime::mapping_write::type11_sample_window(m, c0.mapping_id, w, h, c0.format)?;
     Some(crate::model::ComputeStorageResidencyKey {
         mapping_id: c0.mapping_id,
         map_generation: m.map_generation,
