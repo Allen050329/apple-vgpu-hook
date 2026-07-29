@@ -4,7 +4,6 @@
 
 use ash::vk;
 use std::collections::BTreeSet;
-use std::time::Instant;
 
 use super::caches::{BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches};
 use super::compute_execution::ComputeExecutionDecline;
@@ -512,29 +511,18 @@ pub(crate) unsafe fn execute_compute_inner(
     counters: &EngineCounters,
     req: &ComputeRequest,
 ) -> Result<ComputeOutput, DrawError> {
-    let t0 = Instant::now();
     validate_compute(req)?;
     let force_loss = owner.force_device_lost;
     if force_loss {
         owner.force_device_lost = false;
     }
-    let context_started = Instant::now();
     let ctx = owner.ensure(counters)?;
-    counters.context_us.fetch_add(
-        context_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
     if !ctx.compute_capable {
         return Err(DrawError::Unsupported(
             super::reason::DrawReason::NoCombinedGraphicsComputeQueue,
         ));
     }
-    let pool_init_started = Instant::now();
     pools.ensure_init(ctx, counters)?;
-    counters.pool_init_us.fetch_add(
-        pool_init_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
@@ -575,7 +563,6 @@ pub(crate) unsafe fn execute_compute_inner(
         bindings: layout_bindings,
     };
 
-    let cache_started = Instant::now();
     let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let cpipe_key = ComputePipelineKey {
@@ -600,14 +587,8 @@ pub(crate) unsafe fn execute_compute_inner(
         caches.cache_prepared_dispatch(cpipe_key.clone(), pipe);
         pipe
     };
-    counters.cache_us.fetch_add(
-        cache_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
-    let resource_started = Instant::now();
-    let storage_prepare_started = Instant::now();
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
         let slot = pools.acquire_staging(
@@ -624,15 +605,10 @@ pub(crate) unsafe fn execute_compute_inner(
             resource.writable,
         ));
     }
-    counters.storage_prepare_us.fetch_add(
-        storage_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Sampled images: device-local + staging seed upload — or a device-local
     // copy from a resident storage image (copy-on-sample: the transient never
     // aliases the live resident, so the same dispatch may storage-write it).
-    let sampled_prepare_started = Instant::now();
     let mut sampled_slots = Vec::new();
     for resource in &req.sampled_images {
         let key = StorageImageKey {
@@ -716,26 +692,16 @@ pub(crate) unsafe fn execute_compute_inner(
             height: resource.height,
         });
     }
-    counters.sampled_prepare_us.fetch_add(
-        sampled_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
-    let sampler_prepare_started = Instant::now();
     let mut sampler_handles = Vec::new();
     for sampler in &req.samplers {
         let handle = caches.get_or_create_sampler(ctx, &sampler.state_key(), counters, pools)?;
         sampler_handles.push((sampler.binding, handle));
     }
-    counters.sampler_prepare_us.fetch_add(
-        sampler_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Storage images: device-local + staging seed upload + readback buffer
     // (or a direct transfer-dst buffer over the caller's imported guest
     // window). The guard destroys direct allocations on every exit.
-    let storage_image_prepare_started = Instant::now();
     let mut simg_slots = Vec::new();
     let mut direct_allocs = DirectWritebackAllocs {
         device: ctx.device.clone(),
@@ -829,13 +795,8 @@ pub(crate) unsafe fn execute_compute_inner(
             residency: resource.residency,
         });
     }
-    counters.storage_image_prepare_us.fetch_add(
-        storage_image_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Descriptor set
-    let descriptor_prepare_started = Instant::now();
     // Owning pool block travels with the set for a correctly-routed free.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
     let dset = if dsl != vk::DescriptorSetLayout::null() {
@@ -912,18 +873,9 @@ pub(crate) unsafe fn execute_compute_inner(
     } else {
         None
     };
-    counters.descriptor_prepare_us.fetch_add(
-        descriptor_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    counters.resource_us.fetch_add(
-        resource_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
-    let t_record = Instant::now();
     ctx.device
         .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecResetCb, e)))?;
@@ -1376,10 +1328,6 @@ pub(crate) unsafe fn execute_compute_inner(
     ctx.device
         .end_command_buffer(cb)
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecEndCb, e)))?;
-    counters.record_us.fetch_add(
-        t_record.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     if force_loss {
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
@@ -1391,7 +1339,6 @@ pub(crate) unsafe fn execute_compute_inner(
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedCompute));
     }
 
-    let t_submit = Instant::now();
     let queue = ctx.queue();
     let cbs = [cb];
     let si = vk::SubmitInfo::default().command_buffers(&cbs);
@@ -1405,10 +1352,6 @@ pub(crate) unsafe fn execute_compute_inner(
         }
         Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ComputeExecSubmit, e))),
     }
-    counters.submit_us.fetch_add(
-        t_submit.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // A dispatch whose every output stays on the GPU (deferred storage-image
     // writebacks, no writable SSBO readbacks, no direct guest-window DMA) has
@@ -1435,12 +1378,7 @@ pub(crate) unsafe fn execute_compute_inner(
             .compute_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
-        let t_wait = Instant::now();
         pools.retire_all(ctx, counters)?;
-        counters.wait_us.fetch_add(
-            t_wait.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
     }
 
     for prepared in &simg_slots {
@@ -1453,7 +1391,6 @@ pub(crate) unsafe fn execute_compute_inner(
         }
     }
 
-    let t_rb = Instant::now();
     let mut buffers = Vec::with_capacity(
         storage_slots
             .iter()
@@ -1522,10 +1459,6 @@ pub(crate) unsafe fn execute_compute_inner(
         images_direct.push(false);
         images_deferred.push(false);
     }
-    counters.readback_us.fetch_add(
-        t_rb.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Cleanup was parked on the ring slot right after submit; nothing left
     // to free here (cleanup_us stays 0 on this path).
@@ -1533,10 +1466,6 @@ pub(crate) unsafe fn execute_compute_inner(
     counters
         .dispatches
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    counters.dispatch_us.fetch_add(
-        t0.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     Ok(ComputeOutput {
         buffers,

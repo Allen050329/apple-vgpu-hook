@@ -23,7 +23,6 @@ pub struct EngineCounters {
     pub compute_pipeline_hits: AtomicU64,
     pub compute_pipeline_misses: AtomicU64,
     pub dispatches: AtomicU64,
-    pub dispatch_us: AtomicU64,
     pub fence_timeouts: AtomicU64,
     /// Compute sampled-image bytes staged for host→device upload.
     pub compute_sampled_uploads: AtomicU64,
@@ -94,41 +93,10 @@ pub struct EngineCounters {
     /// VK_EXT_external_memory_host (workstream E) — zero CPU readback copy.
     pub import_presents: AtomicU64,
     // timing splits (microseconds, cumulative between resets)
-    pub lock_wait_us: AtomicU64,
-    pub context_us: AtomicU64,
-    pub pool_init_us: AtomicU64,
-    pub cache_us: AtomicU64,
-    pub shader_create_us: AtomicU64,
-    pub layout_create_us: AtomicU64,
-    pub pass_create_us: AtomicU64,
-    pub pipeline_create_us: AtomicU64,
-    pub sampler_create_us: AtomicU64,
-    pub resource_us: AtomicU64,
-    pub sampler_prepare_us: AtomicU64,
-    pub vertex_prepare_us: AtomicU64,
-    pub index_prepare_us: AtomicU64,
-    pub storage_prepare_us: AtomicU64,
-    pub storage_image_prepare_us: AtomicU64,
-    pub seed_prepare_us: AtomicU64,
-    pub target_prepare_us: AtomicU64,
-    pub sampled_prepare_us: AtomicU64,
-    pub readback_prepare_us: AtomicU64,
-    pub descriptor_prepare_us: AtomicU64,
-    /// Nested within the resource-preparation buckets above.
-    pub memory_alloc_us: AtomicU64,
-    pub pre_record_wait_us: AtomicU64,
-    pub record_us: AtomicU64,
-    pub submit_us: AtomicU64,
-    pub wait_us: AtomicU64,
-    pub readback_us: AtomicU64,
-    pub cleanup_us: AtomicU64,
     /// Post-submit fence waits skipped by all-deferred compute dispatches.
     pub compute_post_wait_skips: AtomicU64,
     /// Post-submit fence waits skipped by no-readback (resident-target) draws.
     pub render_post_wait_skips: AtomicU64,
-    /// Fence wait paid at a later entry to retire a predecessor that skipped
-    /// its post-submit wait (the moved wait cost).
-    pub retire_wait_us: AtomicU64,
     /// Entries that found the ring full and had to block on the oldest
     /// in-flight fence in begin_entry. This fires only when RING_DEPTH
     /// consecutive no-wait entries outrun the GPU.
@@ -244,7 +212,6 @@ impl EngineCounters {
             compute_pipeline_hits: self.compute_pipeline_hits.load(Ordering::Relaxed),
             compute_pipeline_misses: self.compute_pipeline_misses.load(Ordering::Relaxed),
             dispatches: self.dispatches.load(Ordering::Relaxed),
-            dispatch_us: self.dispatch_us.load(Ordering::Relaxed),
             fence_timeouts: self.fence_timeouts.load(Ordering::Relaxed),
             compute_sampled_uploads: self.compute_sampled_uploads.load(Ordering::Relaxed),
             compute_sampled_upload_bytes: self.compute_sampled_upload_bytes.load(Ordering::Relaxed),
@@ -300,36 +267,8 @@ impl EngineCounters {
             target_stale_import: self.target_stale_import.load(Ordering::Relaxed),
             gen_mismatch: self.gen_mismatch.load(Ordering::Relaxed),
             import_presents: self.import_presents.load(Ordering::Relaxed),
-            lock_wait_us: self.lock_wait_us.load(Ordering::Relaxed),
-            context_us: self.context_us.load(Ordering::Relaxed),
-            pool_init_us: self.pool_init_us.load(Ordering::Relaxed),
-            cache_us: self.cache_us.load(Ordering::Relaxed),
-            shader_create_us: self.shader_create_us.load(Ordering::Relaxed),
-            layout_create_us: self.layout_create_us.load(Ordering::Relaxed),
-            pass_create_us: self.pass_create_us.load(Ordering::Relaxed),
-            pipeline_create_us: self.pipeline_create_us.load(Ordering::Relaxed),
-            sampler_create_us: self.sampler_create_us.load(Ordering::Relaxed),
-            resource_us: self.resource_us.load(Ordering::Relaxed),
-            sampler_prepare_us: self.sampler_prepare_us.load(Ordering::Relaxed),
-            vertex_prepare_us: self.vertex_prepare_us.load(Ordering::Relaxed),
-            index_prepare_us: self.index_prepare_us.load(Ordering::Relaxed),
-            storage_prepare_us: self.storage_prepare_us.load(Ordering::Relaxed),
-            storage_image_prepare_us: self.storage_image_prepare_us.load(Ordering::Relaxed),
-            seed_prepare_us: self.seed_prepare_us.load(Ordering::Relaxed),
-            target_prepare_us: self.target_prepare_us.load(Ordering::Relaxed),
-            sampled_prepare_us: self.sampled_prepare_us.load(Ordering::Relaxed),
-            readback_prepare_us: self.readback_prepare_us.load(Ordering::Relaxed),
-            descriptor_prepare_us: self.descriptor_prepare_us.load(Ordering::Relaxed),
-            memory_alloc_us: self.memory_alloc_us.load(Ordering::Relaxed),
-            pre_record_wait_us: self.pre_record_wait_us.load(Ordering::Relaxed),
-            record_us: self.record_us.load(Ordering::Relaxed),
-            submit_us: self.submit_us.load(Ordering::Relaxed),
-            wait_us: self.wait_us.load(Ordering::Relaxed),
-            readback_us: self.readback_us.load(Ordering::Relaxed),
-            cleanup_us: self.cleanup_us.load(Ordering::Relaxed),
             compute_post_wait_skips: self.compute_post_wait_skips.load(Ordering::Relaxed),
             render_post_wait_skips: self.render_post_wait_skips.load(Ordering::Relaxed),
-            retire_wait_us: self.retire_wait_us.load(Ordering::Relaxed),
             ring_retire_blocks: self.ring_retire_blocks.load(Ordering::Relaxed),
             batch_opens: self.batch_opens.load(Ordering::Relaxed),
             batch_joins: self.batch_joins.load(Ordering::Relaxed),
@@ -364,7 +303,6 @@ impl EngineCounters {
         self.compute_pipeline_hits.store(0, Ordering::Relaxed);
         self.compute_pipeline_misses.store(0, Ordering::Relaxed);
         self.dispatches.store(0, Ordering::Relaxed);
-        self.dispatch_us.store(0, Ordering::Relaxed);
         self.fence_timeouts.store(0, Ordering::Relaxed);
         self.compute_sampled_uploads.store(0, Ordering::Relaxed);
         self.compute_sampled_upload_bytes
@@ -415,36 +353,8 @@ impl EngineCounters {
         self.target_stale_import.store(0, Ordering::Relaxed);
         self.gen_mismatch.store(0, Ordering::Relaxed);
         self.import_presents.store(0, Ordering::Relaxed);
-        self.lock_wait_us.store(0, Ordering::Relaxed);
-        self.context_us.store(0, Ordering::Relaxed);
-        self.pool_init_us.store(0, Ordering::Relaxed);
-        self.cache_us.store(0, Ordering::Relaxed);
-        self.shader_create_us.store(0, Ordering::Relaxed);
-        self.layout_create_us.store(0, Ordering::Relaxed);
-        self.pass_create_us.store(0, Ordering::Relaxed);
-        self.pipeline_create_us.store(0, Ordering::Relaxed);
-        self.sampler_create_us.store(0, Ordering::Relaxed);
-        self.resource_us.store(0, Ordering::Relaxed);
-        self.sampler_prepare_us.store(0, Ordering::Relaxed);
-        self.vertex_prepare_us.store(0, Ordering::Relaxed);
-        self.index_prepare_us.store(0, Ordering::Relaxed);
-        self.storage_prepare_us.store(0, Ordering::Relaxed);
-        self.storage_image_prepare_us.store(0, Ordering::Relaxed);
-        self.seed_prepare_us.store(0, Ordering::Relaxed);
-        self.target_prepare_us.store(0, Ordering::Relaxed);
-        self.sampled_prepare_us.store(0, Ordering::Relaxed);
-        self.readback_prepare_us.store(0, Ordering::Relaxed);
-        self.descriptor_prepare_us.store(0, Ordering::Relaxed);
-        self.memory_alloc_us.store(0, Ordering::Relaxed);
-        self.pre_record_wait_us.store(0, Ordering::Relaxed);
-        self.record_us.store(0, Ordering::Relaxed);
-        self.submit_us.store(0, Ordering::Relaxed);
-        self.wait_us.store(0, Ordering::Relaxed);
-        self.readback_us.store(0, Ordering::Relaxed);
-        self.cleanup_us.store(0, Ordering::Relaxed);
         self.compute_post_wait_skips.store(0, Ordering::Relaxed);
         self.render_post_wait_skips.store(0, Ordering::Relaxed);
-        self.retire_wait_us.store(0, Ordering::Relaxed);
         self.ring_retire_blocks.store(0, Ordering::Relaxed);
         self.batch_opens.store(0, Ordering::Relaxed);
         self.batch_joins.store(0, Ordering::Relaxed);
@@ -479,7 +389,6 @@ pub struct CounterSnapshot {
     pub compute_pipeline_hits: u64,
     pub compute_pipeline_misses: u64,
     pub dispatches: u64,
-    pub dispatch_us: u64,
     pub fence_timeouts: u64,
     pub compute_sampled_uploads: u64,
     pub compute_sampled_upload_bytes: u64,
@@ -519,36 +428,8 @@ pub struct CounterSnapshot {
     pub target_stale_import: u64,
     pub gen_mismatch: u64,
     pub import_presents: u64,
-    pub lock_wait_us: u64,
-    pub context_us: u64,
-    pub pool_init_us: u64,
-    pub cache_us: u64,
-    pub shader_create_us: u64,
-    pub layout_create_us: u64,
-    pub pass_create_us: u64,
-    pub pipeline_create_us: u64,
-    pub sampler_create_us: u64,
-    pub resource_us: u64,
-    pub sampler_prepare_us: u64,
-    pub vertex_prepare_us: u64,
-    pub index_prepare_us: u64,
-    pub storage_prepare_us: u64,
-    pub storage_image_prepare_us: u64,
-    pub seed_prepare_us: u64,
-    pub target_prepare_us: u64,
-    pub sampled_prepare_us: u64,
-    pub readback_prepare_us: u64,
-    pub descriptor_prepare_us: u64,
-    pub memory_alloc_us: u64,
-    pub pre_record_wait_us: u64,
-    pub record_us: u64,
-    pub submit_us: u64,
-    pub wait_us: u64,
-    pub readback_us: u64,
-    pub cleanup_us: u64,
     pub compute_post_wait_skips: u64,
     pub render_post_wait_skips: u64,
-    pub retire_wait_us: u64,
     pub ring_retire_blocks: u64,
     pub batch_opens: u64,
     pub batch_joins: u64,
@@ -603,7 +484,6 @@ impl CounterSnapshot {
                 .compute_pipeline_misses
                 .saturating_sub(earlier.compute_pipeline_misses),
             dispatches: self.dispatches.saturating_sub(earlier.dispatches),
-            dispatch_us: self.dispatch_us.saturating_sub(earlier.dispatch_us),
             fence_timeouts: self.fence_timeouts.saturating_sub(earlier.fence_timeouts),
             compute_sampled_uploads: self
                 .compute_sampled_uploads
@@ -699,68 +579,12 @@ impl CounterSnapshot {
                 .saturating_sub(earlier.target_stale_import),
             gen_mismatch: self.gen_mismatch.saturating_sub(earlier.gen_mismatch),
             import_presents: self.import_presents.saturating_sub(earlier.import_presents),
-            lock_wait_us: self.lock_wait_us.saturating_sub(earlier.lock_wait_us),
-            context_us: self.context_us.saturating_sub(earlier.context_us),
-            pool_init_us: self.pool_init_us.saturating_sub(earlier.pool_init_us),
-            cache_us: self.cache_us.saturating_sub(earlier.cache_us),
-            shader_create_us: self
-                .shader_create_us
-                .saturating_sub(earlier.shader_create_us),
-            layout_create_us: self
-                .layout_create_us
-                .saturating_sub(earlier.layout_create_us),
-            pass_create_us: self.pass_create_us.saturating_sub(earlier.pass_create_us),
-            pipeline_create_us: self
-                .pipeline_create_us
-                .saturating_sub(earlier.pipeline_create_us),
-            sampler_create_us: self
-                .sampler_create_us
-                .saturating_sub(earlier.sampler_create_us),
-            resource_us: self.resource_us.saturating_sub(earlier.resource_us),
-            sampler_prepare_us: self
-                .sampler_prepare_us
-                .saturating_sub(earlier.sampler_prepare_us),
-            vertex_prepare_us: self
-                .vertex_prepare_us
-                .saturating_sub(earlier.vertex_prepare_us),
-            index_prepare_us: self
-                .index_prepare_us
-                .saturating_sub(earlier.index_prepare_us),
-            storage_prepare_us: self
-                .storage_prepare_us
-                .saturating_sub(earlier.storage_prepare_us),
-            storage_image_prepare_us: self
-                .storage_image_prepare_us
-                .saturating_sub(earlier.storage_image_prepare_us),
-            seed_prepare_us: self.seed_prepare_us.saturating_sub(earlier.seed_prepare_us),
-            target_prepare_us: self
-                .target_prepare_us
-                .saturating_sub(earlier.target_prepare_us),
-            sampled_prepare_us: self
-                .sampled_prepare_us
-                .saturating_sub(earlier.sampled_prepare_us),
-            readback_prepare_us: self
-                .readback_prepare_us
-                .saturating_sub(earlier.readback_prepare_us),
-            descriptor_prepare_us: self
-                .descriptor_prepare_us
-                .saturating_sub(earlier.descriptor_prepare_us),
-            memory_alloc_us: self.memory_alloc_us.saturating_sub(earlier.memory_alloc_us),
-            pre_record_wait_us: self
-                .pre_record_wait_us
-                .saturating_sub(earlier.pre_record_wait_us),
-            record_us: self.record_us.saturating_sub(earlier.record_us),
-            submit_us: self.submit_us.saturating_sub(earlier.submit_us),
-            wait_us: self.wait_us.saturating_sub(earlier.wait_us),
-            readback_us: self.readback_us.saturating_sub(earlier.readback_us),
-            cleanup_us: self.cleanup_us.saturating_sub(earlier.cleanup_us),
             compute_post_wait_skips: self
                 .compute_post_wait_skips
                 .saturating_sub(earlier.compute_post_wait_skips),
             render_post_wait_skips: self
                 .render_post_wait_skips
                 .saturating_sub(earlier.render_post_wait_skips),
-            retire_wait_us: self.retire_wait_us.saturating_sub(earlier.retire_wait_us),
             ring_retire_blocks: self
                 .ring_retire_blocks
                 .saturating_sub(earlier.ring_retire_blocks),

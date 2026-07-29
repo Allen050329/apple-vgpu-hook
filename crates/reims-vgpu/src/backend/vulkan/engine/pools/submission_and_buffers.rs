@@ -1093,13 +1093,8 @@ impl ResourcePools {
                 .map_err(|e| {
                     Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
                 })?;
-            let retire_started = Instant::now();
             self.retire_slot(ctx, counters, next)?;
             if still_running {
-                counters.retire_wait_us.fetch_add(
-                    retire_started.elapsed().as_micros() as u64,
-                    Ordering::Relaxed,
-                );
                 counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1124,15 +1119,7 @@ impl ResourcePools {
         ctx: &DeviceContext,
         counters: &EngineCounters,
     ) -> Result<(vk::CommandBuffer, vk::Fence), DrawError> {
-        let retire_started = Instant::now();
-        let waited = self.in_flight > 0;
         self.retire_all(ctx, counters)?;
-        if waited {
-            counters.retire_wait_us.fetch_add(
-                retire_started.elapsed().as_micros() as u64,
-                Ordering::Relaxed,
-            );
-        }
         self.begin_entry(ctx, counters)
     }
 
@@ -1547,7 +1534,6 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mt),
-            counters,
             AllocSite::Staging,
         )
         .map_err(|e| {
@@ -1695,7 +1681,6 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mt),
-            counters,
             AllocSite::Readback,
         )
         .map_err(|e| {
@@ -1769,7 +1754,6 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mt),
-            counters,
             AllocSite::ReadbackMulti,
         )
         .map_err(|e| {

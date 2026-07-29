@@ -81,7 +81,6 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mt),
-            counters,
             AllocSite::StorageImage,
         )
         .map_err(|e| {
@@ -724,7 +723,6 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                counters,
                 AllocSite::ResidentColor,
             )
             .map_err(|e| {
@@ -855,7 +853,6 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(ireq.size)
                 .memory_type_index(imt),
-            counters,
             AllocSite::TransientDepth,
         )
         .map_err(|e| {

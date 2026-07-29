@@ -459,7 +459,6 @@ impl SlabPool {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(block_size)
                 .memory_type_index(mem_type),
-            counters,
             AllocSite::SlabBlock,
         )
         .map_err(|result| {

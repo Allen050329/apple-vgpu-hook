@@ -4,7 +4,6 @@
 
 use ash::vk;
 use std::collections::BTreeSet;
-use std::time::Instant;
 
 use super::caches::{
     AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey, PipelineKey, SecondaryAttachKey,
@@ -725,18 +724,8 @@ pub(crate) unsafe fn execute_draw_inner(
     if force_loss {
         owner.force_device_lost = false;
     }
-    let context_started = Instant::now();
     let ctx = owner.ensure(counters)?;
-    counters.context_us.fetch_add(
-        context_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let pool_init_started = Instant::now();
     pools.ensure_init(ctx, counters)?;
-    counters.pool_init_us.fetch_add(
-        pool_init_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Draw batching (deferred submit): a draw that hands the CPU nothing
     // (skip_readback + resident target, no MRT) leaves its CB in recording
@@ -912,7 +901,6 @@ pub(crate) unsafe fn execute_draw_inner(
         })
         .collect();
 
-    let cache_started = Instant::now();
     let (vert_digest, vert_module) =
         caches.get_or_create_shader(ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
@@ -975,27 +963,16 @@ pub(crate) unsafe fn execute_draw_inner(
         caches.cache_prepared(pipeline_key.clone(), pipe);
         pipe
     };
-    counters.cache_us.fetch_add(
-        cache_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Samplers
-    let resource_started = Instant::now();
-    let sampler_prepare_started = Instant::now();
     let mut sampler_handles = Vec::new();
     for s in &req.samplers {
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
         sampler_handles.push((s.binding, h));
     }
-    counters.sampler_prepare_us.fetch_add(
-        sampler_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
-    let vertex_prepare_started = Instant::now();
     let no_vertex_fetch = draw_has_no_invocations(req);
     let mut slots_by_content: std::collections::HashMap<(usize, u64), BufferSlot> =
         std::collections::HashMap::new();
@@ -1055,13 +1032,8 @@ pub(crate) unsafe fn execute_draw_inner(
         };
         vertex_bufs.push((resource.binding, slot));
     }
-    counters.vertex_prepare_us.fetch_add(
-        vertex_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Index buffer
-    let index_prepare_started = Instant::now();
     let mut index_slot = None;
     if let Some(indexed) = &req.indexed {
         let slot = pools.acquire_staging(
@@ -1073,15 +1045,10 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.write_staging(ctx, &slot, &indexed.indices)?;
         index_slot = Some(slot);
     }
-    counters.index_prepare_us.fetch_add(
-        index_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Storage buffers (deduplicated by content with the vertex streams: a
     // stage-in buffer doubling as a storage bind reuses the same slot —
     // staging slots always carry the full usage superset).
-    let storage_prepare_started = Instant::now();
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
         let slot = stage_buffer_content(
@@ -1096,13 +1063,8 @@ pub(crate) unsafe fn execute_draw_inner(
         )?;
         storage_slots.push((resource.binding, slot));
     }
-    counters.storage_prepare_us.fetch_add(
-        storage_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Target seed staging (CPU import only — not LoadFromTarget).
-    let seed_prepare_started = Instant::now();
     let seed_slot = if let Some(rgba8) = &seed_bytes {
         let slot = pools.acquire_staging(
             ctx,
@@ -1116,13 +1078,8 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    counters.seed_prepare_us.fetch_add(
-        seed_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Prefer identity-keyed resident target when provided; else geometry pool.
-    let target_prepare_started = Instant::now();
     let use_registry = req.target_identity.is_some();
     // A secondary MRT attachment is bound + rendered as attachment N of an
     // ad-hoc framebuffer built here. The primary slot 0 keeps its own single-RT
@@ -1332,14 +1289,9 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             None
         };
-    counters.target_prepare_us.fetch_add(
-        target_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Resolve sampled images only after ensuring the render target so registry
     // capacity eviction cannot destroy an image already selected for this draw.
-    let sampled_prepare_started = Instant::now();
     let mut sampled = Vec::new();
     for resource in &req.sampled_images {
         match &resource.source {
@@ -1529,12 +1481,7 @@ pub(crate) unsafe fn execute_draw_inner(
             }
         }
     }
-    counters.sampled_prepare_us.fetch_add(
-        sampled_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
-    let readback_prepare_started = Instant::now();
     let rb_size = (req.width as u64) * (req.height as u64) * 4;
     let do_readback = !req.skip_readback;
     let readback = if do_readback {
@@ -1542,14 +1489,9 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    counters.readback_prepare_us.fetch_add(
-        readback_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
     let _ = use_registry;
 
     // Descriptor set
-    let descriptor_prepare_started = Instant::now();
     // Owning pool block travels alongside the set so the flush-time free routes
     // back to the block it was allocated from (arena may grow past block 0).
     let mut dset_pool: Option<vk::DescriptorPool> = None;
@@ -1624,20 +1566,11 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    counters.descriptor_prepare_us.fetch_add(
-        descriptor_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    counters.resource_us.fetch_add(
-        resource_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     // A batch joiner's CB is already recording (opened by the batch opener);
     // its commands append after the previous draw's end_render_pass.
-    let t_record = Instant::now();
     if !joins {
         ctx.device
             .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
@@ -2427,10 +2360,6 @@ pub(crate) unsafe fn execute_draw_inner(
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
     }
-    counters.record_us.fetch_add(
-        t_record.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     if force_loss {
         // Recycle transient resources before reporting loss.
@@ -2444,7 +2373,6 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if !defer_submit {
-        let t_submit = Instant::now();
         let queue = ctx.queue();
         let cbs = [cb];
         let si = vk::SubmitInfo::default().command_buffers(&cbs);
@@ -2458,10 +2386,6 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
         }
-        counters.submit_us.fetch_add(
-            t_submit.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
     }
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
@@ -2585,14 +2509,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // `finish_us` tail). The cleanup is already parked with `finish_entry_async`
     // above, so the slot stays pending and the ring retires it later with no
     // extra wait (its fence is already signaled).
-    let t_wait = Instant::now();
     pools.wait_entry_fence(ctx, counters, fence)?;
-    counters.wait_us.fetch_add(
-        t_wait.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
-    let t_rb = Instant::now();
     let out = {
         let ptr = ctx
             .device
@@ -2605,10 +2523,6 @@ pub(crate) unsafe fn execute_draw_inner(
         counters.note_readback(rb_size);
         pixels
     };
-    counters.readback_us.fetch_add(
-        t_rb.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     Ok(DrawOutput { pixels: out })
 }

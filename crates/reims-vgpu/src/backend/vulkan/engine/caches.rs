@@ -5,7 +5,6 @@
 use ash::vk;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 // ash Handle trait not required here.
 
@@ -398,14 +397,9 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let created = ctx
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None);
-        counters.shader_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         let module = created.map_err(|e| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateShaderModule, e));
             self.shaders.insert_negative(key, err.clone());
@@ -434,7 +428,6 @@ impl ObjectCaches {
             return Ok((dsl, pl));
         }
         counters.layout_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = key
             .bindings
             .iter()
@@ -483,10 +476,6 @@ impl ObjectCaches {
                 self.layouts.insert_negative(key.clone(), err.clone());
                 err
             })?;
-        counters.layout_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         counters.note_create();
         if let Some((old_dsl, old_pl)) = self.layouts.insert(key.clone(), (dsl, pl)) {
             pools.dispose(&ctx.device, DeferredHandle::PipelineLayout(old_pl));
@@ -513,7 +502,6 @@ impl ObjectCaches {
             return Ok(rp);
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let target_format = translate::pixel::resident_color(key.bgra);
         let (load_op, initial) = if key.load_seed {
             (
@@ -699,10 +687,6 @@ impl ObjectCaches {
             self.passes.insert_negative(key, err.clone());
             err
         })?;
-        counters.pass_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         counters.note_create();
         if let Some(old) = self.passes.insert(key, rp) {
             pools.dispose(&ctx.device, DeferredHandle::RenderPass(old));
@@ -726,7 +710,6 @@ impl ObjectCaches {
             return Ok(s);
         }
         counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let not_mipmapped = key.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
         let (min_lod, max_lod) = if key.unnormalized_coordinates || not_mipmapped {
             (0.0, 0.0)
@@ -804,10 +787,6 @@ impl ObjectCaches {
                 self.samplers.insert_negative(*key, err.clone());
                 err
             })?;
-        counters.sampler_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         counters.note_create();
         if let Some(old) = self.samplers.insert(*key, sampler) {
             pools.dispose(&ctx.device, DeferredHandle::Sampler(old));
@@ -1095,14 +1074,9 @@ impl ObjectCaches {
         if key.pass.depth.is_some() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
-        let create_started = Instant::now();
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
-        counters.pipeline_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
             self.pipelines.insert_negative(key.clone(), err.clone());

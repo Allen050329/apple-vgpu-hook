@@ -377,12 +377,7 @@ pub fn execute_compute(req: ComputeRequest) -> Result<ComputeOutput, ComputeErro
 
 /// Borrow form of [`execute_compute`].
 pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
-    let lock_started = std::time::Instant::now();
     let mut guard = lock_engine();
-    guard
-        .counters
-        .lock_wait_us
-        .fetch_add(lock_started.elapsed().as_micros() as u64, Ordering::Relaxed);
     let EngineState {
         ref mut owner,
         ref mut caches,
