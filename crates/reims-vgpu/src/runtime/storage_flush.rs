@@ -1267,6 +1267,73 @@ mod tests {
         );
     }
 
+    /// A render window fully covered by a later writer is *dropped*, not
+    /// flushed, and dropping it takes its alias-index refs with it.
+    ///
+    /// This is the difference between a deferral and a rescheduling. A guest
+    /// compositing into one surface re-Stores the identical guest range every
+    /// frame, so the previous window always intersects the new one; landing it
+    /// there performs exactly the guest write the rail exists to skip, once per
+    /// Store, and `surface_flush` would track `surface_deferred` at a ratio of 1.
+    ///
+    /// The alias-index half is the part that is easy to get wrong: taking the
+    /// entry with a bare `remove` leaves `deferred_alias_pages` holding page
+    /// refs for a mapping with no windows left, and the raw-GVA sampling guard
+    /// then walks pages nothing defers on.
+    #[test]
+    fn a_superseded_render_window_is_dropped_and_releases_its_alias_pages() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let k = key(9, 0, 256);
+        state
+            .compute_deferred_flush
+            .insert(k, crate::model::DeferredOwner::Render { armed_seq: 1 });
+        state.index_deferred_alias_pages(9);
+        assert!(
+            state.deferred_alias_pages.contains_key(&9),
+            "arming indexes the mapping's pages for the raw-GVA guard"
+        );
+
+        let owner = state.take_deferred_flush_window_exact(&k);
+        assert!(
+            matches!(owner, Some(crate::model::DeferredOwner::Render { .. })),
+            "the exact key is the one taken"
+        );
+        assert!(state.compute_deferred_flush.is_empty());
+        assert!(
+            !state.deferred_alias_pages.contains_key(&9),
+            "the last window leaving must drop the mapping's alias-page refs"
+        );
+    }
+
+    /// Superseding one window must not disturb a sibling covering a different
+    /// guest range on the same mapping — that one holds bytes the new Store does
+    /// not write, and dropping it would lose them.
+    #[test]
+    fn superseding_one_window_leaves_a_disjoint_sibling_armed() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let covered = key(9, 0, 256);
+        let sibling = key(9, 256, 512);
+        state
+            .compute_deferred_flush
+            .insert(covered, crate::model::DeferredOwner::Render { armed_seq: 1 });
+        state
+            .compute_deferred_flush
+            .insert(sibling, crate::model::DeferredOwner::Render { armed_seq: 2 });
+
+        assert!(state.take_deferred_flush_window_exact(&covered).is_some());
+        assert!(
+            state.compute_deferred_flush.contains_key(&sibling),
+            "a different range is a different obligation"
+        );
+        assert_eq!(state.compute_deferred_flush.len(), 1);
+    }
+
     /// Teardown must name the render rail, because the two rails pin different
     /// registries and the drop is where the pin is released.
     ///

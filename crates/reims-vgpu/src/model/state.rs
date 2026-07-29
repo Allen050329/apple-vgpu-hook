@@ -2331,6 +2331,24 @@ impl DeviceState {
         });
     }
 
+    /// Remove one deferred window by exact key, pruning the alias index with it.
+    ///
+    /// For supersede: a writer that fully covers a window's guest range drops
+    /// the obligation instead of landing it, and must not disturb the
+    /// intersecting siblings [`Self::take_deferred_flush_windows`] would also
+    /// take. Going through here rather than `compute_deferred_flush.remove`
+    /// keeps the raw-GVA alias index in step — a mapping whose last window
+    /// leaves must lose its page refs, or the union index keeps counting pages
+    /// nothing defers on.
+    pub fn take_deferred_flush_window_exact(
+        &mut self,
+        key: &ComputeStorageResidencyKey,
+    ) -> Option<DeferredOwner> {
+        let owner = self.compute_deferred_flush.remove(key)?;
+        self.prune_alias_index(key.mapping_id);
+        Some(owner)
+    }
+
     /// Remove and return every deferred-writeback window intersecting
     /// `[lo, hi)` on this mapping. The caller owns flushing each returned
     /// entry (or reporting the loss) — once taken, the map no longer names it.

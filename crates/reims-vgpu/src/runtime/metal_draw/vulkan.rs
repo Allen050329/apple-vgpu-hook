@@ -4589,25 +4589,46 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     if key.mapping_id != mapping_id || key.width != width || key.height != height {
         return false;
     }
-    // The cache is the flush's source and the Load seed's source, so it has to
-    // hold this frame before the window claims the guest pages are stale. The
-    // synchronous route got this for free inside `write_rgba8_image_changed`;
-    // here it is explicit, and it is the one copy this rail still pays.
-    crate::runtime::surface_cache::store(state, mapping_id, width, height, {
-        let mut bgra = rgba.to_vec();
-        for px in bgra.chunks_exact_mut(4) {
-            px.swap(0, 2);
+    // Supersede — do not flush — the window this Store fully covers.
+    //
+    // This is `supersede_gva_window`'s rule, and it is what makes the rail a
+    // deferral instead of a rescheduling. A compositor painting the same surface
+    // every frame re-Stores the identical guest range, so the previous window
+    // always intersects: flushing it here would perform exactly the guest write
+    // this rail exists to skip, once per Store, and `surface_flush` would track
+    // `surface_deferred` at a ratio of 1.
+    //
+    // Dropping is sound for the reason it is sound on the GVA rail: those bytes
+    // were never observable without a flush — any reader would have taken the
+    // window first — and this Store's pixels cover every byte of the range.
+    let covered: Vec<crate::model::ComputeStorageResidencyKey> = state
+        .compute_deferred_flush
+        .iter()
+        .filter(|(k, o)| {
+            k.mapping_id == key.mapping_id
+                && k.surface_offset == key.surface_offset
+                && k.span_end == key.span_end
+                && matches!(o, crate::model::DeferredOwner::Render { .. })
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    for old in covered {
+        if state.take_deferred_flush_window_exact(&old).is_some() {
+            crate::observe::line(format!(
+                "surface_deferred_superseded mapping={} {}x{} fmt={:#x}",
+                old.mapping_id, old.width, old.height, old.pixel_format
+            ));
         }
-        bgra
-    });
-    // Land any window whose guest range this Store's pixels supersede, before
-    // the cache below replaces the bytes those windows would have written.
-    // Unlike the compute supersede this flushes rather than drops: an
-    // intersecting window may cover guest bytes *outside* this Store's own
-    // range — a different plane window on the same mapping — and dropping it
-    // would lose those. An exact-range sibling is superseded for free, because
-    // its flush writes from the same cache entry this Store is about to
-    // refresh, so the newer bytes land either way.
+    }
+    // Whatever still intersects covers guest bytes this Store does *not* write —
+    // a different plane window on the same mapping — so it has to land.
+    //
+    // It must land BEFORE the cache is refreshed below. The flush reads its
+    // pixels from `surface_cache`, so replacing the entry first would either
+    // write this frame's bytes for an older window's range or, when the geometry
+    // differs, miss the cache entirely and report a loss for a window that was
+    // perfectly landable. The boot at the parent commit showed that ordering as
+    // 7 `deferred_flush_lost … reason=cache_miss`.
     if !crate::runtime::storage_flush::flush_intersecting(
         state,
         host,
@@ -4619,6 +4640,18 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         // unknown; arming over it would attribute its loss to this Store.
         return false;
     }
+    // Now the cache may take this frame. It is the flush's source and the Load
+    // seed's source, so it has to hold these pixels before the window claims the
+    // guest pages are stale. The synchronous route got this for free inside
+    // `write_rgba8_image_changed`; here it is explicit, and it is the one copy
+    // this rail still pays.
+    crate::runtime::surface_cache::store(state, mapping_id, width, height, {
+        let mut bgra = rgba.to_vec();
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        bgra
+    });
     // Land oldest-first through the normal choke point rather than taking the
     // entry directly: `flush_intersecting` runs the fixpoint that drags in
     // siblings overlapping the same guest bytes, and taking one window out from
