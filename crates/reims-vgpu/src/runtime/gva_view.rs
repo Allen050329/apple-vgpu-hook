@@ -19,6 +19,21 @@ use crate::model::{DeviceState, GvaHostView, TaskEntry};
 use crate::runtime::gva_mem::geometry_for_page_shift;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 
+/// Dedup key for a fragmented-span decline: the span identity plus its shape.
+///
+/// A fragmented GVA span is refused every time the caller asks, and the
+/// compositor asks constantly — one measured boot logged 34 000
+/// `gva_view_fragmented` lines covering 2 449 distinct spans. The refusal is
+/// documented control flow (the caller takes its per-run multi-import
+/// fallback), so what the always-on sink owes the reader is that the *class* is
+/// happening and on which spans, not one line per ask.
+fn fragmented_span_key(task_id: u32, gva: u64, pages: usize, runs: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (task_id, gva, pages, runs).hash(&mut h);
+    h.finish()
+}
+
 /// True if half-open ranges `[a, a+la)` and `[b, b+lb)` overlap.
 #[inline]
 pub fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
@@ -496,10 +511,15 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     // `write_span` / `read_span` import the maximal runs instead.
     let runs = contig_run_count(&gpas, state.page_size());
     if runs != 1 {
-        crate::observe::off(format!(
-            "gva_view_fragmented task={resolved_tid} gva={gva:#x} pages={} runs={runs}",
-            gpas.len(),
-        ));
+        if crate::observe::first_sight(
+            "gva_view_fragmented",
+            fragmented_span_key(resolved_tid, gva, gpas.len(), runs),
+        ) {
+            crate::observe::off(format!(
+                "gva_view_fragmented task={resolved_tid} gva={gva:#x} pages={} runs={runs}",
+                gpas.len(),
+            ));
+        }
         return None;
     }
     let ptr = host.map_pages(&gpas, page_sz)?;
@@ -674,10 +694,15 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     // the same pre-check `ensure_gva_view` already applies.
     let runs = contig_run_count(&gpas, page_size);
     if runs != 1 {
-        crate::observe::off(format!(
-            "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span)",
-            gpas.len(),
-        ));
+        if crate::observe::first_sight(
+            "gva_view_fragmented_fresh",
+            fragmented_span_key(task_id, gva, gpas.len(), runs),
+        ) {
+            crate::observe::off(format!(
+                "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span)",
+                gpas.len(),
+            ));
+        }
         return None;
     }
     crate::runtime::mapper::flush_retired_views(state, host);
@@ -966,6 +991,68 @@ mod tests {
         let before = host.map_pages_calls;
         assert!(ensure_gva_view(&mut state, &mut host, 1, 8, 4).is_some());
         assert_eq!(host.map_pages_calls, before + 1);
+    }
+
+    /// The fragmented-span decline reports each distinct span once, not once per
+    /// ask.
+    ///
+    /// The refusal is documented control flow — the caller falls back to
+    /// per-run multi-import — so repeating it says nothing new, and the
+    /// compositor repeats it constantly: one measured boot logged 34 000
+    /// `gva_view_fragmented` lines over 2 449 distinct spans. Without the
+    /// first-sight guard this test sees sixteen lines for one span.
+    #[test]
+    fn a_fragmented_span_reports_once_and_a_different_span_reports_again() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        // A task id no other test in this module uses (`MAX_TASKS` is 256, so it
+        // must be in range): `first_sight` is process-global, so sharing an id
+        // would let another test's span consume this one's first sight.
+        let task = 200u32;
+        assert!(state.define_task(task, page, 2));
+
+        let cap = crate::observe::FailCapture::start();
+        let lines = || -> Vec<String> {
+            cap.lines()
+                .into_iter()
+                .filter(|l| l.starts_with("OFF gva_view_fragmented"))
+                .collect()
+        };
+
+        for _ in 0..16 {
+            assert_eq!(
+                ensure_gva_view(&mut state, &mut host, task, page - 4, 8),
+                None,
+                "a gapped span has no packed whole-span view"
+            );
+        }
+        let first = lines();
+        assert_eq!(
+            first.len(),
+            1,
+            "sixteen asks on one fragmented span must report once: {first:?}"
+        );
+        assert!(
+            first[0].contains(" pages=2 runs=2"),
+            "the line keeps its shape: {}",
+            first[0]
+        );
+
+        // A different span at the same shape is a different key and reports again.
+        assert_eq!(
+            ensure_gva_view(&mut state, &mut host, task, page - 8, 16),
+            None
+        );
+        let after = lines();
+        assert_eq!(
+            after.len(),
+            2,
+            "a span not seen before must still report: {after:?}"
+        );
     }
 
     #[test]

@@ -42,11 +42,6 @@ static FLUSHED: AtomicU64 = AtomicU64::new(0);
 static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
 /// Present Stores that ran the synchronous scatter-DMA (no defer happened).
 static SYNC: AtomicU64 = AtomicU64::new(0);
-/// Deferred windows that armed the async readback prefetch (not dmabuf-carried).
-static PREFETCH_ARMED: AtomicU64 = AtomicU64::new(0);
-/// Deferred windows that SKIPPED the prefetch (dmabuf carries the display; the
-/// flush, if any, reads synchronously) — the elided per-present GPU→host copy.
-static PREFETCH_SKIPPED: AtomicU64 = AtomicU64::new(0);
 static WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
 
 const WINDOW_MS: u64 = 1000;
@@ -80,16 +75,6 @@ pub fn note_sync(dmabuf: bool) {
     maybe_emit();
 }
 
-/// One deferred window's readback prefetch was `armed` (dmabuf off) or skipped
-/// (dmabuf carries the display → the elided per-present GPU→host copy).
-pub fn note_prefetch(armed: bool) {
-    if armed {
-        PREFETCH_ARMED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        PREFETCH_SKIPPED.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 fn maybe_emit() {
     if let Some(line) = maybe_line_at(observe::elapsed_ms() as u64) {
         observe::off(line);
@@ -117,8 +102,6 @@ fn maybe_line_at(now: u64) -> Option<String> {
     let flushed = FLUSHED.swap(0, Ordering::Relaxed);
     let superseded = SUPERSEDED.swap(0, Ordering::Relaxed);
     let sync = SYNC.swap(0, Ordering::Relaxed);
-    let pf_armed = PREFETCH_ARMED.swap(0, Ordering::Relaxed);
-    let pf_skipped = PREFETCH_SKIPPED.swap(0, Ordering::Relaxed);
     if armed == 0 && flushed == 0 && superseded == 0 && sync == 0 {
         return None;
     }
@@ -129,12 +112,9 @@ fn maybe_line_at(now: u64) -> Option<String> {
         flushed,
         superseded,
         sync,
-        pf_armed,
-        pf_skipped,
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn format_line(
     dt: u64,
     armed: u64,
@@ -142,8 +122,6 @@ fn format_line(
     flushed: u64,
     superseded: u64,
     sync: u64,
-    pf_armed: u64,
-    pf_skipped: u64,
 ) -> String {
     // consume_ratio: of the deferred windows that resolved this window
     // (flushed + superseded), the fraction actually read back. Near 0 while
@@ -158,8 +136,7 @@ fn format_line(
     format!(
         "writeback_consume window_ms={dt} armed={armed} dmabuf_armed={dmabuf_armed} \
          flushed={flushed} superseded={superseded} sync={sync} \
-         consume_ratio={consume_ratio:.3} armed_hz={armed_hz:.1} \
-         pf_armed={pf_armed} pf_skipped={pf_skipped}"
+         consume_ratio={consume_ratio:.3} armed_hz={armed_hz:.1}"
     )
 }
 
@@ -174,8 +151,6 @@ mod tests {
             &FLUSHED,
             &SUPERSEDED,
             &SYNC,
-            &PREFETCH_ARMED,
-            &PREFETCH_SKIPPED,
             &WINDOW_START_MS,
         ] {
             a.store(0, Ordering::Relaxed);
@@ -198,17 +173,15 @@ mod tests {
 
     #[test]
     fn ratio_is_zero_when_all_superseded_and_one_when_all_flushed() {
-        // All superseded (dmabuf steady state): consume_ratio → 0, prefetch skipped.
-        let all_dropped = format_line(1000, 120, 120, 0, 118, 0, 0, 120);
+        // All superseded (dmabuf steady state): consume_ratio → 0.
+        let all_dropped = format_line(1000, 120, 120, 0, 118, 0);
         assert!(all_dropped.contains("consume_ratio=0.000"));
         assert!(all_dropped.contains("dmabuf_armed=120"));
-        assert!(all_dropped.contains("pf_armed=0 pf_skipped=120"));
         // All flushed (nothing dmabuf, every writeback consumed): ratio → 1.
-        let all_flushed = format_line(1000, 60, 0, 60, 0, 0, 60, 0);
+        let all_flushed = format_line(1000, 60, 0, 60, 0, 0);
         assert!(all_flushed.contains("consume_ratio=1.000"));
-        assert!(all_flushed.contains("pf_armed=60 pf_skipped=0"));
         // Half/half.
-        let mixed = format_line(1000, 40, 40, 20, 20, 0, 0, 40);
+        let mixed = format_line(1000, 40, 40, 20, 20, 0);
         assert!(mixed.contains("consume_ratio=0.500"));
     }
 

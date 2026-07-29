@@ -8,8 +8,7 @@
 //!
 //! | Proxy | Meaning | Why it tracks flicker |
 //! | --- | --- | --- |
-//! | `mid_switch` | Consecutive CmdDisplaySwap captures name different mapping ids | Dual-buffer A/B present |
-//! | `nz_swing` | On mid_switch, min(nz)/max(nz) < [`NZ_SWING_RATIO`] | One mid holds far less content (logo/partial vs full) |
+//! | `nz_swing` | Consecutive CmdDisplaySwap captures name different mapping ids **and** min(nz)/max(nz) < [`NZ_SWING_RATIO`] | One mid holds far less content (logo/partial vs full). A mid switch on its own is ordinary double-buffering and is counted (`mid_sw=`), not logged |
 //! | `sparse_present` | Captured frame nonzero fraction < [`SPARSE_NZ_FRAC`] at full desktop size | Logo-like / mostly-empty retain |
 //! | `geom_mismatch` | Capture W×H differs from previous present geom | Letterbox / mode thrash |
 //! | `capture_fail` | DisplaySwap capture returned false | Retain hole / keep_prior path |
@@ -2027,21 +2026,14 @@ pub fn note_capture_ok(sample: PresentCaptureSample) {
                         p.from_last_store as u8,
                         sample.from_last_store as u8
                     ));
-                } else {
-                    thrash_line(&format!(
-                        "mid_switch {}→{} gen {}→{} nz {}→{} rgb_nz {}→{} {}x{}",
-                        p.mapping_id,
-                        sample.mapping_id,
-                        p.generation,
-                        sample.generation,
-                        p.nz,
-                        sample.nz,
-                        p.rgb_nz,
-                        sample.rgb_nz,
-                        sample.width,
-                        sample.height
-                    ));
                 }
+                // The `else` here — the mid rotated and the occupancy did not
+                // swing — is the healthy case, and it used to emit a per-present
+                // `mid_switch` line through the always-on sink. macOS rotates
+                // its buffers on every present, so that fired on all 31 392
+                // presents of a measured boot with `nz` identical on both sides:
+                // a proxy announcing that it checked and found nothing. The
+                // magnitude survives in `mid_sw=` on the windowed summary.
                 // Structure thrash: equal-ish nz but edge energy diverges
                 // (wallpaper-filled holes in shattered Safari still count as nz).
                 let elo = p.edge_energy.min(sample.edge_energy) as f64;

@@ -5080,7 +5080,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             gpu_boundary_seed = true;
                             seed_src = "front_frame_resident_gpu";
                             if w >= 1280 && h >= 720 {
-                                crate::observe::fail(format!(
+                                // The GPU boundary seed was armed: the success
+                                // path, taken on essentially every compositor
+                                // draw. Every sibling seed line is verbose; this
+                                // one alone reached the always-on sink.
+                                crate::observe::line(format!(
                                     "m2v_load_seed mid={import_mid} {w}x{h} pipe={} tex_ref={} src={seed_src} front_mid={} front_gen={}",
                                     req.pipeline_ref,
                                     req.colors.first().map(|c| c.texture_ref).unwrap_or(0),

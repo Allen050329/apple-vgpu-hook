@@ -1551,18 +1551,18 @@ fn present_named_mapping<H: HostMemory + HostOps>(
                 state.present.frame_valid as u8
             ));
         } else {
-            let max_rgb = state
-                .present
-                .frame_bgra
-                .chunks_exact(4)
-                .map(|px| px[0].max(px[1]).max(px[2]))
-                .max()
-                .unwrap_or(0);
-            let (rgb_nz, max_rgb2, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
-            let max_rgb = max_rgb.max(max_rgb2);
+            // One pass. `bgra_rgb_stats` already maxes the same
+            // `px[0].max(px[1]).max(px[2])` per pixel, so a separate scan for
+            // `max_rgb` was a second full 8 MiB walk of the frame, under the
+            // device lock, for a value this call already returns.
+            let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&state.present.frame_bgra);
             let verdict = present_content_verdict(&state.present.frame_bgra, max_rgb);
             if verdict == PresentContentVerdict::Unsampled {
-                crate::observe::off(format!(
+                // Not a decline: the dmabuf rail carried the frame, so there are
+                // no CPU pixels to judge and no guest work was lost.
+                // `present_black` below is the alarm. On that rail this is the
+                // normal outcome of every present.
+                crate::observe::line(format!(
                     "present_content_unsampled mid={mapping} {w}x{h} gen={gen} \
                      (dmabuf carried the frame; no CPU pixels to judge)"
                 ));
@@ -1608,12 +1608,10 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // The guest's `screencapture` is an oracle because it makes the guest
         // re-execute the composite; its memory for a surface we render into is
         // not.
+        // One line per accepted present, verbose-only. `present_enqueue` carried
+        // the same fields through the always-on sink alongside it.
         crate::observe::line(format!(
-            "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={}",
-            encoded as u8, state.present.frame_valid as u8
-        ));
-        crate::observe::off(format!(
-            "present_enqueue mid={mapping} {w}x{h} gen={gen} encoded={} retain={} unpainted={}",
+            "present paint mid={mapping} {w}x{h} gen={gen} encoded={} retain={} unpainted={}",
             encoded as u8,
             state.present.frame_valid as u8,
             state.present.unpainted_presents.saturating_add(1)
