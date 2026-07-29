@@ -3869,9 +3869,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // protocol data and must not be rewritten from an RGB content census;
         // content-gated keep-seed / alpha0-holes composites are retired.
         let load_action = req.colors.first().map(|c| c.load_action);
-        let premult_load = load_action == Some(PASS_LOAD_ACTION_LOAD)
-            && target_rgba8.is_some()
-            && color0_is_premult_one_omsa(&pd);
         let store_is_store = req
             .colors
             .first()
@@ -4126,12 +4123,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        let _premult_load = premult_load; // retained for census logs below
-                                          // Metal path always passes color0 blend into the encoder. Linux/engine
-                                          // previously left `resources.blend = None` → opaque replace for every
-                                          // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
-                                          // dock/chrome layers that Metal would alpha-blend over the attachment.
-                                          // Contract: type-7 color attachment blend tags (decode/resource.rs).
+        // Metal path always passes color0 blend into the encoder. Linux/engine
+        // previously left `resources.blend = None` → opaque replace for every
+        // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
+        // dock/chrome layers that Metal would alpha-blend over the attachment.
+        // Contract: type-7 color attachment blend tags (decode/resource.rs).
         if pd.color0.blending_enabled {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
             match translate::blend::state(
@@ -4363,21 +4359,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // seed_rgb stays unconditional: the retired-proxy fire counters after
-        // the draw (keep_seed_empty_sample / keep_seed_uncovered) consume it,
-        // and it only scans when a CPU seed is actually attached.
-        let seed_rgb = resources
-            .target_rgba8
-            .as_ref()
-            .map(|s| {
-                s.chunks_exact(4)
-                    .filter(|p| p[0] | p[1] | p[2] != 0)
-                    .count()
-            })
-            .unwrap_or(0);
         // Sum of per-bind rgb_nz over Bytes sources, accumulated in the bind
         // loop (resident Target binds contribute no CPU bytes, as before).
         if census_verbose || fixed_gap_first {
+            // O(seed pixels), and the line below is its only reader.
+            let seed_rgb = resources
+                .target_rgba8
+                .as_ref()
+                .map(|s| {
+                    s.chunks_exact(4)
+                        .filter(|p| p[0] | p[1] | p[2] != 0)
+                        .count()
+                })
+                .unwrap_or(0);
             let tex_rgb: usize = 0;
             let idx_count = resources
                 .indexed
@@ -4588,69 +4582,48 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
-        // Measure-only: RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
+        // RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
         // Resident/import path uses skip_readback → empty `out.pixels` is **expected**
         // and must not be read as "GPU drew black" (use import_content res_rgb_nz).
-        let mut rgb_nz = 0usize;
-        let mut max_rgb = 0u8;
-        if out.pixels.is_empty() {
-            crate::observe::line(format!(
-                "linux_m2v_pixels pipe={} {}x{} skip_readback=1 (no CPU pixels; see import_content)",
-                req.pipeline_ref, w, h
-            ));
-        } else {
-            for px in out.pixels.chunks_exact(4) {
-                let m = px[0].max(px[1]).max(px[2]);
-                if m != 0 {
-                    rgb_nz += 1;
+        // The scan is O(pixels) on the drain worker and the line it feeds is the
+        // only consumer, so it runs only when that sink is open.
+        if census_verbose {
+            if out.pixels.is_empty() {
+                crate::observe::line(format!(
+                    "linux_m2v_pixels pipe={} {}x{} skip_readback=1 (no CPU pixels; see import_content)",
+                    req.pipeline_ref, w, h
+                ));
+            } else {
+                let mut rgb_nz = 0usize;
+                let mut max_rgb = 0u8;
+                for px in out.pixels.chunks_exact(4) {
+                    let m = px[0].max(px[1]).max(px[2]);
+                    if m != 0 {
+                        rgb_nz += 1;
+                    }
+                    if m > max_rgb {
+                        max_rgb = m;
+                    }
                 }
-                if m > max_rgb {
-                    max_rgb = m;
-                }
+                crate::observe::line(format!(
+                    "linux_m2v_pixels pipe={} {}x{} rgb_nz={} max_rgb={} px0=[{},{},{},{}]",
+                    req.pipeline_ref,
+                    w,
+                    h,
+                    rgb_nz,
+                    max_rgb,
+                    out.pixels.first().copied().unwrap_or(0),
+                    out.pixels.get(1).copied().unwrap_or(0),
+                    out.pixels.get(2).copied().unwrap_or(0),
+                    out.pixels.get(3).copied().unwrap_or(0),
+                ));
             }
-            crate::observe::line(format!(
-                "linux_m2v_pixels pipe={} {}x{} rgb_nz={} max_rgb={} px0=[{},{},{},{}]",
-                req.pipeline_ref,
-                w,
-                h,
-                rgb_nz,
-                max_rgb,
-                out.pixels.first().copied().unwrap_or(0),
-                out.pixels.get(1).copied().unwrap_or(0),
-                out.pixels.get(2).copied().unwrap_or(0),
-                out.pixels.get(3).copied().unwrap_or(0),
-            ));
         }
-        // D3: no content-gated CPU composites. Premult One/OMSA is hardware
-        // Load+blend; keep-seed / alpha0-holes retired (real Metal has neither).
-        // Fire-counter proxies still log when the OLD content gates *would* have
-        // fired so live boots can prove they stay quiet.
-        // `a0` (alpha-zero pixel count) is a full-frame scan of the readback
-        // pixels but is consumed only by the two composite-fire proxies below —
-        // gated on `_premult_load` or the LOAD/seed/max_rgb shape. Compute it
-        // only when a consumer will actually fire; otherwise the O(pixels) scan
-        // is discarded work on the drain worker (both consumer conditions are
-        // a0-independent, so skipping is behavior-identical).
-        let need_a0 = !out.pixels.is_empty()
-            && (_premult_load
-                || (load_action == Some(PASS_LOAD_ACTION_LOAD) && seed_rgb > 0 && max_rgb == 0));
-        let a0 = if need_a0 {
-            out.pixels.chunks_exact(4).filter(|p| p[3] == 0).count()
-        } else {
-            0
-        };
-        if _premult_load {
-            crate::observe::fail(format!(
-                "linux_m2v_composite_fire premult_hw=1 pipe={} seed_rgb={} draw_rgb={} a0={} (GPU Load+blend; no software premult)",
-                req.pipeline_ref, seed_rgb, rgb_nz, a0
-            ));
-        }
-        if load_action == Some(PASS_LOAD_ACTION_LOAD) && seed_rgb > 0 && max_rgb == 0 && a0 > 0 {
-            crate::observe::fail(format!(
-                "linux_m2v_composite_fire keep_seed_uncovered=1 pipe={} seed_rgb={} a0={} (retired; measure-only)",
-                req.pipeline_ref, seed_rgb, a0
-            ));
-        }
+        // No content-gated CPU composites: premultiplied One/OneMinusSourceAlpha
+        // is hardware Load+blend, and keep-seed / alpha0-hole compositing is not
+        // something real Metal does. The blend state below is what makes that
+        // true; a draw that lands wrong shows up as a typed decline on this
+        // boundary, not as a pixel census.
         // Engine pixels are authoritative (empty when skip_readback; Store path
         // materializes bytes for surface_cache / guest writeback unless import).
         let pixels = out.pixels;

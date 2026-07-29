@@ -2342,16 +2342,6 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
     (out, blended)
 }
 
-/// True when type-7 color0 blend is premultiplied One / OneMinusSrcAlpha (live
-/// pipe 22/26 chrome). Used only to select Load composite math — not a content gate.
-fn color0_is_premult_one_omsa(pd: &RenderPipelineDescriptor) -> bool {
-    pd.color0.blending_enabled
-        && pd.color0.src_rgb == 1 // MTLBlendFactorOne
-        && pd.color0.dst_rgb == 5 // MTLBlendFactorOneMinusSrcAlpha
-        && pd.color0.src_alpha == 1
-        && pd.color0.dst_alpha == 5
-}
-
 /// Decoded `MTLLoadAction` → the Metal C ABI value.
 ///
 /// `MTLLoadAction` has exactly three values, so all three are spelled out and
