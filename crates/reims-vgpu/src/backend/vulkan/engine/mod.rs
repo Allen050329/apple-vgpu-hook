@@ -54,9 +54,10 @@ pub use types::{
     IndexType, IndexedDrawResource, LoadOp, PrimitiveTopology, SampledContentIdentity,
     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
-    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
-    StorageImageFormat, TargetIdentity, VertexAttributeFormat, VertexAttributeResource,
-    VertexStepFunction, ViewportResource, WindowPresentSource, COLOR_INPUT_BINDING,
+    SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
+    StorageBufferResource, StorageImageFormat, TargetIdentity, VertexAttributeFormat,
+    VertexAttributeResource, VertexStepFunction, ViewportResource, WindowPresentSource,
+    COLOR_INPUT_BINDING,
 };
 pub use vk_call::{VkCall, VkOp};
 #[cfg(all(feature = "host-window", target_os = "macos"))]

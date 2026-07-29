@@ -97,6 +97,27 @@ pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Opt
     get_from(&state.host_surfaces, surface_id, width, height)
 }
 
+/// [`get`] as a shared handle, for a caller that needs to own the frame past the
+/// borrow of `state` — a Load seed does, and taking it this way costs a refcount
+/// rather than a full-framebuffer copy.
+///
+/// A handle cannot be truncated the way [`get`]'s slice is, so this additionally
+/// requires the stored buffer to be *exactly* `width * height * 4`. A store with
+/// slop past that is served by [`get`] and misses here, which is the safe way
+/// round: the engine rejects a seed whose length is not exactly the geometry
+/// (`TargetSeedLength`), so handing one out would turn a working draw into a
+/// declined one.
+pub fn get_shared(
+    state: &DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    let need = get_from(&state.host_surfaces, surface_id, width, height)?.len();
+    let e = state.host_surfaces.get(&surface_id)?;
+    (e.bgra.len() == need).then(|| std::sync::Arc::clone(&e.bgra))
+}
+
 /// Type-2/3 encode cache by texture object ref (not surface_id).
 pub fn store_texture(
     state: &mut DeviceState,

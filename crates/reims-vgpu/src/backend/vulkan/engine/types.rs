@@ -240,9 +240,22 @@ pub struct DrawRequest {
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
     pub samplers: Vec<SamplerResource>,
-    /// RGBA8 Load seed for the color target (None = clear black).
-    /// Preferred when `load_op` is not set; still honored as `LoadOp::LoadSeed`.
-    pub target_rgba8: Option<Vec<u8>>,
+    /// CPU Load seed for the color target (None = clear black), in the order
+    /// [`DrawRequest::target_seed_order`] names. Preferred when `load_op` is not
+    /// set; still honored as `LoadOp::LoadSeed`.
+    ///
+    /// Shared rather than owned so a caller holding the frame behind an `Arc` —
+    /// `surface_cache` does — can seed a draw with a refcount instead of a
+    /// whole-framebuffer copy.
+    pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
+    /// Byte order of the CPU seed above, relative to the attachment it seeds.
+    ///
+    /// The attachment is BGRA when [`DrawRequest::output_bgra`] and RGBA
+    /// otherwise. When the two disagree the exchange is folded into the copy
+    /// into the mapped staging span, which has to happen regardless — so a
+    /// caller whose pixels are already in guest scanout order never has to
+    /// materialize a converted frame to seed a draw with them.
+    pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
@@ -1132,6 +1145,24 @@ impl TargetIdentity {
             Self::Anonymous { .. } => 0,
         }
     }
+}
+
+/// Byte order of a CPU load seed, relative to the attachment it seeds.
+///
+/// Vulkan buffer→image copies perform no format conversion, so the staged bytes
+/// must already be in the attachment's physical order. Stating the seed's own
+/// order — rather than assuming one — lets the exchange fold into the copy into
+/// the mapped staging span instead of being paid as a separate converted frame:
+/// `surface_cache` holds guest scanout order and the pooled target is RGBA, so
+/// the runtime used to allocate, copy and swizzle a whole framebuffer per seeded
+/// draw purely to restate the pixels it already had.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOrder {
+    /// Semantic RGBA8 — R, G, B, A in memory.
+    #[default]
+    Rgba8,
+    /// Guest scanout order — B, G, R, A in memory.
+    Bgra8,
 }
 
 /// Color attachment load action for resident targets.

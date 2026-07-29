@@ -3591,7 +3591,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         // Color load seed: CLEAR → solid; LOAD → guest/host seed when present.
-        let mut target_rgba8: Option<Vec<u8>> = None;
+        // `seed_order` names what is in those bytes; the engine folds any needed
+        // R/B exchange into its copy into the mapped staging span rather than
+        // making this side materialize a converted frame.
+        let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
+        let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         #[cfg(feature = "backend-vulkan")]
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -3671,24 +3675,33 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // Resident target carries the chain; no CPU seed bytes.
                 }
                 x if x == PASS_LOAD_ACTION_CLEAR => {
-                    target_rgba8 = Some(solid_rgba_local(w, h, &c0.clear_color));
+                    target_rgba8 =
+                        Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
                 }
                 x if x == PASS_LOAD_ACTION_LOAD => {
                     if let Some(seed) = c0.target_seed_rgba.as_ref() {
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
-                            target_rgba8 = Some(seed.clone());
+                            target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
                         }
                     } else if let Some(seed) = req.target_seed_rgba.as_ref() {
                         if seed.len() == (w as usize) * (h as usize) * 4 {
-                            target_rgba8 = Some(seed.clone());
+                            target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
                         }
                     } else if c0.mapping_id != 0 {
+                        // The type-11 Load seed, and the hot one: `store_routes`
+                        // measures 28-111 of these a second under a browser
+                        // workload. The cache holds guest scanout order and the
+                        // pooled target is RGBA, so this used to allocate, copy
+                        // and swizzle a whole framebuffer per seeded draw just to
+                        // restate pixels it already had. Hand the cache's own
+                        // buffer over and let the exchange ride the staging copy.
                         if let Some(bgra) =
-                            crate::runtime::surface_cache::get(state, c0.mapping_id, w, h)
+                            crate::runtime::surface_cache::get_shared(state, c0.mapping_id, w, h)
                         {
-                            target_rgba8 = Some(swap_rb_channels(bgra));
+                            target_rgba8 = Some(bgra);
+                            seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
                         }
                     } else if c0.texture_ref != 0 {
                         // GVA type-2/3 Load: texture_ref encode cache (separate
@@ -3700,15 +3713,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             None
                         };
                         if let Some(bgra) = gva_hit {
-                            let mut rgba = bgra;
-                            for px in rgba.chunks_exact_mut(4) {
-                                px.swap(0, 2);
-                            }
-                            target_rgba8 = Some(rgba);
+                            target_rgba8 = Some(std::sync::Arc::new(bgra));
+                            seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
                         } else if let Some(bgra) =
                             crate::runtime::surface_cache::get_texture(state, c0.texture_ref, w, h)
                         {
-                            target_rgba8 = Some(swap_rb_channels(bgra));
+                            target_rgba8 = Some(std::sync::Arc::new(bgra.to_vec()));
+                            seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
                         }
                     }
                 }
@@ -3716,7 +3727,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         } else if let Some(seed) = req.target_seed_rgba.as_ref() {
             if seed.len() == (w as usize) * (h as usize) * 4 {
-                target_rgba8 = Some(seed.clone());
+                target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
             }
         }
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
@@ -3811,6 +3822,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .map(|c| c.store_action == PASS_STORE_ACTION_STORE)
             .unwrap_or(true);
         resources.target_rgba8 = target_rgba8;
+        resources.target_seed_order = seed_order;
         // A Store reads back; anything else skips it.
         //
         // A Store used to have a second option: when the host's page aliases

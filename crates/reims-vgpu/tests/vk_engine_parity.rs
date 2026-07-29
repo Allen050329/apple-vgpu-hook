@@ -600,7 +600,7 @@ fn load_seed_preserves_uncovered_and_draws() {
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     // Fullscreen triangle covers everything; seed is Load base then overdrawn.
-    req.target_rgba8 = Some([10, 20, 30, 255].repeat(8 * 8));
+    req.target_rgba8 = Some(std::sync::Arc::new([10, 20, 30, 255].repeat(8 * 8)));
     if let Some(px) = draw_or_skip("load_seed", &req) {
         assert_fullscreen_fragment_color("load_seed", &px, 8, 8);
     }
@@ -612,7 +612,7 @@ fn blend_src_alpha_known_color() {
     engine::test_reset_engine();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
-    req.target_rgba8 = Some([0, 0, 0, 255].repeat(8 * 8));
+    req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
     req.blend = Some(BlendStateResource {
         src_color: BlendFactor::SrcAlpha,
         dst_color: BlendFactor::OneMinusSrcAlpha,
@@ -1845,6 +1845,86 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     );
 }
 
+/// A `SeedOrder::Bgra8` seed into the default RGBA target must land the same
+/// semantic pixels as the equivalent `SeedOrder::Rgba8` seed.
+///
+/// This is the type-11 composite Load. `surface_cache` holds guest scanout order
+/// while the pooled target is RGBA, so the runtime used to allocate, copy and
+/// swizzle a whole framebuffer per seeded draw purely to restate pixels it
+/// already had — at the 28-111 Stores/s `store_routes` measures. Naming the
+/// seed's own order lets the exchange ride the copy into the mapped staging
+/// span, which happens either way.
+///
+/// A partial draw is what makes it observable: the scissor leaves most of the
+/// seed untouched, and a fullscreen draw would overwrite a wrong upload and pass
+/// regardless. Both arms are run and compared rather than asserting a literal,
+/// so this cannot pass by both paths being broken the same way.
+#[test]
+fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
+    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    engine::test_reset_engine();
+    let (vert, frag) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // Deliberately asymmetric in R and B, so an omitted or doubled exchange is
+    // visible rather than cancelling.
+    let semantic_rgba = [17u8, 91, 203, 255];
+    let scanout_bgra = [
+        semantic_rgba[2],
+        semantic_rgba[1],
+        semantic_rgba[0],
+        semantic_rgba[3],
+    ];
+    let outside = ((h / 2) * w + w / 2) as usize * 4;
+
+    let read_back = |order: engine::SeedOrder, bytes: [u8; 4], id: u32| -> Option<Vec<u8>> {
+        let identity = TargetIdentity::Surface {
+            id,
+            width: w,
+            height: h,
+            generation: 1,
+        };
+        let mut req = engine_req(&vert, &frag, w, h);
+        req.target_identity = Some(identity.clone());
+        req.skip_readback = true;
+        req.target_rgba8 = Some(std::sync::Arc::new(bytes.repeat((w * h) as usize)));
+        req.target_seed_order = order;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+        match engine::execute_draw_request(&req) {
+            Ok(_) => {}
+            Err(e) if skip_if_no_gpu(&e.to_string()) => {
+                eprintln!("SKIP seed order: {e}");
+                return None;
+            }
+            Err(e) => panic!("seed order draw: {e}"),
+        }
+        Some(engine::read_target(&identity).expect("read seed-order target"))
+    };
+
+    let Some(rgba_arm) = read_back(engine::SeedOrder::Rgba8, semantic_rgba, 91) else {
+        return;
+    };
+    let Some(bgra_arm) = read_back(engine::SeedOrder::Bgra8, scanout_bgra, 92) else {
+        return;
+    };
+    assert_eq!(
+        &bgra_arm[outside..outside + 4],
+        &rgba_arm[outside..outside + 4],
+        "the same pixels described in two orders must land identically"
+    );
+    // And that they landed as the semantic colour, not as some agreed-upon
+    // wrong one: the target is RGBA, so untouched storage is the seed verbatim.
+    assert_eq!(
+        &rgba_arm[outside..outside + 4],
+        &semantic_rgba[..],
+        "an RGBA-ordered seed into an RGBA target must be stored verbatim"
+    );
+}
+
 /// Premult One/OMSA: GPU Load+blend matches the retired software composite oracle.
 #[test]
 fn premult_one_omsa_gpu_blend_matches_software_oracle() {
@@ -1857,7 +1937,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     let seed: Vec<u8> = (0..(w * h)).flat_map(|_| [128u8, 128, 128, 255]).collect();
     // GPU path: Load seed + One/OMSA blend (fullscreen frag writes opaque color).
     let mut gpu = engine_req(&v, &f, w, h);
-    gpu.target_rgba8 = Some(seed.clone());
+    gpu.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
     gpu.blend = Some(BlendStateResource {
         src_color: BlendFactor::One,
         dst_color: BlendFactor::OneMinusSrcAlpha,
@@ -1990,7 +2070,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
         Err(e) => panic!("chain d1: {e}"),
     };
     let mut d2_cpu = engine_req(&v, &f, 16, 16);
-    d2_cpu.target_rgba8 = Some(p1.clone());
+    d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
     let p2_cpu = engine::execute_draw_request(&d2_cpu)
         .expect("cpu seed chain")
         .pixels;
@@ -2042,10 +2122,10 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         Err(e) => panic!("gva_chain d1: {e}"),
     };
     let mut d2 = engine_req(&v, &f, 16, 16);
-    d2.target_rgba8 = Some(p1);
+    d2.target_rgba8 = Some(std::sync::Arc::new(p1));
     let p2 = engine::execute_draw_request(&d2).expect("cpu d2").pixels;
     let mut d3 = engine_req(&v, &f, 16, 16);
-    d3.target_rgba8 = Some(p2);
+    d3.target_rgba8 = Some(std::sync::Arc::new(p2));
     let p3_cpu = engine::execute_draw_request(&d3).expect("cpu d3").pixels;
 
     // Resident chain on a Gva identity: intermediates never touch the CPU.
@@ -2531,7 +2611,9 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
     let mut req = engine_req(&v, &f, w, h);
     req.color_input = true;
     // Seed (64, 128, 191, 255) → expect ~(191, 127, 64, 255).
-    req.target_rgba8 = Some([64, 128, 191, 255].repeat((w * h) as usize));
+    req.target_rgba8 = Some(std::sync::Arc::new(
+        [64, 128, 191, 255].repeat((w * h) as usize),
+    ));
     let Some(px) = draw_or_skip("framebuffer_fetch", &req) else {
         return;
     };

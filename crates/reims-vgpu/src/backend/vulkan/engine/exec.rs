@@ -17,7 +17,7 @@ use super::draw_validation::DrawValidationDecline;
 use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
 use super::types::{
     BufferContent, DrawError, DrawOutput, DrawRequest, LoadOp, SampledSource, ScissorResource,
-    VertexStepFunction, ViewportResource,
+    SeedOrder, VertexStepFunction, ViewportResource,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -794,7 +794,7 @@ pub(crate) unsafe fn execute_draw_inner(
     let seed_bytes: Option<&[u8]> = match &req.load_op {
         Some(LoadOp::LoadSeed(native)) => Some(native.as_slice()),
         Some(_) => None,
-        None => req.target_rgba8.as_deref(),
+        None => req.target_rgba8.as_ref().map(|v| v.as_slice()),
     };
     let mut pass_key = PassKey::single(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),
@@ -1013,12 +1013,14 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::BufferUsageFlags::TRANSFER_SRC,
             counters,
         )?;
-        // LoadSeed is semantic RGBA8. Vulkan buffer→image copies do not perform
-        // format conversion, so a BGRA resident attachment needs physical
-        // B/G/R/A bytes — otherwise partial draws preserve an exact
-        // R/B-exchanged seed outside their damaged geometry.
-        if output_bgra {
-            pools.write_staging_rgba_as_bgra(ctx, &slot, rgba8)?;
+        // Vulkan buffer→image copies do not perform format conversion, so the
+        // staged bytes must already be in the attachment's physical order —
+        // otherwise partial draws preserve an exact R/B-exchanged seed outside
+        // their damaged geometry. The attachment is BGRA when `output_bgra`; the
+        // seed states its own order. Exchange exactly when they disagree, inside
+        // the copy that has to happen anyway.
+        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+            pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
         } else {
             pools.write_staging(ctx, &slot, rgba8)?;
         }

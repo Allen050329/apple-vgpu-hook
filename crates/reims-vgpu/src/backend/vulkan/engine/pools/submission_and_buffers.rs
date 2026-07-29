@@ -1461,14 +1461,19 @@ impl ResourcePools {
         Ok(())
     }
 
-    /// Copy semantic RGBA8 into a mapped staging slot as physical BGRA8.
+    /// Copy into a mapped staging slot with R and B exchanged.
     ///
-    /// The R/B exchange a BGRA resident attachment needs used to run over a
-    /// heap copy of the seed, which cost a full-frame allocation, a memcpy to
-    /// fill it, a second pass to swizzle it and a third to write it into the
-    /// mapped span. The exchange is per-pixel and order-independent, so it
-    /// folds into the copy: read RGBA from the caller's borrow, write BGRA
-    /// straight into mapped memory, one pass, no allocation.
+    /// The exchange is an involution, so this serves both directions: a
+    /// semantic-RGBA seed into a BGRA attachment, and a guest-scanout-order seed
+    /// (what `surface_cache` holds) into the RGBA pooled target. Which one is
+    /// wanted is decided by the caller from `target_seed_order` against
+    /// `output_bgra`; the transformation is the same either way.
+    ///
+    /// It used to run over a heap copy of the seed, which cost a full-frame
+    /// allocation, a memcpy to fill it, a second pass to swizzle it and a third
+    /// to write it into the mapped span. Being per-pixel and order-independent
+    /// it folds into the copy: read from the caller's borrow, write the exchanged
+    /// bytes straight into mapped memory, one pass, no allocation.
     ///
     /// Mapped staging is host-visible and written only, never read back, so
     /// this writes each destination byte exactly once and never loads from
@@ -1478,7 +1483,7 @@ impl ResourcePools {
     /// A trailing partial pixel (`len % 4 != 0`) is copied through unswizzled;
     /// a seed is always whole RGBA8 pixels, so the remainder is empty in
     /// practice and this only keeps the mapped span fully defined.
-    pub(crate) unsafe fn write_staging_rgba_as_bgra(
+    pub(crate) unsafe fn write_staging_swap_rb(
         &self,
         ctx: &DeviceContext,
         slot: &BufferSlot,
