@@ -739,34 +739,6 @@ impl ComputeStorageResidencyKey {
     }
 }
 
-/// Deferred render-Store window: guest pages of this type-11 view are STALE —
-/// the pinned engine resident render target (identity reconstructed as
-/// `TargetIdentity::Surface { id: mapping_id, width, height, generation:
-/// map_generation }`) is the authoritative content until a flush lands it.
-///
-/// Keyed like [`ComputeStorageResidencyKey`] so intersecting range scans share
-/// one shape; ordered by `(mapping_id, surface_offset, span_end)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RenderDeferredKey {
-    pub mapping_id: u32,
-    pub surface_offset: u64,
-    pub span_end: u64,
-}
-
-/// Everything a later flush needs to replay the deferred import-present Store.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RenderDeferredEntry {
-    pub width: u32,
-    pub height: u32,
-    /// Mapping lifetime at defer time — flush drops on drift (recycled pages).
-    pub map_generation: u64,
-    /// Arm order for oldest-first flush when the render-deferred window cap is
-    /// hit — mirrors [`GvaDeferredEntry::armed_seq`]. Bounds the pinned resident
-    /// population so a compositing burst (YouTube page-load) cannot balloon the
-    /// registry far past its slot cap.
-    pub armed_seq: u64,
-}
-
 /// Everything a later flush needs to land a deferred **GVA render Store**
 /// (type-2/3 color0 with `target_gva != 0`): the engine resident
 /// `TargetIdentity::Gva { gva, width, height, generation: 0 }` holds the
@@ -878,8 +850,9 @@ pub enum PaintSrc {
     /// into the guest pages during this capture's own `flush_intersecting`.
     ReuseStore,
     /// Read straight out of the GPU resident (`read_resident_bgra`) with **no**
-    /// guest-page scatter — the oracle frame source. The guest-page writeback
-    /// stays deferred on the `render_deferred_flush` rail for a real guest read.
+    /// guest-page scatter — the oracle frame source. Nothing is owed to the
+    /// guest pages by this read: a type-11 Store writes them on its own path
+    /// (`mapping_write::write_rgba8_image_changed`).
     Resident,
     /// Contiguous HostOps view read (packed mapping — one host span).
     GuestPagesContig,
@@ -1351,12 +1324,6 @@ pub struct DeviceState {
     /// first (`runtime::storage_flush::flush_intersecting`). Value = the
     /// engine resident generation to flush.
     pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, u32>,
-    /// Deferred render Stores: type-11 windows whose guest pages are STALE —
-    /// the pinned engine resident render target is authoritative. Same
-    /// flush-on-access contract as [`Self::compute_deferred_flush`]
-    /// (`runtime::storage_flush::flush_intersecting`); lifetime boundaries
-    /// drop fail-visibly, never write.
-    pub render_deferred_flush: BTreeMap<RenderDeferredKey, RenderDeferredEntry>,
     /// Physical page bases of each mapping with live deferred windows, for the
     /// raw task-GVA sampling guard (`storage_flush::flush_intersecting_task_gva`).
     /// Built at defer time from the just-resolved `page_entries`
@@ -1421,9 +1388,6 @@ pub struct DeviceState {
     pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
-    /// Monotonic arm counter for the [`Self::render_deferred_flush`]
-    /// oldest-first cap (bounds the pinned resident population).
-    pub render_deferred_seq: u64,
     /// GVAs rendered this guest lifetime as an **MRT secondary attachment**
     /// (e.g. the vibrancy RG16Float coverage mask) → its (width, height). The
     /// producer records the identity + geometry here; a later draw sampling a
@@ -1548,7 +1512,6 @@ impl DeviceState {
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
-            render_deferred_flush: BTreeMap::new(),
             deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
             present: PresentState::default(),
@@ -1570,7 +1533,6 @@ impl DeviceState {
             gva_deferred_flush: DeferredWindows::new(),
             mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,
-            render_deferred_seq: 0,
             retired_gva_windows: Vec::new(),
             linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -2049,24 +2011,6 @@ impl DeviceState {
         Some((gva, entry))
     }
 
-    /// Remove the least-recently-armed render-deferred window, for the
-    /// oldest-first flush that bounds the window population (and thus the pinned
-    /// resident count) under a compositing burst. Mirrors
-    /// [`Self::take_oldest_gva_deferred_window`]; prunes the alias index for the
-    /// window's mapping so the incremental deferred-page refcount stays exact.
-    pub fn take_oldest_render_deferred_window(
-        &mut self,
-    ) -> Option<(RenderDeferredKey, RenderDeferredEntry)> {
-        let key = *self
-            .render_deferred_flush
-            .iter()
-            .min_by_key(|(_, e)| e.armed_seq)
-            .map(|(k, _)| k)?;
-        let entry = self.render_deferred_flush.remove(&key)?;
-        self.prune_alias_index(key.mapping_id);
-        Some((key, entry))
-    }
-
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) -> bool {
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::DefineTaskIdRange { task_id }.emit(u64::from(task_id));
@@ -2388,37 +2332,6 @@ impl DeviceState {
         taken
     }
 
-    /// Remove and return every deferred render-Store window intersecting
-    /// `[lo, hi)` on this mapping. Same take-then-flush ownership contract as
-    /// [`Self::take_deferred_flush_windows`].
-    pub fn take_render_deferred_windows(
-        &mut self,
-        mapping_id: u32,
-        lo: u64,
-        hi: u64,
-    ) -> Vec<(RenderDeferredKey, RenderDeferredEntry)> {
-        let keys: Vec<RenderDeferredKey> = self
-            .render_deferred_flush
-            .keys()
-            .filter(|key| {
-                key.mapping_id == mapping_id && key.span_end > lo && key.surface_offset < hi
-            })
-            .cloned()
-            .collect();
-        let taken: Vec<(RenderDeferredKey, RenderDeferredEntry)> = keys
-            .into_iter()
-            .filter_map(|key| {
-                self.render_deferred_flush
-                    .remove(&key)
-                    .map(|entry| (key, entry))
-            })
-            .collect();
-        if !taken.is_empty() {
-            self.prune_alias_index(mapping_id);
-        }
-        taken
-    }
-
     /// Record the physical page bases of `mapping_id` in the raw-GVA alias
     /// index. Called at defer time, when `page_entries` are freshly resolved
     /// (the Store/dispatch just targeted them) — never at sample time.
@@ -2448,17 +2361,13 @@ impl DeviceState {
         }
     }
 
-    /// Drop the alias-index entry once no deferred window (compute or render)
-    /// names this mapping anymore.
+    /// Drop the alias-index entry once no mapping-keyed deferred window names
+    /// this mapping anymore.
     fn prune_alias_index(&mut self, mapping_id: u32) {
         let live = self
             .compute_deferred_flush
             .keys()
-            .any(|k| k.mapping_id == mapping_id)
-            || self
-                .render_deferred_flush
-                .keys()
-                .any(|k| k.mapping_id == mapping_id);
+            .any(|k| k.mapping_id == mapping_id);
         if !live {
             if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
                 self.deferred_ref_sub_pages(&old);

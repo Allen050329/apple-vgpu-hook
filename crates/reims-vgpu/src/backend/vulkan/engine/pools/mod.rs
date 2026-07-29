@@ -868,16 +868,17 @@ pub(crate) struct RegistryGeomCensus {
 
 /// Cap on the **non-pinned** (LRU-evictable) resident-target population — the
 /// active render working set. Pinned slots (deferred-write windows, each holding
-/// content only on the GPU, bounded separately by
-/// `import_present::RENDER_DEFERRED_WINDOW_CAP`) are **excluded** from this count
+/// content only on the GPU, bounded separately by the arming rail's own window
+/// cap — `metal_draw::vulkan::GVA_DEFERRED_WINDOW_CAP` for the GVA Store rail)
+/// are **excluded** from this count
 /// (see the eviction loops): counting them would force the still-in-use active
 /// targets out whenever a compositing burst pins hundreds, thrashing exactly the
 /// targets a draw is about to reuse (measured `reg=512/512 evicts=168` under a
 /// YouTube page-load, ~320 pinned). Excluding them lets the active set keep its
 /// full cap regardless of the pinned burst, so a burst is *absorbed* (evicts≈0)
 /// instead of thrashing. Total registry is bounded by construction —
-/// `REGISTRY_CAP` non-pinned + `RENDER_DEFERRED_WINDOW_CAP` pinned. VRAM does not
-/// stay pinned at this ceiling: the idle drain
+/// `REGISTRY_CAP` non-pinned plus the pinned windows, which each arming rail caps
+/// itself. VRAM does not stay pinned at this ceiling: the idle drain
 /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a burst's stale
 /// leftovers ~2 s after last use, returning the resident set to the ~56 idle
 /// working set once the burst ends. So this is sized to absorb the burst's *live*

@@ -389,26 +389,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
-        type_name: "ImportDecline",
-        defined_in: "runtime/import_present.rs",
-        slug_blocks: &[],
-        emission: Emission::At(&[("runtime/import_present.rs", "import_present")]),
-        slug_calls: &[],
-        slugs: &[
-            "import_map_gen_drift",
-            "import_unmapped",
-            "import_no_sample_window",
-            "import_bpr_below_tight",
-            "import_short_view",
-            "import_base_off_overflow",
-            "import_revalidate",
-            "import_short_table",
-            "import_no_runs",
-            "import_map_run_failed",
-            "import_no_intersect",
-        ],
-    },
-    DeclineClass {
         type_name: "TextureViewDecline",
         defined_in: "runtime/metal_draw/texture_view.rs",
         slug_blocks: &[],
@@ -465,9 +445,18 @@ pub const REGISTRY: &[DeclineClass] = &[
         type_name: "HostPresentDecline",
         defined_in: "backend/vulkan/engine/reason.rs",
         slug_blocks: &[],
-        // The runtime's three import paths all classify on this type now, and
-        // all three emit through `import_present`.
-        emission: Emission::At(&[("runtime/import_present.rs", "import_present")]),
+        // The import-present rail that used to classify on this type and emit it
+        // through `import_present` is gone, so the only path left to the sink is
+        // the Metal→Vulkan draw boundary, which renders whatever `DrawError` it
+        // gets back and lets it delegate its slug here.
+        //
+        // That path is currently unreachable in practice: this type is produced
+        // only by `resolve_scatter_regions`, reached only from
+        // `present_into_host_runs`, which has no product caller left. It is not
+        // registered `Unreachable` because the engine entry point still exists
+        // and the gate correctly refuses the claim while it does. Retire this
+        // row when the scatter rail itself is deleted.
+        emission: Emission::At(&[("runtime/metal_draw/mod.rs", "linux_m2v_draw")]),
         slug_calls: &[],
         slugs: &[
             "read_target_unknown_identity",
@@ -512,7 +501,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("backend/vulkan/engine/mod.rs", "present_capture"),
             ("backend/vulkan/engine/mod.rs", "vk_engine_probe"),
             ("backend/vulkan/engine/mod.rs", "vk_device_recreate"),
-            ("runtime/import_present.rs", "import_present"),
             ("runtime/metal_draw/mod.rs", "linux_m2v_draw"),
             ("runtime/compute_exec/mod.rs", "compute_linux_engine"),
             (
@@ -939,7 +927,6 @@ pub const REGISTRY: &[DeclineClass] = &[
                 "backend/vulkan/engine/window_present.rs",
                 "host_window_destroy",
             ),
-            ("runtime/import_present.rs", "import_present"),
             ("runtime/storage_flush.rs", "deferred_flush_lost"),
             ("lib.rs", "export_present"),
             ("host_window/present.rs", "host_window_present"),
@@ -2336,25 +2323,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "cmd_task_ambiguous",
             "cmd_task_shifted",
             "cmd_task_dead",
-        ],
-    },
-    DeclineClass {
-        type_name: "Type11LoadDecision",
-        defined_in: "runtime/metal_draw/mod.rs",
-        slug_blocks: &[],
-        // Census, not a refusal: the Load resolved every time. Six checks
-        // collapse into three `Type11LoadChoice` values and `UseCpuSeed` alone
-        // is reached three ways, so all six are registered — the reading is
-        // which check applied, which the outcome cannot say.
-        emission: Emission::At(&[("runtime/metal_draw/vulkan.rs", "t11_load")]),
-        slug_calls: &[],
-        slugs: &[
-            "t11_load_non_load_seeded",
-            "t11_load_non_load_bare",
-            "t11_load_present_boundary",
-            "t11_load_resident_ready",
-            "t11_load_seed_not_ready",
-            "t11_load_nothing",
         ],
     },
     DeclineClass {

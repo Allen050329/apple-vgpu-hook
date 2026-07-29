@@ -31,9 +31,6 @@ pub mod host;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 
-/// Safe zero-copy import-present (resident BGRA → guest pages, stride-correct).
-#[cfg(feature = "backend-vulkan")]
-pub mod import_present;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
@@ -51,6 +48,9 @@ pub mod mtlb;
 /// Object-list lookup and type-11 registration.
 pub mod objects;
 pub mod plan;
+/// The resident identity a type-11 guest surface renders into.
+#[cfg(feature = "backend-vulkan")]
+pub mod present_identity;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).

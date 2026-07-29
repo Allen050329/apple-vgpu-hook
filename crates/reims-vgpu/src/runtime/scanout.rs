@@ -126,7 +126,7 @@ fn try_capture_from_resident(
 ) -> bool {
     let need = buf.len();
     let identity =
-        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
+        crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
     let Some(bgra) = crate::backend::vulkan::engine::read_resident_bgra(&identity, need) else {
         return false;
     };
@@ -272,8 +272,10 @@ pub fn capture_present_frame(
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
     // to be in guest pages. This reads the resident and nothing else: no
-    // `flush_intersecting`, so the guest-page writeback stays deferred on the
-    // `render_deferred_flush` rail, which already flushes on a genuine guest read
+    // `flush_intersecting`. Nothing is owed — a type-11 render Store lands its
+    // own guest-page writeback (`mapping_write::write_rgba8_image_changed`), and
+    // the deferred rails that remain (compute storage, linear, GVA) are keyed on
+    // resources this capture does not touch and flush on a genuine guest read
     // (LOAD re-seed / SynchronizeResources / guest CPU read). The retained
     // `frame_bgra` filled here is unchanged, so the present-boundary seed (which
     // reads the retained front frame first, guest pages only as fallback) is

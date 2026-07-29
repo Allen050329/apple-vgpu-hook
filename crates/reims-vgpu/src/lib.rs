@@ -642,7 +642,7 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let present_identity = crate::runtime::import_present::surface_identity(
+        let present_identity = crate::runtime::present_identity::surface_identity(
             state,
             p.frame_mapping,
             p.frame_width,
@@ -807,7 +807,7 @@ fn window_present_source(
     crate::backend::vulkan::engine::WindowPresentSource {
         width,
         height,
-        candidates: vec![crate::runtime::import_present::surface_identity(
+        candidates: vec![crate::runtime::present_identity::surface_identity(
             state, mapping, width, height,
         )],
     }
@@ -1293,7 +1293,7 @@ pub fn device_poll(id: u64) -> bool {
     {
         let present = &device.state.present;
         let display_id = present.frame_valid.then(|| {
-            runtime::import_present::surface_identity(
+            runtime::present_identity::surface_identity(
                 &device.state,
                 present.frame_mapping,
                 present.frame_width,

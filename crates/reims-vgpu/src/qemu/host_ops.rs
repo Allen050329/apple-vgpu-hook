@@ -50,11 +50,23 @@ pub struct ReimsVgpuHostOps {
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
     pub notify_actions: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
-    /// 1 when `map_pages` returns a stable guest-RAM alias whose address is
-    /// never unmapped or recycled during the device lifetime (x86 PCI: a
-    /// direct RAMBlock pointer; arm MMIO: a direct HVA or retained packed
-    /// `mach_vm_remap` view). `unmap_pages` is a no-op. Only a stable alias may
-    /// be retained in a cached host-pointer import — see `map_pages_stable`.
+    /// 1 when `map_pages` owes no release: the pointer is guest RAM itself and
+    /// stays valid for the device lifetime, so a caller may hold it
+    /// indefinitely and `unmap_pages` has nothing to free.
+    ///
+    /// The two shims answer differently and the difference is real. x86 PCI
+    /// answers **1**: it never allocates, refusing any list that is not a
+    /// packed host-contiguous run and otherwise returning
+    /// `memory_region_get_ram_ptr() + xlat`. arm MMIO answers **0**: a
+    /// contiguous run gets the same direct HVA, but a fragmented one gets a
+    /// packed `mach_vm_remap` view, and a bare pointer cannot say which it is.
+    ///
+    /// This used to also license retaining the pointer inside a cached
+    /// `VK_EXT_external_memory_host` import, which is where the stronger
+    /// promise came from — MMIO could claim 1 only because it never released a
+    /// view at all, so every fragmented map leaked a VA reservation until
+    /// teardown. Nothing imports guest pages now, `unmap_pages` on that shim
+    /// really deallocates, and the flag is back to the narrow claim above.
     pub map_pages_stable: c_int,
 }
 

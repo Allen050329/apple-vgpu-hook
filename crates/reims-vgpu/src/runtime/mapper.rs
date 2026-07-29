@@ -328,13 +328,14 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
 pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u32) -> bool {
+    // Neither branch below releases a deferred writeback window. A type-11
+    // render Store writes guest pages on its own path, so an UNMAP (or a MAP
+    // that re-backs the slot with a different MappingInternal, orphaning the
+    // old identity) leaves no mapping-keyed render obligation behind. Compute
+    // storage windows are the surviving mapping-keyed rail and they are torn
+    // down by `storage_flush::drop_windows` from the lifecycle sites that know
+    // whether the pages can still be written.
     if cap.request_type == MAPPER_REQUEST_UNMAP {
-        // The surface is gone: eagerly release any deferred present-store window
-        // pinning its resident, so the registry LRU can reclaim it. Without this
-        // the pin lingers for the guest lifetime (nothing triggers the lazy
-        // `map_generation_drift` drop) and the registry soft-exceeds its cap.
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::import_present::drop_render_deferred_windows(state, mapping_id);
         return state.unmap_surface(mapping_id);
     }
     if cap.request_type != MAPPER_REQUEST_MAP {
@@ -342,22 +343,6 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
     }
     if cap.mapper_device_kva != 0 {
         state.mapper_device_kva = cap.mapper_device_kva;
-    }
-    // A MAP that re-backs the slot with a *different* MappingInternal is a new
-    // surface (attach_mapping_internal bumps the generation and drops the old
-    // geometry). Its old deferred windows now name a stale identity that no
-    // access will ever flush — release their pins here too. A re-statement of
-    // the same internal keeps its windows (attach early-returns unchanged).
-    #[cfg(feature = "backend-vulkan")]
-    {
-        let internal_changed = state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.mapping_internal != cap.mapping_internal)
-            .unwrap_or(true);
-        if internal_changed {
-            crate::runtime::import_present::drop_render_deferred_windows(state, mapping_id);
-        }
     }
     state.attach_mapping_internal(mapping_id, cap.mapping_internal)
 }
@@ -621,15 +606,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // deferred window survived); plain reprieves are steady id-recycle
         // control flow.
         let windows = state
-            .render_deferred_flush
+            .compute_deferred_flush
             .keys()
             .filter(|k| k.mapping_id == mapping_id)
-            .count()
-            + state
-                .compute_deferred_flush
-                .keys()
-                .filter(|k| k.mapping_id == mapping_id)
-                .count();
+            .count();
         if windows > 0 {
             // Condemn dropped the raw-GVA alias index; the pages just
             // re-adopted are the same ones the windows defer-armed on.

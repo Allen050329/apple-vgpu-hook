@@ -14,9 +14,8 @@ pub use state::{
     DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GuestRunMemoEntry,
     GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface, IosfcRegs,
     LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc,
-    PendingWork, PresentState, PresentedGeom, RenderDeferredEntry, RenderDeferredKey, StampSlot,
-    SurfaceWriteKind, TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
-    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
+    PendingWork, PresentState, PresentedGeom, StampSlot, SurfaceWriteKind, TaskEntry, TaskMapSpan,
+    WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;

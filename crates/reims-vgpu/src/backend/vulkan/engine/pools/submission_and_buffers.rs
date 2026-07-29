@@ -566,8 +566,8 @@ impl ResourcePools {
 
     /// Count of registry residents NOT held by a deferred-write pin — the
     /// LRU-evictable (active) working set the `REGISTRY_CAP` bounds. Pinned slots
-    /// are bounded separately (`RENDER_DEFERRED_WINDOW_CAP`) and excluded so a
-    /// pinned burst cannot force the active set into eviction thrash.
+    /// are bounded separately (by the arming rail's own window cap) and excluded
+    /// so a pinned burst cannot force the active set into eviction thrash.
     fn non_pinned_registry_len(&self) -> usize {
         let pinned = self
             .registry
@@ -1438,7 +1438,12 @@ impl ResourcePools {
             let mut s = String::new();
             for (i, n) in v.iter().enumerate() {
                 if *n != 0 {
-                    let _ = write!(s, "{}{}:{n}", if s.is_empty() { "" } else { "," }, 1u64 << i);
+                    let _ = write!(
+                        s,
+                        "{}{}:{n}",
+                        if s.is_empty() { "" } else { "," },
+                        1u64 << i
+                    );
                 }
             }
             if s.is_empty() {

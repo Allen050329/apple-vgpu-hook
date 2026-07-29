@@ -2144,132 +2144,24 @@ pub(crate) fn store_seed_policy(
     }
 }
 
-/// How Linux/Vulkan should honor a type-11 color attachment Load.
-///
-/// Metal type-11 Load reads guest-backed attachment bytes (unified). Discrete
-/// Vulkan keeps the live surface on a **resident GPU image**; zero-copy Store
-/// then DMA's into guest pages and **evicts host_cache**. If LOAD falls through
-/// to engine Clear black (no `target_rgba8` / no `load_op`), each multi-pass
-/// Store wipes prior layers → class A empty present (`import_content res=0`
-/// progressive collapse, pill-only boot).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Type11LoadChoice {
-    /// `LoadOp::LoadFromTarget` — prior resident content is ready.
-    LoadFromTarget,
-    /// Keep / upload CPU seed (`target_rgba8` / `LoadSeed`).
-    UseCpuSeed,
-    /// No seed and no ready resident → engine Clear black.
-    ClearBlack,
-}
-
-/// **Which check** decided the type-11 Load, not just what it chose.
-///
-/// Six distinct decisions collapse into three [`Type11LoadChoice`] values, and
-/// `UseCpuSeed` alone is reached three different ways. That is the same "one
-/// status for N checks" shape the guest-write gate carried until its arms were
-/// typed: the always-on log could say a seed was uploaded and could not say
-/// *why*, so no reading could separate a normal not-ready seed from the
-/// present-boundary rule.
-///
-/// The present-boundary rule is the one that needs separating. It is documented
-/// from live forensics rather than from a decoded field — the guest sends no
-/// "re-seed from the front buffer" instruction — which makes it a candidate for
-/// deletion, and nothing can weigh that while its decisions are indistinguishable
-/// from the two legitimate seed paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Type11LoadDecision {
-    /// Not a LOAD, and a seed exists: upload it rather than load the target.
-    NonLoadSeeded,
-    /// Not a LOAD and no seed: clear.
-    NonLoadBare,
-    /// LOAD, the mapping presented since the last draw, and a seed exists.
-    /// **The arm derived from observation** — it overrides a ready resident.
-    PresentBoundary,
-    /// LOAD and the resident is authoritative after our Stores.
-    ResidentReady,
-    /// LOAD, resident not ready, but a seed was built.
-    SeedWhileNotReady,
-    /// LOAD with neither a ready resident nor any seed.
-    NothingToLoad,
-}
-
-impl Type11LoadDecision {
-    pub(crate) fn choice(self) -> Type11LoadChoice {
-        match self {
-            Self::NonLoadSeeded | Self::PresentBoundary | Self::SeedWhileNotReady => {
-                Type11LoadChoice::UseCpuSeed
-            }
-            Self::ResidentReady => Type11LoadChoice::LoadFromTarget,
-            Self::NonLoadBare | Self::NothingToLoad => Type11LoadChoice::ClearBlack,
-        }
-    }
-}
-
-impl crate::observe::Decline for Type11LoadDecision {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::NonLoadSeeded => "t11_load_non_load_seeded",
-            Self::NonLoadBare => "t11_load_non_load_bare",
-            Self::PresentBoundary => "t11_load_present_boundary",
-            Self::ResidentReady => "t11_load_resident_ready",
-            Self::SeedWhileNotReady => "t11_load_seed_not_ready",
-            Self::NothingToLoad => "t11_load_nothing",
-        }
-    }
-}
-
-/// Pure resolution for type-11 Load on the Linux product path.
-///
-/// - CLEAR / non-LOAD: not this helper's concern for LoadFromTarget (caller
-///   keeps Clear/seed policy).
-/// - LOAD + presented-since-last-draw + seed present: **UseCpuSeed** — the
-///   mapping's own present (CmdDisplaySwap) is the swapchain boundary; the
-///   caller seeds the pass from the retained front frame (`+0x188`, see
-///   [`present_front_frame_rgba`]) so the buffer inherits the display's
-///   current content before this frame's damage draws. Chaining the resident
-///   here keeps the buffer's stale base forever (dual-mid strobe class:
-///   boot-27 forensics — the guest performs no CPU copy and no blit between
-///   buffers; the one full-display pass lands in a single buffer). Falls back
-///   to the resident when no seed could be built.
-/// - LOAD + `resident_content_ready`: **LoadFromTarget** (GPU is
-///   authoritative after our Stores; host_cache may be empty or stale black).
-/// - LOAD + not ready + some CPU seed: UseCpuSeed.
-/// - LOAD + not ready + no seed: ClearBlack.
-///
-/// Returns the check that decided rather than only its outcome, so the always-on
-/// census can separate the three routes to `UseCpuSeed`.
-pub(crate) fn resolve_type11_load_decision(
-    load_action: u16,
-    resident_content_ready: bool,
-    cpu_seed: Option<&[u8]>,
-    gpu_seed: bool,
-    presented_since_last_draw: bool,
-) -> Type11LoadDecision {
-    // Presence is the protocol fact. The bytes may legitimately describe a
-    // fully black or transparent attachment and must never affect this choice.
-    // A GPU boundary seed (engine resident→target copy armed on the request)
-    // counts as seed presence exactly like CPU bytes.
-    let has_seed = cpu_seed.is_some() || gpu_seed;
-    if load_action != PASS_LOAD_ACTION_LOAD {
-        // CLEAR / DONT_CARE: never LoadFromTarget via this helper.
-        return if has_seed {
-            Type11LoadDecision::NonLoadSeeded
-        } else {
-            Type11LoadDecision::NonLoadBare
-        };
-    }
-    if presented_since_last_draw && has_seed {
-        return Type11LoadDecision::PresentBoundary;
-    }
-    if resident_content_ready {
-        return Type11LoadDecision::ResidentReady;
-    }
-    if has_seed {
-        Type11LoadDecision::SeedWhileNotReady
-    } else {
-        Type11LoadDecision::NothingToLoad
-    }
-}
+// A six-way type-11 Load resolver stood here — `Type11LoadChoice`,
+// `Type11LoadDecision` and `resolve_type11_load_decision` — deciding whether a
+// LOAD should read the resident target, upload a CPU seed, or clear black, and
+// naming *which* check decided so the always-on census could separate the three
+// routes to a seed.
+//
+// It existed because a type-11 Store that landed by host-pointer import left the
+// attachment resident-only with no CPU bytes, so a later LOAD had to work out
+// which resident held the frame the guest's compositor computes its damage
+// against. Stores read back and seed from guest pages now, so every LOAD has its
+// bytes and there is nothing to resolve. Its one caller was inside the
+// `try_import` branch and went out with it.
+//
+// Worth noting what this resolver was for, because it was the honest half of a
+// problem that is now moot: its `PresentBoundary` arm was derived from live
+// forensics rather than any decoded field — the guest sends no "re-seed from the
+// front buffer" instruction — and the typed decisions existed so that arm could
+// be told apart from the two legitimate seed paths and weighed for deletion.
 
 /// Premultiplied `src` over `dst` with Metal factors **One / OneMinusSrcAlpha**.
 ///
@@ -3966,42 +3858,6 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         return load_type11_rgba_static(state, host, mid, fmt_override);
     }
     load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override)
-}
-
-/// Present-boundary seed: the retained front frame (PGDisplay `+0x188`) as
-/// tight RGBA8, or `None` when the retain is invalid or its geometry differs.
-///
-/// The guest's compositor damage-draws each swapchain buffer against the
-/// display's current front content; the present model is the only
-/// inter-buffer transfer it performs (no CPU copy, no blit — boot-27
-/// forensics). Geometry must match exactly: the retain is display-sized and
-/// only same-geometry compositor members may inherit it. Content never gates
-/// this choice — an all-black front frame is a valid seed.
-pub(crate) fn present_front_frame_rgba(
-    present: &crate::model::PresentState,
-    width: u32,
-    height: u32,
-) -> Option<Vec<u8>> {
-    if !present.frame_valid || present.frame_width != width || present.frame_height != height {
-        return None;
-    }
-    let need = (width as usize)
-        .checked_mul(height as usize)?
-        .checked_mul(RGBA8_BPP as usize)?;
-    if need == 0 || present.frame_bgra.len() < need {
-        return None;
-    }
-    let mut rgba = vec![0u8; need];
-    for (d, s) in rgba
-        .chunks_exact_mut(4)
-        .zip(present.frame_bgra.chunks_exact(4))
-    {
-        d[0] = s[2];
-        d[1] = s[1];
-        d[2] = s[0];
-        d[3] = s[3];
-    }
-    Some(rgba)
 }
 
 fn load_type11_rgba_static<M: HostMemory + HostOps>(
