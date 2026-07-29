@@ -329,24 +329,6 @@ pub fn contig_page_runs(gpas: &[u64], page_size: u64) -> Vec<std::ops::Range<usi
     runs
 }
 
-/// Whether `gpas` can possibly produce a whole-span packed host view.
-///
-/// [`HostOps::map_pages`] aliases page `i` at `base + i * page_size` inside one
-/// RAMBlock, and two RAMBlock offsets are only adjacent in host VA when their
-/// GPAs are adjacent — so a list that is not a single packed run can never map
-/// as one view. Callers whose contract is "packed view or use the multi-run
-/// path" ask here first: without it every fragmented surface spends an FFI call
-/// to be told no, and the refusal lands in the always-on failure log as
-/// `qemu_map_pages_callback_failed` even though the multi-run path then handles
-/// it. A single boot of the x86 desktop logged 536 such non-failures.
-///
-/// Contiguous GPAs remain necessary, not sufficient (a run can still cross a
-/// MemoryRegion edge or cover non-RAM), so a genuine `map_pages` refusal over a
-/// packed list stays fail-visible.
-pub fn is_single_packed_run(gpas: &[u64], page_size: u64) -> bool {
-    contig_run_count(gpas, page_size) == 1
-}
-
 /// How many runs [`contig_page_runs`] would return, without building them.
 ///
 /// The packed-view pre-check and the lines that report a fragmented decline
@@ -829,15 +811,6 @@ mod tests {
         assert_eq!(runs, vec![0..2, 2..4, 4..5]);
         assert_eq!(contig_page_runs(&[0x1000], page), vec![0..1]);
         assert!(contig_page_runs(&[], page).is_empty());
-    }
-
-    #[test]
-    fn single_packed_run_is_the_map_pages_precondition() {
-        let page = 0x1000u64;
-        assert!(is_single_packed_run(&[0x1000, 0x2000, 0x3000], page));
-        assert!(is_single_packed_run(&[0x1000], page));
-        assert!(!is_single_packed_run(&[0x1000, 0x3000], page));
-        assert!(!is_single_packed_run(&[], page));
     }
 
     /// [`contig_run_count`] is what the packed-view pre-check and the

@@ -42,11 +42,6 @@ pub fn page_index(address: u64, page_shift: u32) -> u64 {
     address >> page_shift
 }
 
-#[inline]
-pub fn page_offset(address: u64, page_shift: u32) -> u32 {
-    let mask = (1u64 << page_shift) - 1;
-    (address & mask) as u32
-}
 
 #[cfg(test)]
 mod tests {
@@ -67,11 +62,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_shift_helpers_round_trip_page_and_offset() {
+    fn explicit_shift_helpers_round_trip_pfn_and_page_index() {
         for shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
             let gpa = pfn_to_gpa(0x1234, shift);
             assert_eq!(page_index(gpa + 0x321, shift), 0x1234);
-            assert_eq!(page_offset(gpa + 0x321, shift), 0x321);
         }
     }
 }

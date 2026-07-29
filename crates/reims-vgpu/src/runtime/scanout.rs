@@ -1010,52 +1010,6 @@ pub fn present_dims(state: &DeviceState, mapping_id: u32) -> (u32, u32) {
     (0, 0)
 }
 
-/// Record a successful full-display compositor dependency `source -> output`.
-///
-/// Both mappings must have the exact render-target geometry and the edge must
-/// be non-self.  This is resource provenance from decoded texture/attachment
-/// bindings, not a content or object-id ranking.  Measure-only: the edge is
-/// traced on `compositor_edge` and no present, resident or capture decision
-/// reads it.
-pub fn note_compositor_edge(
-    state: &mut DeviceState,
-    source_mapping: u32,
-    output_mapping: u32,
-    width: u32,
-    height: u32,
-    pipeline_ref: u32,
-) -> bool {
-    if source_mapping == 0
-        || output_mapping == 0
-        || source_mapping == output_mapping
-        || width == 0
-        || height == 0
-    {
-        return false;
-    }
-    let source_matches = state
-        .mappings
-        .get(&source_mapping)
-        .map(|m| m.has_geom && m.width == width && m.height == height)
-        .unwrap_or(false);
-    let Some(output_generation) = state.mappings.get(&output_mapping).and_then(|m| {
-        (m.has_geom && m.width == width && m.height == height).then_some(m.content_generation)
-    }) else {
-        return false;
-    };
-    if !source_matches {
-        return false;
-    }
-
-    // Per-present-per-source re-assertion of an already-discovered edge (~2.8k/
-    // 25s under a continuously-animating app — the single largest present-path
-    // flood), so gate this edge trace behind REIMS_VGPU_DRAW_LOG.
-    crate::observe::line(format!(
-        "compositor_edge source_mid={source_mapping} output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
-    ));
-    true
-}
-
 /// After a successful type-11 color writeback: maybe latch front mapping / paint.
 ///
 /// Contract:
@@ -1386,53 +1340,6 @@ mod tests {
         }
     }
 
-    /// The decoded compositor edge is accepted only when the dependency is
-    /// non-self and BOTH mappings carry the exact render-target geometry the
-    /// edge names — the gating that keeps the `compositor_edge` trace from
-    /// claiming a dependency the guest never expressed.
-    #[test]
-    fn compositor_edge_proxy_records_only_non_self_matching_geometry() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        for mapping_id in [5u32, 6u32] {
-            assert!(state.map_surface(mapping_id));
-            let m = state.mappings.get_mut(&mapping_id).unwrap();
-            m.mapped = true;
-            m.has_geom = true;
-            m.width = 64;
-            m.height = 48;
-            m.content_generation = mapping_id;
-        }
-        let pipeline_ref = std::process::id();
-        assert!(note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
-        // A self edge is not a dependency.
-        assert!(!note_compositor_edge(
-            &mut state,
-            6,
-            6,
-            64,
-            48,
-            pipeline_ref
-        ));
-        // A geometry that is not the mappings' own render-target geometry.
-        assert!(!note_compositor_edge(
-            &mut state,
-            5,
-            6,
-            63,
-            48,
-            pipeline_ref
-        ));
-        // An unmapped output has no geometry to match against.
-        assert!(state.unmap_surface(6));
-        assert!(!note_compositor_edge(
-            &mut state,
-            5,
-            6,
-            64,
-            48,
-            pipeline_ref
-        ));
-    }
 
     #[test]
     fn missing_mapping_fails_without_latching() {

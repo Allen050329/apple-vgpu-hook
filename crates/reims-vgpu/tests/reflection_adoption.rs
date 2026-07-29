@@ -144,11 +144,17 @@ fn reflected_translate_populates_datalayout_and_stage() {
     );
 }
 
-/// End-to-end through reims-vgpu's own cache: `translate_cached_reflected`
-/// returns byte-identical SPIR-V to the plain `translate_cached`, plus a
-/// populated reflection, and a warm second call hits the cache.
+/// End-to-end through reims-vgpu's own cache: a cold `translate_cached_reflected`
+/// emits SPIR-V with a populated reflection, and a warm second call for the same
+/// AIR returns the same entry off the cache rather than re-translating.
+///
+/// The warm half is the load-bearing part and it used not to be asserted at all:
+/// this case's two calls used to be to `translate_cached_reflected` and the
+/// deleted `translate_cached` wrapper, so it compared one entry point against
+/// another and never read `stats()`. Two calls to the *same* entry point are what
+/// make the hit observable.
 #[test]
-fn m2v_cache_reflected_matches_plain_bytes_and_caches() {
+fn m2v_cache_reflects_on_the_cold_call_and_hits_on_the_warm_one() {
     if !have_llvm_dis() {
         eprintln!("skipping: llvm-dis not on PATH");
         return;
@@ -157,15 +163,25 @@ fn m2v_cache_reflected_matches_plain_bytes_and_caches() {
     let fixtures = fixtures();
     let air = std::fs::read(fixtures.join("render_frag_texture.air")).unwrap();
 
-    let shader = m2v_cache::translate_cached_reflected(&air, Stage::Fragment, 1).unwrap();
-    let plain = m2v_cache::translate_cached(&air, Stage::Fragment, 1).unwrap();
+    // Deltas rather than absolutes: the cache is process-global and
+    // `reset_for_test` is `#[cfg(test)]`, so an integration test cannot clear it.
+    let (hits_before, _, _) = m2v_cache::stats();
+    let cold = m2v_cache::translate_cached_reflected(&air, Stage::Fragment, 1).unwrap();
     assert_eq!(
-        shader.spirv, plain,
-        "reflected and plain bytes must be identical"
-    );
-    assert_eq!(
-        shader.reflection.stage,
+        cold.reflection.stage,
         metal2vulkan::reflect::ShaderStage::Fragment
     );
-    assert!(shader.reflection.datalayout.is_some());
+    assert!(cold.reflection.datalayout.is_some());
+
+    let warm = m2v_cache::translate_cached_reflected(&air, Stage::Fragment, 1).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&cold, &warm),
+        "a warm call must hand back the cached entry, not a re-translation"
+    );
+    let (hits_after, _, _) = m2v_cache::stats();
+    assert_eq!(
+        hits_after - hits_before,
+        1,
+        "exactly one of the two calls may be a hit"
+    );
 }
