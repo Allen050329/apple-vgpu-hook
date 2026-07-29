@@ -1020,10 +1020,9 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<Vec<u64>> {
-    use crate::runtime::census::sampled_census;
-    if !sampled_census::timed(sampled_census::Step::MapRevalidate, || {
+    if !{
         revalidate_mapping_pages(state, host, mapping_id)
-    }) {
+    } {
         return None;
     }
     let m = state.mappings.get(&mapping_id)?;
@@ -1039,9 +1038,9 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
     }
-    if let Some((gpa, owner)) = sampled_census::timed(sampled_census::Step::MapCollision, || {
+    if let Some((gpa, owner)) = {
         first_control_page_collision(state, &gpas)
-    }) {
+    } {
         crate::observe::fail(format!(
             "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
             gpas.len()

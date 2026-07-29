@@ -14,7 +14,6 @@ use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, R
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 use crate::observe::Decline;
-use crate::runtime::census::sampled_census;
 use crate::runtime::census::srgb_census;
 use crate::runtime::census::t11_decline;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -4336,9 +4335,9 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         span,
         (stride as usize).saturating_mul(h as usize),
     );
-    if !sampled_census::timed(sampled_census::Step::T11MemoRead, || {
+    if !{
         crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
-    }) {
+    } {
         state.type11_memo_scratch = scratch;
         return None;
     }
@@ -4349,11 +4348,10 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
     if let Some(m) = state.type11_memo.get_touch(&key) {
-        if sampled_census::timed(sampled_census::Step::T11MemoCmp, || m.native == scratch) {
+        if m.native == scratch {
             let rgba = m.rgba.clone();
             let generation = m.generation;
             state.type11_memo_scratch = scratch;
-            sampled_census::note(sampled_census::Branch::T11Memo, 0);
             return Some((
                 rgba,
                 LinearSampleIdentity {
@@ -4365,26 +4363,20 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     }
     // First sight or the native bytes changed: convert BGRA→RGBA fresh.
     let mut rgba = vec![0u8; span];
-    let converted = sampled_census::timed(sampled_census::Step::T11MemoConvert, || {
-        for y in 0..h as usize {
-            let off = y * (stride as usize);
-            if !pixel_format::convert_row_to_rgba8(
-                sample_fmt,
-                &scratch[off..off + (w as usize) * 4],
-                w,
-                &mut rgba[off..off + (w as usize) * 4],
-            ) {
-                return false;
-            }
-        }
-        true
+    let converted = (0..h as usize).all(|y| {
+        let off = y * (stride as usize);
+        pixel_format::convert_row_to_rgba8(
+            sample_fmt,
+            &scratch[off..off + (w as usize) * 4],
+            w,
+            &mut rgba[off..off + (w as usize) * 4],
+        )
     });
     if !converted {
         state.type11_memo_scratch = scratch;
         return None;
     }
     let rgba = std::sync::Arc::new(rgba);
-    let rgba_len = rgba.len();
     state.guest_linear_gen += 1;
     let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
     let entry_bytes = scratch.len() + rgba.len();
@@ -4398,7 +4390,6 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         },
         entry_bytes,
     );
-    sampled_census::note(sampled_census::Branch::T11Guest, rgba_len);
     Some((
         rgba,
         LinearSampleIdentity {

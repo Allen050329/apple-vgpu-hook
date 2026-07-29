@@ -3705,15 +3705,6 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     st16(&mut device_desc[DEVICE_DESC_BPE..], 2);
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
 
-    // The per-bind `type5_draw_view ok` line is now REIMS_VGPU_DRAW_LOG-gated (it
-    // floods the always-on log under video); the ALWAYS-ON signal that a
-    // serialized-view materialization happened is the `sampled_branch_census`
-    // Type5View branch (idx 0, monotonic — a delta of >=1 is race-safe under
-    // parallel tests). Snapshot the count before the bind, assert it advanced.
-    let census_before = crate::runtime::census::sampled_census::count(
-        crate::runtime::census::sampled_census::Branch::Type5View,
-    );
-
     let (sample_w, sample_h, sample_mid, sampled) =
         resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None)
             .expect("serialized RG8 view must sample the 2-byte surface");
@@ -3735,14 +3726,6 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
         &sampled[last..last + 2],
         &[158, 154],
         "row padding must not enter the RG8 view"
-    );
-    let census_after = crate::runtime::census::sampled_census::count(
-        crate::runtime::census::sampled_census::Branch::Type5View,
-    );
-    assert!(
-        census_after > census_before,
-        "the always-on sampled census must record the serialized-view \
-             materialization (Type5View {census_before} -> {census_after})"
     );
 }
 

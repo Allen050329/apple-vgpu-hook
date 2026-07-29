@@ -905,7 +905,6 @@ pub(crate) fn render_flush_one<M: HostMemory + HostOps>(
     // Measure-only consume census: this deferred window was actually flushed
     // into guest pages — a consumer (present capture, guest sample, or
     // SynchronizeResources) read them, so the writeback was needed.
-    crate::runtime::census::writeback_census::note_flushed();
     let flush_us = started.elapsed().as_micros() as u64;
     // Per-flush success census with wall-clock `us=` — one line per deferred
     // render flush (~1.8k/25s under a continuously-animating app) and

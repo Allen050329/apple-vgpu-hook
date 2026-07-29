@@ -287,7 +287,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             } else {
                 // Direct synchronous Store (no defer happened) — no prefetch armed.
                 // Measure-only: the synchronous scatter-DMA ran on the stamp path.
-                crate::runtime::census::writeback_census::note_sync(state.present.dmabuf_active);
                 try_import_present_store(state, host, &identity, mid, w, h)
             };
             let pages_ok = matches!(imp, ImportPresentResult::Ok);
@@ -753,7 +752,6 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     if !engine::resident_content_ready(&id) {
         return None;
     }
-    sampled_census::note(sampled_census::Branch::GvaResident, 0);
     Some((win.width, win.height, 0, SampledSourceRequest::Target(id)))
 }
 
@@ -807,7 +805,6 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
         );
         return None;
     }
-    sampled_census::note(sampled_census::Branch::GvaResident, 0);
     Some((w, h, 0, SampledSourceRequest::Target(id)))
 }
 
@@ -876,9 +873,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
     if !is_type5 {
-        let t_ref = std::time::Instant::now();
         let resolved = objects::resolve_type11_ref(state, host, task_id, texture_ref);
-        crate::runtime::census::setup_tex_census::note_ref(t_ref.elapsed().as_micros() as u64);
         if let Some(mid) = resolved {
             surface_candidates.push(mid);
         }
@@ -888,9 +883,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
 
     for mid in surface_candidates {
         // Ensure type-4 pages exist for this surface id.
-        let t_ensure = std::time::Instant::now();
         let _ = objects::ensure_surface_for_present(state, host, mid);
-        crate::runtime::census::setup_tex_census::note_ensure(t_ensure.elapsed().as_micros() as u64);
         // A type-5 serialized record is the exact Metal texture view over the
         // IOSurface bytes. Materialize it only when it differs from (or cannot
         // be inferred from) the base mapping. Exact base views keep the fast
@@ -945,7 +938,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // object-list decode prelude. This block acquires the global engine
                 // lock (`resident_content_ready`), the suspected dock-hover-freeze
                 // contention site.
-                let t_bind = std::time::Instant::now();
                 // Resident-surface identity: computed once and reused for both the
                 // readiness check and the direct bind. `surface_identity` locks a
                 // global dedup mutex and does an output-group lookup; this bind
@@ -971,23 +963,15 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
                     {
-                        crate::runtime::census::setup_tex_census::note_bind(
-                            t_bind.elapsed().as_micros() as u64,
-                        );
-                        sampled_census::note(sampled_census::Branch::Resident, 0);
                         return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
                     }
                 }
-                crate::runtime::census::setup_tex_census::note_bind(
-                    t_bind.elapsed().as_micros() as u64
-                );
 
                 // 1) Host cache.
                 if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
                     let rgba = swap_rb_channels(bgra);
                     let (nz, _, _) = crate::observe::rgba_rgb_stats(&rgba);
                     if nz > 0 || !resident_ready {
-                        sampled_census::note(sampled_census::Branch::T11Cache, rgba.len());
                         return Some((
                             w,
                             h,
@@ -1142,7 +1126,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
         if bgra.len() >= need {
             let rgba = swap_rb_channels(&bgra[..need]);
-            sampled_census::note(sampled_census::Branch::TexrefAny, rgba.len());
             return Some((
                 w,
                 h,
@@ -1162,7 +1145,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
         if rgba.len() >= need {
             rgba.truncate(need);
-            sampled_census::note(sampled_census::Branch::StaticTail, rgba.len());
             return Some((
                 w,
                 h,
@@ -1178,7 +1160,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
     }
     let side = (px as f64).sqrt() as u32;
     if side > 0 && (side as usize) * (side as usize) * 4 == rgba.len() {
-        sampled_census::note(sampled_census::Branch::StaticTail, rgba.len());
         return Some((
             side,
             side,
@@ -1518,7 +1499,6 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
             let rgba = m.rgba.clone();
             let generation = m.generation;
             ok_line("memo", &rgba);
-            sampled_census::note(sampled_census::Branch::T5Memo, 0);
             return Some((
                 view.width,
                 view.height,
@@ -1580,7 +1560,6 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
         },
         entry_bytes,
     );
-    sampled_census::note(sampled_census::Branch::Type5View, rgba.len());
     Some((
         view.width,
         view.height,
@@ -2052,7 +2031,6 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if !engine::ensure_host_imports(&runs) {
         return None;
     }
-    sampled_census::note(sampled_census::Branch::LinZeroCopy, 0);
     Some((
         w,
         h,
@@ -2129,12 +2107,12 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     }
     // Land any resident-authoritative deferred window before the GPU reads
     // the pages (same coherence rule as paint_mapping / the linear rail).
-    sampled_census::timed(sampled_census::Step::T11ZcFlush, || {
+    {
         let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
-    });
-    let gpas = sampled_census::timed(sampled_census::Step::T11ZcGpas, || {
+    };
+    let gpas = {
         mapper::mapping_page_gpas(state, host, mid)
-    })
+    }
     .ok_or(Reason::Coverage)?;
     let page = state.page_size();
     let window_end = base_off.checked_add(span).ok_or(Reason::Coverage)?;
@@ -2157,9 +2135,9 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
             j += 1;
         }
-        let base = sampled_census::timed(sampled_census::Step::T11ZcMap, || {
+        let base = {
             host.map_pages(&window[i..j], page as usize)
-        })
+        }
         .ok_or(Reason::ImportFail)? as u64;
         let start_in_run = if i == 0 { head_off } else { 0 };
         let avail = ((j - i) as u64) * page - start_in_run;
@@ -2174,9 +2152,9 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     if consumed != span {
         return Err(Reason::ImportFail);
     }
-    if !sampled_census::timed(sampled_census::Step::T11ZcImport, || {
+    if !{
         engine::ensure_host_imports(&runs)
-    }) {
+    } {
         return Err(Reason::ImportFail);
     }
     let row_length_texels = if bpr == tight {
@@ -2186,7 +2164,6 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
             .ok()
             .ok_or(Reason::Stride)?
     };
-    sampled_census::note(sampled_census::Branch::T11ZeroCopy, 0);
     Ok(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
@@ -2311,7 +2288,6 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     } else {
         u32::try_from(bpr / bpp as u64).ok()?
     };
-    sampled_census::note(sampled_census::Branch::T5ZeroCopy, 0);
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
@@ -2443,12 +2419,9 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     }
     // Same coherence rule as the general loader: land any resident-
     // authoritative writeback aliasing the sampled span before reading it.
-    let t_flush = std::time::Instant::now();
     crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
-    let flush_us = t_flush.elapsed().as_micros() as u64;
     let mut scratch = std::mem::take(&mut state.guest_linear_scratch);
     scratch.resize(native_len, 0);
-    let t_read = std::time::Instant::now();
     let read = gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
@@ -2457,25 +2430,17 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         &mut scratch,
         state.page_shift,
     );
-    let read_us = t_read.elapsed().as_micros() as u64;
     if read.is_err() {
-        crate::runtime::census::setup_tex_census::note_lin_memo(flush_us, read_us, 0);
         state.guest_linear_scratch = scratch;
         return None;
     }
     let key = (task_id, gva, w, h, sample_fmt);
-    let t_cmp = std::time::Instant::now();
     let hit = state
         .guest_linear_memo
         .get_touch(&key)
         // Vec equality is length + byte memcmp with early exit on change.
         .filter(|m| m.native == scratch)
         .map(|m| (m.rgba.clone(), m.generation, m.bgra8));
-    crate::runtime::census::setup_tex_census::note_lin_memo(
-        flush_us,
-        read_us,
-        t_cmp.elapsed().as_micros() as u64,
-    );
     if let Some((rgba, generation, bgra8)) = hit {
         let fmt = if bgra8 {
             TexelLayout::Bgra8
@@ -2483,7 +2448,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
             TexelLayout::Rgba8
         };
         state.guest_linear_scratch = scratch;
-        sampled_census::note(sampled_census::Branch::LinMemo, 0);
         return Some((
             rgba,
             Some(LinearSampleIdentity {
@@ -2498,7 +2462,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         state.guest_linear_scratch = scratch;
         return None;
     };
-    let rgba_len = rgba.len();
     state.guest_linear_gen += 1;
     let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
     let rgba = std::sync::Arc::new(rgba);
@@ -2526,7 +2489,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         },
         entry_bytes,
     );
-    sampled_census::note(sampled_census::Branch::LinGuest, rgba_len);
     Some((
         rgba,
         Some(LinearSampleIdentity {
@@ -2573,7 +2535,6 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             if let Some(rgba) =
                 linear_sampled_memo_reuse(state, task_id, texture_ref, gva, host_gen, w, h)
             {
-                sampled_census::note(sampled_census::Branch::GvaMemo, 0);
                 return Some((w, h, rgba, identity, TexelLayout::Rgba8));
             }
             let rgba = swap_rb_channels(bgra);
@@ -2604,7 +2565,6 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
                 host_gen,
                 &rgba,
             );
-            sampled_census::note(sampled_census::Branch::GvaCopy, rgba.len());
             let rgba = std::sync::Arc::new(rgba);
             let entry_bytes = rgba.len();
             state.linear_sampled_memo.insert(
@@ -2650,7 +2610,6 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             host_gen,
             &rgba,
         );
-        sampled_census::note(sampled_census::Branch::RefCache, rgba.len());
         return Some((w, h, std::sync::Arc::new(rgba), None, TexelLayout::Rgba8));
     }
     // Guest-CPU-produced linear textures (wallpaper, glyph atlases) have no
@@ -2694,13 +2653,11 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             0,
             &rgba[..need],
         );
-        sampled_census::note(sampled_census::Branch::LinGuestFallback, need);
         // Measure-only: does this padded-fallback texture's authoritative gva
         // recur across binds? That is the ceiling on any gva-keyed padded memo's
         // hit rate — high repeat_pct means a memo (skip alloc + engine hash) is
         // worth building; a fresh-gva-dominated log means Safari rotates glyph
         // backing and a memo can never hit. Cheap (no content hash), bounded LRU.
-        crate::runtime::census::sampled_gva_churn::note(task_id, gva, w, h);
         // `load_linear_texture_native_host` already returns a tight `need`-byte
         // buffer (RGBA8, or native BGRA8 when `byte_format == Bgra8`), so
         // `rgba.len() == need` in the common case — move it straight into the
@@ -4013,7 +3970,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // per-bind resolution (guest object-list + descriptor reads +
                 // resolve + surface ensure) vs the post-resolve stats scan, so a
                 // boot log names which half of the ~800us/draw to cut.
-                let t_resolve = std::time::Instant::now();
                 let texture_entry =
                     objects::lookup_list_entry(state, host, req.task_id, texture_ref);
                 // A type-8 view's channel remap. Resolved here rather than in
@@ -4118,10 +4074,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     };
                     loaded
                 };
-                let resolve_us = t_resolve.elapsed().as_micros() as u64;
-                crate::runtime::census::setup_tex_census::note_resolve(resolve_us);
-                sampled_census::note_resolve_us(resolve_us);
-                let t_stats = std::time::Instant::now();
                 if sampled_mid != 0 && tw == w && th == h {
                     display_sample_mids.insert(sampled_mid);
                 }
@@ -4245,9 +4197,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if view_swizzle.is_some() {
                     crate::runtime::census::view_swizzle_census::note_gpu_mapping();
                 }
-                crate::runtime::census::setup_tex_census::note_stats(
-                    t_stats.elapsed().as_micros() as u64
-                );
                 Ok(())
             };
             for t in &req.vertex_textures {

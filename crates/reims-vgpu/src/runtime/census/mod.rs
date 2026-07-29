@@ -34,20 +34,10 @@
 //! |---|---|
 //! | [`present_proxy`] | present-path health: `capture_fail`, `stale_online_pending`, `t11_large_fallback`, `empty_sample`, the secondary-MRT drop/blend census, and the windowed cadence/publish/import/pressure submodules |
 //! | [`srgb_census`] | which rails drop the sRGB transfer function, and how often |
-//! | [`sampled_census`] | sampled-source resolution: which rail served a texture bind and which missed |
-//! | [`setup_tex_census`] | setup-phase texture staging, before the compositor converges |
-//! | [`sampled_gva_churn`] | how often a sampled guest-VA texture's backing moves |
-//! | [`ensure_surface_census`] | surface-ensure outcomes on the present path |
 //! | [`view_swizzle_census`] | type-8 view swizzle plans actually bound |
-//! | [`writeback_census`] | compute storage-image writeback volume and shape |
 //! | [`t11_decline`] | type-11 IOSurface resolution declines, by reason |
 
-pub mod ensure_surface_census;
 pub mod present_proxy;
-pub mod sampled_census;
-pub mod sampled_gva_churn;
-pub mod setup_tex_census;
 pub mod srgb_census;
 pub mod t11_decline;
 pub mod view_swizzle_census;
-pub mod writeback_census;

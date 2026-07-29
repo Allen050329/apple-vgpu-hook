@@ -997,19 +997,11 @@ pub fn resolve_type4_surface_force<M: HostMemory>(
 }
 
 /// Latch the task that owns `surface_id` as its type-4 backing so the next
-/// present-path scan tries it right after task 0, and record the scan census.
-fn record_type4_owner(
-    state: &mut DeviceState,
-    surface_id: u32,
-    task_id: u32,
-    probes: u64,
-    hint: u32,
-) {
+/// present-path scan tries it right after task 0.
+fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
     if let Some(m) = state.mappings.get_mut(&surface_id) {
         m.owner_task_hint = task_id;
     }
-    let hint_hit = hint != 0 && task_id == hint;
-    crate::runtime::census::ensure_surface_census::note_scan(probes, true, hint_hit);
 }
 
 fn resolve_type4_surface_ex<M: HostMemory>(
@@ -1024,8 +1016,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
     // Task probe order: task 0 (kernel/global — historical type-4 home) first,
     // then the cached owner-task hint (so a hot present-path re-scan
     // short-circuits on the owning task instead of walking all 256 slots),
-    // then the remaining tasks. `ensure_surface_census.probes_per_scan`
-    // measures how much the hint cuts the per-bind scan.
+    // then the remaining tasks.
     let hint = state
         .mappings
         .get(&surface_id)
@@ -1043,7 +1034,6 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         order.push(tid);
     }
 
-    let mut probes: u64 = 0;
     for task_id in order {
         if task_id as usize >= state.tasks.len() {
             continue;
@@ -1052,7 +1042,6 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             continue;
         }
         // Count the guest-read cost of one active-task object-list probe.
-        probes += 1;
         let Some(entry) = lookup_list_entry(state, host, task_id, surface_id) else {
             continue;
         };
@@ -1114,7 +1103,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             if same_geom {
                 // Same geom + non-empty pages: keep (guest double-buffer
                 // may still rewrite page *content* without changing pfn).
-                record_type4_owner(state, surface_id, task_id, probes, hint);
+                record_type4_owner(state, surface_id, task_id);
                 return true;
             }
         } else if let Some(m) = state.mappings.get(&surface_id) {
@@ -1160,15 +1149,14 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             }
         }
         if force_fresh {
-            record_type4_owner(state, surface_id, task_id, probes, hint);
+            record_type4_owner(state, surface_id, task_id);
             return true;
         }
         if apply_type4_backing(state, host, task_id, surface_id, &surf) {
-            record_type4_owner(state, surface_id, task_id, probes, hint);
+            record_type4_owner(state, surface_id, task_id);
             return true;
         }
     }
-    crate::runtime::census::ensure_surface_census::note_scan(probes, false, false);
     false
 }
 
@@ -1185,7 +1173,6 @@ pub fn ensure_surface_for_present<M: HostMemory + crate::runtime::host::HostOps>
     if surface_id == 0 {
         return false;
     }
-    crate::runtime::census::ensure_surface_census::note_call();
     let need = state
         .mappings
         .get(&surface_id)

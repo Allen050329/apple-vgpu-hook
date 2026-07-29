@@ -518,14 +518,11 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     // rule as finish_import). Pins are counted: the pin above holds this
     // window's own count, so every superseded window releases its count —
     // including one on the same identity.
-    let mut superseded = 0u64;
     for (key, entry) in state.take_render_deferred_windows(mapping_id, 0, u64::MAX) {
         engine::unpin_resident_target(&render_deferred_identity(key.mapping_id, &entry));
-        superseded += 1;
     }
     // Measure-only: these older windows are dropped before any consumer read
     // their guest pages — the fresher defer below replaces them.
-    crate::runtime::census::writeback_census::note_superseded(superseded);
     let map_generation = member_map_generation;
     // Async readback prefetch: the composite draws for this resident are already
     // in flight, so submit the GPU→host copy now (dedicated fence, keyed by this
@@ -562,7 +559,6 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     // Measure-only consume census: this deferred window is now pending. Whether
     // it is later flushed (a consumer read the pages) or superseded (dropped
     // unread) is the signal for whether the writeback is elidable under dmabuf.
-    crate::runtime::census::writeback_census::note_armed(state.present.dmabuf_active);
     // Bound the outstanding-window population: each window pins a resident, and
     // a compositing burst (YouTube page-load: many short-lived surfaces deferred
     // faster than consumers read them) otherwise balloons the pinned registry to
@@ -1096,10 +1092,8 @@ fn finish_import(
             // this mapping — the DMA'd content is strictly newer, so a later
             // flush replaying the old identity would corrupt it. (No-op on
             // the flush path itself: the window was taken before replay.)
-            let mut superseded = 0u64;
             for (key, entry) in state.take_render_deferred_windows(mapping_id, 0, u64::MAX) {
                 engine::unpin_resident_target(&render_deferred_identity(key.mapping_id, &entry));
-                superseded += 1;
                 crate::observe::off(format!(
                     "render_deferred_superseded mapping={} {}x{} gen={}",
                     key.mapping_id,
@@ -1108,7 +1102,6 @@ fn finish_import(
                     entry.map_generation,
                 ));
             }
-            crate::runtime::census::writeback_census::note_superseded(superseded);
             let _ = state.mark_mapping_written(mapping_id);
             state.note_surface_composite(mapping_id);
             // Full-frame publish — same membership grant as the multi-run path
