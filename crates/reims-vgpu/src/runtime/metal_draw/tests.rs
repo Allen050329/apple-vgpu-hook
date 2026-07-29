@@ -1061,48 +1061,7 @@ fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
 }
 
 #[test]
-fn linear_cache_guest_probe_distinguishes_same_and_changed_bytes() {
-    let cache = [10u8, 20, 30, 255, 0, 0, 0, 0];
-    let same = compare_linear_cache_guest(&cache, &cache).expect("matching shape");
-    assert_eq!(same.differing_texels, 0);
-    assert_eq!(same.cache_rgb_nz, 1);
-    assert_eq!(same.guest_rgb_nz, 1);
-    assert_eq!(same.cache_alpha0, 1);
-    assert_eq!(same.guest_alpha0, 1);
-
-    let guest = [1u8, 2, 3, 255, 9, 0, 0, 255];
-    let changed = compare_linear_cache_guest(&cache, &guest).expect("matching shape");
-    assert_eq!(changed.differing_texels, 2);
-    assert_eq!(changed.cache_rgb_nz, 1);
-    assert_eq!(changed.guest_rgb_nz, 2);
-    assert_eq!(changed.cache_alpha0, 1);
-    assert_eq!(changed.guest_alpha0, 0);
-    assert!(compare_linear_cache_guest(&cache, &guest[..4]).is_none());
-
-    let task_id = std::process::id();
-    log_linear_cache_guest_comparison(
-        task_id,
-        202,
-        OBJECT_TYPE_TEXTURE_VARIANT,
-        0x04e4_d000,
-        MTL_FORMAT_BGRA8_UNORM,
-        7680,
-        1920,
-        1080,
-        5,
-        changed,
-    );
-    let marker = format!(
-            "OFF linear_cache_guest_probe status=ok task={task_id} ref=202 type={} gva=0x4e4d000 fmt=0x50 1920x1080 bpr=7680 host_gen=5 same=0 diff_px=2 cache_rgb=1 guest_rgb=2 cache_a0=1 guest_a0=0",
-            OBJECT_TYPE_TEXTURE_VARIANT
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "cache-vs-guest divergence proxy must be always-on"
-    );
-
+fn gva_cache_owner_object_type_transitions_are_named() {
     assert!(gva_cache_owner_allows_object_type(
         0,
         OBJECT_TYPE_TEXTURE_VARIANT
@@ -1123,57 +1082,6 @@ fn linear_cache_guest_probe_distinguishes_same_and_changed_bytes() {
         OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW
     ));
-    log_linear_cache_authority_transition(
-        task_id,
-        19,
-        OBJECT_TYPE_TEXTURE_VARIANT,
-        0x04ec_c000,
-        1920,
-        1080,
-        1,
-        task_id,
-        110,
-        OBJECT_TYPE_TEXTURE,
-    );
-    let authority_marker = format!(
-            "OFF linear_cache_authority reason=object_type_transition action=skip_gva_cache task={task_id} ref=19 type={} gva=0x4ecc000 1920x1080 host_gen=1 producer_task={task_id} producer_ref=110 producer_type={}",
-            OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&authority_marker)),
-        "object-type transition authority proxy must be always-on"
-    );
-}
-
-#[test]
-fn zero_rgb_alpha_mask_proxy_is_fail_visible_for_small_samples() {
-    let task_id = std::process::id();
-    let texture_ref = 0xf000_0000u32.wrapping_add(task_id);
-    let marker = format!(
-            "OFF sample_alpha_mask reason=zero_rgb_alpha_preserved src=guest task={task_id} ref={texture_ref} type=2 gva=0x7788000 fmt=0x1 3x1 bpr=3 host_gen=0 zero_rgb_alpha=2 opaque_black=1"
-        );
-    let rgba = [0, 0, 0, 17, 0, 0, 0, 255, 0, 0, 0, 0];
-    log_linear_sample_src(
-        task_id,
-        texture_ref,
-        2,
-        0x0778_8000,
-        pixel_format::MTL_FORMAT_A8_UNORM,
-        3,
-        3,
-        1,
-        "guest",
-        0,
-        &rgba,
-    );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "small alpha-mask preservation proxy must be always-on"
-    );
 }
 
 /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
@@ -1211,17 +1119,6 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
 
-    log_attachment_alias_chain(task_id, 0, texture_ref, target_gva, 2, 1, actual);
-    let marker = format!(
-            "OFF attachment_alias_chain reason=in_process_seed action=sample_seed task={task_id} i=0 ref={texture_ref} gva=0xabcd000 2x1 rgb_nz=1 max_rgb=10 alpha_nz=1"
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines()
-            .any(|line| crate::observe::line_is(line, &marker)),
-        "attachment alias chain proxy must be always-on"
-    );
 
     req.colors[0].mapping_id = 9;
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
@@ -1342,32 +1239,6 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     });
     assert_eq!(srgb_census::counts().0, 0);
     srgb_census::reset_for_tests();
-}
-
-#[test]
-fn linear_sample_read_proxy_is_fail_visible() {
-    let task_id = std::process::id();
-    let marker = format!(
-            "OFF linear_sample_read mode=bulk_tight task={task_id} ref=19 gva=0x50be000 1920x1080 bpr=7680 calls=1 total_us=1234"
-        );
-    log_linear_sample_read(
-        task_id,
-        19,
-        0x50be000,
-        1920,
-        1080,
-        7680,
-        "bulk_tight",
-        1,
-        1234,
-    );
-
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "linear sample read-cost proxy must be always-on"
-    );
 }
 
 #[test]
@@ -2987,7 +2858,6 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     }
     host_cache_store_gva_layer(
         &mut state,
-        0,
         tex_ref,
         OBJECT_TYPE_TEXTURE,
         gva,
@@ -3100,8 +2970,6 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         w,
         h,
         bgra,
-        1,
-        77,
         OBJECT_TYPE_TEXTURE,
     );
 
@@ -3437,15 +3305,6 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     .expect("exact GVA cache seed");
     assert_eq!(seed, vec![0, 0, 0, 255, 0, 0, 0, 255]);
 
-    let marker = format!(
-            "OFF load_seed_black reason=zero_rgb_seed_preserved src=gva_cache task={task_id} ref={texture_ref} mid=0 gva={target_gva:#x} 2x1 alpha_nz=2"
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "black Load preservation proxy must be always-on"
-    );
 
     // Without a GVA match, use the texture namespace (green), never the
     // colliding surface namespace (red).

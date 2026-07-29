@@ -552,7 +552,6 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     }
     crate::runtime::metal_draw::host_cache_store_gva_layer(
         state,
-        entry.task_id,
         entry.texture_ref,
         entry.producer_object_type,
         gva,

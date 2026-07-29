@@ -924,7 +924,7 @@ fn apply_type4_backing<M: HostMemory>(
         let changed = prior != entries;
         let replaced = !prior.is_empty() && changed;
         if changed {
-            crate::model::DeviceState::bump_map_generation(surface_id, m);
+            crate::model::DeviceState::bump_map_generation(m);
         }
         if replaced {
             // Recycled-mid backing-refresh census (not a drop; the recycle rate

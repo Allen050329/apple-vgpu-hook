@@ -2146,36 +2146,9 @@ fn apply_clear<M: HostMemory + HostOps>(
         }
     }
     let _ = MTL_FORMAT_BGRA8_UNORM;
-    // Measure-only: clear-only packet on a display-sized type-11 can reset a
-    // lagging dual-mid base to solid (then damage-only Load sticks incomplete).
-    if w >= 1280 && h >= 720 {
-        crate::observe::fail(format!(
-            "display_clear mid={} {}x{} rgba=[{},{},{},{}] (clear-only stream)",
-            c0.mapping_id, w, h, r, g, b, a
-        ));
-        crate::observe::off(format!(
-            "display_clear mid={} {}x{} tex_ref={} rgba=[{},{},{},{}] present_mapping={} frame_flush={}",
-            c0.mapping_id,
-            w,
-            h,
-            att.texture_ref,
-            r,
-            g,
-            b,
-            a,
-            state.present.present_mapping,
-            state.present.frame_flush_seen as u8
-        ));
-    }
     let ok = mapping_write::write_bgra8(state, host, c0.mapping_id, &img, stride, w, h);
     // host_cache also updated inside write_bgra8 (surface_cache::store).
     state.note_surface_clear(c0.mapping_id);
-    if w >= 1280 && h >= 720 {
-        crate::observe::off(format!(
-            "display_clear_done mid={} pages_ok={} (host_cache now solid clear)",
-            c0.mapping_id, ok as u8
-        ));
-    }
     ok
 }
 

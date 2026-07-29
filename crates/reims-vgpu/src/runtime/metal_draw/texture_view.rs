@@ -498,7 +498,6 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Safari source). Padded rows retain the conservative disjoint reads so we
     // never touch padding that the guest did not make readable.
     if bpr_u32 == tight {
-        let started = Instant::now();
         let (rgba, fmt) = load_tight_linear_rgba_with(w, h, sample_fmt, native_bgra8, |native| {
             gva_mem::read_task_gva_by_id(
                 host,
@@ -510,19 +509,6 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             )
             .is_ok()
         })?;
-        if w >= 1280 && h >= 720 {
-            log_linear_sample_read(
-                task_id,
-                texture_ref,
-                gva,
-                w,
-                h,
-                bpr,
-                "bulk_tight",
-                1,
-                started.elapsed().as_micros() as u64,
-            );
-        }
         return Some((rgba, fmt));
     }
     // Padded rows. When the source bytes are already in the final upload order
@@ -536,7 +522,6 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     {
         let row_bytes = tight as usize;
         let mut rgba = vec![0u8; need_rgba];
-        let started = Instant::now();
         for y in 0..h {
             let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
             let dst_off = (y as usize).checked_mul(row_bytes)?;
@@ -550,24 +535,10 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             )
             .ok()?;
         }
-        if w >= 1280 && h >= 720 {
-            log_linear_sample_read(
-                task_id,
-                texture_ref,
-                gva,
-                w,
-                h,
-                bpr,
-                "row_padded_native",
-                h,
-                started.elapsed().as_micros() as u64,
-            );
-        }
         return Some((rgba, fmt));
     }
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
-    let started = Instant::now();
     for y in 0..h {
         let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
         gva_mem::read_task_gva_by_id(
@@ -583,19 +554,6 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
             return None;
         }
-    }
-    if w >= 1280 && h >= 720 {
-        log_linear_sample_read(
-            task_id,
-            texture_ref,
-            gva,
-            w,
-            h,
-            bpr,
-            "row_padded",
-            h,
-            started.elapsed().as_micros() as u64,
-        );
     }
     Some((rgba, TexelLayout::Rgba8))
 }
@@ -664,23 +622,6 @@ where
         }
     }
     Some((rgba, TexelLayout::Rgba8))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_linear_sample_read(
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    width: u32,
-    height: u32,
-    row_stride: u64,
-    mode: &str,
-    calls: u32,
-    total_us: u64,
-) {
-    crate::observe::off(format!(
-        "linear_sample_read mode={mode} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} bpr={row_stride} calls={calls} total_us={total_us}"
-    ));
 }
 
 #[cfg(test)]

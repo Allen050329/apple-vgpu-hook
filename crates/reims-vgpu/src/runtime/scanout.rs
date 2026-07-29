@@ -1299,20 +1299,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             state.present.early_front_mapping = mapping_id;
             state.present.early_front_generation = gen;
         }
-        // Offline: only log when writeback mid ≠ present (dual-mid gap class).
-        if mapping_id != state.present.present_mapping
-            && mapping_id != state.present.host_mapping
-            && mapping_id != state.present.frame_mapping
-            && width >= 1280
-            && height >= 720
-        {
-            crate::observe::line(format!(
-                "front_wb SKIP post_boundary mid={mapping_id} {width}x{height} present_mapping={} frame_mapping={} early_peer={} (full-frame writeback landed on a surface none of the present slots name)",
-                state.present.present_mapping,
-                state.present.frame_mapping,
-                state.present.early_front_mapping
-            ));
-        }
         return;
     }
 

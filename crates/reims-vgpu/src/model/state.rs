@@ -838,10 +838,8 @@ pub struct HostSurface {
     pub bgra: Vec<u8>,
     /// Monotonic host store generation (independent of guest content_generation).
     pub host_gen: u32,
-    /// Producer identity for GVA-keyed type-2/3 encodes. Zero for surface/ref
-    /// caches and for legacy/compute stores that did not record an owner.
-    pub producer_task_id: u32,
-    pub producer_texture_ref: u32,
+    /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
+    /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
 }
 
@@ -2828,19 +2826,11 @@ impl DeviceState {
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
     ///
-    /// The bump orphans any generation-keyed resident for the mapping — for a
-    /// large surface that moment is load-bearing when diagnosing sample
-    /// fallback classes, so it traces under `REIMS_VGPU_DRAW_LOG=1`.
-    pub fn bump_map_generation(mapping_id: u32, e: &mut MappingEntry) {
+    /// The bump orphans any generation-keyed resident for the mapping.
+    pub fn bump_map_generation(e: &mut MappingEntry) {
         e.map_generation = e.map_generation.wrapping_add(1);
         if e.map_generation == 0 {
             e.map_generation = 1;
-        }
-        if crate::observe::enabled() && (e.width as u64) * (e.height as u64) >= 250_000 {
-            crate::observe::line(format!(
-                "map_gen_bump mid={mapping_id} {}x{} gen={}",
-                e.width, e.height, e.map_generation
-            ));
         }
     }
 
@@ -2977,7 +2967,7 @@ impl DeviceState {
         e.page_entries.clear();
         e.page_table_kva = 0;
         e.condemned_entries = None;
-        Self::bump_map_generation(mapping_id, e);
+        Self::bump_map_generation(e);
         let retired = Self::take_mapping_view(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
@@ -3088,7 +3078,7 @@ impl DeviceState {
             e.condemned_entries = None;
             e.mapping_internal = 0;
             e.device_desc.clear();
-            Self::bump_map_generation(mapping_id, e);
+            Self::bump_map_generation(e);
             e.has_geom = false;
             e.width = 0;
             e.height = 0;
@@ -3132,7 +3122,7 @@ impl DeviceState {
         e.condemned_entries = None;
         e.device_desc.clear();
         e.content_generation = 0;
-        Self::bump_map_generation(mapping_id, e);
+        Self::bump_map_generation(e);
         // New MappingInternal ⇒ new surface; force device-desc re-resolve.
         e.has_geom = false;
         e.width = 0;

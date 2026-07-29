@@ -478,7 +478,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             .unwrap_or(0);
                     host_cache_store_gva_layer(
                         state,
-                        req.task_id,
                         c0.texture_ref,
                         producer_object_type,
                         c0.target_gva,
@@ -656,46 +655,6 @@ fn fragment_attachment_alias_sample<'a>(
         _ => None,
     }
 }
-
-#[cfg(feature = "backend-vulkan")]
-#[allow(clippy::too_many_arguments)]
-fn log_attachment_alias_chain(
-    task_id: u32,
-    texture_index: u32,
-    texture_ref: u32,
-    target_gva: u64,
-    width: u32,
-    height: u32,
-    rgba: &[u8],
-) {
-    let (rgb_nz, max_rgb, _) = crate::observe::rgba_rgb_stats(rgba);
-    let alpha_nz = rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count();
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    type AttachmentAliasKey = (u32, u32, u32, u64, u32, u32, usize, usize);
-    static SEEN: Mutex<Option<HashSet<AttachmentAliasKey>>> = Mutex::new(None);
-    let first = SEEN
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get_or_insert_with(HashSet::new)
-        .insert((
-            task_id,
-            texture_index,
-            texture_ref,
-            target_gva,
-            width,
-            height,
-            rgb_nz,
-            alpha_nz,
-        ));
-    if first {
-        crate::observe::off(format!(
-            "attachment_alias_chain reason=in_process_seed action=sample_seed task={task_id} i={texture_index} ref={texture_ref} gva={target_gva:#x} {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} alpha_nz={alpha_nz}"
-        ));
-    }
-}
-
-
 
 /// A deferred GVA window may serve a sampled bind directly from its resident
 /// target only when the sampled view is the exact window content: descriptor
@@ -2387,8 +2346,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    texture_ref: u32,
-    object_type: u8,
     tex: &TextureDescriptor,
     gva: u64,
     w: u32,
@@ -2465,19 +2422,6 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state.guest_linear_gen += 1;
     let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
     let rgba = std::sync::Arc::new(rgba);
-    log_linear_sample_src(
-        task_id,
-        texture_ref,
-        object_type,
-        gva,
-        sample_fmt,
-        bpr,
-        w,
-        h,
-        "guest_memo_fill",
-        0,
-        &rgba,
-    );
     let entry_bytes = scratch.len() + rgba.len();
     state.guest_linear_memo.insert(
         key,
@@ -2522,7 +2466,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if state.gva_deferred_flush.contains_key(&gva) {
         crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, "gva_sample");
     }
-    if let Some((bgra, host_gen, producer_task, producer_ref, producer_type)) =
+    if let Some((bgra, host_gen, producer_type)) =
         crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h)
     {
         if gva_cache_owner_allows_object_type(producer_type, entry.object_type) {
@@ -2538,33 +2482,6 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
                 return Some((w, h, rgba, identity, TexelLayout::Rgba8));
             }
             let rgba = swap_rb_channels(bgra);
-            log_linear_sample_src(
-                task_id,
-                texture_ref,
-                entry.object_type,
-                gva,
-                tex.pixel_format,
-                layout.row_stride,
-                w,
-                h,
-                "gva_cache",
-                host_gen,
-                &rgba,
-            );
-            probe_linear_cache_guest(
-                state,
-                host,
-                task_id,
-                texture_ref,
-                entry.object_type,
-                gva,
-                tex.pixel_format,
-                layout.row_stride,
-                w,
-                h,
-                host_gen,
-                &rgba,
-            );
             let rgba = std::sync::Arc::new(rgba);
             let entry_bytes = rgba.len();
             state.linear_sampled_memo.insert(
@@ -2580,53 +2497,18 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             );
             return Some((w, h, rgba, identity, TexelLayout::Rgba8));
         }
-        log_linear_cache_authority_transition(
-            task_id,
-            texture_ref,
-            entry.object_type,
-            gva,
-            w,
-            h,
-            host_gen,
-            producer_task,
-            producer_ref,
-            producer_type,
-        );
     }
-    if let Some((bgra, host_gen)) =
-        crate::runtime::surface_cache::get_texture_with_gen(state, texture_ref, w, h)
-    {
+    if let Some(bgra) = crate::runtime::surface_cache::get_texture(state, texture_ref, w, h) {
         let rgba = swap_rb_channels(bgra);
-        log_linear_sample_src(
-            task_id,
-            texture_ref,
-            entry.object_type,
-            gva,
-            tex.pixel_format,
-            layout.row_stride,
-            w,
-            h,
-            "ref_cache",
-            host_gen,
-            &rgba,
-        );
         return Some((w, h, std::sync::Arc::new(rgba), None, TexelLayout::Rgba8));
     }
     // Guest-CPU-produced linear textures (wallpaper, glyph atlases) have no
     // host producer generation. Re-read the native rows and byte-compare
     // against the memo: unchanged content reuses the retained swizzled Arc
     // and carries a generation identity so the engine skips hash+memcmp too.
-    if let Some((rgba, identity, byte_format)) = load_linear_guest_memoized(
-        state,
-        host,
-        task_id,
-        texture_ref,
-        entry.object_type,
-        tex,
-        gva,
-        w,
-        h,
-    ) {
+    if let Some((rgba, identity, byte_format)) =
+        load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
+    {
         return Some((w, h, rgba, identity, byte_format));
     }
     let Some((rgba, byte_format)) =
@@ -2640,24 +2522,6 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     };
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() >= need {
-        log_linear_sample_src(
-            task_id,
-            texture_ref,
-            entry.object_type,
-            gva,
-            tex.pixel_format,
-            layout.row_stride,
-            w,
-            h,
-            "guest",
-            0,
-            &rgba[..need],
-        );
-        // Measure-only: does this padded-fallback texture's authoritative gva
-        // recur across binds? That is the ceiling on any gva-keyed padded memo's
-        // hit rate — high repeat_pct means a memo (skip alloc + engine hash) is
-        // worth building; a fresh-gva-dominated log means Safari rotates glyph
-        // backing and a memo can never hit. Cheap (no content hash), bounded LRU.
         // `load_linear_texture_native_host` already returns a tight `need`-byte
         // buffer (RGBA8, or native BGRA8 when `byte_format == Bgra8`), so
         // `rgba.len() == need` in the common case — move it straight into the
@@ -2704,220 +2568,13 @@ fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bo
             && gva_cache_linear_texture_type(current_type))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn log_linear_cache_authority_transition(
-    task_id: u32,
-    texture_ref: u32,
-    object_type: u8,
-    gva: u64,
-    width: u32,
-    height: u32,
-    host_gen: u32,
-    producer_task: u32,
-    producer_ref: u32,
-    producer_type: u8,
-) {
-    crate::observe::off(format!(
-        "linear_cache_authority reason=object_type_transition action=skip_gva_cache task={task_id} ref={texture_ref} type={object_type} gva={gva:#x} {width}x{height} host_gen={host_gen} producer_task={producer_task} producer_ref={producer_ref} producer_type={producer_type}"
-    ));
-}
-
-/// Measure-only provenance for display-sized type-2/3 compositor inputs.
-///
-/// Content counters diagnose producer loss; they never select or gate product
-/// behavior. Object type + descriptor identity avoid conclusions from recycled
-/// texture refs alone.
-#[allow(clippy::too_many_arguments)]
-fn log_linear_sample_src(
-    task_id: u32,
-    texture_ref: u32,
-    object_type: u8,
-    gva: u64,
-    pixel_format: u16,
-    row_stride: u64,
-    width: u32,
-    height: u32,
-    source: &str,
-    host_gen: u32,
-    rgba: &[u8],
-) {
-    let zero_rgb_alpha = rgba
-        .chunks_exact(4)
-        .filter(|p| p[0] | p[1] | p[2] == 0 && p[3] != 0)
-        .count();
-    if zero_rgb_alpha != 0 {
-        let opaque_black = rgba
-            .chunks_exact(4)
-            .filter(|p| p[0] | p[1] | p[2] == 0 && p[3] == u8::MAX)
-            .count();
-        // One line per distinct sampled content identity. Small A8 glyph/mask
-        // textures are expected to be sampled many times; repeating their
-        // census on every draw would hide the useful signal in log volume.
-        use std::collections::HashSet;
-        use std::sync::Mutex;
-        type ZeroRgbAlphaKey = (u32, u32, u64, u16, u32, u32, u32, usize, usize);
-        static SEEN: Mutex<Option<HashSet<ZeroRgbAlphaKey>>> = Mutex::new(None);
-        let first = {
-            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-            seen.get_or_insert_with(HashSet::new).insert((
-                task_id,
-                texture_ref,
-                gva,
-                pixel_format,
-                width,
-                height,
-                host_gen,
-                zero_rgb_alpha,
-                opaque_black,
-            ))
-        };
-        if first {
-            crate::observe::off(format!(
-                "sample_alpha_mask reason=zero_rgb_alpha_preserved src={source} task={task_id} ref={texture_ref} type={object_type} gva={gva:#x} fmt={pixel_format:#x} {width}x{height} bpr={row_stride} host_gen={host_gen} zero_rgb_alpha={zero_rgb_alpha} opaque_black={opaque_black}"
-            ));
-        }
-    }
-}
-
-/// Measurement-only comparison between a retained GVA encode and the bytes
-/// currently visible through the guest page table for the same texture.
-///
-/// This must never select the sampled source. It names the stale-vs-retained
-/// ambiguity without turning pixel content into device policy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct LinearCacheGuestComparison {
-    differing_texels: usize,
-    cache_rgb_nz: usize,
-    guest_rgb_nz: usize,
-    cache_alpha0: usize,
-    guest_alpha0: usize,
-}
-
-fn compare_linear_cache_guest(
-    cache_rgba: &[u8],
-    guest_rgba: &[u8],
-) -> Option<LinearCacheGuestComparison> {
-    if cache_rgba.len() != guest_rgba.len() || !cache_rgba.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut out = LinearCacheGuestComparison::default();
-    for (cache, guest) in cache_rgba.chunks_exact(4).zip(guest_rgba.chunks_exact(4)) {
-        out.differing_texels += usize::from(cache != guest);
-        out.cache_rgb_nz += usize::from(cache[0] | cache[1] | cache[2] != 0);
-        out.guest_rgb_nz += usize::from(guest[0] | guest[1] | guest[2] != 0);
-        out.cache_alpha0 += usize::from(cache[3] == 0);
-        out.guest_alpha0 += usize::from(guest[3] == 0);
-    }
-    Some(out)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_linear_cache_guest_comparison(
-    task_id: u32,
-    texture_ref: u32,
-    object_type: u8,
-    gva: u64,
-    pixel_format: u16,
-    row_stride: u64,
-    width: u32,
-    height: u32,
-    host_gen: u32,
-    stats: LinearCacheGuestComparison,
-) {
-    crate::observe::off(format!(
-        "linear_cache_guest_probe status=ok task={task_id} ref={texture_ref} type={object_type} gva={gva:#x} fmt={pixel_format:#x} {width}x{height} bpr={row_stride} host_gen={host_gen} same={} diff_px={} cache_rgb={} guest_rgb={} cache_a0={} guest_a0={}",
-        (stats.differing_texels == 0) as u8,
-        stats.differing_texels,
-        stats.cache_rgb_nz,
-        stats.guest_rgb_nz,
-        stats.cache_alpha0,
-        stats.guest_alpha0
-    ));
-}
-
-/// Probe each display-sized retained cache identity once. A full GVA read is
-/// deduplicated before I/O so repeated compositor samples do not become
-/// repeated multi-megabyte page-table walks.
-#[allow(clippy::too_many_arguments)]
-fn probe_linear_cache_guest<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    texture_ref: u32,
-    object_type: u8,
-    gva: u64,
-    pixel_format: u16,
-    row_stride: u64,
-    width: u32,
-    height: u32,
-    host_gen: u32,
-    cache_rgba: &[u8],
-) {
-    if width < 1280 || height < 720 {
-        return;
-    }
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    type CacheGuestDeltaKey = (u32, u32, u64, u32, u32, u32);
-    static SEEN: Mutex<Option<HashSet<CacheGuestDeltaKey>>> = Mutex::new(None);
-    let first = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get_or_insert_with(HashSet::new).insert((
-            task_id,
-            texture_ref,
-            gva,
-            width,
-            height,
-            host_gen,
-        ))
-    };
-    if !first {
-        return;
-    }
-
-    let Some(guest_rgba) =
-        load_linear_texture_rgba_host(state, host, task_id, texture_ref, 0, None)
-    else {
-        crate::observe::off(format!(
-            "linear_cache_guest_probe status=unavailable task={task_id} ref={texture_ref} type={object_type} gva={gva:#x} fmt={pixel_format:#x} {width}x{height} bpr={row_stride} host_gen={host_gen}"
-        ));
-        return;
-    };
-    let need = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    let Some(stats) = guest_rgba
-        .get(..need)
-        .and_then(|guest| compare_linear_cache_guest(cache_rgba, guest))
-    else {
-        crate::observe::off(format!(
-            "linear_cache_guest_probe status=short task={task_id} ref={texture_ref} type={object_type} gva={gva:#x} fmt={pixel_format:#x} {width}x{height} bpr={row_stride} host_gen={host_gen} cache_len={} guest_len={} need={need}",
-            cache_rgba.len(), guest_rgba.len()
-        ));
-        return;
-    };
-    log_linear_cache_guest_comparison(
-        task_id,
-        texture_ref,
-        object_type,
-        gva,
-        pixel_format,
-        row_stride,
-        width,
-        height,
-        host_gen,
-        stats,
-    );
-}
-
 /// Store type-2/3 encode into texture_ref + GVA host caches (BGRA).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the cache identity mirrors the task, object, GVA, and texture geometry"
+    reason = "the cache identity mirrors the object, GVA, and texture geometry"
 )]
 pub(crate) fn host_cache_store_gva_layer(
     state: &mut DeviceState,
-    task_id: u32,
     texture_ref: u32,
     object_type: u8,
     gva: u64,
@@ -2945,16 +2602,7 @@ pub(crate) fn host_cache_store_gva_layer(
         );
     }
     if gva != 0 {
-        crate::runtime::surface_cache::store_gva_owned(
-            state,
-            gva,
-            width,
-            height,
-            bgra,
-            task_id,
-            texture_ref,
-            object_type,
-        );
+        crate::runtime::surface_cache::store_gva_owned(state, gva, width, height, bgra, object_type);
     }
 }
 
@@ -3997,35 +3645,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 TexelLayout::Rgba8,
                             ),
                         ),
-                        AttachmentAliasSample::Seed(seed) => {
-                            let target_gva = req
-                                .colors
-                                .iter()
-                                .find(|color| {
-                                    color.slot == index && color.texture_ref == texture_ref
-                                })
-                                .map(|color| color.target_gva)
-                                .unwrap_or(0);
-                            log_attachment_alias_chain(
-                                req.task_id,
-                                index,
-                                texture_ref,
-                                target_gva,
-                                aw,
-                                ah,
-                                seed,
-                            );
-                            (
-                                aw,
-                                ah,
-                                0,
-                                SampledSourceRequest::Bytes(
-                                    std::sync::Arc::new(seed.to_vec()),
-                                    None,
-                                    TexelLayout::Rgba8,
-                                ),
-                            )
-                        }
+                        AttachmentAliasSample::Seed(seed) => (
+                            aw,
+                            ah,
+                            0,
+                            SampledSourceRequest::Bytes(
+                                std::sync::Arc::new(seed.to_vec()),
+                                None,
+                                TexelLayout::Rgba8,
+                            ),
+                        ),
                         #[cfg(feature = "backend-vulkan")]
                         AttachmentAliasSample::ResidentChain => {
                             let identity = render_chain_identity(state, req).ok_or({

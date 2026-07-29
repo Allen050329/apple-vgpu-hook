@@ -595,7 +595,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             m.contig_len = 0;
         }
         if pages_changed {
-            DeviceState::bump_map_generation(mapping_id, m);
+            DeviceState::bump_map_generation(m);
         }
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
@@ -1723,7 +1723,7 @@ mod revalidate_tests {
         {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.page_entries = vec![entry(gpa0), entry(gpa1), entry(gpa2)];
-            DeviceState::bump_map_generation(mid, m);
+            DeviceState::bump_map_generation(m);
         }
         assert!(ensure_contig_view(&mut state, &mut host, mid).is_none());
         let after = lines();

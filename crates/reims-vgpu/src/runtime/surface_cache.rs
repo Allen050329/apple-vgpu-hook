@@ -104,19 +104,6 @@ pub fn get_texture(
     get_from(&state.host_texture_surfaces, texture_ref, width, height)
 }
 
-/// Borrow a texture-ref encode plus its producer generation.
-///
-/// This is diagnostic provenance for the linear-sample loss proxy; selection
-/// semantics are identical to [`get_texture`].
-pub fn get_texture_with_gen(
-    state: &DeviceState,
-    texture_ref: u32,
-    width: u32,
-    height: u32,
-) -> Option<(&[u8], u32)> {
-    get_from_with_gen(&state.host_texture_surfaces, texture_ref, width, height)
-}
-
 /// Any size under texture_ref (sample path when descriptor geom unknown).
 pub fn get_texture_any(state: &DeviceState, texture_ref: u32) -> Option<(u32, u32, &[u8])> {
     let e = state.host_texture_surfaces.get(&texture_ref)?;
@@ -380,22 +367,19 @@ pub fn mirror_linear_color_cache(
 /// Guest MapMemory2 unmap/remap changes PFNs under the same GVA but does **not**
 /// destroy the encode — see [`note_unmap_retain_gva`] (Unmap retains; Map notify-only).
 pub fn store_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32, bgra: Vec<u8>) {
-    store_gva_owned(state, gva, width, height, bgra, 0, 0, 0);
+    store_gva_owned(state, gva, width, height, bgra, 0);
 }
 
 /// Store a GVA encode with the decoded object identity that produced it.
 /// Type-2/type-3 wrappers are the same linear texture storage family when the
 /// GVA and geometry match; unrelated nonzero object-type transitions still
 /// identify a different resource class.
-#[allow(clippy::too_many_arguments)]
 pub fn store_gva_owned(
     state: &mut DeviceState,
     gva: u64,
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    task_id: u32,
-    texture_ref: u32,
     object_type: u8,
 ) {
     if gva == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM
@@ -416,8 +400,6 @@ pub fn store_gva_owned(
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
-    entry.producer_task_id = task_id;
-    entry.producer_texture_ref = texture_ref;
     entry.producer_object_type = object_type;
 }
 
@@ -448,13 +430,13 @@ pub fn get_gva_with_gen(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Borrow a GVA encode plus its decoded producer identity.
+/// Borrow a GVA encode plus its decoded producer object type.
 pub fn get_gva_with_owner(
     state: &DeviceState,
     gva: u64,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32, u32, u32, u8)> {
+) -> Option<(&[u8], u32, u8)> {
     let e = state.host_gva_surfaces.get(&gva)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -465,13 +447,7 @@ pub fn get_gva_with_owner(
     if e.bgra.len() < need {
         return None;
     }
-    Some((
-        &e.bgra[..need],
-        e.host_gen,
-        e.producer_task_id,
-        e.producer_texture_ref,
-        e.producer_object_type,
-    ))
+    Some((&e.bgra[..need], e.host_gen, e.producer_object_type))
 }
 
 /// Peek GVA encode without geom filter (tests / diagnostics).
@@ -911,12 +887,11 @@ mod tests {
 
         let mut owned = vec![0u8; 16];
         owned[0] = 0xcc;
-        store_gva_owned(&mut st, gva, 2, 2, owned, 1, 110, 2);
-        let (got, generation, task, texture_ref, object_type) =
-            get_gva_with_owner(&st, gva, 2, 2).unwrap();
+        store_gva_owned(&mut st, gva, 2, 2, owned, 2);
+        let (got, generation, object_type) = get_gva_with_owner(&st, gva, 2, 2).unwrap();
         assert_eq!(got[0], 0xcc);
         assert_eq!(generation, 3);
-        assert_eq!((task, texture_ref, object_type), (1, 110, 2));
+        assert_eq!(object_type, 2);
         evict_gva(&mut st, gva);
         assert!(get_gva(&st, gva, 2, 2).is_none());
     }

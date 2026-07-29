@@ -3663,15 +3663,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         .unwrap_or(0)
                 ));
             }
-            if shader_fmt != guest_fmt && t.width >= 1280 && t.height >= 720 {
-                crate::observe::off(format!(
-                    "compute_linux storage_format_view pipe={} bind={} spirv={specialized:?} engine={shader_fmt:?} guest={guest_fmt:?} simg={} bpp={}",
-                    acc.pipeline_ref,
-                    t.binding,
-                    selector,
-                    shader_fmt.bytes_per_texel()
-                ));
-            }
             // Deferred writeback: a resident type-11 output skips the engine
             // readback and the CPU guest writeback entirely — the pinned
             // resident is authoritative and every host access of the window

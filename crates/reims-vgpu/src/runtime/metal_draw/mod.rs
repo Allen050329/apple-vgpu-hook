@@ -36,7 +36,6 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
-use std::time::Instant;
 
 /// Upper bound on a single buffer materialization (pathological pooled allocs).
 /// Metal buffer/texture bind **index** cap (`REIMS_VGPU_METAL_MAX_BUFFERS`) — API slot
@@ -1342,19 +1341,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 None,
             );
         };
-        // Measure-only: empty sample payloads (Favourites / icon class). Does
-        // not gate encode — proxies live in present_proxy / observe fail lines.
-        {
-            #[cfg(test)]
-            let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-            crate::runtime::census::present_proxy::note_empty_sample_if(
-                t.texture_ref,
-                w,
-                h,
-                &rgba,
-                "frag",
-            );
-        }
         frag_tex_items.push(TexItem {
             index: t.index,
             w,
@@ -4082,7 +4068,6 @@ fn seed_color_load<M: HostMemory + HostOps>(
     if width > 0 && height > 0 {
         let cached = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
-                .map(|bgra| (bgra, "gva_cache"))
         } else {
             None
         }
@@ -4092,81 +4077,14 @@ fn seed_color_load<M: HostMemory + HostOps>(
                     crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
                 })
                 .flatten()
-                .map(|bgra| (bgra, "texture_cache"))
         });
-        if let Some((bgra, source)) = cached {
-            let rgba = swap_rb_channels(bgra);
-            log_black_load_seed_preserved(
-                task_id,
-                texture_ref,
-                0,
-                target_gva,
-                width,
-                height,
-                source,
-                &rgba,
-            );
-            return Some(rgba);
+        if let Some(bgra) = cached {
+            return Some(swap_rb_channels(bgra));
         }
     }
     // Type-2/3 (or type-8 base) linear GVA → convert to RGBA8.
     let rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
-    log_black_load_seed_preserved(
-        task_id,
-        texture_ref,
-        0,
-        target_gva,
-        width,
-        height,
-        "guest",
-        &rgba,
-    );
     Some(rgba)
-}
-
-/// Measure-only proxy for the black-load-seed-discard class.
-///
-/// RGB content never participates in seed selection. This census proves a
-/// zero-RGB seed reached the selected Load path and is deduplicated by protocol
-/// identity so ordinary black UI targets cannot flood the always-on log.
-#[allow(clippy::too_many_arguments)]
-fn log_black_load_seed_preserved(
-    task_id: u32,
-    texture_ref: u32,
-    mapping_id: u32,
-    target_gva: u64,
-    width: u32,
-    height: u32,
-    source: &str,
-    rgba: &[u8],
-) {
-    let (rgb_nz, _, _) = crate::observe::rgba_rgb_stats(rgba);
-    if rgb_nz != 0 {
-        return;
-    }
-    let alpha_nz = rgba.chunks_exact(4).filter(|p| p[3] != 0).count();
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    type EmptyResidentSampleKey = (u32, u32, u32, u64, u32, u32, String, usize);
-    static SEEN: Mutex<Option<HashSet<EmptyResidentSampleKey>>> = Mutex::new(None);
-    let first = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get_or_insert_with(HashSet::new).insert((
-            task_id,
-            texture_ref,
-            mapping_id,
-            target_gva,
-            width,
-            height,
-            source.to_owned(),
-            alpha_nz,
-        ))
-    };
-    if first {
-        crate::observe::off(format!(
-            "load_seed_black reason=zero_rgb_seed_preserved src={source} task={task_id} ref={texture_ref} mid={mapping_id} gva={target_gva:#x} {width}x{height} alpha_nz={alpha_nz}"
-        ));
-    }
 }
 
 /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).
