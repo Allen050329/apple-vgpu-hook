@@ -326,6 +326,43 @@ after the gesture and score the burst, rather than sampling its endpoints. Befor
 sequence does not reproduce, confirm the sampling rate could have caught it — and prefer the
 always-on log, which is continuous by construction and did record the failure the captures missed.
 
+**A frame is not a present: `present_content` counts mappings.** Frame rate is the headline number
+for this device and the obvious line to derive it from is wrong by construction. `present_content`
+is emitted once per *mapping*, and the guest composites several layers per frame, so a gap histogram
+over it reports a fast tail that no frame ever had.
+
+The tell is one command. Split the gaps by whether consecutive lines carry the same `mid=`:
+
+| gap | same `mid` | different `mid` |
+|---|---|---|
+| < 20 ms | **0** | 328 |
+| ≥ 20 ms | 4 | 2114 |
+
+Every single sub-20 ms gap was between two different mappings — the layers of one composite going
+out back to back — and no mapping ever re-presented that fast. Read ungrouped, that boot is 2.9 Hz
+with a floor of 2 ms, which invites "the present path can do 500 Hz". Grouped into frames on a 20 ms
+burst boundary it is **2.06 Hz**, and the fastest any single layer ever repeated is 148 ms.
+
+So group bursts before quoting a rate, and print the distinct `mid` count next to it: if that drops
+to 1 the grouping is a no-op and the two numbers must agree. `.agents/repros/soak.sh` does this.
+
+**Three things are already refuted as the cause of the ~2 Hz frame rate, each from the always-on
+channel.** Do not re-derive them:
+
+- *The present path.* A whole five-layer composite goes out in ~20 ms and per-layer gaps bottom out
+  at 2 ms. It is not the limit.
+- *VBL delivery.* This was unmeasured until `display_vbl` was added, and the guess was that we were
+  starving the guest's display link. We are not: it reads `window_hz=125.0` against a 125 Hz grid,
+  steady, for the whole boot. The guest is being ticked 125 times a second and produces two frames.
+- *Shader translation stalls.* `exec_translation_deferred reason=air_loading` fires 115 times across
+  680 s — 0.17/s against 2 frames/s. Occasional compiles, not a per-frame cost.
+
+What is **not** established is where the time does go. Resist the two counters that look like they
+answer it: `contig_view_fragmented` and `type4_pages_refreshed` both land near one event per frame
+in aggregate, but they fire on *re-derivation*, not per access — `mid=2` accounts for 59 events in
+1124 s — so neither can price the path it names. That is the "an event count is not a state" rule
+applied to a cost rather than to a state.
+
 **A live rig is not a live workload — validate the specific thing you drove.** "The log grew and
 presents happened" proves the rig is alive. It does not prove the workload ran, and the two get
 confused because a healthy-looking log is exactly what a validity check is supposed to produce.
