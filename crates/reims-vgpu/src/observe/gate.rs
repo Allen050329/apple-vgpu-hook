@@ -999,11 +999,12 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (70, 1586): removing the per-present GPU statistics oracle
-        // retired `PresentStatsSetup` and the `present_stats_*` slugs it and
-        // `EngineProbe` carried. A decline type with no path left to reach it is
-        // not silent surface, so the baseline drops with the code.
-        (69, 1566),
+        // Down from (69, 1566): removing the uncalled `retire_gva_views_for_task`
+        // retired `ViewAliasSite` and its one `view_alias_retire` slug. That
+        // tripwire's "measured zero on two boots" was unreadable — its only
+        // emission site sat inside a function with no callers, so the zero meant
+        // "could never fire", not "did not fire".
+        (68, 1565),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

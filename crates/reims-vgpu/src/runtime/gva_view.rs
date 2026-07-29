@@ -76,50 +76,6 @@ pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
     task_match_kind(view_task, wire_task).is_some()
 }
 
-/// A retire/evict pass dropped a view registered under a *different* task id.
-///
-/// Only one site remains. `find_covering_view` used to share this vocabulary and
-/// no longer aliases at all: reading through another task's view is wrong, and
-/// two boots of `view_alias_lookup` measured zero, so that arm was deleted.
-///
-/// Retiring is the opposite polarity and keeps its aliasing. Dropping a view
-/// that did not need dropping costs one re-walk; *failing* to drop one leaves a
-/// stale host pointer live to be read after the guest recycled its pages, which
-/// is the class `write_span`'s doc comment records as a WindowServer SIGSEGV.
-/// So this stays a tripwire rather than a deletion target: it measured zero on
-/// two boots, and if it ever fires the aliasing here is load-bearing and the
-/// reason will be in the log instead of inferred.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ViewAliasSite {
-    /// A retire/evict pass dropped a view registered under a different task.
-    Retire,
-}
-
-impl crate::observe::Decline for ViewAliasSite {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::Retire => "view_alias_retire",
-        }
-    }
-}
-
-/// Record an accepted aliased view match, latched per `(view_task, wire_task)`.
-///
-/// Same shape as [`note_task_walk_ambiguity`]: the latch is taken before the
-/// line is built, because these sit inside per-access scans and `Emit::field`
-/// renders eagerly.
-fn note_view_alias(site: ViewAliasSite, view_task: u32, wire_task: u32) {
-    use crate::observe::Decline;
-    let discriminant = (u64::from(view_task) << 32) | u64::from(wire_task);
-    if !crate::observe::first_sight(site.slug(), discriminant) {
-        return;
-    }
-    crate::observe::Emit::decline("view_alias", &site)
-        .field("view", view_task)
-        .field("wire", wire_task)
-        .fail();
-}
-
 /// Retire every registered GVA view that overlaps `[gva, gva+length)` under `task_id`.
 ///
 /// Pushes `(ptr, ptr_len)` into `retired_views` for [`mapper::flush_retired_views`].
@@ -163,39 +119,6 @@ pub fn retire_gva_views_overlapping(
     n
 }
 
-/// Retire all GVA views for a task (delete_task / task redefine).
-pub fn retire_gva_views_for_task(state: &mut DeviceState, task_id: u32) -> u32 {
-    let mut n = 0u32;
-    let mut i = 0;
-    while i < state.gva_host_views.len() {
-        if task_matches(state.gva_host_views[i].task_id, task_id) {
-            // The conservative polarity, censused for the opposite reason: if
-            // this fires, the aliasing is what keeps a stale view from being
-            // read after its task is gone, and it must not be deleted with the
-            // lookup arm.
-            if task_match_kind(state.gva_host_views[i].task_id, task_id)
-                == Some(TaskViewMatch::Aliased)
-            {
-                note_view_alias(ViewAliasSite::Retire, state.gva_host_views[i].task_id, task_id);
-            }
-            let v = state.gva_host_views.swap_remove(i);
-            if v.ptr != 0 && v.ptr_len != 0 {
-                state.retired_views.push((v.ptr, v.ptr_len));
-            }
-            n = n.saturating_add(1);
-        } else {
-            i += 1;
-        }
-    }
-    state
-        .guest_run_memo
-        .retain(|e| !task_matches(e.task_id, task_id));
-    state
-        .flush_nohit_memo
-        .retain(|&(t, _, _), _| !task_matches(t, task_id));
-    n
-}
-
 /// Find a covering view for `task_id` + `[gva, gva+length)` if one is registered.
 pub fn find_covering_view(
     state: &DeviceState,
@@ -217,9 +140,9 @@ pub fn find_covering_view(
     // answers a miss by walking the guest page table and building a fresh view.
     // The cost is one extra walk; the alternative was wrong bytes.
     //
-    // The retire and evict sites keep [`task_matches`] deliberately — see
-    // [`ViewAliasSite`]. Widening is conservative there and narrowing it could
-    // leave a stale view live to be read later.
+    // The overlap-retire site keeps [`task_matches`] deliberately: widening is
+    // conservative there (dropping a view that did not need dropping costs one
+    // re-walk) and narrowing it could leave a stale view live to be read later.
     state.gva_host_views.iter().find(|v| {
         v.task_id == task_id
             && v.gva <= gva

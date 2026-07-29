@@ -2351,17 +2351,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
-        type_name: "ViewAliasSite",
-        defined_in: "runtime/gva_view.rs",
-        slug_blocks: &[],
-        // Census of an accepted aliased view match. Two sites, opposite
-        // polarities: dropping an aliased view is conservative, reading through
-        // one is not.
-        emission: Emission::At(&[("runtime/gva_view.rs", "view_alias")]),
-        slug_calls: &[],
-        slugs: &["view_alias_retire"],
-    },
-    DeclineClass {
         type_name: "TaskWalkAmbiguity",
         defined_in: "runtime/gva_view.rs",
         slug_blocks: &[],

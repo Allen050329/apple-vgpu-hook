@@ -2082,6 +2082,21 @@ impl DeviceState {
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.clear_task_map_spans(task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
+        self.retire_task_gva_views(task_id);
+        self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
+        true
+    }
+
+    /// Retire every GVA HostOps view registered under `task_id`, plus the two
+    /// memos that carry the same invalidation contract.
+    ///
+    /// Both entry points that end a task's page table — `define_task` on a
+    /// redefine and `delete_task` on teardown — owe exactly this: the views hold
+    /// host pointers into pages the guest is about to recycle, so leaving one
+    /// live is a read of memory that no longer belongs to the surface (the
+    /// WindowServer SIGSEGV class `write_span` documents). `retired_views` is
+    /// drained by `mapper::flush_retired_views` through `HostOps::unmap_pages`.
+    fn retire_task_gva_views(&mut self, task_id: u32) {
         let mut i = 0;
         while i < self.gva_host_views.len() {
             if self.gva_host_views[i].task_id == task_id {
@@ -2095,8 +2110,6 @@ impl DeviceState {
         }
         self.guest_run_memo.retain(|e| e.task_id != task_id);
         self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
-        self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
-        true
     }
 
     /// Record a MapMemory2 span (guest already installed PTEs; notify only).
@@ -2273,19 +2286,7 @@ impl DeviceState {
         // Task teardown ≡ all GPU VA maps for this task go away — retire any
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
-        let mut i = 0;
-        while i < self.gva_host_views.len() {
-            if self.gva_host_views[i].task_id == task_id {
-                let v = self.gva_host_views.swap_remove(i);
-                if v.ptr != 0 && v.ptr_len != 0 {
-                    self.retired_views.push((v.ptr, v.ptr_len));
-                }
-            } else {
-                i += 1;
-            }
-        }
-        self.guest_run_memo.retain(|e| e.task_id != task_id);
-        self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
+        self.retire_task_gva_views(task_id);
         self.tasks[task_id as usize] = TaskEntry::default();
         true
     }
