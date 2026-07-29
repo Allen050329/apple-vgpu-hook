@@ -203,8 +203,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 ) -> ExecResult {
     let exec_started = std::time::Instant::now();
     let mut out = ExecResult::default();
-    // Batch-ceiling census: draw runs never span packets.
-    state.last_draw_batch_key = None;
     if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
         return out;
     }

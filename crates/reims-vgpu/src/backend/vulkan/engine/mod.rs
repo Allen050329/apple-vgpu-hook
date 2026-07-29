@@ -1616,10 +1616,9 @@ pub fn cap_pressure_snapshot() -> crate::runtime::census::present_proxy::cap_pre
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the
 /// currently-presented target (`display`) alive, and reclaim aged non-pinned
 /// residents. Called from the poll heartbeat (so the clock keeps ticking when the
-/// guest stops publishing) and each present publish. Returns the count reclaimed
-/// this call for the always-on `idle_target_drain` census. No-op before the
-/// device context exists.
-pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) -> usize {
+/// guest stops publishing) and each present publish. No-op before the device
+/// context exists.
+pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -1627,9 +1626,11 @@ pub fn maintain_idle_residents(display: Option<&TargetIdentity>, now_ms: u64) ->
         ..
     } = &mut *guard;
     let Some(ctx) = owner.ctx.as_ref() else {
-        return 0;
+        return;
     };
-    unsafe { pools.advance_registry_touch_and_drain(ctx, now_ms, display) }
+    unsafe {
+        pools.advance_registry_touch_and_drain(ctx, now_ms, display);
+    }
 }
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).

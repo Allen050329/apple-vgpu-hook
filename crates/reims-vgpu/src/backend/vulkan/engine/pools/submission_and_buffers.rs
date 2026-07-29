@@ -515,9 +515,9 @@ impl ResourcePools {
         ctx: &DeviceContext,
         now_ms: u64,
         display: Option<&TargetIdentity>,
-    ) -> usize {
+    ) {
         let Some(victims) = self.plan_idle_drain(now_ms, display) else {
-            return 0;
+            return;
         };
         let drained = victims.len();
         for k in victims {
@@ -583,7 +583,6 @@ impl ResourcePools {
         // teardown; this releases it once the VM is genuinely quiescent.
         let cold = self.plan_host_import_idle_sweep(self.idle_clock_ms, IDLE_RECYCLE_TRIM_PER_PASS);
         self.evict_host_imports(ctx, cold, "idle");
-        drained
     }
 
     /// Count of registry residents NOT held by a deferred-write pin — the

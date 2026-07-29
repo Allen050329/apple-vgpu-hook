@@ -587,6 +587,27 @@ always-on text that entries were ageing out unpaired. That is not a regression t
 deletion announcing itself. Boot once after any deletion and diff the always-on line census against
 the boot before — the new lines are the work list, and the ones that vanish are the confirmation.
 
+**A product call nested inside a census argument dies with the census.** The censuses this codebase
+grew are mostly `note(x)` one-liners, and the idiom that grew with them is to compute `x` inline. When
+`x` is itself the call that does the work, deleting the census statement deletes the work, and every
+check that would catch it passes: it compiles, the tests pass, clippy is clean, and the function it
+called is `pub` so nothing warns that it now has no callers.
+
+That happened here. `idle_drain::note(maintain_idle_residents(display, now) as u64)` appeared at three
+sites — two present-publish paths and the poll heartbeat. Removing the `idle_drain` census removed all
+three, and `maintain_idle_residents` sat uncalled for four commits. It is not a small function to
+lose: past the registry reclaim it trims the recycle pools, ages out the sampled-content cache and the
+compute-storage residents, releases empty slab blocks, and sweeps cold host imports. Its own comment
+says a publish-clocked drain once froze with "~260 stale residents (~516 MiB) pinned for the guest
+lifetime", which is what the device now does with no drain at all.
+
+So when removing an observability call, read its **arguments** before deleting the statement, and
+restate what each one does. If an argument calls anything, hoist the call to its own statement first
+and delete only the `note`. The mechanical check that finds an already-orphaned one: list every
+`pub fn` in the crate whose name occurs exactly once across `src/` and `tests/` — a definition with no
+reference. `pub` items in a staticlib are invisible to the dead-code lint, which is why this class
+survives a clean `-D warnings` build.
+
 ### Fit The Wrong Output Before Naming A Wrong Mechanism
 
 Once known values have been through the path, you hold measured/nominal pairs. **Fit them to a

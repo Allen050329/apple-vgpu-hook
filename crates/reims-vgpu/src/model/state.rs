@@ -1373,12 +1373,6 @@ pub struct DeviceState {
     pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
     /// Per-mid last write **command class** (ClearOnly vs Composite) — present path.
     pub surface_write_kind: BTreeMap<u32, SurfaceWriteKind>,
-    /// RGB-nonzero pixel count of each mapping's last full-frame Store import
-    /// (`import_present ok_runs` resident stats). Diagnostic memory for the
-    /// `fullquad_store_noop` proxy — a full-quad draw whose resident content
-    /// stats do not move names the incomplete-swap-base class. Never gates
-    /// behavior.
-    pub import_rgb_nz: BTreeMap<u32, usize>,
     pub present: PresentState,
     pub cursor: CursorState,
     pub display: DisplayHandshake,
@@ -1463,11 +1457,6 @@ pub struct DeviceState {
     pub store_seq: u64,
     /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
     pub tranche: MemoCounters,
-    /// Batch-ceiling census key of the previous engine draw in the current
-    /// packet: (hash of the engine target identity, width, height, bgra).
-    /// Reset at every ExecIndirect2 packet start. The identity is stored as a
-    /// std-hash so the model stays independent of backend engine types.
-    pub last_draw_batch_key: Option<(u64, u32, u32, bool)>,
     /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
     /// invalidation contract (mirrors `gva_host_views` exactly). A `VecDeque`
     /// so the FIFO cap evict is an O(1) `pop_front` rather than a `Vec`
@@ -1567,7 +1556,6 @@ impl DeviceState {
             render_deferred_flush: BTreeMap::new(),
             deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
-            import_rgb_nz: BTreeMap::new(),
             present: PresentState::default(),
             cursor: CursorState {
                 show: true,
@@ -1600,7 +1588,6 @@ impl DeviceState {
             store_seq: 0,
             gva_host_views: Vec::new(),
             tranche: MemoCounters::default(),
-            last_draw_batch_key: None,
             guest_run_memo: std::collections::VecDeque::new(),
             view_verify_ctr: 0,
             view_stale_reads: 0,

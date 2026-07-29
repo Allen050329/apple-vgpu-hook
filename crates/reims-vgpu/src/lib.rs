@@ -624,6 +624,10 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         let mut cap_sample = crate::backend::vulkan::engine::cap_pressure_snapshot();
         cap_sample.render_windows = state.render_deferred_flush.len();
         crate::runtime::census::present_proxy::cap_pressure::note(cap_sample);
+        crate::backend::vulkan::engine::maintain_idle_residents(
+            resident_source.candidates.first(),
+            now_ms,
+        );
         let published = window_write_frame(
             link,
             p.frame_width,
@@ -736,6 +740,10 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         // sitting at the high REGISTRY_CAP for the guest lifetime. The presented
         // target is kept alive (export_present already touched it above; passing its
         // identity here guards the CPU-fallback present where export did not run).
+        crate::backend::vulkan::engine::maintain_idle_residents(
+            Some(&present_identity),
+            crate::observe::elapsed_ms() as u64,
+        );
         // Record whether the display is carried by the GPU resident this present so
         // the NEXT capture can skip the CPU readback (same drain worker, one present
         // later — dmabuf state is stable across steady-state presents). A miss
@@ -1288,6 +1296,22 @@ pub fn device_poll(id: u64) -> bool {
     // advancing and returns VRAM to baseline. The presented target is kept alive
     // by identity so it is never reclaimed from under the display. The engine
     // throttles the actual reclaim to IDLE_DRAIN_INTERVAL_MS internally.
+    #[cfg(feature = "backend-vulkan")]
+    {
+        let present = &device.state.present;
+        let display_id = present.frame_valid.then(|| {
+            runtime::import_present::surface_identity(
+                &device.state,
+                present.frame_mapping,
+                present.frame_width,
+                present.frame_height,
+            )
+        });
+        crate::backend::vulkan::engine::maintain_idle_residents(
+            display_id.as_ref(),
+            observe::elapsed_ms() as u64,
+        );
+    }
     // Pre-boundary early-console → host window (headless-safe: the heartbeat
     // drives poll even under -display none). No-op post-boundary or with no
     // window attached.
