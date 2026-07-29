@@ -8,10 +8,10 @@
 use crate::contract::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, read_internal_desc_ptr, read_mapper_identity,
-    read_mapper_internal, sample_window, sample_window_prefer_device, validate_mapper_internal,
-    PagesMemory, DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE,
-    MAPPER_CAPTURE_REG_MAPPING_INTERNAL, MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN,
-    MAPPER_REQUEST_MAP, MAPPER_REQUEST_UNMAP,
+    read_mapper_internal, sample_window_prefer_device, validate_mapper_internal, PagesMemory,
+    DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
+    MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
+    MAPPER_REQUEST_UNMAP,
 };
 use crate::model::{DeviceState, MapperCapture, MAX_MAPPINGS};
 use crate::runtime::host::{HostMemory, HostOps, MemError};
@@ -477,8 +477,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                             sample_window_prefer_device(Some(&desc), None, format, width, height)
                         {
                             min_size = min_size.max(end).max(guest_page);
-                        } else if let Some((_, _, end)) = sample_window(0, format, width, height) {
-                            min_size = min_size.max(end).max(guest_page);
                         }
                     }
                 }
@@ -520,8 +518,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             if let Some((_, _, end, _)) =
                 sample_window_prefer_device(desc_slice, None, format, width, height)
             {
-                min_size = min_size.max(end).max(guest_page);
-            } else if let Some((_, _, end)) = sample_window(0, format, width, height) {
                 min_size = min_size.max(end).max(guest_page);
             }
         }
@@ -877,7 +873,7 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         // Match scanout/writeback default when format not latched.
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
-    let span_end = if let Some((_, _, end, _)) = sample_window_prefer_device(
+    let Some((_, _, span_end, _)) = sample_window_prefer_device(
         if m.device_desc.len() >= DEVICE_DESC_LEN {
             Some(m.device_desc.as_slice())
         } else {
@@ -887,11 +883,7 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         format,
         m.width,
         m.height,
-    ) {
-        end
-    } else if let Some((_, _, end)) = sample_window(0, format, m.width, m.height) {
-        end
-    } else {
+    ) else {
         return false;
     };
     let page_size = crate::contract::iosurface_pages::page_size_of(state.page_shift);
@@ -1876,7 +1868,10 @@ mod tests {
         // `lo` to the bottom of RAM and make the span claim pages no write can
         // reach, which is the wrong direction for a bound used as evidence.
         let with_hole = [0u32, valid(3), valid(9), 0u32];
-        assert_eq!(entry_gpa_span(&with_hole, 12), Some((3u64 << 12, 9u64 << 12)));
+        assert_eq!(
+            entry_gpa_span(&with_hole, 12),
+            Some((3u64 << 12, 9u64 << 12))
+        );
         // Page shift is honoured rather than assumed to be 12 (arm64 is 14).
         assert_eq!(entry_gpa_span(&entries, 14), Some((3u64 << 14, 9u64 << 14)));
         // Nothing resolvable ⇒ no span at all, rather than (u64::MAX, 0).
@@ -2296,6 +2291,59 @@ mod tests {
             m.page_entries = vec![0x22; 1];
         }
         assert!(pages_cover_geom(&state, 3));
+    }
+
+    /// A page table cannot make a window the guest's own allocation does not
+    /// contain, however many pages it holds.
+    ///
+    /// `sample_window_prefer_device` refuses when the invented packed span runs
+    /// past `device_desc.alloc_size` — that refusal is the only place the wire
+    /// allocation bounds the window. This case is the one where a caller could
+    /// answer it by calling `sample_window` directly and getting the rejected
+    /// span back: the descriptor says 1.5 MiB, the packed 1024² BGRA window is
+    /// 4 MiB, and the table is deliberately sized to cover the 4 MiB. Falling
+    /// back would report "covered" for a surface whose own descriptor says it is
+    /// a third of that size.
+    #[test]
+    fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
+        use crate::contract::endian::{st32, st64};
+        use crate::contract::iosurface_pages::{
+            DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
+            DEVICE_DESC_PLANE_COUNT,
+        };
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        // 1.5 MiB allocation, single plane, and a bpr too small for 1024 BGRA so
+        // the device-surface path refuses and the invent tail is what runs.
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x18_0000);
+        st64(
+            &mut desc[DEVICE_DESC_DIMS..],
+            (1024u64 << 8) | (1024u64 << 40),
+        );
+        st32(&mut desc[DEVICE_DESC_BPR..], 64);
+        desc[DEVICE_DESC_PLANE_COUNT] = 0;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        assert!(state.attach_mapping_internal(9, KVA));
+        assert!(state.set_mapping_device_desc(9, &desc));
+        assert!(state.set_mapping_geom(
+            9,
+            1024,
+            1024,
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        ));
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.mapped = true;
+            // 256 × 16 KiB = 4 MiB, exactly the packed 1024² BGRA span, so a
+            // fallback to `sample_window` would compare 4 MiB against 4 MiB and
+            // pass.
+            m.page_entries = vec![0x33; 256];
+        }
+        assert!(
+            !pages_cover_geom(&state, 9),
+            "alloc_size 0x18_0000 cannot hold a 4 MiB window; the page count is not the bound"
+        );
     }
 
     /// 249² Favourites-class tiles fit in 16×16KiB pages; short-table proxy is

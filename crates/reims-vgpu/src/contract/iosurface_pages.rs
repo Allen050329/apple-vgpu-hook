@@ -432,6 +432,13 @@ pub fn sample_window_prefer_device(
     // The device-surface path already rejects span_end > alloc_size; invent must
     // not invent a larger span past that wire allocation (old invent ignored it
     // → host claimed a plane-sized window over fewer mapped pages).
+    //
+    // This `None` is therefore the *only* place the allocation bound is applied,
+    // and no caller may answer it by calling `sample_window` itself: the two
+    // differ by exactly this check, so a `sample_window_prefer_device(..) else
+    // sample_window(..)` ladder re-takes the span that was just rejected, and
+    // does so only when the span overruns the guest's own allocation. Three such
+    // ladders existed in `mapper.rs` and are gone.
     let (off, bpr, end) = sample_window(plane_index.unwrap_or(0), pixel_format, width, height)?;
     if let Some(desc) = desc {
         if desc.len() >= DEVICE_DESC_LEN {

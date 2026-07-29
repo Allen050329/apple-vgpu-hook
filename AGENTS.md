@@ -971,6 +971,27 @@ Note also that this is on the host-window present thread, not the drain worker, 
 `publish_us` of 2-10 ms does **not** bound it and it is invisible to the duty measurement. Any claim
 that it does or does not cost frames needs its own measurement.
 
+**The type-11 sample window is resolved from the guest's descriptor, not invented — measured, and it
+is the reason not to delete the invent rung.** Type-11 is the one case with **no wire plane index**:
+nothing on the wire names which plane a texture wants, so `sample_window_prefer_device` matches width,
+height and bytes-per-element and takes the plane only when *exactly one* matches. Zero matches and
+two-or-more matches both fall through to an invented packed window at offset 0, which on a multi-plane
+surface is a bind of the wrong plane — and the geometry scan cannot detect that by construction. The
+fallback therefore reports itself: `type11_window_invent`, always-on, deduped per (mapping, geometry,
+format), carrying the plane count so "no descriptor yet" (`planes=-1`) reads differently from "the scan
+could not pick a plane" (`planes>1`).
+
+One x86/Vulkan boot, 2026-07-30, guest at a real session (Dock asserted, Safari on three pages,
+Calendar, System Settings, host window verified rendering all of it): **0 lines**, while the type-11
+Store rail was demonstrably live (`store_routes surface_deferred`/`surface_flush`, `type11_store_route`
+×3). So every type-11 window on that boot came from the guest's `sIOSurfaceDeviceDescriptor`.
+
+Do **not** read that as licence to delete the invent rung. Two reasons, and the second is the one that
+matters: the denominator is small, per the standing rule that an event count over one window is not a
+state; and the rung covers the *headerless* case, where the mapping has geometry but no descriptor has
+been cached yet, so deleting it turns a legitimate early bind into a refusal. What the zero does buy
+is that the wrong-plane hazard is not currently being taken on this pathway.
+
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
 and the measured frame period sat at 252–665 ms, i.e. just under that threshold for entire runs. It
