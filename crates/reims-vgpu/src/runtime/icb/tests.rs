@@ -481,6 +481,43 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Publish an encoded ICB command-memory `slot` at `cmd_handle`'s page, wrap it
+/// in buffer object 10, and associate that buffer with ICB object 9 through
+/// opcode 0x1d1 — the sequence `execute` performs before any fill, spelled in
+/// thirteen test bodies before this.
+///
+/// `cmd_handle` is the caller's because it is the slot's GVA page index and must
+/// not collide with the other fixtures a given test has already placed; refs 9
+/// and 10 and descriptor GVA 0x1a0 are this file's fixture identities and are
+/// the same at every one of those sites.
+fn associate_icb_command_memory(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    cmd_handle: u32,
+    slot: &[u8],
+) {
+    let cmd_gva = u64::from(cmd_handle) << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], cmd_gva, slot);
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], u64::from(cmd_handle));
+    put_object(host, state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
+    // `&*host`, not `host`: this takes `&M` while `put_object` above needs
+    // `&mut FakeHost`, and the reborrow is what lets one binding serve both.
+    apply_icb_host_resource_info(
+        state,
+        &*host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1 associate ICB command memory");
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn map_draw_target(host: &mut FakeHost, state: &mut DeviceState, pfn: u32) -> u32 {
     let mapping_id = 9u32;
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
@@ -2300,33 +2337,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     )
     .unwrap();
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    let cmd_bdesc_gva = 0x1a0u64;
-    put_object(
-        &mut host,
-        &state,
-        10,
-        OBJECT_TYPE_BUFFER,
-        cmd_bdesc_gva,
-        &cmd_bdesc,
-    );
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x31);
 
@@ -2470,25 +2481,7 @@ fn wire_backed_draw_patches_tessellation_e2e() {
     .expect("encode DrawPatches slot");
 
     // Command memory only — never call fill_render_command.
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1 associate command memory");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     // Explicit re-fill (what execute does) — proves decode+resolve path.
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
@@ -2614,25 +2607,7 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     )
     .expect("encode DrawIndexedPatches slot");
 
-    let cmd_handle = 7u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1 associate command memory");
+    associate_icb_command_memory(&mut host, &state, 7, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory DrawIndexedPatches");
@@ -2823,25 +2798,7 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode dual-export slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory dual-export object+mesh");
@@ -3056,25 +3013,7 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh SPI slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory mesh SPI pipeline");
@@ -3359,25 +3298,7 @@ fn wire_backed_mesh_buffer_bind_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh bind slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory mesh buffer bind");
@@ -3479,25 +3400,7 @@ fn wire_backed_object_buffer_bind_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode object bind slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory object buffer bind");
@@ -3835,25 +3738,7 @@ fn wire_backed_object_tg_memory_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode object TG slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory object TG");
@@ -3937,25 +3822,7 @@ fn wire_backed_mesh_threads_e2e() {
     )
     .expect("encode MeshThreads slot");
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory MeshThreads");
@@ -4039,25 +3906,7 @@ fn wire_backed_mesh_threadgroups_e2e() {
     )
     .expect("encode MeshThreadgroups slot");
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory MeshThreadgroups");
@@ -4659,25 +4508,7 @@ fn wire_backed_draw_primitives_stagein_e2e() {
     )
     .expect("encode Draw primitives slot");
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory Draw primitives");
@@ -5031,25 +4862,7 @@ fn wire_backed_attribute_stride_stagein_e2e() {
         "attribute stride table on wire"
     );
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory attributeStride");
@@ -6292,25 +6105,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
         _ => panic!("indexed"),
     }
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x35);
 
