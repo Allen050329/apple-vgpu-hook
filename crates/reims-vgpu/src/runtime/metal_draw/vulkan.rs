@@ -4625,12 +4625,8 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     // Whatever still intersects covers guest bytes this Store does *not* write —
     // a different plane window on the same mapping — so it has to land.
     //
-    // It must land BEFORE the cache is refreshed below. The flush reads its
-    // pixels from `surface_cache`, so replacing the entry first would either
-    // write this frame's bytes for an older window's range or, when the geometry
-    // differs, miss the cache entirely and report a loss for a window that was
-    // perfectly landable. The boot at the parent commit showed that ordering as
-    // 7 `deferred_flush_lost … reason=cache_miss`.
+    // Each of those windows carries its own pixels, so unlike the first cut of
+    // this rail the order against the cache refresh below no longer matters.
     if !crate::runtime::storage_flush::flush_intersecting(
         state,
         host,
@@ -4642,18 +4638,24 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         // unknown; arming over it would attribute its loss to this Store.
         return false;
     }
-    // Now the cache may take this frame. It is the flush's source and the Load
-    // seed's source, so it has to hold these pixels before the window claims the
-    // guest pages are stale. The synchronous route got this for free inside
-    // `write_rgba8_image_changed`; here it is explicit, and it is the one copy
-    // this rail still pays.
-    crate::runtime::surface_cache::store(state, mapping_id, width, height, {
+    // Convert once, into guest scanout order, and reference it twice: the Load
+    // seed and the present capture read it through `surface_cache`, and the
+    // window below owns it so the writeback it defers can always be performed.
+    // This is the one copy this rail still pays.
+    let frame = std::sync::Arc::new({
         let mut bgra = rgba.to_vec();
         for px in bgra.chunks_exact_mut(4) {
             px.swap(0, 2);
         }
         bgra
     });
+    crate::runtime::surface_cache::store_shared(
+        state,
+        mapping_id,
+        width,
+        height,
+        std::sync::Arc::clone(&frame),
+    );
     // Land oldest-first through the normal choke point rather than taking the
     // entry directly: `flush_intersecting` runs the fixpoint that drags in
     // siblings overlapping the same guest bytes, and taking one window out from
@@ -4672,9 +4674,13 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     }
     state.surface_deferred_seq = state.surface_deferred_seq.wrapping_add(1);
     let armed_seq = state.surface_deferred_seq;
-    state
-        .compute_deferred_flush
-        .insert(key, crate::model::DeferredOwner::Render { armed_seq });
+    state.compute_deferred_flush.insert(
+        key,
+        crate::model::DeferredOwner::Render {
+            armed_seq,
+            bgra: frame,
+        },
+    );
     // Raw task-GVA reads that alias these physical pages flush through
     // `flush_intersecting_task_gva`, which finds the mapping via this index.
     state.index_deferred_alias_pages(key.mapping_id);
@@ -4718,7 +4724,7 @@ fn oldest_render_window_range(state: &DeviceState) -> Option<(u32, u64, u64)> {
         .compute_deferred_flush
         .iter()
         .filter_map(|(k, o)| match o {
-            crate::model::DeferredOwner::Render { armed_seq } => Some((*armed_seq, k)),
+            crate::model::DeferredOwner::Render { armed_seq, .. } => Some((*armed_seq, k)),
             _ => None,
         })
         .min_by_key(|(seq, _)| *seq)

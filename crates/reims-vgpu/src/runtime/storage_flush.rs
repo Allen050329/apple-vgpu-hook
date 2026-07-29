@@ -585,10 +585,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // outcomes that are not — a refused write, and a window whose span the guest
     // had already torn down — each emit their own typed line above, so the
     // always-on view keeps the losses and drops the running commentary.
-    crate::runtime::drain::note_drain_phase(
-        crate::runtime::drain::DrainPhase::Flush,
-        started,
-    );
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::line(format!(
         "gva_deferred_flush gva={gva:#x} {}x{} fmt={:#x} guest={guest} trigger={trigger} bytes={} us={}",
         entry.width,
@@ -725,10 +722,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             "write_fail"
         };
     }
-    crate::runtime::drain::note_drain_phase(
-        crate::runtime::drain::DrainPhase::Flush,
-        started,
-    );
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::off(format!(
         "linear_deferred_flush task={task_id} ref={texture_ref} {}x{} fmt={:#x} gen={generation} guest={guest} bytes={} us={}",
         key.width,
@@ -802,7 +796,9 @@ fn flush_one<M: HostMemory + HostOps>(
         crate::model::DeferredOwner::Storage { generation } => {
             flush_storage_one(state, host, key, generation)
         }
-        crate::model::DeferredOwner::Render { .. } => flush_render_one(state, host, key),
+        crate::model::DeferredOwner::Render { bgra, .. } => {
+            flush_render_one(state, host, key, &bgra)
+        }
     }
 }
 
@@ -827,6 +823,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
+    bgra: &[u8],
 ) -> bool {
     let started = std::time::Instant::now();
     // Counted on the same one-line-per-second census as the Store routes, so a
@@ -855,24 +852,21 @@ fn flush_render_one<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    // The cache holds BGRA — guest scanout order — so this copies in with no
-    // channel conversion. A miss means something evicted the frame between arm
-    // and flush; the guest pages then keep their stale-but-coherent bytes and
-    // that is a real loss of the Store.
-    let Some(bgra) = crate::runtime::surface_cache::get(state, key.mapping_id, key.width, key.height)
-        .map(|b| b.to_vec())
-    else {
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=cache_miss",
-            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-        ));
-        return false;
-    };
+    // The window carries its own frame in guest scanout order, so this copies in
+    // with no channel conversion and cannot miss.
+    //
+    // It used to read `surface_cache::get(mapping_id, key.width, key.height)`,
+    // and that is one entry per mapping: a later Store at a different geometry
+    // replaced it and every window still armed at the old geometry lost its
+    // pixels — `deferred_flush_lost reason=cache_miss`, 15 whole layers in one
+    // boot, which is a compositing layer going solid black. The bytes are shared
+    // with the cache entry the same readback stored, so owning them costs an
+    // `Arc` clone and no copy.
     let ok = crate::runtime::mapping_write::write_bgra8(
         state,
         host,
         key.mapping_id,
-        &bgra,
+        bgra,
         key.width.saturating_mul(4),
         key.width,
         key.height,
@@ -902,6 +896,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     _host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
+    _bgra: &[u8],
 ) -> bool {
     // No engine ⇒ nothing can have deferred; drop the obligation fail-visibly.
     let _ = state;
@@ -1000,10 +995,7 @@ fn flush_storage_one<M: HostMemory + HostOps>(
     // re-establish the mirror entry the write's own invalidation dropped so
     // chained seed skips stay live.
     state.compute_storage_residency.insert(*key, generation);
-    crate::runtime::drain::note_drain_phase(
-        crate::runtime::drain::DrainPhase::Flush,
-        started,
-    );
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::off(format!(
         "compute_deferred_flush mapping={} {}x{} fmt={:#x} gen={generation} bytes={} us={}",
         key.mapping_id,
@@ -1043,14 +1035,14 @@ pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
             key.width,
             key.height,
             key.pixel_format,
-            owner_slug(owner)
+            owner_slug(&owner)
         ));
         // The two rails pin different registries, so the release has to follow
         // the owner. Unpinning storage for a render window would leave the
         // target resident pinned for the life of the boot — the "~260 stale
         // residents (~516 MiB)" shape — while reporting a clean teardown.
         #[cfg(feature = "backend-vulkan")]
-        release_window_pin(&key, owner);
+        release_window_pin(&key, &owner);
     }
 }
 
@@ -1065,7 +1057,7 @@ pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn release_window_pin(
     key: &crate::model::ComputeStorageResidencyKey,
-    owner: crate::model::DeferredOwner,
+    owner: &crate::model::DeferredOwner,
 ) {
     match owner {
         crate::model::DeferredOwner::Storage { .. } => {
@@ -1075,7 +1067,7 @@ pub(crate) fn release_window_pin(
     }
 }
 
-pub(crate) fn owner_slug(owner: crate::model::DeferredOwner) -> &'static str {
+pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
     match owner {
         crate::model::DeferredOwner::Storage { .. } => "compute",
         crate::model::DeferredOwner::Render { .. } => "render",
@@ -1097,6 +1089,15 @@ mod tests {
             height: 4,
             pixel_format: 0x46,
             texture_ref: 0,
+        }
+    }
+
+    /// A render window carrying its own 4x4 BGRA frame — the geometry [`key`]
+    /// names, since the flush writes `key.width x key.height` from these bytes.
+    fn render_owner(armed_seq: u64) -> crate::model::DeferredOwner {
+        crate::model::DeferredOwner::Render {
+            armed_seq,
+            bgra: std::sync::Arc::new(vec![0u8; 4 * 4 * 4]),
         }
     }
 
@@ -1189,7 +1190,10 @@ mod tests {
         // the mapping is at 5, and the content generation is 3. Only one pair
         // of those is what the guard compares.
         m.map_generation = 5;
-        state.compute_deferred_flush.insert(key(9, 0, 256), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         let cap = crate::observe::FailCapture::start();
         assert!(!super::flush_intersecting(
             &mut state,
@@ -1246,7 +1250,7 @@ mod tests {
         m.map_generation = 5;
         state
             .compute_deferred_flush
-            .insert(key(9, 0, 256), crate::model::DeferredOwner::Render { armed_seq: 1 });
+            .insert(key(9, 0, 256), render_owner(1));
         let cap = crate::observe::FailCapture::start();
         assert!(
             !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
@@ -1265,6 +1269,87 @@ mod tests {
             state.compute_deferred_flush.is_empty(),
             "the trigger must consume the window it took"
         );
+    }
+
+    /// A render window lands its own pixels even when `surface_cache` has moved
+    /// on to another geometry for the same mapping.
+    ///
+    /// The flush used to source its bytes from
+    /// `surface_cache::get(mapping_id, key.width, key.height)`, and that cache
+    /// holds exactly one entry per mapping. A guest that re-Stores the surface at
+    /// a new size therefore orphaned every window still armed at the old one:
+    /// the flush missed, emitted `deferred_flush_lost reason=cache_miss` and the
+    /// guest kept its stale pixels. One boot lost 15 whole layers that way —
+    /// including a 1920x1080 desktop surface and a 1920x24 menu bar — which on
+    /// screen is a compositing layer rendering solid black.
+    #[test]
+    fn a_render_window_lands_its_own_pixels_after_the_cache_moved_geometry() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x4400_0000u64;
+        host.map_range(gpa, page as usize, 0);
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.mapped = true;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        // The window's own frame — every byte 0xA7.
+        let frame = vec![0xA7u8; 4 * 4 * 4];
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                bgra: std::sync::Arc::new(frame.clone()),
+            },
+        );
+        // A later Store re-Stored this mapping at 8x8, replacing the one cache
+        // entry it has. The 4x4 window above is now unreachable through it.
+        crate::runtime::surface_cache::store(&mut state, 9, 8, 8, vec![0x11u8; 8 * 8 * 4]);
+
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window carrying its own pixels is always landable"
+        );
+        assert!(
+            cap.lines()
+                .iter()
+                .all(|l| !l.contains("deferred_flush_lost")),
+            "nothing may be lost: {:?}",
+            cap.lines()
+        );
+        // The guest side is row-strided at the mapping's own bytes-per-row, so
+        // read it the way the writeback wrote it.
+        let (base_off, bpr, _) = {
+            let m = state.mappings.get(&9).unwrap();
+            crate::runtime::mapping_write::type11_sample_window(
+                m,
+                4,
+                4,
+                crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            )
+            .expect("the mapping has a type-11 sample window")
+        };
+        for y in 0..4u64 {
+            let mut row = [0u8; 4 * 4];
+            host.read_gpa(gpa + base_off + y * bpr as u64, &mut row)
+                .unwrap();
+            assert_eq!(
+                &row[..],
+                &frame[(y as usize) * 16..(y as usize) * 16 + 16],
+                "row {y} of the guest pages must hold the window's frame, not the cache's"
+            );
+        }
     }
 
     /// A render window fully covered by a later writer is *dropped*, not
@@ -1290,9 +1375,7 @@ mod tests {
             m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
         let k = key(9, 0, 256);
-        state
-            .compute_deferred_flush
-            .insert(k, crate::model::DeferredOwner::Render { armed_seq: 1 });
+        state.compute_deferred_flush.insert(k, render_owner(1));
         state.index_deferred_alias_pages(9);
         assert!(
             state.deferred_alias_pages.contains_key(&9),
@@ -1321,10 +1404,10 @@ mod tests {
         let sibling = key(9, 256, 512);
         state
             .compute_deferred_flush
-            .insert(covered, crate::model::DeferredOwner::Render { armed_seq: 1 });
+            .insert(covered, render_owner(1));
         state
             .compute_deferred_flush
-            .insert(sibling, crate::model::DeferredOwner::Render { armed_seq: 2 });
+            .insert(sibling, render_owner(2));
 
         assert!(state.take_deferred_flush_window_exact(&covered).is_some());
         assert!(
@@ -1347,10 +1430,11 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         state
             .compute_deferred_flush
-            .insert(key(9, 0, 256), crate::model::DeferredOwner::Render { armed_seq: 7 });
-        state
-            .compute_deferred_flush
-            .insert(key(9, 256, 512), crate::model::DeferredOwner::Storage { generation: 3 });
+            .insert(key(9, 0, 256), render_owner(7));
+        state.compute_deferred_flush.insert(
+            key(9, 256, 512),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         let cap = crate::observe::FailCapture::start();
         super::drop_windows(&mut state, 9, "unit");
         let lines: Vec<String> = cap
@@ -1389,7 +1473,9 @@ mod tests {
             m.map_generation = 2;
             m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
-        state.compute_deferred_flush.insert(k, crate::model::DeferredOwner::Storage { generation: 3 });
+        state
+            .compute_deferred_flush
+            .insert(k, crate::model::DeferredOwner::Storage { generation: 3 });
         // The guest deletes the backing; the window is kept for the fingerprint
         // decision and the page list moves to `condemned_entries`.
         assert!(state.condemn_surface_backing(9));
@@ -1409,7 +1495,10 @@ mod tests {
         let mut host = FakeHost::new();
         // Window over an unmapped mapping: the flush must fail closed
         // (fail-visible loss), remove the window, and return false.
-        state.compute_deferred_flush.insert(key(9, 0, 4096), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            key(9, 0, 4096),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
         assert!(!ok, "lost window must report failure");
         assert!(
@@ -1417,7 +1506,10 @@ mod tests {
             "taken windows never return to the map"
         );
         // Disjoint mapping id: untouched.
-        state.compute_deferred_flush.insert(key(10, 0, 4096), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            key(10, 0, 4096),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         assert!(super::flush_intersecting(
             &mut state,
             &mut host,
@@ -1468,8 +1560,14 @@ mod tests {
             m.page_entries = vec![page_entry(pfn)];
         }
         let ckey = |mapping_id: u32| key(mapping_id, 0, 0x1000);
-        state.compute_deferred_flush.insert(ckey(9), crate::model::DeferredOwner::Storage { generation: 3 });
-        state.compute_deferred_flush.insert(ckey(10), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            ckey(9),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        state.compute_deferred_flush.insert(
+            ckey(10),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         // Product defer sites index pages at defer time.
         state.index_deferred_alias_pages(9);
         state.index_deferred_alias_pages(10);
@@ -1511,9 +1609,15 @@ mod tests {
             m.mapped = true;
             m.page_entries = vec![page_entry(pfn)];
         }
-        state.compute_deferred_flush.insert(key(9, 0, 256), crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         let disjoint = key(10, 0, 0x1000);
-        state.compute_deferred_flush.insert(disjoint, crate::model::DeferredOwner::Storage { generation: 3 });
+        state.compute_deferred_flush.insert(
+            disjoint,
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         // Linear windows never name the mapping: one aliases mapping 9's
         // physical page, one sits on a disjoint page.
         let mut lin_aliased = key(0, 0, 0x1000);
@@ -2228,9 +2332,18 @@ mod tests {
     #[test]
     fn take_deferred_windows_is_exact_intersection() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        state.compute_deferred_flush.insert(key(7, 0, 256), crate::model::DeferredOwner::Storage { generation: 3 });
-        state.compute_deferred_flush.insert(key(7, 256, 512), crate::model::DeferredOwner::Storage { generation: 4 });
-        state.compute_deferred_flush.insert(key(8, 0, 256), crate::model::DeferredOwner::Storage { generation: 5 });
+        state.compute_deferred_flush.insert(
+            key(7, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        state.compute_deferred_flush.insert(
+            key(7, 256, 512),
+            crate::model::DeferredOwner::Storage { generation: 4 },
+        );
+        state.compute_deferred_flush.insert(
+            key(8, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 5 },
+        );
 
         // Disjoint range takes nothing.
         assert!(state.take_deferred_flush_windows(7, 512, 1024).is_empty());

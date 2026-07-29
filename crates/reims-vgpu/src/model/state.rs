@@ -745,23 +745,31 @@ impl ComputeStorageResidencyKey {
 /// What genuinely differs is only where the pixels are. Everything else the
 /// flush needs — mapping id, geometry, format, guest byte range — is already in
 /// the key, which is why neither variant carries geometry of its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeferredOwner {
     /// Compute rail: a *storage* resident keyed by this same
     /// `ComputeStorageResidencyKey`, read with
     /// `engine::read_resident_storage(key, generation)`. The generation is the
     /// resident's **content** generation, unrelated to `key.map_generation`.
     Storage { generation: u32 },
-    /// Type-11 render Store rail: a *target* resident keyed by
-    /// `TargetIdentity::Surface { id: mapping_id, width, height, generation }`,
-    /// read with `engine::read_target`. The storage key cannot name a target
-    /// resident, which is the whole reason this is an enum and not a flag —
-    /// `flush_one` had one read and now needs two.
+    /// Type-11 render Store rail: the window **owns the frame it deferred**,
+    /// tight BGRA8 at `key.width x key.height`, shared with the
+    /// [`crate::runtime::surface_cache`] entry that was stored from the same
+    /// readback.
     ///
-    /// The identity is reconstructible from the key alone: `map_generation` is
-    /// exactly what `present_identity::surface_identity` puts in the target
-    /// identity's `generation`.
-    Render { armed_seq: u64 },
+    /// Owning it is what makes the obligation landable. The flush used to source
+    /// its pixels from `surface_cache::get(mapping_id, key.width, key.height)`,
+    /// and that cache holds exactly **one** entry per mapping: a later Store at a
+    /// different geometry replaces it, and every window still armed at the old
+    /// geometry then misses and reports `deferred_flush_lost reason=cache_miss`.
+    /// One boot lost 15 whole layers that way — a 1920x1080 desktop surface, a
+    /// 1920x24 menu bar, several window-sized rects — which is a compositing
+    /// layer rendering solid black with the loss reported only after the fact.
+    /// An `Arc` clone costs nothing at arm time and cannot be orphaned.
+    Render {
+        armed_seq: u64,
+        bgra: std::sync::Arc<Vec<u8>>,
+    },
 }
 
 /// Everything a later flush needs to land a deferred **GVA render Store**
@@ -829,7 +837,12 @@ pub struct HostSurface {
     pub width: u32,
     pub height: u32,
     /// Tight BGRA8, stride = width * 4.
-    pub bgra: Vec<u8>,
+    ///
+    /// Shared rather than owned so a [`DeferredOwner::Render`] window can hold
+    /// the exact frame it deferred without copying it: the window and this entry
+    /// point at one allocation, and replacing the entry leaves the window's
+    /// pixels intact instead of orphaning them.
+    pub bgra: std::sync::Arc<Vec<u8>>,
     /// Monotonic host store generation (independent of guest content_generation).
     pub host_gen: u32,
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for

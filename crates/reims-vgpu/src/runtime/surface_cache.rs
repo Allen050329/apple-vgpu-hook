@@ -25,7 +25,7 @@ fn store_into(
     id: u32,
     width: u32,
     height: u32,
-    bgra: Vec<u8>,
+    bgra: std::sync::Arc<Vec<u8>>,
 ) {
     if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return;
@@ -76,6 +76,19 @@ fn get_from_with_gen(
 
 /// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
 pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
+    store_shared(state, surface_id, width, height, std::sync::Arc::new(bgra));
+}
+
+/// [`store`] for a frame already held behind an `Arc` — the type-11 render Store
+/// arms its deferred window with the same allocation, so the frame is stored
+/// once and referenced twice.
+pub fn store_shared(
+    state: &mut DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    bgra: std::sync::Arc<Vec<u8>>,
+) {
     store_into(&mut state.host_surfaces, surface_id, width, height, bgra);
 }
 
@@ -97,7 +110,7 @@ pub fn store_texture(
         texture_ref,
         width,
         height,
-        bgra,
+        std::sync::Arc::new(bgra),
     );
 }
 
@@ -405,7 +418,7 @@ pub fn store_gva_owned(
     }
     entry.width = width;
     entry.height = height;
-    entry.bgra = bgra;
+    entry.bgra = std::sync::Arc::new(bgra);
     entry.producer_object_type = object_type;
 }
 
@@ -765,7 +778,7 @@ mod tests {
             HostSurface {
                 width: w,
                 height: h,
-                bgra,
+                bgra: std::sync::Arc::new(bgra),
                 host_gen: 9,
                 ..Default::default()
             },
@@ -785,7 +798,7 @@ mod tests {
         assert_eq!(get_from(&map, id, w, h), Some(bytes));
 
         // Empty bytes -> None even with matching geometry.
-        map.get_mut(&id).unwrap().bgra.clear();
+        map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(Vec::new());
         assert_eq!(
             get_from_with_gen(&map, id, w, h),
             None,
@@ -793,7 +806,7 @@ mod tests {
         );
 
         // Non-empty but short of `need` -> None (truncated store, no partial serve).
-        map.get_mut(&id).unwrap().bgra = vec![0xABu8; need - 1];
+        map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(vec![0xABu8; need - 1]);
         assert_eq!(
             get_from_with_gen(&map, id, w, h),
             None,

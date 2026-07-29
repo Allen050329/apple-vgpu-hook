@@ -618,6 +618,24 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     {
         return false;
     }
+    // Deferred-writeback flush-on-access, for the same reason
+    // `mapper::read_mapping_bytes` does it: this read must observe the deferred
+    // Store's pixels, not the stale pre-Store guest bytes.
+    //
+    // It has to be here rather than at the callers because only one of the two
+    // paths below was ever covered. The fragmented path ends in
+    // `read_mapping_bytes`, which flushes; the `contig_for_span` path is a raw
+    // `copy_nonoverlapping` out of the mapped span and flushes nothing — so
+    // whether a type-11 surface read observed the deferred Store depended on
+    // whether its guest pages happened to be contiguous. Three callers read
+    // guest pages through here with no flush of their own: the type-5 view
+    // loader, a blit reading a type-11 texture backing, and the compute sample
+    // stage.
+    //
+    // `flush_intersecting` returns immediately when nothing is armed, so this
+    // costs a map-empty check per read. It must also precede `contig_for_span`:
+    // the flush writes through the mapping and can retire the cached view.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -1620,5 +1638,88 @@ mod tests {
         assert!(!write_rect_raw(
             &mut state, &mut host, 5, 3, 0, 2, 1, &src, 8
         ));
+    }
+
+    /// A rect read through the **contiguous** path must observe a deferred
+    /// type-11 Store, not the stale guest bytes underneath it.
+    ///
+    /// `read_rect_raw_at` has two paths and only one of them was ever covered.
+    /// The fragmented path ends in `mapper::read_mapping_bytes`, which flushes;
+    /// the `contig_for_span` path is a raw `copy_nonoverlapping` out of the
+    /// mapped span and flushed nothing. So whether a type-11 surface read saw
+    /// the deferred Store depended on whether its guest pages happened to be
+    /// contiguous — and three callers read guest pages through here with no
+    /// flush of their own (the type-5 view loader, a blit reading a type-11
+    /// texture backing, and the compute sample stage). On screen that is a
+    /// sampled layer rendering its pre-Store contents.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_contiguous_rect_read_flushes_the_deferred_store_first() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x9100_0000u64;
+        host.map_range(gpa, page as usize, 0);
+        // Stale guest bytes: what a reader saw before the Store landed.
+        host.write_gpa(gpa, &[0x22u8; 256]).unwrap();
+
+        let mid = 21u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (base_off, bpr, span_end) = {
+            let m = state.mappings.get(&mid).unwrap();
+            type11_sample_window(
+                m,
+                4,
+                4,
+                crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            )
+            .expect("the mapping has a type-11 sample window")
+        };
+        // The Store the guest issued, deferred rather than written.
+        let frame = vec![0xE3u8; 4 * 4 * 4];
+        state.compute_deferred_flush.insert(
+            crate::model::ComputeStorageResidencyKey {
+                mapping_id: mid,
+                map_generation: 1,
+                surface_offset: base_off,
+                surface_bpr: bpr,
+                span_end,
+                width: 4,
+                height: 4,
+                pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                texture_ref: 0,
+            },
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                bgra: std::sync::Arc::new(frame.clone()),
+            },
+        );
+
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        assert!(read_rect_raw_at(
+            &mut state, &mut host, mid, base_off, bpr, span_end, 0, 0, 4, 4, 4, &mut dst, 16,
+        ));
+        assert_eq!(
+            dst, frame,
+            "the read must observe the deferred Store, not the stale guest bytes"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the read is a flush trigger, so it must consume the window"
+        );
     }
 }

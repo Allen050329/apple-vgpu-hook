@@ -3823,9 +3823,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         victim.width,
                         victim.height,
                         victim.pixel_format,
-                        crate::runtime::storage_flush::owner_slug(victim_owner)
+                        crate::runtime::storage_flush::owner_slug(&victim_owner)
                     ));
-                    crate::runtime::storage_flush::release_window_pin(&victim, victim_owner);
+                    crate::runtime::storage_flush::release_window_pin(&victim, &victim_owner);
                 }
             }
             state
