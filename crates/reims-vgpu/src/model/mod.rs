@@ -113,7 +113,7 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
     use crate::runtime::{
-        complete_async_job, enqueue_async_stamp, FakeHost, HostActionKind, HostMemory,
+        complete_async_job, enqueue_async_stamp_surface, FakeHost, HostActionKind, HostMemory,
     };
 
     #[test]
@@ -307,7 +307,7 @@ mod tests {
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
         let ch = 1u32;
-        let job = enqueue_async_stamp(&mut d.state, ch, ch, 5).unwrap();
+        let job = enqueue_async_stamp_surface(&mut d.state, ch, ch, 5, 0).unwrap();
         d.state.child_stamps[ch as usize].push(StampSlot {
             stamp_index: ch,
             stamp_value: 6,

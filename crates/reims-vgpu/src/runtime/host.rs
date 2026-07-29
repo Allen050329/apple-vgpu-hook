@@ -934,12 +934,6 @@ pub fn write_u32<M: HostMemory>(mem: &mut M, gpa: u64, v: u32) -> Result<(), Mem
     mem.write_gpa(gpa, &v.to_le_bytes())
 }
 
-pub fn read_u16<M: HostMemory>(mem: &M, gpa: u64) -> Result<u16, MemError> {
-    let mut b = [0u8; 2];
-    mem.read_gpa(gpa, &mut b)?;
-    Ok(u16::from_le_bytes(b))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

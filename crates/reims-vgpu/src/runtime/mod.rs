@@ -68,13 +68,11 @@ pub mod texture;
 
 pub use drain::{
     complete_async_job, drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending,
-    drain_stranded_fifos, enqueue_async_stamp, enqueue_async_stamp_surface, signal_display_vbl,
-    wait_surface_mapping, wait_surface_other_channels, wait_surface_snapshot_once, write_stamp,
-    Packet, PacketError,
+    enqueue_async_stamp_surface, signal_display_vbl, wait_surface_mapping,
+    wait_surface_other_channels, write_stamp, Packet, PacketError,
 };
 pub use host::{
-    read_u16, read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps,
-    MemError,
+    read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
 };
 
 #[cfg(test)]

@@ -3117,16 +3117,6 @@ pub fn wait_surface_mapping<H: HostMemory + HostOps>(
     wait_surface_other_channels(state, host, 0, mapping)
 }
 
-/// Alias for [`wait_surface_mapping`] — archive uses one function at every
-/// sample / Load-seed / DisplaySwap site.
-pub fn wait_surface_snapshot_once<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping: u32,
-) {
-    let _ = wait_surface_mapping(state, host, mapping);
-}
-
 /// Host paint consumed the current +0x188 retain (Painted or Unchanged).
 ///
 /// Clears the entry-side present backpressure counter so a DisplaySwap held
@@ -3161,32 +3151,6 @@ fn mapping_content_gen(state: &DeviceState, mapping: u32) -> u32 {
         .get(&mapping)
         .map(|m| m.content_generation)
         .unwrap_or(0)
-}
-
-/// Archive `apple_pv_gpu_poll_tick` Dekker rescue: re-drain main/child FIFOs
-/// when producer is ahead of consumer without a fresh doorbell (guest may
-/// append while a drain is in flight and skip ringing).
-pub fn drain_stranded_fifos<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    if state.gfx.control_fifo != 0 {
-        if state
-            .gfx
-            .fifo_read
-            .load(std::sync::atomic::Ordering::Acquire)
-            != state.gfx.fifo_written
-        {
-            drain_main_fifo(state, host);
-        }
-        let mask = state.active_child_mask | state.pending.child_mask;
-        for ch in 1..MAX_CHANNELS as u32 {
-            if mask & (1u32 << ch) != 0 {
-                drain_child_fifo(state, host, ch);
-            }
-        }
-        state.pending.child_mask = 0;
-    }
-    if state.iosfc.consumer != state.iosfc.producer {
-        drain_iosfc(state, host);
-    }
 }
 
 /// Publish the poll-tick/Dekker rescue to the asynchronous drain owner.
@@ -3303,16 +3267,6 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
 ///
 /// `target_mapping` is the type-11 surface this job writes (0 = none) — archive
 /// `DrawJob.mapping_id` for `surface_inflight` / `render_wait_surface`.
-pub fn enqueue_async_stamp(
-    state: &mut DeviceState,
-    channel_id: u32,
-    stamp_index: u32,
-    stamp_value: u32,
-) -> Option<u64> {
-    enqueue_async_stamp_surface(state, channel_id, stamp_index, stamp_value, 0)
-}
-
-/// Like [`enqueue_async_stamp`] with an explicit type-11 write target.
 pub fn enqueue_async_stamp_surface(
     state: &mut DeviceState,
     channel_id: u32,

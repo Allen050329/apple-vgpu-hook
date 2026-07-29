@@ -1193,20 +1193,19 @@ fn set_mapping_geom_size_change_resets_content_generation() {
     );
 }
 
-/// Archive poll_tick / render_wait_surface helpers: no rings → no-op, no panic.
+/// Archive render_wait_surface helper: no rings → no-op, no panic.
 #[test]
-fn drain_other_and_stranded_are_safe_noop_without_rings() {
+fn drain_other_child_fifos_is_a_safe_noop_without_rings() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.active_child_mask = (1 << 1) | (1 << 4);
     state.pending.child_mask = 1 << 1;
     state.gfx.control_fifo = 1;
-    // No root_page / rings: drains return immediately.
+    // No root_page / rings: the drain returns immediately.
     drain_other_child_fifos(&mut state, &mut host, 4);
-    drain_stranded_fifos(&mut state, &mut host);
     assert_eq!(
         state.pending.child_mask, 0,
-        "stranded drain clears pending mask"
+        "the sibling drain consumes the pending mask"
     );
 }
 
@@ -1291,18 +1290,6 @@ fn wait_surface_surface_inflight_tracks_async_target_mapping() {
     complete_async_job(&mut state, &mut host, 1, job);
     assert!(!surface_inflight(&state, 42));
     assert_eq!(wait_surface_mapping(&mut state, &mut host, 42), 0);
-}
-
-/// Sample/Load path shares the same wait (archive one function).
-#[test]
-fn wait_surface_snapshot_once_matches_mapping_wait() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    state.draining_channel = 4;
-    state.draining_mask = 1 << 4;
-    wait_surface_snapshot_once(&mut state, &mut host, 3);
-    assert_eq!(state.draining_channel, 4);
-    assert_eq!(state.draining_mask, 1 << 4);
 }
 
 /// qemu-shim dual-mid: incomplete last_store on one mid (logo/partial)
