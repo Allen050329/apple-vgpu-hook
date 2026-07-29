@@ -330,31 +330,6 @@ impl ResourcePools {
         self.registry.get(identity)
     }
 
-    /// Measure-only: the newest-generation registry Surface entry for this
-    /// mapping id + geometry, at ANY generation. Diagnoses generation-orphaned
-    /// residents (a map_generation bump strands the content under the old key).
-    pub(crate) fn registry_probe_surface_any_gen(
-        &self,
-        id: u32,
-        width: u32,
-        height: u32,
-    ) -> Option<(u64, bool)> {
-        self.registry
-            .iter()
-            .filter_map(|(k, s)| match k {
-                TargetIdentity::Surface {
-                    id: i,
-                    width: w,
-                    height: h,
-                    generation,
-                } if *i == id && *w == width && *h == height => {
-                    Some((*generation, s.content_ready))
-                }
-                _ => None,
-            })
-            .max_by_key(|(g, _)| *g)
-    }
-
     /// Measure-only: classify what the registry holds at `width`x`height`. Used
     /// to diagnose an `export_present_miss` event — it distinguishes a
     /// resident that exists but under a DIFFERENT key (a stale-generation

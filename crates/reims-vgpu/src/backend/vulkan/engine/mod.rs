@@ -408,16 +408,6 @@ pub fn external_memory_host_available() -> bool {
         .is_some_and(|ctx| ctx.ext_external_memory_host.is_some())
 }
 
-/// Measure-only: newest-generation registry Surface entry for `id` at this
-/// geometry, ignoring generation. Returns `(generation, content_ready)`.
-/// Diagnoses generation-orphaned residents at type-11 sample fallbacks.
-pub fn resident_probe_surface_any_gen(id: u32, width: u32, height: u32) -> Option<(u64, bool)> {
-    let guard = lock_engine();
-    guard
-        .pools
-        .registry_probe_surface_any_gen(id, width, height)
-}
-
 /// Pin a content-ready resident render target against LRU eviction (deferred
 /// render Store — the GPU image is the only copy until flush-on-access lands
 /// it in guest pages). Returns false when the identity is absent or not

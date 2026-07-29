@@ -958,30 +958,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 let mut t11_zc_decline = t11_decline::Reason::ResidentGated;
                 #[cfg(feature = "backend-vulkan")]
                 if !resident_ready {
-                    // Always-on discriminator (rare post group/incarnation
-                    // fixes): a large mapping sampled from guest pages while
-                    // the registry holds a same-surface resident under ANOTHER
-                    // generation is the generation-orphaning signature
-                    // (black-band class). Surfaces as a deduped
-                    // `t11_large_fallback` line plus THRASH `t11_fb=`.
-                    if (w as u64) * (h as u64) >= 250_000 {
-                        let map_gen = state
-                            .mappings
-                            .get(&mid)
-                            .map(|m| m.map_generation)
-                            .unwrap_or(0);
-                        let probe = crate::backend::vulkan::engine::resident_probe_surface_any_gen(
-                            mid, w, h,
-                        );
-                        crate::runtime::census::present_proxy::note_t11_large_fallback(
-                            mid, map_gen, probe,
-                        );
-                        if crate::observe::enabled() {
-                            crate::observe::line(format!(
-                                "t11_zc_fallback mid={mid} {w}x{h} map_gen={map_gen} probe={probe:?}"
-                            ));
-                        }
-                    }
                     match try_type11_sample_zero_copy(state, host, mid, w, h) {
                         Ok(src) => return Some((w, h, mid, src)),
                         Err(reason) => t11_zc_decline = reason,
@@ -2791,12 +2767,7 @@ fn build_secondary_targets(
                     a.op_alpha,
                     blend_constants,
                 ) {
-                    Ok(state) => {
-                        crate::runtime::census::present_proxy::note_secondary_mrt_blend(
-                            c.slot, c.width, c.height,
-                        );
-                        Some(state)
-                    }
+                    Ok(state) => Some(state),
                     // An out-of-contract blend factor or op on a secondary
                     // slot: the attachment still renders, unblended, and the
                     // decline says which value refused rather than the slot

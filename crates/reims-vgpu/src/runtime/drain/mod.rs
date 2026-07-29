@@ -1535,11 +1535,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
             // succeeds. Invalidating the retain forced a black /
             // empty console when dual-mid page resolve raced.
             state.present.frame_encode_pending = true;
-            {
-                #[cfg(test)]
-                let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                crate::runtime::census::present_proxy::note_capture_fail(mapping, w, h, gen);
-            }
             let (pages, mapped, fmt) = state
                 .mappings
                 .get(&mapping)

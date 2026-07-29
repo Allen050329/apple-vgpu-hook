@@ -3,14 +3,12 @@
 //! These do **not** change product behavior. They record compact, fail-visible
 //! signals so a log census can name a class without opening screenshots.
 //!
-//! ## Proxies (log: `/tmp/reims-vgpu-thrash.log`, also `observe::fail` on events)
+//! ## Proxies (always-on `observe::fail` lines)
 //!
 //! | Proxy | Meaning |
 //! | --- | --- |
-//! | `capture_fail` | DisplaySwap capture returned false — retain hole / keep_prior path |
 //! | `stale_online_pending` | A post-ack display IRQ raised with the shared-page ONLINE bit still pending |
 //! | `secondary_mrt_drop` / `mrt_mask_bind_miss` | A multi-RT draw degraded to single-RT, or a rendered mask failed to bind at sample time |
-//! | `t11_large_fallback` | A large type-11 composite sampled guest pages because no current-generation resident was ready |
 //! | `empty_sample` | A resolved fragment/vertex sample whose payload was all-zero |
 //!
 //! The windowed submodules below (`cadence`, `hitch`, `present_import`,
@@ -23,7 +21,6 @@ use std::sync::Mutex;
 use crate::observe;
 
 struct ThrashState {
-    capture_fail: u64,
     /// Dedup for `secondary_mrt_drop`: (reason_code, width, height) already
     /// reported this boot, so a per-draw MRT-secondary drop fires once per
     /// distinct combo, never per frame. Names which build path silently degraded
@@ -32,7 +29,6 @@ struct ThrashState {
     /// pass-through class). Bounded by the small set of
     /// (reason, geometry) combinations a boot produces.
     secondary_mrt_drop_seen: std::collections::BTreeSet<(u8, u32, u32)>,
-    secondary_mrt_blend_seen: std::collections::BTreeSet<(u32, u32, u32)>,
     /// Post-**ack** display IRQs raised while the shared-page ONLINE bit (bit2)
     /// was still pending — the guest re-reads it and re-runs `process_online` →
     /// `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17).
@@ -40,17 +36,6 @@ struct ThrashState {
     stale_online_pending: u64,
     /// Latch so the (per-VBL, ~60 Hz) stale-online line fires once per boot.
     stale_online_logged: bool,
-    /// Large-mapping type-11 zero-copy fallbacks (composite sampled guest
-    /// pages because no current-generation resident was ready). Always-on
-    /// black-band discriminator: `t11_fb=0` in the summary means the composite
-    /// never fell back — any zeros came through the resident/cache path
-    /// (guest-painted); a nonzero total means residents were missing at sample
-    /// time for the mids named by the `t11_large_fallback` lines.
-    t11_fb_total: u64,
-    /// `(mid, map_generation)` combinations already named by a
-    /// `t11_large_fallback` line, so a sustained episode logs once per surface
-    /// instead of once per frame. Bounded by the live large-mapping set.
-    t11_fb_seen: std::collections::BTreeSet<(u32, u32)>,
 }
 
 /// Which multi-RT build check bailed, degrading the draw to single-RT.
@@ -135,37 +120,10 @@ impl MaskBindMiss {
 impl ThrashState {
     const fn new() -> Self {
         Self {
-            capture_fail: 0,
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
-            secondary_mrt_blend_seen: std::collections::BTreeSet::new(),
             stale_online_pending: 0,
             stale_online_logged: false,
-            t11_fb_total: 0,
-            t11_fb_seen: std::collections::BTreeSet::new(),
         }
-    }
-}
-
-/// Record a large-mapping type-11 zero-copy fallback (always-on; called from
-/// the sample rail when a ≥250k-px mapping lacks a current-generation ready
-/// resident). Rare on a healthy boot — the black-band discriminator.
-///
-/// The running total feeds `t11_fb=` in the summary; the identity of the mids
-/// that fell back is emitted once per `(mid, map_generation)` so a sustained
-/// episode names its surfaces without a per-frame line. `probe` is the newest
-/// any-generation registry entry for that surface at sample time
-/// (`(generation, content_ready)`), which is what separates a genuinely absent
-/// resident from one orphaned under another generation.
-pub fn note_t11_large_fallback(mid: u32, map_gen: u32, probe: Option<(u64, bool)>) {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.t11_fb_total = st.t11_fb_total.saturating_add(1);
-    let first = st.t11_fb_seen.insert((mid, map_gen));
-    let total = st.t11_fb_total;
-    drop(st);
-    if first {
-        observe::off(format!(
-            "t11_large_fallback mid={mid} map_gen={map_gen} probe={probe:?} total={total}"
-        ));
     }
 }
 
@@ -203,31 +161,6 @@ pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
     observe::Emit::decline("secondary_mrt_drop", &reason)
         .field("geom", format!("{width}x{height}"))
         .fail();
-}
-
-/// A secondary MRT attachment carries its OWN blend state and the pipeline now
-/// honours it.
-///
-/// Until 2026-07-25 every secondary attachment was forced unblended, on the
-/// strength of a comment claiming the decode side did not carry per-attachment
-/// blend — it did, and the Metal arm had been reading it per slot all along.
-/// This is the proxy for the fixed class: it fires when a guest MRT pipeline
-/// actually asks to blend a secondary slot, which is the only case whose
-/// rendering changed. **Zero lines means the fix is inert on this workload**,
-/// not that it is wrong; a nonzero count is the population that used to get a
-/// raw store where Metal composites.
-///
-/// Deduped on `(slot, w, h)` and measure-only — nothing branches on it.
-pub fn note_secondary_mrt_blend(slot: u32, width: u32, height: u32) {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if !st.secondary_mrt_blend_seen.insert((slot, width, height)) {
-        return;
-    }
-    drop(st);
-    observe::off(format!(
-        "secondary_mrt_blend slot={slot} {width}x{height} \
-         (per-slot blend honored; this slot used to write unblended)"
-    ));
 }
 
 /// Sibling of [`note_secondary_mrt_drop`] for the SAMPLE side: a draw sampled a
@@ -295,23 +228,6 @@ pub fn reset_for_device() {
 fn reset_state_inner() {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     *st = ThrashState::new();
-}
-
-fn append_thrash_file(msg: &str) {
-    // Dedicated always-on file for `grep THRASH /tmp/reims-vgpu-thrash.log`.
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/reims-vgpu-thrash.log")
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{msg}")
-        });
-}
-
-fn thrash_line(msg: &str) {
-    observe::fail(format!("THRASH {msg}"));
-    append_thrash_file(msg);
 }
 
 /// Always-on **display-signal cadence** — the guest's real frame pacing.
@@ -860,19 +776,9 @@ pub mod cap_flush {
     }
 }
 
-/// Record a failed DisplaySwap capture (retain not updated).
-pub fn note_capture_fail(mapping_id: u32, width: u32, height: u32, generation: u32) {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.capture_fail = st.capture_fail.saturating_add(1);
-    thrash_line(&format!(
-        "capture_fail mid={mapping_id} {width}x{height} gen={generation}"
-    ));
-}
-
 /// Snapshot counters (tests / external poll).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ThrashCounters {
-    pub capture_fail: u64,
     /// Post-converge display IRQs raised with the ONLINE bit still pending.
     pub stale_online_pending: u64,
 }
@@ -900,7 +806,6 @@ pub fn note_stale_online_pending(src: &str, pending: u32) {
 pub fn counters() -> ThrashCounters {
     let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     ThrashCounters {
-        capture_fail: st.capture_fail,
         stale_online_pending: st.stale_online_pending,
     }
 }
@@ -1117,14 +1022,6 @@ mod tests {
             log.contains("stale_online_pending src=vbl pending=0x4 count=1"),
             "first stale-online must log the always-on line"
         );
-    }
-
-    #[test]
-    fn capture_fail_counted() {
-        let _g = test_lock();
-        reset_for_test();
-        note_capture_fail(5, 1440, 1080, 2);
-        assert_eq!(counters().capture_fail, 1);
     }
 
     /// The sample side and the render side of the MRT-mask class had one name
