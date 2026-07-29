@@ -3186,13 +3186,14 @@ fn emit_draw_phase() {
         return;
     };
     crate::observe::off(format!(
-        "draw_phase draws={} prep_us={} pipeline_us={} stage_us={} acquire_us={} \
-         descriptors_us={} record_us={} submit_us={} wait_us={} readback_us={} \
-         max_us={} stalls={}",
+        "draw_phase draws={} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+         acquire_us={} descriptors_us={} record_us={} submit_us={} wait_us={} \
+         readback_us={} max_us={} stalls={}",
         w.draws,
         w.prep_us,
         w.pipeline_us,
         w.stage_us,
+        w.stage_pass_us,
         w.acquire_us,
         w.descriptors_us,
         w.record_us,

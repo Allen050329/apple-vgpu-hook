@@ -27,6 +27,7 @@
 //! | `prep` | entry | `begin_entry` returns a ring slot |
 //! | `pipeline` | there | shaders, layout, pass and pipeline are resolved |
 //! | `stage` | there | vertex/index/storage/seed bytes are in staging |
+//! | `stage_pass` | there | the primary render pass is resolved |
 //! | `acquire` | there | target, sampled and readback images are held |
 //! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
@@ -75,15 +76,16 @@ pub(crate) enum Phase {
     Prep = 0,
     Pipeline = 1,
     Stage = 2,
-    Acquire = 3,
-    Descriptors = 4,
-    Record = 5,
-    Submit = 6,
-    Wait = 7,
-    Readback = 8,
+    StagePass = 3,
+    Acquire = 4,
+    Descriptors = 5,
+    Record = 6,
+    Submit = 7,
+    Wait = 8,
+    Readback = 9,
 }
 
-const PHASES: usize = 9;
+const PHASES: usize = 10;
 
 static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
@@ -97,6 +99,7 @@ pub struct DrawPhaseWindow {
     pub prep_us: u64,
     pub pipeline_us: u64,
     pub stage_us: u64,
+    pub stage_pass_us: u64,
     pub acquire_us: u64,
     pub descriptors_us: u64,
     pub record_us: u64,
@@ -116,6 +119,7 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
         prep_us: ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed),
         pipeline_us: ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed),
         stage_us: ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed),
+        stage_pass_us: ACC[Phase::StagePass as usize].swap(0, Ordering::Relaxed),
         acquire_us: ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed),
         descriptors_us: ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed),
         record_us: ACC[Phase::Record as usize].swap(0, Ordering::Relaxed),
@@ -198,12 +202,13 @@ impl Drop for DrawTimer {
             ""
         };
         crate::observe::off(format!(
-            "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} acquire_us={} \
-             descriptors_us={} record_us={} submit_us={} wait_us={} readback_us={} \
-             geom={w}x{h} readback_bytes={} exit={:?}{latched}",
+            "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+             acquire_us={} descriptors_us={} record_us={} submit_us={} wait_us={} \
+             readback_us={} geom={w}x{h} readback_bytes={} exit={:?}{latched}",
             self.us[Phase::Prep as usize],
             self.us[Phase::Pipeline as usize],
             self.us[Phase::Stage as usize],
+            self.us[Phase::StagePass as usize],
             self.us[Phase::Acquire as usize],
             self.us[Phase::Descriptors as usize],
             self.us[Phase::Record as usize],

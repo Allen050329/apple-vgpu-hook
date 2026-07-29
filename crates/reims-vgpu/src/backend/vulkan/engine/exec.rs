@@ -1050,6 +1050,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // with and without an input reference are NOT framebuffer-compatible),
     // and the fetch-carrying `render_pass` is used only for the ad-hoc
     // framebuffer + pipeline, exactly like MRT/depth.
+    phase.enter(super::draw_phase::Phase::StagePass);
     let primary_pass = if is_mrt || req.depth.is_some() || req.color_input {
         caches.get_or_create_pass(
             ctx,

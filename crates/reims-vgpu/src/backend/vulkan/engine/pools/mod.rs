@@ -852,6 +852,69 @@ fn emit_alloc_site_census() {
     crate::observe::off(line);
 }
 
+/// A single host→staging step that blocked long enough to cost frames.
+///
+/// `draw_phase` put ~950 ms idle stalls inside the staging span of a draw and
+/// could not say which of its four calls owned them — including for a 31x24
+/// cursor draw, where no plausible amount of copying explains a second. These
+/// are `memcpy`s into a mapped span and an allocate/map, so at this scale the
+/// cost is the *mapping*, not the bytes: a `HOST_VISIBLE|DEVICE_LOCAL` span
+/// whose first touch after an idle stretch wakes the device, or guest pages the
+/// host has to fault back in. Naming the call and its size separates those.
+///
+/// Watches from `Drop` so a `?` inside the watched call still reports. Bounded
+/// per boot rather than latched per key, for the same reason `draw_stall` is:
+/// the distribution is the signal, and a healthy boot produces none of these.
+pub(crate) struct SlowStagingWrite {
+    kind: &'static str,
+    bytes: u64,
+    runs: usize,
+    started: std::time::Instant,
+}
+
+/// Below this a staging step is ordinary work. A frame at 60 Hz is 16.7 ms; the
+/// staging-miss census already reports means in the 0.3-5 ms band, so this is
+/// well clear of the healthy population and still an order of magnitude under
+/// the stall being chased.
+const SLOW_STAGING_WRITE_US: u64 = 20_000;
+const SLOW_STAGING_LINE_CAP: u64 = 256;
+static SLOW_STAGING_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl SlowStagingWrite {
+    pub(crate) fn watch(kind: &'static str, bytes: u64, runs: usize) -> Self {
+        Self {
+            kind,
+            bytes,
+            runs,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowStagingWrite {
+    fn drop(&mut self) {
+        let us = self.started.elapsed().as_micros() as u64;
+        if us < SLOW_STAGING_WRITE_US {
+            return;
+        }
+        let n = SLOW_STAGING_LINES.fetch_add(1, Ordering::Relaxed);
+        if n >= SLOW_STAGING_LINE_CAP {
+            return;
+        }
+        crate::observe::off(format!(
+            "staging_write_slow kind={} us={us} bytes={} runs={}{}",
+            self.kind,
+            self.bytes,
+            self.runs,
+            if n + 1 == SLOW_STAGING_LINE_CAP {
+                " (last: report cap reached)"
+            } else {
+                ""
+            }
+        ));
+    }
+}
+
 include!("submission_and_buffers.rs");
 include!("images_and_registry.rs");
 include!("teardown.rs");

@@ -1370,6 +1370,7 @@ impl ResourcePools {
             }
         }
         let miss_started = Instant::now();
+        let _slow = SlowStagingWrite::watch("acquire", need, 0);
         let buffer = ctx
             .device
             .create_buffer(
@@ -1444,6 +1445,7 @@ impl ResourcePools {
         slot: &BufferSlot,
         bytes: &[u8],
     ) -> Result<(), DrawError> {
+        let _slow = SlowStagingWrite::watch("bytes", bytes.len() as u64, 0);
         let size = bytes.len().max(4) as u64;
         let ptr = staging_write_ptr(ctx, slot, size)?;
         unsafe {
@@ -1533,6 +1535,7 @@ impl ResourcePools {
         runs: &[super::types::GuestRun],
         total_len: u64,
     ) -> Result<(), DrawError> {
+        let _slow = SlowStagingWrite::watch("guest_runs", total_len, runs.len());
         let size = total_len.max(4);
         let ptr = staging_write_ptr(ctx, slot, size)?;
         let total = total_len as usize;
