@@ -2978,12 +2978,37 @@ const DRAIN_DUTY_REPORT_MS: u64 = 1000;
 /// `skipped` counts tranches that returned before taking the lock at all
 /// (`present_action_pending`): a worker that keeps bailing looks identical to an
 /// idle one in the duty figure alone, and it is not the same fault.
+/// Which phase of guest work a slice of `drain_us` belongs to.
+///
+/// These are attributions inside `drain_us`, not a partition of it: a flush
+/// reached from inside a draw is counted by both. That is deliberate and it is
+/// self-checking — if the three sum to more than `drain_us` the phases nest, and
+/// if they sum to much less the time is somewhere none of them names. Either
+/// reading is useful and a single fused figure gives neither.
+#[derive(Clone, Copy)]
+pub enum DrainPhase {
+    /// `encode_draw_chain`: metal2vulkan translate, encode, submit, readback.
+    Draw,
+    /// One compute record applied: bind bookkeeping for most kinds, encode +
+    /// execute for a dispatch. Timed as a whole because "the binds are the cost"
+    /// is exactly as interesting an answer as "the dispatch is".
+    Compute,
+    /// Deferred window flush: resident readback + guest writeback.
+    Flush,
+}
+
 #[derive(Default)]
 pub(crate) struct DrainDutyCensus {
     tranches: std::sync::atomic::AtomicU64,
     skipped: std::sync::atomic::AtomicU64,
     drain_us: std::sync::atomic::AtomicU64,
     publish_us: std::sync::atomic::AtomicU64,
+    draw_us: std::sync::atomic::AtomicU64,
+    draws: std::sync::atomic::AtomicU64,
+    compute_us: std::sync::atomic::AtomicU64,
+    computes: std::sync::atomic::AtomicU64,
+    flush_us: std::sync::atomic::AtomicU64,
+    flushes: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
     last_report_ms: std::sync::atomic::AtomicU64,
 }
@@ -2993,6 +3018,18 @@ impl DrainDutyCensus {
     pub(crate) fn note_skipped(&self) {
         self.skipped
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Attribute `us` of the current tranche's `drain_us` to one phase.
+    pub(crate) fn note_phase(&self, phase: DrainPhase, us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (total, count) = match phase {
+            DrainPhase::Draw => (&self.draw_us, &self.draws),
+            DrainPhase::Compute => (&self.compute_us, &self.computes),
+            DrainPhase::Flush => (&self.flush_us, &self.flushes),
+        };
+        total.fetch_add(us, Relaxed);
+        count.fetch_add(1, Relaxed);
     }
 
     /// Accumulate one completed tranche and return the line when a report is
@@ -3024,11 +3061,19 @@ impl DrainDutyCensus {
         let drain = self.drain_us.swap(0, Relaxed);
         let publish = self.publish_us.swap(0, Relaxed);
         let max = self.max_tranche_us.swap(0, Relaxed);
+        let draw = self.draw_us.swap(0, Relaxed);
+        let draws = self.draws.swap(0, Relaxed);
+        let compute = self.compute_us.swap(0, Relaxed);
+        let computes = self.computes.swap(0, Relaxed);
+        let flush = self.flush_us.swap(0, Relaxed);
+        let flushes = self.flushes.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
         Some(format!(
             "drain_duty win_ms={win_ms} tranches={tranches} skipped={skipped} busy_us={busy} \
-             duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max}"
+             duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
+             draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
+             flush_us={flush} flushes={flushes}"
         ))
     }
 }
@@ -3046,6 +3091,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// Count a drain wake-up that returned before taking the device lock.
 pub fn note_drain_skipped() {
     DRAIN_DUTY.note_skipped();
+}
+
+/// Attribute elapsed time since `started` to one phase of the current tranche.
+pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
+    DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
 }
 
 fn signal_display_vbl_at<H: HostMemory + HostOps>(

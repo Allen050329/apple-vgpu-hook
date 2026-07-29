@@ -1639,12 +1639,17 @@ fn finish_stream<M: HostMemory + HostOps>(
                 if do_writeback {
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }
+                let draw_started = std::time::Instant::now();
                 let encode = metal_draw::encode_draw_chain(
                     state,
                     host,
                     &mut req,
                     do_writeback,
                     force_full_store,
+                );
+                crate::runtime::drain::note_drain_phase(
+                    crate::runtime::drain::DrainPhase::Draw,
+                    draw_started,
                 );
                 match encode {
                     (EncodeStatus::Ok, Some(rgba)) => {

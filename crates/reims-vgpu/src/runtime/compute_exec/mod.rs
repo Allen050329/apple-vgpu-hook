@@ -446,6 +446,19 @@ pub fn apply_record<M: HostMemory + HostOps>(
     cmd: &ComputeCommand,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
+    let started = std::time::Instant::now();
+    let out = apply_record_inner(state, host, task_id, cmd, seg);
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
+    out
+}
+
+fn apply_record_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &ComputeCommand,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
+) -> Option<ComputeStatus> {
     match cmd.kind {
         Kind::Pipeline => {
             seg.acc.set_pipeline(cmd.pipeline_ref);

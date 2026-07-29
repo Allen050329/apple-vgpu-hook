@@ -1908,7 +1908,7 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
 ///   instead of a lifetime average.
 #[test]
 fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases() {
-    use crate::runtime::drain::DrainDutyCensus;
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase};
     let c = DrainDutyCensus::default();
 
     // The first call only arms the window: reporting here would divide the whole
@@ -1936,6 +1936,16 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
     );
     assert!(line.contains("max_tranche_us=90000"), "{line}");
 
+    // Phases are attributions inside `drain_us`, not a partition of it, so they
+    // are reported with their own counts and are allowed to overlap each other.
+    // What must hold is that each lands in its own bucket — a fused figure would
+    // make "the draws are slow" and "the flushes are slow" the same reading.
+    for _ in 0..3 {
+        c.note_phase(DrainPhase::Draw, 20_000);
+    }
+    c.note_phase(DrainPhase::Compute, 7_000);
+    c.note_phase(DrainPhase::Flush, 11_000);
+
     // An idle window must read near zero rather than inheriting the busy one,
     // and `skipped` must survive as its own arm: a worker that keeps bailing
     // before the lock looks identical to an idle one in the duty alone.
@@ -1953,6 +1963,15 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
         "the window must not average in the previous busy one: {idle}"
     );
     assert!(idle.contains("skipped=2"), "{idle}");
+    assert!(
+        idle.contains("draw_us=60000")
+            && idle.contains("draws=3")
+            && idle.contains("compute_us=7000")
+            && idle.contains("computes=1")
+            && idle.contains("flush_us=11000")
+            && idle.contains("flushes=1"),
+        "each phase must land in its own bucket with its own count: {idle}"
+    );
 }
 
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
