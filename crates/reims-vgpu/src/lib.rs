@@ -1281,7 +1281,6 @@ pub fn device_poll(id: u64) -> bool {
     slot.vbl_online
         .store(device.state.display.online_acked, Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
-    runtime::census::present_proxy::cadence::note_poll();
     // Drive the resident idle-drain off the poll heartbeat, which ticks even when
     // the guest stops compositing (a static page → `present_import used_hz=0` →
     // no publishes). A publish-clocked drain froze there, pinning a burst's ~260
@@ -1366,7 +1365,6 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     slot.intr_disp
         .fetch_or(1u32 << (idx & 0x1f), Ordering::AcqRel);
     host.enqueue(HostAction::irq_gfx());
-    runtime::census::present_proxy::cadence::note_vbl();
 }
 
 /// Pop one HostAction for the QEMU BH. Returns false if the queue is empty.

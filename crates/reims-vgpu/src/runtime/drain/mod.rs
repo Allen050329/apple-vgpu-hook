@@ -2811,7 +2811,6 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
             .interrupt_status_disp
             .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
-        crate::runtime::census::present_proxy::cadence::note_present_complete();
     }
 }
 
@@ -2926,7 +2925,6 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         .interrupt_status_disp
         .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
     host.enqueue(HostAction::irq_gfx());
-    crate::runtime::census::present_proxy::cadence::note_vbl();
 }
 
 /// Assert display ONLINE once the guest has published the enable mask.
