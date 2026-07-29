@@ -1016,6 +1016,49 @@ mod tests {
         );
     }
 
+    /// Every bind opcode refuses `count == 0` and refuses more entries than the
+    /// slot table holds, so a decoded bind record ALWAYS carries at least one
+    /// entry.
+    ///
+    /// `exec::apply_record` relies on this: it walks `buffer_binds` / `ref_binds`
+    /// directly, with no single-entry wire form to fall back to. If a zero-count
+    /// record ever decoded successfully, those loops would silently bind nothing.
+    #[test]
+    fn a_bind_record_never_decodes_to_zero_entries() {
+        for (op, entry_size) in [
+            (OP_SET_VERTEX_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (OP_SET_FRAGMENT_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (OP_SET_VERTEX_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (OP_SET_FRAGMENT_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (OP_SET_VERTEX_SAMPLER, REF_BIND_ENTRY_SIZE),
+            (OP_SET_FRAGMENT_SAMPLER, REF_BIND_ENTRY_SIZE),
+        ] {
+            let hdr_len = 8;
+            let body = |count: u32, entries: usize| {
+                let mut v = hdr(op, hdr_len + BIND_ENTRIES + entries * entry_size);
+                st32(&mut v[hdr_len + BIND_FIRST..], 0);
+                st32(&mut v[hdr_len + BIND_COUNT..], count);
+                v
+            };
+            assert_eq!(
+                decode(&body(0, 0)).unwrap_err(),
+                DecodeStatus::ErrBadLength,
+                "op {op:#x} accepted count=0"
+            );
+            assert_eq!(
+                decode(&body(MAX_BIND_ENTRIES + 1, (MAX_BIND_ENTRIES + 1) as usize)).unwrap_err(),
+                DecodeStatus::ErrBadLength,
+                "op {op:#x} accepted count past MAX_BIND_ENTRIES"
+            );
+            let c = decode(&body(1, 1)).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+            assert_eq!(
+                c.buffer_binds.len() + c.ref_binds.len(),
+                1,
+                "op {op:#x} decoded one entry into neither list"
+            );
+        }
+    }
+
     #[test]
     fn property_fuzz() {
         for op in 0u32..0x120 {

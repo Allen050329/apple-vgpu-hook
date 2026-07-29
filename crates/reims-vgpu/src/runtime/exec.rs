@@ -897,16 +897,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
             acc.pipeline_ref = cmd.pipeline_ref;
         }
         RenderKind::SetBuffer => {
-            // Multi-entry archive layout: slots first..first+n from buffer_binds.
-            let binds = if !cmd.buffer_binds.is_empty() {
-                cmd.buffer_binds.as_slice()
-            } else if cmd.buffer_ref != 0 {
-                // Legacy single-entry fallback.
-                &[(cmd.buffer_ref, cmd.buffer_offset)][..]
-            } else {
-                &[][..]
-            };
-            for (i, &(buffer_ref, offset)) in binds.iter().enumerate() {
+            // Slots first..first+n from the archive layout's entry array.
+            // `render::decode` refuses `count == 0` with `ErrBadLength`, and
+            // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
+            // SetBuffer always carries at least one entry and there is no
+            // single-entry wire form to fall back to.
+            for (i, &(buffer_ref, offset)) in cmd.buffer_binds.iter().enumerate() {
                 let index = cmd.first.saturating_add(i as u32);
                 if index >= MAX_BIND_SLOTS {
                     break;
@@ -949,14 +945,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::SetTexture => {
-            let refs: Vec<u32> = if !cmd.ref_binds.is_empty() {
-                cmd.ref_binds.clone()
-            } else if cmd.texture_ref != 0 {
-                vec![cmd.texture_ref]
-            } else {
-                Vec::new()
-            };
-            for (i, &texture_ref) in refs.iter().enumerate() {
+            // As for SetBuffer: `ref_binds` is never empty on a decoded record,
+            // and the clone the removed fallback needed went with it.
+            for (i, &texture_ref) in cmd.ref_binds.iter().enumerate() {
                 let index = cmd.first.saturating_add(i as u32);
                 if index >= MAX_BIND_SLOTS {
                     break;
@@ -996,13 +987,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
             }
         }
         RenderKind::SetSampler => {
-            let refs: Vec<u32> = if !cmd.ref_binds.is_empty() {
-                cmd.ref_binds.clone()
-            } else if cmd.sampler_ref != 0 {
-                vec![cmd.sampler_ref]
-            } else {
-                Vec::new()
-            };
+            let refs = &cmd.ref_binds;
             for (i, &sampler_ref) in refs.iter().enumerate() {
                 let index = cmd.first.saturating_add(i as u32);
                 if index >= MAX_BIND_SLOTS {

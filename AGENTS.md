@@ -1609,6 +1609,18 @@ boot, an exact **round trip** (as for `backend-metal` below), or not making the 
 "validate the specific thing you drove" rule applied to the test suite itself: the green summary is
 the healthy-looking log, and it is produced whether or not a driver exists.
 
+**Read the count; do not assume it. On the x86 dev host it is now 0.** Measured 2026-07-30, serial,
+three separate full-suite runs: `vk_engine_parity` **40 passed, `grep -c SKIP` = 0**, and
+`vk_engine_compute` 14 of 14 with 0 SKIP in the same session. So on that host `cargo test` *does*
+execute barriers, layout transitions, descriptor writes and readback, and a change to them is
+test-covered rather than unverified.
+
+This does not retire the rule or the ceiling described below — it says the ceiling is a property of
+the environment, and the environment the ceiling was measured in was an agent sandbox, not this
+machine. The command above is one line and answers for the box you are actually on. Run it; quoting
+either number from memory is how a "20 skipped" exclusion or a "it all runs" reassurance outlives the
+host it was true for.
+
 **The `vk_result` in that line is not the diagnosis — re-measured, the driver was there.** On a host
 with a working NVIDIA RTX 5080 (`vulkaninfo --summary` names it) the same 20 cases still skip, while
 `vk_engine_compute` runs **15 of 15 with zero SKIP** in the same environment and the same session.

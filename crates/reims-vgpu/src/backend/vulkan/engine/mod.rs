@@ -582,6 +582,131 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
     Some(px)
 }
 
+/// The five fallible Vulkan calls a whole-image readback makes, named per rail.
+///
+/// The rails differ in nothing else, but they must not share slugs: a
+/// `reason=vk_readback_submit` that could have come from either the present
+/// drain or a deferred compute flush names neither, which is the collapse the
+/// typed [`VkOp`] vocabulary exists to prevent.
+struct ReadbackOps {
+    reset_cb: VkOp,
+    begin_cb: VkOp,
+    end_cb: VkOp,
+    submit: VkOp,
+    map: VkOp,
+}
+
+/// Copy level 0 of a resident color image to host bytes, tightly packed.
+///
+/// Shared by the target readback (present / Synchronize / Map / Store boundary)
+/// and the pinned-storage deferred flush. `src_access` is the only Vulkan
+/// difference: a render target may have a `COLOR_ATTACHMENT_WRITE` to drain, a
+/// storage image cannot.
+///
+/// Async ring advance (retires only the one slot it reuses), NOT a whole-ring
+/// quiesce: this reads content that is already ready, not an UNDEFINED-layout
+/// seed, so the `ALL_COMMANDS → TRANSFER` barrier plus single-queue submission
+/// order fully order the copy after every prior-submitted draw. `begin_entry_sync`
+/// would block this guest-drain readback behind an unrelated in-flight heavy
+/// draw — the `finish_us` tail. We wait only our own `fence` after submit, and
+/// the slot stays pending for the ring to retire later.
+#[allow(clippy::too_many_arguments)]
+unsafe fn copy_image_level0_to_host(
+    ctx: &context::DeviceContext,
+    pools: &mut pools::ResourcePools,
+    counters: &EngineCounters,
+    image: ash::vk::Image,
+    old_layout: ash::vk::ImageLayout,
+    src_access: ash::vk::AccessFlags,
+    width: u32,
+    height: u32,
+    rb_size: u64,
+    ops: ReadbackOps,
+) -> Result<Vec<u8>, DrawError> {
+    let readback = pools.acquire_readback(ctx, rb_size, counters)?;
+    let (cb, fence) = pools.begin_entry(ctx, counters)?;
+    ctx.device
+        .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
+        .map_err(|e| DrawError::VkCall(VkCall::new(ops.reset_cb, e)))?;
+    ctx.device
+        .begin_command_buffer(
+            cb,
+            &ash::vk::CommandBufferBeginInfo::default()
+                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
+    if old_layout != ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
+        let barrier = [ash::vk::ImageMemoryBarrier::default()
+            .src_access_mask(src_access)
+            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+            .old_layout(old_layout)
+            .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(ash::vk::ImageSubresourceRange {
+                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            ash::vk::PipelineStageFlags::ALL_COMMANDS,
+            ash::vk::PipelineStageFlags::TRANSFER,
+            ash::vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+    }
+    let region = [ash::vk::BufferImageCopy::default()
+        .image_subresource(ash::vk::ImageSubresourceLayers {
+            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(ash::vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })];
+    ctx.device.cmd_copy_image_to_buffer(
+        cb,
+        image,
+        ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        readback.buffer,
+        &region,
+    );
+    ctx.device
+        .end_command_buffer(cb)
+        .map_err(|e| DrawError::VkCall(VkCall::new(ops.end_cb, e)))?;
+    let queue = ctx.queue();
+    let cbs = [cb];
+    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
+    ctx.device
+        .queue_submit(queue, &[si], fence)
+        .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
+    let cleanup = pools.seal_entry(Vec::new(), Vec::new());
+    pools.finish_entry_async(cleanup);
+    pools.wait_entry_fence(ctx, counters, fence)?;
+    let ptr = ctx
+        .device
+        .map_memory(
+            readback.memory,
+            0,
+            rb_size,
+            ash::vk::MemoryMapFlags::empty(),
+        )
+        .map_err(|e| DrawError::VkCall(VkCall::new(ops.map, e)))? as *const u8;
+    // No pre-zero: every one of `rb_size` bytes is written by the copy below, so
+    // `vec![0u8; rb_size]`'s zeroing of a full 8 MiB frame is pure waste on a
+    // guest-blocking drain. Allocate uninit and fill in one pass.
+    let out = exec_compute::copy_mapped_output(ptr, rb_size as usize);
+    ctx.device.unmap_memory(readback.memory);
+    Ok(out)
+}
+
 fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
@@ -605,106 +730,27 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
     let image = slot.image;
     let old_layout = slot.layout;
     let rb_size = (width as u64) * (height as u64) * 4;
-    let readback = unsafe { pools.acquire_readback(ctx, rb_size, counters)? };
-
     unsafe {
-        // Async ring advance (retires only the one slot it reuses), NOT a
-        // whole-ring quiesce: this is a pure content_ready readback, not an
-        // UNDEFINED-layout seed, so the `ALL_COMMANDS → TRANSFER` barrier below
-        // + single-queue submission order fully order the copy after every
-        // prior-submitted draw (the same argument the async prefetch path
-        // relies on). `begin_entry_sync` would block this guest-drain readback
-        // behind an unrelated in-flight heavy draw — the `finish_us` tail. We
-        // wait only our own `fence` after submit.
-        let (cb, fence) = pools.begin_entry(ctx, counters)?;
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
-                cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackBeginCb, e)))?;
-        if old_layout != ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-            let barrier = [ash::vk::ImageMemoryBarrier::default()
-                .src_access_mask(
-                    ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                        | ash::vk::AccessFlags::TRANSFER_WRITE
-                        | ash::vk::AccessFlags::SHADER_WRITE,
-                )
-                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
-                .old_layout(old_layout)
-                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(image)
-                .subresource_range(ash::vk::ImageSubresourceRange {
-                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                ash::vk::PipelineStageFlags::ALL_COMMANDS,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
-        }
-        let region = [ash::vk::BufferImageCopy::default()
-            .image_subresource(ash::vk::ImageSubresourceLayers {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(ash::vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_image_to_buffer(
-            cb,
+        let out = copy_image_level0_to_host(
+            ctx,
+            pools,
+            counters,
             image,
-            ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            readback.buffer,
-            &region,
-        );
-        ctx.device
-            .end_command_buffer(cb)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackEndCb, e)))?;
-        let queue = ctx.queue();
-        let cbs = [cb];
-        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-        ctx.device
-            .queue_submit(queue, &[si], fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackSubmit, e)))?;
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(cleanup);
-        // Wait ONLY our own readback fence; the slot stays pending and the ring
-        // retires it later (no-wait drain, fence already signaled).
-        pools.wait_entry_fence(ctx, counters, fence)?;
-        let ptr = ctx
-            .device
-            .map_memory(
-                readback.memory,
-                0,
-                rb_size,
-                ash::vk::MemoryMapFlags::empty(),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ReadbackMap, e)))?
-            as *const u8;
-        // No pre-zero: every one of `rb_size` bytes is written below (the
-        // stats copy or the plain memcpy from the mapped readback), so
-        // `vec![0u8; rb_size]`'s zeroing of a full 8 MiB frame per present is
-        // pure waste on the guest-blocking present drain. Allocate uninit and
-        // fill in one pass.
-        let out = exec_compute::copy_mapped_output(ptr, rb_size as usize);
-        ctx.device.unmap_memory(readback.memory);
+            old_layout,
+            ash::vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | ash::vk::AccessFlags::TRANSFER_WRITE
+                | ash::vk::AccessFlags::SHADER_WRITE,
+            width,
+            height,
+            rb_size,
+            ReadbackOps {
+                reset_cb: VkOp::ReadbackResetCb,
+                begin_cb: VkOp::ReadbackBeginCb,
+                end_cb: VkOp::ReadbackEndCb,
+                submit: VkOp::ReadbackSubmit,
+                map: VkOp::ReadbackMap,
+            },
+        )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_readback(rb_size);
         Ok(out)
@@ -755,100 +801,27 @@ pub fn read_resident_storage(
     }
     let texel = key.format.bytes_per_texel() as u32;
     let rb_size = (key.width as u64) * (key.height as u64) * texel as u64;
-    let readback = unsafe { pools.acquire_readback(ctx, rb_size, counters)? };
-
     unsafe {
-        // Async ring advance (retires only the one slot it reuses), NOT a
-        // whole-ring quiesce: this is a pure content_ready readback, not an
-        // UNDEFINED-layout seed, so the `ALL_COMMANDS → TRANSFER` barrier below
-        // + single-queue submission order fully order the copy after every
-        // prior-submitted draw (the same argument the async prefetch path
-        // relies on). `begin_entry_sync` would block this guest-drain readback
-        // behind an unrelated in-flight heavy draw — the `finish_us` tail. We
-        // wait only our own `fence` after submit.
-        let (cb, fence) = pools.begin_entry(ctx, counters)?;
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::StorageReadResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
-                cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::StorageReadBeginCb, e)))?;
-        if old_layout != ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-            let barrier = [ash::vk::ImageMemoryBarrier::default()
-                .src_access_mask(
-                    ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::SHADER_WRITE,
-                )
-                .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
-                .old_layout(old_layout)
-                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(image)
-                .subresource_range(ash::vk::ImageSubresourceRange {
-                    aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })];
-            ctx.device.cmd_pipeline_barrier(
-                cb,
-                ash::vk::PipelineStageFlags::ALL_COMMANDS,
-                ash::vk::PipelineStageFlags::TRANSFER,
-                ash::vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barrier,
-            );
-        }
-        let region = [ash::vk::BufferImageCopy::default()
-            .image_subresource(ash::vk::ImageSubresourceLayers {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(ash::vk::Extent3D {
-                width: key.width,
-                height: key.height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_image_to_buffer(
-            cb,
+        let out = copy_image_level0_to_host(
+            ctx,
+            pools,
+            counters,
             image,
-            ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            readback.buffer,
-            &region,
-        );
-        ctx.device
-            .end_command_buffer(cb)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::StorageReadEndCb, e)))?;
-        let queue = ctx.queue();
-        let cbs = [cb];
-        let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-        ctx.device
-            .queue_submit(queue, &[si], fence)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::StorageReadSubmit, e)))?;
-        let cleanup = pools.seal_entry(Vec::new(), Vec::new());
-        pools.finish_entry_async(cleanup);
-        // Wait ONLY our own readback fence; the slot stays pending and the ring
-        // retires it later (no-wait drain, fence already signaled).
-        pools.wait_entry_fence(ctx, counters, fence)?;
-        let ptr = ctx
-            .device
-            .map_memory(
-                readback.memory,
-                0,
-                rb_size,
-                ash::vk::MemoryMapFlags::empty(),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::StorageReadMap, e)))?
-            as *const u8;
-        let mut out = vec![0u8; rb_size as usize];
-        std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), rb_size as usize);
-        ctx.device.unmap_memory(readback.memory);
+            old_layout,
+            // A storage image is never a color attachment, so there is no
+            // `COLOR_ATTACHMENT_WRITE` to drain here.
+            ash::vk::AccessFlags::TRANSFER_WRITE | ash::vk::AccessFlags::SHADER_WRITE,
+            key.width,
+            key.height,
+            rb_size,
+            ReadbackOps {
+                reset_cb: VkOp::StorageReadResetCb,
+                begin_cb: VkOp::StorageReadBeginCb,
+                end_cb: VkOp::StorageReadEndCb,
+                submit: VkOp::StorageReadSubmit,
+                map: VkOp::StorageReadMap,
+            },
+        )?;
         pools.set_resident_storage_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         pools.pin_resident_storage(identity, false);
         counters.note_compute_deferred_flush(rb_size);
