@@ -66,11 +66,6 @@ pub fn page_size_of(page_shift: u32) -> u64 {
     1u64 << page_shift
 }
 
-#[inline]
-pub fn page_offset_mask(page_shift: u32) -> u64 {
-    page_size_of(page_shift) - 1
-}
-
 pub const PAGE_ENTRY_VALID: u32 = 0x1;
 pub const PAGE_ENTRY_PFN_SHIFT: u32 = 2;
 
@@ -168,8 +163,6 @@ pub struct TextureDescriptor {
     pub mapping_id64: u64,
     pub mapping_id: u32,
     pub object_ref: u32,
-    pub has_plane_index: bool,
-    pub plane_index: u32,
     pub pixel_format: u16,
     pub width: u32,
     pub height: u32,
@@ -201,7 +194,6 @@ pub struct PageTablePlan {
     pub page_table_kva: u64,
     pub min_size: u64,
     pub required_pages: u64,
-    pub cached: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -508,8 +500,6 @@ pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Stat
         mapping_id64: ld64(&bytes[TEXTURE_DESC_MAPPING_ID..]),
         mapping_id: ld32(&bytes[TEXTURE_DESC_MAPPING_ID..]),
         object_ref: ld32(&bytes[TEXTURE_DESC_OBJECT_REF..]),
-        has_plane_index: false,
-        plane_index: 0,
         pixel_format: ld16(&bytes[TEXTURE_DESC_PIXEL_FORMAT..]),
         width: ld32(&bytes[TEXTURE_DESC_WIDTH..]),
         height: ld32(&bytes[TEXTURE_DESC_HEIGHT..]),
@@ -752,7 +742,6 @@ pub fn build_table_plan(
                     page_table_kva: table_kva,
                     min_size,
                     required_pages,
-                    cached: false,
                 });
             }
             Err(e) => {

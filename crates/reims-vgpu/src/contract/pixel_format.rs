@@ -899,18 +899,18 @@ fn row_walk_backward(
     dst_len: usize,
     dst_stride: usize,
     same_base: bool,
-) -> Option<bool> {
+) -> bool {
     // Non-overlapping or zero lengths: forward.
     if src_len == 0 || dst_len == 0 {
-        return Some(false);
+        return false;
     }
     // We cannot detect true pointer overlap without raw pointers; for Rust
     // slice APIs we only allow in-place when same_base is true (caller asserts
     // src and dst alias the same allocation).
     if !same_base {
-        return Some(false);
+        return false;
     }
-    Some(dst_stride > src_stride)
+    dst_stride > src_stride
 }
 
 pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
@@ -941,15 +941,13 @@ fn convert_row_to_rgba8_ex(
     if src.len() < src_len || dst_rgba.len() < dst_len {
         return false;
     }
-    let Some(backward) = row_walk_backward(
+    let backward = row_walk_backward(
         src_len,
         bpp as usize,
         dst_len,
         RGBA8_BPP as usize,
         same_base,
-    ) else {
-        return false;
-    };
+    );
 
     if format == MTL_FORMAT_RGBA16_FLOAT {
         let lut = f16_to_unorm8_lut();

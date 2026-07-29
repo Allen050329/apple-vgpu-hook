@@ -217,10 +217,6 @@ impl HostAction {
         }
     }
 
-    pub fn scanout(mapping_id: u32, width: u32, height: u32) -> Self {
-        Self::scanout_gen(mapping_id, width, height, 0)
-    }
-
     pub fn scanout_gen(mapping_id: u32, width: u32, height: u32, generation: u32) -> Self {
         Self {
             kind: HostActionKind::ScanoutUpdate,

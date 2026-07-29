@@ -1345,7 +1345,7 @@ pub fn decode_render_pipeline_descriptor(
             out.vertex_attributes = parse_vertex_block(bytes, first_tlv_end, color_abs)?;
         }
         if color_abs < declared {
-            out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
+            out.color_attachments = parse_color_attachments(bytes, declared, color_abs);
             if let Some(c0) = out.color_attachments.first().copied() {
                 out.color0 = c0;
             }
@@ -1359,7 +1359,7 @@ fn parse_one_color_entry(
     len: usize,
     entry: usize,
     slot: u32,
-) -> Result<PipelineColorAttachment, DecodeStatus> {
+) -> PipelineColorAttachment {
     let mut out = PipelineColorAttachment {
         slot,
         src_rgb: BLEND_FACTOR_ONE,
@@ -1419,7 +1419,7 @@ fn parse_one_color_entry(
         COLOR_ATTACHMENT_TAG_ALPHA_OP,
         BLEND_OP_ADD,
     );
-    Ok(out)
+    out
 }
 
 /// Parse all color-attachment entries (slot = entry index in the section).
@@ -1427,10 +1427,10 @@ pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
     section_off: usize,
-) -> Result<Vec<PipelineColorAttachment>, DecodeStatus> {
+) -> Vec<PipelineColorAttachment> {
     let mut out = Vec::new();
     if section_off == 0 || section_off + 8 > len {
-        return Ok(out);
+        return out;
     }
     let count = ld32(&bytes[section_off..]) as usize;
     for i in 0..count.min(8) {
@@ -1443,9 +1443,9 @@ pub fn parse_color_attachments(
             Some(e) if e < len => e,
             _ => break,
         };
-        out.push(parse_one_color_entry(bytes, len, entry, i as u32)?);
+        out.push(parse_one_color_entry(bytes, len, entry, i as u32));
     }
-    Ok(out)
+    out
 }
 
 pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescriptor, DecodeStatus> {
@@ -2581,7 +2581,7 @@ mod tests {
         buf[entry + 13] = COLOR_ATTACHMENT_TAG_DST_RGB;
         buf[entry + 14] = 4;
         st32(&mut buf[entry + 15..], 5); // OneMinusSourceAlpha
-        let all = parse_color_attachments(&buf, buf.len(), off).unwrap();
+        let all = parse_color_attachments(&buf, buf.len(), off);
         let c = all.first().copied().unwrap_or_default();
         assert!(c.has_pixel_format);
         assert_eq!(c.pixel_format, MTL_FORMAT_BGRA8_UNORM as u32);
@@ -2589,7 +2589,7 @@ mod tests {
         assert_eq!(c.dst_rgb, 5);
         assert_eq!(c.src_rgb, BLEND_FACTOR_ONE);
         assert_eq!(c.slot, 0);
-        let all = parse_color_attachments(&buf, buf.len(), off).unwrap();
+        let all = parse_color_attachments(&buf, buf.len(), off);
         assert_eq!(all.len(), 1);
     }
 
