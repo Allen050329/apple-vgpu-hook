@@ -1450,6 +1450,7 @@ pub const REGISTRY: &[DeclineClass] = &[
         slugs: &[
             "host_import_region_count_cap",
             "host_import_total_byte_cap",
+            "host_import_epoch_admitted",
             "host_import_zero_length_span",
             "host_import_extension_absent",
             "host_import_pointer_misaligned",

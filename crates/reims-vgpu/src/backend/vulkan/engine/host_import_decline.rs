@@ -12,6 +12,13 @@ use crate::observe::Decline;
 pub enum HostImportDecline {
     RegionCount,
     TotalBytes,
+    /// This submission epoch already paid for a region import. The span takes
+    /// the CPU byte path and the next epoch may admit again, so a working set
+    /// the idle sweep released rebuilds one window per submission instead of
+    /// all of them inside one frame.
+    EpochAdmitted {
+        epoch: u64,
+    },
     ZeroLength,
     ExtensionAbsent,
     PointerMisaligned {
@@ -38,6 +45,7 @@ impl Decline for HostImportDecline {
         match self {
             Self::RegionCount => "host_import_region_count_cap",
             Self::TotalBytes => "host_import_total_byte_cap",
+            Self::EpochAdmitted { .. } => "host_import_epoch_admitted",
             Self::ZeroLength => "host_import_zero_length_span",
             Self::ExtensionAbsent => "host_import_extension_absent",
             Self::PointerMisaligned { .. } => "host_import_pointer_misaligned",
@@ -73,6 +81,7 @@ impl Decline for HostImportDecline {
                 ("len", len.to_string()),
                 ("alignment", alignment.to_string()),
             ],
+            Self::EpochAdmitted { epoch } => vec![("epoch", epoch.to_string())],
             Self::RegionCount | Self::TotalBytes | Self::ZeroLength | Self::ExtensionAbsent => {
                 Vec::new()
             }

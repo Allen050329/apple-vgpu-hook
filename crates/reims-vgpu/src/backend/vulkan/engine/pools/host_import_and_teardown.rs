@@ -30,6 +30,7 @@ impl ResourcePools {
             HostImportDecline::TotalBytes => &mut self.host_import_byte_cap_logged,
             HostImportDecline::ZeroLength => &mut self.host_import_zero_len_logged,
             HostImportDecline::ExtensionAbsent => &mut self.host_import_no_ext_logged,
+            HostImportDecline::EpochAdmitted { .. } => &mut self.host_import_epoch_admitted_logged,
             HostImportDecline::PointerMisaligned { .. }
             | HostImportDecline::SizeMisaligned { .. }
             | HostImportDecline::RangeOverflow { .. }
@@ -47,6 +48,19 @@ impl ResourcePools {
     /// Both refusal sites share this: the pre-walk ask at the minimum candidate
     /// size and the per-candidate ask at its real size. `candidate_bytes` is what
     /// was asked for, so the two read apart in the log.
+    /// Whether this submission epoch may still pay for a fresh region import.
+    ///
+    /// Device-free so the bound is testable without a `DeviceContext`; the
+    /// resolver asks before the VMA walk, like the byte budget above it.
+    pub(super) fn host_import_epoch_admission(&self) -> Result<(), HostImportDecline> {
+        if self.host_import_admit_epoch == Some(self.host_import_epoch) {
+            return Err(HostImportDecline::EpochAdmitted {
+                epoch: self.host_import_epoch,
+            });
+        }
+        Ok(())
+    }
+
     fn note_host_import_budget_decline(&mut self, reason: HostImportDecline, candidate_bytes: u64) {
         if self.host_import_first_time(reason) {
             crate::observe::Emit::decline("host_import_fail", &reason)
@@ -155,6 +169,24 @@ impl ResourcePools {
             self.mark_host_import_occupancy(base, offset, len);
             return Ok((buffer, offset));
         }
+        // One fresh import per submission epoch. Everything below this point
+        // costs a ~47 ms `vkAllocateMemory` over a 1 GiB host pointer, and the
+        // resident set is released wholesale by the idle sweep, so without a
+        // per-epoch bound the first frame to touch the working set again paid
+        // for every window it had lost — measured at eight imports and 400 ms
+        // inside one exec, 31 times in one boot. Declining is not refusing
+        // work: the caller writes the span through the CPU byte path, so the
+        // set rebuilds one window per submission with no frame paying more
+        // than one import.
+        if let Err(reason) = self.host_import_epoch_admission() {
+            self.host_import_deferrals = self.host_import_deferrals.saturating_add(1);
+            if self.host_import_first_time(reason) {
+                crate::observe::Emit::decline("host_import_fail", &reason)
+                    .field("len", format!("{len:#x}"))
+                    .fail();
+            }
+            return Err(DrawError::HostImport(reason));
+        }
         let align = ctx.min_imported_host_pointer_alignment.max(1);
         // Admit only when admission is free. A miss here is not a failure — the
         // caller writes the span through the CPU byte path — so releasing a
@@ -234,12 +266,14 @@ impl ResourcePools {
                 continue;
             }
             self.host_import_creates = self.host_import_creates.saturating_add(1);
+            self.host_import_admit_epoch = Some(self.host_import_epoch);
             crate::observe::off(format!(
                 "host_import_region base={base:#x} len={region_len:#x} regions={} \
-                 creates={} evictions={}",
+                 creates={} evictions={} deferred={}",
                 self.host_imports.len() + 1,
                 self.host_import_creates,
-                self.host_import_evictions
+                self.host_import_evictions,
+                self.host_import_deferrals
             ));
             self.host_import_touch = self.host_import_touch.saturating_add(1);
             self.host_imports.push(HostImportRegion {

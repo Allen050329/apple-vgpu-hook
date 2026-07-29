@@ -182,6 +182,21 @@ pub(crate) struct ResourcePools {
     /// "touched since the last submit" needs no begin/end bracketing at the
     /// five `host_import_resolve` call sites.
     host_import_epoch: u64,
+    /// Submission epoch that already paid for a fresh region import, so the
+    /// next one waits for the following submission.
+    ///
+    /// The byte budget bounds how much is RESIDENT; nothing bounded how much a
+    /// single frame could IMPORT. A 1 GiB host-pointer import measures ~47 ms on
+    /// the x86 rail, and the idle sweep releases the whole working set after
+    /// ~30 s, so the first frame to touch it again rebuilt every window at once.
+    /// Measured over one 4 320 s boot: 90 import bursts, 31 of them all eight
+    /// regions, median 400 ms of wall clock inside a single exec; drain tranches
+    /// following a create averaged 65 ms of `zc_import_us` against 141 µs for
+    /// those that did not — 98 % of all zero-copy import time. Admitting one per
+    /// epoch spreads that rebuild over as many submissions, and the spans that
+    /// miss meanwhile are not refused work: they take the documented CPU byte
+    /// path, which is a copy of the span and not of the window.
+    host_import_admit_epoch: Option<u64>,
     /// Per-bucket-base occupancy of the windows this pool has imported, kept
     /// across evict/re-import so it describes the guest's working set rather
     /// than the thrash rate. Bounded by guest RAM / [`HOST_IMPORT_WINDOW_CAP`].
@@ -192,6 +207,11 @@ pub(crate) struct ResourcePools {
     host_import_evictions: u64,
     /// One-shot guards for fail-visible import-budget declines.
     host_import_count_cap_logged: bool,
+    host_import_epoch_admitted_logged: bool,
+    /// Imports deferred to a later epoch by the per-epoch admission cap. The
+    /// decline itself latches after its first sighting, so this is where the
+    /// magnitude lives; it rides the `host_import_region` census line.
+    host_import_deferrals: u64,
     host_import_zero_len_logged: bool,
     host_import_no_ext_logged: bool,
     host_import_byte_cap_logged: bool,
@@ -1293,6 +1313,45 @@ mod host_import_budget_tests {
             });
         }
         pools
+    }
+
+    /// One submission may pay for one region import, and the next may pay again.
+    ///
+    /// A 1 GiB host-pointer import costs ~47 ms on the x86 rail and the idle
+    /// sweep releases the whole resident set after ~30 s, so before this bound
+    /// the first frame to touch the working set again rebuilt every window
+    /// inside one exec. Measured over a 4 320 s boot: 90 import bursts, 31 of
+    /// them all eight regions at a median 400 ms, and drain tranches following a
+    /// create averaged 65 ms of `zc_import_us` against 141 µs for those that did
+    /// not. The bound is per epoch rather than per region count so the rebuild
+    /// tracks submissions — the thing a frame actually costs.
+    #[test]
+    fn one_region_import_per_submission_epoch() {
+        let mut pools = pool_with_windows(&[], 3);
+        assert!(
+            pools.host_import_epoch_admission().is_ok(),
+            "an epoch that has imported nothing must admit"
+        );
+
+        // Recording an admission closes this epoch.
+        pools.host_import_admit_epoch = Some(pools.host_import_epoch);
+        let refused = pools
+            .host_import_epoch_admission()
+            .expect_err("a second import in one epoch must be deferred");
+        assert_eq!(refused.slug(), "host_import_epoch_admitted");
+        assert_eq!(
+            refused.fields(),
+            vec![("epoch", "3".to_string())],
+            "the decline names the epoch that already paid"
+        );
+
+        // The next submission may pay again, so a released working set rebuilds
+        // one window per frame instead of stalling on all of them at once.
+        pools.host_import_epoch = pools.host_import_epoch.wrapping_add(1);
+        assert!(
+            pools.host_import_epoch_admission().is_ok(),
+            "the following epoch must admit again or the set never rebuilds"
+        );
     }
 
     /// The torn-scatter guard. `present_scatter_gpu` resolves EVERY run of a
