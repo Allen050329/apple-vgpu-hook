@@ -516,15 +516,6 @@ impl ResourcePools {
         }
     }
 
-    /// Refresh a resident's idle-drain timestamp without going through the draw
-    /// path. The present/export path resolves a target via `registry_get` (a
-    /// read) rather than `registry_ensure` (which stamps), so a target that is
-    /// re-presented but not re-drawn would otherwise age out from under the
-    /// display — this keeps the currently-presented target alive.
-    pub(crate) fn registry_touch(&mut self, identity: &TargetIdentity) {
-        self.registry_touch_at(identity, self.idle_clock_ms);
-    }
-
     /// Refresh a resident's idle-drain timestamp to at least `now_ms`. Used by
     /// host-window direct present before the export attempt so offscreen
     /// compositor peers needed for route-B tile compositing do not age out while
@@ -975,20 +966,6 @@ impl ResourcePools {
         }
         self.cur = next;
         Ok((self.slots[next].cmd_buf, self.slots[next].fence))
-    }
-
-    /// [`Self::begin_entry`] for fully synchronous paths (target reads,
-    /// presents, imports): additionally retires EVERY in-flight slot, so the
-    /// caller records against a quiesced device — required by paths whose
-    /// barriers assume no concurrent CB (e.g. UNDEFINED-layout seeds of an
-    /// existing registry image).
-    pub(crate) unsafe fn begin_entry_sync(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-    ) -> Result<(vk::CommandBuffer, vk::Fence), DrawError> {
-        self.retire_all(ctx, counters)?;
-        self.begin_entry(ctx, counters)
     }
 
     /// Seal the current entry's transient resources: move every live pool slot

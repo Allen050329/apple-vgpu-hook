@@ -1242,17 +1242,12 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     assert!(engine::resident_content_ready(&pinned));
 }
 
-/// Direct-present zero-copy export (host-window route B, B2): a content-ready
-/// BGRA resident exports straight to a dmabuf fd via a GPU→GPU blit — no CPU
-/// readback. Prove the end-to-end product path runs on a real resident: it
-/// returns a usable fd + correct geometry, and it leaves the resident intact and
-/// readable (the blit restored TRANSFER_SRC_OPTIMAL, so a later `read_target`
-/// still sees the same content). The byte-fidelity of the exported pixels is
-/// pinned separately by the in-crate `blit_present_into_export_is_byte_identical`
-/// (the test crate cannot reach the `pub(crate)` dmabuf import helper).
+/// A `output_bgra` + `skip_readback` resident draw leaves content that
+/// [`engine::read_target`] can read back twice with the same answer — the
+/// property the deleted dmabuf-export case used as its precondition, kept
+/// because nothing else in this suite reads the same resident twice.
 #[test]
-fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
-    use std::os::fd::FromRawFd;
+fn a_bgra_resident_draw_reads_back_identically_twice() {
     let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     engine::test_reset_engine();
     let (v, f) = triangle_spirv();
@@ -1272,56 +1267,26 @@ fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP export-present resident: {e}");
+            eprintln!("SKIP bgra resident readback: {e}");
             return;
         }
         Err(e) => panic!("bgra resident draw: {e}"),
     }
-
-    // Center color the fullscreen triangle wrote (BGRA), read BEFORE the export.
-    let before = engine::read_target(&identity).expect("read resident before export");
     let i = ((h / 2) * w + w / 2) as usize * 4;
-    let center_before = [before[i], before[i + 1], before[i + 2], before[i + 3]];
-
-    match unsafe { engine::export_present_from_resident_fd_policy(&identity, |_, _, _| true) } {
-        Ok((fd, pitch, ew, eh, ring_idx)) => {
-            let fd = fd.expect("always-true fd policy must return an fd");
-            assert!(fd >= 0, "export returned an invalid fd");
-            assert_eq!((ew, eh), (w, h), "export geometry must match the resident");
-            assert!(
-                pitch >= (w as u64) * 4,
-                "LINEAR row pitch {pitch} < tight {}",
-                w * 4
-            );
-            assert!(ring_idx < 3, "ring index {ring_idx} out of range");
-            // Own + close the dmabuf fd so the test does not leak it.
-            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-        }
-        Err(e)
-            if e.to_string().contains("extensions unavailable")
-                || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP export-present resident (no dmabuf export): {e}");
-            return;
-        }
-        Err(e) => panic!("export_present_from_resident_fd_policy: {e}"),
-    }
-
-    // The export blit must not have corrupted the resident: the same content is
-    // still readable (and the tracked layout was restored so the readback's own
-    // barrier starts from the right place).
-    let after = engine::read_target(&identity).expect("read resident after export");
-    let center_after = [after[i], after[i + 1], after[i + 2], after[i + 3]];
+    let first = engine::read_target(&identity).expect("read resident");
+    let center_first = [first[i], first[i + 1], first[i + 2], first[i + 3]];
+    let second = engine::read_target(&identity).expect("re-read resident");
+    let center_second = [second[i], second[i + 1], second[i + 2], second[i + 3]];
     assert_eq!(
-        center_before, center_after,
-        "resident content changed across the export blit",
+        center_first, center_second,
+        "resident content changed across a second readback",
     );
     assert!(
-        near(center_after[0], 191)
-            && near(center_after[1], 128)
-            && near(center_after[2], 64)
-            && near(center_after[3], 255),
-        "resident center BGRA={center_after:?}; expected ~(191,128,64,255)"
+        near(center_second[0], 191)
+            && near(center_second[1], 128)
+            && near(center_second[2], 64)
+            && near(center_second[3], 255),
+        "resident center BGRA={center_second:?}; expected ~(191,128,64,255)"
     );
 }
 

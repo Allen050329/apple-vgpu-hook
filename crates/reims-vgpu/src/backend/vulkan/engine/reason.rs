@@ -91,18 +91,6 @@ pub enum DrawReason {
     NoDeviceLocalMemoryForMrtSecondary { memory_type_bits: u32 },
     /// No device-local memory type for a depth attachment image.
     NoDeviceLocalMemoryForDepth { memory_type_bits: u32 },
-    /// No memory type for the exportable (dmabuf) scanout image.
-    NoMemoryTypeForScanoutExport { memory_type_bits: u32 },
-    /// No memory type in the intersection of the image's requirements and the
-    /// kernel's allowed set for an imported dmabuf. Carries that intersection.
-    NoMemoryTypeForDmabufImport { memory_type_bits: u32 },
-    /// dmabuf export extensions absent — the display zero-copy rail.
-    DmabufExportUnavailable,
-    /// Per-present export specifically.
-    PresentExportUnavailable,
-    /// A resident asked to be exported for present is not in guest scanout
-    /// order, so exporting it would hand the display swapped channels.
-    PresentExportResidentNotBgra,
     /// `VK_KHR_swapchain` is not enabled on the engine device.
     SwapchainUnavailable,
     /// The engine's queue family cannot present to the host window's surface.
@@ -147,11 +135,6 @@ impl crate::observe::Decline for DrawReason {
                 "no_device_local_memory_for_mrt_secondary"
             }
             Self::NoDeviceLocalMemoryForDepth { .. } => "no_device_local_memory_for_depth",
-            Self::NoMemoryTypeForScanoutExport { .. } => "no_memory_type_for_scanout_export",
-            Self::NoMemoryTypeForDmabufImport { .. } => "no_memory_type_for_dmabuf_import",
-            Self::DmabufExportUnavailable => "dmabuf_export_unavailable",
-            Self::PresentExportUnavailable => "present_export_unavailable",
-            Self::PresentExportResidentNotBgra => "present_export_resident_not_bgra",
             Self::SwapchainUnavailable => "swapchain_unavailable",
             Self::QueueCannotPresent { .. } => "queue_cannot_present",
             Self::SwapchainLacksTransferDst => "swapchain_lacks_transfer_dst",
@@ -186,9 +169,7 @@ impl std::fmt::Display for DrawReason {
             | Self::NoDeviceLocalMemoryForStorageImage { memory_type_bits }
             | Self::NoDeviceLocalMemoryForSlab { memory_type_bits }
             | Self::NoDeviceLocalMemoryForMrtSecondary { memory_type_bits }
-            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits }
-            | Self::NoMemoryTypeForScanoutExport { memory_type_bits }
-            | Self::NoMemoryTypeForDmabufImport { memory_type_bits } => {
+            | Self::NoDeviceLocalMemoryForDepth { memory_type_bits } => {
                 write!(f, " memory_type_bits={memory_type_bits:#x}")
             }
             Self::QueueCannotPresent { queue_family } => write!(f, " queue_family={queue_family}"),
@@ -280,15 +261,6 @@ mod tests {
         DrawReason::NoDeviceLocalMemoryForDepth {
             memory_type_bits: 0,
         },
-        DrawReason::NoMemoryTypeForScanoutExport {
-            memory_type_bits: 0,
-        },
-        DrawReason::NoMemoryTypeForDmabufImport {
-            memory_type_bits: 0,
-        },
-        DrawReason::DmabufExportUnavailable,
-        DrawReason::PresentExportUnavailable,
-        DrawReason::PresentExportResidentNotBgra,
         DrawReason::SwapchainUnavailable,
         DrawReason::QueueCannotPresent { queue_family: 0 },
         DrawReason::SwapchainLacksTransferDst,
@@ -372,13 +344,6 @@ mod tests {
             .to_string(),
             "reason=no_device_local_memory_for_depth memory_type_bits=0x82"
         );
-        assert_eq!(
-            DrawReason::NoMemoryTypeForScanoutExport {
-                memory_type_bits: 0xff
-            }
-            .to_string(),
-            "reason=no_memory_type_for_scanout_export memory_type_bits=0xff"
-        );
         // Staging, readback and stats are three purposes that all want
         // host-visible memory — a shared slug would leave a grep unable to say
         // which allocation had nowhere to live.
@@ -405,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn slab_memory_and_export_format_refusals_keep_distinct_product_reasons() {
+    fn slab_memory_refusal_carries_its_own_slug_and_bits() {
         let slab = DrawReason::NoDeviceLocalMemoryForSlab {
             memory_type_bits: 0x81,
         };
@@ -413,13 +378,6 @@ mod tests {
         assert_eq!(
             slab.to_string(),
             "reason=no_device_local_memory_for_slab memory_type_bits=0x81"
-        );
-
-        let export = DrawReason::PresentExportResidentNotBgra;
-        assert_eq!(export.slug(), "present_export_resident_not_bgra");
-        assert_eq!(
-            export.to_string(),
-            "reason=present_export_resident_not_bgra"
         );
     }
 

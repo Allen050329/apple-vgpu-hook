@@ -2,7 +2,7 @@
 //!
 //! The final compositor resident stays on the engine `VkDevice`. A short
 //! queue-ordered blit writes it into the acquired MoltenVK swapchain image; no
-//! host readback, staging upload, dmabuf export, or second Vulkan device exists
+//! host readback, staging upload, or second Vulkan device exists
 //! on this pathway.
 
 #![allow(unsafe_op_in_unsafe_fn)]

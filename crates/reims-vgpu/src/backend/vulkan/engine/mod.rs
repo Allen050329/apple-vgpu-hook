@@ -19,13 +19,9 @@ mod draw_execution;
 mod draw_phase;
 mod draw_preparation;
 mod draw_validation;
-// `pub(crate)` so the host-window present thread ([[host-window]] direct-present
-// route B) can import the engine's exported scanout dmabuf on its own device.
-pub(crate) mod dmabuf_export;
 mod exec;
 mod exec_compute;
 mod facade_decline;
-pub mod fd_dup;
 pub mod init_decline;
 mod pools;
 pub mod reason;
@@ -45,7 +41,6 @@ pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
 pub use draw_preparation::DrawPreparationDecline;
 pub use draw_validation::DrawValidationDecline;
 pub use facade_decline::EngineFacadeDecline;
-use fd_dup::{FdDupDecline, FdDupRail};
 pub use init_decline::InitDecline;
 pub use reason::DrawReason;
 pub use types::{
@@ -70,23 +65,14 @@ use context::ContextOwner;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pools::ResourcePools;
-use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::atomic::Ordering;
 use types::ComputeError;
-
-pub type OptionalExportedPresent = (Option<i32>, u64, u32, u32, usize);
 
 struct EngineState {
     owner: ContextOwner,
     caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
-    /// Ring of exportable dmabuf images for the direct-present path (host window
-    /// route B): a fresh slot each present so the engine never overwrites the
-    /// slot the window is mid-blit reading. Empty until `export_present_from_
-    /// resident` runs. Tied to the current device context — dropped on device
-    /// recreate / guest reset alongside the other device-derived state.
-    present_export_ring: dmabuf_export::ScanoutExportRing,
     #[cfg(all(feature = "host-window", target_os = "macos"))]
     window_presenter: Option<window_present::WindowPresenter>,
 }
@@ -98,7 +84,6 @@ impl EngineState {
             caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
-            present_export_ring: dmabuf_export::ScanoutExportRing::new(),
             #[cfg(all(feature = "host-window", target_os = "macos"))]
             window_presenter: None,
         }
@@ -110,10 +95,6 @@ impl EngineState {
                 #[cfg(all(feature = "host-window", target_os = "macos"))]
                 if let Some(mut presenter) = self.window_presenter.take() {
                     presenter.destroy(ctx, Some(&mut self.pools));
-                }
-                for fd in self.present_export_ring.destroy(&ctx.device) {
-                    // Close via OwnedFd drop (crate idiom; libc is Apple-only).
-                    drop(std::os::fd::OwnedFd::from_raw_fd(fd));
                 }
                 self.caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
@@ -162,7 +143,6 @@ pub fn reset_guest_state() -> GuestResetStats {
     let EngineState {
         ref owner,
         ref mut pools,
-        ref mut present_export_ring,
         #[cfg(all(feature = "host-window", target_os = "macos"))]
         ref mut window_presenter,
         ..
@@ -176,9 +156,6 @@ pub fn reset_guest_state() -> GuestResetStats {
             #[cfg(all(feature = "host-window", target_os = "macos"))]
             if let Some(presenter) = window_presenter.as_mut() {
                 presenter.release_pins_after_idle(pools);
-            }
-            for fd in present_export_ring.destroy(&ctx.device) {
-                drop(std::os::fd::OwnedFd::from_raw_fd(fd));
             }
             pools.destroy_all(&ctx.device);
         }
@@ -404,7 +381,7 @@ pub fn unpin_resident_target(identity: &TargetIdentity) {
 }
 
 /// Refresh a resident target's idle-drain timestamp without doing GPU work.
-/// Direct-present uses this before export so the displayed resident is not
+/// The present publish uses this so the displayed resident is not
 /// reclaimed underneath the window on a present that does no draw.
 pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
     let Some(identity) = identity else {
@@ -829,198 +806,6 @@ pub fn read_resident_storage(
     }
 }
 
-/// Short protocol-kind label for a [`TargetIdentity`] (diagnostics only).
-fn identity_kind(identity: &TargetIdentity) -> &'static str {
-    match identity {
-        TargetIdentity::Surface { .. } => "surface",
-        TargetIdentity::Texture { .. } => "texture",
-        TargetIdentity::Gva { .. } => "gva",
-        TargetIdentity::Anonymous { .. } => "anon",
-    }
-}
-
-/// Classify an `export_present_from_resident_fd_policy` registry miss
-/// into an actionable outcome, ONE always-on line per (kind, geometry) per
-/// process (deduped so a steady miss never floods). A resident that exists under
-/// a DIFFERENT key at this geometry
-/// (group present while present asked for a surface, or a stale-generation
-/// surface) is an identity/generation ORPHAN — fixable by aligning the export
-/// lookup. No resident at all at this geometry means the composited frame was
-/// never rendered into a GPU target (it lives only in guest pages / the CPU
-/// surface cache) — direct present then needs the composite render kept
-/// resident, not just an identity tweak. This census writes `outcome=`, while
-/// the typed decline reaches the caller's `export_present reason=…` boundary.
-/// Measure-only; no product branch.
-fn classify_export_present_miss(pools: &pools::ResourcePools, identity: &TargetIdentity) {
-    use std::collections::BTreeSet;
-    use std::sync::Mutex;
-    type ExportMissKey = (&'static str, u32, u32);
-    static LOGGED: Mutex<Option<BTreeSet<ExportMissKey>>> = Mutex::new(None);
-    let (w, h) = (identity.width(), identity.height());
-    let kind = identity_kind(identity);
-    {
-        let mut guard = LOGGED.lock().unwrap_or_else(|p| p.into_inner());
-        if !guard.get_or_insert_with(BTreeSet::new).insert((kind, w, h)) {
-            return;
-        }
-    }
-    let c = pools.registry_geom_census(w, h);
-    // Summarize surfaces compactly: id:gen:ready, capped so the line stays bounded.
-    let mut surf = String::new();
-    for (i, (id, gen, ready)) in c.surfaces.iter().take(8).enumerate() {
-        if i > 0 {
-            surf.push(',');
-        }
-        surf.push_str(&format!("{id}:{gen}:{}", *ready as u8));
-    }
-    if c.surfaces.len() > 8 {
-        surf.push_str(",…");
-    }
-    // The orphan verdict: content exists at this geometry under another key.
-    let orphan = !c.surfaces.is_empty() || c.gva > 0;
-    crate::observe::off(format!(
-        "export_present_miss outcome={} want={kind} geom={w}x{h} want_gen={} \
-         surfaces=[{surf}] gva={} reg_len={}",
-        if orphan { "orphan" } else { "absent" },
-        identity.generation(),
-        c.gva,
-        c.total,
-    ));
-}
-
-/// Blit `identity`'s resident into the next present export ring slot and hand
-/// back that slot's dmabuf.
-///
-/// The exported pixels are exactly the named resident's; nothing else is mixed
-/// in. `fd_needed` lets the caller decide whether the selected export ring slot
-/// needs another fd duplicate. The export image is still updated every call;
-/// suppressing the fd only avoids redundant fd dup/close churn when the
-/// consumer has acknowledged an existing import.
-///
-/// # Safety
-///
-/// Engine teardown must not race this call. When `fd_needed` requests an fd,
-/// the caller owns it and must close it after importing or abandoning it.
-pub unsafe fn export_present_from_resident_fd_policy(
-    identity: &TargetIdentity,
-    fd_needed: impl FnOnce(usize, u32, u32) -> bool,
-) -> Result<OptionalExportedPresent, DrawError> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref mut present_export_ring,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = owner.ensure(counters)?;
-    pools.ensure_init(ctx, counters)?;
-    if ctx.ext_external_memory_fd.is_none() {
-        return Err(DrawError::Unsupported(
-            reason::DrawReason::PresentExportUnavailable,
-        ));
-    }
-
-    // Resolve the resident and snapshot the Copy fields, dropping the pools
-    // borrow before we mutate pools (begin_entry) / the export ring (acquire).
-    let (src_image, src_layout, width, height) = {
-        let slot = match pools.registry_get(identity) {
-            Some(s) => s,
-            None => {
-                classify_export_present_miss(pools, identity);
-                return Err(DrawError::Facade(
-                    EngineFacadeDecline::ExportPresentUnknownIdentity {
-                        identity: identity.clone(),
-                    },
-                ));
-            }
-        };
-        if !slot.content_ready {
-            return Err(DrawError::Facade(
-                EngineFacadeDecline::ExportPresentNotReady {
-                    identity: identity.clone(),
-                },
-            ));
-        }
-        // The export image is B8G8R8A8_UNORM; an RGBA resident would export with
-        // R/B swapped. Reject rather than emit wrong colors (a caller-visible
-        // fallback to the CPU path handles it correctly).
-        if !slot.bgra {
-            return Err(DrawError::Unsupported(
-                reason::DrawReason::PresentExportResidentNotBgra,
-            ));
-        }
-        (slot.image, slot.layout, slot.width, slot.height)
-    };
-    // Keep the presented target alive against the idle drain: a re-presented but
-    // not re-drawn resident is resolved via registry_get (no draw-path stamp), so
-    // without this it could age out from under the display.
-    pools.registry_touch(identity);
-
-    // Advance to the next ring slot (a DIFFERENT dmabuf than the last few
-    // presents), so the engine never overwrites the image the window is still
-    // reading — the tear-safety guarantee. On a geometry change every prior slot
-    // is retired here; destroy + close each (the prior blit already retired at
-    // the end of its own call, and the window drops its imports of them on the
-    // same geometry change via dmabuf refcounting).
-    let (ring_idx, retired) = present_export_ring.acquire_next(ctx, width, height)?;
-    for old in retired {
-        let fd = old.fd;
-        old.destroy(&ctx.device);
-        drop(std::os::fd::OwnedFd::from_raw_fd(fd));
-    }
-    let export = present_export_ring.slot(ring_idx);
-    let row_pitch = export.row_pitch;
-    let cached_fd = export.fd;
-
-    // Phase split (measure-only): `begin_entry_sync` drains the guest's in-flight
-    // compositing draws into the resident (inherent), the later `retire_all` waits
-    // for our own export blit. Timing them apart tells whether the ~50ms/present at
-    // 4K is ours to optimize before the hard async-export work — see
-    // present_proxy::export_present::note_phases.
-    let (cb, fence) = pools.begin_entry_sync(ctx, counters)?;
-    ctx.device
-        .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentResetCb, e)))?;
-    ctx.device
-        .begin_command_buffer(
-            cb,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentBeginCb, e)))?;
-    // GPU→GPU: resident (OPTIMAL, current layout) → export (LINEAR). Same helper
-    // the byte-identical blit test validates.
-    dmabuf_export::record_blit_present_into_export(&ctx.device, cb, src_image, src_layout, export);
-    ctx.device
-        .end_command_buffer(cb)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentEndCb, e)))?;
-    let queue = ctx.queue();
-    let cbs = [cb];
-    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-    ctx.device
-        .queue_submit(queue, &[si], fence)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportPresentSubmit, e)))?;
-    let sealed = pools.seal_entry(Vec::new(), Vec::new());
-    pools.finish_entry_async(sealed);
-    pools.retire_all(ctx, counters)?;
-    // record_blit leaves the resident in TRANSFER_SRC_OPTIMAL — keep the tracked
-    // layout in sync so the next draw/readback barriers from the right layout.
-    pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-
-    let dup_fd = if fd_needed(ring_idx, width, height) {
-        Some(
-            std::os::fd::BorrowedFd::borrow_raw(cached_fd)
-                .try_clone_to_owned()
-                .map_err(|e| DrawError::FdDup(FdDupDecline::new(FdDupRail::ExportPresent, &e)))?
-                .into_raw_fd(),
-        )
-    } else {
-        None
-    };
-    Ok((dup_fd, row_pitch, width, height, ring_idx))
-}
-
 /// The non-pinned resident-target slot cap. Exposed so a test that must blow
 /// past the LRU sweep derives its filler count from the live value instead of
 /// hard-coding one — `vk_engine_parity` previously fixed 70 fillers against a
@@ -1078,16 +863,6 @@ pub fn test_reset_engine() {
     let mut g = lock_engine();
     if let Some(mut ctx) = g.owner.ctx.take() {
         unsafe {
-            // The dmabuf export ring holds VkImages bound to THIS device and is
-            // NOT owned by caches/pools. Tear it down here — exactly as the
-            // production device-recreate path (`flush_device_derived`) does —
-            // before destroying the device. Skipping it orphans stale image
-            // handles that a later `reset_guest_state`/flush destroys against the
-            // recreated device, which faults inside the driver (a real SIGSEGV
-            // the serial parity suite hit at `guest_reset_evicts_*`).
-            for fd in g.present_export_ring.destroy(&ctx.device) {
-                drop(std::os::fd::OwnedFd::from_raw_fd(fd));
-            }
             g.caches.destroy_all(&ctx.device);
             g.pools.destroy_all(&ctx.device);
             ctx.destroy();

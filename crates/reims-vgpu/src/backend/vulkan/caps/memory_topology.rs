@@ -65,7 +65,7 @@ pub enum MemoryClass {
     /// GPU-only working set: render targets, sampled textures, scratch buffers.
     DeviceLocal,
     /// GPU-side working memory that *wants* to be device-local but must never
-    /// fail to allocate — the dmabuf export images and window scratch, where a
+    /// fail to allocate — the host-window staging image, where a
     /// host-memory placement is slower but still correct. Distinct from
     /// [`MemoryClass::DeviceLocal`], which is a hard requirement.
     DeviceLocalPreferred,

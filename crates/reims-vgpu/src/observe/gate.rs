@@ -719,7 +719,6 @@ fn every_declared_slug_is_log_safe() {
     );
 }
 
-
 /// The extractor has to be right or every row above passes vacuously, so it is
 /// checked against hand-written blocks with the exact shapes the crate uses.
 #[test]
@@ -917,7 +916,6 @@ const PERMANENT: &[(&str, &str, &str)] = &[
     ),
 ];
 
-
 /// A payload-free `Unsupported`-shaped variant is the defect the ground rules
 /// name by example. Catching it by scan rather than by memory is what stops it
 /// being reintroduced the next time an enum grows a catch-all.
@@ -1003,7 +1001,10 @@ fn the_scanner_walks_the_whole_crate() {
 #[test]
 fn every_permanent_exemption_names_a_live_file_and_a_reason() {
     for (file, enum_name, why) in PERMANENT {
-        assert!(!why.is_empty(), "{file}: {enum_name} must say why it is exempt");
+        assert!(
+            !why.is_empty(),
+            "{file}: {enum_name} must say why it is exempt"
+        );
         let src = std::fs::read_to_string(crate_src().join(file))
             .unwrap_or_else(|e| panic!("{file}: {e}"));
         assert!(

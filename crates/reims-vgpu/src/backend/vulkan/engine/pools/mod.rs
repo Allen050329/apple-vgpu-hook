@@ -552,19 +552,6 @@ impl FreeTargetImage {
     }
 }
 
-/// Measure-only snapshot of what the target registry holds at one geometry,
-/// produced by [`ResourcePools::registry_geom_census`] to classify an
-/// `export_present_miss outcome=…` census event. Not a product-control input.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RegistryGeomCensus {
-    /// Total registry occupancy (all geometries).
-    pub total: usize,
-    /// Every `Surface` resident at this geom: `(id, generation, content_ready)`.
-    pub surfaces: Vec<(u32, u64, bool)>,
-    /// Count of `Gva` residents at this geom.
-    pub gva: usize,
-}
-
 /// Cap on the **non-pinned** (LRU-evictable) resident-target population — the
 /// active render working set. Pinned slots (deferred-write windows, each holding
 /// content only on the GPU, bounded separately by the arming rail's own window

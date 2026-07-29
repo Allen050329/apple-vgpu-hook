@@ -330,43 +330,6 @@ impl ResourcePools {
         self.registry.get(identity)
     }
 
-    /// Measure-only: classify what the registry holds at `width`x`height`. Used
-    /// to diagnose an `export_present_miss` event — it distinguishes a
-    /// resident that exists but under a DIFFERENT key (a stale-generation
-    /// `Surface`) from a genuinely-absent one (no GPU render
-    /// pass produced this frame — the composited content lives only in guest
-    /// pages / the CPU surface cache, so there is nothing on the GPU to export).
-    /// That split decides whether the direct-present fix is "align the export
-    /// identity to the live resident" (cheap) or "keep the composite render
-    /// resident alive to present time" (architectural).
-    pub(crate) fn registry_geom_census(&self, width: u32, height: u32) -> RegistryGeomCensus {
-        let mut c = RegistryGeomCensus {
-            total: self.registry.len(),
-            ..Default::default()
-        };
-        for (k, s) in self.registry.iter() {
-            match k {
-                TargetIdentity::Surface {
-                    id,
-                    width: w,
-                    height: h,
-                    generation,
-                } if *w == width && *h == height => {
-                    c.surfaces.push((*id, *generation, s.content_ready));
-                }
-                TargetIdentity::Gva {
-                    width: w,
-                    height: h,
-                    ..
-                } if *w == width && *h == height => {
-                    c.gva += 1;
-                }
-                _ => {}
-            }
-        }
-        c
-    }
-
     /// Ensure a resident target exists for `identity` with the given geometry + pass.
     /// Image/memory persist across Load vs Clear render-pass changes; only the
     /// framebuffer is rebuilt when the pass handle differs.
@@ -1128,7 +1091,10 @@ mod pin_count_tests {
         for _ in 0..SETTLED_PASSES_FOR_BUFFER_TRIM {
             pools.note_drain_settled(0);
         }
-        assert!(pools.note_drain_settled(0), "no victims, no uploads → settled");
+        assert!(
+            pools.note_drain_settled(0),
+            "no victims, no uploads → settled"
+        );
 
         // One staging acquire between passes — no victim, still not settled.
         pools.staging_hits += 1;
@@ -1224,66 +1190,5 @@ mod pin_count_tests {
             now,
             "the touched target is stamped at the touch time"
         );
-    }
-
-    /// The geometry census classifies an export miss: it must surface a resident
-    /// that exists under a DIFFERENT key at the same geometry (the orphan case
-    /// direct-present must recover) and report an empty census when nothing
-    /// backs that geometry (the "content is only on the CPU/guest side" case).
-    #[test]
-    fn geom_census_reports_surfaces_at_geometry() {
-        let mut pools = ResourcePools::new();
-        // Empty registry: nothing at any geometry.
-        let empty = pools.registry_geom_census(16, 16);
-        assert_eq!(empty.total, 0);
-        assert!(empty.surfaces.is_empty());
-        assert_eq!(empty.gva, 0);
-
-        // Two Surface residents at 16x16 (one at a different generation, one
-        // not-ready), and one at a DIFFERENT geometry that must not leak in.
-        pools.registry.insert(
-            TargetIdentity::Surface {
-                id: 3,
-                width: 16,
-                height: 16,
-                generation: 7,
-            },
-            dummy_slot(true),
-        );
-        pools.registry.insert(
-            TargetIdentity::Surface {
-                id: 5,
-                width: 16,
-                height: 16,
-                generation: 2,
-            },
-            dummy_slot(false),
-        );
-        pools.registry.insert(
-            TargetIdentity::Surface {
-                id: 9,
-                width: 32,
-                height: 32,
-                generation: 1,
-            },
-            dummy_slot(true),
-        );
-
-        let c = pools.registry_geom_census(16, 16);
-        assert_eq!(c.total, 3, "counts all geometries");
-        assert_eq!(c.surfaces.len(), 2, "only the two 16x16 surfaces");
-        assert!(c.surfaces.contains(&(3, 7, true)));
-        assert!(c.surfaces.contains(&(5, 2, false)));
-        assert!(
-            !c.surfaces.iter().any(|&(id, ..)| id == 9),
-            "other-geometry resident excluded"
-        );
-        assert_eq!(c.gva, 0);
-
-        // A geometry with no resident: the miss classifier reads this as "no GPU
-        // content — CPU/guest-only", not an orphan.
-        let bare = pools.registry_geom_census(64, 64);
-        assert!(bare.surfaces.is_empty() && bare.gva == 0);
-        assert_eq!(bare.total, 3);
     }
 }

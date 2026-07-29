@@ -38,10 +38,6 @@ pub enum DrawError {
     /// which call refused.
     /// See [`super::vk_call::VkCall`].
     VkCall(super::vk_call::VkCall),
-    /// A `dup(2)` of an export dmabuf fd failed — a POSIX syscall failure
-    /// carrying an errno, not a `vk::Result`, so it is not [`Self::VkCall`].
-    /// See [`super::fd_dup::FdDupDecline`].
-    FdDup(super::fd_dup::FdDupDecline),
     /// The image-memory slab rejected an impossible allocation/invariant
     /// without pretending the driver returned OOM.
     Slab(super::slab::SlabDecline),
@@ -64,7 +60,6 @@ impl std::fmt::Display for DrawError {
             Self::ComputeExecution(d) => write!(f, "vk_engine_compute_execution: {d}"),
             Self::TargetRead(d) => write!(f, "vk_engine_target_read: {d}"),
             Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
-            Self::FdDup(d) => write!(f, "vk_engine_fd_dup: {d}"),
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
             Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
             Self::DeviceLost(d) => write!(f, "vk_engine_device_lost: {d}"),
@@ -84,7 +79,6 @@ impl crate::observe::Decline for DrawError {
             // Delegates like the two typed variants above: the call names itself,
             // so one event has one name whether it is read here or on `VkCall`.
             Self::VkCall(c) => c.slug(),
-            Self::FdDup(d) => d.slug(),
             Self::Slab(d) => d.slug(),
             Self::FenceTimeout => "vk_engine_fence_timeout",
             Self::Init(d) => d.slug(),
@@ -103,7 +97,6 @@ impl crate::observe::Decline for DrawError {
             Self::TargetRead(d) => d.fields(),
             Self::Unsupported(r) => r.fields(),
             Self::VkCall(c) => c.fields(),
-            Self::FdDup(d) => d.fields(),
             Self::Slab(d) => d.fields(),
             Self::Init(d) => d.fields(),
             Self::DrawValidation(d) => d.fields(),

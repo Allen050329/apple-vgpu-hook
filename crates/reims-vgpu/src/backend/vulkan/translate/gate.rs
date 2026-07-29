@@ -77,7 +77,7 @@ const OWNING_DIRS: &[&str] = &["backend/vulkan/translate/", "backend/vulkan/caps
 /// depth-stencil format against the driver, where the question is "which of
 /// these does this device support", not "what did the guest ask for".
 ///
-/// Note what is NOT here. Swapchain images, dmabuf exports and resident targets
+/// Note what is NOT here. Swapchain images and resident targets
 /// all use one format because the guest's scanout order is BGRA8 — that IS a
 /// translated fact, so they name `translate::pixel::SCANOUT_FORMAT` instead of
 /// spelling it, and a single wrong spelling among them would have shown up as

@@ -349,7 +349,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
 /// The guest's scanout byte order, in Vulkan terms.
 ///
 /// The compositor's framebuffers are `MTLPixelFormatBGRA8Unorm`, so a resident
-/// target, an exported dmabuf and a swapchain image all use this format to keep
+/// target and a swapchain image both use this format to keep
 /// the present path free of a channel swap. Named once because it is one
 /// decision — spelled at each site it would drift, and a single wrong spelling
 /// shows up as red-and-blue-swapped output rather than a failure.

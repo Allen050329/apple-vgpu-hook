@@ -65,42 +65,6 @@ pub enum VkOp {
     /// `vkMapMemory` of the storage readback buffer to copy the bytes out.
     StorageReadMap,
 
-    // ---- mod.rs `export_present_from_resident_fd_policy` — the
-    //      zero-copy resident → dmabuf present export rail ----
-    /// `vkResetCommandBuffer` before recording the present export blit.
-    ExportPresentResetCb,
-    /// `vkBeginCommandBuffer` for the present export blit.
-    ExportPresentBeginCb,
-    /// `vkEndCommandBuffer` closing the present export blit.
-    ExportPresentEndCb,
-    /// `vkQueueSubmit` of the present export blit.
-    ExportPresentSubmit,
-
-    // ---- dmabuf_export.rs `export_bgra_scanout_dmabuf` — the low-level dmabuf
-    //      scanout image export (the exportable VkImage the present export rail
-    //      above is built on), create + alloc + bind + get_fd ----
-    /// `vkCreateImage` for the exportable LINEAR scanout image.
-    DmabufExportCreateImage,
-    /// `vkAllocateMemory` for that image (device-local preferred, exportable).
-    DmabufExportAlloc,
-    /// `vkBindImageMemory` binding that memory to the image.
-    DmabufExportBind,
-    /// `vkGetMemoryFdKHR` exporting the dmabuf fd for that memory.
-    DmabufExportGetFd,
-
-    // ---- dmabuf_export.rs `import_bgra_dmabuf_image` — the consumer half: the
-    //      host window imports the engine's exported dmabuf fd as a sampleable
-    //      `VkImage` for its zero-copy present blit, create + fd-props + alloc +
-    //      bind. Sibling of the export ops above, on the other device. ----
-    /// `vkCreateImage` for the LINEAR image backing the imported dmabuf.
-    DmabufImportCreateImage,
-    /// `vkGetMemoryFdPropertiesKHR` for the imported fd's allowed memory types.
-    DmabufImportFdProps,
-    /// `vkAllocateMemory` importing the dmabuf fd as dedicated device memory.
-    DmabufImportAlloc,
-    /// `vkBindImageMemory` binding the imported memory to the image.
-    DmabufImportBind,
-
     // ---- caches.rs `ObjectCaches` — the L2–L7 immutable-object create caches.
     //      Each op is cached negatively as a `VkCall`, so the cheap re-attempt
     //      replays the same typed reason rather than a re-formatted string ----
@@ -348,21 +312,6 @@ impl Decline for VkCall {
             VkOp::StorageReadSubmit => "vk_storage_read_submit",
             VkOp::StorageReadMap => "vk_storage_read_map",
 
-            VkOp::ExportPresentResetCb => "vk_export_present_reset_cb",
-            VkOp::ExportPresentBeginCb => "vk_export_present_begin_cb",
-            VkOp::ExportPresentEndCb => "vk_export_present_end_cb",
-            VkOp::ExportPresentSubmit => "vk_export_present_submit",
-
-            VkOp::DmabufExportCreateImage => "vk_dmabuf_export_create_image",
-            VkOp::DmabufExportAlloc => "vk_dmabuf_export_alloc",
-            VkOp::DmabufExportBind => "vk_dmabuf_export_bind",
-            VkOp::DmabufExportGetFd => "vk_dmabuf_export_get_fd",
-
-            VkOp::DmabufImportCreateImage => "vk_dmabuf_import_create_image",
-            VkOp::DmabufImportFdProps => "vk_dmabuf_import_fd_props",
-            VkOp::DmabufImportAlloc => "vk_dmabuf_import_alloc",
-            VkOp::DmabufImportBind => "vk_dmabuf_import_bind",
-
             VkOp::CachesCreateShaderModule => "vk_caches_create_shader_module",
             VkOp::CachesCreateDescriptorSetLayout => "vk_caches_create_descriptor_set_layout",
             VkOp::CachesCreatePipelineLayout => "vk_caches_create_pipeline_layout",
@@ -512,18 +461,6 @@ mod tests {
         VkOp::StorageReadEndCb,
         VkOp::StorageReadSubmit,
         VkOp::StorageReadMap,
-        VkOp::ExportPresentResetCb,
-        VkOp::ExportPresentBeginCb,
-        VkOp::ExportPresentEndCb,
-        VkOp::ExportPresentSubmit,
-        VkOp::DmabufExportCreateImage,
-        VkOp::DmabufExportAlloc,
-        VkOp::DmabufExportBind,
-        VkOp::DmabufExportGetFd,
-        VkOp::DmabufImportCreateImage,
-        VkOp::DmabufImportFdProps,
-        VkOp::DmabufImportAlloc,
-        VkOp::DmabufImportBind,
         VkOp::CachesCreateShaderModule,
         VkOp::CachesCreateDescriptorSetLayout,
         VkOp::CachesCreatePipelineLayout,

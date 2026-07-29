@@ -168,16 +168,6 @@ struct WindowLink {
     bgra_short_geom: Option<(u32, u32)>,
     /// Set to ask the window thread to exit (VM teardown); the thread polls it.
     stop: host_window::present::StopFlag,
-    /// Latched by the window thread: `true` iff its device can import dmabufs.
-    /// The publish path skips the resident export when this is `false` (unknown
-    /// at startup, or a window device without the import extensions), so the
-    /// export blit is only paid when the window will actually consume it.
-    #[cfg(not(target_os = "macos"))]
-    import_capable: host_window::present::ImportCapableFlag,
-    /// Import-success latch shared with the window so the producer can skip
-    /// redundant fd duplicates once a dmabuf ring slot is imported.
-    #[cfg(not(target_os = "macos"))]
-    import_ack: Arc<host_window::present::DirectPresentImportAck>,
     /// Window thread handle. `device_window_stop` sets `stop` and joins it, so
     /// the window's Vulkan objects tear down before QEMU teardown proceeds
     /// (avoids the driver-unload-during-exit crash class).
@@ -475,10 +465,6 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         },
     };
     let stop: host_window::present::StopFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let import_capable: host_window::present::ImportCapableFlag =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
-    #[cfg(not(target_os = "macos"))]
-    let import_ack = Arc::new(host_window::present::DirectPresentImportAck::default());
     #[cfg(target_os = "macos")]
     let (thread, exited) = {
         let exited: host_window::present::ExitedFlag =
@@ -489,7 +475,6 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             on_input,
             Arc::clone(&frames),
             Arc::clone(&stop),
-            Arc::clone(&import_capable),
             Arc::clone(&exited),
         ) {
             observe::Emit::decline("host_window_start", &error)
@@ -505,7 +490,6 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         on_input,
         Arc::clone(&frames),
         Arc::clone(&stop),
-        Arc::clone(&import_capable),
     ));
     *link = Some(WindowLink {
         frames,
@@ -514,10 +498,6 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         #[cfg(not(target_os = "macos"))]
         bgra_short_geom: None,
         stop,
-        #[cfg(not(target_os = "macos"))]
-        import_capable,
-        #[cfg(not(target_os = "macos"))]
-        import_ack,
         thread,
         #[cfg(target_os = "macos")]
         exited,
@@ -568,16 +548,15 @@ pub fn device_window_run_main(_id: u64) -> bool {
 /// Publish the current finished present frame into the window's frame slot, if a
 /// window is running and this present has not been published yet. Runs on the
 /// drain worker under no device lock of its own (its own small mutex), so it
-/// never contends the render tranche. One CPU copy per present (removed by the
-/// direct-present increment); latest-wins.
+/// never contends the render tranche. Latest-wins.
 #[cfg(feature = "host-window")]
 fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
     let mut guard = slot.window.lock();
     let Some(link) = guard.as_mut() else {
         // No window consumes the capture: revert the next capture to the full
         // readback path (a torn-down window must not leave `frame_bgra` stale
-        // behind an unreset `dmabuf_active`).
-        state.present.dmabuf_active = false;
+        // behind an unreset `display_from_resident`).
+        state.present.display_from_resident = false;
         return;
     };
     let p = &state.present;
@@ -596,10 +575,9 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
     }
     #[cfg(target_os = "macos")]
     {
-        // Only the engine-swapchain handoff consumes a resident source; the
-        // dmabuf handoff re-derives its own present identity below. Building it
-        // unconditionally walked present state once per frame for nothing on
-        // every non-macOS host.
+        // Only the engine-swapchain handoff consumes a resident source, and it is
+        // macOS-only. Building it unconditionally walked present state once per
+        // frame for nothing on every other host.
         let resident_source =
             window_present_source(state, p.frame_mapping, p.frame_width, p.frame_height);
         let direct_ready = resident_source
@@ -614,7 +592,7 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             // interesting signal is a SUSTAINED run, which the windowed proxy
             // reports as `dropped=N reason=resident_not_ready`.
             crate::runtime::census::present_proxy::window_publish::note(false);
-            state.present.dmabuf_active = false;
+            state.present.display_from_resident = false;
             return;
         }
         let now_ms = crate::observe::elapsed_ms() as u64;
@@ -637,7 +615,7 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         crate::runtime::census::present_proxy::window_publish::note(published);
         if published {
             link.last = key;
-            state.present.dmabuf_active = true;
+            state.present.display_from_resident = true;
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -699,76 +677,22 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
                 }
             }
         }
-        // Zero-copy source (direct-present route B): export this present's resident
-        // target as a dmabuf the window can blit without the CPU upload. `None` when
-        // the resident is not exportable (no dmabuf exts / not content-ready / not
-        // BGRA) — the window then needs the `bgra` fallback below. Skip the export
-        // entirely when the window has reported it cannot import (avoids a wasted GPU
-        // blit per present on an iGPU/window that lacks the exts).
-        //
-        // Ordered BEFORE the `frame_bgra` length check: direct presents keep that
-        // buffer empty, and requiring CPU fallback pixels here would drop every
-        // resident-carried frame.
-        let dmabuf = if link
-            .import_capable
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // Time the whole export (GPU blit submit + synchronous fence wait on the
-            // drain worker) so the biggest remaining per-present serialization is
-            // measured, not lumped into `retire_wait_us`. Off-main-core (drain
-            // worker); `us` is SCHED_IDLE-contaminated for the agent, real at
-            // SCHED_OTHER for the user; hits/misses are count-trustworthy.
-            let now_ms = crate::observe::elapsed_ms() as u64;
-            crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
-            export_present_dmabuf(
-                state,
-                p.frame_mapping,
-                p.frame_width,
-                p.frame_height,
-                &link.import_ack,
-            )
-        } else {
-            None
-        };
-        // Reclaim resident targets idle past the wall-clock age threshold, so VRAM
-        // returns to the working-set baseline after a compositing burst instead of
-        // sitting at the high REGISTRY_CAP for the guest lifetime. The presented
-        // target is kept alive (export_present already touched it above; passing its
-        // identity here guards the CPU-fallback present where export did not run).
-        crate::backend::vulkan::engine::maintain_idle_residents(
-            Some(&present_identity),
-            crate::observe::elapsed_ms() as u64,
-        );
-        // Record whether the display is carried by the GPU resident this present so
-        // the NEXT capture can skip the CPU readback (same drain worker, one present
-        // later — dmabuf state is stable across steady-state presents). A miss
-        // (`None`) forces the next capture to the full readback path so the CPU
-        // fallback frame the window then blits is fresh, not stale.
-        let used_dmabuf = dmabuf.is_some();
-        // CPU fallback payload. The window reads `bgra` ONLY when it has no dmabuf
-        // for this frame, so copying it on a dmabuf-carried present was an 8 MiB
-        // alloc + memcpy per present (~120/s) that nothing ever read. Hand over an
-        // empty Vec instead and let the dmabuf carry the frame.
-        //
-        // Tradeoff, deliberate: if the window's dmabuf IMPORT fails mid-run it can no
-        // longer revert to a CPU frame for this present and holds its last good frame
-        // instead. That revert is already logged by the window
-        // (`direct_present_reverted_to_staging`), and the next capture sees
-        // `dmabuf_active=false` and reads back for real, so the gap is bounded to the
-        // frames until that correction lands.
-        let bgra = if used_dmabuf {
-            Vec::new()
-        } else {
+        // Keep the resident this present names alive across the idle sweep below,
+        // then reclaim targets idle past the wall-clock age threshold so VRAM returns
+        // to the working-set baseline after a compositing burst instead of sitting at
+        // the high REGISTRY_CAP for the guest lifetime.
+        let now_ms = crate::observe::elapsed_ms() as u64;
+        crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
+        crate::backend::vulkan::engine::maintain_idle_residents(Some(&present_identity), now_ms);
+        let bgra = {
             if p.frame_bgra.len() < need {
-                // No dmabuf AND no usable CPU frame: nothing to publish. Reachable via
-                // keep-prior when a capture FAILS at a new/larger geometry (dims
-                // advanced, buffer kept the smaller prior), or when the oracle readback
-                // is off and an export misses before `dmabuf_active` flips back.
-                // Skipping is correct (never publish a short/torn frame; the window
-                // holds its last good frame), but silence would hide "the window froze
-                // because captures keep failing at this geometry". Fail-visible +
-                // deduped per geometry so a persistent mismatch logs once, not every
-                // present (no flood).
+                // No usable CPU frame: nothing to publish. Reachable via keep-prior
+                // when a capture FAILS at a new/larger geometry (dims advanced, the
+                // buffer kept the smaller prior). Skipping is correct (never publish a
+                // short/torn frame; the window holds its last good frame), but silence
+                // would hide "the window froze because captures keep failing at this
+                // geometry". Fail-visible + deduped per geometry so a persistent
+                // mismatch logs once, not every present (no flood).
                 if link.bgra_short_geom != Some((p.frame_width, p.frame_height)) {
                     link.bgra_short_geom = Some((p.frame_width, p.frame_height));
                     observe::off(format!(
@@ -781,7 +705,6 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
                         p.frame_generation
                     ));
                 }
-                state.present.dmabuf_active = false;
                 return;
             }
             // A well-formed frame cleared the short-buffer condition; re-arm the latch
@@ -789,15 +712,13 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             link.bgra_short_geom = None;
             p.frame_bgra[..need].to_vec()
         };
-        if window_write_frame(link, p.frame_width, p.frame_height, bgra, dmabuf, None) {
+        if window_write_frame(link, p.frame_width, p.frame_height, bgra, None) {
             link.last = key;
         }
-        // `p` (the `&state.present` borrow) is last used above; safe to mutate now.
-        state.present.dmabuf_active = used_dmabuf;
     }
 }
 
-#[cfg(feature = "host-window")]
+#[cfg(all(feature = "host-window", target_os = "macos"))]
 fn window_present_source(
     state: &crate::model::DeviceState,
     mapping: u32,
@@ -813,61 +734,6 @@ fn window_present_source(
     }
 }
 
-/// Export the present's resident target as a dmabuf `FrameDmabuf` for the window,
-/// or `None` when it is not exportable (the window falls back to the CPU `bgra`).
-/// The returned fd is owned by the `FrameDmabuf` — consumed once by the window's
-/// import or closed by the frame's `Drop`.
-#[cfg(all(feature = "host-window", not(target_os = "macos")))]
-fn export_present_dmabuf(
-    state: &crate::model::DeviceState,
-    mapping: u32,
-    width: u32,
-    height: u32,
-    import_ack: &Arc<host_window::present::DirectPresentImportAck>,
-) -> Option<host_window::present::FrameDmabuf> {
-    use std::os::fd::FromRawFd;
-    let source = window_present_source(state, mapping, width, height);
-    let identity = source.candidates.first()?;
-    let export = unsafe {
-        crate::backend::vulkan::engine::export_present_from_resident_fd_policy(
-            identity,
-            |ring_idx, ew, eh| !import_ack.is_imported(ew, eh, ring_idx),
-        )
-    };
-    match export {
-        Ok((fd, _pitch, ew, eh, ring_idx)) if ew == width && eh == height => {
-            // SAFETY: when present, `fd` is a fresh owned dmabuf dup from the
-            // engine; wrap it so the window consumes it (import) or the Frame's
-            // Drop closes it. `None` means the window has already acknowledged
-            // importing this ring slot at this geometry.
-            let owned = fd.map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-            Some(host_window::present::FrameDmabuf {
-                fd: std::sync::Mutex::new(owned),
-                ring_idx,
-                import_ack: Arc::clone(import_ack),
-            })
-        }
-        Ok((fd, _, _, _, _)) => {
-            // Geometry mismatch (identity carries w,h so this is unexpected) —
-            // close the fd rather than hand the window a mismatched image.
-            if let Some(fd) = fd {
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-            }
-            None
-        }
-        // This is the one owner of a final export failure: the output-group
-        // candidate may legitimately miss before the member retry succeeds, so
-        // the engine entry point only returns a typed decline. Name the final
-        // cause here; `fail_once` because export runs every present.
-        Err(e) => {
-            crate::observe::Emit::decline("export_present", &e)
-                .field("geom", format!("{width}x{height}"))
-                .fail_once(0);
-            None
-        }
-    }
-}
-
 /// Write a frame into the window's slot, stamping the next monotonic `seq` so
 /// the window prepares only new content. Returns false if the slot lock is
 /// poisoned (a panicked window thread — the window is gone, drop the publish).
@@ -878,7 +744,6 @@ fn window_write_frame(
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    dmabuf: Option<host_window::present::FrameDmabuf>,
     resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
@@ -887,7 +752,6 @@ fn window_write_frame(
         width,
         height,
         bgra,
-        dmabuf,
         resident,
     });
     match link.frames.lock() {
@@ -1041,8 +905,8 @@ fn publish_window_early_frame<M: crate::runtime::host::HostMemory>(
     }
     slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     // Early boot frames come from the BAR1 GOP framebuffer, not a resident
-    // target — no dmabuf export, always the CPU buffer.
-    window_write_frame(link, w, h, buf, None, None);
+    // target, so there is no resident source to hand over.
+    window_write_frame(link, w, h, buf, None);
 }
 
 /// Copy the registered BAR1 early framebuffer into `dst` (tight BGRA8). Returns

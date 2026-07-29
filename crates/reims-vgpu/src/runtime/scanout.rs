@@ -82,10 +82,11 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     paint_mapping(state, host, mapping_id, dst, dst_stride, width, height)
 }
 
-/// Always-on census of the direct-present readback-elision ratio (never silent):
-/// `full` = readback + proxy scan ran; `light` = dmabuf-carried, readback
-/// skipped. Deduped to one line per 1024 total captures (a line every ~8 s at
-/// 120 Hz), so it confirms the elision engages without flooding the fail view.
+/// Always-on census of the capture readback-elision ratio (never silent):
+/// `full` = readback + proxy scan ran; `light` = the window is carrying the frame
+/// from the engine resident, readback skipped. Deduped to one line per 1024 total
+/// captures (a line every ~8 s at 120 Hz), so it confirms the elision engages
+/// without flooding the fail view.
 fn maybe_log_capture_sampling(state: &DeviceState) {
     let full = state.present.full_captures;
     let light = state.present.light_captures;
@@ -185,33 +186,32 @@ pub fn capture_present_frame(
     }
     note_display_action(state, mapping_id, width, height);
     state.advance_present_epoch();
-    // --- Direct-present readback elision ---
-    // When the previous present's window publish carried the frame as a zero-copy
-    // dmabuf (route B, `dmabuf_active`), the display reads the GPU resident
-    // directly and does NOT consume this CPU capture. The ~8-12 ms guest-page
-    // gather + full-frame proxy scan below is then pure present-hot-path overhead
-    // that serializes the guest behind the drain lock (the fullscreen-video
-    // slowdown class). Skip it on those presents. The cheap protocol-structural
-    // a/b guard still runs on every light present. Never taken on non-host-window
-    // or non-import-capable builds: `dmabuf_active` only becomes true after a
-    // successful direct export.
+    // --- Capture readback elision ---
+    // When the previous present's window publish handed the window an engine
+    // resident (`display_from_resident` — the macOS engine-swapchain handoff), the
+    // display reads that resident directly and does NOT consume this CPU capture.
+    // The ~8-12 ms guest-page gather + full-frame proxy scan below is then pure
+    // present-hot-path overhead that serializes the guest behind the drain lock
+    // (the fullscreen-video slowdown class). Skip it on those presents; the cheap
+    // protocol-structural a/b guard still runs on every light present.
+    //
+    // Never taken where the window owns its swapchain and uploads CPU pixels —
+    // every non-macOS host — because `display_from_resident` only becomes true
+    // after a resident publish succeeds.
     //
     // The full-frame readback has EXACTLY ONE reason to exist: the DISPLAY needs
-    // CPU pixels because no dmabuf is carrying the frame, and the window will
+    // CPU pixels because no resident is carrying the frame, and the window will
     // blit `frame_bgra`. Nothing else reads it.
     //
-    // Consequence: with dmabuf carrying, `frame_bgra` holds no frame for this
+    // Consequence: with a resident carrying, `frame_bgra` holds no frame for this
     // present, and the branch below drops it so that stays literally true.
-    // `publish_window_frame` must not require it when it produced a dmabuf — it
-    // does not; the export runs before the bgra check, and an empty buffer is
-    // what tells it there are no CPU pixels to fall back to.
-    let display_needs_cpu_frame = !state.present.dmabuf_active;
+    let display_needs_cpu_frame = !state.present.display_from_resident;
     if !display_needs_cpu_frame {
-        // Publish the new resident (fresh direct export in `publish_window_frame`)
-        // and leave `frame_bgra` empty: the window ignores CPU pixels while the
-        // resident carries the display. An export miss costs one dropped frame
-        // (the window holds its last good frame and publish logs the drop), then
-        // `dmabuf_active=false` forces the next capture to read back for fallback.
+        // Publish the new resident and leave `frame_bgra` empty: the window
+        // ignores CPU pixels while the resident carries the display. A publish
+        // miss costs one dropped frame (the window holds its last good frame and
+        // publish logs the drop), then `display_from_resident=false` forces the
+        // next capture to read back for fallback.
         //
         // Dropping it is what makes "no CPU pixels for this present" a fact
         // rather than an inference. Skipping the readback only leaves the buffer
@@ -1860,7 +1860,7 @@ mod tests {
         assert_eq!(state.present.light_captures, 0);
 
         // dmabuf carrying: there must be no readback.
-        state.present.dmabuf_active = true;
+        state.present.display_from_resident = true;
         let frame_b = [0x44u8, 0x55, 0x66, 0xFF].repeat(4);
         assert!(write_bgra8(&mut state, &mut host, mid, &frame_b, 8, 2, 2));
         let gen_b = state.mappings.get(&mid).unwrap().content_generation;
@@ -2419,7 +2419,7 @@ mod tests {
 
         // Direct present is carrying the display, so this capture takes the
         // light path and reads back nothing.
-        state.present.dmabuf_active = true;
+        state.present.display_from_resident = true;
         let before = state.present.light_captures;
         assert!(capture_present_frame(&mut state, 1, w, h, 1));
         assert_eq!(

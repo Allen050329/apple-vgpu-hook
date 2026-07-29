@@ -23,12 +23,6 @@ pub enum EngineFacadeDecline {
         actual_generation: u32,
         expected_generation: u32,
     },
-    ExportPresentUnknownIdentity {
-        identity: TargetIdentity,
-    },
-    ExportPresentNotReady {
-        identity: TargetIdentity,
-    },
     WindowSourceDisappearedBeforePin {
         identity: TargetIdentity,
     },
@@ -42,10 +36,6 @@ impl Decline for EngineFacadeDecline {
             Self::StorageReadGenerationMismatch { .. } => {
                 "vk_engine_storage_read_generation_mismatch"
             }
-            Self::ExportPresentUnknownIdentity { .. } => {
-                "vk_engine_export_present_unknown_identity"
-            }
-            Self::ExportPresentNotReady { .. } => "vk_engine_export_present_not_ready",
             Self::WindowSourceDisappearedBeforePin { .. } => {
                 "vk_engine_window_source_disappeared_before_pin"
             }
@@ -68,9 +58,7 @@ impl Decline for EngineFacadeDecline {
                 ]);
                 fields
             }
-            Self::ExportPresentUnknownIdentity { identity }
-            | Self::ExportPresentNotReady { identity }
-            | Self::WindowSourceDisappearedBeforePin { identity } => identity_fields(identity),
+            Self::WindowSourceDisappearedBeforePin { identity } => identity_fields(identity),
         }
     }
 }
@@ -115,12 +103,6 @@ mod tests {
                 actual_generation: 8,
                 expected_generation: 9,
             },
-            EngineFacadeDecline::ExportPresentUnknownIdentity {
-                identity: identity(),
-            },
-            EngineFacadeDecline::ExportPresentNotReady {
-                identity: identity(),
-            },
             EngineFacadeDecline::WindowSourceDisappearedBeforePin {
                 identity: identity(),
             },
@@ -141,7 +123,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 6, "the engine façade reason census moved");
+        assert_eq!(before, 4, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 
@@ -160,18 +142,15 @@ mod tests {
         }
     }
 
+    /// The identity fields are what a reader needs to find the resident a
+    /// window-source pin missed, so they must all reach the line.
     #[test]
-    fn export_present_state_failures_keep_identity_and_readiness_distinct() {
-        let unknown = EngineFacadeDecline::ExportPresentUnknownIdentity {
+    fn a_window_source_decline_names_the_whole_identity() {
+        let decline = EngineFacadeDecline::WindowSourceDisappearedBeforePin {
             identity: identity(),
         };
-        let not_ready = EngineFacadeDecline::ExportPresentNotReady {
-            identity: identity(),
-        };
-        assert_ne!(unknown.slug(), not_ready.slug());
-        assert_eq!(unknown.fields(), not_ready.fields());
         assert_eq!(
-            unknown.fields(),
+            decline.fields(),
             vec![
                 ("identity_kind", "surface".into()),
                 ("identity_id", "7".into()),

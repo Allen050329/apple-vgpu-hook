@@ -234,7 +234,7 @@ fn reset_state_inner() {
 /// The macOS/MoltenVK publish path drops a captured frame outright when no
 /// candidate resident has landed content, so the window keeps showing its
 /// previous (or slate) contents. That drop used to be completely silent — the
-/// only trace was `dmabuf_active` flipping false. A sustained drop run is the
+/// only trace was `display_from_resident` flipping false. A sustained drop run is the
 /// "desktop frozen but the device is alive" class, so it needs a name and a
 /// count.
 pub mod window_publish {

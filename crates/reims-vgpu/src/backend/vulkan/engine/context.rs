@@ -240,11 +240,6 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
-    /// dmabuf EXPORT loader (`vkGetMemoryFdKHR`), present iff
-    /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` were both
-    /// enabled at device create. Backs the GL/dmabuf scanout export path
-    /// (`dmabuf_export`).
-    pub ext_external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -412,14 +407,6 @@ impl DeviceContext {
         let enabled = features.enabled_features();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
-        // dmabuf EXPORT capability (workstream: GL/dmabuf scanout export — hand
-        // the finished present image to QEMU as a dmabuf fd so the frame never
-        // leaves the GPU). Needs the fd export loader + the DMA_BUF handle-type
-        // enabler; VK_KHR_external_memory is core in 1.1 but enable it explicitly
-        // for portability. All three must be present or export is unavailable.
-        let external_memory_fd = has_device_extension(vk::KHR_EXTERNAL_MEMORY_FD_NAME);
-        let external_memory_dma_buf = has_device_extension(vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME);
-        let dmabuf_export = external_memory_fd && external_memory_dma_buf;
         #[cfg(all(feature = "host-window", target_os = "macos"))]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
@@ -471,11 +458,6 @@ impl DeviceContext {
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
         }
-        if dmabuf_export {
-            enabled_device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME.as_ptr());
-            enabled_device_extensions.push(vk::KHR_EXTERNAL_MEMORY_FD_NAME.as_ptr());
-            enabled_device_extensions.push(vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME.as_ptr());
-        }
         #[cfg(all(feature = "host-window", target_os = "macos"))]
         if swapchain {
             enabled_device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
@@ -514,13 +496,10 @@ impl DeviceContext {
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
-        let ext_external_memory_fd =
-            dmabuf_export.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let props = instance.get_physical_device_properties(pd);
         let memory_properties = instance.get_physical_device_memory_properties(pd);
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
-            dmabuf: dmabuf_export,
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             portability_subset,
             device_api_version: props.api_version,
@@ -603,7 +582,6 @@ impl DeviceContext {
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
-            ext_external_memory_fd,
             depth_stencil_format,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),

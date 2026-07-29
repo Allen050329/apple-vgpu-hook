@@ -1039,17 +1039,18 @@ pub struct PresentState {
     /// untouched (keep-prior contract). Serialized with the console paint by the
     /// device lock; never read as content.
     pub capture_scratch: Vec<u8>,
-    /// True when the previous present's window publish exported the frame as a
-    /// zero-copy dmabuf (direct present, route B) rather than falling back to the
-    /// CPU staging upload. Set by `publish_window_frame` each present (same drain
-    /// worker, one present after the capture reads it — dmabuf state is stable
-    /// across steady-state presents). When true, the display is carried by the
-    /// GPU resident and does NOT consume the CPU `frame_bgra`, so
-    /// `capture_present_frame` skips the expensive guest-page readback. Always
-    /// false on non-host-window / non-import-capable builds, so those keep the
-    /// per-present readback unchanged.
-    pub dmabuf_active: bool,
-    /// Always-on census: full (readback ran) vs light (dmabuf-carried, readback
+    /// True when the previous present's window publish handed the window a GPU
+    /// resident rather than CPU pixels — the macOS engine-swapchain handoff, which
+    /// presents the compositor's resident through the engine's own MoltenVK
+    /// swapchain and never reads `frame_bgra`. Set by `publish_window_frame` each
+    /// present (same drain worker, one present after the capture reads it; the
+    /// handoff is stable across steady-state presents). When true,
+    /// `capture_present_frame` skips the expensive guest-page readback.
+    ///
+    /// Always false where the window owns its own swapchain and uploads CPU pixels
+    /// — every non-macOS host — so those keep the per-present readback unchanged.
+    pub display_from_resident: bool,
+    /// Always-on census: full (readback ran) vs light (resident-carried, readback
     /// skipped) captures, so the readback-elision ratio is visible.
     pub full_captures: u64,
     pub light_captures: u64,
@@ -2911,7 +2912,11 @@ mod fail_vocabulary_tests {
         for decline in declines {
             assert!(slugs.insert(decline.slug()), "duplicate {}", decline.slug());
         }
-        assert_eq!(slugs.len(), 17, "every state mutation check has its own slug");
+        assert_eq!(
+            slugs.len(),
+            17,
+            "every state mutation check has its own slug"
+        );
         assert_eq!(
             crate::observe::Emit::decline(
                 "model_state_mutation",

@@ -4,11 +4,13 @@
 //! Everything here is *measured* on the device at create time and consumed
 //! either by a decision or by the one-shot `vk_caps` line. There is
 //! deliberately no derived taxonomy on top of it: a classification nothing
-//! branches on cannot be wrong in a way anyone notices, and the one that used
-//! to live here was wrong — it printed `handoff=dmabuf_fd handoff_declined=[]`
-//! on boots where the dmabuf arm was never entered, because the ladder that
-//! produced the string and the branch that picks the present path were separate
-//! pieces of code that had never been made to agree.
+//! branches on cannot be wrong in a way anyone notices, and the one that used to
+//! live here was wrong — it printed `handoff=dmabuf_fd handoff_declined=[]` on
+//! boots where the dmabuf arm was never entered, because the ladder that produced
+//! the string and the branch that picks the present path were separate pieces of
+//! code that had never been made to agree. The `dmabuf` bit itself went the same
+//! way once the export rail it described was deleted: nothing branched on it and
+//! nothing could.
 //!
 //! * [`memory_topology::MemoryTopology`] — `Unified` vs `Discrete` selects an
 //!   allocation *preference*, never a different observable result. Live: every
@@ -76,15 +78,6 @@ impl DriverQuirk {
 #[derive(Clone, Debug)]
 pub struct HostGpuCaps {
     pub memory: MemoryProfile,
-    /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` were both
-    /// advertised **and** enabled at device create. Linux only; MoltenVK has
-    /// neither and needs neither, because on macOS the engine device owns the
-    /// window surface and a finished frame never crosses a device boundary.
-    ///
-    /// This is one bit because it is one question. Whether a given present
-    /// actually took the dmabuf path is a property of that present, reported by
-    /// `direct_present_source` and `export_present_*` at the site that chose.
-    pub dmabuf: bool,
     pub quirks: DriverQuirk,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
@@ -103,17 +96,15 @@ impl HostGpuCaps {
 
     /// One-shot, fail-visible summary of the classification. Load-bearing for
     /// portability debugging: it names the memory topology, the signal that
-    /// decided it, the heap sizes that signal was read from, and whether the
-    /// device can hand a frame to another device without a copy. Every field is
+    /// decided it, and the heap sizes that signal was read from. Every field is
     /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps api={} baseline={} memory={} memory_signal={} dmabuf={} device_local_mb={} host_visible_device_local_mb={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps api={} baseline={} memory={} memory_signal={} device_local_mb={} host_visible_device_local_mb={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
             self.memory.signal.slug(),
-            self.dmabuf,
             self.memory.device_local_bytes >> 20,
             self.memory.host_visible_device_local_bytes >> 20,
             self.portability_subset,
@@ -127,12 +118,11 @@ impl HostGpuCaps {
     /// memory reaches the GPU, which is the engine device's job.
     pub fn consumer_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps role=consumer api={} baseline={} memory={} memory_signal={} dmabuf={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps role=consumer api={} baseline={} memory={} memory_signal={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
             self.memory.signal.slug(),
-            self.dmabuf,
             self.portability_subset,
             self.device_type,
         )
@@ -144,10 +134,9 @@ mod tests {
     use super::*;
     use memory_topology::fixtures;
 
-    fn caps(api: u32, props: &vk::PhysicalDeviceMemoryProperties, dmabuf: bool) -> HostGpuCaps {
+    fn caps(api: u32, props: &vk::PhysicalDeviceMemoryProperties) -> HostGpuCaps {
         HostGpuCaps {
             memory: memory_topology::classify_memory(props),
-            dmabuf,
             quirks: DriverQuirk::default(),
             portability_subset: false,
             device_api_version: api,
@@ -155,16 +144,15 @@ mod tests {
         }
     }
 
-    /// The selection line names the topology, the signal that decided it, and
-    /// the frame-sharing answer — what a portability bug report needs. Every
-    /// assertion here is a field a reader greps for.
+    /// The selection line names the topology, the signal that decided it, and the
+    /// heap sizes that signal was read from — what a portability bug report needs.
+    /// Every assertion here is a field a reader greps for.
     #[test]
     fn selection_line_carries_the_diagnosis() {
-        let c = caps(vk::API_VERSION_1_3, &fixtures::nvidia_discrete(), true);
+        let c = caps(vk::API_VERSION_1_3, &fixtures::nvidia_discrete());
         let line = c.selection_line("NVIDIA GeForce RTX 5080");
         assert!(line.contains("memory=discrete"), "{line}");
         assert!(line.contains("memory_signal=separate_host_heap"), "{line}");
-        assert!(line.contains("dmabuf=true"), "{line}");
         assert!(line.contains("device_local_mb=16384"), "{line}");
         // The baseline is stated on every line so no reader mistakes the
         // device's reported version for a requirement.
@@ -172,7 +160,7 @@ mod tests {
     }
 
     /// The API version does not change the classification. Getting this wrong is
-    /// how the retired tier axis smuggled "has dmabuf" in under "is 1.3".
+    /// how the retired tier axis smuggled a capability in under "is 1.3".
     #[test]
     fn the_api_version_does_not_change_the_classification() {
         let props = fixtures::intel_igpu();
@@ -181,21 +169,19 @@ mod tests {
             vk::API_VERSION_1_3,
             vk::make_api_version(0, 1, 4, 334),
         ] {
-            let line = caps(api, &props, true).selection_line("dev");
+            let line = caps(api, &props).selection_line("dev");
             assert!(line.contains("memory=unified"), "{line}");
-            assert!(line.contains("dmabuf=true"), "{line}");
         }
     }
 
-    /// A host with no frame-sharing mechanism says so. It is fully supported —
-    /// the present path copies — and the line is where "why is this host slow"
-    /// starts.
+    /// A unified-memory host classifies as unified whatever else it reports, and
+    /// the line is where "why is this host slow" starts.
     #[test]
-    fn a_copy_only_host_says_it_has_no_dmabuf() {
-        let line = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max(), false)
-            .selection_line("Apple M3 Max");
-        assert!(line.contains("dmabuf=false"), "{line}");
+    fn a_unified_memory_host_says_so() {
+        let line =
+            caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max()).selection_line("Apple M3 Max");
         assert!(line.contains("memory=unified"), "{line}");
+        assert!(line.contains("memory_signal="), "{line}");
     }
 
     /// The consumer line answers for the window's own device and does not
@@ -203,9 +189,9 @@ mod tests {
     /// engine's line for the same GPU on a hybrid host.
     #[test]
     fn consumer_line_omits_the_engine_only_fields() {
-        let line = caps(vk::API_VERSION_1_2, &fixtures::intel_igpu(), false).consumer_line("iGPU");
+        let line = caps(vk::API_VERSION_1_2, &fixtures::intel_igpu()).consumer_line("iGPU");
         assert!(line.contains("role=consumer"), "{line}");
-        assert!(line.contains("dmabuf=false"), "{line}");
+        assert!(line.contains("memory=unified"), "{line}");
         assert!(!line.contains("device_local_mb"), "{line}");
     }
 
