@@ -406,7 +406,24 @@ pub fn contig_page_runs(gpas: &[u64], page_size: u64) -> Vec<std::ops::Range<usi
 /// MemoryRegion edge or cover non-RAM), so a genuine `map_pages` refusal over a
 /// packed list stays fail-visible.
 pub fn is_single_packed_run(gpas: &[u64], page_size: u64) -> bool {
-    contig_page_runs(gpas, page_size).len() == 1
+    contig_run_count(gpas, page_size) == 1
+}
+
+/// How many runs [`contig_page_runs`] would return, without building them.
+///
+/// The packed-view pre-check and the lines that report a fragmented decline
+/// both want only the count, and on this rail the fragmented answer is the
+/// common one: a compositor mapping of 2040 pages in 511 runs is asked hundreds
+/// of times a second, and materializing a 511-element `Vec` to read its `len()`
+/// was the entire cost of the check. Counting the breaks is the same traversal
+/// with no allocation.
+pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
+    if gpas.is_empty() || page_size == 0 {
+        return 0;
+    }
+    1 + (1..gpas.len())
+        .filter(|&i| gpas[i] != gpas[i - 1].wrapping_add(page_size))
+        .count()
 }
 
 /// Build or reuse a contiguous host-VA view of guest pages for `[gva, gva+length)`.
@@ -477,11 +494,11 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     // Full-span packed view only (single map_pages). Fragmented → None, and
     // asking `map_pages` for a view it cannot build is not a failure to log:
     // `write_span` / `read_span` import the maximal runs instead.
-    if !is_single_packed_run(&gpas, state.page_size()) {
+    let runs = contig_run_count(&gpas, state.page_size());
+    if runs != 1 {
         crate::observe::off(format!(
-            "gva_view_fragmented task={resolved_tid} gva={gva:#x} pages={} runs={}",
+            "gva_view_fragmented task={resolved_tid} gva={gva:#x} pages={} runs={runs}",
             gpas.len(),
-            contig_page_runs(&gpas, state.page_size()).len()
         ));
         return None;
     }
@@ -655,11 +672,11 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     // multi-import fallback (the rgba8 store / `write_span`). A genuine
     // `map_pages` refusal over a *packed* list below stays fail-visible. Mirrors
     // the same pre-check `ensure_gva_view` already applies.
-    if !is_single_packed_run(&gpas, page_size) {
+    let runs = contig_run_count(&gpas, page_size);
+    if runs != 1 {
         crate::observe::off(format!(
-            "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={} (map_fresh_span)",
+            "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span)",
             gpas.len(),
-            contig_page_runs(&gpas, page_size).len()
         ));
         return None;
     }
@@ -873,6 +890,49 @@ mod tests {
         assert!(is_single_packed_run(&[0x1000], page));
         assert!(!is_single_packed_run(&[0x1000, 0x3000], page));
         assert!(!is_single_packed_run(&[], page));
+    }
+
+    /// [`contig_run_count`] is what the packed-view pre-check and the
+    /// fragmented-decline lines now read, so it has to agree with the runs
+    /// [`contig_page_runs`] would have built — on every shape, including the two
+    /// that return no runs at all. A count that drifted high would turn a packed
+    /// mapping into a permanent multi-import fallback; one that drifted low
+    /// would hand `map_pages` a list it cannot view and put the refusal in the
+    /// failure log.
+    #[test]
+    fn contig_run_count_agrees_with_the_runs_it_does_not_build() {
+        let page = 0x1000u64;
+        let shapes: &[&[u64]] = &[
+            &[],
+            &[0x1000],
+            &[0x1000, 0x2000, 0x3000],
+            &[0x1000, 0x3000],
+            &[0x1000, 0x2000, 0x4000, 0x5000, 0x8000],
+            // Descending and repeated GPAs are breaks like any other.
+            &[0x3000, 0x2000, 0x1000],
+            &[0x1000, 0x1000],
+        ];
+        for shape in shapes {
+            assert_eq!(
+                contig_run_count(shape, page),
+                contig_page_runs(shape, page).len(),
+                "shape {shape:x?}"
+            );
+        }
+        let fragmented: Vec<u64> = (0..2040u64)
+            .map(|i| (i / 4) * 0x8000 + (i % 4) * page)
+            .collect();
+        assert_eq!(contig_run_count(&fragmented, page), 510);
+        assert_eq!(
+            contig_run_count(&fragmented, page),
+            contig_page_runs(&fragmented, page).len()
+        );
+        // `page_size == 0` is the no-runs guard, not a one-run answer.
+        assert_eq!(contig_run_count(&[0x1000, 0x2000], 0), 0);
+        assert_eq!(
+            contig_run_count(&[0x1000, 0x2000], 0),
+            contig_page_runs(&[0x1000, 0x2000], 0).len()
+        );
     }
 
     /// A fragmented span must not spend a `map_pages` call to be told no. The
@@ -1230,7 +1290,14 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         assert!(
-            write_span(&mut state, &mut host, 1, page - 4, &[1, 2, 3, 4, 5, 6, 7, 8]).is_ok(),
+            write_span(
+                &mut state,
+                &mut host,
+                1,
+                page - 4,
+                &[1, 2, 3, 4, 5, 6, 7, 8]
+            )
+            .is_ok(),
             "the multi-import path exists to write a gapped span"
         );
         let mut back = [0u8; 4];

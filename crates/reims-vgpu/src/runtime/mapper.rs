@@ -1157,11 +1157,11 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     // anyway turns documented control flow ("use write_mapping_bytes /
     // read_mapping_bytes / multi-run import-present") into a logged
     // `qemu_map_pages_callback_failed`.
-    if !crate::runtime::gva_view::is_single_packed_run(&gpas, page_sz as u64) {
+    let runs = crate::runtime::gva_view::contig_run_count(&gpas, page_sz as u64);
+    if runs != 1 {
         crate::observe::off(format!(
-            "contig_view_fragmented mid={mapping_id} pages={} runs={}",
+            "contig_view_fragmented mid={mapping_id} pages={} runs={runs}",
             gpas.len(),
-            crate::runtime::gva_view::contig_page_runs(&gpas, page_sz as u64).len()
         ));
         return None;
     }
