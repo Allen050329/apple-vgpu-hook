@@ -864,12 +864,31 @@ and was reverted — a retained context keeps a warm pipeline cache, which is ex
 
 Two consequences worth knowing before touching this:
 
-- **The skips hide real failures.** With all 41 executing, the suite is 37 passed / **4 failed**.
-  Three of those — `sampled_and_sampler_still_renders`,
-  `sampled_identity_fast_path_skips_content_compare` and
-  `sampled_rgba_upload_to_bgra_target_preserves_semantic_channels` — fail a `sampled_cache_hits`
-  assertion, and fail the same way in a small filter where no skipping occurs. They have presumably
-  been failing for as long as they have been skipped.
+- **The skips hid a real failure for the entire life of the tree.** Three cases —
+  `sampled_and_sampler_still_renders`, `sampled_identity_fast_path_skips_content_compare` and
+  `sampled_rgba_upload_to_bgra_target_preserves_semantic_channels` — failed a `sampled_cache_hits`
+  assertion, and they were right: the sampled content cache could not hit until the submission ring
+  wrapped, so an unchanging texture re-uploaded for `RING_DEPTH - 1` draws. Fixed by reaping the
+  oldest signaled run in `begin_entry`.
+
+  What let it hide for so long is worth more than the bug. **Every assertion in the suite that the
+  cache *hits* was inside one of those three masked cases. The assertions that passed were all
+  `sampled_cache_hits == 0`** — and a `== 0` assertion passes whether the cache works or is
+  completely broken. So the suite had no passing evidence the cache had ever hit even once, and it
+  read as green. When a subsystem's positive tests are all skipped, its negative tests do not hold
+  the line; they go quiet in exactly the same shape as success.
+
+  Re-measured after the fix: each of the 42 cases run one at a time, `--exact`, all 42 pass with
+  `grep -c SKIP` of **0** each. There is no remaining masked failure. Note this does not test
+  *ordering* — a full run still cannot execute every case, so state leaking between cases is
+  untested by construction.
+
+  The "4 failed" this section used to claim is retracted. The fourth was
+  `warm_identical_draw_zero_creates_and_allocs`, and it failed only under the retained-`DeviceContext`
+  patch used to un-skip the suite — that patch keeps a warm pipeline cache, which is precisely what
+  that case measures. The instrument manufactured the fourth failure, which is the same trap as the
+  `magick compare -metric AE` residue count above: a number produced by the measurement, not by the
+  code.
 - **Hoisting the loader handle does nothing.** `ash::Entry::load()` dlopens libvulkan per
   `DeviceContext` and dropping the `Entry` dlcloses it, which looks like the mechanism and is not:
   making the `Entry` a process-wide `OnceLock` leaves the count at exactly 20. The ICD is unloaded
