@@ -829,6 +829,16 @@ fn flush_render_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
 ) -> bool {
     let started = std::time::Instant::now();
+    // Counted on the same one-line-per-second census as the Store routes, so a
+    // boot reads `surface_deferred=N surface_flush=M` on one line.
+    //
+    // That ratio is the only thing that separates a deferral from a
+    // rescheduling, and nothing else can report it: a reader draining every
+    // window every frame arms and flushes at identical rates and is
+    // indistinguishable from a working rail by arm count alone. M << N is the
+    // win; M ≈ N means some guest-page reader is asking for these bytes anyway
+    // and the next question is which one.
+    crate::runtime::drain::note_store_route("surface_flush");
     // Recycled-pages guard, identical in intent to the compute rail's below and
     // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
     // arm time (ReplacePhysical, unmap/remap) points at pages this window's
