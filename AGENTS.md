@@ -1571,6 +1571,60 @@ Behavior changes need tests that fail without the change. Bug fixes need a focus
 or proxy test for the bug class. Run Rust tests serially with `-- --test-threads=1`; GPU-touching
 tests are not safe to run in parallel.
 
+### Four Deletion Candidates That Do Not Survive Reading The Code
+
+Audited 2026-07-30 by hand after a subagent sweep nominated each. All four **rejected**, with the
+mechanism recorded so the next sweep — which will nominate them again, because they look identical
+from a distance — costs a read rather than a session. Per "exclusions decay", each names what would
+overturn it.
+
+**`census/srgb_census.rs` — keep. The nomination inverted the rule.** It was proposed for deletion on
+the grounds that it "carries a typed decline slug ✓", read as evidence the refusal is reported
+elsewhere. It is not: `note_downgrade` **is** the emitter — it calls `observe::fail` with
+`SRGB_DOWNGRADED_SLUG` itself, and its module doc says the class it exists for is that the fold "used
+to be **silent** … at twelve independent sites, with nothing in the fail log". Deleting it
+manufactures exactly the silent failure the ground rules forbid. The rule reads the other way round:
+a census carrying **no** slug is the tally suspect; one that *is* the slug's only writer is the
+report. Cheap, too — deduped per (site, format), bounded by 6 sites times the sRGB formats. It has
+fired **0 times in the whole accumulated log**, which its own doc names as the healthy reading ("no
+lines means the guest never asked for sRGB"), not as evidence of uselessness.
+
+**`census/t11_decline.rs` — keep, and the reason is not the census.** This one *is* a true tally: no
+slug, `observe::off` only, cumulative atomics, throttled one line per 256 declines — and it has
+produced **0 lines in the entire recorded history**, so on this rig the "hundreds of MB/session"
+lever it was built to size does not exist. That is a real argument for deleting it, and it loses to a
+better one: `t11_decline::Reason` is the `Err` type of `try_type11_sample_zero_copy`, used at 19
+sites, and the census is its **only** consumer. Delete the census and the enum is dead; delete both
+and nine typed early-outs collapse into an `Option` — which is the "one status for N checks" regress
+that the typed-decline work already ended, re-introduced on a rail whose failure mode is a silent CPU
+copy. Overturn it by giving `Reason` a second reader (a typed decline at the call site), then the
+tally goes.
+
+**`blit_exec.rs` `read_texture_row` / `write_texture_row` (lines ~854–1008) — reject, same mechanism
+as the b2t/t2b pair above.** 148 lines that are genuinely near-identical; the merge still loses. The
+two carry **16 distinct slug literals** between them (`rd_row_*` / `wr_row_*`), and slugs cannot be
+built by concatenation — `observe/gate.rs` finds them by lexing the source for literals, so a
+runtime-assembled slug is invisible to the gate. A merged form therefore needs eight `&'static str`
+parameters passed at each of two call sites, which costs more than it saves. Independently, the
+buffer is `&mut [u8]` one way and `&[u8]` the other, so it cannot be one parameter without an enum or
+closure. This is the third time this shape has been nominated and rejected; the discriminator is
+always "count the slug literals first".
+
+**`mapping_write.rs` `read_raw_rows` / `write_raw_rows` (lines ~486–622) — reject on auditability,
+not on line count.** These return `bool`, so the slug argument does not apply and a merge would
+genuinely save ~55 lines. It is still the wrong trade: both bodies end in an
+`unsafe { copy_nonoverlapping }` over a raw `contig_for_span` pointer, and merging makes the copy
+*direction* a runtime flag inside that unsafe block. This crate has an open, unexplained
+guest-memory-corruption signature — seven kernel panics with a uniformly random victim process — and
+these two writers are named in that section as hand-audited **Sound**. Trading the readability of a
+raw guest-memory copy for 55 lines, while a corruption class is open and unattributed, is a bad deal.
+Overturn it if the corruption class is ever closed.
+
+The transferable point: three of the four were rejected by reading **one specific thing** — who calls
+`observe::fail`, who else reads the enum, how many slug literals there are, whether the block is
+`unsafe`. A size-and-similarity sweep cannot see any of them, so treat every such nomination as a
+pointer to a file, never as a finding.
+
 ### Do Not Overfit Fixes
 
 Never special-case behavior for a screenshot, boot stage, pixel dimension, resource size, object id,
