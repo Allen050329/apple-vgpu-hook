@@ -535,15 +535,9 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     let fresh = vec![0x11u8; need];
     assert!(write_bgra8(&mut state, &mut host, 1, &fresh, stride, w, h));
     state.note_surface_composite(1);
-    assert!(crate::runtime::scanout::note_linear_compositor_edge(
-        &mut state, 1, w, h, 11
-    ));
     let stale = vec![0x55u8; need];
     assert!(write_bgra8(&mut state, &mut host, 5, &stale, stride, w, h));
     state.note_surface_composite(5);
-    assert!(crate::runtime::scanout::note_linear_compositor_edge(
-        &mut state, 5, w, h, 12
-    ));
     // Both members are genuine swapchain buffers that alternate as the presented
     // front; mid 1 has been displayed once at this geometry.
     state.note_presented_geom(1, w, h);

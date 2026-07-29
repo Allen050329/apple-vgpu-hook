@@ -1425,36 +1425,6 @@ pub fn note_compositor_edge(
     true
 }
 
-/// Record a successful same-geometry linear-texture → type-11 dependency.
-///
-/// Type-2/3 textures have no surface mapping id, so the traced source is the
-/// decoded linear-input class rather than a mapping id. Exact input/output
-/// geometry and a mapped output are required; content occupancy is never
-/// inspected. Measure-only, like [`note_compositor_edge`].
-pub fn note_linear_compositor_edge(
-    state: &mut DeviceState,
-    output_mapping: u32,
-    width: u32,
-    height: u32,
-    pipeline_ref: u32,
-) -> bool {
-    if output_mapping == 0 || width == 0 || height == 0 {
-        return false;
-    }
-    let Some(output_generation) = state.mappings.get(&output_mapping).and_then(|m| {
-        (m.has_geom && m.width == width && m.height == height).then_some(m.content_generation)
-    }) else {
-        return false;
-    };
-
-    // Per-present linear-source edge re-assertion; gate behind REIMS_VGPU_DRAW_LOG
-    // for the same reason as the sampled-source edge above.
-    crate::observe::line(format!(
-        "compositor_edge source=linear output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
-    ));
-    true
-}
-
 /// After a successful type-11 color writeback: maybe latch front mapping / paint.
 ///
 /// Contract:
@@ -1838,44 +1808,6 @@ mod tests {
         // An unmapped output has no geometry to match against.
         assert!(state.unmap_surface(6));
         assert!(!note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
-    }
-
-    #[test]
-    fn linear_compositor_proxy_records_only_matching_output_geometry() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        assert!(state.map_surface(6));
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 64;
-        m.height = 48;
-        m.content_generation = 9;
-
-        let pipeline_ref = std::process::id();
-        assert!(note_linear_compositor_edge(
-            &mut state,
-            6,
-            64,
-            48,
-            pipeline_ref
-        ));
-        // Not the output's own render-target geometry: not this edge.
-        assert!(!note_linear_compositor_edge(
-            &mut state,
-            6,
-            63,
-            48,
-            pipeline_ref
-        ));
-        // An unmapped output has no geometry to match against.
-        assert!(state.unmap_surface(6));
-        assert!(!note_linear_compositor_edge(
-            &mut state,
-            6,
-            64,
-            48,
-            pipeline_ref
-        ));
     }
 
     #[test]

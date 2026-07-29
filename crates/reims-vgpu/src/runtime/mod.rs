@@ -59,7 +59,6 @@ pub mod scanout;
 pub mod spirv_bind;
 mod spirv_layout;
 /// Bounded structural evaluation of vertex clip positions (coverage proof).
-pub mod spirv_vertex_eval;
 /// Deferred compute-writeback flush (flush-on-access; resident authoritative).
 pub mod storage_flush;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).

@@ -115,41 +115,6 @@ fn reflection_is_wellformed_and_complete_for_every_texture_binding() {
     );
 }
 
-/// The reflection-derived shader-pull coverage gate (which retired the
-/// `vertex_position_interface` walk) is well-defined for every vertex fixture:
-/// reflection carries `vertex_builtins`, and the gate is self-consistent with the
-/// buffer-binding list (gate true ⟹ at least one pulled buffer). Verified
-/// byte-for-byte equal to the old walk gate across this corpus before the walk was
-/// deleted (see journal).
-#[test]
-fn vertex_pull_gate_is_wellformed_from_reflection() {
-    if !have_llvm_dis() {
-        eprintln!("skipping: llvm-dis not on PATH");
-        return;
-    }
-    let mut checked = 0usize;
-    for &(name, stage) in FIXTURES {
-        if stage != Stage::Vertex {
-            continue;
-        }
-        let (_spirv, reflection) = translate_reflected(name, stage);
-        assert!(
-            reflection.vertex_builtins.is_some(),
-            "{name} ({stage:?}): vertex stage must carry vertex_builtins"
-        );
-        let gate = spirv_bind::vertex_position_pull_gate(&reflection);
-        let bindings = spirv_bind::vertex_pull_buffer_bindings(&reflection);
-        if gate {
-            assert!(
-                !bindings.is_empty(),
-                "{name} ({stage:?}): gate true but no pulled buffer bindings"
-            );
-        }
-        checked += 1;
-    }
-    assert!(checked > 0, "no vertex fixtures exercised the gate");
-}
-
 /// The reflected translate populates the datalayout (the single source of truth
 /// the layout repair now consumes) and the stage — proving the toolchain path
 /// reims-vgpu's m2v_cache now relies on is live on this host.

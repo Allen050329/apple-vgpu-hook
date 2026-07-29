@@ -176,7 +176,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 width,
                 height,
                 display_sample_mids,
-                full_geometry_linear_sample,
                 full_quad_bounds,
             }) => {
                 draw_resident = Some((
@@ -185,7 +184,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     width,
                     height,
                     display_sample_mids,
-                    full_geometry_linear_sample,
                     full_quad_bounds,
                 ));
                 crate::observe::line(format!(
@@ -282,7 +280,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // No CPU write_bgra8 fallback for type-11 composite Stores.
     #[cfg(feature = "backend-vulkan")]
     if writeback_guest {
-        if let Some((identity, mid, w, h, display_sample_mids, linear_sample, full_quad_bounds)) =
+        if let Some((identity, mid, w, h, display_sample_mids, full_quad_bounds)) =
             draw_resident.take()
         {
             use crate::runtime::import_present::{
@@ -345,15 +343,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 state.present.frame_mapping
             ));
             if pages_ok {
-                if linear_sample {
-                    let _ = crate::runtime::scanout::note_linear_compositor_edge(
-                        state,
-                        mid,
-                        w,
-                        h,
-                        req.pipeline_ref,
-                    );
-                }
                 for source_mid in display_sample_mids {
                     let _ = crate::runtime::scanout::note_compositor_edge(
                         state,
@@ -613,7 +602,6 @@ type DrawResident = (
     u32,
     u32,
     Vec<u32>,
-    bool,
     bool,
 );
 
@@ -3350,166 +3338,6 @@ fn engine_unattributed_us(engine_us: u64, phases: &[u64]) -> u64 {
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct FullTargetCoverage {
-    bounds_span: bool,
-    triangles_cover: bool,
-}
-
-impl FullTargetCoverage {
-    fn full(self) -> bool {
-        self.bounds_span && self.triangles_cover
-    }
-}
-
-/// A fail-closed shader-pulled coverage proof.
-///
-/// Evaluator failures delegate their exact registered reason; the remaining
-/// variants name the command/geometry checks around evaluation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ShaderPulledCoverageDecline {
-    ZeroTarget,
-    PartialViewportOrScissor,
-    IndexStreamInvalid,
-    TooFewIndices { count: usize },
-    VertexEval(crate::runtime::spirv_vertex_eval::VertexEvalDecline),
-    PositionWDegenerate { vertex_index: u32 },
-    PositionNotFinite { vertex_index: u32 },
-    TriangleGap,
-    PartialBounds,
-}
-
-impl Decline for ShaderPulledCoverageDecline {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::ZeroTarget => "shader_pulled_coverage_zero_target",
-            Self::PartialViewportOrScissor => "shader_pulled_coverage_partial_viewport_or_scissor",
-            Self::IndexStreamInvalid => "shader_pulled_coverage_index_stream_invalid",
-            Self::TooFewIndices { .. } => "shader_pulled_coverage_too_few_indices",
-            Self::VertexEval(reason) => reason.slug(),
-            Self::PositionWDegenerate { .. } => "shader_pulled_coverage_position_w_degenerate",
-            Self::PositionNotFinite { .. } => "shader_pulled_coverage_position_not_finite",
-            Self::TriangleGap => "shader_pulled_coverage_triangle_gap",
-            Self::PartialBounds => "shader_pulled_coverage_partial_bounds",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        match self {
-            Self::TooFewIndices { count } => vec![("count", count.to_string())],
-            Self::VertexEval(reason) => reason.fields(),
-            Self::PositionWDegenerate { vertex_index }
-            | Self::PositionNotFinite { vertex_index } => {
-                vec![("vertex_index", vertex_index.to_string())]
-            }
-            _ => Vec::new(),
-        }
-    }
-}
-
-impl From<crate::runtime::spirv_vertex_eval::VertexEvalDecline> for ShaderPulledCoverageDecline {
-    fn from(reason: crate::runtime::spirv_vertex_eval::VertexEvalDecline) -> Self {
-        Self::VertexEval(reason)
-    }
-}
-
-/// Whether decoded triangle geometry covers the complete color target.
-///
-/// This is resource/command geometry only: viewport, scissor, topology, index
-/// stream, and location-0 Float position data. It never inspects rendered
-/// pixels. A global vertex bounding box is not sufficient: two disjoint quads
-/// can touch opposite target edges while leaving a large uncovered rectangle.
-#[cfg(feature = "backend-vulkan")]
-fn draw_full_target_coverage(
-    resources: &crate::backend::vulkan::engine::DrawRequest,
-    width: u32,
-    height: u32,
-    vertex_count: u32,
-) -> FullTargetCoverage {
-    let mut coverage = FullTargetCoverage::default();
-    if width == 0 || height == 0 {
-        return coverage;
-    }
-    if !full_viewport_scissor(resources, width, height) {
-        return coverage;
-    }
-
-    let Some(position) = resources.vertex_attributes.iter().find(|a| {
-        a.location == 0
-            && a.step_function == crate::backend::vulkan::engine::VertexStepFunction::PerVertex
-            && matches!(
-                a.format,
-                crate::backend::vulkan::engine::VertexAttributeFormat::Float2
-                    | crate::backend::vulkan::engine::VertexAttributeFormat::Float3
-                    | crate::backend::vulkan::engine::VertexAttributeFormat::Float4
-            )
-    }) else {
-        return coverage;
-    };
-    if position.stride == 0 {
-        return coverage;
-    }
-
-    let Some(indices) = decode_coverage_indices(resources, vertex_count) else {
-        return coverage;
-    };
-    if indices.len() < 3 {
-        return coverage;
-    }
-
-    let mut positions = std::collections::BTreeMap::<u32, [f64; 2]>::new();
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    let position_bytes = position.content.cpu_bytes();
-    for &index in &indices {
-        let Some(off) = (index as usize)
-            .checked_mul(position.stride as usize)
-            .and_then(|v| v.checked_add(position.offset as usize))
-        else {
-            return coverage;
-        };
-        let Some(raw) = position_bytes.get(off..off.saturating_add(8)) else {
-            return coverage;
-        };
-        let x = f32::from_le_bytes(raw[0..4].try_into().unwrap());
-        let y = f32::from_le_bytes(raw[4..8].try_into().unwrap());
-        if !x.is_finite() || !y.is_finite() {
-            return coverage;
-        }
-        positions.insert(index, [f64::from(x), f64::from(y)]);
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-
-    let pixel_space =
-        min_x <= 0.0 && min_y <= 0.0 && max_x >= width as f32 && max_y >= height as f32;
-    let ndc_space = min_x <= -1.0 && min_y <= -1.0 && max_x >= 1.0 && max_y >= 1.0;
-    coverage.bounds_span = pixel_space || ndc_space;
-    if !coverage.bounds_span {
-        return coverage;
-    }
-
-    if ndc_space && !pixel_space {
-        for position in positions.values_mut() {
-            position[0] = (position[0] + 1.0) * f64::from(width) * 0.5;
-            position[1] = (position[1] + 1.0) * f64::from(height) * 0.5;
-        }
-    }
-
-    coverage.triangles_cover = triangle_union_covers(
-        &positions,
-        &indices,
-        resources.primitive_topology,
-        width,
-        height,
-    );
-    coverage
-}
-
 /// Decoded location-0 position AABB over the drawn index set, plus index
 /// count. Raw vertex-space values (pixel or NDC — per-pipe contract); no
 /// coverage judgment, no pixel inspection. `None` when there is no per-vertex
@@ -3559,31 +3387,6 @@ fn draw_position_bounds(
     Some(([min_x, min_y, max_x, max_y], indices.len()))
 }
 
-/// Whether every viewport/scissor covers the complete target.
-#[cfg(feature = "backend-vulkan")]
-fn full_viewport_scissor(
-    resources: &crate::backend::vulkan::engine::DrawRequest,
-    width: u32,
-    height: u32,
-) -> bool {
-    if resources.viewports.iter().any(|vp| {
-        !vp.x.is_finite()
-            || !vp.y.is_finite()
-            || !vp.width.is_finite()
-            || !vp.height.is_finite()
-            || vp.x > 0.0
-            || vp.y > 0.0
-            || vp.x + vp.width < width as f32
-            || vp.y + vp.height < height as f32
-    }) {
-        return false;
-    }
-    !resources
-        .scissors
-        .iter()
-        .any(|sc| sc.x != 0 || sc.y != 0 || sc.width < width || sc.height < height)
-}
-
 /// Decode the validated vertex-index stream for a coverage proof.
 #[cfg(feature = "backend-vulkan")]
 fn decode_coverage_indices(
@@ -3622,311 +3425,6 @@ fn decode_coverage_indices(
     }
 }
 
-/// Prove continuous scanline coverage across every target pixel-center row.
-/// Linear in target height and triangle count; callers pre-filter with the
-/// cheaper bounds test so ordinary partial draws never pay this walk.
-#[cfg(feature = "backend-vulkan")]
-fn triangle_union_covers(
-    positions: &std::collections::BTreeMap<u32, [f64; 2]>,
-    indices: &[u32],
-    topology: crate::backend::vulkan::engine::PrimitiveTopology,
-    width: u32,
-    height: u32,
-) -> bool {
-    use crate::backend::vulkan::engine::PrimitiveTopology;
-    let triangles: Vec<[u32; 3]> = match topology {
-        PrimitiveTopology::Triangle => indices
-            .chunks_exact(3)
-            .map(|triangle| [triangle[0], triangle[1], triangle[2]])
-            .collect(),
-        PrimitiveTopology::TriangleStrip => indices
-            .windows(3)
-            .enumerate()
-            .map(|(i, triangle)| {
-                if i & 1 == 0 {
-                    [triangle[0], triangle[1], triangle[2]]
-                } else {
-                    [triangle[1], triangle[0], triangle[2]]
-                }
-            })
-            .collect(),
-        PrimitiveTopology::Point | PrimitiveTopology::Line | PrimitiveTopology::LineStrip => {
-            return false;
-        }
-    };
-    if triangles.is_empty() {
-        return false;
-    }
-
-    let target_left = 0.5f64;
-    let target_right = f64::from(width) - 0.5;
-    const EDGE_EPSILON: f64 = 1.0e-6;
-    for row in 0..height {
-        let sample_y = f64::from(row) + 0.5;
-        let mut intervals = Vec::<[f64; 2]>::new();
-        for triangle in &triangles {
-            let Some(vertices) = triangle
-                .iter()
-                .map(|index| positions.get(index).copied())
-                .collect::<Option<Vec<_>>>()
-            else {
-                return false;
-            };
-            let mut intersections = Vec::with_capacity(6);
-            for edge in 0..3 {
-                let a = vertices[edge];
-                let b = vertices[(edge + 1) % 3];
-                let min_y = a[1].min(b[1]);
-                let max_y = a[1].max(b[1]);
-                if sample_y + EDGE_EPSILON < min_y || sample_y - EDGE_EPSILON > max_y {
-                    continue;
-                }
-                let dy = b[1] - a[1];
-                if dy.abs() <= EDGE_EPSILON {
-                    intersections.push(a[0]);
-                    intersections.push(b[0]);
-                } else {
-                    let t = (sample_y - a[1]) / dy;
-                    if (-EDGE_EPSILON..=1.0 + EDGE_EPSILON).contains(&t) {
-                        intersections.push(a[0] + t * (b[0] - a[0]));
-                    }
-                }
-            }
-            if intersections.len() >= 2 {
-                let left = intersections.iter().copied().fold(f64::INFINITY, f64::min);
-                let right = intersections
-                    .iter()
-                    .copied()
-                    .fold(f64::NEG_INFINITY, f64::max);
-                if left.is_finite() && right.is_finite() && right >= left {
-                    intervals.push([left, right]);
-                }
-            }
-        }
-        intervals.sort_by(|a, b| a[0].total_cmp(&b[0]));
-        let mut covered_right = target_left;
-        let mut started = false;
-        for [left, right] in intervals {
-            if right + EDGE_EPSILON < target_left || left - EDGE_EPSILON > target_right {
-                continue;
-            }
-            if !started {
-                if left > target_left + EDGE_EPSILON {
-                    return false;
-                }
-                covered_right = right;
-                started = true;
-            } else if left > covered_right + EDGE_EPSILON {
-                return false;
-            } else {
-                covered_right = covered_right.max(right);
-            }
-            if covered_right >= target_right - EDGE_EPSILON {
-                break;
-            }
-        }
-        if !started || covered_right < target_right - EDGE_EPSILON {
-            return false;
-        }
-    }
-    true
-}
-
-/// Coverage proof for shader-pulled positions: evaluate the translated vertex
-/// SPIR-V against the decoded bound buffer bytes for every drawn index, then
-/// run the same bounds + triangle-union proof in pixel space. Every failure is
-/// a named slug for the `linear_coverage_gap` line; callers must treat it as
-/// "coverage unproven", never as a position default.
-#[cfg(feature = "backend-vulkan")]
-fn draw_full_target_coverage_shader_pulled(
-    resources: &crate::backend::vulkan::engine::DrawRequest,
-    width: u32,
-    height: u32,
-    vertex_count: u32,
-    v_words: &[u32],
-) -> Result<FullTargetCoverage, ShaderPulledCoverageDecline> {
-    let mut coverage = FullTargetCoverage::default();
-    if width == 0 || height == 0 {
-        return Err(ShaderPulledCoverageDecline::ZeroTarget);
-    }
-    if !full_viewport_scissor(resources, width, height) {
-        return Err(ShaderPulledCoverageDecline::PartialViewportOrScissor);
-    }
-    let indices = decode_coverage_indices(resources, vertex_count)
-        .ok_or(ShaderPulledCoverageDecline::IndexStreamInvalid)?;
-    if indices.len() < 3 {
-        return Err(ShaderPulledCoverageDecline::TooFewIndices {
-            count: indices.len(),
-        });
-    }
-    let mut unique = indices.clone();
-    unique.sort_unstable();
-    unique.dedup();
-    let buffer_views: Vec<(u32, std::borrow::Cow<'_, [u8]>)> = resources
-        .storage_buffers
-        .iter()
-        .map(|b| (b.binding, b.content.cpu_bytes()))
-        .collect();
-    let buffers: Vec<(u32, &[u8])> = buffer_views
-        .iter()
-        .map(|(binding, view)| (*binding, view.as_ref()))
-        .collect();
-    let clip = crate::runtime::spirv_vertex_eval::evaluate_vertex_clip_positions(
-        v_words,
-        &buffers,
-        &unique,
-        resources.base_instance,
-    )?;
-    let mut positions = std::collections::BTreeMap::<u32, [f64; 2]>::new();
-    let mut min_x = f64::INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    for (index, clip) in unique.iter().zip(&clip) {
-        let clip_w = f64::from(clip[3]);
-        if !clip_w.is_finite() || clip_w.abs() < 1.0e-9 {
-            return Err(ShaderPulledCoverageDecline::PositionWDegenerate {
-                vertex_index: *index,
-            });
-        }
-        let ndc_x = f64::from(clip[0]) / clip_w;
-        let ndc_y = f64::from(clip[1]) / clip_w;
-        if !ndc_x.is_finite() || !ndc_y.is_finite() {
-            return Err(ShaderPulledCoverageDecline::PositionNotFinite {
-                vertex_index: *index,
-            });
-        }
-        let px = (ndc_x + 1.0) * f64::from(width) * 0.5;
-        let py = (ndc_y + 1.0) * f64::from(height) * 0.5;
-        positions.insert(*index, [px, py]);
-        min_x = min_x.min(px);
-        min_y = min_y.min(py);
-        max_x = max_x.max(px);
-        max_y = max_y.max(py);
-    }
-    // Sub-half-pixel slack absorbs f32 transform rounding; the scanline proof
-    // below (against exact pixel centers) remains the authority.
-    const BOUNDS_EPSILON_PX: f64 = 1.0e-3;
-    coverage.bounds_span = min_x <= BOUNDS_EPSILON_PX
-        && min_y <= BOUNDS_EPSILON_PX
-        && max_x >= f64::from(width) - BOUNDS_EPSILON_PX
-        && max_y >= f64::from(height) - BOUNDS_EPSILON_PX;
-    if !coverage.bounds_span {
-        return Ok(coverage);
-    }
-    coverage.triangles_cover = triangle_union_covers(
-        &positions,
-        &indices,
-        resources.primitive_topology,
-        width,
-        height,
-    );
-    Ok(coverage)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_compositor_linear_coverage(
-    output_mapping: u32,
-    width: u32,
-    height: u32,
-    pipeline_ref: u32,
-    full: bool,
-    bounds_span: bool,
-    vertex_count: u32,
-    indexed: bool,
-    viewport: Option<[f64; 4]>,
-    scissor: Option<(u32, u32, u32, u32)>,
-    src: &str,
-) {
-    // This census is emitted for every same-geometry linear-sample draw. Under an
-    // active compositor (e.g. Notification Center widgets, which draw tens of
-    // thousands of vertex-pulled tile quads) that is tens of thousands of always-on
-    // writes per interaction — a render-worker stall AND a flood that drowns
-    // genuine failure lines. Dedup to one line per distinct
-    // (mid, pipe, full, bounds, src) verdict, so every coverage-state transition is
-    // still fail-visible while steady-state repeats are suppressed.
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    type FullTargetVerdictKey = (u32, u32, bool, bool, String);
-    static SEEN: Mutex<Option<HashSet<FullTargetVerdictKey>>> = Mutex::new(None);
-    let first = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get_or_insert_with(HashSet::new).insert((
-            output_mapping,
-            pipeline_ref,
-            full,
-            bounds_span,
-            src.to_string(),
-        ))
-    };
-    if !first {
-        return;
-    }
-    crate::observe::off(format!(
-        "compositor_linear_coverage output_mid={output_mapping} {width}x{height} pipe={pipeline_ref} full={} bounds={} src={src} vtx={vertex_count} indexed={} viewport={viewport:?} scissor={scissor:?}",
-        full as u8,
-        bounds_span as u8,
-        indexed as u8,
-    ));
-    if bounds_span && !full {
-        crate::observe::off(format!(
-            "linear_coverage_gap reason=bounds_only_triangle_gap action=reject_edge output_mid={output_mapping} {width}x{height} pipe={pipeline_ref} vtx={vertex_count} indexed={}",
-            indexed as u8
-        ));
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_shader_pulled_coverage_gap(
-    output_mapping: u32,
-    width: u32,
-    height: u32,
-    pipeline_ref: u32,
-    vertex_count: u32,
-    indexed: bool,
-    reflection: &metal2vulkan::reflect::ShaderReflection,
-    decline: &ShaderPulledCoverageDecline,
-) {
-    if !crate::runtime::spirv_bind::vertex_position_pull_gate(reflection) {
-        return;
-    }
-    // Vertex-pulled compositor tiles (Notification Center widgets) issue this
-    // rejected-edge shape on every partial-coverage draw — 25k+ per interaction on
-    // a single 1024x1024 tile. Dedup to one line per distinct (mid, pipe, eval) so
-    // each unresolved-position cause stays fail-visible without flooding the
-    // always-on log or stalling the render worker.
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<(u32, u32, String)>>> = Mutex::new(None);
-    let rendered = crate::observe::Emit::decline("linear_coverage_gap", decline).render();
-    let first = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get_or_insert_with(HashSet::new)
-            .insert((output_mapping, pipeline_ref, rendered))
-    };
-    if !first {
-        return;
-    }
-    let bindings = crate::runtime::spirv_bind::vertex_pull_buffer_bindings(reflection)
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    crate::observe::Emit::decline("linear_coverage_gap", decline)
-        .field("class", "shader_pulled_position_unresolved")
-        .field("action", "reject_edge")
-        .field("output_mid", output_mapping)
-        .field("width", width)
-        .field("height", height)
-        .field("pipe", pipeline_ref)
-        .field("vtx", vertex_count)
-        .field("indexed", indexed as u8)
-        .field("position_out", 1)
-        .field("vertex_index", 1)
-        .field("storage_bindings", format!("[{bindings}]"))
-        .off();
-}
-
 /// Result of a Linux metal2vulkan draw.
 #[cfg(feature = "backend-vulkan")]
 enum M2vDrawSpan {
@@ -3943,8 +3441,6 @@ enum M2vDrawSpan {
         height: u32,
         /// Non-self full-geometry type-11 inputs resolved by this draw.
         display_sample_mids: Vec<u32>,
-        /// A decoded same-geometry type-2/3 input covered the full output.
-        full_geometry_linear_sample: bool,
         /// Decoded location-0 bounds span the full target (pixel or NDC) —
         /// diagnostic provenance for the `fullquad_store_noop` proxy.
         full_quad_bounds: bool,
@@ -4691,7 +4187,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         let mut display_sample_mids: std::collections::BTreeSet<u32> = Default::default();
-        let mut full_geometry_linear_sample = false;
         let mut linear_sample_rows: Vec<sample_seed_relation::SampleRow> = Vec::new();
         // Measure multi-bind compositor: which refs load and with what occupancy.
         let mut tex_bind_diag: Vec<String> = Vec::new();
@@ -4845,9 +4340,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let t_stats = std::time::Instant::now();
                 if sampled_mid != 0 && tw == w && th == h {
                     display_sample_mids.insert(sampled_mid);
-                }
-                if is_linear_texture && sampled_mid == 0 && tw == w && th == h {
-                    full_geometry_linear_sample = true;
                 }
                 let mut bytes_identity = None;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a native
@@ -5826,85 +5318,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             req.vertex_count.max(1)
         };
         let output_mapping = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
-        let same_geometry_linear_sample = full_geometry_linear_sample && output_mapping != 0;
         let t_asm_load_done = std::time::Instant::now();
-        let mut linear_coverage = if same_geometry_linear_sample {
-            draw_full_target_coverage(&resources, w, h, vertex_count)
-        } else {
-            Default::default()
-        };
-        let mut linear_coverage_src = "stage_in";
-        if same_geometry_linear_sample && !linear_coverage.full() {
-            let has_stage_in_position = resources.vertex_attributes.iter().any(|attribute| {
-                attribute.location == 0
-                    && attribute.step_function
-                        == crate::backend::vulkan::engine::VertexStepFunction::PerVertex
-                    && matches!(
-                        attribute.format,
-                        crate::backend::vulkan::engine::VertexAttributeFormat::Float2
-                            | crate::backend::vulkan::engine::VertexAttributeFormat::Float3
-                            | crate::backend::vulkan::engine::VertexAttributeFormat::Float4
-                    )
-            });
-            if !has_stage_in_position {
-                // Gate the shader-pulled coverage proof from reflection (writes
-                // Position, reads VertexIndex, binds a buffer) — no SPIR-V walk.
-                if crate::runtime::spirv_bind::vertex_position_pull_gate(&v_shader.reflection) {
-                    {
-                        // No stage-in position: evaluate the translated vertex
-                        // SPIR-V against the decoded bound buffers to prove or
-                        // reject coverage generically (fail closed).
-                        let eval = draw_full_target_coverage_shader_pulled(
-                            &resources,
-                            w,
-                            h,
-                            vertex_count,
-                            &v_words,
-                        );
-                        let gap_slug = match eval {
-                            Ok(eval_coverage) if eval_coverage.full() => {
-                                linear_coverage = eval_coverage;
-                                linear_coverage_src = "shader_eval";
-                                None
-                            }
-                            Ok(eval_coverage) if eval_coverage.bounds_span => {
-                                Some(ShaderPulledCoverageDecline::TriangleGap)
-                            }
-                            Ok(_) => Some(ShaderPulledCoverageDecline::PartialBounds),
-                            Err(decline) => Some(decline),
-                        };
-                        if let Some(decline) = gap_slug {
-                            log_shader_pulled_coverage_gap(
-                                output_mapping,
-                                w,
-                                h,
-                                req.pipeline_ref,
-                                vertex_count,
-                                resources.indexed.is_some(),
-                                &v_shader.reflection,
-                                &decline,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let full_geometry_linear_sample = linear_coverage.full();
-        if same_geometry_linear_sample {
-            log_compositor_linear_coverage(
-                output_mapping,
-                w,
-                h,
-                req.pipeline_ref,
-                full_geometry_linear_sample,
-                linear_coverage.bounds_span,
-                vertex_count,
-                resources.indexed.is_some(),
-                req.viewport.map(|v| [v[0], v[1], v[2], v[3]]),
-                req.scissor,
-                linear_coverage_src,
-            );
-        }
         // Measure-only per-draw geometry census for display-sized type-11
         // targets: decoded location-0 position AABB over the drawn index set,
         // raw (no NDC/pixel disambiguation — the census consumer knows the
@@ -6545,7 +5959,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     width: w,
                     height: h,
                     display_sample_mids: display_sample_mids.into_iter().collect(),
-                    full_geometry_linear_sample,
                     full_quad_bounds,
                 });
             }
