@@ -179,6 +179,32 @@ that refused. If it did not, the fix is to make the callee carry its reason, not
 about the label. The "one status for N checks" collapse the typed-decline work already ended regrows
 anywhere a `-> bool` crosses a module boundary.
 
+**A measurement that a branch reads has stopped being a measurement. One is still live, and it is
+named here so it is not rediscovered a third time.** `runtime/census/README.md` states the rule
+outright — "Nothing in the device or backend may read one of these back to decide what to present,
+decode or execute. A proxy that changes behaviour has stopped being a proxy and become a content
+heuristic, which the ground rules forbid outright." `metal_draw/vulkan.rs`'s sampled-source resolve
+breaks it:
+
+```rust
+if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
+    let rgba = swap_rb_channels(bgra);
+    let (nz, _, _) = crate::observe::rgba_rgb_stats(&rgba);
+    if nz > 0 || !resident_ready {
+```
+
+`rgba_rgb_stats` is one of the sink's whole-frame pixel scanners, and `nz` is a count of non-black
+pixels. So *which image gets bound to a sampled texture* depends on whether the host cache's copy
+happens to contain a non-black pixel — an O(w·h) scan per bind whose result is a branch, on content,
+which is exactly the two things forbidden. "All black" is also a perfectly legal frame, so the
+heuristic mistakes a correct black surface for an empty one.
+
+Not changed here, because it selects what gets bound and this rig cannot boot to score the change.
+What it needs is the decoded contract — a resident/cache ready flag — rather than a look at the
+pixels. Flagged rather than fixed, with the caveat that the "measure-only" audits above walked past
+this line several times: a scan whose result is consumed by an `if` will not be found by grepping for
+census modules, because it is spelled as an ordinary function call on the hot path.
+
 **A pixel count is not a visual defect — read the magnitude.** `magick compare -metric AE` counts a
 pixel as differing if any channel differs *at all*, so a pixel off by 1/255 scores exactly like one
 off by 255/255. Every screen-difference number this project recorded for the residue class came from

@@ -645,33 +645,6 @@ pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
     (rgb_nz, max_rgb, px0)
 }
 
-/// RGB occupancy stats plus the transparent-pixel (`alpha == 0`) count in a
-/// single pass. The alpha-zero count distinguishes an opaque-black empty
-/// (`a0 == 0`) from a transparent empty (`a0 ≈ w*h`) for Load+premult wipe
-/// diagnosis. Folding it into the same scan that produces `rgb_nz` avoids a
-/// second full-texture pass on every RGBA8 sampled bind (the `rgb_nz` value is
-/// load-bearing and always computed; the a0 count adds one compare per pixel to
-/// an already-running loop rather than a whole extra O(w*h) scan). Returns
-/// `(rgb_nz, max_rgb, a0)`; `rgb_nz`/`max_rgb` are byte-identical to
-/// [`rgba_rgb_stats`].
-pub fn rgba_rgb_a0_stats(rgba: &[u8]) -> (usize, u8, usize) {
-    let mut rgb_nz = 0usize;
-    let mut max_rgb = 0u8;
-    let mut a0 = 0usize;
-    for px in rgba.chunks_exact(4) {
-        let m = px[0].max(px[1]).max(px[2]);
-        if m != 0 {
-            rgb_nz += 1;
-        }
-        if m > max_rgb {
-            max_rgb = m;
-        }
-        if px[3] == 0 {
-            a0 += 1;
-        }
-    }
-    (rgb_nz, max_rgb, a0)
-}
 
 #[cfg(test)]
 mod tests {
@@ -744,41 +717,6 @@ mod tests {
         assert_eq!(fused, bgra_present_stats_scalar(&frame));
     }
 
-    #[test]
-    fn rgba_rgb_a0_stats_fuses_a0_without_changing_rgb_stats() {
-        // Mixed content spanning the a0-relevant classes: transparent-black
-        // (a0, rgb-empty), opaque-black (rgb-empty but a0=0), colored-opaque,
-        // colored-transparent, saturated-opaque.
-        let rgba: Vec<u8> = vec![
-            0, 0, 0, 0, // transparent black -> a0, rgb-empty
-            0, 0, 0, 255, // opaque black -> NOT a0, rgb-empty
-            10, 20, 30, 255, // colored opaque -> rgb-nonzero
-            40, 0, 0, 0, // colored but fully transparent -> a0, rgb-nonzero
-            255, 255, 255, 255, // saturated opaque
-        ];
-        let (rgb_nz_ref, max_rgb_ref, _) = rgba_rgb_stats(&rgba);
-        let (rgb_nz, max_rgb, a0) = rgba_rgb_a0_stats(&rgba);
-        assert_eq!(
-            (rgb_nz, max_rgb),
-            (rgb_nz_ref, max_rgb_ref),
-            "fused helper must reproduce rgba_rgb_stats byte-for-byte"
-        );
-        assert_eq!(
-            rgb_nz, 3,
-            "two black pixels are rgb-empty; three are non-black"
-        );
-        assert_eq!(
-            a0, 2,
-            "two pixels have alpha==0 (transparent black + transparent red)"
-        );
-        assert_eq!(max_rgb, 255);
-        // The fused a0 must equal an independent alpha-zero scan for any content.
-        let a0_ref = rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
-        assert_eq!(a0, a0_ref);
-        // Empty/short guards.
-        assert_eq!(rgba_rgb_a0_stats(&[]), (0, 0, 0));
-        assert_eq!(rgba_rgb_a0_stats(&[0, 0, 0, 0]), (0, 0, 1));
-    }
 
     #[test]
     fn bgra_present_stats_byte_exact_with_sse2() {

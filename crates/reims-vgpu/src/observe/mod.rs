@@ -60,7 +60,7 @@ pub use zero_copy_lost::ZeroCopyLost;
 // for readers who want the machinery.
 pub use sink::{
     bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, fail, line, nonzero_stats, off,
-    redirect_logs_for_tests, rgba_rgb_a0_stats, rgba_rgb_stats,
+    redirect_logs_for_tests, rgba_rgb_stats,
 };
 pub(crate) use sink::{draw_log_enabled, elapsed_ms};
 
