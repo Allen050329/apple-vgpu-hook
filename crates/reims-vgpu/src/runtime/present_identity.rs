@@ -77,4 +77,38 @@ mod tests {
             "geometry is part of the resident's shape"
         );
     }
+
+    /// A compositor swapchain — several scanout buffers presenting at ONE
+    /// geometry — must get one resident each.
+    ///
+    /// This is the shape that used to collapse: four buffers at 1920x1080
+    /// unified onto a single geometry-keyed resident, and a held drag that
+    /// reversed direction left a selection-rectangle fragment on the desktop.
+    /// Interleaved on/off A/B over four boots: 5 of 12 rounds reproduced with
+    /// the collapse, 1 of 12 without, and the dominant sub-class — a 15x15
+    /// fragment at the press point — went 4 to 0.
+    ///
+    /// What holds the line now is structural rather than a check a caller has
+    /// to remember: the mapping id is part of the registry key, so
+    /// `registry_get` on one buffer's identity cannot return another's. That
+    /// replaced an explicit `surface_mapping_id()` predicate, which the
+    /// geometry-keyed resolver needed and nothing does. The pairwise case above
+    /// states the same property; this one states it over the exact arity the
+    /// live defect had, because "distinct in pairs" is what a reader checks and
+    /// "four buffers, four residents" is what the compositor does.
+    #[test]
+    fn a_four_buffer_swapchain_at_one_geometry_gets_four_residents() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let ids: Vec<TargetIdentity> = [11u32, 12, 13, 14]
+            .iter()
+            .map(|&mid| surface_identity(&state, mid, 1920, 1080))
+            .collect();
+        for (i, a) in ids.iter().enumerate() {
+            for (j, b) in ids.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "scanout buffers {i} and {j} share a resident");
+                }
+            }
+        }
+    }
 }

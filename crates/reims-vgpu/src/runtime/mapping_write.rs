@@ -53,18 +53,6 @@ pub fn type5_sample_window(
     sample_window_prefer_device(desc, Some(plane_index), format, width, height)
 }
 
-/// Public contig-view probe for GPU-direct writeback planning: the packed
-/// host view of the whole mapping (base pointer + available length) covering
-/// at least `span_end` bytes, or `None` when fragmented.
-pub fn contig_ptr_for_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    span_end: u64,
-) -> Option<(usize, usize)> {
-    contig_for_span(state, host, mapping_id, span_end)
-}
-
 /// Revalidate + packed contig host view covering at least `span_end` bytes.
 ///
 /// Returns `None` when the mapping is fragmented on Linux (use
