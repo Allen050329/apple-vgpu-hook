@@ -1,6 +1,8 @@
 //! Resource descriptor decode (port of `host/utils/reims-vgpu-resource-decode`).
 
-use crate::contract::endian::{ld16, ld32, ld64, st16, st32}; // ld64: texture-view level base/count
+use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
+#[cfg(test)]
+use crate::contract::endian::{st16, st32}; // ICB layout fixture encoder only
 
 /// A refusal from the descriptor decoder.
 ///
@@ -1772,6 +1774,7 @@ pub fn decode_icb_command_layout(bytes: &[u8]) -> Result<IcbCommandLayout, Decod
 }
 
 /// Encode layout into 52 bytes (tests / fixtures).
+#[cfg(test)]
 pub fn encode_icb_command_layout(layout: &IcbCommandLayout) -> [u8; ICB_LAYOUT_LEN] {
     let mut b = [0u8; ICB_LAYOUT_LEN];
     st16(&mut b[0..], layout.command_type_offset);
@@ -1801,6 +1804,7 @@ pub fn encode_icb_command_layout(layout: &IcbCommandLayout) -> [u8; ICB_LAYOUT_L
 /// vertex → fragment → **object → mesh** → kernel, each `count × 0x14`, then
 /// attribute-stride table (`maxVertex × 8` when dynamic stride), object-TG
 /// lengths, kernel-TG lengths, then args.
+#[cfg(test)]
 pub fn render_icb_layout(
     max_vertex: u16,
     max_fragment: u16,
@@ -1810,6 +1814,7 @@ pub fn render_icb_layout(
 }
 
 /// Like [`render_icb_layout`] with object/mesh bind tables and object-TG lengths.
+#[cfg(test)]
 pub fn render_icb_layout_ex(
     max_vertex: u16,
     max_fragment: u16,
@@ -1884,36 +1889,43 @@ pub fn render_icb_layout_ex(
 }
 
 /// Draw-only convenience (commandTypes Draw).
+#[cfg(test)]
 pub fn render_only_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW)
 }
 
 /// DrawIndexed-only convenience.
+#[cfg(test)]
 pub fn render_draw_indexed_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW_INDEXED)
 }
 
 /// DrawPatches-only convenience (args 0x38 + tessellation factor table at 0x40).
+#[cfg(test)]
 pub fn render_draw_patches_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW_PATCHES)
 }
 
 /// DrawIndexedPatches-only convenience (args 0x4a).
+#[cfg(test)]
 pub fn render_draw_indexed_patches_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES)
 }
 
 /// DrawMeshThreads-only convenience (args 0x48, optional mesh bind slots).
+#[cfg(test)]
 pub fn render_draw_mesh_threads_icb_layout(max_mesh: u16) -> IcbCommandLayout {
     render_icb_layout_ex(0, 0, 0, max_mesh, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS)
 }
 
 /// DrawMeshThreadgroups-only convenience (args 0x48).
+#[cfg(test)]
 pub fn render_draw_mesh_threadgroups_icb_layout() -> IcbCommandLayout {
     render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS)
 }
 
 /// Mesh draw with object + mesh bind tables.
+#[cfg(test)]
 pub fn render_draw_mesh_threads_icb_layout_with_binds(
     max_object: u16,
     max_mesh: u16,
@@ -1929,6 +1941,7 @@ pub fn render_draw_mesh_threads_icb_layout_with_binds(
 }
 
 /// Object+mesh drawMeshThreadgroups with optional object TG memory slots.
+#[cfg(test)]
 pub fn render_draw_mesh_threadgroups_icb_layout_ex(
     max_object: u16,
     max_mesh: u16,
@@ -1949,6 +1962,7 @@ pub fn render_draw_mesh_threadgroups_icb_layout_ex(
 /// Matches `AppleParavirtIndirectCommandBuffer setupCommandLayout:` for the
 /// common product case (commandTypes=`1<<5`, inheritBuffers=false,
 /// inheritPipelineState=false). Threadgroup-memory table size 0 (no TG binds).
+#[cfg(test)]
 pub fn compute_only_icb_layout(max_kernel: u16) -> IcbCommandLayout {
     compute_icb_layout(max_kernel, 0)
 }
@@ -1959,6 +1973,7 @@ pub fn compute_only_icb_layout(max_kernel: u16) -> IcbCommandLayout {
 /// 1. `max_kernel × 8` attribute-stride u64s at `attributeStrideOffset`
 /// 2. `max_kernel_tg × 8` TG-memory length u64s at `threadgroupMemoryLengthOffset`
 /// 3. dispatch args. Barrier is u32 at `barrierOffset` (typically 4).
+#[cfg(test)]
 pub fn compute_icb_layout(max_kernel: u16, max_kernel_tg: u16) -> IcbCommandLayout {
     let pipeline = 0x60u32;
     let kernel_bind = 0x64u32;

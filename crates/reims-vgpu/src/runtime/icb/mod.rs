@@ -36,9 +36,12 @@ use crate::runtime::decode::resource::{
     ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED, ICB_CMD_TYPE_DRAW_INDEXED_PATCHES,
     ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS, ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES,
     ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN, ICB_DRAW_PATCHES_ARGS_LEN,
-    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, MTL_INDIRECT_CMD_DRAW,
-    MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES, MTL_INDIRECT_CMD_DRAW_PATCHES, OBJECT_TYPE_TYPE7,
+    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, OBJECT_TYPE_TYPE7,
 }; // ICB_TG_MEMORY_STRIDE: object + kernel TG length tables
+#[cfg(test)]
+use crate::runtime::decode::resource::{
+    MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES, MTL_INDIRECT_CMD_DRAW_PATCHES,
+}; // slot-encoder fixtures only
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::objects;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -783,6 +786,7 @@ fn read_tessellation_factor(layout: &IcbCommandLayout, slot: &[u8]) -> IcbTessel
     }
 }
 
+#[cfg(test)]
 fn write_tessellation_factor(
     layout: &IcbCommandLayout,
     slot: &mut [u8],
@@ -813,6 +817,7 @@ fn icb_layout_stage_bind_count(start: u32, end: u32) -> u16 {
 }
 
 /// Encode one render Draw / DrawIndexed command slot (tests / fixtures).
+#[cfg(test)]
 pub fn encode_render_command_slot(
     layout: &IcbCommandLayout,
     fill: &IcbRenderFill,
@@ -1024,6 +1029,7 @@ pub fn encode_render_command_slot(
 }
 
 /// Encode one compute command slot into ICB backing bytes (tests / fixtures).
+#[cfg(test)]
 pub fn encode_compute_command_slot(
     layout: &IcbCommandLayout,
     fill: &IcbComputeFill,
@@ -1468,6 +1474,7 @@ fn read_attribute_stride(layout: &IcbCommandLayout, slot: &[u8], index: u32) -> 
     }
 }
 
+#[cfg(test)]
 fn write_attribute_stride(
     layout: &IcbCommandLayout,
     slot: &mut [u8],
