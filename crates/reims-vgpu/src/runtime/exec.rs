@@ -735,7 +735,6 @@ fn handle_compute_record<M: HostMemory + HostOps>(
                 FenceDomain::ComputeFence,
                 cmd.fence_ref,
                 action,
-                0,
             );
             tally_fence(
                 st,
@@ -1327,7 +1326,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 FenceDomain::RenderFence,
                 cmd.fence_ref,
                 action,
-                0,
             );
             tally_fence(
                 st,

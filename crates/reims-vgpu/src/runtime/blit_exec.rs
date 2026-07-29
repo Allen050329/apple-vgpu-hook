@@ -2510,7 +2510,6 @@ pub fn execute_blit_fence(state: &mut DeviceState, task_id: u32, cmd: &Command) 
         FenceDomain::BlitFence,
         cmd.fence,
         action,
-        0,
     ))
 }
 

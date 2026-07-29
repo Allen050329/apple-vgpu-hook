@@ -51,8 +51,6 @@ pub mod mtlb;
 /// Object-list lookup and type-11 registration.
 pub mod objects;
 pub mod plan;
-/// GVA resolver traits (wraps [`crate::contract::gva_resolve`]).
-pub mod resolve;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
