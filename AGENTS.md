@@ -821,6 +821,29 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+**A green Vulkan suite does not mean the GPU ran it.** `tests/vk_engine_parity.rs` guards every
+GPU-executing case with a `skip_if_no_gpu` arm that prints `SKIP …` to stdout and **returns `ok`**.
+Cargo's summary cannot distinguish that from a pass. Measured in an agent environment with an
+NVIDIA GPU physically present, `/dev/dri/renderD128` readable and a `nvidia_icd.json` installed:
+
+| suite | reported | actually executed on the GPU |
+|---|---|---|
+| `vk_engine_parity` | `41 passed; 0 failed` | 21 — the other **20** skipped on `vk_init_create_instance vk_result=Unable_to_find_a_Vulkan_driver` |
+
+So `cargo test` alone verifies decode, planning and the CPU-side rails, and verifies **nothing**
+about barriers, layout transitions, pipeline state, descriptor writes or readback. Before landing a
+change to any of those, run the suite with `--nocapture` and read the SKIP count:
+
+```sh
+cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window \
+  --test vk_engine_parity -- --test-threads=1 --nocapture 2>&1 | grep -c SKIP
+```
+
+A nonzero count means the arm you are changing was not executed, and the honest options are a live
+boot, an exact **round trip** (as for `backend-metal` below), or not making the change. This is the
+"validate the specific thing you drove" rule applied to the test suite itself: the green summary is
+the healthy-looking log, and it is produced whether or not a driver exists.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
