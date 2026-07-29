@@ -844,6 +844,41 @@ boot, an exact **round trip** (as for `backend-metal` below), or not making the 
 "validate the specific thing you drove" rule applied to the test suite itself: the green summary is
 the healthy-looking log, and it is produced whether or not a driver exists.
 
+**The `vk_result` in that line is not the diagnosis — re-measured, the driver was there.** On a host
+with a working NVIDIA RTX 5080 (`vulkaninfo --summary` names it) the same 20 cases still skip, while
+`vk_engine_compute` runs **15 of 15 with zero SKIP** in the same environment and the same session.
+`Unable_to_find_a_Vulkan_driver` is what the loader *says*, not what is true, and the exclusion
+"this box has no GPU" that it invites is wrong.
+
+The failure is **positional, not per-test**. In the serial run, parity cases 1-19 execute and cases
+20-41 skip, every one of them, on a clean cliff. Any skipped case passes when run alone or in a
+small `--test` filter. What separates the arms is *how many times the suite has already torn the
+engine down*: `test_reset_engine` calls `ctx.destroy()`, which calls `vkDestroyInstance`, and the
+parity suite calls it 43 times. Sampling `/proc/PID/maps` through a run shows the `nvidia` mappings
+dropping to zero and reloading each cycle, and around the twentieth the reload stops working.
+
+Confirmed by intervention, not correlation: making `test_reset_engine` retain its `DeviceContext`
+instead of destroying it takes the SKIP count **from 20 to 0** in one run. That patch is not a fix
+and was reverted — a retained context keeps a warm pipeline cache, which is exactly what
+`warm_identical_draw_zero_creates_and_allocs` exists to measure, and that case fails under it.
+
+Two consequences worth knowing before touching this:
+
+- **The skips hide real failures.** With all 41 executing, the suite is 37 passed / **4 failed**.
+  Three of those — `sampled_and_sampler_still_renders`,
+  `sampled_identity_fast_path_skips_content_compare` and
+  `sampled_rgba_upload_to_bgra_target_preserves_semantic_channels` — fail a `sampled_cache_hits`
+  assertion, and fail the same way in a small filter where no skipping occurs. They have presumably
+  been failing for as long as they have been skipped.
+- **Hoisting the loader handle does nothing.** `ash::Entry::load()` dlopens libvulkan per
+  `DeviceContext` and dropping the `Entry` dlcloses it, which looks like the mechanism and is not:
+  making the `Entry` a process-wide `OnceLock` leaves the count at exactly 20. The ICD is unloaded
+  by `vkDestroyInstance`, not by releasing the loader. Predicted 0, measured 20, hypothesis dead.
+
+So to exercise a parity case on the GPU, **run it in a filter small enough to stay under the cycle
+limit** and confirm `grep -c SKIP` is 0 for that run. A full-suite count of 20 on a machine with a
+working driver is this ceiling, and says nothing about whether your change works.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
