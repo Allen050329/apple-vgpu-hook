@@ -499,28 +499,31 @@ fn resolve_indirect_threadgroups_from_buffer() {
     cmd.indirect_buffer_ref = 7;
     cmd.indirect_buffer_offset = 0;
     cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
-    let acc = ComputeAccum::default();
     let (gx, gy, gz, tx, ty, tz, threads) =
-        resolve_dispatch_dims(&mut state, &host, 1, &acc, &cmd).unwrap();
+        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
     assert_eq!((gx, gy, gz, tx, ty, tz, threads), (2, 3, 1, 8, 1, 1, false));
 }
 
+/// The wire shape that used to be "recovered" is now a named refusal.
+///
+/// `grid = [45, u64::MAX, 1]`, `tg = [32, 0, 1]` is a threadgroup with **zero**
+/// threads next to a grid axis of `u64::MAX` — both `y` components garbage while
+/// `x` and `z` are sane, which is a decode defect, not a sentinel the guest
+/// sends on purpose. The dispatch dimensions are taken from the wire and
+/// nowhere else, so this refuses with the slug of the check that refused it
+/// rather than substituting a grid derived from whichever bound texture happens
+/// to be largest.
 #[test]
-fn sentinel_grid_recovers_from_largest_texture() {
-    // Wire: grid=[45, UINT64_MAX, 1], tg=[32, 0, 1] → recover for 1440×1080.
+fn the_zero_threadgroup_wire_shape_is_refused_by_name() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 8, 8);
-    assert!(state.set_object_list(1, 0, 32));
-    // type-11 mapping as write target
+    // A bound write target at a plausible full-screen geometry: the deleted
+    // heuristic sourced its invented grid from exactly this, so its presence is
+    // what makes the refusal meaningful rather than incidental.
     assert!(state.map_surface(3));
     assert!(state.set_mapping_geom(3, 1440, 1080, 0x73));
-    // Register type-11 ref 10 → mapping 3 via object list would need full
-    // setup; instead bind a type-2 texture with dims via raw desc.
-    // Use mapping path: put type-11 object if helpers exist; else skip full
-    // e2e and unit-test try_recover pure path with largest_bound via mapping
-    // by faking resolve_type11 — not available without object list.
-    // Pure arithmetic shape check via try_recover with empty textures = None.
+
     let mut cmd = ComputeCommand::default();
     cmd.kind = Kind::DispatchThreadgroups;
     cmd.grid = compute::Size3 {
@@ -529,11 +532,23 @@ fn sentinel_grid_recovers_from_largest_texture() {
         z: 1,
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let acc = ComputeAccum::default();
-    assert!(try_recover_sentinel_grid(&mut state, &host, 1, &acc, &cmd).is_none());
-    // With a synthetic texture bind we need object-list; at least raw dims
-    // recovery formula is covered when textures resolve.
-    let _ = host;
+    assert_eq!(
+        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap_err(),
+        ComputeStatus::BadGrid("compute_grid_dim_range"),
+    );
+    // Each garbage component refuses on its own account: `u64::MAX` overflows
+    // `u32` and `0` is not a dispatchable extent.
+    cmd.grid.y = 3;
+    assert_eq!(
+        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap_err(),
+        ComputeStatus::BadGrid("compute_grid_dim_range"),
+        "tg.y == 0 must still refuse"
+    );
+    cmd.threads_per_threadgroup.y = 32;
+    assert!(
+        resolve_dispatch_dims(&mut state, &host, 1, &cmd).is_ok(),
+        "a wholly sane grid must pass"
+    );
 }
 
 /// The rail's whole point after this migration: a refusal renders the

@@ -861,22 +861,41 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     }
                 }
 
-                // 1) Host cache.
+                // 1) Host cache. Taken unconditionally: a ready resident already
+                // returned above, so this line is reached only with
+                // `resident_ready == false` and there is nothing for the cache
+                // bytes to lose to.
+                //
+                // What stood here was `let (nz,_,_) = rgba_rgb_stats(&rgba); if
+                // nz > 0 || !resident_ready`, i.e. an O(w*h) count of non-black
+                // pixels — 2 073 600 per bind at 1080p, on a path the census
+                // measures at ~29k resident samples a session — feeding a
+                // decision about *which image gets bound*. Two things were wrong
+                // with it and they compound: `runtime/census/README.md` forbids
+                // exactly this ("a proxy that changes behaviour has stopped
+                // being a proxy and become a content heuristic"), and an
+                // all-black frame is a legal frame, so the test mistook a
+                // correct black surface for an empty one.
+                //
+                // The disjunct also could not change the outcome. `!resident_ready`
+                // is true here on both backends — under `backend-vulkan` because
+                // the `if resident_ready` above returns, and under `backend-metal`
+                // because `resident_ready` is bound to `false` outright — so the
+                // condition was already unconditionally true and the scan's
+                // result was discarded. The identical gate on the guest-pages
+                // branch below had already been worked out and removed for this
+                // reason; its comment says so. This one kept paying for the scan.
                 if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
-                    let rgba = swap_rb_channels(bgra);
-                    let (nz, _, _) = crate::observe::rgba_rgb_stats(&rgba);
-                    if nz > 0 || !resident_ready {
-                        return Some((
-                            w,
-                            h,
-                            mid,
-                            SampledSourceRequest::Bytes(
-                                std::sync::Arc::new(rgba),
-                                None,
-                                TexelLayout::Rgba8,
-                            ),
-                        ));
-                    }
+                    return Some((
+                        w,
+                        h,
+                        mid,
+                        SampledSourceRequest::Bytes(
+                            std::sync::Arc::new(swap_rb_channels(bgra)),
+                            None,
+                            TexelLayout::Rgba8,
+                        ),
+                    ));
                 }
 
                 // 2) Guest pages. When no resident is authoritative the guest

@@ -2632,134 +2632,6 @@ fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
     }
 }
 
-/// Archive `REIMS_VGPU_COMPUTE_PLAN_DEFERRED_GRID_Y_SENTINEL` / `try_recover_sentinel_grid`.
-///
-/// Live Core Image wallpaper shape (journal 2026-07-06):
-///   grid = [ceil(ow/tg), UINT64_MAX, 1], tg = [32, 0, 1]
-/// Recover tg.y = tg.x (square tile) and both grid axes from the largest
-/// write-capable bound texture. Without this every wallpaper VTMTS/CI dispatch
-/// hits [`ComputeStatus::BadGrid`] and the desktop stays black.
-const DEFERRED_GRID_Y_SENTINEL: u64 = u64::MAX;
-const GRID_DIM_MAX: u64 = 0x1_0000;
-const THREADGROUP_DIM_MAX: u64 = 1024;
-
-fn ceil_div_u64(n: u64, d: u64) -> u64 {
-    if d == 0 {
-        return 0;
-    }
-    n.div_ceil(d)
-}
-
-/// Largest bound texture (type-11 or type-2/3) by pixel area — archive picks the
-/// full-screen write target over small inputs.
-fn largest_bound_texture_dims<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    acc: &ComputeAccum,
-) -> Option<(u32, u32)> {
-    let mut best: Option<(u32, u32, u64)> = None;
-    for t in &acc.textures {
-        if t.texture_ref == 0 {
-            continue;
-        }
-        // Prefer type-11 mapping geom.
-        if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, t.texture_ref) {
-            let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
-            if let Some(m) = state.mappings.get(&mid) {
-                if m.has_geom && m.width > 0 && m.height > 0 {
-                    let area = (m.width as u64).saturating_mul(m.height as u64);
-                    if best.map(|(_, _, a)| area > a).unwrap_or(true) {
-                        best = Some((m.width, m.height, area));
-                    }
-                    continue;
-                }
-            }
-        }
-        // type-2/3 linear.
-        let Some(entry) = objects::lookup_list_entry(state, host, task_id, t.texture_ref) else {
-            continue;
-        };
-        if entry.object_type != OBJECT_TYPE_TEXTURE
-            && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-        {
-            continue;
-        }
-        let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
-            continue;
-        };
-        let Ok(tex) = decode_texture_descriptor(&desc) else {
-            continue;
-        };
-        if !tex.has_width || !tex.has_height || tex.width == 0 || tex.height == 0 {
-            continue;
-        }
-        let area = (tex.width as u64).saturating_mul(tex.height as u64);
-        if best.map(|(_, _, a)| area > a).unwrap_or(true) {
-            best = Some((tex.width, tex.height, area));
-        }
-    }
-    best.map(|(w, h, _)| (w, h))
-}
-
-/// Recover CI sentinel grid/threadgroup (archive `try_recover_sentinel_grid`).
-/// Returns `Some((gx,gy,gz,tx,ty,tz))` when the wire matches the sentinel shape
-/// and a bound texture supplies coverage; otherwise `None`.
-fn try_recover_sentinel_grid<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    acc: &ComputeAccum,
-    cmd: &ComputeCommand,
-) -> Option<(u32, u32, u32, u32, u32, u32)> {
-    if cmd.kind != Kind::DispatchThreadgroups {
-        return None;
-    }
-    let g0 = cmd.grid.x;
-    let g1 = cmd.grid.y;
-    let g2 = cmd.grid.z;
-    let t0 = cmd.threads_per_threadgroup.x;
-    let t1 = cmd.threads_per_threadgroup.y;
-    let t2 = cmd.threads_per_threadgroup.z;
-    if !((1..=GRID_DIM_MAX).contains(&g0)
-        && g1 == DEFERRED_GRID_Y_SENTINEL
-        && g2 == 1
-        && (1..=THREADGROUP_DIM_MAX).contains(&t0)
-        && t1 == 0
-        && t2 == 1)
-    {
-        return None;
-    }
-    let (tw, th) = largest_bound_texture_dims(state, host, task_id, acc)?;
-    let ty = t0;
-    let mut gx = ceil_div_u64(tw as u64, t0).max(1);
-    let mut gy = ceil_div_u64(th as u64, ty).max(1);
-    if gx > GRID_DIM_MAX {
-        gx = GRID_DIM_MAX;
-    }
-    if gy > GRID_DIM_MAX {
-        gy = GRID_DIM_MAX;
-    }
-    // Always-on, deduped per (wire shape, invented dims). This substitutes
-    // dispatch dimensions the guest did not send, so it is a mis-execution of a
-    // decoded command and owes the reader a line on the channel a normal boot
-    // reads — it was on the `REIMS_VGPU_DRAW_LOG` tier, which meant a boot that
-    // took this path said nothing at all. Bounded by the small set of distinct
-    // (threadgroup, texture geometry) combinations one boot produces.
-    if crate::observe::first_sight(
-        "compute_sentinel_recover",
-        u64::from(t0 as u32) << 40 | u64::from(tw) << 20 | u64::from(th),
-    ) {
-        crate::observe::off(format!(
-            "compute_sentinel_recover grid=[{gx},{gy},1] tg=[{t0},{ty},1] tex={tw}x{th} \
-             wire_grid=[{g0},u64::MAX,{g2}] wire_tg=[{t0},{t1},{t2}] \
-             (dispatch dimensions the guest did not send: grid.y and tg.y are \
-             invented from the largest bound texture, tg.y assumes a square tile)"
-        ));
-    }
-    Some((gx as u32, gy as u32, 1, t0 as u32, ty as u32, 1))
-}
-
 /// Execute a direct or indirect dispatch against the current compute accum state.
 pub fn execute_dispatch<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2908,24 +2780,21 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    acc: &ComputeAccum,
     cmd: &ComputeCommand,
 ) -> Result<DispatchDims, ComputeStatus> {
     match cmd.kind {
-        Kind::DispatchThreadgroups => {
-            if let Some(dims) = try_recover_sentinel_grid(state, host, task_id, acc, cmd) {
-                return Ok((dims.0, dims.1, dims.2, dims.3, dims.4, dims.5, false));
-            }
-            Ok((
-                u32_dim(cmd.grid.x)?,
-                u32_dim(cmd.grid.y)?,
-                u32_dim(cmd.grid.z)?,
-                u32_dim(cmd.threads_per_threadgroup.x)?,
-                u32_dim(cmd.threads_per_threadgroup.y)?,
-                u32_dim(cmd.threads_per_threadgroup.z)?,
-                false,
-            ))
-        }
+        // Every dimension comes from the wire. `u32_dim` refuses `0` and
+        // anything past `u32::MAX` with `BadGrid("compute_grid_dim_range")`, so
+        // a malformed grid is a named refusal rather than a substitution.
+        Kind::DispatchThreadgroups => Ok((
+            u32_dim(cmd.grid.x)?,
+            u32_dim(cmd.grid.y)?,
+            u32_dim(cmd.grid.z)?,
+            u32_dim(cmd.threads_per_threadgroup.x)?,
+            u32_dim(cmd.threads_per_threadgroup.y)?,
+            u32_dim(cmd.threads_per_threadgroup.z)?,
+            false,
+        )),
         Kind::DispatchThreads => Ok((
             u32_dim(cmd.grid.x)?,
             u32_dim(cmd.grid.y)?,
@@ -3022,7 +2891,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }
     // Dims first (cheap; proves sentinel recovery without m2v/vk).
     let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims(state, host, task_id, acc, cmd) {
+        match resolve_dispatch_dims(state, host, task_id, cmd) {
             Ok(v) => v,
             Err(e) => {
                 crate::observe::line(format!(
@@ -4242,7 +4111,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     };
 
     let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims(state, host, task_id, acc, cmd) {
+        match resolve_dispatch_dims(state, host, task_id, cmd) {
             Ok(v) => v,
             Err(e) => {
                 crate::observe::line(format!(
