@@ -2145,9 +2145,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         state.note_task_map(task_id, gva, length);
                     }
                 }
-                if packet.opcode == CHILD_OP_UNMAP_MEMORY && gva != 0 {
-                    crate::runtime::surface_cache::note_unmap_retain_gva(state, gva);
-                }
                 // Deferred GVA render-Store windows overlapping the notified
                 // VA range land **cache-only**: on Unmap the PTEs are already
                 // gone; on Map the PFNs are fresh and the map-notify guest

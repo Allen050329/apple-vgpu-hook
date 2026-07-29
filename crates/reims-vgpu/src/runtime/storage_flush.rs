@@ -560,7 +560,11 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         entry.height,
         &rgba,
     );
-    crate::observe::off(format!(
+    // A flush that landed is expected control flow and stays quiet. The two
+    // outcomes that are not — a refused write, and a window whose span the guest
+    // had already torn down — each emit their own typed line above, so the
+    // always-on view keeps the losses and drops the running commentary.
+    crate::observe::line(format!(
         "gva_deferred_flush gva={gva:#x} {}x{} fmt={:#x} guest={guest} trigger={trigger} bytes={} us={}",
         entry.width,
         entry.height,

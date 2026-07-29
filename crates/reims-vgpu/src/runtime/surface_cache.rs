@@ -536,57 +536,15 @@ pub fn get_gva_any(state: &DeviceState, gva: u64) -> Option<(u32, u32, &[u8])> {
     Some((e.width, e.height, &e.bgra[..need]))
 }
 
-/// UnmapMemory of a guest GVA must **not** drop discrete encode content.
-///
-/// Live x86 wallpaper class (serial-20260714-022033): full sky store to
-/// `gva=0x2c22000` (rgb_nz=full) → UnmapMemory → MapMemory2 same VA, **new PFNs**
-/// → sample sees zero guest pages + empty host_cache → pipe stores black wipe.
-/// On unified Apple hosts Unmap tears down GPU VA; on this discrete rail the
-/// host_cache **is** the texture body — retain across unmap/remap of the same VA.
-///
-/// Measure-only: UnmapMemory retains any GVA encode (no size gate — RE is PT-only).
-pub fn note_unmap_retain_gva(state: &DeviceState, gva: u64) {
-    if gva == 0 {
-        return;
-    }
-    if let Some(e) = state.host_gva_surfaces.get(&gva) {
-        if e.bgra.is_empty() {
-            return;
-        }
-        let need = (e.height as usize)
-            .saturating_mul(e.width as usize)
-            .saturating_mul(RGBA8_BPP as usize);
-        let slice = &e.bgra[..need.min(e.bgra.len())];
-        let (rgb_nz, max_rgb, _) = crate::observe::bgra_rgb_stats(slice);
-        crate::observe::off(format!(
-            "host_cache_gva_retain_on_unmap gva={gva:#x} {}x{} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb}",
-            e.width, e.height, e.host_gen
-        ));
-    }
-}
 
 /// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
-    if let Some(e) = state.host_gva_surfaces.remove(&gva) {
-        if !e.bgra.is_empty() {
-            crate::observe::off(format!(
-                "host_cache_evict tag=gva gva={gva:#x} {}x{} host_gen={}",
-                e.width, e.height, e.host_gen
-            ));
-        }
-    }
+    state.host_gva_surfaces.remove(&gva);
 }
 
 /// Drop host-cache entry (unmap / delete surface).
 pub fn evict(state: &mut DeviceState, surface_id: u32) {
-    if let Some(e) = state.host_surfaces.remove(&surface_id) {
-        if e.width >= 1280 && e.height >= 720 {
-            crate::observe::off(format!(
-                "host_cache_evict mid={surface_id} {}x{} host_gen={}",
-                e.width, e.height, e.host_gen
-            ));
-        }
-    }
+    state.host_surfaces.remove(&surface_id);
 }
 
 /// Outcome of [`flush_surface_id_to_guest_pages`] (Synchronize / pageoff).
@@ -1010,9 +968,18 @@ mod tests {
         assert!(get_gva(&st, gva, 2, 2).is_none());
     }
 
-    /// Unmap must not drop GVA encode for any geom (PT-only RE; no size heuristic).
+    /// The GVA encode cache is keyed by virtual address alone, at any geometry.
+    ///
+    /// This is what makes "UnmapMemory retains the encode" work: the retain is
+    /// the *absence* of an evict on the unmap path, so the cache has to stay
+    /// readable through page-table churn without anyone re-registering it. The
+    /// live x86 wallpaper class was a full sky store to `gva=0x2c22000` followed
+    /// by UnmapMemory + MapMemory2 of the same VA with new PFNs; if the entry
+    /// did not survive on the VA key alone, the next sample found zero guest
+    /// pages and an empty cache and the pipe stored a black wipe. No size gate —
+    /// a 64x48 layer takes the same path as a full-screen one.
     #[test]
-    fn unmap_retains_gva_encode_any_size() {
+    fn gva_encode_is_keyed_by_address_at_any_size() {
         let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let gva = 0x2c22000u64;
         // Small layer — same retain path as wallpaper (no W×H gate).
@@ -1027,8 +994,9 @@ mod tests {
         }
         store_gva(&mut st, gva, w, h, px);
         assert!(get_gva(&st, gva, w, h).is_some());
-        note_unmap_retain_gva(&st, gva);
-        let (gw, gh, got) = get_gva_any(&st, gva).expect("retained after unmap");
+        // Readable with no geometry supplied: the caller after a remap knows the
+        // VA and nothing else.
+        let (gw, gh, got) = get_gva_any(&st, gva).expect("retained on the VA key");
         assert_eq!((gw, gh), (w, h));
         assert_eq!(got[0], 185);
         assert_eq!(got[2], 81);
