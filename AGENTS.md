@@ -402,6 +402,55 @@ Note which way the cache counters cut. `pipeline_misses`, `shader_misses` and `t
 does on the *hit* path. A hypothesis of the form "something is missing its cache" is refuted by the
 same line that shows the bytes.
 
+**The route that pays it is `cpu_portability`, and it is the one route with no deferred rail.**
+`store_routes` counts the guest-Store routing decision per second, next to `engine_delta` in the same
+window. Under load, and with `readbacks` alongside:
+
+| `cpu_portability` | `gva_deferred` | `readbacks` | readback MB | seed MB |
+|---|---|---|---|---|
+| 60 | 30 | 80 | 196 | 188 |
+| 67 | 29 | 86 | 191 | 192 |
+| 111 | 48 | 155 | 249 | 236 |
+| 28 | 38 | 32 | 180 | 180 |
+| 43 | 47 | 66 | 242 | 241 |
+
+Two things to read off it. `readbacks` tracks `cpu_portability` almost one-for-one while
+`gva_deferred` adds few — that is the deferred rail *working*, taking no readback at Store time and
+paying one only if the window is later flushed. And `seed MB` equals `readback MB` in every row, so
+the traffic is symmetric: each pass uploads the target's prior contents, draws, and reads the whole
+target back.
+
+The asymmetry is structural, not incidental. `gva_store_defer_eligible` opens with
+
+```rust
+if c0.mapping_id != 0 || c0.target_gva == 0 || c0.row_stride == 0 {
+    return false;
+}
+```
+
+so a **type-11 composite Store can never defer** — it always reads back and CPU-copies into the
+mapping's guest pages. That is precisely the hole the host-pointer import used to cover, and
+`metal_draw/vulkan.rs` says so where it sets the flag: "the import is gone, so the only way a Store's
+pixels reach the guest is the CPU writeback, and that needs them read back."
+
+So the actionable shape of the ~2 Hz problem is: **give the type-11 render Store the deferred rail the
+GVA render Store already has** — keep the composite on the registry resident with `skip_readback`,
+arm a flush-on-access window, and let the matching Load take `LoadOp::LoadFromTarget` instead of a CPU
+seed. That kills both halves, because the Load-side seed is chosen by asking whether a deferred window
+exists (`metal_draw/mod.rs`, the `PASS_LOAD_ACTION_LOAD && mapping_id == 0` arm), so a type-11 window
+would suppress the seed for free.
+
+Do not do this by restoring `VK_EXT_external_memory_host`. The deleted `import_present` rail had an
+"ack-fast deferred rung" that looks like the same idea, but what it needed the host pointer for was
+the eventual *DMA*; the deferral itself did not. The flush here is the CPU writeback that already
+exists (`mapping_write::write_rgba8_image_changed`) — the win is doing it once on demand instead of
+~70 times a second unconditionally.
+
+Worth checking before building: the model already carries mapping-keyed deferred windows for the
+*compute* rail (`ComputeStorageResidencyKey`'s "Surface window (`mapping_id != 0`)" kind, landed by
+`storage_flush`'s `flush_one` and its `compute_deferred_flush mapping=` line). The render Store may be
+able to arm one of those rather than growing a fourth window kind.
+
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
 and the measured frame period sat at 252–665 ms, i.e. just under that threshold for entire runs. It
