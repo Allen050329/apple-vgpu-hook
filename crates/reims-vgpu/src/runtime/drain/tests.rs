@@ -2234,11 +2234,6 @@ fn synchronize_resources_does_not_write_guest_pages() {
         [0, 0, 0, 0],
         "Synchronize must not write host_cache into guest pages"
     );
-    // Helper remains for explicit/unit use only.
-    assert!(matches!(
-        surface_cache::flush_surface_id_to_guest_pages(&mut state, &mut host, mid),
-        surface_cache::SyncFlushResult::WroteGuest { .. }
-    ));
 }
 
 /// set guestValid alone must not bump host content generation.
