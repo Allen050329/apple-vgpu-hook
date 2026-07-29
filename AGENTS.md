@@ -511,6 +511,37 @@ Generalise it. **A deferred obligation that names its data indirectly is only as
 indirection**, and every cache in this tree is keyed loosely enough to be replaced under a live
 window. Prefer owning the bytes; with `Arc` it is free.
 
+**The symptom was then caught live and correlated, and the correlating line needed no new probe.**
+A user watching a boot reported the desktop background *oscillating* between half-black and correct.
+That boot was still on the pre-fix binary, so it is a reproduction rather than a survival, and the
+whole correlation came out of `present_content` — which carries `rgb_nz`, a count of pixels with
+max(B,G,R) > 0, i.e. a black-fraction proxy for the frame actually presented. Sliced per `mid`:
+
+| mid | presents | mean non-black | lost a Store? |
+|---|---|---|---|
+| 4 | 253 | 95.2% | no |
+| 6 | 268 | 79.8% | yes — `1920x1080 reason=cache_miss` |
+| 37 | 175 | 80.6% | yes — `1920x1080 reason=cache_miss` |
+
+mid 4 is under 10% black in 238 of its 253 presents. Mids 6 and 37 spend 84 and 54 presents in the
+20-70% band. The guest ping-pongs its front buffer `4 → 37 → 6 → 4`, so the screen alternates between
+a clean mapping and two that lost pixels — which is exactly "oscillating between half black and not",
+and is why a single screenshot of this class can look fine.
+
+The timing closes it. mid 6 lost its Store at `t=68750` and its first 61%-black present is `t=68838`,
+88 ms later; mid 37 lost at `t=68786` and presents 61% black at `t=68840`, 54 ms later. Each within
+one frame of its own loss.
+
+Two process points. First, `present_content`'s `rgb_nz` was already being emitted on every present
+and nobody had ever sliced it per `mid` — the "identify comes before add" rule paying for itself, and
+the answer cost one `awk`. Second, note what this is and is not: a per-mid correlation plus a
+one-frame lead is strong, but it is still a correlation, and the fix is not scored by it. The fix is
+scored by `cache_miss` being **unreachable by construction** once the window owns its pixels.
+
+Do not read the per-mid means as a standing exclusion of mid 4 either. It did not lose a Store *in
+that boot*; other boots lost full-screen Stores on other mids, and which mapping the compositor picks
+is not ours to predict.
+
 The counter that separates those two worlds is `surface_flush` on the `store_routes` line: an arm
 count cannot tell "the writeback was skipped" from "the writeback happened a millisecond later", and
 `surface_flush / surface_deferred` is the ratio that can.
