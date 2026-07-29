@@ -881,7 +881,6 @@ pub(crate) fn render_flush_one<M: HostMemory + HostOps>(
         key.mapping_id,
         entry.width,
         entry.height,
-        entry.full_quad_bounds,
     );
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     if !matches!(
@@ -998,7 +997,6 @@ mod tests {
             width: 4,
             height: 4,
             map_generation: 1,
-            full_quad_bounds: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32, lo: u64, hi: u64| RenderDeferredKey {
@@ -1153,7 +1151,6 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 2,
-                full_quad_bounds: false,
                     armed_seq: 0,
             },
         );
@@ -1192,7 +1189,6 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 2,
-                full_quad_bounds: false,
                     armed_seq: 0,
             },
         );
@@ -1226,7 +1222,6 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 1,
-                full_quad_bounds: false,
                     armed_seq: 0,
             },
         );
@@ -1247,7 +1242,6 @@ mod tests {
                 width: 32,
                 height: 32,
                 map_generation: 1,
-                full_quad_bounds: false,
                     armed_seq: 0,
             },
         );
@@ -1305,7 +1299,6 @@ mod tests {
             width: 32,
             height: 32,
             map_generation: 1,
-            full_quad_bounds: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32| RenderDeferredKey {
@@ -1362,7 +1355,6 @@ mod tests {
             width: 32,
             height: 32,
             map_generation: 1,
-            full_quad_bounds: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32| RenderDeferredKey {

@@ -79,7 +79,6 @@ struct ImportTiming {
     started: Instant,
     revalidate_us: u64,
     window_us: u64,
-    resident_stats_us: u64,
 }
 
 impl ImportTiming {
@@ -88,7 +87,6 @@ impl ImportTiming {
             started: Instant::now(),
             revalidate_us: 0,
             window_us: 0,
-            resident_stats_us: 0,
         }
     }
 
@@ -120,7 +118,6 @@ impl ImportTiming {
                 total_us,
                 self.revalidate_us,
                 self.window_us,
-                self.resident_stats_us,
                 map_us,
                 dma_us,
                 post_us,
@@ -147,7 +144,6 @@ fn import_store_timing_line(
     total_us: u64,
     revalidate_us: u64,
     window_us: u64,
-    resident_stats_us: u64,
     map_us: u64,
     dma_us: u64,
     post_us: u64,
@@ -157,7 +153,7 @@ fn import_store_timing_line(
     cached: bool,
 ) -> String {
     format!(
-        "import_store_timing path={path} mid={mapping_id} {width}x{height} total_us={total_us} revalidate_us={revalidate_us} window_us={window_us} resident_stats_us={resident_stats_us} map_us={map_us} dma_us={dma_us} post_us={post_us} runs={runs} cache_hits={cache_hits} cache_misses={cache_misses} cached={} threshold_us={IMPORT_STORE_TIMING_SLOW_US}",
+        "import_store_timing path={path} mid={mapping_id} {width}x{height} total_us={total_us} revalidate_us={revalidate_us} window_us={window_us} map_us={map_us} dma_us={dma_us} post_us={post_us} runs={runs} cache_hits={cache_hits} cache_misses={cache_misses} cached={} threshold_us={IMPORT_STORE_TIMING_SLOW_US}",
         cached as u8
     )
 }
@@ -248,216 +244,16 @@ pub fn drop_render_deferred_windows(state: &mut DeviceState, mapping_id: u32) ->
     dropped
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ResidentContentStats {
-    rgb_nz: usize,
-    rgb_max: u8,
-    alpha_nz: usize,
-    alpha_opaque: usize,
-}
 
-impl From<engine::Color8ContentStats> for ResidentContentStats {
-    fn from(stats: engine::Color8ContentStats) -> Self {
-        Self {
-            rgb_nz: stats.rgb_nz,
-            rgb_max: stats.rgb_max,
-            alpha_nz: stats.alpha_nz,
-            alpha_opaque: stats.alpha_opaque,
-        }
-    }
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ChannelTransitionStats {
-    changed_px: usize,
-    rb_swap_px: usize,
-}
 
-/// Measure an exact red/blue exchange between two BGRA rows.
-///
-/// This never selects Store behavior. It distinguishes the window-damage class
-/// where changed target pixels preserve G/A but exchange the B/R bytes.
-fn channel_transition_stats_bgra(before: &[u8], after: &[u8]) -> ChannelTransitionStats {
-    let mut stats = ChannelTransitionStats::default();
-    for (old, new) in before.chunks_exact(4).zip(after.chunks_exact(4)) {
-        if old != new {
-            stats.changed_px += 1;
-        }
-        if old[0] != old[2]
-            && new[0] == old[2]
-            && new[1] == old[1]
-            && new[2] == old[0]
-            && new[3] == old[3]
-        {
-            stats.rb_swap_px += 1;
-        }
-    }
-    stats
-}
 
-/// CPU implementation of the resident content stats the GPU reduction computes
-/// on the zero-copy path (`present_stats.comp` / `Color8ContentStats`). Used in
-/// tests and on non-stable host mappings, where arm64/MoltenVK must take a CPU
-/// readback before writing transient `mach_vm_remap` views.
-fn resident_content_stats_from_rgba(px: &[u8]) -> ResidentContentStats {
-    let mut stats = ResidentContentStats {
-        rgb_nz: 0,
-        rgb_max: 0,
-        alpha_nz: 0,
-        alpha_opaque: 0,
-    };
-    for pixel in px.chunks_exact(4) {
-        let rgb_max = pixel[0].max(pixel[1]).max(pixel[2]);
-        stats.rgb_nz += usize::from(rgb_max != 0);
-        stats.rgb_max = stats.rgb_max.max(rgb_max);
-        stats.alpha_nz += usize::from(pixel[3] != 0);
-        stats.alpha_opaque += usize::from(pixel[3] == u8::MAX);
-    }
-    stats
-}
 
-/// Resident content stats cost a readback, so only display-sized imports pay
-/// for them — that is the geometry whose occupancy answers "did the composited
-/// frame arrive".
-fn should_measure_resident_content(width: u32, height: u32) -> bool {
-    width >= 1280 && height >= 720
-}
 
-/// Measure-only: read one tight BGRA guest mapping row (multi-import safe).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the diagnostic reader names the exact mapping row geometry"
-)]
-fn guest_row_bgra_at_y<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    base_off: u64,
-    bpr: u32,
-    y: u32,
-) -> Option<Vec<u8>> {
-    if width == 0 || height == 0 || bpr < width.saturating_mul(RGBA8_BPP) || y >= height {
-        return None;
-    }
-    let tight = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    let mut row = vec![0u8; tight];
-    let moff = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-    if !mapper::read_mapping_bytes(state, host, mapping_id, moff, &mut row) {
-        return None;
-    }
-    Some(row)
-}
 
-/// Measure-only: sample one guest mapping row after DMA (multi-import safe).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the diagnostic sampler names the exact mapping row geometry"
-)]
-fn guest_row_rgb_stats_at_y<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    base_off: u64,
-    bpr: u32,
-    y: u32,
-) -> Option<(usize, u8)> {
-    let row = guest_row_bgra_at_y(state, host, mapping_id, width, height, base_off, bpr, y)?;
-    // BGRA on wire — occupancy is channel-order invariant for max of first 3.
-    let (nz, max, _) = crate::observe::rgba_rgb_stats(&row);
-    Some((nz, max))
-}
 
-/// Measure-only: sample guest mapping after DMA (center row, multi-import safe).
-fn guest_center_row_rgb_stats<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    base_off: u64,
-    bpr: u32,
-) -> Option<(usize, u8)> {
-    guest_row_rgb_stats_at_y(
-        state,
-        host,
-        mapping_id,
-        width,
-        height,
-        base_off,
-        bpr,
-        height / 2,
-    )
-}
 
-/// Always-on content proxy: resident vs guest after import.
-///
-/// `res_rgb_nz=None` → skipped (small) or read_target failed.
-/// Class map:
-/// - res high, guest low → DMA / multi-run / sample-window bug
-/// - res low, guest low → GPU drew empty (upstream sample/clear/load)
-/// - both high → import content OK (visual issue is scanout ownership)
-fn import_content_line(
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    outcome: &str,
-    res: Option<ResidentContentStats>,
-    guest: Option<(usize, u8)>,
-    transition: Option<ChannelTransitionStats>,
-) -> String {
-    let res = res.unwrap_or(ResidentContentStats {
-        rgb_nz: usize::MAX,
-        rgb_max: 0,
-        alpha_nz: usize::MAX,
-        alpha_opaque: usize::MAX,
-    });
-    let (gnz, gmax) = guest.unwrap_or((usize::MAX, 0));
-    let transition = transition.unwrap_or(ChannelTransitionStats {
-        changed_px: usize::MAX,
-        rb_swap_px: usize::MAX,
-    });
-    format!(
-        "import_content mid={mapping_id} {width}x{height} outcome={outcome} res_rgb_nz={} res_max={} res_alpha_nz={} res_alpha_opaque={} guest_row_nz={} guest_row_max={} changed_row_px={} rb_swap_row_px={}",
-        if res.rgb_nz == usize::MAX { -1i64 } else { res.rgb_nz as i64 },
-        res.rgb_max,
-        if res.alpha_nz == usize::MAX { -1i64 } else { res.alpha_nz as i64 },
-        if res.alpha_opaque == usize::MAX { -1i64 } else { res.alpha_opaque as i64 },
-        if gnz == usize::MAX { -1i64 } else { gnz as i64 },
-        gmax,
-        if transition.changed_px == usize::MAX { -1i64 } else { transition.changed_px as i64 },
-        if transition.rb_swap_px == usize::MAX { -1i64 } else { transition.rb_swap_px as i64 }
-    )
-}
 
-/// `success` selects the sink: an import-content census attached to a
-/// successful used=1 store is offline-analysis (OFF, fires per import on the
-/// healthy path); the same census attached to a used=0 import failure stays
-/// fail-visible so the drop is not hidden.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the proxy records all load-bearing import identity and occupancy fields"
-)]
-fn log_import_content(
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    outcome: &str,
-    res: Option<ResidentContentStats>,
-    guest: Option<(usize, u8)>,
-    transition: Option<ChannelTransitionStats>,
-    success: bool,
-) {
-    let line = import_content_line(mapping_id, width, height, outcome, res, guest, transition);
-    if success {
-        crate::observe::off(line);
-    } else {
-        crate::observe::fail(line);
-    }
-}
 
 /// DMA resident BGRA target into guest mapping pages (stride-correct).
 ///
@@ -475,7 +271,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     mapping_id: u32,
     width: u32,
     height: u32,
-    full_quad_bounds: bool,
 ) -> ImportPresentResult {
     let mut timing = ImportTiming::new();
     if !eligible(mapping_id, width, height) {
@@ -574,20 +369,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     // a separate resident diagnostic readback; fragmented Stores reuse the
     // mandatory scatter readback. Comparing them is measurement-only and
     // localizes exact R/B-swapped damage before the Store overwrites the row.
-    let guest_before_center = if width >= 1280 && height >= 720 {
-        guest_row_bgra_at_y(
-            state,
-            host,
-            mapping_id,
-            width,
-            height,
-            base_off,
-            bpr,
-            height / 2,
-        )
-    } else {
-        None
-    };
     if !host.map_pages_stable() {
         return try_import_present_cpu_unstable(
             state,
@@ -598,7 +379,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             height,
             base_off,
             bpr,
-            guest_before_center,
             timing,
         );
     }
@@ -626,50 +406,10 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         // SAFETY: contig view is live for this mapping; revalidate + map_gen gate
         // above; execution is sync-per-packet so no concurrent unmap mid-DMA.
         let dma_started = Instant::now();
-        let measure_content = should_measure_resident_content(width, height);
-        let res = unsafe {
-            engine::present_into_host_ptr_strided(identity, dst, dst_len, bpr, measure_content)
-        };
+        let res = unsafe { engine::present_into_host_ptr_strided(identity, dst, dst_len, bpr) };
         let dma_us = dma_started.elapsed().as_micros() as u64;
         let post_started = Instant::now();
-        // Content stats come from the GPU reduction the store armed (no
-        // full-frame CPU readback); split the Result so finish_import still
-        // sees the bare Ok/Err. Symmetric with the fragmented path.
-        let (res_for_finish, res_stats) = match res {
-            Ok(content) => (Ok(()), content.map(ResidentContentStats::from)),
-            Err(e) => (Err(e), None),
-        };
-        // Center-row channel transition: read ONE guest row back out of the
-        // pages the GPU just wrote (~7.7 KiB at 1920), not the 8 MiB frame the
-        // old full readback handed over for free — same as the fragmented path.
-        let transition_stats = if res_for_finish.is_ok() {
-            guest_before_center.as_deref().and_then(|before| {
-                let after = guest_row_bgra_at_y(
-                    state,
-                    host,
-                    mapping_id,
-                    width,
-                    height,
-                    base_off,
-                    bpr,
-                    height / 2,
-                )?;
-                (before.len() == after.len()).then(|| channel_transition_stats_bgra(before, &after))
-            })
-        } else {
-            None
-        };
-        if let Some(stats) = res_stats {
-            #[cfg(test)]
-            let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-            crate::runtime::census::present_proxy::note_selected_peer_divergence(
-                mapping_id,
-                state.present.frame_mapping,
-                width,
-                height,
-                stats.rgb_nz,
-            );
-        }
+        let res_for_finish = res;
         let r = finish_import(
             state,
             mapping_id,
@@ -680,20 +420,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             res_for_finish,
             "ok",
         );
-        if r.used() {
-            let guest =
-                guest_center_row_rgb_stats(state, host, mapping_id, width, height, base_off, bpr);
-            log_import_content(
-                mapping_id,
-                width,
-                height,
-                "ok",
-                res_stats,
-                guest,
-                transition_stats,
-                true,
-            );
-        }
         let post_us = post_started.elapsed().as_micros() as u64;
         // Per-tranche attribution: present-capture store readback+writeback is
         // not a render draw; count its lock hold out of the opaque `other_us`.
@@ -717,7 +443,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             height,
             base_off,
             bpr,
-            guest_before_center,
             timing,
         );
     }
@@ -733,8 +458,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         base_off,
         bpr,
         need,
-        guest_before_center,
-        full_quad_bounds,
         timing,
     )
 }
@@ -754,7 +477,6 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     mapping_id: u32,
     width: u32,
     height: u32,
-    full_quad_bounds: bool,
 ) -> bool {
     // A portability-subset device may use synchronous external-host-memory
     // Store, but guest pages must be authoritative before packet completion.
@@ -824,7 +546,6 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
             width,
             height,
             map_generation,
-            full_quad_bounds,
             armed_seq,
         },
     );
@@ -879,7 +600,6 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
     height: u32,
     base_off: u64,
     bpr: u32,
-    guest_before_center: Option<Vec<u8>>,
     timing: ImportTiming,
 ) -> ImportPresentResult {
     let read_started = Instant::now();
@@ -895,14 +615,10 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
                 .field("base_off", format!("{base_off:#x}"))
                 .fail();
             log_result(mapping_id, width, height, ImportPresentResult::Fail(reason));
-            log_import_content(mapping_id, width, height, reason, None, None, None, false);
             return ImportPresentResult::Fail(reason);
         }
     };
     let read_us = read_started.elapsed().as_micros() as u64;
-    let res_stats = should_measure_resident_content(width, height)
-        .then(|| resident_content_stats_from_rgba(&pixels));
-
     let write_started = Instant::now();
     let stride = width.saturating_mul(RGBA8_BPP);
     if !mapping_write::write_bgra8(state, host, mapping_id, &pixels, stride, width, height) {
@@ -911,27 +627,11 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
             "import_present used=0 reason={reason} mid={mapping_id} {width}x{height} bpr={bpr} base_off={base_off:#x}"
         ));
         log_result(mapping_id, width, height, ImportPresentResult::Fail(reason));
-        log_import_content(
-            mapping_id, width, height, reason, res_stats, None, None, false,
-        );
         return ImportPresentResult::Fail(reason);
     }
     let write_us = write_started.elapsed().as_micros() as u64;
 
     let post_started = Instant::now();
-    let transition_stats = guest_before_center.as_deref().and_then(|before| {
-        let after = guest_row_bgra_at_y(
-            state,
-            host,
-            mapping_id,
-            width,
-            height,
-            base_off,
-            bpr,
-            height / 2,
-        )?;
-        (before.len() == after.len()).then(|| channel_transition_stats_bgra(before, &after))
-    });
     let r = finish_import(
         state,
         mapping_id,
@@ -942,20 +642,6 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
         Ok(()),
         "cpu_unstable",
     );
-    if r.used() {
-        let guest =
-            guest_center_row_rgb_stats(state, host, mapping_id, width, height, base_off, bpr);
-        log_import_content(
-            mapping_id,
-            width,
-            height,
-            "cpu_unstable",
-            res_stats,
-            guest,
-            transition_stats,
-            true,
-        );
-    }
     let post_us = post_started.elapsed().as_micros() as u64;
     state
         .tranche
@@ -991,9 +677,7 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
     base_off: u64,
     bpr: u32,
     need: u64,
-    guest_before_center: Option<Vec<u8>>,
-    full_quad_bounds: bool,
-    mut timing: ImportTiming,
+    timing: ImportTiming,
 ) -> ImportPresentResult {
     let map_started = Instant::now();
     let Some(gpas) = mapper::mapping_page_gpas(state, host, mapping_id) else {
@@ -1074,16 +758,8 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
     // SAFETY: mapped views remain live and disjoint until the synchronous
     // readback/scatter returns; product drain cannot unmap them concurrently.
     let dma_started = Instant::now();
-    let measure_content = should_measure_resident_content(width, height);
     let res = unsafe {
-        engine::present_into_host_runs(
-            identity,
-            base_off,
-            bpr,
-            &host_runs,
-            measure_content,
-            host.map_pages_stable(),
-        )
+        engine::present_into_host_runs(identity, base_off, bpr, &host_runs, host.map_pages_stable())
     };
     let dma_us = dma_started.elapsed().as_micros() as u64;
     let post_started = Instant::now();
@@ -1110,50 +786,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
             crate::runtime::census::present_proxy::store_scatter::note(
                 true, gpu_stores, fb_unres, fb_submit,
             );
-            let resident_stats_started = Instant::now();
-            let res_stats = present.content.map(ResidentContentStats::from);
-            // Before/after channel transition of the centre row. The frame no
-            // longer exists on the CPU, so read the "after" back out of the
-            // guest pages the GPU just wrote — ONE row (~7.7 KiB at 1920), not
-            // the 8 MiB frame the old readback handed over for free.
-            let transition_stats = guest_before_center.as_deref().and_then(|before| {
-                let after = guest_row_bgra_at_y(
-                    state,
-                    host,
-                    mapping_id,
-                    width,
-                    height,
-                    base_off,
-                    bpr,
-                    height / 2,
-                )?;
-                (before.len() == after.len()).then(|| channel_transition_stats_bgra(before, &after))
-            });
-            timing.resident_stats_us = resident_stats_started.elapsed().as_micros() as u64;
-            if let Some(stats) = res_stats {
-                #[cfg(test)]
-                let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                crate::runtime::census::present_proxy::note_selected_peer_divergence(
-                    mapping_id,
-                    state.present.frame_mapping,
-                    width,
-                    height,
-                    stats.rgb_nz,
-                );
-                // Incomplete-swap-base class marker: a draw
-                // whose decoded geometry spans the full target should move the
-                // resident content stats; byte-identical rgb_nz after a
-                // full-quad pass names the "fade deposits nothing" disease.
-                // Measure-only — legitimate zero-opacity transition frames may
-                // fire a bounded handful of these during a fade.
-                let prev = state.import_rgb_nz.insert(mapping_id, stats.rgb_nz);
-                if full_quad_bounds && prev == Some(stats.rgb_nz) {
-                    crate::observe::fail(format!(
-                        "fullquad_store_noop mid={mapping_id} {width}x{height} rgb_nz={} (full-quad draw left resident content stats unchanged)",
-                        stats.rgb_nz
-                    ));
-                }
-            }
             let _ = state.mark_mapping_written(mapping_id);
             state.note_surface_composite(mapping_id);
             // Full-frame publish: the entire resident target was scattered into
@@ -1178,18 +810,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
                     host_runs.len()
                 ));
             }
-            let guest =
-                guest_center_row_rgb_stats(state, host, mapping_id, width, height, base_off, bpr);
-            log_import_content(
-                mapping_id,
-                width,
-                height,
-                "ok_runs",
-                res_stats,
-                guest,
-                transition_stats,
-                true,
-            );
             ImportPresentResult::Ok
         }
         Err(e) => {
@@ -1201,14 +821,10 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
                 .field("bpr", bpr)
                 .field("base_off", format!("{base_off:#x}"))
                 .fail();
-            // The shared readback itself failed, so resident diagnostics are
-            // unavailable; the specific transfer reason remains fail-visible.
-            log_import_content(mapping_id, width, height, reason, None, None, None, false);
             ImportPresentResult::Fail(reason)
         }
     };
-    let post_us =
-        (post_started.elapsed().as_micros() as u64).saturating_sub(timing.resident_stats_us);
+    let post_us = post_started.elapsed().as_micros() as u64;
     // Per-tranche attribution: fragmented present-capture store readback+writeback
     // is not a render draw; count its lock hold out of the opaque `other_us`.
     state
@@ -1238,7 +854,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
         height,
         base_off,
         bpr,
-        guest_before_center,
         timing,
     )
 }
@@ -1304,7 +919,6 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
     height: u32,
     base_off: u64,
     bpr: u32,
-    guest_before_center: Option<Vec<u8>>,
     timing: ImportTiming,
 ) -> ImportPresentResult {
     let ImportPresentResult::Fail(reason) = result else {
@@ -1327,7 +941,6 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
         height,
         base_off,
         bpr,
-        guest_before_center,
         timing,
     )
 }
@@ -1594,6 +1207,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::runtime::host::FakeHost;
     use crate::backend::vulkan::engine::reason::{DrawReason, HostPresentDecline};
     use crate::backend::vulkan::engine::DrawError;
     use crate::model::{DeviceId, DeviceState, PAGE_SHIFT_X86};
@@ -1746,7 +1360,6 @@ mod tests {
             width: 8,
             height: 8,
             map_generation: 1,
-            full_quad_bounds: false,
             armed_seq: 0,
         };
         let rkey = |mapping_id: u32, lo: u64, hi: u64| RenderDeferredKey {
@@ -1786,7 +1399,6 @@ mod tests {
                     width: 8,
                     height: 8,
                     map_generation: 1,
-                    full_quad_bounds: false,
                             armed_seq,
                 },
             )
@@ -1810,80 +1422,6 @@ mod tests {
         assert!(state.take_oldest_render_deferred_window().is_none());
     }
 
-    #[test]
-    fn import_content_proxy_reports_resident_alpha_occupancy() {
-        let px = [
-            1, 0, 0, 0, // RGB content with zero destination alpha.
-            0, 0, 0, 1, // Non-zero, non-opaque alpha.
-            0, 2, 0, 255, // Opaque alpha.
-        ];
-        let stats = resident_content_stats_from_rgba(&px);
-        assert_eq!(
-            stats,
-            ResidentContentStats {
-                rgb_nz: 2,
-                rgb_max: 2,
-                alpha_nz: 2,
-                alpha_opaque: 1,
-            }
-        );
-        let line = import_content_line(
-            5,
-            1920,
-            1080,
-            "ok_runs",
-            Some(stats),
-            Some((1920, 255)),
-            Some(ChannelTransitionStats {
-                changed_px: 7,
-                rb_swap_px: 6,
-            }),
-        );
-        for field in [
-            "res_rgb_nz=2",
-            "res_max=2",
-            "res_alpha_nz=2",
-            "res_alpha_opaque=1",
-            "guest_row_nz=1920",
-            "guest_row_max=255",
-            "changed_row_px=7",
-            "rb_swap_row_px=6",
-        ] {
-            assert!(line.contains(field), "missing {field}: {line}");
-        }
-    }
-
-    #[test]
-    fn resident_content_measurement_is_bounded_to_display_size() {
-        assert!(should_measure_resident_content(1920, 1080));
-        assert!(should_measure_resident_content(1280, 720));
-        assert!(!should_measure_resident_content(715, 625));
-        assert!(!should_measure_resident_content(31, 24));
-        // A thin horizontal chrome strip is display-wide but not display-tall;
-        // it must not pull a readback (the menu-bar content detector is gone).
-        assert!(!should_measure_resident_content(1920, 24));
-    }
-
-    #[test]
-    fn channel_transition_proxy_distinguishes_exact_rb_swap_damage() {
-        let before = [
-            10, 20, 30, 255, // exact B/R exchange below
-            40, 50, 60, 128, // arbitrary change below
-            70, 80, 70, 255, // equal B/R must not count as a swap
-            1, 2, 3, 4, // unchanged
-        ];
-        let after = [
-            30, 20, 10, 255, 41, 52, 63, 128, 70, 80, 70, 255, 1, 2, 3, 4,
-        ];
-        assert_eq!(
-            channel_transition_stats_bgra(&before, &after),
-            ChannelTransitionStats {
-                changed_px: 2,
-                rb_swap_px: 1,
-            }
-        );
-    }
-    use crate::runtime::host::FakeHost;
 
     #[test]
     fn eligible_requires_mid_and_geom() {
@@ -1908,7 +1446,6 @@ mod tests {
             11,
             1,
             2,
-            3,
             4,
             5,
             6,
@@ -1924,7 +1461,6 @@ mod tests {
             "total_us=11",
             "revalidate_us=1",
             "window_us=2",
-            "resident_stats_us=3",
             "map_us=4",
             "dma_us=5",
             "post_us=6",
@@ -2008,7 +1544,6 @@ mod tests {
             width: 1920,
             height: 1080,
             map_generation: 7,
-            full_quad_bounds: false,
             armed_seq: 0,
         };
         assert_eq!(
@@ -2066,7 +1601,6 @@ mod tests {
                 2,
                 0,
                 8,
-                None,
                 ImportTiming::new(),
             )
         };
@@ -2113,7 +1647,7 @@ mod tests {
             height: 1080,
             generation: 0,
         };
-        let r = try_import_present_store(&mut state, &mut host, &id, 1, 1920, 1080, false);
+        let r = try_import_present_store(&mut state, &mut host, &id, 1, 1920, 1080);
         assert!(matches!(r, ImportPresentResult::Fail(_)));
     }
 }

@@ -176,16 +176,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 width,
                 height,
                 display_sample_mids,
-                full_quad_bounds,
             }) => {
-                draw_resident = Some((
-                    identity,
-                    mapping_id,
-                    width,
-                    height,
-                    display_sample_mids,
-                    full_quad_bounds,
-                ));
+                draw_resident = Some((identity, mapping_id, width, height, display_sample_mids));
                 crate::observe::line(format!(
                     "linux_m2v_draw ok resident_bgra mid={mapping_id} {width}x{height} pipe={}",
                     req.pipeline_ref
@@ -280,7 +272,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // No CPU write_bgra8 fallback for type-11 composite Stores.
     #[cfg(feature = "backend-vulkan")]
     if writeback_guest {
-        if let Some((identity, mid, w, h, display_sample_mids, full_quad_bounds)) =
+        if let Some((identity, mid, w, h, display_sample_mids)) =
             draw_resident.take()
         {
             use crate::runtime::import_present::{
@@ -289,14 +281,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // Ack-fast rung: keep the composite resident-side and flush on
             // access instead of a ~7 ms synchronous DMA on the stamp path.
             let deferred =
-                try_defer_present_store(state, host, &identity, mid, w, h, full_quad_bounds);
+                try_defer_present_store(state, host, &identity, mid, w, h);
             let imp = if deferred {
                 ImportPresentResult::Ok
             } else {
                 // Direct synchronous Store (no defer happened) — no prefetch armed.
                 // Measure-only: the synchronous scatter-DMA ran on the stamp path.
                 crate::runtime::census::writeback_census::note_sync(state.present.dmabuf_active);
-                try_import_present_store(state, host, &identity, mid, w, h, full_quad_bounds)
+                try_import_present_store(state, host, &identity, mid, w, h)
             };
             let pages_ok = matches!(imp, ImportPresentResult::Ok);
             // Mapping lifetime on every Store line — mids are recycled, so a
@@ -602,7 +594,6 @@ type DrawResident = (
     u32,
     u32,
     Vec<u32>,
-    bool,
 );
 
 /// Authoritative contents when a fragment texture aliases a GVA color target.
@@ -3338,92 +3329,7 @@ fn engine_unattributed_us(engine_us: u64, phases: &[u64]) -> u64 {
     })
 }
 
-/// Decoded location-0 position AABB over the drawn index set, plus index
-/// count. Raw vertex-space values (pixel or NDC — per-pipe contract); no
-/// coverage judgment, no pixel inspection. `None` when there is no per-vertex
-/// Float2/3/4 location-0 attribute or the index/position decode fails.
-#[cfg(feature = "backend-vulkan")]
-fn draw_position_bounds(
-    resources: &crate::backend::vulkan::engine::DrawRequest,
-    vertex_count: u32,
-) -> Option<([f32; 4], usize)> {
-    let position = resources.vertex_attributes.iter().find(|a| {
-        a.location == 0
-            && a.step_function == crate::backend::vulkan::engine::VertexStepFunction::PerVertex
-            && matches!(
-                a.format,
-                crate::backend::vulkan::engine::VertexAttributeFormat::Float2
-                    | crate::backend::vulkan::engine::VertexAttributeFormat::Float3
-                    | crate::backend::vulkan::engine::VertexAttributeFormat::Float4
-            )
-    })?;
-    if position.stride == 0 {
-        return None;
-    }
-    let indices = decode_coverage_indices(resources, vertex_count)?;
-    if indices.is_empty() {
-        return None;
-    }
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    let position_bytes = position.content.cpu_bytes();
-    for &index in &indices {
-        let off = (index as usize)
-            .checked_mul(position.stride as usize)?
-            .checked_add(position.offset as usize)?;
-        let raw = position_bytes.get(off..off.saturating_add(8))?;
-        let x = f32::from_le_bytes(raw[0..4].try_into().unwrap());
-        let y = f32::from_le_bytes(raw[4..8].try_into().unwrap());
-        if !x.is_finite() || !y.is_finite() {
-            return None;
-        }
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-    Some(([min_x, min_y, max_x, max_y], indices.len()))
-}
 
-/// Decode the validated vertex-index stream for a coverage proof.
-#[cfg(feature = "backend-vulkan")]
-fn decode_coverage_indices(
-    resources: &crate::backend::vulkan::engine::DrawRequest,
-    vertex_count: u32,
-) -> Option<Vec<u32>> {
-    if let Some(indexed) = resources.indexed.as_ref() {
-        let index_size = indexed.index_type.byte_size();
-        let need = (indexed.index_count as usize).checked_mul(index_size)?;
-        if indexed.indices.len() < need {
-            return None;
-        }
-        let mut indices = Vec::with_capacity(indexed.index_count as usize);
-        for i in 0..indexed.index_count as usize {
-            let off = i * index_size;
-            let raw = match indexed.index_type {
-                crate::backend::vulkan::engine::IndexType::U16 => {
-                    u16::from_le_bytes([indexed.indices[off], indexed.indices[off + 1]]) as u32
-                }
-                crate::backend::vulkan::engine::IndexType::U32 => u32::from_le_bytes([
-                    indexed.indices[off],
-                    indexed.indices[off + 1],
-                    indexed.indices[off + 2],
-                    indexed.indices[off + 3],
-                ]),
-            };
-            let adjusted = i64::from(raw) + i64::from(indexed.vertex_offset);
-            let adjusted = u32::try_from(adjusted).ok()?;
-            indices.push(adjusted);
-        }
-        Some(indices)
-    } else {
-        Some(
-            (resources.first_vertex..resources.first_vertex.saturating_add(vertex_count)).collect(),
-        )
-    }
-}
 
 /// Result of a Linux metal2vulkan draw.
 #[cfg(feature = "backend-vulkan")]
@@ -3441,9 +3347,6 @@ enum M2vDrawSpan {
         height: u32,
         /// Non-self full-geometry type-11 inputs resolved by this draw.
         display_sample_mids: Vec<u32>,
-        /// Decoded location-0 bounds span the full target (pixel or NDC) —
-        /// diagnostic provenance for the `fullquad_store_noop` proxy.
-        full_quad_bounds: bool,
     },
     /// Intermediate record of a resident render-pass chain: content stays on
     /// the protocol-keyed engine target (no CPU pixels, no fence wait, no guest
@@ -5321,25 +5224,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         } else {
             req.vertex_count.max(1)
         };
-        let output_mapping = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
         let t_asm_load_done = std::time::Instant::now();
-        // Measure-only per-draw geometry census for display-sized type-11
-        // targets: decoded location-0 position AABB over the drawn index set,
-        // raw (no NDC/pixel disambiguation — the census consumer knows the
-        // pipe's vertex space). Answers "which draws ever touch region R of
-        // buffer B" for the black-band burn-in class without pixel inspection.
-        let mut full_quad_bounds = false;
-        if output_mapping != 0 && w >= 1280 && h >= 720 {
-            if let Some((b, n_idx)) = draw_position_bounds(&resources, vertex_count) {
-                let pixel_span = b[0] <= 0.0 && b[1] <= 0.0 && b[2] >= w as f32 && b[3] >= h as f32;
-                let ndc_span = b[0] <= -1.0 && b[1] <= -1.0 && b[2] >= 1.0 && b[3] >= 1.0;
-                full_quad_bounds = pixel_span || ndc_span;
-                crate::observe::line(format!(
-                    "m2v_draw_bounds mid={output_mapping} {w}x{h} pipe={} idx={n_idx} b=[{:.1},{:.1},{:.1},{:.1}]",
-                    req.pipeline_ref, b[0], b[1], b[2], b[3]
-                ));
-            }
-        }
         let t_asm_cov_done = std::time::Instant::now();
 
         // Decide FIRST whether a census line will be emitted at all; the
@@ -5963,7 +5848,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     width: w,
                     height: h,
                     display_sample_mids: display_sample_mids.into_iter().collect(),
-                    full_quad_bounds,
                 });
             }
         }

@@ -921,7 +921,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         // (`vk_engine_vk: reason=vk_window_… vk_result=…`) into that type's own
         // `host_window_init` line.
         emission: Emission::At(&[
-            ("backend/vulkan/engine/stats_reduce.rs", "stats_reduce"),
             ("backend/vulkan/engine/context.rs", "vk_pipeline_cache_save"),
             ("backend/vulkan/engine/desc_arena.rs", "desc_arena_free"),
             (
@@ -949,24 +948,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         ]),
         slug_calls: &[],
         slugs: &[
-            "vk_stats_desc_pool",
-            "vk_stats_sampler",
-            "vk_stats_create_buffer",
-            "vk_stats_alloc",
-            "vk_stats_bind",
-            "vk_stats_map",
-            "vk_stats_alloc_cb",
-            "vk_stats_create_fence",
-            "vk_stats_fence_status_reclaim",
-            "vk_stats_alloc_descriptor_set",
-            "vk_stats_reset_fence",
-            "vk_stats_reset_command_buffer",
-            "vk_stats_begin_command_buffer",
-            "vk_stats_end_command_buffer",
-            "vk_stats_queue_submit",
-            "vk_stats_fence_status_consume",
-            "vk_stats_wait_fence_blocking",
-            "vk_stats_wait_fence_destroy",
             "vk_readback_reset_cb",
             "vk_readback_begin_cb",
             "vk_readback_end_cb",
@@ -2902,20 +2883,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_pipeline_cache_warm_create",
             "vk_pipeline_cache_write",
             "vk_pipeline_cache_rename",
-        ],
-    },
-    DeclineClass {
-        type_name: "StatsReduceDecline",
-        defined_in: "backend/vulkan/engine/stats_reduce.rs",
-        slug_blocks: &[],
-        emission: Emission::At(&[
-            ("backend/vulkan/engine/mod.rs", "stats_reduce"),
-            ("backend/vulkan/engine/stats_reduce.rs", "stats_reduce"),
-        ]),
-        slug_calls: &[],
-        slugs: &[
-            "vk_stats_reduce_zero_sequence",
-            "vk_stats_reduce_zero_geometry",
         ],
     },
     DeclineClass {

@@ -465,11 +465,7 @@ impl ResourcePools {
         // Prefetch slots own dedicated fences + host-coherent buffers; their CBs
         // are freed with `cmd_pool` below. Destroy them before the pool so the
         // best-effort in-flight fence waits happen while the device is live.
-        // Same rule for the stats-reduction pool: dedicated fences, a
-        // persistently-mapped buffer, a private descriptor pool and a
-        // sampler. Its CBs come from `cmd_pool`, so hand it over here and
-        // destroy before the pool itself goes.
-        self.stats_reduce.destroy_all(device, self.cmd_pool);
+        // Same rule for the host-scatter pool.
         self.host_scatter.destroy_all(device, self.cmd_pool);
         for slot in self.slots.drain(..) {
             device.destroy_fence(slot.fence, None);

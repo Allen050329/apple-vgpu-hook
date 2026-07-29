@@ -40,43 +40,6 @@ use crate::observe::Decline;
 /// stays distinguishable in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VkOp {
-    // ---- stats_reduce.rs — the present-proxy GPU stats-reduction pool ----
-    /// `vkCreateDescriptorPool` for the private stats descriptor pool.
-    StatsDescPool,
-    /// `vkCreateSampler` for the point sampler `texelFetch` binds.
-    StatsSampler,
-    /// `vkCreateBuffer` for a slot's 32-byte readback buffer.
-    StatsCreateBuffer,
-    /// `vkAllocateMemory` for that buffer.
-    StatsAlloc,
-    /// `vkBindBufferMemory` for that buffer.
-    StatsBind,
-    /// `vkMapMemory` for that buffer's persistent host-coherent map.
-    StatsMap,
-    /// `vkAllocateCommandBuffers` for a slot's command buffer.
-    StatsAllocCb,
-    /// `vkCreateFence` for a slot's completion fence.
-    StatsCreateFence,
-    /// `vkGetFenceStatus` while reclaiming a saturated slot.
-    StatsFenceStatusReclaim,
-    /// `vkAllocateDescriptorSets` for a stats slot.
-    StatsAllocDescriptorSet,
-    /// `vkResetFences` before one stats dispatch.
-    StatsResetFence,
-    /// `vkResetCommandBuffer` before one stats dispatch.
-    StatsResetCommandBuffer,
-    /// `vkBeginCommandBuffer` for one stats dispatch.
-    StatsBeginCommandBuffer,
-    /// `vkEndCommandBuffer` after one stats dispatch.
-    StatsEndCommandBuffer,
-    /// `vkQueueSubmit` of one stats dispatch.
-    StatsQueueSubmit,
-    /// `vkGetFenceStatus` while non-blockingly consuming a stats block.
-    StatsFenceStatusConsume,
-    /// `vkWaitForFences` for the synchronous Store stats consumer.
-    StatsWaitFenceBlocking,
-    /// Bounded `vkWaitForFences` before destroying an in-flight stats slot.
-    StatsWaitFenceDestroy,
 
     // ---- mod.rs `read_target_inner` — the full-frame CPU readback rail ----
     /// `vkResetCommandBuffer` before recording the readback copy.
@@ -417,24 +380,6 @@ impl Decline for VkCall {
     /// this type's own `Decline` impl.
     fn slug(&self) -> &'static str {
         match self.op {
-            VkOp::StatsDescPool => "vk_stats_desc_pool",
-            VkOp::StatsSampler => "vk_stats_sampler",
-            VkOp::StatsCreateBuffer => "vk_stats_create_buffer",
-            VkOp::StatsAlloc => "vk_stats_alloc",
-            VkOp::StatsBind => "vk_stats_bind",
-            VkOp::StatsMap => "vk_stats_map",
-            VkOp::StatsAllocCb => "vk_stats_alloc_cb",
-            VkOp::StatsCreateFence => "vk_stats_create_fence",
-            VkOp::StatsFenceStatusReclaim => "vk_stats_fence_status_reclaim",
-            VkOp::StatsAllocDescriptorSet => "vk_stats_alloc_descriptor_set",
-            VkOp::StatsResetFence => "vk_stats_reset_fence",
-            VkOp::StatsResetCommandBuffer => "vk_stats_reset_command_buffer",
-            VkOp::StatsBeginCommandBuffer => "vk_stats_begin_command_buffer",
-            VkOp::StatsEndCommandBuffer => "vk_stats_end_command_buffer",
-            VkOp::StatsQueueSubmit => "vk_stats_queue_submit",
-            VkOp::StatsFenceStatusConsume => "vk_stats_fence_status_consume",
-            VkOp::StatsWaitFenceBlocking => "vk_stats_wait_fence_blocking",
-            VkOp::StatsWaitFenceDestroy => "vk_stats_wait_fence_destroy",
 
             VkOp::ReadbackResetCb => "vk_readback_reset_cb",
             VkOp::ReadbackBeginCb => "vk_readback_begin_cb",
@@ -623,24 +568,6 @@ mod tests {
     use super::*;
 
     const ALL: &[VkOp] = &[
-        VkOp::StatsDescPool,
-        VkOp::StatsSampler,
-        VkOp::StatsCreateBuffer,
-        VkOp::StatsAlloc,
-        VkOp::StatsBind,
-        VkOp::StatsMap,
-        VkOp::StatsAllocCb,
-        VkOp::StatsCreateFence,
-        VkOp::StatsFenceStatusReclaim,
-        VkOp::StatsAllocDescriptorSet,
-        VkOp::StatsResetFence,
-        VkOp::StatsResetCommandBuffer,
-        VkOp::StatsBeginCommandBuffer,
-        VkOp::StatsEndCommandBuffer,
-        VkOp::StatsQueueSubmit,
-        VkOp::StatsFenceStatusConsume,
-        VkOp::StatsWaitFenceBlocking,
-        VkOp::StatsWaitFenceDestroy,
         VkOp::ReadbackResetCb,
         VkOp::ReadbackBeginCb,
         VkOp::ReadbackEndCb,
@@ -806,12 +733,12 @@ mod tests {
     #[test]
     fn the_line_carries_the_driver_result_code() {
         let c = VkCall::new(
-            VkOp::StatsCreateBuffer,
+            VkOp::HostScatterCreateFence,
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
         );
-        let line = crate::observe::Emit::decline("stats_reduce", &c).render();
+        let line = crate::observe::Emit::decline("host_scatter", &c).render();
         assert!(
-            line.starts_with("stats_reduce reason=vk_stats_create_buffer vk_result="),
+            line.starts_with("host_scatter reason=vk_host_scatter_create_fence vk_result="),
             "{line}"
         );
         assert!(

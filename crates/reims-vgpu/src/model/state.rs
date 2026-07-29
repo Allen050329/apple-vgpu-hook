@@ -763,8 +763,6 @@ pub struct RenderDeferredEntry {
     pub height: u32,
     /// Mapping lifetime at defer time — flush drops on drift (recycled pages).
     pub map_generation: u64,
-    /// Bounds mode the original Store would have used.
-    pub full_quad_bounds: bool,
     /// Arm order for oldest-first flush when the render-deferred window cap is
     /// hit — mirrors [`GvaDeferredEntry::armed_seq`]. Bounds the pinned resident
     /// population so a compositing burst (YouTube page-load) cannot balloon the
@@ -1056,23 +1054,14 @@ pub struct PresentState {
     /// worker, one present after the capture reads it — dmabuf state is stable
     /// across steady-state presents). When true, the display is carried by the
     /// GPU resident and does NOT consume the CPU `frame_bgra`, so
-    /// `capture_present_frame` skips the expensive guest-page readback. The GPU
-    /// stats oracle feeds the proxies without a framebuffer copy. Always false
-    /// on non-host-window / non-import-capable builds, so those keep the
+    /// `capture_present_frame` skips the expensive guest-page readback. Always
+    /// false on non-host-window / non-import-capable builds, so those keep the
     /// per-present readback unchanged.
     pub dmabuf_active: bool,
     /// Always-on census: full (readback ran) vs light (dmabuf-carried, readback
     /// skipped) captures, so the readback-elision ratio is visible.
     pub full_captures: u64,
     pub light_captures: u64,
-    /// The GPU stats reduction armed by the previous present, awaiting consume.
-    ///
-    /// The zero-copy oracle is asynchronous: a present arms a reduction and a
-    /// later present collects it, so nothing ever blocks on the GPU. This
-    /// carries the key needed to rebuild the exact identity that was armed.
-    pub pending_stats: Option<PendingStats>,
-    /// Monotonic arm counter for [`PendingStats::seq`]; never 0 once armed.
-    pub stats_seq: u64,
 }
 
 /// One surface's present/scanout evidence: the geometry the guest named it at,
@@ -1087,24 +1076,6 @@ pub struct PresentedGeom {
     pub width: u32,
     pub height: u32,
     pub map_generation: u32,
-}
-
-/// Key for an in-flight GPU stats reduction (the zero-copy present oracle).
-///
-/// Carries everything needed to rebuild the resident identity that was armed,
-/// **without re-resolving it** — same rule as `render_deferred_identity`:
-/// anything that moves between arm and consume must not make us look up a
-/// different image than the one the dispatch actually read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingStats {
-    pub mapping_id: u32,
-    pub width: u32,
-    pub height: u32,
-    /// Protocol content generation, for proxy attribution.
-    pub generation: u32,
-    /// Identity generation — the mapping's lifetime at arm time.
-    pub map_generation: u64,
-    pub seq: u64,
 }
 
 /// Hardware cursor model.
@@ -2419,7 +2390,6 @@ impl DeviceState {
     }
 
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
-        crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
         // Prune the dense-frame seq: a recycled mapping id must not inherit a
         // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
@@ -3102,7 +3072,6 @@ impl DeviceState {
         // generation when it is. Dropping it eagerly demoted a proven swapchain
         // buffer to a private resident for every draw until its next present,
         // which is the black-desktop class.
-        crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
         true
     }
 

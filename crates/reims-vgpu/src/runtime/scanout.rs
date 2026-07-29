@@ -119,101 +119,6 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
     }
 }
 
-/// Arm a GPU stats reduction for this present and consume the previous one.
-///
-/// This is the zero-copy oracle. `capture_present_frame`'s CPU path only runs
-/// when the DISPLAY needs pixels (no dmabuf carrying the frame); on every other
-/// present the proxies would otherwise go dark. Instead we dispatch the
-/// reduction kernel over the resident the display already holds and read back a
-/// 32-byte block — so the always-on proxies keep measuring every present with
-/// **no** full-frame copy on any path.
-///
-/// Asynchronous by construction: `arm` submits and returns, `take` polls a fence
-/// without blocking. Stats therefore describe a present one or more frames back.
-/// That is safe because the block is matched on the exact
-/// `(identity, generation, seq)` it was armed with, so a proxy is never handed
-/// another frame's numbers — it sees the same sequence, shifted. Proxies that
-/// compare consecutive captures (`mid_switch`, `nz_swing`) are unaffected by a
-/// uniform shift.
-#[cfg(feature = "backend-vulkan")]
-fn run_gpu_stats_oracle(
-    state: &mut crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    generation: u32,
-) {
-    use crate::backend::vulkan::engine;
-
-    // 1. Collect the previous present's reduction, if the GPU has finished it.
-    if let Some(p) = state.present.pending_stats {
-        let identity = pending_stats_identity(&p);
-        match engine::take_present_stats(&identity, p.map_generation, p.seq) {
-            Some(stats) => {
-                state.present.pending_stats = None;
-                // Reject a block whose geometry disagrees with what we armed:
-                // the resident was recreated under us and the numbers describe a
-                // different surface.
-                if stats.width == p.width && stats.height == p.height {
-                    crate::runtime::census::present_proxy::note_capture_ok(
-                        crate::runtime::census::present_proxy::PresentCaptureSample {
-                            mapping_id: p.mapping_id,
-                            generation: p.generation,
-                            width: p.width,
-                            height: p.height,
-                            nz: stats.byte_nz as usize,
-                            max_byte: stats.byte_max,
-                            rgb_nz: stats.rgb_nz as usize,
-                            max_rgb: stats.max_rgb,
-                            // GPU-sourced: never the deferred-store CPU reuse.
-                            from_last_store: false,
-                            edge_energy: stats.edge_energy,
-                        },
-                    );
-                } else {
-                    crate::observe::off(format!(
-                        "present_stats DROP reason=geom_drift mid={} armed={}x{} got={}x{} seq={}",
-                        p.mapping_id, p.width, p.height, stats.width, stats.height, p.seq
-                    ));
-                }
-            }
-            None => {
-                // Not finished yet. Leave it pending so a later present collects
-                // it — unless a newer arm is about to displace it, handled below.
-            }
-        }
-    }
-
-    // 2. Arm this present. If one is still pending, cancel it first: the pool is
-    //    small and a stale key would pin a slot forever.
-    if let Some(p) = state.present.pending_stats.take() {
-        engine::cancel_present_stats(p.seq);
-        crate::runtime::census::present_proxy::stats_oracle::note_superseded();
-    }
-    let map_generation = state
-        .mappings
-        .get(&mapping_id)
-        .map(|m| m.map_generation as u64)
-        .unwrap_or(0);
-    let seq = state.present.stats_seq.wrapping_add(1).max(1);
-    state.present.stats_seq = seq;
-    let pending = crate::model::PendingStats {
-        mapping_id,
-        width,
-        height,
-        generation,
-        map_generation,
-        seq,
-    };
-    let identity = pending_stats_identity(&pending);
-    if engine::arm_present_stats(&identity, seq) {
-        state.present.pending_stats = Some(pending);
-        crate::runtime::census::present_proxy::stats_oracle::note_armed(true);
-    } else {
-        crate::runtime::census::present_proxy::stats_oracle::note_armed(false);
-    }
-}
-
 /// Record the display action for `mapping_id`.
 ///
 /// A capture IS the display action, and `presented_geoms` is where the decoded
@@ -226,31 +131,6 @@ fn note_display_action(
     height: u32,
 ) {
     state.note_presented_geom(mapping_id, width, height);
-}
-
-/// Rebuild the exact identity a [`crate::model::PendingStats`] was armed with.
-/// Never re-resolves it (see the type's docs).
-#[cfg(feature = "backend-vulkan")]
-fn pending_stats_identity(
-    p: &crate::model::PendingStats,
-) -> crate::backend::vulkan::engine::types::TargetIdentity {
-    crate::backend::vulkan::engine::types::TargetIdentity::Surface {
-        id: p.mapping_id,
-        width: p.width,
-        height: p.height,
-        generation: p.map_generation,
-    }
-}
-
-/// Non-Vulkan backends have no resident registry and so no GPU oracle.
-#[cfg(not(feature = "backend-vulkan"))]
-fn run_gpu_stats_oracle(
-    _state: &mut crate::model::DeviceState,
-    _mapping_id: u32,
-    _width: u32,
-    _height: u32,
-    _generation: u32,
-) {
 }
 
 /// Fill `buf` from the mapping's GPU resident, without any guest-page scatter.
@@ -338,18 +218,13 @@ pub fn capture_present_frame(
     // gather + full-frame proxy scan below is then pure present-hot-path overhead
     // that serializes the guest behind the drain lock (the fullscreen-video
     // slowdown class). Skip it on those presents. The cheap protocol-structural
-    // a/b guard still runs on every light present, and the GPU stats oracle feeds
-    // content proxies without a framebuffer copy. Never taken on non-host-window
+    // a/b guard still runs on every light present. Never taken on non-host-window
     // or non-import-capable builds: `dmabuf_active` only becomes true after a
     // successful direct export.
-    // The full-frame readback now has EXACTLY ONE reason to exist: the DISPLAY
-    // needs CPU pixels because no dmabuf is carrying the frame, and the window
-    // will blit `frame_bgra`. Nothing else reads it.
     //
-    // The proxies used to be the other reason, and that was the last full-frame
-    // GPU→CPU copy on the present path. They are now fed by a compute reduction
-    // over the resident (`run_gpu_stats_oracle`), which returns 32 bytes, so the
-    // oracle costs no full-frame copy and needs no opt-in.
+    // The full-frame readback has EXACTLY ONE reason to exist: the DISPLAY needs
+    // CPU pixels because no dmabuf is carrying the frame, and the window will
+    // blit `frame_bgra`. Nothing else reads it.
     //
     // Consequence: with dmabuf carrying, `frame_bgra` holds no frame for this
     // present, and the branch below drops it so that stays literally true.
@@ -390,11 +265,6 @@ pub fn capture_present_frame(
         // The present declares this mapping's pages the finished frame; the first
         // LOAD draw after must re-seed from guest pages (dual-mid strobe class).
         state.presented_needs_guest_seed.insert(mapping_id);
-        // Zero-copy oracle: the proxies still get measured on this present, they
-        // just get measured ON THE GPU. Arm a reduction over the resident and
-        // collect whichever earlier one has finished. No frame crosses the bus,
-        // and neither call blocks.
-        run_gpu_stats_oracle(state, mapping_id, width, height, generation);
         state.present.light_captures = state.present.light_captures.wrapping_add(1);
         maybe_log_capture_sampling(state);
         // Light capture pays ~no lock hold; attribute a zero to the tranche so the
@@ -491,19 +361,17 @@ pub fn capture_present_frame(
     // halving the measure-only scan cuts per-present lock-hold (present cadence
     // / boot convergence). Byte-exact with nonzero_stats + bgra_rgb_stats.
     let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
-    let edge = crate::runtime::census::present_proxy::edge_energy_bgra(&buf, width, height);
     let scan_us = scan_started.elapsed().as_micros() as u64;
     crate::observe::line(format!(
-        "scanout capture_present mid={mapping_id} {width}x{height} gen={generation} nz={nz} max={maxb} edge={edge} last_store={} host_cache={}",
+        "scanout capture_present mid={mapping_id} {width}x{height} gen={generation} nz={nz} max={maxb} last_store={} host_cache={}",
         from_last_store as u8,
         from_host_cache as u8
     ));
     // Offline: always log capture with RGB-visible stats (not byte-nz/alpha).
     // The `peers=[...]` field re-scans every same-geometry host surface (up to
-    // several 8 MiB buffers) purely for diagnosis; the real peer-divergence
-    // signal is the always-on `selected_peer_divergence` proxy (cached per-Store
-    // rgb_nz, no rescan). Build the field only under REIMS_VGPU_DRAW_LOG so a normal
-    // boot does not pay N extra full-frame scans per present on the drain lock.
+    // several 8 MiB buffers) purely for diagnosis. Build the field only under
+    // REIMS_VGPU_DRAW_LOG so a normal boot does not pay N extra full-frame scans
+    // per present on the drain lock.
     let mut peers = String::new();
     if crate::observe::draw_log_enabled() {
         for (&mid, e) in state.host_surfaces.iter() {
@@ -524,15 +392,13 @@ pub fn capture_present_frame(
     }
     // Per-present provenance census — one line on EVERY present. Under a
     // continuously-animating app this is ~15–30k lines/session of pure diagnostic
-    // trace: the always-on present-health signal (rate, occupancy, mid/nz/struct
-    // swings, sparse/converge) lives in the `note_capture_ok` windowed `summary`
-    // line and its on-anomaly THRASH events, and `present_black` fires the
-    // genuine "console will be black" alarm. Nothing consumes this line's fields
-    // beyond diagnosis, so gate it (and the redundant `present host_cache`, whose
-    // info is the `src=host_cache` field here) behind REIMS_VGPU_DRAW_LOG so a normal
-    // boot does not flood the curated fail view.
+    // trace: `present_black` fires the genuine "console will be black" alarm and
+    // nothing consumes this line's fields beyond diagnosis, so gate it (and the
+    // redundant `present host_cache`, whose info is the `src=host_cache` field
+    // here) behind REIMS_VGPU_DRAW_LOG so a normal boot does not flood the
+    // curated fail view.
     crate::observe::line(format!(
-        "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} edge={edge} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
+        "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
         px0[0],
         px0[1],
         px0[2],
@@ -546,27 +412,9 @@ pub fn capture_present_frame(
             "present host_cache mid={mapping_id} {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} gen={generation}"
         ));
     }
-    // PGDisplay presentFrame always installs the named surface into +0x188
-    // Do not gate present on nonzero/sparsity measurements. Capture-fail
-    // (return false above)
-    // already keeps the prior retain via drain keep_prior frame_valid.
-    crate::runtime::census::present_proxy::note_capture_ok(
-        crate::runtime::census::present_proxy::PresentCaptureSample {
-            mapping_id,
-            generation,
-            width,
-            height,
-            nz,
-            max_byte: maxb,
-            rgb_nz,
-            max_rgb,
-            from_last_store,
-            edge_energy: edge,
-        },
-    );
     // Sub-phase split of the capture lock hold (paint = guest read / host_cache
-    // copy; scan = fused occupancy pass + edge). Names which part of the
-    // per-present floor to cut.
+    // copy; scan = fused occupancy pass). Names which part of the per-present
+    // floor to cut.
     // Per-present + pure wall-clock (SCHED_IDLE-contaminated under the agent
     // harness), so this is REIMS_VGPU_DRAW_LOG-only diagnostic trace, not an always-on
     // signal: the drain-side `tranche` capture_us aggregate carries the floor.
@@ -700,7 +548,7 @@ pub unsafe fn copy_to_host_ptr_gpu(
         crate::runtime::import_present::surface_identity(state, shown_mid, width, height);
     let result = unsafe {
         crate::backend::vulkan::engine::present_into_host_ptr_strided(
-            &identity, host_ptr, ptr_len, dst_stride, false,
+            &identity, host_ptr, ptr_len, dst_stride,
         )
     };
     if let Err(err) = result {

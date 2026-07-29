@@ -1,93 +1,30 @@
-//! Always-on **flicker / dual-mid thrash proxies** for the present path.
+//! Always-on **present-path census and draw-side drop proxies**.
 //!
 //! These do **not** change product behavior. They record compact, fail-visible
-//! signals so a log census can tell "dual-mid incomplete thrash is happening"
-//! without opening screenshots.
+//! signals so a log census can name a class without opening screenshots.
 //!
 //! ## Proxies (log: `/tmp/reims-vgpu-thrash.log`, also `observe::fail` on events)
 //!
-//! | Proxy | Meaning | Why it tracks flicker |
-//! | --- | --- | --- |
-//! | `nz_swing` | Consecutive CmdDisplaySwap captures name different mapping ids **and** min(nz)/max(nz) < [`NZ_SWING_RATIO`] | One mid holds far less content (logo/partial vs full). A mid switch on its own is ordinary double-buffering and is counted (`mid_sw=`), not logged |
-//! | `sparse_present` | Captured frame nonzero fraction < [`SPARSE_NZ_FRAC`] at full desktop size | Logo-like / mostly-empty retain |
-//! | `geom_mismatch` | Capture W×H differs from previous present geom | Letterbox / mode thrash |
-//! | `capture_fail` | DisplaySwap capture returned false | Retain hole / keep_prior path |
-//! | `selected_peer_divergence` | The protocol-selected retain is sparse while a same-geometry Store peer is dense | Hidden complete ping/pong sibling / incomplete retained Load base |
+//! | Proxy | Meaning |
+//! | --- | --- |
+//! | `capture_fail` | DisplaySwap capture returned false — retain hole / keep_prior path |
+//! | `stale_online_pending` | A post-ack display IRQ raised with the shared-page ONLINE bit still pending |
+//! | `secondary_mrt_drop` / `mrt_mask_bind_miss` | A multi-RT draw degraded to single-RT, or a rendered mask failed to bind at sample time |
+//! | `t11_large_fallback` | A large type-11 composite sampled guest pages because no current-generation resident was ready |
+//! | `empty_sample` | A resolved fragment/vertex sample whose payload was all-zero |
 //!
-//! Summary counters: `THRASH summary presents=… present_hz=… mid_sw=… nz_sw=… struct_sw=…
-//! sparse=… geom=… fail=… peer_divergence=… converged=… post_converge_regress=…
-//! stale_online=… t11_fb=…` (emitted every [`SUMMARY_EVERY`] present captures).
+//! The windowed submodules below (`cadence`, `hitch`, `present_import`,
+//! `window_publish`, `capture_source`, `export_present`, `cap_flush`,
+//! `idle_drain`, `store_scatter`, `cap_pressure`, `vram`, `lifecycle_churn`)
+//! each emit one line per window and stay silent while their counters are zero.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::observe;
 
-/// min(nz)/max(nz) below this on a mid switch ⇒ nz_swing thrash event.
-/// Dual-mid logo residual: full desktop ~6.2e6 nz vs logo mid ~2e6 (ratio ~0.33).
-/// Live incomplete dual-mid (black+layers ~3.4e6 vs full ~6.2e6) sits ~0.54 —
-/// still incomplete visual thrash (structure_swing also fires). Measure-only.
-const NZ_SWING_RATIO: f64 = 0.60;
-
-/// Nonzero-byte fraction of a full frame below this ⇒ sparse_present.
-/// Logo mid is sparse relative to wallpaper; empty dock glass is also low-variance
-/// but still mid-nz — use a low bar so only near-empty/logo frames fire.
-const SPARSE_NZ_FRAC: f64 = 0.08;
-
-/// RGB-occupancy fraction at or above which a full-size present counts as a
-/// **converged** desktop frame (wallpaper composited, not chrome-only-over-black).
-/// The dual-mid boot strobe alternates a chrome-only sparse buffer (rgb_frac
-/// ≈0.003) with the full desktop (rgb_frac ≈1.0); half-occupancy cleanly
-/// separates the two and is reached only once the wallpaper underlay lands.
-/// Measure-only — the `present_converge` timestamp it emits never gates present
-/// selection (that would be the forbidden content-heuristic).
-const CONVERGE_DENSE_FRAC: f64 = 0.50;
-
-/// Consecutive non-dense (rgb_frac < [`CONVERGE_DENSE_FRAC`]) full-size presents
-/// *after* the desktop first converged that count as a **post-converge regression**
-/// — the desktop composited, then the guest reverted to the login/boot overlay
-/// (rgb_frac ≈0.13, Apple-logo-over-black) or a sparse strobe. Because the retain
-/// captured into +0x188 is the *full composited frame*, a normal desktop present
-/// stays dense (~1.0) even for a tiny damage update; rgb_frac only falls below the
-/// dense bar when the guest genuinely composites a mostly-empty/overlay frame. A
-/// sustained run is therefore the intermittent "desktop rendered then broke" class.
-/// Conservative so a brief
-/// legitimately-dark fullscreen transition does not fire; measure-only.
-const POST_CONVERGE_REGRESS_RUN: u64 = 24;
-
-/// Minimum pixel count before sparse/swing proxies apply (ignore cursors / 2×2 tests).
-const MIN_PROXY_PIXELS: u64 = 320 * 200;
-
-const SUMMARY_EVERY: u64 = 32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PresentCaptureSample {
-    pub mapping_id: u32,
-    pub generation: u32,
-    pub width: u32,
-    pub height: u32,
-    /// Byte nonzero (includes alpha-only black clears). Prefer [`Self::rgb_nz`]
-    /// for content thrash.
-    pub nz: usize,
-    pub max_byte: u8,
-    /// Pixels with any RGB channel nonzero — alpha-only clear is 0.
-    pub rgb_nz: usize,
-    pub max_rgb: u8,
-    pub from_last_store: bool,
-    /// Subsampled mean absolute horizontal edge (luma) — structure thrash proxy.
-    pub edge_energy: u32,
-}
-
 struct ThrashState {
-    last: Option<PresentCaptureSample>,
-    presents: u64,
-    mid_switches: u64,
-    nz_swings: u64,
-    structure_swings: u64,
-    sparse: u64,
-    geom_mismatch: u64,
     capture_fail: u64,
-    selected_peer_divergence: u64,
     /// Dedup for `secondary_mrt_drop`: (reason_code, width, height) already
     /// reported this boot, so a per-draw MRT-secondary drop fires once per
     /// distinct combo, never per frame. Names which build path silently degraded
@@ -97,19 +34,6 @@ struct ThrashState {
     /// (reason, geometry) combinations a boot produces.
     secondary_mrt_drop_seen: std::collections::BTreeSet<(u8, u32, u32)>,
     secondary_mrt_blend_seen: std::collections::BTreeSet<(u32, u32, u32)>,
-    /// Boot-convergence proxy: whether a full-size present has reached
-    /// [`CONVERGE_DENSE_FRAC`] RGB occupancy yet (the wallpaper/desktop first
-    /// fully composited). Latched once — the `present_converge` line fires
-    /// exactly at that first dense present so every boot leaves one greppable
-    /// convergence timestamp, and a boot that strobes forever leaves
-    /// `converged=0` in the summary instead of silence.
-    first_dense_seen: bool,
-    /// Consecutive non-dense full-size presents since the last dense one, counted
-    /// only after `first_dense_seen`. A dense present resets it to 0; crossing
-    /// [`POST_CONVERGE_REGRESS_RUN`] fires `post_converge_regress`.
-    post_converge_nondense_run: u64,
-    /// Distinct post-converge regression episodes (desktop → overlay/strobe).
-    post_converge_regress: u64,
     /// Post-**ack** display IRQs raised while the shared-page ONLINE bit (bit2)
     /// was still pending — the guest re-reads it and re-runs `process_online` →
     /// `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17).
@@ -128,16 +52,6 @@ struct ThrashState {
     /// `t11_large_fallback` line, so a sustained episode logs once per surface
     /// instead of once per frame. Bounded by the live large-mapping set.
     t11_fb_seen: std::collections::BTreeSet<(u32, u32)>,
-    /// Process-monotonic ms and present count at the previous summary, so each
-    /// summary can report `present_hz` — the guest composite/render throughput.
-    /// Under a real app this is the render-bound fps (the guest is render-, not
-    /// VBL-bound: composites ~31–34/s at both 60 and 120 Hz). Making it a
-    /// first-class always-on number turns a render-throughput regression (a
-    /// pipeline stall dragging composites down) into a visible drop instead of a
-    /// hand-diff of two `presents=` counters. `0` on the first summary (no prior
-    /// window). Runs on the drain worker (off the QEMU main core).
-    last_summary_ms: u64,
-    last_summary_presents: u64,
 }
 
 /// Which multi-RT build check bailed, degrading the draw to single-RT.
@@ -222,26 +136,13 @@ impl MaskBindMiss {
 impl ThrashState {
     const fn new() -> Self {
         Self {
-            last: None,
-            presents: 0,
-            mid_switches: 0,
-            nz_swings: 0,
-            structure_swings: 0,
-            sparse: 0,
-            geom_mismatch: 0,
             capture_fail: 0,
-            selected_peer_divergence: 0,
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
             secondary_mrt_blend_seen: std::collections::BTreeSet::new(),
-            first_dense_seen: false,
-            post_converge_nondense_run: 0,
-            post_converge_regress: 0,
             stale_online_pending: 0,
             stale_online_logged: false,
             t11_fb_total: 0,
             t11_fb_seen: std::collections::BTreeSet::new(),
-            last_summary_ms: 0,
-            last_summary_presents: 0,
         }
     }
 }
@@ -269,10 +170,6 @@ pub fn note_t11_large_fallback(mid: u32, map_gen: u32, probe: Option<(u64, bool)
     }
 }
 
-/// Dual-mid structure thrash: similar nz (wallpaper-in-holes still nonzero) but
-/// edge energy diverges — live Safari shattered vs full-chrome alternating frames.
-const STRUCTURE_SWING_RATIO: f64 = 0.75;
-
 /// Single mutex so unit tests and concurrent presents cannot interleave counters.
 static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 
@@ -280,142 +177,6 @@ static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 fn display_store_peak_map() -> &'static Mutex<HashMap<u32, usize>> {
     static MAP: std::sync::OnceLock<Mutex<HashMap<u32, usize>>> = std::sync::OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// A conservative selected-vs-peer Store comparison. This is deliberately
-/// separate from present selection: RGB occupancy can diagnose divergence but
-/// must never choose the surface shown to the guest.
-const PEER_DENSE_MIN_FRAC: f64 = 0.90;
-const SELECTED_PEER_MAX_RATIO: f64 = 0.45;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DisplayStoreSample {
-    width: u32,
-    height: u32,
-    rgb_nz: usize,
-    seq: u64,
-}
-
-#[derive(Default)]
-struct PeerDivergenceState {
-    stores: HashMap<u32, DisplayStoreSample>,
-    active: Option<(u32, u32, u32, u32)>,
-    seq: u64,
-}
-
-fn peer_divergence_state() -> &'static Mutex<PeerDivergenceState> {
-    static STATE: std::sync::OnceLock<Mutex<PeerDivergenceState>> = std::sync::OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(PeerDivergenceState::default()))
-}
-
-/// Record a display Store and detect a sparse protocol-selected retain with a
-/// dense same-geometry sibling. Returns true only on entry into a new episode.
-/// Measurement-only: the result never gates ownership, Store, or presentation.
-pub fn note_selected_peer_divergence(
-    mapping_id: u32,
-    selected_mapping: u32,
-    width: u32,
-    height: u32,
-    rgb_nz: usize,
-) -> bool {
-    let total = (width as u64).saturating_mul(height as u64);
-    if mapping_id == 0 || selected_mapping == 0 || total < MIN_PROXY_PIXELS || rgb_nz == 0 {
-        return false;
-    }
-
-    let event = {
-        let mut peers = peer_divergence_state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        peers.seq = peers.seq.saturating_add(1);
-        let seq = peers.seq;
-        peers.stores.insert(
-            mapping_id,
-            DisplayStoreSample {
-                width,
-                height,
-                rgb_nz,
-                seq,
-            },
-        );
-        let Some(selected) = peers.stores.get(&selected_mapping).copied() else {
-            peers.active = None;
-            return false;
-        };
-        let dense_min = (total as f64 * PEER_DENSE_MIN_FRAC).ceil() as usize;
-        let dense = peers
-            .stores
-            .iter()
-            .filter(|(mid, sample)| {
-                **mid != selected_mapping
-                    && sample.width == selected.width
-                    && sample.height == selected.height
-                    && sample.rgb_nz >= dense_min
-            })
-            .max_by_key(|(_, sample)| sample.rgb_nz)
-            .map(|(mid, sample)| (*mid, *sample));
-        let Some((dense_mid, dense)) = dense else {
-            peers.active = None;
-            return false;
-        };
-        let ratio = selected.rgb_nz as f64 / dense.rgb_nz.max(1) as f64;
-        if ratio >= SELECTED_PEER_MAX_RATIO {
-            peers.active = None;
-            return false;
-        }
-        let key = (selected_mapping, dense_mid, selected.width, selected.height);
-        if peers.active == Some(key) {
-            return false;
-        }
-        peers.active = Some(key);
-        Some((selected, dense_mid, dense, ratio))
-    };
-
-    let Some((selected, dense_mid, dense, ratio)) = event else {
-        return false;
-    };
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.selected_peer_divergence = st.selected_peer_divergence.saturating_add(1);
-    drop(st);
-    let selected_newer = selected.seq >= dense.seq;
-    let seq_delta = if selected_newer {
-        selected.seq - dense.seq
-    } else {
-        dense.seq - selected.seq
-    };
-    thrash_line(&format!(
-        "selected_peer_divergence incoming_mid={mapping_id} selected_mid={selected_mapping} selected_rgb_nz={} selected_seq={} dense_mid={dense_mid} dense_rgb_nz={} dense_seq={} selected_newer={} seq_delta={} ratio={ratio:.4} {}x{}",
-        selected.rgb_nz,
-        selected.seq,
-        dense.rgb_nz,
-        dense.seq,
-        u8::from(selected_newer),
-        seq_delta,
-        selected.width,
-        selected.height
-    ));
-    true
-}
-
-/// Mapping-lifetime hook for selected-vs-peer diagnostics. A recycled mapping id
-/// must not keep an old Store occupancy sample, or the measure-only
-/// `selected_peer_divergence` proxy can compare the new surface against a dead
-/// peer. This prunes only diagnostic state; present selection and residency are
-/// unaffected.
-pub fn forget_display_store_sample(mapping_id: u32) {
-    if mapping_id == 0 {
-        return;
-    }
-    let mut peers = peer_divergence_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    peers.stores.remove(&mapping_id);
-    if peers
-        .active
-        .is_some_and(|(selected, dense, _, _)| selected == mapping_id || dense == mapping_id)
-    {
-        peers.active = None;
-    }
 }
 
 /// Always-on visibility for a **silently-degraded MRT draw**: a draw whose color
@@ -568,9 +329,6 @@ fn reset_state_inner() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    *peer_divergence_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = PeerDivergenceState::default();
 }
 
 /// Test/helper: clear display Store peaks (unit tests isolation).
@@ -1136,109 +894,6 @@ pub mod present_import {
     #[cfg(test)]
     pub(crate) fn test_maybe_line(now: u64) -> Option<String> {
         maybe_line_at(now)
-    }
-}
-
-/// Always-on windowed census of the GPU stats oracle (the zero-copy proxy rail).
-///
-/// The proxies are fed by a compute reduction over the resident, not by a CPU
-/// frame copy. This is the health signal for that rail: `armed` = dispatches
-/// submitted, `arm_fail` = the resident was not reducible (not content-ready,
-/// not BGRA, or the pool saturated), `superseded` = a pending reduction was
-/// cancelled because the next present arrived before the GPU finished it.
-///
-/// Read it as: a healthy desktop shows `armed` tracking the present rate with
-/// `arm_fail=0`. A climbing `arm_fail` means the proxies are going dark — the
-/// resident registry is missing the presented mid — and a climbing `superseded`
-/// means the reduction is not keeping up with the present rate, so proxy
-/// sampling is thinning out. Neither ever costs correctness; both cost coverage,
-/// which is exactly what a measurement rail must report about itself.
-pub mod stats_oracle {
-    use crate::observe;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static ARMED: AtomicU64 = AtomicU64::new(0);
-    static ARM_FAIL: AtomicU64 = AtomicU64::new(0);
-    static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
-    static WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
-
-    const WINDOW_MS: u64 = 1000;
-
-    pub fn note_armed(ok: bool) {
-        if ok {
-            ARMED.fetch_add(1, Ordering::Relaxed);
-        } else {
-            ARM_FAIL.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(line) = maybe_line_at(observe::elapsed_ms() as u64) {
-            observe::off(line);
-        }
-    }
-
-    pub fn note_superseded() {
-        SUPERSEDED.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn maybe_line_at(now: u64) -> Option<String> {
-        let start = WINDOW_START_MS.load(Ordering::Relaxed);
-        if start == 0 {
-            let _ = WINDOW_START_MS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
-            return None;
-        }
-        let dt = now.saturating_sub(start);
-        if dt < WINDOW_MS {
-            return None;
-        }
-        if WINDOW_START_MS
-            .compare_exchange(start, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return None;
-        }
-        let armed = ARMED.swap(0, Ordering::Relaxed);
-        let arm_fail = ARM_FAIL.swap(0, Ordering::Relaxed);
-        let superseded = SUPERSEDED.swap(0, Ordering::Relaxed);
-        if armed.saturating_add(arm_fail) == 0 {
-            return None;
-        }
-        Some(format_line(dt, armed, arm_fail, superseded))
-    }
-
-    fn format_line(dt: u64, armed: u64, arm_fail: u64, superseded: u64) -> String {
-        let hz = armed.saturating_mul(1000) as f64 / dt.max(1) as f64;
-        format!(
-            "stats_oracle window_ms={dt} armed={armed} arm_fail={arm_fail} \
-             superseded={superseded} armed_hz={hz:.1}"
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset() {
-        for a in [&ARMED, &ARM_FAIL, &SUPERSEDED, &WINDOW_START_MS] {
-            a.store(0, Ordering::Relaxed);
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn window_reports_arm_health() {
-            reset();
-            assert_eq!(maybe_line_at(1), None, "first call opens the window");
-            ARMED.fetch_add(30, Ordering::Relaxed);
-            ARM_FAIL.fetch_add(2, Ordering::Relaxed);
-            SUPERSEDED.fetch_add(5, Ordering::Relaxed);
-            let line = maybe_line_at(1 + WINDOW_MS).expect("line");
-            assert!(line.contains("armed=30"), "{line}");
-            assert!(line.contains("arm_fail=2"), "{line}");
-            assert!(line.contains("superseded=5"), "{line}");
-            assert!(
-                maybe_line_at(1 + 2 * WINDOW_MS).is_none(),
-                "idle window emits nothing"
-            );
-        }
     }
 }
 
@@ -1860,279 +1515,6 @@ pub mod idle_drain {
     }
 }
 
-/// Record a successful present retain (after `capture_present_frame` fills +0x188).
-/// Composite/render throughput over one summary window: presents delta / dt.
-/// `prev_ms == 0` marks the first summary (no prior window) → `0.0`; a
-/// zero/backwards `dt` also yields `0.0` (the monotonic clock cannot regress,
-/// but be defensive). Saturating so a counter reset never underflows.
-fn present_hz_over_window(prev_ms: u64, prev_presents: u64, now_ms: u64, presents: u64) -> f64 {
-    if prev_ms == 0 {
-        return 0.0;
-    }
-    let dt = now_ms.saturating_sub(prev_ms);
-    if dt == 0 {
-        return 0.0;
-    }
-    let dp = presents.saturating_sub(prev_presents);
-    dp as f64 * 1000.0 / dt as f64
-}
-
-pub fn note_capture_ok(sample: PresentCaptureSample) {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.presents = st.presents.saturating_add(1);
-    let n = st.presents;
-    let pixels = (sample.width as u64).saturating_mul(sample.height as u64);
-    let total_bytes = pixels.saturating_mul(4);
-
-    if pixels >= MIN_PROXY_PIXELS && total_bytes > 0 {
-        // RGB occupancy: alpha-only DisplaySwap clears (byte_nz full, rgb_nz 0)
-        // are empty presents — the dual-mid black class from live OFF logs.
-        let rgb_frac = sample.rgb_nz as f64 / pixels as f64;
-        if sample.rgb_nz == 0 || rgb_frac < SPARSE_NZ_FRAC {
-            st.sparse = st.sparse.saturating_add(1);
-            thrash_line(&format!(
-                "sparse_present mid={} gen={} {}x{} nz={} rgb_nz={} max={} max_rgb={} frac={:.4} rgb_frac={:.4} last_store={}",
-                sample.mapping_id,
-                sample.generation,
-                sample.width,
-                sample.height,
-                sample.nz,
-                sample.rgb_nz,
-                sample.max_byte,
-                sample.max_rgb,
-                sample.nz as f64 / total_bytes as f64,
-                rgb_frac,
-                sample.from_last_store as u8
-            ));
-            // Named alias for greps (`sparse_front`); same condition as sparse_present.
-            // Measure-only — never gates present/decode/execute. No size heuristic.
-            thrash_line(&format!(
-                "sparse_front mid={} gen={} {}x{} rgb_nz={} rgb_frac={:.4}",
-                sample.mapping_id,
-                sample.generation,
-                sample.width,
-                sample.height,
-                sample.rgb_nz,
-                rgb_frac
-            ));
-        } else if rgb_frac >= CONVERGE_DENSE_FRAC && !st.first_dense_seen {
-            // Boot-convergence: the first full-size present that composites the
-            // wallpaper/desktop (not chrome-only-over-black). The trailing
-            // `t=<ms>` field on the fail-log copy of this THRASH line is the
-            // wall-clock time to a full desktop — the user-visible "console →
-            // logo → desktop" latency. `sparse_before` / `presents_before`
-            // quantify how long the dual-mid strobe ran first. Fires once per
-            // boot; a boot that never converges leaves `converged=0` in the
-            // periodic summary rather than no signal at all (the pathological
-            // slow boot otherwise emits *less* than a healthy one).
-            st.first_dense_seen = true;
-            thrash_line(&format!(
-                "present_converge mid={} gen={} {}x{} rgb_nz={} rgb_frac={:.4} presents_before={} sparse_before={}",
-                sample.mapping_id,
-                sample.generation,
-                sample.width,
-                sample.height,
-                sample.rgb_nz,
-                rgb_frac,
-                n.saturating_sub(1),
-                st.sparse
-            ));
-        }
-
-        // Post-converge regression: once the desktop has fully composited, a
-        // sustained run of non-dense full-size presents means it reverted to the
-        // login/boot overlay or a sparse strobe. A dense present
-        // clears the run; a normal desktop present captures the full composited
-        // +0x188 so it stays dense even for a tiny damage update. Measure-only.
-        if st.first_dense_seen {
-            if rgb_frac >= CONVERGE_DENSE_FRAC {
-                st.post_converge_nondense_run = 0;
-            } else {
-                st.post_converge_nondense_run = st.post_converge_nondense_run.saturating_add(1);
-                if st
-                    .post_converge_nondense_run
-                    .is_multiple_of(POST_CONVERGE_REGRESS_RUN)
-                {
-                    st.post_converge_regress = st.post_converge_regress.saturating_add(1);
-                    // Two structural discriminators (measure-only; the fire
-                    // condition stays occupancy-based so a real overlay/strobe is
-                    // never missed): `gen_adv` is whether a FRESH full-frame Store
-                    // landed since the previous present (generation advanced) vs.
-                    // re-presenting a STUCK retained frame, and `edge` is the
-                    // subsampled luma-edge structure. A sustained legitimately-dark
-                    // fullscreen app (a dark video/game/site — the false-positive
-                    // class) reads `gen_adv=1 edge>0` (live, structured content just
-                    // below the 0.50 dense threshold); a genuine reversion to the
-                    // login/boot overlay or a strobe reads `gen_adv=0` (stuck) and/or
-                    // near-zero `edge` (flat) with a much lower `rgb_frac` (~0.13).
-                    // So an auditor can tell benign-dark-fullscreen from a real
-                    // regression straight from the always-on line.
-                    let gen_adv = st.last.is_none_or(|p| p.generation != sample.generation);
-                    thrash_line(&format!(
-                        "post_converge_regress mid={} gen={} gen_adv={} edge={} {}x{} rgb_nz={} rgb_frac={:.4} nondense_run={} episodes={}",
-                        sample.mapping_id,
-                        sample.generation,
-                        gen_adv as u8,
-                        sample.edge_energy,
-                        sample.width,
-                        sample.height,
-                        sample.rgb_nz,
-                        rgb_frac,
-                        st.post_converge_nondense_run,
-                        st.post_converge_regress
-                    ));
-                }
-            }
-        }
-    }
-
-    if let Some(p) = st.last {
-        if p.width != sample.width || p.height != sample.height {
-            st.geom_mismatch = st.geom_mismatch.saturating_add(1);
-            thrash_line(&format!(
-                "geom_mismatch prev={}x{} mid={} → {}x{} mid={} gen={}",
-                p.width,
-                p.height,
-                p.mapping_id,
-                sample.width,
-                sample.height,
-                sample.mapping_id,
-                sample.generation
-            ));
-        }
-        if p.mapping_id != sample.mapping_id && p.mapping_id != 0 && sample.mapping_id != 0 {
-            st.mid_switches = st.mid_switches.saturating_add(1);
-            if pixels >= MIN_PROXY_PIXELS {
-                // Prefer RGB occupancy so alpha-only black mid2↔mid3 (byte_nz full)
-                // does not hide the dual-mid empty present class.
-                let lo = p.rgb_nz.min(sample.rgb_nz) as f64;
-                let hi = p.rgb_nz.max(sample.rgb_nz) as f64;
-                // When both are empty (rgb 0), still not an nz_swing — both black.
-                if hi > 0.0 && (lo / hi) < NZ_SWING_RATIO {
-                    st.nz_swings = st.nz_swings.saturating_add(1);
-                    thrash_line(&format!(
-                        "nz_swing mid {}→{} gen {}→{} nz {}→{} rgb_nz {}→{} ratio={:.3} {}x{} last_store {}→{}",
-                        p.mapping_id,
-                        sample.mapping_id,
-                        p.generation,
-                        sample.generation,
-                        p.nz,
-                        sample.nz,
-                        p.rgb_nz,
-                        sample.rgb_nz,
-                        lo / hi,
-                        sample.width,
-                        sample.height,
-                        p.from_last_store as u8,
-                        sample.from_last_store as u8
-                    ));
-                }
-                // The `else` here — the mid rotated and the occupancy did not
-                // swing — is the healthy case, and it used to emit a per-present
-                // `mid_switch` line through the always-on sink. macOS rotates
-                // its buffers on every present, so that fired on all 31 392
-                // presents of a measured boot with `nz` identical on both sides:
-                // a proxy announcing that it checked and found nothing. The
-                // magnitude survives in `mid_sw=` on the windowed summary.
-                // Structure thrash: equal-ish nz but edge energy diverges
-                // (wallpaper-filled holes in shattered Safari still count as nz).
-                let elo = p.edge_energy.min(sample.edge_energy) as f64;
-                let ehi = p.edge_energy.max(sample.edge_energy) as f64;
-                if ehi > 0.0 && (elo / ehi) < STRUCTURE_SWING_RATIO {
-                    st.structure_swings = st.structure_swings.saturating_add(1);
-                    thrash_line(&format!(
-                        "structure_swing mid {}→{} gen {}→{} edge {}→{} ratio={:.3} nz {}→{} {}x{}",
-                        p.mapping_id,
-                        sample.mapping_id,
-                        p.generation,
-                        sample.generation,
-                        p.edge_energy,
-                        sample.edge_energy,
-                        elo / ehi,
-                        p.nz,
-                        sample.nz,
-                        sample.width,
-                        sample.height
-                    ));
-                }
-            }
-        }
-    }
-    st.last = Some(sample);
-
-    if n.is_multiple_of(SUMMARY_EVERY) {
-        // Composite/render throughput over this summary window (drain worker,
-        // off main core). First summary has no prior window → 0.0.
-        let now_ms = crate::observe::elapsed_ms() as u64;
-        let present_hz = present_hz_over_window(
-            st.last_summary_ms,
-            st.last_summary_presents,
-            now_ms,
-            st.presents,
-        );
-        st.last_summary_ms = now_ms;
-        st.last_summary_presents = st.presents;
-        thrash_line(&format!(
-            "summary presents={} present_hz={:.1} mid_sw={} nz_sw={} struct_sw={} sparse={} geom={} fail={} peer_divergence={} converged={} post_converge_regress={} stale_online={} t11_fb={}",
-            st.presents,
-            present_hz,
-            st.mid_switches,
-            st.nz_swings,
-            st.structure_swings,
-            st.sparse,
-            st.geom_mismatch,
-            st.capture_fail,
-            st.selected_peer_divergence,
-            st.first_dense_seen as u8,
-            st.post_converge_regress,
-            st.stale_online_pending,
-            st.t11_fb_total
-        ));
-    }
-}
-
-/// Subsampled horizontal edge energy (BGRA luma). Measure-only structure proxy.
-///
-/// Returns **total** edge energy scaled by `>> 8` (not the per-sample average).
-/// Live 1440×1080 wallpaper averages ~0–1 abs-luma/sample so a mean-based
-/// score collapsed every frame to 0/1 and structure_swing never fired on
-/// equal-nz dual-mid thrash (full dock vs partial glass, boxy Safari). The
-/// integrated total still separates chrome-rich frames from smooth wallpaper.
-pub fn edge_energy_bgra(frame_bgra: &[u8], width: u32, height: u32) -> u32 {
-    if width < 8 || height < 8 {
-        return 0;
-    }
-    let stride = (width as usize).saturating_mul(4);
-    let need = stride.saturating_mul(height as usize);
-    if frame_bgra.len() < need {
-        return 0;
-    }
-    let mut sum: u64 = 0;
-    let mut y = 0u32;
-    while y < height {
-        let row = (y as usize) * stride;
-        let mut x = 0u32;
-        while x + 1 < width {
-            let o0 = row + (x as usize) * 4;
-            let o1 = o0 + 4;
-            // Approximate luma from BGRA: 0.25R+0.5G+0.25B
-            let l0 = (frame_bgra[o0 + 2] as u32)
-                .saturating_add((frame_bgra[o0 + 1] as u32) << 1)
-                .saturating_add(frame_bgra[o0] as u32)
-                >> 2;
-            let l1 = (frame_bgra[o1 + 2] as u32)
-                .saturating_add((frame_bgra[o1 + 1] as u32) << 1)
-                .saturating_add(frame_bgra[o1] as u32)
-                >> 2;
-            sum += l0.abs_diff(l1) as u64;
-            x = x.saturating_add(4);
-        }
-        y = y.saturating_add(4);
-    }
-    // Scale so a full 1440×1080 desktop fits in u32 without saturating tests.
-    (sum >> 8).min(u32::MAX as u64) as u32
-}
-
 /// Measure-only: fragment/vertex sample resolved but all-zero payload.
 ///
 /// Proxies empty Favourites tiles / zero icon RTs without gating encode.
@@ -2172,33 +1554,9 @@ pub fn note_capture_fail(mapping_id: u32, width: u32, height: u32, generation: u
 /// Snapshot counters (tests / external poll).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ThrashCounters {
-    pub presents: u64,
-    pub mid_switches: u64,
-    pub nz_swings: u64,
-    pub structure_swings: u64,
-    pub sparse: u64,
-    pub geom_mismatch: u64,
     pub capture_fail: u64,
-    pub selected_peer_divergence: u64,
-    /// True once a full-size present reached [`CONVERGE_DENSE_FRAC`] occupancy
-    /// (the desktop first fully composited this boot).
-    pub converged: bool,
-    /// Distinct post-converge regression episodes (desktop → overlay/strobe).
-    pub post_converge_regress: u64,
     /// Post-converge display IRQs raised with the ONLINE bit still pending.
     pub stale_online_pending: u64,
-}
-
-/// Whether this boot has reached boot-convergence (a full-size present crossed
-/// [`CONVERGE_DENSE_FRAC`] and `present_converge` fired). Latched for the boot.
-/// Read by the display-lifecycle path to correlate a guest display reinit that
-/// arrives *after* convergence — the smoking gun for the post-converge
-/// boot-progress overlay. Measure-only.
-pub fn has_converged() -> bool {
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .first_dense_seen
 }
 
 /// Record that a post-ack display IRQ (`src` = vbl|present) was raised while the
@@ -2224,16 +1582,7 @@ pub fn note_stale_online_pending(src: &str, pending: u32) {
 pub fn counters() -> ThrashCounters {
     let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     ThrashCounters {
-        presents: st.presents,
-        mid_switches: st.mid_switches,
-        nz_swings: st.nz_swings,
-        structure_swings: st.structure_swings,
-        sparse: st.sparse,
-        geom_mismatch: st.geom_mismatch,
         capture_fail: st.capture_fail,
-        selected_peer_divergence: st.selected_peer_divergence,
-        converged: st.first_dense_seen,
-        post_converge_regress: st.post_converge_regress,
         stale_online_pending: st.stale_online_pending,
     }
 }
@@ -2253,24 +1602,6 @@ mod tests {
     /// and exclude parallel device resets ([`test_exclusive`]).
     fn test_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
         test_exclusive()
-    }
-
-    #[test]
-    fn present_hz_window_math_and_edges() {
-        // First summary: no prior window → 0.0 (prev_ms == 0), regardless of
-        // the present count, so a boot never reports a bogus spike.
-        assert_eq!(present_hz_over_window(0, 0, 1_000, 32), 0.0);
-        assert_eq!(present_hz_over_window(0, 100, 1_000, 132), 0.0);
-        // 32 presents over exactly 1 s → 32 Hz (the observed idle/scroll band).
-        assert_eq!(present_hz_over_window(1_000, 100, 2_000, 132), 32.0);
-        // 60 presents over 500 ms → 120 Hz (headroom case).
-        assert_eq!(present_hz_over_window(1_000, 0, 1_500, 60), 120.0);
-        // Zero elapsed (two summaries same ms) → 0.0, no divide-by-zero.
-        assert_eq!(present_hz_over_window(5_000, 100, 5_000, 132), 0.0);
-        // Defensive: a backwards clock or counter reset saturates to 0, never
-        // underflows into a huge bogus rate.
-        assert_eq!(present_hz_over_window(9_000, 100, 8_000, 132), 0.0);
-        assert_eq!(present_hz_over_window(1_000, 200, 2_000, 100), 0.0);
     }
 
     /// The display-cadence census opens on the first poll, then emits once per
@@ -2531,37 +1862,6 @@ mod tests {
         present_import::reset();
     }
 
-    /// `rgb_px` = RGB-nonzero **pixel** count; byte `nz` ≈ 4× for alpha-full frames.
-    fn sample(mid: u32, rgb_px: usize, w: u32, h: u32) -> PresentCaptureSample {
-        PresentCaptureSample {
-            mapping_id: mid,
-            generation: 1,
-            width: w,
-            height: h,
-            nz: rgb_px.saturating_mul(4),
-            max_byte: 255,
-            rgb_nz: rgb_px,
-            max_rgb: 255,
-            from_last_store: true,
-            edge_energy: 10,
-        }
-    }
-
-    fn sample_edge(mid: u32, rgb_px: usize, w: u32, h: u32, edge: u32) -> PresentCaptureSample {
-        PresentCaptureSample {
-            mapping_id: mid,
-            generation: 1,
-            width: w,
-            height: h,
-            nz: rgb_px.saturating_mul(4),
-            max_byte: 255,
-            rgb_nz: rgb_px,
-            max_rgb: 255,
-            from_last_store: true,
-            edge_energy: edge,
-        }
-    }
-
     /// `note_stale_online_pending` counts every post-converge stale-ONLINE IRQ but
     /// logs its always-on line only once per boot (VBL is ~60 Hz — a per-call line
     /// would flood). The count keeps climbing after the latched line.
@@ -2583,207 +1883,6 @@ mod tests {
             log.contains("stale_online_pending src=vbl pending=0x4 count=1"),
             "first stale-online must log the always-on line"
         );
-    }
-
-    /// The desktop converges, then the guest reverts to a sustained overlay
-    /// (rgb_frac ≈0.13 — not sparse, not dense): `post_converge_regress` fires
-    /// exactly at the run threshold, a dense present clears the run, and it does
-    /// not re-fire until the run rebuilds.
-    #[test]
-    fn post_converge_regress_fires_on_sustained_overlay_after_desktop() {
-        let _g = test_lock();
-        reset_for_test();
-        let (w, h) = (1920u32, 1080u32);
-        let pixels = (w as usize) * (h as usize);
-        let dense = pixels * 60 / 100; // 0.60 → converged desktop
-        let overlay = pixels * 13 / 100; // 0.13 → logo overlay (partial: not sparse/dense)
-
-        note_capture_ok(sample(1, dense, w, h));
-        assert!(counters().converged);
-        assert_eq!(counters().post_converge_regress, 0);
-
-        for _ in 0..(POST_CONVERGE_REGRESS_RUN - 1) {
-            note_capture_ok(sample(4, overlay, w, h));
-        }
-        assert_eq!(
-            counters().post_converge_regress,
-            0,
-            "below threshold stays quiet"
-        );
-        note_capture_ok(sample(4, overlay, w, h)); // run reaches threshold
-        assert_eq!(counters().post_converge_regress, 1);
-        // The fired line carries the structural discriminators: a stuck overlay
-        // re-presents the same retained frame, so `generation` never advances
-        // (`sample()` pins gen=1) → `gen_adv=0`. That is the real-regression
-        // signature (vs. a live dark app, next test).
-        let log = std::fs::read_to_string(observe::fail_log_path()).expect("fail log");
-        assert!(
-            log.contains("post_converge_regress")
-                && log
-                    .lines()
-                    .any(|l| l.contains("post_converge_regress") && l.contains("gen_adv=0")),
-            "stuck-overlay regress line must report gen_adv=0"
-        );
-
-        // A dense present clears the run; a lone overlay after does not re-fire.
-        note_capture_ok(sample(1, dense, w, h));
-        note_capture_ok(sample(4, overlay, w, h));
-        assert_eq!(counters().post_converge_regress, 1);
-    }
-
-    /// A sustained legitimately-dark FULLSCREEN app (a dark video/game/site) sits
-    /// just below the 0.50 dense threshold, so it trips the same non-dense run —
-    /// but it is live, structured content, not a broken desktop. The fired line
-    /// must distinguish it: `gen_adv=1` (a FRESH full-frame Store lands every
-    /// present, generation advancing) and `edge` well above zero (real structure),
-    /// vs the stuck overlay's `gen_adv=0`. This is the false-positive class
-    /// observed live under testufo fullscreen (rgb_frac≈0.49, gen advancing);
-    /// the discriminator lets an audit tell it from a real regression without
-    /// gating the measure-only proxy on content.
-    #[test]
-    fn post_converge_regress_line_flags_live_dark_fullscreen_as_fresh() {
-        let _g = test_lock();
-        reset_for_test();
-        let (w, h) = (1920u32, 1080u32);
-        let pixels = (w as usize) * (h as usize);
-        let dense = pixels * 60 / 100; // 0.60 → converged desktop
-        let dark = pixels * 49 / 100; // 0.49 → legitimately-dark fullscreen app
-
-        note_capture_ok(sample(1, dense, w, h));
-        assert!(counters().converged);
-
-        // A live app: same fullscreen member, moderate structure, but a fresh
-        // Store (advancing generation) each present.
-        for g in 0..POST_CONVERGE_REGRESS_RUN {
-            let mut s = sample_edge(1, dark, w, h, 4000);
-            s.generation = 100 + g as u32; // fresh full-frame Store every present
-            note_capture_ok(s);
-        }
-        assert_eq!(
-            counters().post_converge_regress,
-            1,
-            "run still trips (measure-only)"
-        );
-        let log = std::fs::read_to_string(observe::fail_log_path()).expect("fail log");
-        assert!(
-            log.lines().any(|l| l.contains("post_converge_regress")
-                && l.contains("gen_adv=1")
-                && l.contains("edge=4000")),
-            "live-dark-fullscreen regress line must report gen_adv=1 and nonzero edge"
-        );
-    }
-
-    /// The pre-convergence boot strobe (overlay before the desktop ever
-    /// composites) must NOT fire the post-converge regression.
-    #[test]
-    fn post_converge_regress_quiet_before_convergence() {
-        let _g = test_lock();
-        reset_for_test();
-        let (w, h) = (1920u32, 1080u32);
-        let overlay = (w as usize) * (h as usize) * 13 / 100;
-        for _ in 0..(POST_CONVERGE_REGRESS_RUN * 2) {
-            note_capture_ok(sample(4, overlay, w, h));
-        }
-        assert!(!counters().converged);
-        assert_eq!(counters().post_converge_regress, 0);
-    }
-
-    #[test]
-    fn nz_swing_fires_on_dual_mid_incomplete() {
-        let _g = test_lock();
-        reset_for_test();
-        // Full desktop-ish RGB occupancy vs sparse logo-ish on mid switch.
-        let full = (1440u64 * 1080 * 40 / 100) as usize; // 40% of pixels
-        let logo = (1440u64 * 1080 * 5 / 100) as usize; // 5% of pixels
-        note_capture_ok(sample(3, full, 1440, 1080));
-        note_capture_ok(sample(4, logo, 1440, 1080));
-        let c = counters();
-        assert_eq!(c.mid_switches, 1);
-        assert_eq!(
-            c.nz_swings, 1,
-            "logo vs full dual-mid must count as nz_swing"
-        );
-        assert!(c.sparse >= 1, "5% RGB occupancy is sparse_present");
-    }
-
-    #[test]
-    fn present_converge_latches_once_after_sparse_boot_strobe() {
-        let _g = test_lock();
-        reset_for_test();
-        // Dual-mid boot strobe: chrome-only sparse frames (rgb_frac ≈0.003)
-        // alternating before the wallpaper lands, then the first dense desktop.
-        let chrome = (1920u64 * 1080 * 3 / 1000) as usize; // 0.3% RGB occupancy
-        let dense = (1920u64 * 1080) as usize; // full wallpaper (100%)
-        for _ in 0..4 {
-            note_capture_ok(sample(1, chrome, 1920, 1080));
-            note_capture_ok(sample(5, chrome, 1920, 1080));
-        }
-        let before = counters();
-        assert!(
-            !before.converged,
-            "still strobing chrome-only, not converged"
-        );
-        assert_eq!(before.sparse, 8, "all eight chrome frames are sparse");
-
-        // First full-desktop present: converge latches.
-        note_capture_ok(sample(1, dense, 1920, 1080));
-        let at = counters();
-        assert!(at.converged, "dense wallpaper present converges the boot");
-
-        // A later sparse relapse must NOT re-arm (latched once per boot).
-        note_capture_ok(sample(5, chrome, 1920, 1080));
-        note_capture_ok(sample(1, dense, 1920, 1080));
-        let after = counters();
-        assert!(after.converged, "convergence stays latched across relapse");
-        // sparse keeps counting the relapse, but the convergence latch is stable.
-        assert!(after.sparse >= at.sparse, "relapse still counted as sparse");
-    }
-
-    #[test]
-    fn mid_switch_without_swing_is_not_nz_swing() {
-        let _g = test_lock();
-        reset_for_test();
-        let a = (1440u64 * 1080 * 50 / 100) as usize;
-        let b = (1440u64 * 1080 * 48 / 100) as usize;
-        note_capture_ok(sample(3, a, 1440, 1080));
-        note_capture_ok(sample(4, b, 1440, 1080));
-        let c = counters();
-        assert_eq!(c.mid_switches, 1);
-        assert_eq!(
-            c.nz_swings, 0,
-            "similar nz dual-buffer must not false-positive"
-        );
-        assert_eq!(
-            c.structure_swings, 0,
-            "equal default edge_energy must not structure_swing"
-        );
-    }
-
-    /// qemu-shim: dual-mid with similar nz but divergent edge energy (live
-    /// Safari shattered vs full-chrome) must fire structure_swing.
-    #[test]
-    fn structure_swing_fires_on_equal_nz_boxy_mid() {
-        let _g = test_lock();
-        reset_for_test();
-        let nz = (1440u64 * 1080 * 4 * 50 / 100) as usize;
-        note_capture_ok(sample_edge(3, nz, 1440, 1080, 8)); // smooth
-        note_capture_ok(sample_edge(4, nz, 1440, 1080, 40)); // shattered
-        let c = counters();
-        assert_eq!(c.mid_switches, 1);
-        assert_eq!(c.nz_swings, 0, "equal nz must not nz_swing");
-        assert_eq!(
-            c.structure_swings, 1,
-            "edge 8 vs 40 must count structure_swing"
-        );
-    }
-
-    #[test]
-    fn geom_mismatch_counted() {
-        let _g = test_lock();
-        reset_for_test();
-        note_capture_ok(sample(3, 1_000_000, 1920, 1080));
-        note_capture_ok(sample(3, 1_000_000, 1440, 1080));
-        assert_eq!(counters().geom_mismatch, 1);
     }
 
     #[test]
@@ -2811,56 +1910,6 @@ mod tests {
         let (p4, poison4) = note_display_store_nz(4, 2_000_000);
         assert_eq!(p4, 2_000_000);
         assert!(!poison4, "other mid has independent peak");
-    }
-
-    #[test]
-    fn selected_peer_divergence_fires_once_per_sparse_episode() {
-        let _g = test_lock();
-        reset_for_test();
-        let total = 1920 * 1080;
-
-        assert!(!note_selected_peer_divergence(1, 2, 1920, 1080, total));
-        assert!(note_selected_peer_divergence(2, 2, 1920, 1080, 300_000));
-        assert_eq!(counters().selected_peer_divergence, 1);
-        assert!(!note_selected_peer_divergence(2, 2, 1920, 1080, 400_000));
-        assert!(!note_selected_peer_divergence(11, 2, 1920, 1080, 6_018));
-        assert_eq!(counters().selected_peer_divergence, 1);
-
-        assert!(!note_selected_peer_divergence(2, 2, 1920, 1080, total));
-        assert!(note_selected_peer_divergence(2, 2, 1920, 1080, 300_000));
-        assert_eq!(counters().selected_peer_divergence, 2);
-    }
-
-    #[test]
-    fn selected_peer_divergence_forgets_recycled_mapping_samples() {
-        let _g = test_lock();
-        reset_for_test();
-        let total = 1920 * 1080;
-
-        assert!(!note_selected_peer_divergence(1, 2, 1920, 1080, total));
-        assert!(note_selected_peer_divergence(2, 2, 1920, 1080, 300_000));
-        assert_eq!(counters().selected_peer_divergence, 1);
-
-        forget_display_store_sample(1);
-        assert!(
-            !note_selected_peer_divergence(2, 2, 1920, 1080, 300_000),
-            "forgotten dense peer must not keep the episode alive"
-        );
-        assert_eq!(counters().selected_peer_divergence, 1);
-
-        assert!(
-            note_selected_peer_divergence(3, 2, 1920, 1080, total),
-            "a new dense peer re-arms a new diagnosed episode"
-        );
-        assert_eq!(counters().selected_peer_divergence, 2);
-
-        forget_display_store_sample(2);
-        assert!(
-            !note_selected_peer_divergence(3, 2, 1920, 1080, total),
-            "forgotten selected mapping leaves no selected sample"
-        );
-        assert!(note_selected_peer_divergence(2, 2, 1920, 1080, 300_000));
-        assert_eq!(counters().selected_peer_divergence, 3);
     }
 
     /// The sample side and the render side of the MRT-mask class had one name
@@ -2958,58 +2007,6 @@ mod tests {
         );
     }
 
-    /// Regression guard for [`edge_energy_bgra`], the horizontal-luma-gradient
-    /// proxy behind `PresentCaptureSample::edge_energy` and the
-    /// `structure_swing` event. Its contract is load-bearing for that event and
-    /// for the GPU twin in `stats_reduce`, which must agree with it: a uniform
-    /// frame must read **zero** energy so a smooth desktop never registers as
-    /// structure, structured content must read **nonzero** and grow with
-    /// contrast so a shattered/chrome-rich mid separates from a smooth one, and
-    /// degenerate/short input must read zero rather than panic or emit garbage.
-    #[test]
-    fn edge_energy_flat_is_zero_and_grows_with_contrast() {
-        // Tight BGRA8 frame filled with a single column pattern (repeats each
-        // row) so the subsampled horizontal scan sees the same gradient on
-        // every sampled row.
-        fn frame(width: u32, height: u32, col: impl Fn(u32) -> u8) -> Vec<u8> {
-            let mut v = vec![0u8; (width * height * 4) as usize];
-            for y in 0..height {
-                for x in 0..width {
-                    let o = ((y * width + x) * 4) as usize;
-                    let g = col(x);
-                    v[o] = g; // B
-                    v[o + 1] = g; // G
-                    v[o + 2] = g; // R
-                    v[o + 3] = 0xFF; // A
-                }
-            }
-            v
-        }
-
-        let (w, h) = (16u32, 16u32);
-
-        // Degenerate geometry and short buffers read zero, never panic.
-        assert_eq!(edge_energy_bgra(&frame(7, 7, |_| 200), 7, 7), 0);
-        assert_eq!(edge_energy_bgra(&[0u8; 16], w, h), 0, "short buffer -> 0");
-
-        // A perfectly uniform frame has no horizontal gradient -> zero energy.
-        let flat = frame(w, h, |_| 128);
-        assert_eq!(
-            edge_energy_bgra(&flat, w, h),
-            0,
-            "a clean uniform desktop must read zero edge energy",
-        );
-
-        // Alternating dark/bright columns produce energy that scales with the
-        // per-pixel contrast (the residue gate needs monotonicity to threshold).
-        let low = edge_energy_bgra(&frame(w, h, |x| if x % 2 == 0 { 100 } else { 130 }), w, h);
-        let high = edge_energy_bgra(&frame(w, h, |x| if x % 2 == 0 { 0 } else { 255 }), w, h);
-        assert!(low > 0, "structured content must register nonzero energy");
-        assert!(
-            high > low,
-            "higher per-pixel contrast must read higher energy ({high} !> {low})",
-        );
-    }
 }
 
 /// Which scatter the guest-store path executed.

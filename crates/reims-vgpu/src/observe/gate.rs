@@ -999,7 +999,11 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        (70, 1586),
+        // Down from (70, 1586): removing the per-present GPU statistics oracle
+        // retired `PresentStatsSetup` and the `present_stats_*` slugs it and
+        // `EngineProbe` carried. A decline type with no path left to reach it is
+        // not silent surface, so the baseline drops with the code.
+        (69, 1566),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

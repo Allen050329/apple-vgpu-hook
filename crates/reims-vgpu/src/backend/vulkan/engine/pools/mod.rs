@@ -12,7 +12,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::caches::{BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches};
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
@@ -20,7 +19,6 @@ use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::host_import_decline::HostImportDecline;
 use super::host_scatter;
-use super::stats_reduce;
 use super::types::{DrawError, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::MemoryClass;
@@ -215,8 +213,6 @@ pub(crate) struct ResourcePools {
     host_import_zero_len_logged: bool,
     host_import_no_ext_logged: bool,
     host_import_byte_cap_logged: bool,
-    /// GPU-side present-proxy stats reduction (the zero-copy oracle).
-    stats_reduce: stats_reduce::StatsReducePool,
     host_scatter: host_scatter::HostScatterPool,
     /// Open draw batch: a ring slot whose CB is still recording deferred
     /// same-target draws (submit pending). While `Some`, that CB references
@@ -485,38 +481,6 @@ fn resolve_scatter_regions(
         });
     }
     Ok(regions)
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PresentStatsSetup {
-    Shader,
-    Layout,
-    Pipeline,
-}
-
-impl PresentStatsSetup {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Shader => "shader",
-            Self::Layout => "layout",
-            Self::Pipeline => "pipeline",
-        }
-    }
-
-    fn discriminant(self) -> u64 {
-        match self {
-            Self::Shader => 1,
-            Self::Layout => 2,
-            Self::Pipeline => 3,
-        }
-    }
-}
-
-fn present_stats_setup_decline(
-    setup: PresentStatsSetup,
-    error: &DrawError,
-) -> crate::observe::Emit {
-    crate::observe::Emit::decline("stats_reduce", error).field("setup", setup.name())
 }
 
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
@@ -1284,11 +1248,11 @@ include!("host_import_and_teardown.rs");
 #[cfg(test)]
 mod host_import_budget_tests {
     use super::{
-        host_import_budget, host_scatter, present_stats_setup_decline, resolve_scatter_regions,
-        terminal_host_import_error, DrawError, HostImportDecline, HostImportRegion,
-        PresentStatsSetup, ResourcePools, VkCall, VkOp, HOST_IMPORT_IDLE_AGE_MS,
-        HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP, HOST_IMPORT_WINDOW_BUDGET,
-        HOST_IMPORT_WINDOW_CAP, IDLE_RECYCLE_TRIM_PER_PASS, IDLE_TARGET_AGE_MS,
+        host_import_budget, host_scatter, resolve_scatter_regions, terminal_host_import_error,
+        DrawError, HostImportDecline, HostImportRegion, ResourcePools, VkCall, VkOp,
+        HOST_IMPORT_IDLE_AGE_MS, HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP,
+        HOST_IMPORT_WINDOW_BUDGET, HOST_IMPORT_WINDOW_CAP, IDLE_RECYCLE_TRIM_PER_PASS,
+        IDLE_TARGET_AGE_MS,
     };
     use crate::observe::Decline;
     use ash::vk;
@@ -1624,23 +1588,6 @@ mod host_import_budget_tests {
         );
     }
 
-    #[test]
-    fn present_stats_setup_failures_preserve_leaf_and_setup_stage() {
-        let error = DrawError::VkCall(VkCall::new(
-            VkOp::CachesCreateComputePipelines,
-            ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
-        ));
-        for setup in [
-            PresentStatsSetup::Shader,
-            PresentStatsSetup::Layout,
-            PresentStatsSetup::Pipeline,
-        ] {
-            let line = present_stats_setup_decline(setup, &error).render();
-            assert!(line
-                .starts_with("stats_reduce reason=vk_caches_create_compute_pipelines vk_result="));
-            assert!(line.ends_with(&format!(" setup={}", setup.name())));
-        }
-    }
 }
 
 #[cfg(test)]

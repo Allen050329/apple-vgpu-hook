@@ -32,7 +32,7 @@
 //!
 //! | Module | Class it measures |
 //! |---|---|
-//! | [`present_proxy`] | present-path thrash: `nz_swing`, `sparse_present`, `mid_switch`, `geom_mismatch`, `capture_fail`, plus the secondary-MRT drop/blend census |
+//! | [`present_proxy`] | present-path health: `capture_fail`, `stale_online_pending`, `t11_large_fallback`, `empty_sample`, the secondary-MRT drop/blend census, and the windowed cadence/publish/import/pressure submodules |
 //! | [`srgb_census`] | which rails drop the sRGB transfer function, and how often |
 //! | [`sampled_census`] | sampled-source resolution: which rail served a texture bind and which missed |
 //! | [`setup_tex_census`] | setup-phase texture staging, before the compositor converges |

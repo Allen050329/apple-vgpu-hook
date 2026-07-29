@@ -70,161 +70,28 @@ impl ResourcePools {
             host_import_zero_len_logged: false,
             host_import_no_ext_logged: false,
             host_import_byte_cap_logged: false,
-            stats_reduce: stats_reduce::StatsReducePool::new(),
             host_scatter: host_scatter::HostScatterPool::default(),
             open_batch: None,
             slab: super::slab::SlabPool::new(),
             initialized: false,
         }
     }
-    /// Arm a GPU-side present-proxy stats reduction for `(identity, seq)`.
-    ///
-    /// This is the zero-copy oracle: it dispatches the reduction kernel over the
-    /// resident and returns immediately, so the proxies get their measurements
-    /// without any full-frame GPU→CPU copy. Returns whether it armed; `false`
-    /// means the caller simply has no stats for this present (never a fallback
-    /// to reading the frame back).
-    ///
-    /// Requires the resident to be content-ready **and** BGRA: the kernel reads
-    /// `.rgb` as colour channels and packs `px0` in memory order, so an RGBA
-    /// resident would report channel-swapped `px0`.
-    pub(crate) unsafe fn arm_present_stats(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        caches: &mut ObjectCaches,
-        identity: &TargetIdentity,
-        seq: u64,
-    ) -> bool {
-        // Same ordering rule as the prefetch pool: this submits on its own CB,
-        // bypassing begin_entry, so flush any open draw batch first or the
-        // dispatch would be queued ahead of the draws producing this content.
-        if let Err(error) = self.batch_flush(ctx, counters) {
-            crate::observe::Emit::decline("stats_reduce", &error).fail_once(0);
-            return false;
-        }
-        let (image, view, old_layout, width, height, generation) = {
-            let slot = match self.registry.get(identity) {
-                Some(s) if s.content_ready && s.bgra => s,
-                _ => return false,
-            };
-            (
-                slot.image,
-                slot.view,
-                slot.layout,
-                slot.width,
-                slot.height,
-                slot.generation,
-            )
-        };
-        // Pipeline comes from the shared, content-keyed caches — a host-authored
-        // kernel is just another SPIR-V digest to them.
-        let words = &super::present_stats_spv::PRESENT_STATS_SPIRV;
-        let (_digest, module) = match caches.get_or_create_shader(ctx, words, counters, self) {
-            Ok(value) => value,
-            Err(error) => {
-                let setup = PresentStatsSetup::Shader;
-                present_stats_setup_decline(setup, &error).fail_once(setup.discriminant());
-                return false;
-            }
-        };
-        let layout_key = LayoutKey {
-            bindings: vec![
-                BindingSig {
-                    binding: 0,
-                    ty: vk::DescriptorType::SAMPLED_IMAGE.as_raw() as u32,
-                    stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
-                },
-                BindingSig {
-                    binding: 1,
-                    ty: vk::DescriptorType::SAMPLER.as_raw() as u32,
-                    stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
-                },
-                BindingSig {
-                    binding: 2,
-                    ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
-                    stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
-                },
-            ],
-        };
-        let (set_layout, pipeline_layout) =
-            match caches.get_or_create_layout(ctx, &layout_key, counters, self) {
-                Ok(value) => value,
-                Err(error) => {
-                    let setup = PresentStatsSetup::Layout;
-                    present_stats_setup_decline(setup, &error).fail_once(setup.discriminant());
-                    return false;
-                }
-            };
-        let pkey = ComputePipelineKey {
-            spirv: _digest,
-            entry: "main".to_string(),
-            layout: layout_key,
-        };
-        let pipeline = match caches.get_or_create_compute_pipeline(
-            ctx,
-            &pkey,
-            module,
-            pipeline_layout,
-            counters,
-            self,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                let setup = PresentStatsSetup::Pipeline;
-                present_stats_setup_decline(setup, &error).fail_once(setup.discriminant());
-                return false;
-            }
-        };
-        let cmd_pool = self.cmd_pool;
-        let armed = self.stats_reduce.arm(
-            ctx,
-            counters,
-            cmd_pool,
-            pipeline,
-            pipeline_layout,
-            set_layout,
-            identity,
-            generation,
-            seq,
-            image,
-            view,
-            old_layout,
-            width,
-            height,
-        );
-        if armed {
-            // The dispatch leaves the resident in SHADER_READ_ONLY_OPTIMAL; the
-            // pool cannot reach the registry, so record it here.
-            self.registry_set_layout(identity, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        }
-        armed
-    }
-
     /// Scatter a resident present straight into imported guest pages, with no
     /// full-frame CPU copy anywhere in the path.
     ///
-    /// `Ok(stats)` means the guest pages hold the frame and `stats` carries
-    /// the content measurement (from the GPU reduction, when `measure_content`).
-    /// `Err` names the exact setup/record/submit/state refusal. The caller fails
-    /// the Store rather than publishing a possibly partial guest-page write;
-    /// hosts without `VK_EXT_external_memory_host` select the CPU path before
-    /// entering this rail.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "scatter presentation mirrors the source image and guest run layout"
-    )]
+    /// `Ok(())` means the guest pages hold the frame. `Err` names the exact
+    /// setup/record/submit/state refusal. The caller fails the Store rather than
+    /// publishing a possibly partial guest-page write; hosts without
+    /// `VK_EXT_external_memory_host` select the CPU path before entering this
+    /// rail.
     pub(crate) unsafe fn present_scatter_gpu(
         &mut self,
         ctx: &DeviceContext,
         counters: &EngineCounters,
-        caches: &mut ObjectCaches,
         identity: &TargetIdentity,
         runs: &[host_scatter::ScatterRun],
         spans: &[host_scatter::ScatterSpan],
-        measure_content: bool,
-        stats_seq: u64,
-    ) -> Result<Option<super::content_stats::Color8ContentStats>, DrawError> {
+    ) -> Result<(), DrawError> {
         if spans.is_empty() {
             return Err(DrawError::Present(
                 super::reason::HostPresentDecline::RunsEmpty,
@@ -235,9 +102,9 @@ impl ResourcePools {
                 super::reason::DrawReason::PresentHostPtrImportUnavailable,
             ));
         }
-        // Same ordering rule as the prefetch/stats pools: this submits on its
-        // own CB, so flush any open draw batch or the copy would be queued
-        // ahead of the draws producing this frame.
+        // Same ordering rule as the prefetch pool: this submits on its own CB,
+        // so flush any open draw batch or the copy would be queued ahead of the
+        // draws producing this frame.
         if let Err(error) = self.batch_flush(ctx, counters) {
             self.host_scatter.fallback_submit = self.host_scatter.fallback_submit.wrapping_add(1);
             return Err(error);
@@ -274,7 +141,7 @@ impl ResourcePools {
             }
         }
 
-        let (image, old_layout, generation, width, height) = {
+        let (image, old_layout, width, height) = {
             let slot = self.registry.get(identity).ok_or_else(|| {
                 DrawError::Facade(
                     super::facade_decline::EngineFacadeDecline::ScatterPresentUnknownIdentity {
@@ -294,24 +161,11 @@ impl ResourcePools {
                     super::reason::DrawReason::PresentScatterResidentNotBgra,
                 ));
             }
-            (
-                slot.image,
-                slot.layout,
-                slot.generation,
-                slot.width,
-                slot.height,
-            )
+            (slot.image, slot.layout, slot.width, slot.height)
         };
 
         let regions = resolve_scatter_regions(runs, spans, &bufs, width, height)
             .map_err(DrawError::Present)?;
-
-        // Arm the stats reduction BEFORE the scatter: it reads the resident as
-        // SHADER_READ_ONLY_OPTIMAL, and the scatter then transitions to
-        // TRANSFER_SRC_OPTIMAL. Ordering them the other way would make the
-        // dispatch read an image the copy had already re-laid-out.
-        let armed =
-            measure_content && self.arm_present_stats(ctx, counters, caches, identity, stats_seq);
 
         let cmd_pool = self.cmd_pool;
         if let Err(error) = self
@@ -325,15 +179,7 @@ impl ResourcePools {
         }
         self.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         self.host_scatter.gpu_stores = self.host_scatter.gpu_stores.wrapping_add(1);
-
-        let content = if armed {
-            self.stats_reduce
-                .consume_blocking(ctx, identity, generation, stats_seq)
-                .map(Into::into)
-        } else {
-            None
-        };
-        Ok(content)
+        Ok(())
     }
 
     /// `(gpu_stores, fallback_unresolved, fallback_submit)` for the always-on
@@ -877,43 +723,6 @@ impl ResourcePools {
                 .map(|s| s.size)
                 .sum(),
         }
-    }
-
-    /// Take a completed stats reduction for `(identity, generation, seq)`.
-    /// `None` = not armed, or not finished yet (non-blocking; try again later).
-    pub(crate) unsafe fn take_present_stats(
-        &mut self,
-        ctx: &DeviceContext,
-        identity: &TargetIdentity,
-        generation: u64,
-        seq: u64,
-    ) -> Option<stats_reduce::PresentStats> {
-        self.stats_reduce.consume(ctx, identity, generation, seq)
-    }
-
-    /// Blocking consume of a store-path stats reduction (waits the slot's fence).
-    /// Mirrors `present_scatter_gpu`'s stats collection for the packed-contig
-    /// store path, which needs this frame's content stats before it returns.
-    pub(crate) unsafe fn consume_store_stats_blocking(
-        &mut self,
-        ctx: &DeviceContext,
-        identity: &TargetIdentity,
-        generation: u64,
-        seq: u64,
-    ) -> Option<super::content_stats::Color8ContentStats> {
-        self.stats_reduce
-            .consume_blocking(ctx, identity, generation, seq)
-            .map(Into::into)
-    }
-
-    /// Make an armed stats reduction unmatchable (its present is gone).
-    pub(crate) fn cancel_present_stats(&mut self, seq: u64) {
-        self.stats_reduce.cancel(seq);
-    }
-
-    /// `(arms, hits, misses, not_ready, saturated)` for the always-on census.
-    pub(crate) fn present_stats_counters(&self) -> (u64, u64, u64, u64, u64) {
-        self.stats_reduce.stats()
     }
 
     /// Cumulative sampled-cache pool recycle diagnostics:

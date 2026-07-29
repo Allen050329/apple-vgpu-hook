@@ -30,10 +30,8 @@ mod host_import_decline;
 pub(crate) mod host_scatter;
 pub mod init_decline;
 mod pools;
-pub(crate) mod present_stats_spv;
 pub mod reason;
 mod slab;
-pub(crate) mod stats_reduce;
 pub mod types;
 pub mod vk_call;
 #[cfg(all(feature = "host-window", target_os = "macos"))]
@@ -499,91 +497,18 @@ pub fn touch_resident_target(identity: Option<&TargetIdentity>, now_ms: u64) {
     guard.pools.registry_touch_at(identity, now_ms);
 }
 
-/// Arm a GPU-side present-proxy stats reduction for `identity` (see
-/// [`stats_reduce`]). Submits the reduction dispatch and returns immediately —
-/// the present path never waits.
+
+/// Which engine entry point's initialization prologue refused, for the
+/// `vk_engine_probe` decline's `probe=` field.
 ///
-/// This is what lets the always-on proxies observe a frame with **no**
-/// full-frame GPU→CPU copy: the kernel runs on the GPU that already holds the
-/// resident and writes a 32-byte block. `seq` must be nonzero. Returns whether
-/// a reduction was armed; `false` simply means no stats exist for this present
-/// (there is deliberately no read-the-frame-back fallback).
-pub fn arm_present_stats(identity: &TargetIdentity, seq: u64) -> bool {
-    if seq == 0 {
-        let decline = stats_reduce::StatsReduceDecline::ZeroSequence;
-        crate::observe::Emit::decline("stats_reduce", &decline).fail_once(0);
-        return false;
-    }
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref mut caches,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = match owner.ensure(counters) {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            engine_probe_decline(EngineProbe::PresentStatsContext, &error)
-                .fail_once(EngineProbe::PresentStatsContext.discriminant());
-            return false;
-        }
-    };
-    if let Err(error) = unsafe { pools.ensure_init(ctx, counters) } {
-        engine_probe_decline(EngineProbe::PresentStatsPools, &error)
-            .fail_once(EngineProbe::PresentStatsPools.discriminant());
-        return false;
-    }
-    unsafe { pools.arm_present_stats(ctx, counters, caches, identity, seq) }
-}
-
-/// Take a completed stats reduction for `(identity, generation, seq)`.
-///
-/// Non-blocking: `None` means either nothing was armed under that key or the
-/// dispatch has not finished, so the caller should just try again on a later
-/// present. Because the slot is matched on the exact `(identity, generation,
-/// seq)` triple, a block returned here always belongs to the frame the caller
-/// asked about — stats may lag, but they are never misattributed.
-pub fn take_present_stats(
-    identity: &TargetIdentity,
-    generation: u64,
-    seq: u64,
-) -> Option<stats_reduce::PresentStats> {
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = match owner.ensure(counters) {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            engine_probe_decline(EngineProbe::TakeStatsContext, &error)
-                .fail_once(EngineProbe::TakeStatsContext.discriminant());
-            return None;
-        }
-    };
-    unsafe { pools.take_present_stats(ctx, identity, generation, seq) }
-}
-
-/// Cancel an armed stats reduction whose present is gone.
-pub fn cancel_present_stats(seq: u64) {
-    lock_engine().pools.cancel_present_stats(seq);
-}
-
-/// `(arms, hits, misses, not_ready, saturated)` stats-reduction diagnostics for
-/// the always-on census.
-pub fn present_stats_snapshot() -> (u64, u64, u64, u64, u64) {
-    lock_engine().pools.present_stats_counters()
-}
-
+/// [`EngineProbe::discriminant`] is the `fail_once` dedup key, so it is a
+/// stable numbering and not an index: 1, 2 and 3 are retired holes. They named
+/// the present-proxy GPU stats oracle's context / pool / take prologues
+/// (`present_stats_context`, `present_stats_pools`, `take_stats_context`),
+/// which no longer exist. Do not reuse them — a fail-log line already carrying
+/// one of those keys must not be conflated with a new probe's.
 #[derive(Clone, Copy, Debug)]
 enum EngineProbe {
-    PresentStatsContext,
-    PresentStatsPools,
-    TakeStatsContext,
     HostImportContext,
     HostImportPools,
     ComputeWritebackAlignment,
@@ -595,9 +520,6 @@ enum EngineProbe {
 impl EngineProbe {
     fn name(self) -> &'static str {
         match self {
-            Self::PresentStatsContext => "present_stats_context",
-            Self::PresentStatsPools => "present_stats_pools",
-            Self::TakeStatsContext => "take_stats_context",
             Self::HostImportContext => "host_import_context",
             Self::HostImportPools => "host_import_pools",
             Self::ComputeWritebackAlignment => "compute_writeback_alignment",
@@ -607,11 +529,9 @@ impl EngineProbe {
         }
     }
 
+    /// 1, 2 and 3 are retired (see the type's docs); numbering resumes at 4.
     fn discriminant(self) -> u64 {
         match self {
-            Self::PresentStatsContext => 1,
-            Self::PresentStatsPools => 2,
-            Self::TakeStatsContext => 3,
             Self::HostImportContext => 4,
             Self::HostImportPools => 5,
             Self::ComputeWritebackAlignment => 6,
@@ -1112,13 +1032,6 @@ pub fn read_resident_storage(
 /// 7680) land correctly — a flat `w*h*4` DMA was the known correctness gap on
 /// live mids 1/5.
 ///
-/// When `measure_content` is set, content stats over the resident are computed
-/// **on the GPU** (a 32-byte compute reduction armed before the blit) and
-/// returned — the packed-contig store's measurement path, symmetric with
-/// [`present_into_host_runs`], so it never needs a full-frame CPU readback for
-/// stats. Returns `None` stats when `measure_content` is off, the target is not
-/// BGRA, or the reduction is declined.
-///
 /// Errors (caller falls back to [`read_target`] + CPU copy): capability absent,
 /// unknown/not-ready target, `ptr_len` too small, bad stride, or `host_ptr`/size
 /// not meeting `min_imported_host_pointer_alignment`.
@@ -1131,12 +1044,10 @@ pub unsafe fn present_into_host_ptr_strided(
     host_ptr: *mut std::ffi::c_void,
     ptr_len: u64,
     buffer_row_bytes: u32,
-    measure_content: bool,
-) -> Result<Option<Color8ContentStats>, DrawError> {
+) -> Result<(), DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
         ..
@@ -1148,7 +1059,7 @@ pub unsafe fn present_into_host_ptr_strided(
             reason::DrawReason::PresentHostPtrImportUnavailable,
         ));
     }
-    let (width, height, image, generation) = {
+    let (width, height, image) = {
         let slot = pools.registry_get(identity).ok_or({
             DrawError::Present(reason::HostPresentDecline::HostPtrUnknownIdentity)
         })?;
@@ -1157,7 +1068,7 @@ pub unsafe fn present_into_host_ptr_strided(
                 reason::HostPresentDecline::HostPtrNoReadyContent,
             ));
         }
-        (slot.width, slot.height, slot.image, slot.generation)
+        (slot.width, slot.height, slot.image)
     };
     let tight = width.saturating_mul(4);
     let row_bytes = if buffer_row_bytes == 0 {
@@ -1187,17 +1098,6 @@ pub unsafe fn present_into_host_ptr_strided(
         ));
     }
 
-    // GPU-direct content stats for the packed-contig store's measurement path.
-    // Arm the reduction (reads the resident as SHADER_READ_ONLY_OPTIMAL) BEFORE
-    // the blit transitions it to TRANSFER_SRC_OPTIMAL — the same ordering rule
-    // as present_scatter_gpu. The 32-byte block is consumed after retire below,
-    // so the packed store never needs a full-frame CPU readback for stats. arm
-    // leaves the resident in SHADER_READ_ONLY_OPTIMAL and records that layout in
-    // the registry, so `old_layout` is read AFTER arming.
-    let stats_seq =
-        STORE_STATS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | STORE_STATS_SEQ_TAG;
-    let armed =
-        measure_content && pools.arm_present_stats(ctx, counters, caches, identity, stats_seq);
     let old_layout = pools
         .registry_get(identity)
         .map(|s| s.layout)
@@ -1290,15 +1190,7 @@ pub unsafe fn present_into_host_ptr_strided(
     // HOST_COHERENT: the GPU DMA is visible to the guest CPU with no map/flush.
     pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
     counters.note_import_present();
-    // Collect the stats reduction armed before the blit (32-byte block, no
-    // full-frame copy). `None` when not armed (measure_content off, non-bgra
-    // target, or arm declined).
-    let content = if armed {
-        pools.consume_store_stats_blocking(ctx, identity, generation, stats_seq)
-    } else {
-        None
-    };
-    Ok(content)
+    Ok(())
 }
 
 /// Short protocol-kind label for a [`TargetIdentity`] (diagnostics only).
@@ -1515,7 +1407,6 @@ pub struct HostMappedRun {
 
 #[derive(Debug)]
 pub struct HostRunPresent {
-    pub content: Option<Color8ContentStats>,
     /// Wall-clock of the GPU-direct scatter (plan -> submit -> fence wait).
     pub scatter_us: u64,
 }
@@ -1534,9 +1425,7 @@ pub struct HostRunPresent {
 ///
 /// Fallback (no extension, non-Linux, alignment or region cap) is the portable
 /// path: one pooled tight readback plus a bounded CPU scatter, returning that
-/// readback for caller-side diagnostics. When `measure_content` is set, the GPU
-/// path takes RGB/alpha occupancy from the reduction kernel and the CPU path
-/// fuses it into the mapped-readback copy.
+/// readback for caller-side diagnostics.
 ///
 /// Layout contract (same as packed [`present_into_host_ptr_strided`]):
 /// pixel `(x,y)` lives at mapping linear `sample_base_off + y*row_bytes + x*4`.
@@ -1552,7 +1441,6 @@ pub unsafe fn present_into_host_runs(
     sample_base_off: u64,
     buffer_row_bytes: u32,
     runs: &[HostMappedRun],
-    measure_content: bool,
     runs_stable: bool,
 ) -> Result<HostRunPresent, DrawError> {
     if runs.is_empty() {
@@ -1697,18 +1585,11 @@ pub unsafe fn present_into_host_runs(
             reason::DrawReason::PresentRunsUnstable,
         ));
     }
-    let content = try_gpu_scatter(identity, runs, &spans, measure_content)?;
+    try_gpu_scatter(identity, runs, &spans)?;
     Ok(HostRunPresent {
-        content,
         scatter_us: scatter_started.elapsed().as_micros() as u64,
     })
 }
-
-/// Distinct seq space for the store path's stats reductions, so a store's
-/// block can never be consumed by the present-proxy oracle's `(identity,
-/// generation, seq)` lookup or vice versa.
-static STORE_STATS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-const STORE_STATS_SEQ_TAG: u64 = 1 << 63;
 
 /// Attempt the GPU-direct scatter, preserving the exact initialization,
 /// resource-state, import, or Vulkan-call decline through `import_present`.
@@ -1716,8 +1597,7 @@ fn try_gpu_scatter(
     identity: &TargetIdentity,
     runs: &[HostMappedRun],
     spans: &[host_scatter::ScatterSpan],
-    measure_content: bool,
-) -> Result<Option<Color8ContentStats>, DrawError> {
+) -> Result<(), DrawError> {
     let scatter_runs: Vec<host_scatter::ScatterRun> = runs
         .iter()
         .map(|r| host_scatter::ScatterRun {
@@ -1725,30 +1605,16 @@ fn try_gpu_scatter(
             ptr_len: r.ptr_len,
         })
         .collect();
-    let seq =
-        STORE_STATS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | STORE_STATS_SEQ_TAG;
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
     unsafe { pools.ensure_init(ctx, counters) }?;
-    unsafe {
-        pools.present_scatter_gpu(
-            ctx,
-            counters,
-            caches,
-            identity,
-            &scatter_runs,
-            spans,
-            measure_content,
-            seq,
-        )
-    }
+    unsafe { pools.present_scatter_gpu(ctx, counters, identity, &scatter_runs, spans) }
 }
 
 /// `(gpu_stores, fallback_unresolved, fallback_submit)` for the store proxy.
@@ -1975,9 +1841,6 @@ mod probe_visibility_tests {
     fn each_engine_probe_preserves_the_typed_initialization_reason() {
         let error = vk_call::exec_submit_device_lost_fixture();
         for probe in [
-            EngineProbe::PresentStatsContext,
-            EngineProbe::PresentStatsPools,
-            EngineProbe::TakeStatsContext,
             EngineProbe::HostImportContext,
             EngineProbe::HostImportPools,
             EngineProbe::ComputeWritebackAlignment,

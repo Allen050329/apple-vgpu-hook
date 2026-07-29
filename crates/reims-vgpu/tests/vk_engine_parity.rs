@@ -1145,7 +1145,7 @@ fn present_into_host_ptr_writes_frame_zero_copy() {
     let before = engine::counter_snapshot();
     // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
     let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0, false)
+        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0)
     };
     match res {
         Ok(_) => {
@@ -1300,14 +1300,12 @@ fn present_into_host_ptr_bgra_target_lands_guest_byte_order() {
     let ptr = unsafe { alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "host alloc failed");
 
-    // SAFETY: ptr backs `cap` valid bytes, exclusive for this call. measure_content
-    // exercises the GPU stats reduction the packed-contig store path uses — it
-    // must return content stats with NO full-frame CPU readback.
+    // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
     let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0, true)
+        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0)
     };
     match res {
-        Ok(stats) => {
+        Ok(()) => {
             // SAFETY: ptr backs at least `frame` initialized bytes post-present.
             let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
             let i = ((h / 2) * w + w / 2) as usize * 4;
@@ -1315,31 +1313,6 @@ fn present_into_host_ptr_bgra_target_lands_guest_byte_order() {
             assert!(
                 near(b, 191) && near(g, 128) && near(r, 64) && near(a, 255),
                 "bgra import-present center BGRA=({b},{g},{r},{a}); expected ~(191,128,64,255)"
-            );
-            // GPU-computed content stats (no CPU readback): the whole 16x16
-            // resident is the fragment color, so every pixel is non-zero RGB and
-            // opaque alpha, with rgb_max at the red channel's ~191.
-            let stats = stats.expect("measure_content must return GPU stats for a bgra resident");
-            let px = (w * h) as usize;
-            assert_eq!(
-                stats.rgb_nz, px,
-                "GPU rgb_nz={} expected {px}",
-                stats.rgb_nz
-            );
-            assert_eq!(
-                stats.alpha_opaque, px,
-                "GPU alpha_opaque={} expected {px}",
-                stats.alpha_opaque
-            );
-            assert_eq!(
-                stats.alpha_nz, px,
-                "GPU alpha_nz={} expected {px}",
-                stats.alpha_nz
-            );
-            assert!(
-                near(stats.rgb_max, 191),
-                "GPU rgb_max={} expected ~191",
-                stats.rgb_max
             );
         }
         Err(e)
@@ -2002,7 +1975,7 @@ fn present_into_host_ptr_strided_honors_guest_bpr() {
 
     // SAFETY: ptr backs `cap` exclusive bytes for the DMA.
     let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, bpr, false)
+        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, bpr)
     };
     match res {
         Ok(_) => {

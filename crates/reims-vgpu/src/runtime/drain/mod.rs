@@ -1782,22 +1782,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                     "display_shared_state_setup index={index} gpa={:#x} reinit={reinit}",
                     state.display.shared_gpa
                 ));
-                // Smoking-gun self-labeling proxy: a reinit (guest teardown +
-                // re-register while already ONLINE) that arrives *after* the
-                // desktop converged is the guest-driven display rebuild that
-                // re-shows the boot-progress overlay.
-                // The host never re-drives ONLINE on its own — try_display_online
-                // early-returns once online_acked, and only this SETUP_SHARED_STATE
-                // clears it — so reinit=1 is the *necessary precondition* for the
-                // post-converge overlay, not merely a correlate. Emitting one
-                // correlated line here means a bad boot self-labels instead of
-                // needing a cross-grep of two timestamps.
-                if reinit == 1 && crate::runtime::census::present_proxy::has_converged() {
-                    crate::observe::fail(format!(
-                        "post_converge_display_reinit index={index} gpa={:#x}",
-                        state.display.shared_gpa
-                    ));
-                }
                 // Archive apple_pv_gpu_display_setup: fill descriptor + modes
                 // before completion so createDisplayAttributes sees TimingElements.
                 // Do **not** pulse ONLINE here — enable() has not set +0x104 yet

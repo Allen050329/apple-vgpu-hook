@@ -14,7 +14,7 @@ pub use state::{
     DeviceId, DeviceState, DisplayHandshake, ExecAggStats, ExecFault, ExecPacketSample, FailEvent,
     FrameStats, GfxRegs, GuestLinearMemo, GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry,
     GvaHostView, HostLinearTexture, HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture,
-    MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc, PendingStats,
+    MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc,
     PendingWork,
     PresentState, PresentedGeom, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
     TaskMapSpan, TrancheStats, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,

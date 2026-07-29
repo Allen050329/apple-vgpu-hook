@@ -21,7 +21,6 @@
 //! | `OFF sample_alpha_mask` | Deduplicated zero-RGB/nonzero-alpha sample census; alpha is preserved |
 //! | `linear_sample_miss` | Display-sized type-2/3 sample failed, with descriptor identity |
 //! | `OFF linear_coverage_gap` | Typed stage-in/shader-evaluated coverage check rejected full-display ownership |
-//! | `THRASH selected_peer_divergence` | Protocol-selected retain is sparse while a same-geometry Store peer is dense |
 //! | `import_content` | Resident-to-guest Store census; display rows include exact changed/R↔B-swapped pixel counts |
 //! | `linux_m2v_resources` | Per-draw resource census; `fixed_gap=[...]` names decoded fixed state absent from the Vulkan request |
 //! | `linux_m2v_timing` | always-on stage µs: load/m2v/setup/engine/composite + total |
