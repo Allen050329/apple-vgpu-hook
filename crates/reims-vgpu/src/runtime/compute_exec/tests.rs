@@ -1777,68 +1777,6 @@ fn compute_engine_phase_proxy_names_every_measured_boundary() {
 }
 
 #[test]
-fn full_screen_compute_output_proxy_names_content_and_destination() {
-    let pipe = 0xe000_0000 | (std::process::id() & 0x0fff_ffff);
-    let mut bytes = vec![0u8; 1280 * 720 * 4];
-    bytes[0] = 7;
-    let tex = StagedTexture {
-        binding: 34,
-        pixel_format: pixel_format::MTL_FORMAT_RGBA8_UNORM,
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba8Unorm as u32),
-        width: 1280,
-        height: 720,
-        bytes,
-        is_storage: true,
-        residency: None,
-        seed_skipped: false,
-        sample_resident: None,
-        writeback: TextureWriteback::Type11 {
-            mapping_id: 42,
-            surface_offset: 0,
-            surface_bpr: 1280 * 4,
-            span_end: (1280 * 720 * 4) as u64,
-            width: 1280,
-            height: 720,
-            bpp: 4,
-        },
-    };
-    log_compute_output_texture(pipe, &tex, None);
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(log.lines().any(|line| {
-        line.contains(&format!("compute_linux output_tex pipe={pipe}"))
-            && line.contains("bind=34")
-            && line.contains("dst=type11 mid=42")
-            && line.contains("rgb_nz=1")
-            && line.contains("max_rgb=7")
-    }));
-
-    let packed_pipe = pipe ^ 1;
-    let mut packed_bytes = vec![0u8; 320 * 720 * 16];
-    packed_bytes[0] = 9;
-    let packed = StagedTexture {
-        binding: 35,
-        pixel_format: pixel_format::MTL_FORMAT_RGBA32_UINT,
-        storage_selector: Some(pixel_format::StorageImageSelector::Rgba32Uint as u32),
-        width: 320,
-        height: 720,
-        bytes: packed_bytes,
-        is_storage: true,
-        residency: None,
-        seed_skipped: false,
-        sample_resident: None,
-        writeback: TextureWriteback::None,
-    };
-    log_compute_output_texture(packed_pipe, &packed, None);
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(log.lines().any(|line| {
-        line.contains(&format!("compute_linux output_tex pipe={packed_pipe}"))
-            && line.contains("fmt=0x7b")
-            && line.contains("320x720")
-    }));
-}
-
-#[test]
 fn storage_residency_proxy_requires_exact_view_and_generation() {
     let pipe = 0xd000_0000 | (std::process::id() & 0x0fff_ffff);
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);

@@ -906,11 +906,6 @@ pub struct ComputeOutput {
     /// Empty for images the GPU copied straight into the caller's imported
     /// host window (see `images_direct`).
     pub images: Vec<Vec<u8>>,
-    /// Color8 content stats fused into each image readback copy (same order
-    /// and length as `images`; `None` when the readback is not whole RGBA8
-    /// texels or the image went direct). Saves the runtime a second full scan
-    /// for its output census.
-    pub image_stats: Vec<Option<crate::backend::vulkan::engine::Color8ContentStats>>,
     /// Per image (request order): true when the GPU copy landed in the
     /// caller's `host_writeback` window — the caller must skip its own CPU
     /// writeback for that image. False = the readback in `images` is

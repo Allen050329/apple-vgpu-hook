@@ -1478,7 +1478,6 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
     let mut images = Vec::with_capacity(simg_slots.len());
-    let mut image_stats = Vec::with_capacity(simg_slots.len());
     let mut images_direct = Vec::with_capacity(simg_slots.len());
     let mut images_deferred = Vec::with_capacity(simg_slots.len());
     for prepared in &simg_slots {
@@ -1488,7 +1487,6 @@ pub(crate) unsafe fn execute_compute_inner(
                 // nothing crosses the device→host boundary here.
                 counters.note_compute_direct_writeback(prepared.len as u64);
                 images.push(Vec::new());
-                image_stats.push(None);
                 images_direct.push(true);
                 images_deferred.push(false);
                 continue;
@@ -1501,7 +1499,6 @@ pub(crate) unsafe fn execute_compute_inner(
                 }
                 counters.note_compute_deferred_writeback(prepared.len as u64);
                 images.push(Vec::new());
-                image_stats.push(None);
                 images_direct.push(false);
                 images_deferred.push(true);
                 continue;
@@ -1518,22 +1515,10 @@ pub(crate) unsafe fn execute_compute_inner(
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecMapImageReadback, e)))?
             as *const u8;
-        // Fuse the color8 content census into the mandatory readback copy —
-        // one pass instead of a second full-buffer scan in the runtime
-        // (2–3 ms per display-sized storage image on the stamp path).
-        let (out, stats) = if prepared.len % 4 == 0 && prepared.len != 0 {
-            // SAFETY: mapping covers prepared.len readable bytes; dst capacity
-            // equals len and every byte is written by the fused copy.
-            let src = unsafe { std::slice::from_raw_parts(ptr, prepared.len) };
-            let (dst, stats) = super::content_stats::copy_color8_with_stats_to_vec(src);
-            (dst, Some(stats))
-        } else {
-            (copy_mapped_output(ptr, prepared.len), None)
-        };
+        let out = copy_mapped_output(ptr, prepared.len);
         ctx.device.unmap_memory(readback.memory);
         counters.note_readback(prepared.len as u64);
         images.push(out);
-        image_stats.push(stats);
         images_direct.push(false);
         images_deferred.push(false);
     }
@@ -1556,7 +1541,6 @@ pub(crate) unsafe fn execute_compute_inner(
     Ok(ComputeOutput {
         buffers,
         images,
-        image_stats,
         images_direct,
         images_deferred,
     })

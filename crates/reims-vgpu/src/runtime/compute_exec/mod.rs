@@ -1005,76 +1005,7 @@ fn next_mapping_content_generation(current: u32) -> u32 {
     }
 }
 
-/// Measure the full-screen compute-result boundary before guest writeback.
-///
-/// This is diagnosis only: it never changes dispatch, writeback, or present
-/// behavior. Pair a nonzero `output_tex` destination with later
-/// `empty_sample kind=display` lines to localize loss after shader execution.
-/// `fused_stats` = `(rgb_nz, rgb_max)` already gathered during the engine's
-/// readback copy (identical pixel semantics to `rgba_rgb_stats`).
-fn log_compute_output_texture(pipe: u32, tex: &StagedTexture, fused_stats: Option<(usize, u8)>) {
-    let Some(row_bytes) =
-        pixel_format::bytes_per_pixel(tex.pixel_format).and_then(|bpp| tex.width.checked_mul(bpp))
-    else {
-        return;
-    };
-    // Reinterpreted views may be narrower in texels while covering the same
-    // physical row (for example 320 RGBA32Uint texels == 1280 BGRA8 pixels).
-    if row_bytes < 1280 * pixel_format::RGBA8_BPP || tex.height < 720 {
-        return;
-    }
-    // Prefer the census the engine fused into the readback copy; a second
-    // full scan of a display-sized image costs 2–3 ms on the stamp path.
-    let (nz, max_rgb) = fused_stats.unwrap_or_else(|| {
-        let (nz, max_rgb, _) = crate::observe::rgba_rgb_stats(&tex.bytes);
-        (nz, max_rgb)
-    });
-    let destination = match &tex.writeback {
-        TextureWriteback::None => "none".to_string(),
-        TextureWriteback::Linear { gva, .. } => format!("linear gva={gva:#x}"),
-        TextureWriteback::Type11 { mapping_id, .. } => format!("type11 mid={mapping_id}"),
-    };
-    crate::observe::off(format!(
-        "compute_linux output_tex pipe={pipe} bind={} simg={} fmt={:#x} dst={destination} {}x{} rgb_nz={nz} max_rgb={max_rgb}",
-        tex.binding,
-        tex.storage_selector
-            .map(|selector| selector.to_string())
-            .unwrap_or_else(|| "none".into()),
-        tex.pixel_format,
-        tex.width,
-        tex.height
-    ));
-}
 
-/// Census marker for a storage image the engine wrote back GPU-direct:
-/// content stats are not measured (nothing crossed the device→host
-/// boundary). Same display-size gating as [`log_compute_output_texture`].
-#[cfg(feature = "backend-vulkan")]
-fn log_compute_output_texture_direct(pipe: u32, tex: &StagedTexture) {
-    let Some(row_bytes) =
-        pixel_format::bytes_per_pixel(tex.pixel_format).and_then(|bpp| tex.width.checked_mul(bpp))
-    else {
-        return;
-    };
-    if row_bytes < 1280 * pixel_format::RGBA8_BPP || tex.height < 720 {
-        return;
-    }
-    let destination = match &tex.writeback {
-        TextureWriteback::None => "none".to_string(),
-        TextureWriteback::Linear { gva, .. } => format!("linear gva={gva:#x}"),
-        TextureWriteback::Type11 { mapping_id, .. } => format!("type11 mid={mapping_id}"),
-    };
-    crate::observe::off(format!(
-        "compute_linux output_tex pipe={pipe} bind={} simg={} fmt={:#x} dst={destination} {}x{} census=direct",
-        tex.binding,
-        tex.storage_selector
-            .map(|selector| selector.to_string())
-            .unwrap_or_else(|| "none".into()),
-        tex.pixel_format,
-        tex.width,
-        tex.height
-    ));
-}
 
 /// Measure storage-image seed traffic by structurally reflected content access.
 ///
@@ -3501,8 +3432,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
-    let mut max_nz = 0usize;
-    let mut max_wh = (0u32, 0u32);
     let mut sampled_count = 0usize;
     let mut storage_count = 0usize;
     for t in &staged_tex {
@@ -3510,23 +3439,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             storage_count += 1;
         } else {
             sampled_count += 1;
-        }
-        let (nz, max_rgb, _) = crate::observe::rgba_rgb_stats(&t.bytes);
-        if nz > max_nz {
-            max_nz = nz;
-            max_wh = (t.width, t.height);
-        }
-        if t.width >= 1280 && t.height >= 720 {
-            crate::observe::off(format!(
-                "compute_linux stage_tex pipe={} bind={} access={} {}x{} rgb_nz={} max_rgb={}",
-                acc.pipeline_ref,
-                t.binding,
-                if t.is_storage { "storage" } else { "sampled" },
-                t.width,
-                t.height,
-                nz,
-                max_rgb
-            ));
         }
     }
     let (residency_eligible, residency_hits, residency_eligible_bytes, residency_hit_bytes) =
@@ -3539,8 +3451,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         residency_hit_bytes,
     );
     let stage_us = u64::try_from(stage_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    crate::observe::off(format!(
-        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] max_tex={}x{} max_nz={max_nz} stage_us={} encode=engine",
+    // A dispatch that staged its resources is expected control flow; the
+    // refusals on this path each emit their own typed decline.
+    crate::observe::line(format!(
+        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] stage_us={} encode=engine",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
@@ -3550,8 +3464,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         sampled_count,
         storage_count,
         storage_writeonly_count,
-        max_wh.0,
-        max_wh.1,
         stage_us,
     ));
     let prep_started = std::time::Instant::now();
@@ -3941,7 +3853,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let vk_engine::ComputeOutput {
         buffers: output_buffers,
         images: output_images,
-        image_stats: output_image_stats,
         images_direct: output_images_direct,
         images_deferred: output_images_deferred,
     } = out;
@@ -3972,11 +3883,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return e;
         }
     }
-    for ((((t, bytes), fused_stats), direct), deferred) in staged_tex
+    for (((t, bytes), direct), deferred) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
         .zip(output_images)
-        .zip(output_image_stats)
         .zip(output_images_direct)
         .zip(output_images_deferred)
     {
@@ -4111,28 +4021,20 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             state.invalidate_storage_residency_window(*mapping_id, *surface_offset, *span_end);
             let _ = state.mark_mapping_written(*mapping_id);
             note_storage_residency_writeback(state, t);
-            log_compute_output_texture_direct(acc.pipeline_ref, t);
             continue;
         }
         t.bytes = bytes;
-        let stats_started = std::time::Instant::now();
-        log_compute_output_texture(
-            acc.pipeline_ref,
-            t,
-            fused_stats.map(|s| (s.rgb_nz, s.rgb_max)),
-        );
-        let stats_us = stats_started.elapsed().as_micros() as u64;
         let write_started = std::time::Instant::now();
         if let Err(e) = writeback_texture(state, host, task_id, t) {
             return e;
         }
         let write_us = write_started.elapsed().as_micros() as u64;
         note_storage_residency_writeback(state, t);
-        // Measure-only: split the writeback stall into the content-stats scan
-        // vs the guest write.
-        if stats_us + write_us > 1500 {
+        // A writeback this slow stalls the guest's dispatch ack, so it stays
+        // always-on even though the write itself succeeded.
+        if write_us > 1500 {
             crate::observe::off(format!(
-                "compute_writeback_slow pipe={} bind={} {}x{} stats_us={stats_us} write_us={write_us}",
+                "compute_writeback_slow pipe={} bind={} {}x{} write_us={write_us}",
                 acc.pipeline_ref, t.binding, t.width, t.height
             ));
         }
@@ -4141,7 +4043,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let total_us = u64::try_from(total_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
     let snap = engine_after;
-    crate::observe::off(format!(
+    // A dispatch that completed is expected control flow; every refusal on this
+    // path emits its own typed decline.
+    crate::observe::line(format!(
         "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={} stage_us={stage_us} translate_us={translate_us} prep_us={prep_us} engine_us={engine_us} {engine_phase_fields} writeback_us={writeback_us} total_us={total_us} vk_engine_dispatches={} creates={} allocs={}",
         acc.pipeline_ref,
         staged_bufs.len(),

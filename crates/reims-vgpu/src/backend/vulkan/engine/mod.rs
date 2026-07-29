@@ -10,7 +10,6 @@
 mod caches;
 mod compute_execution;
 mod compute_validation;
-mod content_stats;
 mod context;
 mod counters;
 mod desc_arena;
@@ -39,7 +38,6 @@ mod window_present;
 
 pub use compute_execution::ComputeExecutionDecline;
 pub use compute_validation::ComputeValidationDecline;
-pub use content_stats::Color8ContentStats;
 pub use context::{FENCE_TIMEOUT_NS, MAX_DEVICE_RECREATES};
 pub use counters::{CounterSnapshot, EngineCounters};
 pub use device_lost::{DeviceLostDecline, DeviceLostOp};
@@ -69,7 +67,6 @@ pub use vk_call::{VkCall, VkOp};
 pub use window_present::WindowPresentOutcome;
 
 use caches::ObjectCaches;
-use content_stats::copy_color8_with_stats_to_vec;
 use context::ContextOwner;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -79,7 +76,6 @@ use std::sync::atomic::Ordering;
 use types::ComputeError;
 
 pub type OptionalExportedPresent = (Option<i32>, u64, u32, u32, usize);
-type ResidentReadback = (Vec<u8>, Option<Color8ContentStats>);
 
 struct EngineState {
     owner: ContextOwner,
@@ -717,8 +713,8 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
             return None;
         }
     }
-    let mut px = match read_target_inner(identity, false) {
-        Ok((pixels, _)) => pixels,
+    let mut px = match read_target_inner(identity) {
+        Ok(pixels) => pixels,
         Err(e) => {
             let mut emit = crate::observe::Emit::decline("present_capture", &e);
             for (key, value) in draw_execution::identity_fields(identity) {
@@ -735,10 +731,7 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
     Some(px)
 }
 
-fn read_target_inner(
-    identity: &TargetIdentity,
-    measure_content: bool,
-) -> Result<ResidentReadback, DrawError> {
+fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -859,26 +852,17 @@ fn read_target_inner(
         // `vec![0u8; rb_size]`'s zeroing of a full 8 MiB frame per present is
         // pure waste on the guest-blocking present drain. Allocate uninit and
         // fill in one pass.
-        let (out, content) = if measure_content {
-            let src = std::slice::from_raw_parts(ptr, rb_size as usize);
-            let (out, stats) = copy_color8_with_stats_to_vec(src);
-            (out, Some(stats))
-        } else {
-            (
-                exec_compute::copy_mapped_output(ptr, rb_size as usize),
-                None,
-            )
-        };
+        let out = exec_compute::copy_mapped_output(ptr, rb_size as usize);
         ctx.device.unmap_memory(readback.memory);
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_readback(rb_size);
-        Ok((out, content))
+        Ok(out)
     }
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
 pub fn read_target(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
-    read_target_inner(identity, false).map(|(pixels, _)| pixels)
+    read_target_inner(identity)
 }
 
 /// Flush read of a **pinned deferred-writeback resident storage image**: copy
