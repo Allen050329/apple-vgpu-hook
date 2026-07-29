@@ -1642,14 +1642,23 @@ impl DeviceState {
     }
 
     /// Disarm a linear compute-storage deferred window, keeping the union index
-    /// in sync. Returns whether an entry was present.
-    pub fn disarm_linear_deferred_window(&mut self, key: &ComputeStorageResidencyKey) -> bool {
-        if let Some((_, pages)) = self.linear_deferred_flush.0.remove(key) {
-            self.deferred_ref_sub_pages(&pages);
-            true
-        } else {
-            false
-        }
+    /// in sync.
+    ///
+    /// Returns the page set the window was armed against, so a caller about to
+    /// write those guest pages can check they still belong to this window (see
+    /// `runtime::storage_flush::deferred_pages_still_ours`). This used to return
+    /// a bare `bool` and drop the pages on the floor, which left the flush with
+    /// no way to tell that the guest had re-pointed the span since defer time —
+    /// the same hazard the GVA rail already guards. `Some` still means "an entry
+    /// was present", so the presence test is unchanged for callers that only
+    /// want that.
+    pub fn disarm_linear_deferred_window(
+        &mut self,
+        key: &ComputeStorageResidencyKey,
+    ) -> Option<std::collections::HashSet<u64>> {
+        let (_, pages) = self.linear_deferred_flush.0.remove(key)?;
+        self.deferred_ref_sub_pages(&pages);
+        Some(pages)
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).

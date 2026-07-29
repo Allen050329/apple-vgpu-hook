@@ -421,15 +421,45 @@ fn window_pages_still_ours<M: HostMemory + HostOps>(
     entry: &crate::model::GvaDeferredEntry,
     trigger: &str,
 ) -> bool {
-    let span = entry.span();
-    if span == 0 || entry.pages.is_empty() {
+    deferred_pages_still_ours(
+        state,
+        host,
+        entry.task_id,
+        gva,
+        entry.span(),
+        &entry.pages,
+        &format!("{}x{} trigger={trigger}", entry.width, entry.height),
+    )
+}
+
+/// The drift decision itself, over any deferred window's armed page set.
+///
+/// Both deferred rails arm against a page set resolved at defer time and then
+/// write guest RAM through a *fresh* walk at flush time, so both have the same
+/// hazard and the same answer. Keeping one implementation is what stops the
+/// second rail from drifting away from the first: the linear rail carried this
+/// hazard with no check at all while the GVA rail had one, purely because the
+/// check lived inside the GVA-shaped function.
+///
+/// Returns `true` when the window may still be written to guest RAM.
+#[cfg(feature = "backend-vulkan")]
+fn deferred_pages_still_ours<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    armed: &std::collections::HashSet<u64>,
+    what: &str,
+) -> bool {
+    if span == 0 || armed.is_empty() {
         return true;
     }
     let mut live = std::collections::HashSet::new();
     crate::runtime::gva_mem::visit_task_gva_page_gpas(
         host,
         &state.tasks,
-        entry.task_id,
+        task_id,
         gva,
         span,
         state.page_shift,
@@ -439,24 +469,21 @@ fn window_pages_still_ours<M: HostMemory + HostOps>(
             true
         },
     );
-    // An empty or short walk is the teardown case the writer below names
-    // precisely; deciding it here too would take it away from the reason that
-    // fits it, and that path already lands cache-only.
-    if live.len() < entry.pages.len() {
+    // An empty or short walk is the teardown case the writers name precisely;
+    // deciding it here too would take it away from the reason that fits it, and
+    // those paths already land cache-only.
+    if live.len() < armed.len() {
         return true;
     }
-    if live == entry.pages {
+    if live == *armed {
         return true;
     }
     crate::observe::fail(format!(
-        "deferred_window_page_drift gva={gva:#x} task={} {}x{} trigger={trigger} \
+        "deferred_window_page_drift gva={gva:#x} task={task_id} {what} \
          armed_pages={} live_pages={} moved={} guest=refused",
-        entry.task_id,
-        entry.width,
-        entry.height,
-        entry.pages.len(),
+        armed.len(),
         live.len(),
-        entry.pages.difference(&live).count()
+        armed.difference(&live).count()
     ));
     false
 }
@@ -613,7 +640,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
     generation: u32,
 ) -> bool {
-    state.disarm_linear_deferred_window(key);
+    let armed_pages = state.disarm_linear_deferred_window(key);
     let task_id = key.map_generation;
     let texture_ref = key.texture_ref;
     let started = std::time::Instant::now();
@@ -646,7 +673,36 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     );
     let tight = (key.width as usize).saturating_mul(texel as usize);
     let mut guest = "skip_uncovered";
-    if state.gva_write_allowed(task_id, key.surface_offset, key.span_end) {
+    // Same hazard, same answer as the GVA rail: this window was armed against a
+    // page set at defer time and `write_linear_guest` walks fresh, so a span the
+    // guest has since re-pointed sends a compute-storage image into whatever
+    // owns those pages now. Observed on this rail as guest heap corruption — a
+    // `pmap_page_protect` kernel panic and userspace SIGSEGVs inside libmalloc's
+    // own page bookkeeping. The cache entry keeps the authoritative bytes
+    // (`materialize_linear_resident` ran above), so refusing loses nothing
+    // renderable.
+    let still_ours = match &armed_pages {
+        // `span_end` is a length (`row_stride * height`) for a linear key, not
+        // an end address — and the arm site walks `(surface_offset, span_end)`
+        // with exactly these two values, so this walk has to as well or the two
+        // page sets describe different ranges and every flush reads as drift.
+        Some(pages) => deferred_pages_still_ours(
+            state,
+            host,
+            task_id,
+            key.surface_offset,
+            key.span_end,
+            pages,
+            &format!(
+                "{}x{} trigger=linear_flush ref={texture_ref}",
+                key.width, key.height
+            ),
+        ),
+        None => true,
+    };
+    if !still_ours {
+        guest = "skip_drift";
+    } else if state.gva_write_allowed(task_id, key.surface_offset, key.span_end) {
         guest = if crate::runtime::compute_exec::write_linear_guest(
             state,
             host,
@@ -703,7 +759,7 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     for key in &retired {
         // Task teardown = the GPU VA maps are gone; never write guest pages
         // from here (boot-16 rule) — drop any pending guest-flush obligation.
-        if state.disarm_linear_deferred_window(key) {
+        if state.disarm_linear_deferred_window(key).is_some() {
             crate::observe::off(format!(
                 "linear_deferred_dropped reason=retired task={} ref={}",
                 key.map_generation, key.texture_ref
@@ -1278,7 +1334,11 @@ mod tests {
         );
         assert_index_matches_windows(&state, &seen);
         // Disarm both remaining windows: index empties.
-        assert!(state.disarm_linear_deferred_window(&lin));
+        assert_eq!(
+            state.disarm_linear_deferred_window(&lin),
+            Some([p(0xF)].into_iter().collect()),
+            "disarm returns the pages the window was armed against"
+        );
         assert!(state.take_oldest_gva_deferred_window().is_some());
         for page in seen {
             assert!(!state.deferred_pages_intersect(&[page]));
@@ -1700,6 +1760,104 @@ mod tests {
             "a window whose pages moved must be refused, not merely reported"
         );
         assert_eq!(drift_lines(at), 1, "a window whose pages moved must report");
+    }
+
+    /// The linear compute-storage rail gets the same drift decision as the GVA
+    /// rail, and takes its span the way the arm site does.
+    ///
+    /// `flush_linear_one` needs a live Vulkan engine to reach its guest write, so
+    /// this exercises the decision itself with a linear key's geometry. The span
+    /// argument is the subtle part and the positive control is what pins it: a
+    /// linear key's `span_end` is a *length* (`row_stride * height`), not an end
+    /// address, and the arm site walks `(surface_offset, span_end)` with exactly
+    /// those two values. Reading `span_end` as an end address here would make the
+    /// span `page - page == 0`, the walk would come back empty, the short-walk arm
+    /// would permit, and the positive control below would fail — which is the
+    /// point of siting it at a nonzero offset rather than at GVA 0, where both
+    /// readings coincide.
+    #[test]
+    fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length() {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let (dir_gpa, root_gpa, data0, data1) = (2 * page, 3 * page, 4 * page, 5 * page);
+        for gpa in [dir_gpa, root_gpa, data0, data1] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        // Two PTEs: GVA page 0 → data0, GVA page 1 → data1.
+        let mut ptes = [0u8; 8];
+        st32(&mut ptes[0..], 4);
+        st32(&mut ptes[4..], 5);
+        host.write_gpa(root_gpa, &ptes).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, 8 * page, 2));
+
+        crate::observe::redirect_logs_for_tests();
+        let drift_lines = |from: usize| -> usize {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .get(from..)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("deferred_window_page_drift "))
+                .count()
+        };
+        let mark = || {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len()
+        };
+        // One page long, sited at GVA `page` so a length/end confusion is visible.
+        let (offset, span) = (page, page);
+
+        // Negative control: armed on the page GVA `page` resolves to right now.
+        let at = mark();
+        assert!(
+            super::deferred_pages_still_ours(
+                &state,
+                &host,
+                1,
+                offset,
+                span,
+                &[data1].into_iter().collect(),
+                "8x8 trigger=linear_flush ref=5",
+            ),
+            "an unmoved linear window must stay writable — a guard that refuses \
+             every flush means the guest never sees a compute Store"
+        );
+        assert_eq!(
+            drift_lines(at),
+            0,
+            "a linear window that did not move must be quiet"
+        );
+
+        // Positive control: same window, armed on a page it no longer maps to.
+        // This is also the assertion that the span is read as a length.
+        let at = mark();
+        assert!(
+            !super::deferred_pages_still_ours(
+                &state,
+                &host,
+                1,
+                offset,
+                span,
+                &[9 * page].into_iter().collect(),
+                "8x8 trigger=linear_flush ref=5",
+            ),
+            "a linear window whose pages moved must be refused — and a zero-length \
+             walk from misreading span_end as an end address would permit it"
+        );
+        assert_eq!(
+            drift_lines(at),
+            1,
+            "a linear window whose pages moved must report"
+        );
     }
 
     /// Task teardown moves the task's GVA windows to the retired list (model)
