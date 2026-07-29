@@ -1,7 +1,7 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
 use crate::contract::endian::{ld16, st16};
-use crate::contract::{align_up_u64, checked_mul_u64};
+use crate::contract::checked_mul_u64;
 
 pub const COMPONENT_COUNT: usize = 4;
 pub const COMPONENT_R: usize = 0;
@@ -1154,12 +1154,6 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
         }
     }
     true
-}
-
-// silence unused for now
-#[allow(dead_code)]
-fn _align_up_used() {
-    let _ = align_up_u64(1, 128);
 }
 
 #[cfg(test)]

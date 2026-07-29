@@ -740,14 +740,6 @@ pub unsafe extern "C" fn reims_vgpu_qemu_cursor_glyph_copy(
     )
 }
 
-// Keep HostOps/HostAction types exported for C layout checks.
-#[allow(dead_code)]
-fn _layout_assert() {
-    let _ = std::mem::size_of::<ReimsVgpuHostOps>();
-    let _ = std::mem::size_of::<ReimsVgpuHostAction>();
-    let _ = std::mem::size_of::<*const c_void>();
-}
-
 #[cfg(test)]
 mod tests {
 

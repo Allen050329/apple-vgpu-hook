@@ -52,13 +52,6 @@ impl Backend for VulkanBackend {
     }
 }
 
-// Touch ash so the optional dependency is part of the feature graph and unused-
-// crate linting does not strip it before encode modules land.
-#[allow(dead_code)]
-fn _ash_linkage_anchor() {
-    let _ = std::mem::size_of::<ash::vk::ApplicationInfo<'static>>();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,10 +59,5 @@ mod tests {
     #[test]
     fn name_is_vulkan() {
         assert_eq!(VulkanBackend::new().name(), "vulkan");
-    }
-
-    #[test]
-    fn ash_is_linked() {
-        _ash_linkage_anchor();
     }
 }

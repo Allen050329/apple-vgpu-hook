@@ -9,7 +9,7 @@ use crate::contract::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, read_internal_desc_ptr, read_mapper_identity,
     read_mapper_internal, sample_window, sample_window_prefer_device, validate_mapper_internal,
-    MapperInternalFields, PagesMemory, DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE,
+    PagesMemory, DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE,
     MAPPER_CAPTURE_REG_MAPPING_INTERNAL, MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN,
     MAPPER_REQUEST_MAP, MAPPER_REQUEST_UNMAP,
 };
@@ -1406,12 +1406,6 @@ const MAPPING_RUN_IMPORT_SLOW_US: u64 = 1_000;
 #[inline]
 fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= MAPPING_RUN_IMPORT_SLOW_US
-}
-
-/// Fields helper for tests.
-#[allow(dead_code)]
-pub fn fields_ok(fields: &MapperInternalFields, mapping_id: u32) -> bool {
-    fields.mapping_id == mapping_id
 }
 
 #[cfg(test)]

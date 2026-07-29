@@ -655,7 +655,3 @@ mod texture_view_split_tests {
     }
 }
 
-#[allow(dead_code)]
-fn _ld32_keep(v: &[u8]) -> u32 {
-    ld32(v)
-}

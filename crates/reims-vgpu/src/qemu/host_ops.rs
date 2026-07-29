@@ -525,12 +525,6 @@ impl HostOps for NullHost {
     fn schedule_bh(&mut self) {}
 }
 
-/// Map an internal action kind for C layout checks.
-#[allow(dead_code)]
-pub fn action_kind_wire(kind: HostActionKind) -> u32 {
-    kind as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,7 +801,7 @@ mod tests {
             (K::WindowClosed, ReimsVgpuHostActionKind::WindowClosed, 11),
         ];
         for (k, ak, wire) in pairs {
-            assert_eq!(action_kind_wire(k), wire);
+            assert_eq!(k as u32, wire);
             assert_eq!(ak as u32, wire);
         }
     }

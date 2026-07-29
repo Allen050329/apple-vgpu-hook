@@ -24,7 +24,6 @@
 //! modifier, which every driver exports and imports. Explicit optimal-tiling
 //! modifiers (`VK_EXT_image_drm_format_modifier`) differ per vendor, so LINEAR is
 //! the portable baseline (see the AGENTS.md portability ground rule).
-#![allow(dead_code)]
 
 use ash::vk;
 
@@ -46,7 +45,9 @@ pub(crate) struct ExportedScanoutImage {
     pub fd: i32,
     /// Bytes per row of the LINEAR image (the EGL import stride).
     pub row_pitch: u64,
-    /// Total allocation size (bytes).
+    /// Total allocation size (bytes). Read by the export round-trip test, which
+    /// asserts the allocation covers `row_pitch * height`.
+    #[allow(dead_code)]
     pub size: u64,
     pub width: u32,
     pub height: u32,

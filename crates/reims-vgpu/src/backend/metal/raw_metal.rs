@@ -8,7 +8,7 @@ use metal::{
     NSUInteger, RenderPipelineDescriptorRef, Texture, TextureRef,
 };
 use objc::runtime::{Object, BOOL, NO, YES};
-use objc::{class, msg_send, sel, sel_impl};
+use objc::{msg_send, sel, sel_impl};
 
 // SDK MTLTessellation* enums (not fully exposed by metal-0.33).
 pub const MTL_TESSELLATION_PARTITION_POW2: NSUInteger = 0;
@@ -792,12 +792,6 @@ pub fn render_reflection_sampler_mask(reflection: *mut Object, vertex: bool) -> 
         }
         mask
     }
-}
-
-// Silence unused import of class! in some builds.
-#[allow(dead_code)]
-fn _touch_class() {
-    let _: *mut Object = unsafe { msg_send![class!(NSObject), class] };
 }
 
 /// Helper: MTLSize constructor.

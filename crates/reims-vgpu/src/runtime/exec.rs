@@ -2009,12 +2009,6 @@ fn fill_draw_binds_from_pending(req: &mut metal_draw::DrawEncodeRequest, pd: &Pe
     req.stencil_attach = pd.stencil_attach;
 }
 
-// solid_rgba remains used by metal_draw via clears; keep helper for tests if needed.
-#[allow(dead_code)]
-fn _solid_rgba_keep(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
-    solid_rgba(w, h, clear)
-}
-
 fn dirty_color_targets<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,

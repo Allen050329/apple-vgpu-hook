@@ -14,7 +14,6 @@
 //! on the process main thread, so QEMU creates it through
 //! [`start_main_thread`] during device realize and then makes
 //! [`run_main_thread`] its process-main UI loop.
-#![allow(dead_code)]
 // ash-heavy module: inner unsafe blocks add noise per ash call (matches the
 // engine modules' convention).
 #![allow(unsafe_op_in_unsafe_fn)]

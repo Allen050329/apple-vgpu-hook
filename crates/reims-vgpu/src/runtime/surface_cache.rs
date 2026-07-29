@@ -593,7 +593,6 @@ pub fn flush_gva_host_cache_on_map<
         stats.no_cache = 1;
         return stats;
     }
-    let _page_shift = state.page_shift;
     for gva in keys {
         let Some(e) = state.host_gva_surfaces.get(&gva).cloned() else {
             continue;

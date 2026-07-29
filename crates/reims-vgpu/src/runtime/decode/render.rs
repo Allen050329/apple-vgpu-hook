@@ -772,12 +772,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
     }
 }
 
-// silence unused
-#[allow(dead_code)]
-fn _ld16(p: &[u8]) -> u16 {
-    ld16(p)
-}
-
 #[cfg(test)]
 mod tests {
 
