@@ -357,11 +357,70 @@ channel.** Do not re-derive them:
 - *Shader translation stalls.* `exec_translation_deferred reason=air_loading` fires 115 times across
   680 s — 0.17/s against 2 frames/s. Occasional compiles, not a per-frame cost.
 
-What is **not** established is where the time does go. Resist the two counters that look like they
-answer it: `contig_view_fragmented` and `type4_pages_refreshed` both land near one event per frame
-in aggregate, but they fire on *re-derivation*, not per access — `mid=2` accounts for 59 events in
-1124 s — so neither can price the path it names. That is the "an event count is not a state" rule
-applied to a cost rather than to a state.
+Resist the two counters that look like they answer it: `contig_view_fragmented` and
+`type4_pages_refreshed` both land near one event per frame in aggregate, but they fire on
+*re-derivation*, not per access — `mid=2` accounts for 59 events in 1124 s — so neither can price
+the path it names. That is the "an event count is not a state" rule applied to a cost rather than to
+a state.
+
+**Where the time does go is now measured, and it is one number: ~360 MB/s of CPU↔GPU copying.**
+`drain_duty` reads the drain worker's duty cycle, which is the right frame to ask in — that worker is
+the device's only executor, holds the device lock for a whole tranche, and therefore caps the guest's
+composite rate at the rate it finishes tranches. Under Safari load it sits at **duty 0.93–0.99**, so
+the rate is ours and not the guest's own pacing. Three readings follow from the same line and each
+kills a hypothesis that had looked strong:
+
+- *The host-window export is not the cost.* `publish_us` is 2–10 ms against a `drain_us` of
+  800–1500 ms — about **0.5%** — even though `export_present_dmabuf` quiesces the whole GPU twice per
+  present (`begin_entry_sync` then `retire_all`). Removing those two quiesces is a real cleanup and
+  worth roughly nothing; do not spend a session on it expecting frames.
+- *The machinery around the work is not the cost.* Idle windows read `duty=0.001` across 210+
+  tranches per second.
+- *It is the draws.* `draw_us` is **96–99%** of `drain_us`, at 150–840 draws/s and **1.5–7 ms each**.
+  Compute and flush are noise (`compute_us=0`, `flush_us` a few percent). The guest issues hundreds of
+  draws per composite, so ~2 s of work arrives per second of wall clock.
+
+`engine_delta` then names the per-draw cost, and it needed **no new instrumentation** —
+`engine::counter_snapshot` maintained seventy-odd counters for the life of every boot and had no
+product caller, so nothing had ever read one. In one second:
+
+| | per second |
+|---|---|
+| `readbacks` / `readback_bytes` | 20 / **165 888 000** |
+| `seed_uploads` / `seed_upload_bytes` | 30 / **190 918 800** |
+| `creates` | 30–340 |
+| `pipeline_misses`, `shader_misses`, `target_evicts` | ~0 |
+
+166 MB/s back plus 191 MB/s out. And `readback_bytes / readbacks` is exactly **8 294 400 =
+1920·1080·4** — every readback is a whole framebuffer, not a tile or a dirty rect. The seed side is
+the mirror image: `exec.rs`'s staging block says in situ that it is "Target seed staging (CPU import
+only — **not LoadFromTarget**)". So each render pass uploads its target's prior contents from host
+memory, draws, and reads the whole target back.
+
+Note which way the cache counters cut. `pipeline_misses`, `shader_misses` and `target_evicts` are all
+~0, so this is **not** churn or thrash — the caches are working and the round trip is what the code
+does on the *hit* path. A hypothesis of the form "something is missing its cache" is refuted by the
+same line that shows the bytes.
+
+Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
+a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
+and the measured frame period sat at 252–665 ms, i.e. just under that threshold for entire runs. It
+fired **once** in a four-round boot while the worker was pinned at 100%. Second, `counter_snapshot`
+is the second instrument here found fully built and never called; before adding a probe, grep for a
+snapshot/census function and check it has a caller.
+
+**Do not edit Rust while a multi-boot harness is running.** `boot-x86.sh` rebuilds QEMU every boot,
+so a tree edit lands in the middle of a run. One `stability-n.sh` run was scored `DISCARD` for exactly
+this. The numbers taken before the edit are still good; the verdict is not.
+
+**A watchdog on `hostfwd=tcp::2222` can answer for the previous boot.** The port is claimed by
+whichever QEMU holds it, so a multi-boot harness starts the watchdog while the last guest is still
+alive on it. Measured: run 2's watchdog latched `seen_session=1` off run 1's healthy desktop, then
+scored run 2's normal login window as `SESSION_LOST` — a false WindowServer-crash verdict on a
+completely clean boot, in both runs of one harness, with no `.ips` harvested in either. `watchdog.sh`
+now scopes every latch to the guest's `kern.boottime` epoch and announces a change as
+`GUEST_REBOOTED`. Same class as the `qmp.sock` symlink that outlives its QEMU: **before believing any
+guest reading, establish which guest answered.**
 
 **A live rig is not a live workload — validate the specific thing you drove.** "The log grew and
 presents happened" proves the rig is alive. It does not prove the workload ran, and the two get
