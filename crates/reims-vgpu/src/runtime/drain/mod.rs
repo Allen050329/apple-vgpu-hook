@@ -3085,8 +3085,80 @@ static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
+        emit_engine_delta();
     }
 }
+
+/// The engine's own counters, over the window `drain_duty` just reported.
+///
+/// `drain_duty` established that 96-99% of the saturated drain second is
+/// `draw_us`, at 1.5-7 ms per draw — orders of magnitude more than a draw's CPU
+/// encode should cost. Which of the engine's per-draw costs that is was already
+/// being counted and never reported: `engine::counter_snapshot` had no product
+/// caller, so every one of these numbers existed and no boot had read one.
+///
+/// So this adds no instrumentation, only a window delta of what the engine
+/// already tallies, chosen to separate the candidates that could each explain
+/// milliseconds per draw:
+///
+/// - `batch_*` — whether draws coalesce into one submission or each takes its
+///   own. Per-draw submission is a full CPU-GPU round trip.
+/// - `readbacks` / `readback_bytes` — whether every draw drags its target back
+///   to host memory, which is a fence wait plus a copy.
+/// - `creates` / `*_misses` — pipeline, shader and descriptor churn, where a
+///   miss is a driver compile rather than a lookup.
+/// - `sampled_reuploads` — re-staging texture content a cache hit should have
+///   kept.
+/// - `ring_retire_blocks` / `target_evicts` — the engine waiting on itself.
+///
+/// One line per second, one atomic load per field. Emitted from the same window
+/// as `drain_duty` so the two divide against each other; a delta on its own
+/// clock would not.
+#[cfg(feature = "backend-vulkan")]
+fn emit_engine_delta() {
+    use crate::backend::vulkan::engine::CounterSnapshot;
+    static PREV: std::sync::Mutex<Option<CounterSnapshot>> = std::sync::Mutex::new(None);
+    let now = crate::backend::vulkan::engine::counter_snapshot();
+    let Ok(mut prev) = PREV.lock() else {
+        return;
+    };
+    let d = now.delta_since(&prev.unwrap_or_default());
+    *prev = Some(now);
+    crate::observe::off(format!(
+        "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
+         batch_flush_draws={} readbacks={} readback_bytes={} pipeline_misses={} \
+         shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
+         sampled_cache_hits={} sampled_cache_misses={} sampled_reuploads={} \
+         sampled_reupload_bytes={} seed_uploads={} seed_upload_bytes={} \
+         ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
+        d.creates,
+        d.allocs,
+        d.batch_opens,
+        d.batch_joins,
+        d.batch_flushes,
+        d.batch_flush_draws,
+        d.readbacks,
+        d.readback_bytes,
+        d.pipeline_misses,
+        d.shader_misses,
+        d.pass_misses,
+        d.layout_misses,
+        d.sampler_misses,
+        d.sampled_cache_hits,
+        d.sampled_cache_misses,
+        d.sampled_reuploads,
+        d.sampled_reupload_bytes,
+        d.seed_uploads,
+        d.seed_upload_bytes,
+        d.ring_retire_blocks,
+        d.target_evicts,
+        d.desc_pool_grow,
+        d.gen_mismatch,
+    ));
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn emit_engine_delta() {}
 
 /// Count a drain wake-up that returned before taking the device lock.
 pub fn note_drain_skipped() {
