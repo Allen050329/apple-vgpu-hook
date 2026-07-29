@@ -542,6 +542,46 @@ Do not read the per-mid means as a standing exclusion of mid 4 either. It did no
 that boot*; other boots lost full-screen Stores on other mids, and which mapping the compositor picks
 is not ours to predict.
 
+**Scored on a boot at the fix, with the same workload: `cache_miss` 9 → 0, and the oscillation is
+gone.** `.agents/repros/blacklayer-score.sh` reads both boots the same way. The fix boot did **6.4x
+more deferred work** (`surface_deferred` 33744 against 5239), which matters — a loss count that falls
+while the denominator rises is not a quieter workload.
+
+| | pre-fix (`73648aa`) | at the fix |
+|---|---|---|
+| `deferred_flush_lost` total | 14 | 7 |
+| … `reason=cache_miss` | **9** | **0** |
+| … `reason=map_generation_drift` | 5 | 7 |
+| `surface_deferred` | 5239 | 33744 |
+| presents 20-90% black, per mid | **82 / 54 / 3** | **3 / 3 / 3** |
+| mean black fraction, per mid | 20.2% / 19.4% / 4.8% | 4.0% / 4.0% / 3.4% |
+
+The per-mid row is the one that maps to what a person sees. Before, the two mids that had lost a
+full-screen Store presented partly-black frames 82 and 54 times while the clean mid did so 3 times;
+after, **every presented mid behaves like the clean one did**. The host window at the end of that
+boot renders wallpaper, Calendar, Finder, Dock and menu bar with no black rectangle anywhere.
+
+The 7 remaining losses are all `map_generation_drift`, which is the guard doing its job — the pages
+moved under the window and writing them would land a framebuffer in whatever owns that memory now,
+which is the corruption class. That number going *up* while `cache_miss` goes to zero is expected:
+those windows previously died of `cache_miss` first.
+
+**One boot does not close the class**, per the standing rule here. What the boot establishes is that
+the mechanism is gone from the path it was measured on; what actually retires `cache_miss` is that it
+is unreachable once the window owns its frame, which is a construction argument and does not depend
+on this boot.
+
+Two things this boot does **not** show, stated so they are not quoted later as though it did:
+
+- **No frame-rate claim.** Cadence read 5.85 / 8.35 / 11.86 Hz per round against a pre-fix band of
+  5.3-14.4 across eight boots, with the third round always fastest in both. That is inside the noise,
+  which is exactly what `us_per_draw`'s 1.8x boot-to-boot spread predicts. Scoring the CPU-copy
+  removals needs interleaving or a counter, not this.
+- **`read_overrun` fired 0 times.** The guard added for the unbounded contig read is therefore
+  untested by this boot in the only way that would matter — it has no positive evidence that the
+  overrun was ever being taken. Treat it as a bound that is now enforced, not as a defect that was
+  observed.
+
 The counter that separates those two worlds is `surface_flush` on the `store_routes` line: an arm
 count cannot tell "the writeback was skipped" from "the writeback happened a millisecond later", and
 `surface_flush / surface_deferred` is the ratio that can.
