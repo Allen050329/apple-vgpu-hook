@@ -433,12 +433,61 @@ mapping's guest pages. That is precisely the hole the host-pointer import used t
 `metal_draw/vulkan.rs` says so where it sets the flag: "the import is gone, so the only way a Store's
 pixels reach the guest is the CPU writeback, and that needs them read back."
 
-So the actionable shape of the ~2 Hz problem is: **give the type-11 render Store the deferred rail the
-GVA render Store already has** — keep the composite on the registry resident with `skip_readback`,
-arm a flush-on-access window, and let the matching Load take `LoadOp::LoadFromTarget` instead of a CPU
-seed. That kills both halves, because the Load-side seed is chosen by asking whether a deferred window
-exists (`metal_draw/mod.rs`, the `PASS_LOAD_ACTION_LOAD && mapping_id == 0` arm), so a type-11 window
-would suppress the seed for free.
+So the actionable shape of the ~2 Hz problem is to **give the type-11 render Store a deferred rail**.
+This section used to say how: keep the composite on the registry resident with `skip_readback`, arm a
+flush-on-access window, and let the matching Load take `LoadOp::LoadFromTarget` instead of a CPU seed
+— "so a type-11 window would suppress the seed for free".
+
+**That was built, booted, and is refuted. Do not rebuild it.** The screen came up black with orange
+fragments, and one boot logged **2374** `chain_resident_land_fail` and **816** `deferred_flush_lost
+kind=render`, every one `reason=read_target_no_ready_content`, with `target_evicts` at 134-281/s and
+the cadence reader scoring "too few frames to read".
+
+The tree already said why, in a comment sitting on the exact line the change re-enables (the "Type-11
+Load used to have a GPU rail here" note in `metal_draw/vulkan.rs`): a type-11 `LoadFromTarget` has to
+resolve *which resident holds the frame the guest's compositor computes its damage against* — the
+presented front's own resident, this target's, or the guest pages. The guest ping-pongs its front
+buffer between mappings (that boot: mid 1 and mid 4, both 1920x1080), so a LOAD on one surface
+routinely wants the other's content. That resolve was ~170 lines of front-frame retention policy,
+deleted with the import rail, and making the resident authoritative silently requires it back. Nothing
+about it is free.
+
+Two facts that attempt established, and which still hold:
+
+- `engine::read_resident_bgra` returns `None` unless `slot.bgra`, and
+  `export_present_from_resident_fd_policy` refuses with `PresentExportResidentNotBgra` for the same
+  reason. A resident-authoritative type-11 rail therefore *needs* `req.output_bgra` — that is why it
+  is listed below as part of the fix, and it is a hard requirement rather than an optimization.
+- The mapping-keyed flush-trigger backbone described below is real and does work. It is what the
+  shipped rail is built on.
+
+**What shipped instead: defer the writeback, not the readback.** Keep the readback and `surface_cache`
+exactly as they were, and defer only `mapping_write::write_rgba8_image_changed` — the per-row
+RGBA→native conversion and the fragmented scatter into guest pages, ~8 MB of CPU work per Store at the
+28-111 Stores/s `store_routes` measures. The Load seed, the present capture and the chain
+intermediates are then untouched, which is precisely why the front-buffer problem above does not
+arise. The flush reads the frame back out of `surface_cache` and writes it with `write_bgra8`; no pin,
+no `content_ready` to hold across frames, no identity to resolve. That boot: screen correct, CLEAN,
+`chain_resident_land_fail` **0**, `deferred_flush_lost kind=render` **10**, `target_evicts` **0**, and
+`cpu_portability` gone from `store_routes`.
+
+Two ordering defects in that rail were found by re-reading the diff rather than from a boot, and both
+are worth knowing because they are the generic hazards of any deferred rail:
+
+- **Superseding must drop, not flush.** The arm originally flushed everything intersecting its own
+  guest range before arming. A compositor painting one surface re-Stores the *identical* range every
+  frame, so the previous window always intersects — landing it there performs exactly the write the
+  rail exists to skip, once per Store, and the rail becomes a rescheduling with extra steps. Use
+  `supersede_gva_window`'s rule: a window the new Store *fully covers* is dropped. Sound for the same
+  reason as on the GVA rail — those bytes were never observable without a flush, since any reader
+  would have taken the window first.
+- **Refresh the cache after the flush that reads it.** The flush sources its pixels from
+  `surface_cache`, so storing the new frame first makes an older window at a different geometry miss
+  the cache and report a loss for a window that was perfectly landable.
+
+The counter that separates those two worlds is `surface_flush` on the `store_routes` line: an arm
+count cannot tell "the writeback was skipped" from "the writeback happened a millisecond later", and
+`surface_flush / surface_deferred` is the ratio that can.
 
 Do not do this by restoring `VK_EXT_external_memory_host`. The deleted `import_present` rail had an
 "ack-fast deferred rung" that looks like the same idea, but what it needed the host pointer for was
@@ -556,11 +605,40 @@ mean "the import was tried and worked" — it means the arm is never entered and
 dmabuf handle at all. That is the "instrument the branch, not the arm" trap in its most flattering
 form: `fresh_imports=0` with a clean failure channel reads as health.
 
-Not yet established: **why** the frame carries no handle — nothing here has read what populates it,
-and the `handoff=` disagreement is a symptom whose direction is unknown. Note also that this is on
-the host-window present thread, not the drain worker, so `drain_duty`'s `publish_us` of 2-10 ms does
-**not** bound it and it is invisible to the duty measurement. Any claim that it does or does not cost
-frames needs its own measurement.
+**Why the frame carries no handle is now read, and it is not a capability gate.** The export decline
+is `fail_once`-latched, so it says this once per boot and then goes quiet:
+
+```
+OFF export_present_miss outcome=orphan want=surface geom=1920x1080 want_gen=1 surfaces=[1:1:1] gva=0 reg_len=1
+export_present reason=vk_engine_export_present_unknown_identity identity_kind=surface identity_id=2 …
+```
+
+The present path asks the registry for **mid 2**'s resident; the registry holds only **mid 1**. On x86
+the guest presents ClearOnly mids 2/3 while content renders into mids 1/4/5, so the mapping named by
+`CmdDisplaySwap` is not the mapping anything drew into. The chain is short and every link is a single
+line: `publish_window_frame` passes `p.frame_mapping`; `scanout.rs` sets `frame_mapping` to whatever
+`capture_present_frame` was handed; `drain` hands it the mapping the guest named; and
+`window_present_source` builds **one** candidate from it and nothing else. `outcome=orphan` is
+`classify_export_present_miss` stating exactly this — by its own definition it means "a resident
+exists at this geometry under a different key" — and `surfaces=[…]` is `id:generation:content_ready`.
+
+`state.present.early_front_mapping` already tracks the Composite peer for precisely this dual-mid
+shape. Its only readers are `early_scanout_target` and two diagnostic lines; **the export path never
+consults it.** The `WindowPresentSource` field is literally `candidates: Vec<…>` while
+`export_present_dmabuf` reads only `.first()?` — the plural was built for a multi-candidate resolve
+and has never carried more than one entry.
+
+**Do not just add `early_front_mapping` as a second candidate.** The CPU path that works today reads
+`surface_cache::get(state, frame_mapping, …)` — the ClearOnly mid's *own* cached bytes, which
+something did fill. Substituting the Composite mid's resident presents a different surface, and
+nothing has established the two hold the same pixels. The next step is a measurement: capture mid 2's
+cache and mid 1's resident at the same instant and compare. If they differ, this is the same
+front-frame retention policy question that the retracted type-11 `LoadFromTarget` design ran into
+above, and it deserves the same suspicion.
+
+Note also that this is on the host-window present thread, not the drain worker, so `drain_duty`'s
+`publish_us` of 2-10 ms does **not** bound it and it is invisible to the duty measurement. Any claim
+that it does or does not cost frames needs its own measurement.
 
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
@@ -571,7 +649,23 @@ snapshot/census function and check it has a caller.
 
 **Do not edit Rust while a multi-boot harness is running.** `boot-x86.sh` rebuilds QEMU every boot,
 so a tree edit lands in the middle of a run. One `stability-n.sh` run was scored `DISCARD` for exactly
-this. The numbers taken before the edit are still good; the verdict is not.
+this. The numbers taken before the edit are still good; the verdict is not. `interleave-ab.sh` is
+worse than that: it `git switch --detach`es per boot, so an edit mid-run either fails the checkout or
+is silently measured on the wrong arm. It also leaves the repo on a detached HEAD if it is killed
+outside its trap — check `git rev-parse --abbrev-ref HEAD` before believing a later `git status`.
+
+**`interleave-ab.sh` fed garbage arguments to every parameterized repro, silently.** Its
+`boot_and_measure` read `local arm="$1" ref="$2" round="$3"` and then forwarded `"$@"` — which still
+held all three, because `local x="$1"` reads a positional without consuming it. The repro therefore
+got `(out, arm, ref, round, …its own args)`, so `idle-then-damage.sh` read `IDLE="${2:-90}"` and got
+the literal string `"parent"`. Nothing errors: the run just produces no verdicts, which reads exactly
+like "the arms did not differ". Fixed with `shift 3`. **Any earlier interleaved run that passed repro
+arguments is suspect** — a run with no extra arguments was unaffected, because then `$@` was empty at
+the call site and the stray three were the only ones forwarded.
+
+That is the same shape as the `grep -c` and `qmp.sock` traps already recorded here: the rig failing
+quietly and its silence reading as a clean measurement. Before trusting a harness result, print the
+argv the repro actually received.
 
 **A watchdog on `hostfwd=tcp::2222` can answer for the previous boot.** The port is claimed by
 whichever QEMU holds it, so a multi-boot harness starts the watchdog while the last guest is still
