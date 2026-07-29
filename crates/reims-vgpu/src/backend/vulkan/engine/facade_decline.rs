@@ -87,15 +87,7 @@ impl Decline for EngineFacadeDecline {
     }
 }
 
-impl std::fmt::Display for EngineFacadeDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(EngineFacadeDecline);
 
 #[cfg(test)]
 mod tests {

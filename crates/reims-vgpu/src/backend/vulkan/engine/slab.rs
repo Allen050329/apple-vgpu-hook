@@ -838,16 +838,7 @@ impl crate::observe::Decline for SlabDecline {
     }
 }
 
-impl std::fmt::Display for SlabDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::observe::Decline as _;
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(SlabDecline);
 
 #[cfg(test)]
 mod tests {

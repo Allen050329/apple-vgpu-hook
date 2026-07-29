@@ -57,6 +57,34 @@ pub trait Decline {
     }
 }
 
+/// Give a [`Decline`] the `Display` every always-on line renders it through:
+/// `reason=<slug>` followed by [`Decline::fields`] as ` k=v` pairs.
+///
+/// Rust cannot express this as `impl<T: Decline> Display for T` — the blanket
+/// impl would claim `Display` for every foreign type — so each decline type
+/// needs its own impl, and fourteen of them were the same nine lines. Spelling
+/// it once means a change to the wire shape of a decline line lands in one
+/// place instead of fourteen, which is the same argument the `Decline` trait
+/// itself makes about slugs.
+///
+/// The `use` is inside the function body so the macro works whether or not the
+/// trait is already in scope where it is invoked.
+macro_rules! decline_display {
+    ($ty:ty) => {
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                use $crate::observe::Decline as _;
+                write!(f, "reason={}", self.slug())?;
+                for (key, value) in self.fields() {
+                    write!(f, " {key}={value}")?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+pub(crate) use decline_display;
+
 /// A status enum that mixes success with refusal.
 ///
 /// [`Decline`] is for a value that is *always* a refusal — a `DrawError`, a

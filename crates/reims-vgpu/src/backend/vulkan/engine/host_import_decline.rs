@@ -89,15 +89,7 @@ impl Decline for HostImportDecline {
     }
 }
 
-impl std::fmt::Display for HostImportDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(HostImportDecline);
 
 pub(super) fn validate_host_import_alignment(
     host_ptr: usize,

@@ -429,16 +429,7 @@ impl crate::observe::Decline for ComputeSpirvDecline {
     }
 }
 
-impl std::fmt::Display for ComputeSpirvDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::observe::Decline as _;
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(ComputeSpirvDecline);
 
 impl std::error::Error for ComputeSpirvDecline {}
 

@@ -243,15 +243,7 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
     }
 }
 
-impl std::fmt::Display for DrawExecutionDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(DrawExecutionDecline);
 
 #[cfg(test)]
 mod tests {

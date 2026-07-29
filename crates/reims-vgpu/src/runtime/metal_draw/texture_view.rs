@@ -149,15 +149,7 @@ impl Decline for TextureViewDecline {
     }
 }
 
-impl std::fmt::Display for TextureViewDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(TextureViewDecline);
 
 impl std::error::Error for TextureViewDecline {}
 
