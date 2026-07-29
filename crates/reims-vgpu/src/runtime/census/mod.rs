@@ -36,7 +36,6 @@
 //! | [`srgb_census`] | which rails drop the sRGB transfer function, and how often |
 //! | [`sampled_census`] | sampled-source resolution: which rail served a texture bind and which missed |
 //! | [`setup_tex_census`] | setup-phase texture staging, before the compositor converges |
-//! | [`sample_seed_relation`] | exact relations between a sampled texel and the seed row it came from |
 //! | [`sampled_gva_churn`] | how often a sampled guest-VA texture's backing moves |
 //! | [`ensure_surface_census`] | surface-ensure outcomes on the present path |
 //! | [`view_swizzle_census`] | type-8 view swizzle plans actually bound |
@@ -45,7 +44,6 @@
 
 pub mod ensure_surface_census;
 pub mod present_proxy;
-pub(crate) mod sample_seed_relation;
 pub mod sampled_census;
 pub mod sampled_gva_churn;
 pub mod setup_tex_census;

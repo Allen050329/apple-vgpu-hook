@@ -696,67 +696,7 @@ fn log_attachment_alias_chain(
     }
 }
 
-/// Sampled texture as CPU RGBA8 or a direct resident target.
-///
-/// Order (surface_id vs texture_ref namespaces are separate):
-/// 1. type-5 RefTexture → surface_id; type-11 mapping → mid → `host_surfaces`
-/// 2. type-2/3 linear: GVA encode cache → texture_ref cache (geom match) → guest GVA
-/// 3. fallback texture_ref encode cache (tests / missing list entry)
-///
-/// Always-on dig: where type-11/surface sample bytes came from.
-///
-/// `src` = `cache` | `guest` | `resident`. Product prefers non-empty guest/cache,
-/// then **resident GPU** when guest/cache RGB is empty (C_sample fix).
-fn log_sample_src(
-    texture_ref: u32,
-    mid: u32,
-    w: u32,
-    h: u32,
-    src: &str,
-    rgba: &[u8],
-    resident_ready: bool,
-) {
-    // Display-sized samples dominate the empty-boot class; skip tiny glyphs.
-    if w < 1280 || h < 720 {
-        return;
-    }
-    let (nz, max_rgb, px0) = crate::observe::rgba_rgb_stats(rgba);
-    crate::observe::fail(format!(
-        "sample_src={src} ref={texture_ref} mid={mid} {w}x{h} rgb_nz={nz} max_rgb={max_rgb} resident_ready={} px0=[{},{},{},{}]",
-        resident_ready as u8,
-        px0[0],
-        px0[1],
-        px0[2],
-        px0[3]
-    ));
-}
 
-/// Resolve a content-ready type-11 target without a CPU readback/reupload.
-///
-/// `id` is the resolved identity for the sampled mapping. The engine snapshots
-/// it when the draw also targets the same identity.
-#[cfg(feature = "backend-vulkan")]
-/// Bind a resident surface directly as the sampled source. The caller MUST have
-/// already confirmed `resident_content_ready(&id)` — this function does not
-/// re-acquire the global engine lock to re-check it (that second acquisition per
-/// resident bind was pure overhead on the hot sample-resolve path, and the check
-/// cannot close the eviction race anyway: the readiness the caller observed and
-/// the GPU bind are already separate lock acquisitions, so the engine must
-/// tolerate a since-evicted target at record time regardless).
-fn try_sample_resident_surface(
-    texture_ref: u32,
-    mid: u32,
-    w: u32,
-    h: u32,
-    id: crate::backend::vulkan::engine::TargetIdentity,
-) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    if w >= 1280 && h >= 720 {
-        crate::observe::line(format!(
-            "sample_src=resident_direct ref={texture_ref} mid={mid} {w}x{h} resident_ready=1"
-        ));
-    }
-    Some((w, h, mid, SampledSourceRequest::Target(id)))
-}
 
 /// A deferred GVA window may serve a sampled bind directly from its resident
 /// target only when the sampled view is the exact window content: descriptor
@@ -812,12 +752,6 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     };
     if !engine::resident_content_ready(&id) {
         return None;
-    }
-    if win.width >= 1280 && win.height >= 720 {
-        crate::observe::fail(format!(
-            "sample_src=gva_resident_direct ref={texture_ref} gva={gva:#x} {}x{} resident_ready=1",
-            win.width, win.height
-        ));
     }
     sampled_census::note(sampled_census::Branch::GvaResident, 0);
     Some((win.width, win.height, 0, SampledSourceRequest::Target(id)))
@@ -902,7 +836,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
     // repeat — the guest object list is immutable for the draw.
     if let Some(bt) = buffer_texture_descriptor(state, host, task_id, texture_ref, entry) {
         let (w, h, rgba) = load_buffer_texture_rgba(state, host, task_id, texture_ref, &bt)?;
-        log_sample_src(texture_ref, 0, w, h, "buftex_guest", &rgba, false);
         return Some((
             w,
             h,
@@ -995,7 +928,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     }
                     let (w, h, rgba, identity, byte_format) =
                         load_type5_view_rgba(state, host, task_id, texture_ref, mid, view)?;
-                    log_sample_src(texture_ref, mid, w, h, "type5_view_guest", &rgba, false);
                     return Some((
                         w,
                         h,
@@ -1038,14 +970,12 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // Bind it directly before touching full-frame CPU mirrors.
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
-                    if let Some(v) =
-                        try_sample_resident_surface(texture_ref, mid, w, h, resident_id)
                     {
                         crate::runtime::census::setup_tex_census::note_bind(
                             t_bind.elapsed().as_micros() as u64,
                         );
                         sampled_census::note(sampled_census::Branch::Resident, 0);
-                        return Some(v);
+                        return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
                     }
                 }
                 crate::runtime::census::setup_tex_census::note_bind(
@@ -1057,7 +987,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     let rgba = swap_rb_channels(bgra);
                     let (nz, _, _) = crate::observe::rgba_rgb_stats(&rgba);
                     if nz > 0 || !resident_ready {
-                        log_sample_src(texture_ref, mid, w, h, "cache", &rgba, resident_ready);
                         sampled_census::note(sampled_census::Branch::T11Cache, rgba.len());
                         return Some((
                             w,
@@ -1116,14 +1045,13 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     }
                 }
                 // This path is reached only with `resident_ready == false` (a
-                // ready resident returns above via `try_sample_resident_surface`),
+                // ready resident binds its target and returns above),
                 // so the guest bytes are taken unconditionally — the historical
                 // `nz > 0 || !resident_ready` promotion gate is always true here.
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
-                    log_sample_src(texture_ref, mid, w, h, "guest_memo", &rgba, resident_ready);
                     t11_decline::note(t11_zc_decline, rgba.len());
                     return Some((
                         w,
@@ -1133,23 +1061,18 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     ));
                 }
 
-                if w >= 1280 && h >= 720 {
-                    crate::observe::fail(format!(
-                        "sample_src=miss ref={texture_ref} mid={mid} {w}x{h} resident_ready={} (no guest/cache/resident bytes)",
-                        resident_ready as u8
-                    ));
-                } else if (w as u64) * (h as u64) >= 250_000 {
-                    // App-window-sized surfaces (e.g. a 1240x702 browser content
-                    // layer) sit under the full-screen gate above; a persistent
-                    // miss there paints the window blank with zero log. Latch
-                    // per (mid, geom) so a steady repeat stays at one line.
+                {
+                    // A sample that resolved to no bytes anywhere is a lost
+                    // guest command at any geometry: an app-window layer paints
+                    // blank exactly as a full-screen one does. Latched per
+                    // (mid, geometry) so a steady repeat stays at one line.
                     use std::collections::HashSet;
                     use std::sync::Mutex;
                     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
-                    let mut guard = SEEN.lock().unwrap();
+                    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.get_or_insert_with(HashSet::new).insert((mid, w, h)) {
                         crate::observe::fail(format!(
-                            "sample_src=miss ref={texture_ref} mid={mid} {w}x{h} resident_ready={} latched=1 (no guest/cache/resident bytes)",
+                            "sample_src=miss ref={texture_ref} mid={mid} {w}x{h} resident_ready={} (no guest/cache/resident bytes)",
                             resident_ready as u8
                         ));
                     }
@@ -2750,12 +2673,10 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     let Some((rgba, byte_format)) =
         load_linear_texture_native_host(state, host, task_id, texture_ref, 0, None)
     else {
-        if w >= 1280 && h >= 720 {
-            crate::observe::fail(format!(
-                "linear_sample_miss reason=guest_load task={task_id} ref={texture_ref} type={} gva={gva:#x} fmt={:#x} {w}x{h} bpr={}",
-                entry.object_type, tex.pixel_format, layout.row_stride
-            ));
-        }
+        crate::observe::fail(format!(
+            "linear_sample_miss reason=guest_load task={task_id} ref={texture_ref} type={} gva={gva:#x} fmt={:#x} {w}x{h} bpr={}",
+            entry.object_type, tex.pixel_format, layout.row_stride
+        ));
         return None;
     };
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
@@ -2795,15 +2716,13 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         };
         return Some((w, h, arc, None, byte_format));
     }
-    if w >= 1280 && h >= 720 {
-        crate::observe::fail(format!(
-            "linear_sample_miss reason=short_rgba task={task_id} ref={texture_ref} type={} gva={gva:#x} fmt={:#x} {w}x{h} bpr={} got={} need={need}",
-            entry.object_type,
-            tex.pixel_format,
-            layout.row_stride,
-            rgba.len()
-        ));
-    }
+    crate::observe::fail(format!(
+        "linear_sample_miss reason=short_rgba task={task_id} ref={texture_ref} type={} gva={gva:#x} fmt={:#x} {w}x{h} bpr={} got={} need={need}",
+        entry.object_type,
+        tex.pixel_format,
+        layout.row_stride,
+        rgba.len()
+    ));
     None
 }
 
@@ -2901,14 +2820,6 @@ fn log_linear_sample_src(
             ));
         }
     }
-    if width < 1280 || height < 720 {
-        return;
-    }
-    let (rgb_nz, max_rgb, px0) = crate::observe::rgba_rgb_stats(rgba);
-    crate::observe::off(format!(
-        "linear_sample src={source} task={task_id} ref={texture_ref} type={object_type} gva={gva:#x} fmt={pixel_format:#x} {width}x{height} bpr={row_stride} host_gen={host_gen} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-        px0[0], px0[1], px0[2], px0[3]
-    ));
 }
 
 /// Measurement-only comparison between a retained GVA encode and the bytes
@@ -4090,21 +4001,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
         let mut display_sample_mids: std::collections::BTreeSet<u32> = Default::default();
-        let mut linear_sample_rows: Vec<sample_seed_relation::SampleRow> = Vec::new();
-        // Measure multi-bind compositor: which refs load and with what occupancy.
-        let mut tex_bind_diag: Vec<String> = Vec::new();
-        // Per-bind rgb stats are computed once in the bind loop; the diag
-        // censuses below reuse these accumulators instead of re-scanning the
-        // (large, Arc-shared) sampled bytes a second and third time per draw.
-        let mut bound_tex_rgb: usize = 0;
-        // Only the vulkan cfg has resident Target binds; stays false elsewhere.
-        #[allow(unused_mut)]
-        let mut bound_any_resident_sample = false;
-        let mut bound_all_bytes_rgb_empty = true;
-        // Type-2/3 linear sample resolved to zero RGB (guest-zero wallpaper).
-        // Drives Load keep-seed when multi-bind also binds non-empty layers
-        // (serial-224146 pipe=60 sky wipe).
-        let mut had_empty_type3_linear = false;
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -4129,21 +4025,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let view_swizzle = resolve_texture_view(state, host, req.task_id, texture_ref)
                     .and_then(|view| view.swizzle)
                     .filter(|plan| !pixel_format::swizzle_is_identity(plan));
-                let is_linear_texture = texture_entry
-                    .as_ref()
-                    .map(|entry| {
-                        entry.object_type == OBJECT_TYPE_TEXTURE
-                            || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
-                    })
-                    .unwrap_or(false);
-                let linear_identity = texture_entry.as_ref().and_then(|entry| {
-                    if !is_linear_texture {
-                        return None;
-                    }
-                    let desc = objects::read_descriptor(state, host, req.task_id, entry)?;
-                    let texture = decode_texture_descriptor(&desc).ok()?;
-                    Some((entry.object_type, texture.pixel_format))
-                });
                 let attachment_alias = frag_stage
                     .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
                     .flatten();
@@ -4256,78 +4137,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     SampledSourceRequest::Bytes(rgba, identity, byte_format) => {
                         bytes_identity = identity;
                         sampled_format = byte_format;
-                        // The nz-RGB / alpha-zero empty-layer diagnostics only test
-                        // presence/absence of colour, which is channel-order-
-                        // independent, so they stay valid for a native BGRA8 upload
-                        // (B,G,R is the same nonzero set as R,G,B; alpha is last in
-                        // both). Run them for either 4-byte layout — losing the
-                        // wallpaper/empty-clear proxy on BGRA8 binds would blind the
-                        // "background doesn't clear" class. Only the seed-relation
-                        // center-row capture below is order-sensitive (RGBA8 only).
-                        if matches!(byte_format, TexelLayout::Rgba8 | TexelLayout::Bgra8) {
-                            // Fused single pass: `tnz` is load-bearing (bound_tex_rgb,
-                            // wallpaper/empty-type3 classification below) and always
-                            // computed; the alpha-zero count (opaque-black empty a0=0 vs
-                            // transparent empty a0≈w*h, for Load+premult wipe diagnosis)
-                            // folds into the same scan instead of a second O(w*h) pass.
-                            let (tnz, tmax, a0) = crate::observe::rgba_rgb_a0_stats(&rgba);
-                            bound_tex_rgb += tnz;
-                            if tnz != 0 {
-                                bound_all_bytes_rgb_empty = false;
-                            }
-                            tex_bind_diag.push(format!(
-                                "i{index}:r{texture_ref}:{tw}x{th}:nz={tnz}:max={tmax}:a0={a0}"
-                            ));
-                            // Wallpaper class: display-sized CPU sample resolved but zero RGB.
-                            if tw >= 1280 && th >= 720 && tnz == 0 {
-                                let detail =
-                                    sample_miss_detail(state, host, req.task_id, texture_ref);
-                                let gva_probe =
-                                    empty_layer_gva_probe(state, host, req.task_id, texture_ref);
-                                crate::observe::off(format!(
-                                "m2v_empty_layer pipe={} i={index} ref={texture_ref} {tw}x{th} {detail} {gva_probe}",
-                                req.pipeline_ref
-                            ));
-                                #[cfg(test)]
-                                let _proxy_shared =
-                                    crate::runtime::census::present_proxy::test_shared();
-                                crate::runtime::census::present_proxy::note_empty_sample_if(
-                                    texture_ref,
-                                    tw,
-                                    th,
-                                    &rgba,
-                                    if frag_stage { "frag_bind" } else { "vert_bind" },
-                                );
-                            }
-                            if tnz == 0 {
-                                if let Some(entry) = texture_entry.as_ref() {
-                                    if entry.object_type == OBJECT_TYPE_TEXTURE
-                                        || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
-                                    {
-                                        had_empty_type3_linear = true;
-                                    }
-                                }
-                            }
-                            if byte_format == TexelLayout::Rgba8 && tw == w && th == h {
-                                if let (Some((object_type, pixel_format)), Some(row)) = (
-                                    linear_identity,
-                                    sample_seed_relation::center_row(&rgba, tw, th),
-                                ) {
-                                    linear_sample_rows.push(sample_seed_relation::SampleRow {
-                                        index,
-                                        texture_ref,
-                                        object_type,
-                                        pixel_format,
-                                        frag_stage,
-                                        rgba: row.to_vec(),
-                                    });
-                                }
-                            }
-                        } else {
-                            tex_bind_diag.push(format!(
-                                "i{index}:r{texture_ref}:{tw}x{th}:native={byte_format:?}"
-                            ));
-                        }
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
                     #[cfg(feature = "backend-vulkan")]
@@ -4345,18 +4154,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             );
                             return Ok(());
                         }
-                        bound_any_resident_sample = true;
-                        tex_bind_diag.push(format!(
-                            "i{index}:r{texture_ref}:mid{sampled_mid}:{tw}x{th}:resident_direct"
-                        ));
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
                     #[cfg(feature = "backend-vulkan")]
                     SampledSourceRequest::GuestRuns(src, native) => {
                         sampled_format = native;
-                        tex_bind_diag.push(format!(
-                            "i{index}:r{texture_ref}:mid{sampled_mid}:{tw}x{th}:zero_copy"
-                        ));
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src)
                     }
                 };
@@ -4455,19 +4257,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 push_tex(t.index, t.texture_ref, true)?;
             }
         }
-        // Log all multi-bind and display-sized single-tex binds (pipe-26 chrome
-        // wipe class is img=1 — previously only n>=4 logged).
-        if !tex_bind_diag.is_empty()
-            && (images.len() >= 4 || req.fragment_textures.len() >= 4 || w >= 1280)
-        {
-            crate::observe::line(format!(
-                "m2v_tex_binds pipe={} n_img={} n_req={} [{}]",
-                req.pipeline_ref,
-                images.len(),
-                req.fragment_textures.len(),
-                tex_bind_diag.join(",")
-            ));
-        }
         {
             let mut push_smp =
                 |index: u32, sampler_ref: u32, frag_stage: bool| -> Result<(), DrawError> {
@@ -4563,7 +4352,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let t_tex_done = std::time::Instant::now();
         // Color load seed: CLEAR → solid; LOAD → guest/host seed when present.
         let mut target_rgba8: Option<Vec<u8>> = None;
-        let mut seed_src = "none";
         #[cfg(feature = "backend-vulkan")]
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
@@ -4576,7 +4364,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             if let Some(identity) = render_chain_identity(state, req) {
                 if crate::backend::vulkan::engine::resident_content_ready(&identity) {
                     chain_load_from_target = true;
-                    seed_src = "chain_resident";
                 } else {
                     // The armed chain lost its resident (engine reset /
                     // registry eviction). Seeding from stale guest/cache
@@ -4625,7 +4412,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         && crate::backend::vulkan::engine::resident_content_ready(&identity)
                     {
                         chain_load_from_target = true;
-                        seed_src = "gva_deferred_resident";
                     } else {
                         crate::runtime::storage_flush::flush_gva_exact(
                             state,
@@ -4646,7 +4432,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
                 x if x == PASS_LOAD_ACTION_CLEAR => {
                     target_rgba8 = Some(solid_rgba_local(w, h, &c0.clear_color));
-                    seed_src = "clear";
                 }
                 x if x == PASS_LOAD_ACTION_LOAD => {
                     if let Some(seed) = c0.target_seed_rgba.as_ref() {
@@ -4654,21 +4439,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
                             target_rgba8 = Some(seed.clone());
-                            seed_src = "color_seed";
                         }
                     } else if let Some(seed) = req.target_seed_rgba.as_ref() {
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             target_rgba8 = Some(seed.clone());
-                            seed_src = "req_seed";
                         }
                     } else if c0.mapping_id != 0 {
                         if let Some(bgra) =
                             crate::runtime::surface_cache::get(state, c0.mapping_id, w, h)
                         {
                             target_rgba8 = Some(swap_rb_channels(bgra));
-                            seed_src = "host_cache";
-                        } else {
-                            seed_src = "host_cache_miss";
                         }
                     } else if c0.texture_ref != 0 {
                         // GVA type-2/3 Load: texture_ref encode cache (separate
@@ -4685,33 +4465,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 px.swap(0, 2);
                             }
                             target_rgba8 = Some(rgba);
-                            seed_src = "host_cache_gva";
                         } else if let Some(bgra) =
                             crate::runtime::surface_cache::get_texture(state, c0.texture_ref, w, h)
                         {
                             target_rgba8 = Some(swap_rb_channels(bgra));
-                            seed_src = "host_cache_tex";
-                        } else {
-                            seed_src = "host_cache_tex_miss";
                         }
-                    }
-                    if w >= 1280 && h >= 720 && crate::observe::draw_log_enabled() {
-                        let (snz, smax, spx) = target_rgba8
-                            .as_ref()
-                            .map(|s| crate::observe::rgba_rgb_stats(s))
-                            .unwrap_or((0, 0, [0, 0, 0, 0]));
-                        crate::observe::line(format!(
-                            "m2v_load_seed mid={} {}x{} pipe={} tex_ref={} src={seed_src} rgb_nz={snz} max_rgb={smax} px0=[{},{},{},{}]",
-                            c0.mapping_id,
-                            w,
-                            h,
-                            req.pipeline_ref,
-                            c0.texture_ref,
-                            spx[0],
-                            spx[1],
-                            spx[2],
-                            spx[3]
-                        ));
                     }
                 }
                 _ => {}
@@ -4981,20 +4739,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         {
                             resources.seed_from_target = Some(front_identity);
                             gpu_boundary_seed = true;
-                            seed_src = "front_frame_resident_gpu";
-                            if w >= 1280 && h >= 720 {
-                                // The GPU boundary seed was armed: the success
-                                // path, taken on essentially every compositor
-                                // draw. Every sibling seed line is verbose; this
-                                // one alone reached the always-on sink.
-                                crate::observe::line(format!(
-                                    "m2v_load_seed mid={import_mid} {w}x{h} pipe={} tex_ref={} src={seed_src} front_mid={} front_gen={}",
-                                    req.pipeline_ref,
-                                    req.colors.first().map(|c| c.texture_ref).unwrap_or(0),
-                                    state.present.frame_mapping,
-                                    state.present.frame_generation
-                                ));
-                            }
                         }
                     }
                     let front = if presented_since_last_draw && !gpu_boundary_seed {
@@ -5009,47 +4753,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // double-seed class (190 dropped boundary draws /
                         // black desktop on boot 20260717-031554).
                     } else if let Some(rgba) = front {
-                        // The full-frame stats scan exists only for the
-                        // verbose line — never pay it on a normal boot.
-                        let verbose = crate::observe::draw_log_enabled();
-                        let (snz, smax, _) = if verbose {
-                            crate::observe::rgba_rgb_stats(&rgba)
-                        } else {
-                            (0, 0, [0, 0, 0, 0])
-                        };
                         resources.target_rgba8 = Some(rgba);
-                        seed_src = "front_frame_present_boundary";
-                        if verbose && w >= 1280 && h >= 720 {
-                            crate::observe::line(format!(
-                                "m2v_load_seed mid={import_mid} {w}x{h} pipe={} tex_ref={} src={seed_src} rgb_nz={snz} max_rgb={smax} front_mid={} front_gen={}",
-                                req.pipeline_ref,
-                                req.colors.first().map(|c| c.texture_ref).unwrap_or(0),
-                                state.present.frame_mapping,
-                                state.present.frame_generation
-                            ));
-                        }
                     } else if let Some(rgba) =
                         load_type11_rgba_static(state, host, import_mid, None)
                     {
-                        let verbose = crate::observe::draw_log_enabled();
-                        let (snz, smax, _) = if verbose {
-                            crate::observe::rgba_rgb_stats(&rgba)
-                        } else {
-                            (0, 0, [0, 0, 0, 0])
-                        };
                         resources.target_rgba8 = Some(rgba);
-                        seed_src = if presented_since_last_draw {
-                            "guest_pages_present_boundary"
-                        } else {
-                            "guest_pages"
-                        };
-                        if verbose && w >= 1280 && h >= 720 {
-                            crate::observe::line(format!(
-                                "m2v_load_seed mid={import_mid} {w}x{h} pipe={} tex_ref={} src={seed_src} rgb_nz={snz} max_rgb={smax}",
-                                req.pipeline_ref,
-                                req.colors.first().map(|c| c.texture_ref).unwrap_or(0)
-                            ));
-                        }
                     } else if presented_since_last_draw {
                         crate::observe::fail(format!(
                             "m2v_load_seed mid={import_mid} {w}x{h} pipe={} reason=present_boundary_pages_unreadable fallback=resident ready={}",
@@ -5105,14 +4813,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // dropping it keeps counters/seed_uploads honest.
                         resources.target_rgba8 = None;
                         resources.seed_from_target = None;
-                        if w >= 1280 && h >= 720 {
-                            crate::observe::line(format!(
-                                "m2v_load_seed mid={import_mid} {w}x{h} pipe={} tex_ref={} src=resident_load ready=1 self_front={}",
-                                req.pipeline_ref,
-                                req.colors.first().map(|c| c.texture_ref).unwrap_or(0),
-                                self_front_ready as u8
-                            ));
-                        }
                     }
                     Type11LoadChoice::UseCpuSeed => {
                         // target_rgba8 already set from host cache, clear, or
@@ -5123,57 +4823,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         resources.target_rgba8 = None;
                         resources.seed_from_target = None;
                     }
-                }
-            }
-        }
-        if load_action == Some(PASS_LOAD_ACTION_LOAD) && import_mid != 0 {
-            if let Some(seed) = resources.target_rgba8.as_deref() {
-                if let Some(seed_row) = sample_seed_relation::center_row(seed, w, h) {
-                    sample_seed_relation::log_exact_relations(
-                        req.pipeline_ref,
-                        import_mid,
-                        req.colors.first().map(|c| c.format).unwrap_or(0),
-                        w,
-                        h,
-                        seed_src,
-                        &linear_sample_rows,
-                        seed_row,
-                    );
-                }
-                log_black_load_seed_preserved(
-                    req.task_id,
-                    req.colors.first().map(|c| c.texture_ref).unwrap_or(0),
-                    import_mid,
-                    req.colors.first().map(|c| c.target_gva).unwrap_or(0),
-                    w,
-                    h,
-                    seed_src,
-                    seed,
-                );
-            } else if matches!(
-                resources.load_op,
-                Some(crate::backend::vulkan::engine::LoadOp::LoadFromTarget)
-            ) && !linear_sample_rows.is_empty()
-            {
-                let target_format = req.colors.first().map(|c| c.format).unwrap_or(0);
-                if let Some(seed_row) = sample_seed_relation::load_type11_center_row_rgba(
-                    state,
-                    host,
-                    import_mid,
-                    w,
-                    h,
-                    target_format,
-                ) {
-                    sample_seed_relation::log_exact_relations(
-                        req.pipeline_ref,
-                        import_mid,
-                        target_format,
-                        w,
-                        h,
-                        "resident_guest_mirror",
-                        &linear_sample_rows,
-                        &seed_row,
-                    );
                 }
             }
         }
@@ -5196,18 +4845,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ) {
                 Ok(b) => {
                     resources.blend = Some(b);
-                    if w >= 1280 && h >= 720 {
-                        crate::observe::line(format!(
-                            "m2v_blend pipe={} src_rgb={} dst_rgb={} op_rgb={} src_a={} dst_a={} op_a={}",
-                            req.pipeline_ref,
-                            pd.color0.src_rgb,
-                            pd.color0.dst_rgb,
-                            pd.color0.op_rgb,
-                            pd.color0.src_alpha,
-                            pd.color0.dst_alpha,
-                            pd.color0.op_alpha
-                        ));
-                    }
                 }
                 Err(e) => {
                     crate::observe::fail(format!(
@@ -5443,7 +5080,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Sum of per-bind rgb_nz over Bytes sources, accumulated in the bind
         // loop (resident Target binds contribute no CPU bytes, as before).
         if census_verbose || fixed_gap_first {
-            let tex_rgb: usize = bound_tex_rgb;
+            let tex_rgb: usize = 0;
             let idx_count = resources
                 .indexed
                 .as_ref()
@@ -5780,28 +5417,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         } else {
             0
         };
-        // Bind-loop accumulators: a resident Target bind counts as non-empty
-        // (its bytes live on the GPU), exactly as the retired per-image
-        // re-scan treated `SampledSource::Target`.
-        let samples_all_rgb_empty = !resources.sampled_images.is_empty()
-            && !bound_any_resident_sample
-            && bound_all_bytes_rgb_empty;
-        let empty_sample_keep = should_keep_seed_on_empty_draw(
-            max_rgb,
-            seed_rgb,
-            resources.sampled_images.len(),
-            samples_all_rgb_empty,
-            had_empty_type3_linear,
-        );
-        if empty_sample_keep {
-            crate::observe::fail(format!(
-                "linux_m2v_composite_fire keep_seed_empty_sample=1 pipe={} seed_rgb={} n_img={} type3_empty={} (retired; measure-only)",
-                req.pipeline_ref,
-                seed_rgb,
-                resources.sampled_images.len(),
-                had_empty_type3_linear as u8
-            ));
-        }
         if _premult_load {
             crate::observe::fail(format!(
                 "linux_m2v_composite_fire premult_hw=1 pipe={} seed_rgb={} draw_rgb={} a0={} (GPU Load+blend; no software premult)",

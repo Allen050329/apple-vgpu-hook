@@ -1033,34 +1033,6 @@ fn deferred_gva_sample_eligibility_rules() {
     );
 }
 
-#[test]
-fn display_linear_sample_proxy_is_fail_visible() {
-    let task_id = std::process::id();
-    let marker = format!(
-            "OFF linear_sample src=gva_cache task={task_id} ref=77 type=2 gva=0x12345000 fmt=0x50 1280x720 bpr=5120 host_gen=9 rgb_nz=1 max_rgb=31"
-        );
-    let mut rgba = vec![0u8; 1280 * 720 * 4];
-    rgba[..4].copy_from_slice(&[31, 17, 9, 255]);
-    log_linear_sample_src(
-        task_id,
-        77,
-        2,
-        0x1234_5000,
-        MTL_FORMAT_BGRA8_UNORM,
-        5120,
-        1280,
-        720,
-        "gva_cache",
-        9,
-        &rgba,
-    );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "linear sample provenance proxy must be always-on"
-    );
-}
 
 #[test]
 fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
@@ -1881,31 +1853,6 @@ fn load_composite_full_covered_black_no_seed() {
     assert_eq!(&out[..], &draw[..]);
 }
 
-/// serial-224146 pipe=60: sky Load seed + empty type-3 layer among mixed
-/// binds → opaque black draw must keep seed (not load_wipe sky).
-#[test]
-fn keep_seed_when_empty_type3_linear_among_mixed_binds() {
-    assert!(
-        should_keep_seed_on_empty_draw(0, 2_073_600, 13, false, true),
-        "empty type-3 linear + empty draw keeps sky seed"
-    );
-    assert!(
-        should_keep_seed_on_empty_draw(0, 50_000, 1, true, false),
-        "all samples RGB-empty still keeps"
-    );
-    assert!(
-        !should_keep_seed_on_empty_draw(0, 2_073_600, 13, false, false),
-        "mixed non-empty samples without empty type-3 do not keep"
-    );
-    assert!(
-        !should_keep_seed_on_empty_draw(185, 2_073_600, 13, false, true),
-        "non-empty draw RGB does not keep (real coverage)"
-    );
-    assert!(
-        !should_keep_seed_on_empty_draw(0, 0, 13, false, true),
-        "no Load seed → nothing to keep"
-    );
-}
 
 /// Premult One/OneMinusSrcAlpha Load: transparent draw keeps seed; opaque black wins.
 #[test]

@@ -14,7 +14,6 @@ use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, R
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 use crate::observe::Decline;
-use crate::runtime::census::sample_seed_relation;
 use crate::runtime::census::sampled_census;
 use crate::runtime::census::srgb_census;
 use crate::runtime::census::t11_decline;
@@ -2389,24 +2388,6 @@ pub(crate) fn load_composite_alpha0_holes(draw_rgba: &[u8], seed_rgba: &[u8]) ->
     (composed, filled)
 }
 
-/// Keep Load attachment seed when the fragment RGB is empty and sample state
-/// says the draw could not have authored real coverage.
-///
-/// - `samples_all_rgb_empty`: every bound sample is RGB-zero (serial-212329).
-/// - `had_empty_type3_linear`: at least one type-2/3 linear sample resolved to
-///   zero RGB (guest-zero wallpaper layer). Live serial-224146 pipe=60: i0 full
-///   sky + i3 type-3 empty → multi-bind frag wrote opaque black and
-///   `load_wipe` destroyed `seed_rgb=2073600` because not *all* samples were
-///   empty. Object-type + sample emptiness is bind state, not present rgb_nz.
-pub(crate) fn should_keep_seed_on_empty_draw(
-    max_rgb: u8,
-    seed_rgb: usize,
-    n_img: usize,
-    samples_all_rgb_empty: bool,
-    had_empty_type3_linear: bool,
-) -> bool {
-    max_rgb == 0 && seed_rgb > 0 && n_img > 0 && (samples_all_rgb_empty || had_empty_type3_linear)
-}
 
 /// How Linux/Vulkan should honor a type-11 color attachment Load.
 ///
@@ -2874,67 +2855,6 @@ fn default_sampler(binding: u32) -> crate::backend::metal::abi::ReimsVgpuSampler
     }
 }
 
-/// Probe type-2/3 empty display layers: GVA = handle<<page_shift + level0.offset,
-/// then whether a first-page GVA read is mapped and RGB-empty.
-///
-/// Distinguishes "guest never wrote wallpaper" (mapped zeros) from
-/// "MapMemory2/PT gap" (Unmapped) for the multi-bind i3 wallpaper class.
-#[cfg(feature = "backend-vulkan")]
-fn empty_layer_gva_probe<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    texture_ref: u32,
-) -> String {
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
-        return "gva_probe=no_entry".into();
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return format!("gva_probe=not_linear type={}", entry.object_type);
-    }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return "gva_probe=no_desc".into();
-    };
-    let Ok(tex) = decode_texture_descriptor(&desc_bytes) else {
-        return "gva_probe=desc_decode".into();
-    };
-    let Some((gva, layout)) = tex.level_gva(0, state.page_shift) else {
-        return format!(
-            "gva_probe=no_level0 handle={:#x} shift={} data_off={}",
-            tex.handle, state.page_shift, tex.data_offset
-        );
-    };
-    let mut page = [0u8; 64];
-    match gva_mem::read_task_gva_by_id(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        &mut page,
-        state.page_shift,
-    ) {
-        Ok(()) => {
-            let (rgb_nz, max_rgb, px0) = crate::observe::rgba_rgb_stats(&page);
-            // rgba_rgb_stats expects RGBA; raw GVA is BGRA for fmt 0x50 — still
-            // RGB occupancy is order-invariant for nz/max of first three channels.
-            format!(
-                "gva_probe=mapped gva={gva:#x} bpr={} {}x{} page64_rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-                layout.row_stride,
-                layout.width,
-                layout.height,
-                px0[0],
-                px0[1],
-                px0[2],
-                px0[3]
-            )
-        }
-        Err(_) => format!(
-            "gva_probe=unmapped gva={gva:#x} handle={:#x} shift={} bpr={}",
-            tex.handle, state.page_shift, layout.row_stride
-        ),
-    }
-}
 
 /// Fail-visible diagnosis when a bound sample ref does not materialize.
 ///

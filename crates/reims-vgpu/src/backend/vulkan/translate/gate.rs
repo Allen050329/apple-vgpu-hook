@@ -208,6 +208,34 @@ fn is_wire_value_arm(line: &str) -> bool {
         })
 }
 
+/// Each wire-value arm in `body`, paired with the arm's own body.
+///
+/// The arm body runs from the arm line to the next line indented no deeper than
+/// the arm itself, which is where the arm's block closes. That bound is what
+/// makes "this arm produces the enum" answerable: a translation writes the
+/// engine variant inside the arm that decoded the wire value, so the enum and
+/// the arm are the same statement rather than the same function.
+#[cfg(test)]
+fn arm_bodies(body: &str) -> Vec<(&str, String)> {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !is_wire_value_arm(line) {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let end = lines[i + 1..]
+            .iter()
+            .position(|l| {
+                !l.trim().is_empty() && (l.len() - l.trim_start().len()) <= indent
+            })
+            .map(|p| i + 1 + p)
+            .unwrap_or(lines.len() - 1);
+        out.push((line.trim(), lines[i..=end].join("\n")));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,10 +394,20 @@ mod tests {
                 let Some(named) = ENGINE_STATE_ENUMS.iter().find(|e| names_word(&code, e)) else {
                     continue;
                 };
-                let arms: Vec<&str> = body
-                    .lines()
-                    .filter(|l| is_wire_value_arm(l))
-                    .map(str::trim)
+                // The enum must be produced BY a wire-value arm, not merely
+                // mentioned somewhere in the same item. A hand-rolled Metal→
+                // Vulkan state translation names the engine enum inside the arm
+                // that decodes the wire value — that is the shape this gate is
+                // for. Pairing any mention with any arm across a whole item is
+                // unsound once an item is large: `try_metal2vulkan_draw` matches
+                // pass load actions at one end and passes `CullMode::None` as the
+                // documented fallback to `translate::raster::cull_mode` at the
+                // other, which is precisely the routing the gate wants, and the
+                // loose pairing reported it as a violation.
+                let arms: Vec<&str> = arm_bodies(&body)
+                    .into_iter()
+                    .filter(|(_, arm_body)| names_word(arm_body, named))
+                    .map(|(arm, _)| arm)
                     .collect();
                 if !arms.is_empty() {
                     offenders.push(format!(
@@ -447,6 +485,57 @@ mod tests {
         assert!(!is_wire_value_arm("        other => return Err(reason),"));
         assert!(!is_wire_value_arm("        // 3 => Replace, per the SDK"));
         assert!(!is_wire_value_arm("        let x = 3;"));
+    }
+
+    /// The arm-scoped pairing, which is what separates a hand-rolled
+    /// translation from a large function that happens to mention an engine enum
+    /// somewhere else entirely.
+    ///
+    /// The loose "same item" pairing this replaced reported
+    /// `try_metal2vulkan_draw` as an offender: it matches pass load actions in
+    /// one statement and passes `CullMode::None` as the documented fallback to
+    /// `translate::raster::cull_mode` in another, ~700 lines apart. That is the
+    /// routing the gate exists to require, scored as a violation of it.
+    #[test]
+    fn an_arm_must_itself_produce_the_engine_enum() {
+        // A real duplicate: the arm decodes the wire value and names the enum.
+        let offender = "\
+fn hand_rolled(x: u32) -> CullMode {
+    match x {
+        1 => CullMode::Front,
+        _ => CullMode::None,
+    }
+}";
+        let paired: Vec<&str> = arm_bodies(offender)
+            .into_iter()
+            .filter(|(_, b)| names_word(b, "CullMode"))
+            .map(|(a, _)| a)
+            .collect();
+        assert_eq!(paired, vec!["1 => CullMode::Front,"]);
+
+        // Incidental co-location: the wire arm decodes something unrelated and
+        // the enum is produced by a `translate::` call far away.
+        let innocent = "\
+fn big(load_action: u16, req: &Req) -> R {
+    match load_action {
+        x if x == PASS_LOAD_ACTION_CLEAR => {
+            seed = clear(req);
+        }
+        _ => {}
+    }
+    R {
+        cull_mode: raster_or_default(req.cull, translate::raster::cull_mode, CullMode::None),
+    }
+}";
+        assert!(
+            arm_bodies(innocent)
+                .into_iter()
+                .all(|(_, b)| !names_word(&b, "CullMode")),
+            "an arm that does not produce the enum must not pair with it"
+        );
+        // The arm is still recognised as a raw wire-value arm; only the pairing
+        // changed, so the gate has not stopped seeing this shape.
+        assert_eq!(arm_bodies(innocent).len(), 1);
     }
 
     /// The word-boundary rule, which is the difference between this gate
