@@ -2471,9 +2471,9 @@ fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
 /// present's seq against the previous present's — while "never written" is a
 /// *state*, and `forget_compositor_mapping` prunes both witnesses on teardown so
 /// a re-created surface arrives with neither. Measured on a live boot: the guest
-/// idled, slept its display, re-created its scanout surfaces and presented mid 6
-/// at `gen=0` with `px0=[0,0,0,0]`; the screen stayed black for 18.9 s and
-/// `present_unbacked` fired **zero** times for the whole boot.
+/// re-created its scanout surfaces and presented mid 6 at `gen=0` with
+/// `px0=[0,0,0,0]`, and `present_unbacked` fired **zero** times for the whole
+/// boot. The guest was awake throughout — see `note_present_backing`.
 #[test]
 fn present_backing_gate_reports_a_surface_nothing_ever_stored() {
     let w = 1920u32;

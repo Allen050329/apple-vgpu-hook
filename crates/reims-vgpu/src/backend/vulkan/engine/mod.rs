@@ -16,6 +16,7 @@ mod desc_arena;
 mod device_lost;
 mod digest;
 mod draw_execution;
+mod draw_phase;
 mod draw_preparation;
 mod draw_validation;
 // `pub(crate)` so the host-window present thread ([[host-window]] direct-present
@@ -40,6 +41,7 @@ pub use context::{FENCE_TIMEOUT_NS, MAX_DEVICE_RECREATES};
 pub use counters::{CounterSnapshot, EngineCounters};
 pub use device_lost::{DeviceLostDecline, DeviceLostOp};
 pub use draw_execution::DrawExecutionDecline;
+pub use draw_phase::{take_window as draw_phase_window, DrawPhaseWindow};
 pub use draw_preparation::DrawPreparationDecline;
 pub use draw_validation::DrawValidationDecline;
 pub use facade_decline::EngineFacadeDecline;

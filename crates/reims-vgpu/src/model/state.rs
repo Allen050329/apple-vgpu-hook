@@ -1931,11 +1931,20 @@ impl DeviceState {
             // It matters because that is the worst version of this class rather
             // than a corner of it: a surface nothing has ever Stored into is
             // uninitialized, so presenting it shows a fully black screen, not a
-            // stale one. Measured on a live boot — the guest idled, slept its
-            // display, re-created its scanout surfaces, and presented mid 6 at
-            // `gen=0` with `px0=[0,0,0,0]`; the screen stayed black for 18.9 s
-            // until the guest painted `gen=1`. `present_unbacked` fired **zero**
-            // times during that whole boot.
+            // stale one. Measured on a live boot: the guest re-created its
+            // scanout surfaces (`gen` reset 82 → 0) and we presented mid 6 at
+            // `gen=0` with `px0=[0,0,0,0]` and `rgb_nz=4254` of 2 073 600 — a
+            // black screen — for the three presents that followed.
+            // `present_unbacked` fired **zero** times during that whole boot.
+            //
+            // The guest was awake for all of it. An earlier reading of this
+            // boot blamed display sleep and it does not survive the log: the
+            // 86 s the guest went quiet is bracketed by seven
+            // `sync_exec_lock_hold` events of 935-979 ms each, one guest exec
+            // packet apiece, on an otherwise idle device. The surface
+            // re-creation is downstream of the stall, not of a power
+            // transition. What causes the stall is a separate question and is
+            // measured by `draw_phase`.
             //
             // The old shape could not have caught it. It compared this present's
             // seq against the previous present's, which is a check for a

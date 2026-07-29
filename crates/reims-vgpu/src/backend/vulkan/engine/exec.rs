@@ -677,6 +677,9 @@ pub(crate) unsafe fn execute_draw_inner(
     counters: &EngineCounters,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
+    // Charges this draw's wall clock to one phase at a time; commits from
+    // `Drop`, so the `?` returns below keep their time.
+    let mut phase = super::draw_phase::DrawTimer::start();
     validate_v1(req)?;
     let force_loss = owner.force_device_lost;
     if force_loss {
@@ -742,6 +745,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         pools.begin_entry(ctx, counters)?
     };
+    phase.enter(super::draw_phase::Phase::Setup);
 
     // Build layout key from storage / sampled / sampler bindings.
     let mut layout_bindings = Vec::new();
@@ -1415,6 +1419,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     let rb_size = (req.width as u64) * (req.height as u64) * 4;
     let do_readback = !req.skip_readback;
+    phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
         Some(pools.acquire_readback(ctx, rb_size, counters)?)
     } else {
@@ -1498,6 +1503,7 @@ pub(crate) unsafe fn execute_draw_inner(
         None
     };
 
+    phase.enter(super::draw_phase::Phase::Record);
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     // A batch joiner's CB is already recording (opened by the batch opener);
@@ -2225,6 +2231,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // in recording state for same-target successors and is submitted by
     // pools.batch_flush (next begin_entry / retire / explicit flush).
     let defer_submit = batch_eligible;
+    phase.enter(super::draw_phase::Phase::Submit);
     if !defer_submit {
         ctx.device
             .end_command_buffer(cb)
@@ -2379,8 +2386,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // `finish_us` tail). The cleanup is already parked with `finish_entry_async`
     // above, so the slot stays pending and the ring retires it later with no
     // extra wait (its fence is already signaled).
+    phase.enter(super::draw_phase::Phase::Wait);
     pools.wait_entry_fence(ctx, counters, fence)?;
 
+    phase.enter(super::draw_phase::Phase::Readback);
     let out = {
         let ptr = ctx
             .device

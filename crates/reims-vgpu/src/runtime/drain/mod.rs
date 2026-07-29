@@ -3168,7 +3168,40 @@ fn emit_engine_delta() {
         d.desc_pool_grow,
         d.gen_mismatch,
     ));
+    emit_draw_phase();
 }
+
+/// The split of `drain_duty`'s `draw_us`, over the same window.
+///
+/// `drain_duty` says a saturated second is 93-99% `draw_us` and `engine_delta`
+/// says ~450 MB/s crosses the bus each way. Those two are consistent with
+/// opposite fixes — moving fewer bytes, or stopping the per-draw GPU round trip
+/// — and neither line can tell them apart. This one can: `readback_us` and the
+/// staging half of `setup_us` scale with bytes, `wait_us` does not.
+///
+/// Silent when no draw ran, so an idle desktop costs nothing.
+#[cfg(feature = "backend-vulkan")]
+fn emit_draw_phase() {
+    let Some(w) = crate::backend::vulkan::engine::draw_phase_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "draw_phase draws={} prep_us={} setup_us={} record_us={} submit_us={} wait_us={} \
+         readback_us={} max_us={} stalls={}",
+        w.draws,
+        w.prep_us,
+        w.setup_us,
+        w.record_us,
+        w.submit_us,
+        w.wait_us,
+        w.readback_us,
+        w.max_us,
+        w.stalls,
+    ));
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn emit_draw_phase() {}
 
 #[cfg(not(feature = "backend-vulkan"))]
 fn emit_engine_delta() {}
