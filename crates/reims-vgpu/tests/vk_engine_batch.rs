@@ -351,7 +351,7 @@ fn batch_length_cap_flushes_and_reopens() {
 
 /// A deferred-submit draw whose storage buffer is `BufferContent::GuestRuns`
 /// must snapshot the runs on the CPU at record time — a flush-time GPU gather
-/// would read guest RAM after ack-fast let the guest repaint it (rect_void
+/// would read guest RAM after ack-fast let the guest repaint it (the
 /// black-band class, live A/B 2026-07-19). No host-import window exists in
 /// this process, so the legacy gather path would fail with
 /// `buffer_guest_run_import_missing`; the snapshot path succeeds and the

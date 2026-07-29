@@ -316,9 +316,11 @@ fn resident_content_stats_from_rgba(px: &[u8]) -> ResidentContentStats {
     stats
 }
 
+/// Resident content stats cost a readback, so only display-sized imports pay
+/// for them — that is the geometry whose occupancy answers "did the composited
+/// frame arrive".
 fn should_measure_resident_content(width: u32, height: u32) -> bool {
-    (width >= 1280 && height >= 720)
-        || crate::runtime::census::present_proxy::is_menu_strip_geom(width, height)
+    width >= 1280 && height >= 720
 }
 
 /// Measure-only: read one tight BGRA guest mapping row (multi-import safe).
@@ -457,103 +459,6 @@ fn log_import_content(
     }
 }
 
-/// Measure-only: strip Store ABI census (menu-bar residual).
-///
-/// Logs mapping latch vs job dims, multiplanar, invent-vs-device sample window,
-/// and y0 + center guest row occupancy. Does **not** change Store behavior.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the strip proxy records the decoded job and mapping geometry"
-)]
-fn log_strip_import<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    job_w: u32,
-    job_h: u32,
-    bpr: u32,
-    base_off: u64,
-    from_device: bool,
-    reason: &str,
-    res: Option<ResidentContentStats>,
-) {
-    if !crate::runtime::census::present_proxy::is_menu_strip_geom(job_w, job_h) {
-        return;
-    }
-    let (map_w, map_h, map_fmt, pages, multi) = match state.mappings.get(&mapping_id) {
-        Some(m) => (
-            m.width,
-            m.height,
-            m.format,
-            m.page_entries.len(),
-            crate::runtime::objects::mapping_is_multiplanar(m) as u8,
-        ),
-        None => (0, 0, 0, 0, 0),
-    };
-    let y0 = guest_row_rgb_stats_at_y(state, host, mapping_id, job_w, job_h, base_off, bpr, 0);
-    let ymid = guest_center_row_rgb_stats(state, host, mapping_id, job_w, job_h, base_off, bpr);
-    let (rnz, rmax) = res
-        .map(|stats| (stats.rgb_nz, stats.rgb_max))
-        .unwrap_or((usize::MAX, 0));
-    let (y0_nz, y0_max) = y0.unwrap_or((usize::MAX, 0));
-    let (ym_nz, ym_max) = ymid.unwrap_or((usize::MAX, 0));
-    // Menu-strip A/B diagnostic census on a SUCCESSFUL import (both call sites
-    // pass `ok`/`ok_runs`) — route OFF so it does not pollute the curated
-    // real-error view; still greppable as `OFF strip_import`.
-    crate::observe::off(format!(
-        "strip_import mid={mapping_id} job={job_w}x{job_h} map={map_w}x{map_h} map_fmt={map_fmt:#x} multi={multi} pages={pages} bpr={bpr} invent={} base_off={base_off:#x} reason={reason} res_rgb_nz={} res_max={} guest_y0_nz={} guest_y0_max={} guest_ymid_nz={} guest_ymid_max={}",
-        (!from_device) as u8,
-        if rnz == usize::MAX { -1i64 } else { rnz as i64 },
-        rmax,
-        if y0_nz == usize::MAX { -1i64 } else { y0_nz as i64 },
-        y0_max,
-        if ym_nz == usize::MAX { -1i64 } else { ym_nz as i64 },
-        ym_max
-    ));
-    // Once-per-process: dump first guest row as PPM for A/B vs present top band.
-    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        maybe_dump_strip_guest_row(state, host, mapping_id, job_w, job_h, base_off, bpr);
-    }
-}
-
-/// Measure-only: write first guest row of a strip Store to `/tmp/reims-vgpu-strip-import-*.ppm`.
-fn maybe_dump_strip_guest_row<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    base_off: u64,
-    bpr: u32,
-) {
-    if width == 0 || bpr < width.saturating_mul(RGBA8_BPP) {
-        return;
-    }
-    let dump_h = height.clamp(1, 4);
-    let tight = (width as usize).saturating_mul(RGBA8_BPP as usize);
-    let mut rows = vec![0u8; tight.saturating_mul(dump_h as usize)];
-    for y in 0..dump_h {
-        let moff = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
-        let off = (y as usize).saturating_mul(tight);
-        if !mapper::read_mapping_bytes(state, host, mapping_id, moff, &mut rows[off..off + tight]) {
-            return;
-        }
-    }
-    let path = format!("/tmp/reims-vgpu-strip-import-mid{mapping_id}-{width}x{dump_h}.ppm");
-    if let Ok(mut f) = std::fs::File::create(&path) {
-        use std::io::Write;
-        let _ = writeln!(f, "P6\n{width} {dump_h}\n255");
-        for px in rows.chunks_exact(4) {
-            // Guest wire is BGRA.
-            let _ = f.write_all(&[px[2], px[1], px[0]]);
-        }
-        crate::observe::fail(format!(
-            "strip_import dump path={path} mid={mapping_id} {width}x{dump_h}"
-        ));
-    }
-}
-
 /// DMA resident BGRA target into guest mapping pages (stride-correct).
 ///
 /// Preconditions (fail-closed):
@@ -645,10 +550,10 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             }
         })
         .unwrap_or(MTL_FORMAT_BGRA8_UNORM);
-    let Some((base_off, bpr, span_end, from_device)) = state
+    let Some((base_off, bpr, span_end)) = state
         .mappings
         .get(&mapping_id)
-        .and_then(|m| mapping_write::type11_sample_window_ex(m, width, height, fmt))
+        .and_then(|m| mapping_write::type11_sample_window(m, width, height, fmt))
     else {
         return import_fail(mapping_id, width, height, ImportDecline::NoSampleWindow);
     };
@@ -694,7 +599,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             base_off,
             bpr,
             guest_before_center,
-            from_device,
             timing,
         );
     }
@@ -789,18 +693,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
                 transition_stats,
                 true,
             );
-            log_strip_import(
-                state,
-                host,
-                mapping_id,
-                width,
-                height,
-                bpr,
-                base_off,
-                from_device,
-                "ok",
-                res_stats,
-            );
         }
         let post_us = post_started.elapsed().as_micros() as u64;
         // Per-tranche attribution: present-capture store readback+writeback is
@@ -826,7 +718,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             base_off,
             bpr,
             guest_before_center,
-            from_device,
             timing,
         );
     }
@@ -843,7 +734,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         bpr,
         need,
         guest_before_center,
-        from_device,
         full_quad_bounds,
         timing,
     )
@@ -991,7 +881,6 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
     base_off: u64,
     bpr: u32,
     guest_before_center: Option<Vec<u8>>,
-    from_device: bool,
     timing: ImportTiming,
 ) -> ImportPresentResult {
     let read_started = Instant::now();
@@ -1067,18 +956,6 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
             transition_stats,
             true,
         );
-        log_strip_import(
-            state,
-            host,
-            mapping_id,
-            width,
-            height,
-            bpr,
-            base_off,
-            from_device,
-            "cpu_unstable",
-            res_stats,
-        );
     }
     let post_us = post_started.elapsed().as_micros() as u64;
     state
@@ -1116,7 +993,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
     bpr: u32,
     need: u64,
     guest_before_center: Option<Vec<u8>>,
-    from_device: bool,
     full_quad_bounds: bool,
     mut timing: ImportTiming,
 ) -> ImportPresentResult {
@@ -1315,18 +1191,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
                 transition_stats,
                 true,
             );
-            log_strip_import(
-                state,
-                host,
-                mapping_id,
-                width,
-                height,
-                bpr,
-                base_off,
-                from_device,
-                "ok_runs",
-                res_stats,
-            );
             ImportPresentResult::Ok
         }
         Err(e) => {
@@ -1376,7 +1240,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
         base_off,
         bpr,
         guest_before_center,
-        from_device,
         timing,
     )
 }
@@ -1443,7 +1306,6 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
     base_off: u64,
     bpr: u32,
     guest_before_center: Option<Vec<u8>>,
-    from_device: bool,
     timing: ImportTiming,
 ) -> ImportPresentResult {
     let ImportPresentResult::Fail(reason) = result else {
@@ -1467,7 +1329,6 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
         base_off,
         bpr,
         guest_before_center,
-        from_device,
         timing,
     )
 }
@@ -1994,11 +1855,14 @@ mod tests {
     }
 
     #[test]
-    fn resident_content_measurement_is_bounded_to_display_and_menu_strip() {
+    fn resident_content_measurement_is_bounded_to_display_size() {
         assert!(should_measure_resident_content(1920, 1080));
-        assert!(should_measure_resident_content(1920, 24));
+        assert!(should_measure_resident_content(1280, 720));
         assert!(!should_measure_resident_content(715, 625));
         assert!(!should_measure_resident_content(31, 24));
+        // A thin horizontal chrome strip is display-wide but not display-tall;
+        // it must not pull a readback (the menu-bar content detector is gone).
+        assert!(!should_measure_resident_content(1920, 24));
     }
 
     #[test]
@@ -2029,17 +1893,6 @@ mod tests {
         assert!(!eligible(1, 320, 0));
         assert!(eligible(1, 1, 1));
         assert!(eligible(1, 1920, 1080));
-    }
-
-    #[test]
-    fn strip_geom_uses_present_proxy_classifier() {
-        // Keep import enrich predicate aligned with present_proxy census.
-        assert!(crate::runtime::census::present_proxy::is_menu_strip_geom(
-            1920, 24
-        ));
-        assert!(!crate::runtime::census::present_proxy::is_menu_strip_geom(
-            1920, 1080
-        ));
     }
 
     #[test]
@@ -2215,7 +2068,6 @@ mod tests {
                 0,
                 8,
                 None,
-                false,
                 ImportTiming::new(),
             )
         };

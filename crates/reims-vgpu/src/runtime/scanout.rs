@@ -482,8 +482,8 @@ pub fn capture_present_frame(
         }
     };
     // Sub-phase attribution of the capture lock hold: paint (guest-page read /
-    // host_cache copy) vs the measure-only occupancy scan vs the diagnostic
-    // proxy block. Localizes which part of the 13–25 ms/present floor to cut.
+    // host_cache copy) vs the measure-only occupancy scan. Localizes which part
+    // of the 13–25 ms/present floor to cut.
     let paint_us = capture_started.elapsed().as_micros() as u64;
     let scan_started = std::time::Instant::now();
     // One fused pass over the 8 MiB frame instead of separate byte-nz and
@@ -526,7 +526,7 @@ pub fn capture_present_frame(
     // continuously-animating app this is ~15–30k lines/session of pure diagnostic
     // trace: the always-on present-health signal (rate, occupancy, mid/nz/struct
     // swings, sparse/converge) lives in the `note_capture_ok` windowed `summary`
-    // line + the on-anomaly THRASH proxies below, and `present_black` fires the
+    // line and its on-anomaly THRASH events, and `present_black` fires the
     // genuine "console will be black" alarm. Nothing consumes this line's fields
     // beyond diagnosis, so gate it (and the redundant `present host_cache`, whose
     // info is the `src=host_cache` field here) behind REIMS_VGPU_DRAW_LOG so a normal
@@ -550,7 +550,6 @@ pub fn capture_present_frame(
     // Do not gate present on nonzero/sparsity measurements. Capture-fail
     // (return false above)
     // already keeps the prior retain via drain keep_prior frame_valid.
-    let proxy_started = std::time::Instant::now();
     crate::runtime::census::present_proxy::note_capture_ok(
         crate::runtime::census::present_proxy::PresentCaptureSample {
             mapping_id,
@@ -565,50 +564,14 @@ pub fn capture_present_frame(
             edge_energy: edge,
         },
     );
-    // Measure-only stable black-region proxy (never gates ownership/present).
-    // Reuses the fused-scan `rgb_nz` so the proxy adds no extra full-frame pass.
-    if let Some(void) = crate::runtime::census::present_proxy::note_rect_void(
-        mapping_id, generation, width, height, &buf, rgb_nz,
-    ) {
-        // A void fired: discriminate whether the black band existed in the
-        // still-live retained frame (`frame_bgra`, replaced below at the publish
-        // step) and was LOST this present (host retention failure) vs was never
-        // there. Deduped + only on a real firing, so this second band scan is
-        // rare on a healthy boot. `src` names which capture source produced the
-        // black band (a resident `reuse_store` vs raw `guest_pages` split tells
-        // us whether the seeded resident or the stale guest pages were shown).
-        crate::runtime::census::present_proxy::note_rect_void_origin(
-            &void,
-            &buf,
-            &state.present.frame_bgra,
-            state.present.frame_width,
-            state.present.frame_height,
-            width,
-            height,
-            src,
-        );
-    }
-    // Measure-only retained-old-frame rectangle inside a large transition.
-    crate::runtime::census::present_proxy::note_damage_hole(
-        mapping_id, generation, width, height, &buf,
-    );
-    // Measure-only dock glass residual (does not gate present).
-    crate::runtime::census::present_proxy::note_dock_strip(
-        mapping_id, generation, width, height, &buf, nz,
-    );
-    // Measure-only menu-bar top band (rainbow chrome residual; does not gate present).
-    crate::runtime::census::present_proxy::note_menu_strip(
-        mapping_id, generation, width, height, &buf,
-    );
-    let proxy_us = proxy_started.elapsed().as_micros() as u64;
     // Sub-phase split of the capture lock hold (paint = guest read / host_cache
-    // copy; scan = fused occupancy pass + edge; proxy = the measure-only
-    // diagnostic proxy block). Names which part of the per-present floor to cut.
+    // copy; scan = fused occupancy pass + edge). Names which part of the
+    // per-present floor to cut.
     // Per-present + pure wall-clock (SCHED_IDLE-contaminated under the agent
     // harness), so this is REIMS_VGPU_DRAW_LOG-only diagnostic trace, not an always-on
     // signal: the drain-side `tranche` capture_us aggregate carries the floor.
     crate::observe::line(format!(
-        "present_capture_phase mid={mapping_id} {width}x{height} paint_us={paint_us} scan_us={scan_us} proxy_us={proxy_us} src={src}"
+        "present_capture_phase mid={mapping_id} {width}x{height} paint_us={paint_us} scan_us={scan_us} src={src}"
     ));
     // Publish the new frame and recycle the old retain buffer as the next
     // capture scratch (warm 8 MiB alloc, no per-present malloc/free/zero).

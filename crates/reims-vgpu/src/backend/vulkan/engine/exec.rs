@@ -751,8 +751,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // ack-fast means the guest may repaint that buffer as soon as the command
     // is consumed — deferred submit stretches record→execute from ~0 to a
     // whole batch, so the GPU samples half-repainted a/b window buffers
-    // (rect_void 10x3-tile black bands under window drags, 2026-07-19 live
-    // A/B). Such draws take the immediate-submit path; buffer GuestRuns stay
+    // (large black bands under window drags, 2026-07-19 live A/B). Such draws take the immediate-submit path; buffer GuestRuns stay
     // batchable because `stage_buffer_content` snapshots them at record time.
     let has_zc_sampled = req
         .sampled_images

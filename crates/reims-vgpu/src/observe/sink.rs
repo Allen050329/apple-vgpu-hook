@@ -10,7 +10,6 @@
 //! | `OFF present_op6/7/8` | Display present packet (channel, surface/mapping id, stamp) |
 //! | `OFF present_black` | max_rgb==0 after capture (console will stay black) |
 //! | `OFF present_paint` | HostAction paint / Unchanged |
-//! | `strip_import` | Thin type-11 Store ABI (job vs map, invent, multi, guest y0) |
 //! | `OFF host_cache_store` | Discrete-GPU host surface cache write |
 //! | `OFF host_cache_evict` | Cache drop (unmap/delete) |
 //! | `OFF m2v_store` | metal2vulkan Store to type-11/type-4 mid (incl. is_front) |
@@ -22,7 +21,6 @@
 //! | `OFF sample_alpha_mask` | Deduplicated zero-RGB/nonzero-alpha sample census; alpha is preserved |
 //! | `linear_sample_miss` | Display-sized type-2/3 sample failed, with descriptor identity |
 //! | `OFF linear_coverage_gap` | Typed stage-in/shader-evaluated coverage check rejected full-display ownership |
-//! | `THRASH damage_hole` | Large connected frame transition encloses an unchanged old-frame rectangle |
 //! | `THRASH selected_peer_divergence` | Protocol-selected retain is sparse while a same-geometry Store peer is dense |
 //! | `import_content` | Resident-to-guest Store census; display rows include exact changed/R↔B-swapped pixel counts |
 //! | `linux_m2v_resources` | Per-draw resource census; `fixed_gap=[...]` names decoded fixed state absent from the Vulkan request |

@@ -1099,8 +1099,8 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // fixes): a large mapping sampled from guest pages while
                     // the registry holds a same-surface resident under ANOTHER
                     // generation is the generation-orphaning signature
-                    // (black-band class). Ring + counter
-                    // surface in `rect_void_ctx` / THRASH `t11_fb=`.
+                    // (black-band class). Surfaces as a deduped
+                    // `t11_large_fallback` line plus THRASH `t11_fb=`.
                     if (w as u64) * (h as u64) >= 250_000 {
                         let map_gen = state
                             .mappings
@@ -5323,7 +5323,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // targets: decoded location-0 position AABB over the drawn index set,
         // raw (no NDC/pixel disambiguation — the census consumer knows the
         // pipe's vertex space). Answers "which draws ever touch region R of
-        // buffer B" for the rect_void burn-in class without pixel inspection.
+        // buffer B" for the black-band burn-in class without pixel inspection.
         let mut full_quad_bounds = false;
         if output_mapping != 0 && w >= 1280 && h >= 720 {
             if let Some((b, n_idx)) = draw_position_bounds(&resources, vertex_count) {

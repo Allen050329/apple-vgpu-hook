@@ -32,8 +32,10 @@ pub fn type11_sample_window(
 /// Like [`type11_sample_window`], plus `from_device` (true = guest device
 /// descriptor plane/surface window; false = invent packed fallback).
 ///
-/// Measure/import paths log `invent=` from this flag — menu-strip residual when
-/// a 1920×24 job invents over a stale multiplanar mapping.
+/// The flag distinguishes a window the guest's own `sIOSurfaceDeviceDescriptor`
+/// described from one this device invented, which is what separates a stale or
+/// rejected descriptor from a genuinely packed surface. No caller reads it
+/// today; [`type11_sample_window`] is the form the paths use.
 pub fn type11_sample_window_ex(
     m: &MappingEntry,
     width: u32,
