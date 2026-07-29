@@ -892,25 +892,18 @@ pub(crate) unsafe fn execute_draw_inner(
             }),
         layout: layout_key.clone(),
     };
-    let pipeline = if let Some(pipeline) = caches.get_prepared(&pipeline_key) {
-        counters
-            .pipeline_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pipeline
-    } else {
-        let pipe = caches.get_or_create_pipeline(
-            ctx,
-            &pipeline_key,
-            vert_module,
-            frag_module,
-            pipeline_layout,
-            render_pass,
-            counters,
-            pools,
-        )?;
-        caches.cache_prepared(pipeline_key.clone(), pipe);
-        pipe
-    };
+    // One cache, consulted once. `get_or_create_pipeline` already counts the hit
+    // and already checks the negative entry for a key that failed to compile.
+    let pipeline = caches.get_or_create_pipeline(
+        ctx,
+        &pipeline_key,
+        vert_module,
+        frag_module,
+        pipeline_layout,
+        render_pass,
+        counters,
+        pools,
+    )?;
 
     // Samplers
     let mut sampler_handles = Vec::new();

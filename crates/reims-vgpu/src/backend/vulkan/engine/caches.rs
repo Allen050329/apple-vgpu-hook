@@ -322,11 +322,8 @@ pub(crate) struct ObjectCaches {
     passes: FifoCache<PassKey, vk::RenderPass>,
     pipelines: FifoCache<PipelineKey, vk::Pipeline>,
     samplers: FifoCache<SamplerStateKey, vk::Sampler>,
-    /// Pipeline key → pipeline shortcut for the warm path.
-    prepared: FifoCache<PipelineKey, vk::Pipeline>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: FifoCache<ComputePipelineKey, vk::Pipeline>,
-    prepared_dispatch: FifoCache<ComputePipelineKey, vk::Pipeline>,
 }
 
 impl ObjectCaches {
@@ -337,9 +334,7 @@ impl ObjectCaches {
             passes: FifoCache::new(64),
             pipelines: FifoCache::new(CAP_DEFAULT),
             samplers: FifoCache::new(CAP_DEFAULT),
-            prepared: FifoCache::new(CAP_DEFAULT),
             compute_pipelines: FifoCache::new(CAP_DEFAULT),
-            prepared_dispatch: FifoCache::new(CAP_DEFAULT),
         }
     }
 
@@ -350,8 +345,6 @@ impl ObjectCaches {
         for p in self.compute_pipelines.take_all() {
             device.destroy_pipeline(p, None);
         }
-        self.prepared.clear();
-        self.prepared_dispatch.clear();
         for (dsl, pl) in self.layouts.take_all() {
             device.destroy_pipeline_layout(pl, None);
             if dsl != vk::DescriptorSetLayout::null() {
@@ -375,9 +368,7 @@ impl ObjectCaches {
         self.passes.clear();
         self.pipelines.clear();
         self.samplers.clear();
-        self.prepared.clear();
         self.compute_pipelines.clear();
-        self.prepared_dispatch.clear();
     }
 
     pub(crate) unsafe fn get_or_create_shader(
@@ -1144,26 +1135,6 @@ impl ObjectCaches {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
         Ok(pipe)
-    }
-
-    pub(crate) fn cache_prepared(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
-        let _ = self.prepared.insert(key, pipeline);
-    }
-
-    pub(crate) fn get_prepared(&self, key: &PipelineKey) -> Option<vk::Pipeline> {
-        self.prepared.get(key).copied()
-    }
-
-    pub(crate) fn cache_prepared_dispatch(
-        &mut self,
-        key: ComputePipelineKey,
-        pipeline: vk::Pipeline,
-    ) {
-        let _ = self.prepared_dispatch.insert(key, pipeline);
-    }
-
-    pub(crate) fn get_prepared_dispatch(&self, key: &ComputePipelineKey) -> Option<vk::Pipeline> {
-        self.prepared_dispatch.get(key).copied()
     }
 }
 

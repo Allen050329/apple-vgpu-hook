@@ -364,23 +364,15 @@ pub(crate) unsafe fn execute_compute_inner(
         entry: req.entry.clone(),
         layout: layout_key.clone(),
     };
-    let pipeline = if let Some(pipeline) = caches.get_prepared_dispatch(&cpipe_key) {
-        counters
-            .compute_pipeline_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pipeline
-    } else {
-        let pipe = caches.get_or_create_compute_pipeline(
-            ctx,
-            &cpipe_key,
-            module,
-            pipeline_layout,
-            counters,
-            pools,
-        )?;
-        caches.cache_prepared_dispatch(cpipe_key.clone(), pipe);
-        pipe
-    };
+    // One cache, consulted once; `get_or_create_compute_pipeline` counts the hit.
+    let pipeline = caches.get_or_create_compute_pipeline(
+        ctx,
+        &cpipe_key,
+        module,
+        pipeline_layout,
+        counters,
+        pools,
+    )?;
 
     // Storage buffers: host-visible staging used as SSBOs (same as draw path).
     let mut storage_slots = Vec::new();
