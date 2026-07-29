@@ -9,8 +9,7 @@
 //! `SampledGuestRunImportMissing`, both meaning "an imported guest span
 //! disappeared between the runtime's pre-check and the bind". Neither can
 //! happen now: guest runs are gathered by the CPU out of the mapped span, so
-//! there is no import to lose. The degradation that replaced them is reported
-//! once per process as [`crate::observe::ZeroCopyLost`], not per bind.
+//! there is no import to lose.
 
 use ash::vk;
 

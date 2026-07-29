@@ -248,21 +248,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         return (EncodeStatus::Ok, None);
     }
 
-    // The type-11 composite Store rail that used to sit here is gone. A draw
-    // could return `M2vDrawSpan::ResidentBgra` — a resident BGRA target and no
-    // CPU pixels — and this branch landed it in the mapping's guest pages by
-    // DMA, either through an ack-fast deferred rung that pinned the resident
-    // and replayed the Store on first access, or through a synchronous
-    // strided/scatter import. It was reached only when the device could import
-    // a host pointer over those pages. Nothing can say that now, the span
-    // variant is gone with it, and the Store falls through to the CPU writeback
-    // below — the path every one of those rails already took whenever an import
-    // was refused.
-    #[cfg(feature = "backend-vulkan")]
-    if writeback_guest {
-        crate::observe::ZeroCopyLost::ImportPresent.note();
-    }
-
+    // A type-11 composite Store reaches the guest only through the CPU writeback
+    // below. The DMA rail that used to short-circuit it here — a resident BGRA
+    // target landed straight in the mapping's guest pages through an imported
+    // host pointer — is gone, because a pointer the GPU can read is one it can
+    // write and those pages are guest RAM.
+    //
     // Taken, not borrowed. Every exit from this block returns the frame, and
     // borrowing forced each of them to `rgba.clone()` a whole framebuffer — 8 MB
     // at 1080p, at the 28-111 Stores/s `store_routes` measures, on the drain

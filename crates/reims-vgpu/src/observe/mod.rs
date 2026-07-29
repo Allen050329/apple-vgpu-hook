@@ -46,14 +46,12 @@ pub mod emit;
 #[cfg(test)]
 mod gate;
 pub mod sink;
-pub mod zero_copy_lost;
 
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`
 /// next to the trait it implements, rather than reaching into the submodule.
 pub(crate) use decline::decline_display;
 pub use decline::{Decline, Refusal};
 pub use emit::{first_sight, Emit};
-pub use zero_copy_lost::ZeroCopyLost;
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
 // rather than `observe::sink::fail(…)`. `sink` stays public for the gate and

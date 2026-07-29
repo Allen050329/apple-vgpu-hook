@@ -554,10 +554,7 @@ pub(crate) unsafe fn execute_compute_inner(
             ComputeImageDst::Deferred
         } else {
             // The dispatch's output crosses device→host and the runtime writes
-            // the guest pages. `prepare_direct_dst` used to get first refusal
-            // here, importing the caller's guest window so the copy landed in
-            // it directly; that is the rail this reports as lost.
-            crate::observe::ZeroCopyLost::ComputeDirectWriteback.note();
+            // the guest pages, so it lands in a readback buffer here.
             ComputeImageDst::Readback(pools.acquire_readback_extra(
                 ctx,
                 resource.bytes.len() as u64,

@@ -1722,7 +1722,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         if c.mapping_id == 0 {
             continue;
         }
-        crate::observe::ZeroCopyLost::MetalGuestTexture.note();
         if c.load_action == PASS_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
             color_seeds[i] =
                 seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);

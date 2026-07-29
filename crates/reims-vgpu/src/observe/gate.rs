@@ -662,7 +662,7 @@ fn declared_slugs() -> Vec<(String, String)> {
 /// colliding with an `engine` slug is visible from neither impl, and the
 /// per-enum tests this replaced could not have caught it.
 ///
-/// **What this covers, exactly.** The 644 slugs written as literals in a
+/// **What this covers, exactly.** The slugs written as literals in a
 /// `slug()`/`refusal()` result position. It does *not* cover the vocabularies
 /// written at *construction* sites — `br(BlitStatus::Bounds, "fill_out_of_range")`
 /// and `FenceStatus::Unsupported("fence_domain_unknown")` — where the reason rides

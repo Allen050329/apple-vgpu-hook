@@ -81,8 +81,6 @@ unsafe fn stage_buffer_content(
                 counters
                     .buffer_snapshot_binds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                crate::observe::ZeroCopyLost::BufferGuestRuns.note();
             }
             slot
         }
@@ -1494,7 +1492,6 @@ pub(crate) unsafe fn execute_draw_inner(
                 // runs are guest RAM. `TRANSFER_DST` came off the scratch usage
                 // with it — nothing on the device writes this buffer any more.
                 pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
-                crate::observe::ZeroCopyLost::SampledGuestRuns.note();
                 sampled.push(PreparedSampled::GuestGather {
                     binding: resource.binding,
                     image: img,
