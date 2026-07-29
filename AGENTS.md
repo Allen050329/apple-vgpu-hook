@@ -510,6 +510,26 @@ whole seed frame twice in fifteen lines — once into `resolved_load` (structura
 reference) and again into `seed_bytes`, purely to own a buffer the `output_bgra` arm could mutate in
 place. The second is now a move. Nothing else read `resolved_load` after that point.
 
+**`us_per_draw` has a 1.8x boot-to-boot spread and drifts upward within a session, so it cannot score
+a change sequentially.** This is the interleaving rule above, restated for the perf metric, and it is
+worth stating separately because `drain_duty` looks precise — it is a within-boot duty cycle over 140
+one-second windows, and the temptation is to treat a 35% move as signal. Eight boots, mean
+`draw_us/draws` over busy windows (`duty > 0.8`), in the order they were run:
+
+| boot | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| us/draw | 2310 | 2660 | 3266 | 3561 | 3766 | 4202 | 3582 | 3928 |
+
+The first **six** are all *unchanged* code and span 2310-4202. The last two are the seed-clone
+removal, and they land in the middle of that band. The pre-change series is also close to monotone in
+run order, which is a time drift and not a code effect — so a sequential A/B on this metric will
+report whatever direction the session happens to be drifting.
+
+Concretely: reading boots 2 and 7 as a before/after gives "35% regression" for a commit that deletes
+a `memcpy` and can only be neutral or better. That is the same shape as the 3-of-3 versus 2-of-2
+result recorded above which survived a full revert of its supposed cause. Interleave, or score the
+change with a counter that measures the thing directly rather than the frame rate downstream of it.
+
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
 and the measured frame period sat at 252–665 ms, i.e. just under that threshold for entire runs. It
