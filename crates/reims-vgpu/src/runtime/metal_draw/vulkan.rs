@@ -263,12 +263,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         crate::observe::ZeroCopyLost::ImportPresent.note();
     }
 
-    if let Some(ref rgba) = draw_rgba {
+    // Taken, not borrowed. Every exit from this block returns the frame, and
+    // borrowing forced each of them to `rgba.clone()` a whole framebuffer — 8 MB
+    // at 1080p, at the 28-111 Stores/s `store_routes` measures, on the drain
+    // worker `drain_duty` shows at duty 0.93-0.99. The deferred type-11 arm is
+    // the hot one and it cloned purely to hand back the buffer it already owned.
+    if let Some(rgba) = draw_rgba.take() {
         // Intermediate multi-draw GVA records: return color0 for chaining without
         // guest Store (archive store plan). Resident type-11 intermediates
         // returned above without materializing CPU pixels.
         if !writeback_guest {
-            return (EncodeStatus::Ok, Some(rgba.clone()));
+            return (EncodeStatus::Ok, Some(rgba));
         }
         // Store draw result into primary color RT.
         if let Some(c0) = colors.first() {
@@ -280,7 +285,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // consumer is a `observe::line` a normal boot discards. Each arm
             // now scans only when it is about to write a line.
             let rgb_stats = || {
-                let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
+                let (nz, max, _) = crate::observe::rgba_rgb_stats(&rgba);
                 (nz, max)
             };
             let ok = if c0.mapping_id != 0 {
@@ -315,7 +320,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.mapping_id,
                             c0.width,
                             c0.height,
-                            rgba,
+                            &rgba,
                         );
                     if deferred {
                         note_type11_store_route("surface_deferred");
@@ -327,14 +332,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.height,
                             c0.format,
                         );
-                        return (EncodeStatus::Ok, Some(rgba.clone()));
+                        return (EncodeStatus::Ok, Some(rgba));
                     }
                     note_type11_store_route("cpu_portability");
                     let ok = mapping_write::write_rgba8_image_changed(
                         state,
                         host,
                         c0.mapping_id,
-                        rgba,
+                        &rgba,
                         None,
                         c0.width,
                         c0.height,
@@ -400,7 +405,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c0.height,
                     c0.row_stride,
                     c0.format,
-                    rgba,
+                    &rgba,
                 )
                 .is_ok();
                 // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
@@ -419,7 +424,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.target_gva,
                         c0.width,
                         c0.height,
-                        rgba,
+                        &rgba,
                     );
                 }
                 let (rgb_nz, max_rgb) = rgb_stats();
@@ -460,7 +465,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 false
             };
             if ok {
-                return (EncodeStatus::Ok, Some(rgba.clone()));
+                return (EncodeStatus::Ok, Some(rgba));
             }
         }
     }
