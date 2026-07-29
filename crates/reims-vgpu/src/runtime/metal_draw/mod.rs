@@ -1710,64 +1710,42 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         req.vertex_count as usize
     };
 
-    // Guest-backed attachments for type-11 targets (unified memory) — resolve
-    // BEFORE building ColorRt views so state/host borrows do not overlap.
-    let mut guest_texs: Vec<Option<metal::Texture>> = Vec::with_capacity(color_list.len());
+    // Type-11 color targets render into a host RT and are written back by the
+    // CPU. The guest-backed attachment that used to sit here aliased the
+    // mapping's `mach_vm_remap` view with `newBufferWithBytesNoCopy`, so Load
+    // read and Store wrote guest pages in place; that is exactly the access the
+    // host GPU must not have, and the alias is gone. What runs now is the same
+    // seed-and-write-back path the alias already fell through to on every
+    // contract refusal (unaligned offset or row stride, span out of range, no
+    // device), so this is a rung the rail has always had.
     for (i, c) in color_list.iter().enumerate() {
-        if c.mapping_id != 0 {
-            let Some(window) =
-                type11_attachment_window(state, host, c.mapping_id, width, height, c.format)
-            else {
+        if c.mapping_id == 0 {
+            continue;
+        }
+        crate::observe::ZeroCopyLost::MetalGuestTexture.note();
+        if c.load_action == PASS_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
+            color_seeds[i] =
+                seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
+            if color_seeds[i].is_none() {
                 crate::observe::fail(format!(
-                    "metal_draw guest_attachment fail reason=window_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
-                    req.task_id, req.pipeline_ref, c.mapping_id, c.texture_ref, c.format, width, height
+                    "metal_draw guest_attachment_fallback_seed fail \
+                     reason=load_seed_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
+                    req.task_id,
+                    req.pipeline_ref,
+                    c.mapping_id,
+                    c.texture_ref,
+                    c.format,
+                    width,
+                    height
                 ));
-                return (
-                    EncodeStatus::MetalFailed("draw_mtl_guest_attachment_window"),
-                    None,
-                );
-            };
-            match type11_attachment_from_window(c.mapping_id, width, height, window) {
-                Ok(tex) => guest_texs.push(Some(tex)),
-                Err(status) => {
-                    crate::observe::Emit::refusal("metal_guest_attachment_fallback", &status)
-                        .expect("type-11 texture alias returned a refusal")
-                        .field("task", req.task_id)
-                        .field("pipe", req.pipeline_ref)
-                        .field("ref", c.texture_ref)
-                        .field("format", format!("{:#x}", c.format))
-                        .fail_once(c.mapping_id as u64);
-                    if c.load_action == PASS_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
-                        color_seeds[i] = seed_color_load(
-                            state,
-                            host,
-                            req.task_id,
-                            c.texture_ref,
-                            0,
-                            width,
-                            height,
-                        );
-                        if color_seeds[i].is_none() {
-                            crate::observe::fail(format!(
-                            "metal_draw guest_attachment_fallback_seed fail reason=load_seed_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
-                            req.task_id, req.pipeline_ref, c.mapping_id, c.texture_ref, c.format, width, height
-                        ));
-                        }
-                    }
-                    guest_texs.push(None);
-                }
             }
-        } else {
-            guest_texs.push(None);
         }
     }
 
     // Build ColorRt views with raw pointers into seeds/outs (disjoint mut slices).
     let mut color_rts: Vec<ColorRt<'_>> = Vec::with_capacity(color_list.len());
     for (i, c) in color_list.iter().enumerate() {
-        // GVA targets encode host RGBA8 for writeback conversion; guest-backed
-        // targets need neither seed nor readback (Store lands in guest pages).
-        let guest_backed = guest_texs[i].is_some();
+        // Every target encodes host RGBA8 for writeback conversion.
         let out_ptr = color_outs[i].as_mut_ptr();
         let out_len = color_outs[i].len();
         let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
@@ -1807,22 +1785,16 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             });
         color_rts.push(ColorRt {
             slot: c.slot,
-            // Guest-backed: native guest MTLPixelFormat (PSO keyed to match).
-            // GVA host RT: 0 = RGBA8Unorm (writeback conversion path).
-            pixel_format: if guest_backed { c.format as u32 } else { 0 },
-            seed_rgba8: if guest_backed {
-                None
-            } else {
-                color_seeds[i].as_deref()
-            },
-            out_rgba8: if guest_backed { None } else { Some(out) },
+            // Host RT: 0 = RGBA8Unorm (writeback conversion path).
+            pixel_format: 0,
+            seed_rgba8: color_seeds[i].as_deref(),
+            out_rgba8: Some(out),
             clear_r: c.clear_color[0],
             clear_g: c.clear_color[1],
             clear_b: c.clear_color[2],
             clear_a: c.clear_color[3],
             load_action: map_load_action(req.pipeline_ref, c.load_action),
             blend: slot_blend,
-            guest_tex: guest_texs[i].clone(),
         });
     }
 
@@ -1887,15 +1859,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     }
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == PASS_STORE_ACTION_DONT_CARE {
-            continue;
-        }
-        // Guest-backed type-11 attachment: the Metal Store already wrote guest
-        // memory (unified). Only advance the scanout generation and feed the
-        // measure-only display proxies (nz read from the same guest bytes).
-        let guest_backed = guest_texs.get(i).and_then(|t| t.as_ref()).is_some();
-        if c.mapping_id != 0 && guest_backed {
-            let _ = state.mark_mapping_written(c.mapping_id);
-            any_write = true;
             continue;
         }
         let out_rgba = &color_outs[i];
@@ -2671,74 +2634,11 @@ fn load_type11_rgba<M: HostMemory + HostOps>(
     load_type11_mapping_rgba(state, host, mapping_id, format_override)
 }
 
-/// Guest-memory-backed Metal color attachment for a type-11 mapping.
-///
-/// Unified memory mapping: builds the mapping's contiguous
-/// guest-RAM view on first use and returns a linear texture aliasing it at
-/// the device-descriptor sample window. The texture IS the guest surface —
-/// Load reads guest bytes, Store writes them, no seed/writeback exists.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[derive(Clone, Copy)]
-struct Type11AttachmentWindow {
-    ptr: usize,
-    view_len: usize,
-    base_off: u64,
-    bpr: u32,
-    fmt: u16,
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn type11_attachment_window<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    format: u16,
-) -> Option<Type11AttachmentWindow> {
-    let (ptr, len) = mapper::ensure_contig_view(state, host, mapping_id)?;
-    let fmt = if format != 0 {
-        format
-    } else {
-        MTL_FORMAT_BGRA8_UNORM
-    };
-    let (base_off, bpr, _span_end) = {
-        let m = state.mappings.get(&mapping_id)?;
-        mapping_write::type11_sample_window(m, width, height, fmt)?
-    };
-    Some(Type11AttachmentWindow {
-        ptr,
-        view_len: len,
-        base_off,
-        bpr,
-        fmt,
-    })
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn type11_attachment_from_window(
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    window: Type11AttachmentWindow,
-) -> Result<metal::Texture, crate::backend::metal::util::Status> {
-    crate::backend::metal::runtime::type11_guest_texture(
-        mapping_id,
-        window.ptr,
-        window.view_len,
-        width,
-        height,
-        window.fmt as u32,
-        window.bpr,
-        window.base_off,
-    )
-}
-
 /// Sample a type-11 mapping as tight RGBA8 from guest pages.
 ///
-/// Unified memory: guest pages ARE the surface content — GPU Stores land in
-/// them (guest-backed attachment) and guest CPU writes are immediately
-/// visible. There is exactly one source; no recovery ranking exists.
+/// Guest pages ARE the surface content: the CPU writeback lands Stores in them
+/// and guest CPU writes are immediately visible. There is exactly one source;
+/// no recovery ranking exists.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3455,8 +3355,10 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
         } else if att.load_action == PASS_LOAD_ACTION_LOAD && mapping_id == 0 {
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
             // reims_vgpu_backend_metal; NULL seed → Metal Clear invent, still encode).
-            // Type-11 needs NO seed: the guest-backed attachment already holds
-            // the surface bytes and Metal Load reads them directly.
+            // Type-11 is seeded later instead, at the attachment site in
+            // `encode_draw` — the same place the guest-backed alias used to be
+            // built, and the same seed it already took whenever the alias was
+            // refused. Seeding here would need the mapping read twice.
             //
             // A deferred GVA Store window at this exact target geometry means
             // the engine resident is the authoritative prior content — skip
@@ -3774,12 +3676,12 @@ fn solid_rgba_local(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
 }
 
 /// Seed color RT LOAD from guest type-11 (BGRA→RGBA) or type-2/3/view linear RGBA.
-/// CPU Load seed for **ephemeral host RTs** (GVA linear targets, or type-11
-/// targets whose guest-backed Metal texture alias is rejected by alignment).
 ///
-/// The normal type-11 path is guest-memory-backed, so Metal Load reads the
-/// surface bytes directly (unified memory). The seed path exists only for the
-/// measured alias-reject fallback above.
+/// Every color RT is an ephemeral host RT now, so every `Load` needs this: the
+/// type-11 guest-memory alias that let Metal Load read the surface bytes in
+/// place is deleted. This used to run only on the alias-reject fallback
+/// (unaligned offset or row stride, span out of range, no device), which is why
+/// it is already a complete path and not a new one.
 fn seed_color_load<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

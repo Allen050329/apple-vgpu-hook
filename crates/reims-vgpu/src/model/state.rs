@@ -618,12 +618,13 @@ pub struct MappingEntry {
     /// Used for biplanar plane selection by texture geometry; empty when unknown.
     pub device_desc: Vec<u8>,
     /// Contiguous host-VA view over `page_entries` (`HostOps::map_pages`,
-    /// mach_vm_remap of guest RAM). 0 = not built. This is the unified-memory
-    /// surface storage for the guest mapping: Metal
-    /// render targets and samples are created directly on this view, so GPU
-    /// Load/Store, guest CPU writes, and host page reads all see ONE copy —
-    /// no writeback mirrors, no seed/capture ranking. Retired (never freed in
-    /// place) whenever `page_entries` change; see `DeviceState::retired_views`.
+    /// mach_vm_remap of guest RAM). 0 = not built. This is the surface storage
+    /// for the guest mapping, and it is read and written by the **CPU only**:
+    /// Metal render targets used to be created directly on this view, which
+    /// gave the host GPU a handle on guest RAM, and that alias is deleted.
+    /// Guest CPU writes and host page reads still see one copy; a GPU Store
+    /// reaches it through the writeback. Retired (never freed in place)
+    /// whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
     /// `map_generation` whose page list was measured non-packed, so no
@@ -2393,8 +2394,6 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         had
     }
 
@@ -2425,8 +2424,6 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         true
     }
 
@@ -2472,8 +2469,6 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
         // any present evidence — the slot may hold a NEW surface.
         self.host_surfaces.remove(&mapping_id);
@@ -2508,8 +2503,6 @@ impl DeviceState {
             if let Some(v) = retired {
                 self.retired_views.push(v);
             }
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
             self.host_surfaces.remove(&mapping_id);
             true
         } else {
@@ -2553,8 +2546,6 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with
         // the incarnation that recorded it, so the recycled slot cannot inherit
@@ -2609,12 +2600,9 @@ impl DeviceState {
         }
         let e = self.mappings.entry(mapping_id).or_default();
         // Geom change (mode switch / rematerialize) is a new surface identity:
-        // reset content_generation and drop the cached Metal texture object
-        // (its descriptor no longer matches; the guest pages stay authoritative).
+        // reset content_generation (the guest pages stay authoritative).
         if e.width != width || e.height != height {
             e.content_generation = 0;
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         }
         e.has_geom = true;
         e.width = width;

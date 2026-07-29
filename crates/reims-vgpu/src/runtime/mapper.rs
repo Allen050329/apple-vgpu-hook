@@ -591,8 +591,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     }
     if let Some(v) = retired {
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         state.retired_views.push(v);
     }
     if incarnation_changed {
@@ -978,9 +976,9 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= REVALIDATE_SLOW_US
 }
 
-/// Unmap contiguous views whose page tables changed (safe point: no GPU work
-/// in flight — execution is sync-per-packet and Metal objects were dropped by
-/// `type11_guest_texture_invalidate` when the view was retired).
+/// Unmap contiguous views whose page tables changed. No GPU object can hold one
+/// of these views: nothing on either backend aliases guest pages any more, so
+/// the only readers are CPU copies that finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);

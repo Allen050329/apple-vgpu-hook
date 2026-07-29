@@ -38,7 +38,6 @@ impl MetalBackend {
 impl Backend for MetalBackend {
     fn reset(&mut self) {
         crate::runtime::icb::clear_icb_cache();
-        crate::backend::metal::runtime::type11_guest_texture_invalidate_all();
     }
 }
 

@@ -1330,24 +1330,19 @@ pub struct ColorRt<'a> {
     pub clear_g: f64,
     pub clear_b: f64,
     pub clear_a: f64,
-    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). With a guest-backed
-    /// attachment (`guest_tex`) this is honored verbatim — Metal Load reads
-    /// the guest surface bytes, exactly the Apple unified-memory semantics.
-    /// For ephemeral host RTs (GVA linear targets), Load requires a CPU seed
-    /// (archive `reims_vgpu_backend_metal`: NULL seed → Clear invent).
+    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). Every color target
+    /// is an ephemeral host RT, so Load requires a CPU seed (archive
+    /// `reims_vgpu_backend_metal`: NULL seed → Clear invent).
     pub load_action: u32,
     /// Per-slot blend from pipeline color-attachment section (overrides global for this RT).
     pub blend: Option<ReimsVgpuBlendState>,
-    /// Guest-memory-backed attachment (unified memory): the texture aliases
-    /// the mapping's guest pages, so Load/Store need no seed/readback and the
-    /// Store result is guest-visible when the command buffer completes.
-    pub guest_tex: Option<Texture>,
 }
 
-/// Resolve Metal loadAction for an **ephemeral host RT** color attachment
-/// (GVA linear targets). Archive `reims_vgpu_backend_metal` (fresh Shared RT every
-/// job): `loadAction = target_rgba8 ? Load : Clear` — guest Load without a
-/// CPU seed Clear-invents. Guest-backed attachments bypass this entirely.
+/// Resolve Metal loadAction for a color attachment. Archive
+/// `reims_vgpu_backend_metal` (fresh Shared RT every job):
+/// `loadAction = target_rgba8 ? Load : Clear` — guest Load without a CPU seed
+/// Clear-invents. This is now every color attachment: the guest-backed
+/// alias that used to honor `load_action` verbatim is gone.
 pub(crate) fn color_rt_load_action(guest_load: u32, has_seed: bool) -> u32 {
     use crate::backend::metal::abi::{
         REIMS_VGPU_MTL_LOAD_ACTION_CLEAR, REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
@@ -1668,64 +1663,50 @@ pub fn render_core_mrt(
     };
 
     let mut retained_tex: Vec<Texture> = Vec::new();
-    // (slot, tex, bpp, guest_backed)
-    let mut color_textures: Vec<(u32, Texture, usize, bool)> = Vec::new();
+    // (slot, tex, bpp)
+    let mut color_textures: Vec<(u32, Texture, usize)> = Vec::new();
     for (i, c) in colors.iter().enumerate() {
         let (slot, _fmt_u32, bpp, mtl_fmt) = color_meta[i];
-        let (target, guest_backed) = if let Some(g) = &c.guest_tex {
-            // Unified memory: the attachment IS the guest surface. No host
-            // copy exists, so no seed upload and no readback.
-            (g.clone(), true)
-        } else {
-            let target_descriptor = TextureDescriptor::new();
-            target_descriptor.set_texture_type(MTLTextureType::D2);
-            target_descriptor.set_pixel_format(mtl_fmt);
-            target_descriptor.set_width(width as u64);
-            target_descriptor.set_height(height as u64);
-            target_descriptor.set_storage_mode(MTLStorageMode::Shared);
-            target_descriptor
-                .set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-            let target = device.new_texture(&target_descriptor);
-            // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
-            // (fresh RT every job; NULL seed → Clear invent below).
-            if let Some(seed) = c.seed_rgba8 {
-                let region = MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: width as u64,
-                        height: height as u64,
-                        depth: 1,
-                    },
-                };
-                unsafe {
-                    target.replace_region(
-                        region,
-                        0,
-                        seed.as_ptr() as *const _,
-                        (width as u64) * (bpp as u64),
-                    );
-                }
+        let target_descriptor = TextureDescriptor::new();
+        target_descriptor.set_texture_type(MTLTextureType::D2);
+        target_descriptor.set_pixel_format(mtl_fmt);
+        target_descriptor.set_width(width as u64);
+        target_descriptor.set_height(height as u64);
+        target_descriptor.set_storage_mode(MTLStorageMode::Shared);
+        target_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let target = device.new_texture(&target_descriptor);
+        // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
+        // (fresh RT every job; NULL seed → Clear invent below).
+        if let Some(seed) = c.seed_rgba8 {
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                target.replace_region(
+                    region,
+                    0,
+                    seed.as_ptr() as *const _,
+                    (width as u64) * (bpp as u64),
+                );
             }
-            (target, false)
-        };
+        }
         retained_tex.push(target.clone());
-        color_textures.push((slot, target, bpp, guest_backed));
+        color_textures.push((slot, target, bpp));
     }
     let mut retained_buf: Vec<Buffer> = Vec::new();
 
     let pass = RenderPassDescriptor::new();
     for (i, c) in colors.iter().enumerate() {
-        let (slot, target, _, guest_backed) = &color_textures[i];
+        let (slot, target, _) = &color_textures[i];
         if let Some(ca) = pass.color_attachments().object_at(*slot as u64) {
             ca.set_texture(Some(target));
-            // Guest-backed attachment: honor the guest loadAction verbatim —
-            // Metal Load reads the guest surface bytes (unified memory).
             // Ephemeral host RT: archive Load+seed / Clear invent.
-            let resolved = if *guest_backed {
-                c.load_action
-            } else {
-                color_rt_load_action(c.load_action, c.seed_rgba8.is_some())
-            };
+            let resolved = color_rt_load_action(c.load_action, c.seed_rgba8.is_some());
             let mtl_load = match resolved {
                 x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD => {
                     MTLLoadAction::Load
@@ -2018,12 +1999,8 @@ pub fn render_core_mrt(
             if out.is_empty() {
                 continue;
             }
-            let (slot, target, bpp, guest_backed) = &color_textures[i];
+            let (slot, target, bpp) = &color_textures[i];
             let _ = slot;
-            if *guest_backed {
-                // Unified memory: the Store already landed in guest pages.
-                continue;
-            }
             let target_len = (width as usize)
                 .saturating_mul(height as usize)
                 .saturating_mul(*bpp);

@@ -1299,10 +1299,6 @@ pub const REGISTRY: &[DeclineClass] = &[
                 "runtime/metal_draw/metal_icb.rs",
                 "metal_icb_sampler_fallback",
             ),
-            (
-                "runtime/metal_draw/mod.rs",
-                "metal_guest_attachment_fallback",
-            ),
         ]),
         // The vocabulary lives at the check sites rather than in the status
         // carrier. Removing the payload-free ARGS/EXECUTE constants makes a
@@ -1314,7 +1310,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("backend/metal/function.rs", "Status::execute"),
             ("backend/metal/render.rs", "Status::args"),
             ("backend/metal/render.rs", "Status::execute"),
-            ("backend/metal/runtime.rs", "Status::args"),
             ("backend/metal/runtime.rs", "Status::execute"),
             ("backend/metal/samplers.rs", "Status::args"),
             ("backend/metal/stage_input.rs", "Status::args"),
@@ -1382,16 +1377,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "metal_function_lookup_failed",
             "metal_function_mtlb_empty",
             "metal_buffer_no_copy_length_mismatch",
-            "metal_type11_alias_device_unavailable",
-            "metal_type11_alias_height_zero",
-            "metal_type11_alias_mapping_zero",
-            "metal_type11_alias_offset_unaligned",
-            "metal_type11_alias_row_bytes_unaligned",
-            "metal_type11_alias_span_out_of_range",
-            "metal_type11_alias_span_overflow",
-            "metal_type11_alias_view_length_zero",
-            "metal_type11_alias_view_pointer_null",
-            "metal_type11_alias_width_zero",
             "metal_render_back_stencil_state_unsupported",
             "metal_render_blend_alpha_operation_unsupported",
             "metal_render_blend_dst_alpha_unsupported",
@@ -2529,7 +2514,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "draw_mtl_fragment_buffer_miss",
             "draw_mtl_vertex_texture_miss",
             "draw_mtl_fragment_texture_miss",
-            "draw_mtl_guest_attachment_window",
             "draw_mtl_writeback_none",
             // `encode_draw_chain` — the Vulkan rail. Its other refusals travel
             // inside `DrawError`'s typed variants; these two are the ones that

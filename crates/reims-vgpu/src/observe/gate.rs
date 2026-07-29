@@ -349,6 +349,62 @@ fn the_host_pointer_import_extension_is_never_requested() {
     );
 }
 
+/// Metal has exactly one no-copy buffer constructor, and it takes host bytes.
+///
+/// `newBufferWithBytesNoCopy` is the Metal half of the same hazard the Vulkan
+/// gate above covers: it hands the GPU a pointer, and if that pointer is a
+/// `mach_vm_remap` view of the guest's pages then the host GPU can read and
+/// write guest RAM. It is not banned outright, because the crate legitimately
+/// aliases its **own** allocations with it — the CPU-staged vertex, fragment
+/// and compute byte vectors in `new_buffer_from_host`, which are `Vec<u8>`s
+/// this process owns.
+///
+/// So the invariant is not "never call it", it is "call it in exactly one
+/// place, whose argument is provably host-owned". A second call site is the
+/// thing to look at, whatever it claims to be aliasing. The one that used to
+/// exist took `MappingEntry::contig_ptr` and became a linear texture the guest
+/// surface was rendered into.
+///
+/// This is a **source** assertion for the same reason as the Vulkan gate, and
+/// one more: `backend-metal` is Apple-only and does not compile on a Linux
+/// host at all, so nothing else in this tree — not the compiler, not clippy,
+/// not the feature matrix — reads that code on the machine most of this work
+/// happens on. Comments and string literals are masked, so this paragraph is
+/// not a hit.
+#[test]
+fn metal_no_copy_buffers_alias_host_memory_and_nothing_else() {
+    const OWNER: &str = "backend/metal/runtime.rs";
+    let root = crate_src();
+    let mut sites = Vec::new();
+    for path in rust_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = mask_comments_and_literals(&src);
+        let folded: String = masked
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let count = folded.matches("new_buffer_with_bytes_no_copy").count();
+        if count > 0 {
+            sites.push((
+                path.strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                count,
+            ));
+        }
+    }
+    assert_eq!(
+        sites,
+        vec![(OWNER.to_string(), 1)],
+        "newBufferWithBytesNoCopy must appear exactly once, in {OWNER}'s \
+         new_buffer_from_host over host-owned bytes; a second site is a \
+         candidate guest-RAM alias"
+    );
+}
+
 /// Free-text `Result` errors cannot return. A typed decline may preserve an
 /// external driver's prose as a field, but the error carrier itself must remain
 /// exhaustively matchable and registered.
@@ -1094,9 +1150,18 @@ fn the_registry_is_what_the_last_migration_recorded() {
         // which never had an emission site — the fragmented and packed present
         // rails share one decision point and one `import_present` notice.
         //
+        //
+        // (66, 1437) -> (66, 1426). Eleven more slugs left with the Metal
+        // guest-RAM texture alias: the ten `metal_type11_alias_*` contract
+        // checks on the `mach_vm_remap` view before `newBufferWithBytesNoCopy`
+        // took it, plus `EncodeStatus::draw_mtl_guest_attachment_window`, the
+        // draw-level refusal when that view could not be resolved. The type-11
+        // color attachment now always renders into a host RT. `Status` keeps
+        // its row for the rest of the Metal surface.
+        //
         // Down is the right direction here. A registered slug for a check the
         // crate can no longer make reads as an available refusal when it is not.
-        (66, 1437),
+        (66, 1426),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

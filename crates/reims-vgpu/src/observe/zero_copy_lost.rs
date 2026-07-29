@@ -44,8 +44,10 @@ pub enum ZeroCopyLost {
     /// Console scanout that used to hand QEMU pixels the GPU wrote in place.
     /// Falls back to the CPU capture copy.
     ConsoleScanout,
-    /// Metal texture that used to alias a `map_pages` view of guest RAM with
-    /// `newBufferWithBytesNoCopy`. Falls back to a copied upload.
+    /// Type-11 color attachment that used to alias a `map_pages` view of guest
+    /// RAM with `newBufferWithBytesNoCopy`, so Metal Load read and Store wrote
+    /// the surface in place. Falls back to a host render target: a CPU seed on
+    /// Load and a CPU writeback on Store.
     MetalGuestTexture,
 }
 
@@ -94,7 +96,7 @@ impl ZeroCopyLost {
             Self::ComputeDirectWriteback => "readback_copy",
             Self::ImportPresent => "cpu_writeback",
             Self::ConsoleScanout => "cpu_capture_copy",
-            Self::MetalGuestTexture => "copied_upload",
+            Self::MetalGuestTexture => "host_rt_seed_and_writeback",
         }
     }
 }

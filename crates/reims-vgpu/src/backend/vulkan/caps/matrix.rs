@@ -43,8 +43,10 @@ use super::zero_copy::DmaSupport;
 /// answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SupportCell {
-    /// Unified memory, some rail is zero-copy. Apple M-series through MoltenVK
-    /// (host-pointer import, no dmabuf); an Intel/AMD iGPU on Mesa (both).
+    /// Unified memory, some rail is zero-copy. An Intel/AMD iGPU on Mesa, via
+    /// dmabuf on the display rail. Apple M-series through MoltenVK used to land
+    /// here on the host-pointer import and now classifies [`Self::UnifiedNoDma`],
+    /// because it has no dmabuf and the import is not requested.
     UnifiedDma,
     /// Unified memory, every crossing copies. Cheap copies — same DRAM, no bus
     /// transfer — but copies.

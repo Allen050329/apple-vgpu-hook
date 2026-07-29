@@ -156,8 +156,8 @@ fn try_capture_from_resident(
 /// CmdDisplaySwap after wait_surface drains — before the packet stamp lets the
 /// guest recycle the mid (BH-deferred freeze captured mid-recycle partials).
 ///
-/// Unified memory: guest pages ARE the surface content — GPU Stores land in
-/// them via the guest-backed attachment. There is exactly one capture source.
+/// Guest pages ARE the surface content — the draw path's CPU writeback lands
+/// Stores in them. There is exactly one capture source.
 /// Takes no `HostOps`: with the guest-page capture path gone this reads the GPU
 /// resident and the host surface cache only — it never touches guest memory.
 pub fn capture_present_frame(

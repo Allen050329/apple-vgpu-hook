@@ -2530,9 +2530,9 @@ pub(crate) fn blit_status_from_fence(status: FenceStatus) -> BlitStatus {
     }
 }
 
-/// Blit into a type-11 destination writes the guest pages, and the mapping's
-/// Metal texture is a view over those same bytes (unified memory) — content
-/// is coherent by construction, no invalidation needed.
+/// Blit into a type-11 destination writes the guest pages directly, and no GPU
+/// object caches those bytes — content is coherent by construction, so there is
+/// nothing to invalidate.
 fn invalidate_type11_last_store(_state: &mut DeviceState, _dst: &TextureBacking) {}
 
 /// Execute a decoded blit command on the product path.

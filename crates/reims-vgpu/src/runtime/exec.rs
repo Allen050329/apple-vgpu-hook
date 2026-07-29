@@ -1601,8 +1601,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                     .map(|c| c.mapping_id != 0)
                     .unwrap_or(false);
                 // Records 2+ of a chain composite over the prior record: force
-                // loadAction=Load on every color. Leaving the pass action on a
-                // guest-backed target let a CLEAR re-run before each record,
+                // loadAction=Load on every color. Leaving the pass action alone
+                // on a type-11 target let a CLEAR re-run before each record,
                 // wiping the full composite drawn by record 1 (live poison=1:
                 // mid peak 10.9M native → 2.5M after later records).
                 if di > 0 {
@@ -1906,8 +1906,8 @@ fn dirty_color_targets<M: HostMemory + HostOps>(
 ) {
     for &tex_ref in refs {
         if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, tex_ref) {
-            // Unified memory: the mapping's texture aliases guest pages, so
-            // there is no mirror to drop — only bump gen for scanout skips.
+            // The guest pages are the only copy of a type-11 surface, so there
+            // is no mirror to drop — only bump gen for scanout skips.
             let _ = state.mark_mapping_written(mid);
         } else if objects::resolve_type4_surface(state, host, tex_ref) {
             let _ = state.mark_mapping_written(tex_ref);
