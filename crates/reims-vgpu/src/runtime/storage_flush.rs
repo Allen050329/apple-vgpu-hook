@@ -496,12 +496,19 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     };
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
-    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
+    if guest_write && !state.gva_write_allowed(entry.task_id, gva, entry.span()) {
+        guest = "skip_uncovered";
+    } else if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
         // The window's pages moved under us. Cache-only: see
         // `window_pages_still_ours` for why writing here lands in another
         // owner's memory.
+        //
+        // Ordered after the map gate deliberately. The gate is a scan of this
+        // task's recorded spans; the drift check walks every page of the window
+        // (73 of them for a 196x381 target), so running it for a write the cheap
+        // check has already rejected pays a page walk per flush for nothing.
         guest = "skip_drift";
-    } else if guest_write && state.gva_write_allowed(entry.task_id, gva, entry.span()) {
+    } else if guest_write {
         guest = match crate::runtime::metal_draw::write_gva_rgba8(
             state,
             host,
@@ -537,8 +544,6 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
                 "write_fail"
             }
         };
-    } else if guest_write {
-        guest = "skip_uncovered";
     }
     crate::runtime::metal_draw::host_cache_store_gva_layer(
         state,
