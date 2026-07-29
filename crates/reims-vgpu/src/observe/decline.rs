@@ -2209,19 +2209,13 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("runtime/mapper.rs", "mapper_device_descriptor_fallback"),
             ("runtime/mapper.rs", "mapper_resolve_fail"),
         ]),
-        // `Status` mixes `Ok` with 17 reason-carrying refusal classes. The
+        // `Status` mixes `Ok` with 14 reason-carrying refusal classes. The
         // vocabulary is written at construction sites; `Refusal::refusal`
         // forwards the carried slug.
         slug_calls: &[
             ("contract/iosurface_pages.rs", "Status::ErrArgs("),
             ("contract/iosurface_pages.rs", "Status::ErrShortDescriptor("),
-            (
-                "contract/iosurface_pages.rs",
-                "Status::ErrUnsupportedFormat(",
-            ),
-            ("contract/iosurface_pages.rs", "Status::ErrZeroDimension("),
             ("contract/iosurface_pages.rs", "Status::ErrOverflow("),
-            ("contract/iosurface_pages.rs", "Status::ErrMappingIdRange("),
             ("contract/iosurface_pages.rs", "Status::ErrNotKernelVa("),
             ("contract/iosurface_pages.rs", "Status::ErrInternalRead("),
             ("contract/iosurface_pages.rs", "Status::ErrInternalOwner("),
@@ -2238,18 +2232,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("contract/iosurface_pages.rs", "Status::ErrSpanRange("),
         ],
         slugs: &[
-            "iosurface_geometry_format_unsupported",
-            "iosurface_geometry_height_zero",
-            "iosurface_geometry_last_row_end_overflow",
-            "iosurface_geometry_last_row_start_overflow",
-            "iosurface_geometry_mapping_id_config_range",
-            "iosurface_geometry_mapping_id_truncated",
-            "iosurface_geometry_mapping_id_u64_range",
-            "iosurface_geometry_page_shift_invalid",
-            "iosurface_geometry_prior_rows_overflow",
-            "iosurface_geometry_sample_window_invalid",
-            "iosurface_geometry_tight_row_overflow",
-            "iosurface_geometry_width_zero",
             "iosurface_mapper_device_desc_pointer_invalid",
             "iosurface_mapper_device_desc_pointer_read",
             "iosurface_mapper_device_desc_pointer_zero",

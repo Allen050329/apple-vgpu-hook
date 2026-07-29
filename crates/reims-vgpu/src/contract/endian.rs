@@ -43,21 +43,6 @@ pub fn at(bytes: &[u8], off: usize, n: usize) -> Option<&[u8]> {
     bytes.get(off..off.checked_add(n)?)
 }
 
-#[inline]
-pub fn ld16_at(bytes: &[u8], off: usize) -> Option<u16> {
-    Some(ld16(at(bytes, off, 2)?))
-}
-
-#[inline]
-pub fn ld32_at(bytes: &[u8], off: usize) -> Option<u32> {
-    Some(ld32(at(bytes, off, 4)?))
-}
-
-#[inline]
-pub fn ld64_at(bytes: &[u8], off: usize) -> Option<u64> {
-    Some(ld64(at(bytes, off, 8)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,15 +58,5 @@ mod tests {
         assert_eq!(ld16(&bytes[0..2]), 0x1234);
         assert_eq!(ld32(&bytes[2..6]), 0x89ab_cdef);
         assert_eq!(ld64(&bytes[6..14]), 0x0123_4567_89ab_cdef);
-    }
-
-    #[test]
-    fn absolute_reads_are_checked_including_offset_overflow() {
-        let bytes = [0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0];
-        assert_eq!(ld16_at(&bytes, 1), Some(0x3456));
-        assert_eq!(ld32_at(&bytes, 0), Some(0x1234_5678));
-        assert_eq!(ld64_at(&bytes, 0), Some(0x1234_5678));
-        assert_eq!(ld32_at(&bytes, 6), None);
-        assert_eq!(at(&bytes, usize::MAX, 2), None);
     }
 }

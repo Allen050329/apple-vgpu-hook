@@ -4,7 +4,6 @@ use crate::contract::endian::{ld16, ld32, ld64};
 use crate::contract::pixel_format;
 use crate::contract::{align_up_u64, checked_add_u64, checked_mul_u64};
 
-pub const U16_SIZE: usize = 2;
 pub const U32_SIZE: usize = 4;
 pub const U64_SIZE: usize = 8;
 
@@ -96,10 +95,7 @@ pub enum Status {
     Ok,
     ErrArgs(&'static str),
     ErrShortDescriptor(&'static str),
-    ErrUnsupportedFormat(&'static str),
-    ErrZeroDimension(&'static str),
     ErrOverflow(&'static str),
-    ErrMappingIdRange(&'static str),
     ErrNotKernelVa(&'static str),
     ErrInternalRead(&'static str),
     ErrInternalOwner(&'static str),
@@ -119,10 +115,7 @@ impl crate::observe::Refusal for Status {
             Self::Ok => None,
             Self::ErrArgs(reason)
             | Self::ErrShortDescriptor(reason)
-            | Self::ErrUnsupportedFormat(reason)
-            | Self::ErrZeroDimension(reason)
             | Self::ErrOverflow(reason)
-            | Self::ErrMappingIdRange(reason)
             | Self::ErrNotKernelVa(reason)
             | Self::ErrInternalRead(reason)
             | Self::ErrInternalOwner(reason)
@@ -142,10 +135,7 @@ impl crate::observe::Refusal for Status {
             Self::Ok => return Vec::new(),
             Self::ErrArgs(_) => "args",
             Self::ErrShortDescriptor(_) => "short_descriptor",
-            Self::ErrUnsupportedFormat(_) => "unsupported_format",
-            Self::ErrZeroDimension(_) => "zero_dimension",
             Self::ErrOverflow(_) => "overflow",
-            Self::ErrMappingIdRange(_) => "mapping_id_range",
             Self::ErrNotKernelVa(_) => "not_kernel_va",
             Self::ErrInternalRead(_) => "internal_read",
             Self::ErrInternalOwner(_) => "internal_owner",
@@ -183,21 +173,6 @@ pub struct TextureDescriptor {
     pub pixel_format: u16,
     pub width: u32,
     pub height: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PlaneGeometry {
-    pub mapping_id: u32,
-    pub plane_index: u32,
-    pub pixel_format: u16,
-    pub bytes_per_pixel: u32,
-    pub width: u32,
-    pub height: u32,
-    pub bytes_per_row: u64,
-    pub surface_byte_offset: u64,
-    pub allocation_size: u64,
-    pub last_row_end: u64,
-    pub page_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -261,11 +236,6 @@ pub struct DevicePlaneRecord {
     pub bytes_per_element: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GeometryConfig {
-    pub max_mapping_count: u32,
-}
-
 pub fn arm_kernel_va(address: u64) -> bool {
     (address & ARM_KERNEL_VA_MASK) == ARM_KERNEL_VA_BASE
 }
@@ -277,11 +247,6 @@ pub fn x86_kernel_va(address: u64) -> bool {
 /// Guest kernel VA: arm64e TTBR1 window **or** x86_64 Darwin high half.
 pub fn guest_kernel_va(address: u64) -> bool {
     arm_kernel_va(address) || x86_kernel_va(address)
-}
-
-/// **Arm64e only** (16 KiB pages). Prefer [`span_page_count_shift`] for product.
-pub fn span_page_count_arm64e(min_size: u64) -> u64 {
-    span_page_count_shift(min_size, PAGE_SHIFT_ARM64E)
 }
 
 pub fn span_page_count_shift(min_size: u64, page_shift: u32) -> u64 {
@@ -497,11 +462,6 @@ pub fn sample_window_prefer_device(
     Some((off, bpr, end, false))
 }
 
-/// **Arm64e only** (PFN → GPA with shift 14). Prefer [`entry_gpa_shift`].
-pub fn entry_gpa_arm64e(entry: u32) -> Option<u64> {
-    entry_gpa_shift(entry, PAGE_SHIFT_ARM64E)
-}
-
 pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
     if (entry & PAGE_ENTRY_VALID) == 0 {
         return None;
@@ -574,85 +534,6 @@ pub fn decode_mapper_request_entry(bytes: &[u8]) -> Result<MapperRequestEntry, S
         mapping_id: ld32(&bytes[MAPPER_REQUEST_MAPPING_ID..]),
         reserved: ld64(&bytes[MAPPER_REQUEST_RESERVED..]),
     })
-}
-
-/// Plane geometry with an explicit guest page_shift (12 = x86, 14 = arm64e).
-/// Product paths must pass `state.page_shift`, not a fixed arch constant.
-pub fn make_geometry_shift(
-    desc: &TextureDescriptor,
-    config: Option<&GeometryConfig>,
-    page_shift: u32,
-) -> Result<PlaneGeometry, Status> {
-    if page_shift == 0 || page_shift > 30 {
-        return Err(Status::ErrArgs("iosurface_geometry_page_shift_invalid"));
-    }
-    if desc.mapping_id64 > u32::MAX as u64 {
-        return Err(Status::ErrMappingIdRange(
-            "iosurface_geometry_mapping_id_u64_range",
-        ));
-    }
-    if desc.mapping_id as u64 != desc.mapping_id64 {
-        return Err(Status::ErrMappingIdRange(
-            "iosurface_geometry_mapping_id_truncated",
-        ));
-    }
-    if let Some(cfg) = config {
-        if cfg.max_mapping_count != 0 && desc.mapping_id >= cfg.max_mapping_count {
-            return Err(Status::ErrMappingIdRange(
-                "iosurface_geometry_mapping_id_config_range",
-            ));
-        }
-    }
-    if desc.width == 0 {
-        return Err(Status::ErrZeroDimension("iosurface_geometry_width_zero"));
-    }
-    if desc.height == 0 {
-        return Err(Status::ErrZeroDimension("iosurface_geometry_height_zero"));
-    }
-    let bpp = format_bytes_per_pixel(desc.pixel_format).ok_or(Status::ErrUnsupportedFormat(
-        "iosurface_geometry_format_unsupported",
-    ))?;
-    let plane_index = if desc.has_plane_index {
-        desc.plane_index
-    } else {
-        0
-    };
-    let (surface_byte_offset, bytes_per_row, span_end) =
-        sample_window(plane_index, desc.pixel_format, desc.width, desc.height).ok_or(
-            Status::ErrOverflow("iosurface_geometry_sample_window_invalid"),
-        )?;
-    let tight = checked_mul_u64(desc.width as u64, bpp as u64)
-        .ok_or(Status::ErrOverflow("iosurface_geometry_tight_row_overflow"))?;
-    let prior_rows = checked_mul_u64(desc.height as u64 - 1, bytes_per_row as u64).ok_or(
-        Status::ErrOverflow("iosurface_geometry_prior_rows_overflow"),
-    )?;
-    let last_row_start = checked_add_u64(surface_byte_offset, prior_rows).ok_or(
-        Status::ErrOverflow("iosurface_geometry_last_row_start_overflow"),
-    )?;
-    let last_row_end = checked_add_u64(last_row_start, tight).ok_or(Status::ErrOverflow(
-        "iosurface_geometry_last_row_end_overflow",
-    ))?;
-    Ok(PlaneGeometry {
-        mapping_id: desc.mapping_id,
-        plane_index,
-        pixel_format: desc.pixel_format,
-        bytes_per_pixel: bpp,
-        width: desc.width,
-        height: desc.height,
-        bytes_per_row: bytes_per_row as u64,
-        surface_byte_offset,
-        allocation_size: span_end,
-        last_row_end,
-        page_count: span_page_count_shift(span_end, page_shift),
-    })
-}
-
-/// **Arm64e only** (16 KiB pages). Prefer [`make_geometry_shift`] for product.
-pub fn make_geometry_arm64e(
-    desc: &TextureDescriptor,
-    config: Option<&GeometryConfig>,
-) -> Result<PlaneGeometry, Status> {
-    make_geometry_shift(desc, config, PAGE_SHIFT_ARM64E)
 }
 
 fn read_u32(mem: &dyn PagesMemory, address: u64) -> Option<u32> {
@@ -1045,32 +926,6 @@ mod tests {
     }
 
     #[test]
-    fn geometry_reports_the_exact_zero_dimension() {
-        let base = TextureDescriptor {
-            mapping_id64: 1,
-            mapping_id: 1,
-            pixel_format: MTL_FORMAT_BGRA8_UNORM,
-            width: 1,
-            height: 1,
-            ..TextureDescriptor::default()
-        };
-        let width = make_geometry_shift(
-            &TextureDescriptor { width: 0, ..base },
-            None,
-            PAGE_SHIFT_ARM64E,
-        )
-        .unwrap_err();
-        let height = make_geometry_shift(
-            &TextureDescriptor { height: 0, ..base },
-            None,
-            PAGE_SHIFT_ARM64E,
-        )
-        .unwrap_err();
-        assert_eq!(width.refusal(), Some("iosurface_geometry_width_zero"));
-        assert_eq!(height.refusal(), Some("iosurface_geometry_height_zero"));
-    }
-
-    #[test]
     fn table_entry_failure_outranks_an_unreadable_alternative_pointer() {
         let internal = ARM_KERNEL_VA_BASE + 0x10_000;
         let field_48 = ARM_KERNEL_VA_BASE + 0x20_000;
@@ -1119,23 +974,24 @@ mod tests {
         let d = decode_texture_descriptor(&bytes).unwrap();
         assert_eq!(d.mapping_id, 3);
         assert_eq!(d.pixel_format, MTL_FORMAT_BGRA8_UNORM);
-        let g = make_geometry_arm64e(&d, None).unwrap();
-        assert_eq!(g.width, 64);
-        assert_eq!(g.bytes_per_row, 256);
-        let gx = make_geometry_shift(&d, None, crate::contract::gva::PAGE_SHIFT_X86).unwrap();
-        // Same byte span; page_count differs by guest page size (4KiB vs 16KiB).
-        assert_eq!(gx.allocation_size, g.allocation_size);
-        assert!(gx.page_count >= g.page_count);
+        assert_eq!(d.width, 64);
+        assert_eq!(d.height, 32);
     }
 
     #[test]
     fn entry_gpa_and_span() {
-        assert!(entry_gpa_arm64e(0).is_none());
+        assert!(entry_gpa_shift(0, PAGE_SHIFT_ARM64E).is_none());
         let e = (5 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        assert_eq!(entry_gpa_arm64e(e).unwrap(), (5u64) << PAGE_SHIFT_ARM64E);
-        assert_eq!(span_page_count_arm64e(0), 1);
-        assert_eq!(span_page_count_arm64e(1), 1);
-        assert_eq!(span_page_count_arm64e(PAGE_SIZE_ARM64E + 1), 2);
+        assert_eq!(
+            entry_gpa_shift(e, PAGE_SHIFT_ARM64E).unwrap(),
+            (5u64) << PAGE_SHIFT_ARM64E
+        );
+        assert_eq!(span_page_count_shift(0, PAGE_SHIFT_ARM64E), 1);
+        assert_eq!(span_page_count_shift(1, PAGE_SHIFT_ARM64E), 1);
+        assert_eq!(
+            span_page_count_shift(PAGE_SIZE_ARM64E + 1, PAGE_SHIFT_ARM64E),
+            2
+        );
     }
 
     #[test]

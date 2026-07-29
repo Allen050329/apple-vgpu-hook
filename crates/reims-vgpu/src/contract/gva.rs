@@ -48,16 +48,6 @@ pub fn page_offset(address: u64, page_shift: u32) -> u32 {
     (address & mask) as u32
 }
 
-#[inline]
-pub fn page_aligned(address: u64, page_shift: u32) -> bool {
-    page_offset(address, page_shift) == 0
-}
-
-#[inline]
-pub fn pages_to_bytes(page_count: u32, page_shift: u32) -> u64 {
-    (page_count as u64) << page_shift
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,10 +70,8 @@ mod tests {
     fn explicit_shift_helpers_round_trip_page_and_offset() {
         for shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
             let gpa = pfn_to_gpa(0x1234, shift);
-            assert!(page_aligned(gpa, shift));
             assert_eq!(page_index(gpa + 0x321, shift), 0x1234);
             assert_eq!(page_offset(gpa + 0x321, shift), 0x321);
-            assert_eq!(pages_to_bytes(0x1234, shift), gpa);
         }
     }
 }

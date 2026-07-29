@@ -632,25 +632,6 @@ pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
     width.checked_mul(bpp)
 }
 
-pub fn row_bytes_aligned(width: u32, format: u16, alignment: u32) -> Option<u32> {
-    if width == 0 || alignment == 0 {
-        return None;
-    }
-    let bpp = bytes_per_pixel(format)?;
-    let row = checked_mul_u64(width as u64, bpp as u64)?;
-    let rem = row % alignment as u64;
-    let row = if rem != 0 {
-        row.checked_add(alignment as u64 - rem)?
-    } else {
-        row
-    };
-    if row > u32::MAX as u64 {
-        None
-    } else {
-        Some(row as u32)
-    }
-}
-
 pub fn iosurface_row_bytes(width: u32, format: u16) -> Option<u32> {
     if width == 0 {
         return None;
@@ -668,16 +649,6 @@ pub fn iosurface_row_bytes(width: u32, format: u16) -> Option<u32> {
     } else {
         Some(row as u32)
     }
-}
-
-pub fn tight_image_size(width: u32, height: u32, format: u16) -> Option<usize> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let bpp = bytes_per_pixel(format)?;
-    let pixels = checked_mul_u64(width as u64, height as u64)?;
-    let bytes = checked_mul_u64(pixels, bpp as u64)?;
-    usize::try_from(bytes).ok()
 }
 
 pub fn swizzle_identity() -> SwizzlePlan {
@@ -719,13 +690,6 @@ pub fn swizzle_is_identity(plan: &SwizzlePlan) -> bool {
             SwizzleSource::B,
             SwizzleSource::A,
         ]
-}
-
-pub fn swizzle_word(raw: &[u8; COMPONENT_COUNT]) -> u32 {
-    u32::from(raw[0])
-        | (u32::from(raw[1]) << 8)
-        | (u32::from(raw[2]) << 16)
-        | (u32::from(raw[3]) << 24)
 }
 
 pub fn apply_swizzle_rgba8(plan: &SwizzlePlan, in_rgba: [u8; 4]) -> [u8; 4] {
@@ -800,10 +764,6 @@ fn f16_to_unorm8_lut() -> &'static [u8; 65536] {
     LUT.get_or_init(build_f16_to_unorm8_lut)
 }
 
-pub fn f16_to_unorm8(half_bits: u16) -> u8 {
-    f16_to_unorm8_lut()[half_bits as usize]
-}
-
 fn unorm8_to_f16_slow(value: u8) -> u16 {
     let f = f32::from(value) / f32::from(UNORM8_MAX);
     let x = f.to_bits();
@@ -847,10 +807,6 @@ fn unorm8_to_f16_lut() -> &'static [u16; 256] {
         }
         lut
     })
-}
-
-pub fn unorm8_to_f16(value: u8) -> u16 {
-    unorm8_to_f16_lut()[value as usize]
 }
 
 pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
@@ -959,20 +915,6 @@ fn row_walk_backward(
 
 pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
     convert_row_to_rgba8_ex(format, src, pixels, dst_rgba, false)
-}
-
-pub fn convert_row_to_rgba8_inplace(format: u16, buf: &mut [u8], pixels: u32, bpp: u32) -> bool {
-    // In-place expand: process backward if bpp < 4.
-    let src_len = (pixels as usize).checked_mul(bpp as usize).unwrap_or(0);
-    let dst_len = (pixels as usize)
-        .checked_mul(RGBA8_BPP as usize)
-        .unwrap_or(0);
-    if buf.len() < dst_len.max(src_len) {
-        return false;
-    }
-    // Copy src first into temporary when expanding in place.
-    let src_owned = buf[..src_len].to_vec();
-    convert_row_to_rgba8(format, &src_owned, pixels, &mut buf[..dst_len])
 }
 
 fn convert_row_to_rgba8_ex(
@@ -1362,30 +1304,18 @@ mod tests {
         // Same 4 Bpp packing as BGRA8 → same 128 B aligned row for w=200.
         assert_eq!(iosurface_row_bytes(200, MTL_FORMAT_RGBA8_UNORM), Some(896));
         assert_eq!(tight_row_bytes(200, MTL_FORMAT_BGRA8_UNORM), Some(800));
-        assert_eq!(row_bytes_aligned(3, MTL_FORMAT_RGBA32_FLOAT, 64), Some(64));
-        assert_eq!(tight_image_size(4, 3, MTL_FORMAT_RGBA8_UNORM), Some(48));
-        assert_eq!(
-            tight_image_size(u32::MAX, u32::MAX, MTL_FORMAT_RGBA32_FLOAT),
-            None
-        );
     }
 
     #[test]
     fn swizzle_and_texels() {
         let plan = swizzle_plan(&[2, 3, 4, 5]).unwrap();
         assert!(swizzle_is_identity(&plan));
-        assert_eq!(swizzle_word(&[2, 3, 4, 5]), 0x05040302);
         let bgra = [10u8, 20, 30, 40];
         let rgba = texel_to_rgba8(MTL_FORMAT_BGRA8_UNORM, &bgra).unwrap();
         assert_eq!(rgba, [30, 20, 10, 40]);
         let mut out = [0u8; 4];
         assert!(rgba8_to_texel(MTL_FORMAT_BGRA8_UNORM, rgba, &mut out));
         assert_eq!(out, bgra);
-
-        // f16 round-trip identity for unorm8 extremes
-        assert_eq!(f16_to_unorm8(unorm8_to_f16(0)), 0);
-        assert_eq!(f16_to_unorm8(unorm8_to_f16(255)), 255);
-        assert_eq!(f16_to_unorm8(unorm8_to_f16(128)), 128);
 
         let row = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let mut rgba_row = [0u8; 8];
@@ -1405,11 +1335,14 @@ mod tests {
         ));
         assert_eq!(back, row);
 
-        // property: random unorm8 -> f16 -> unorm8 stable for all bytes
+        // Property: the two lookup tables the conversion paths index are
+        // exact inverses over every byte. Asserted against the tables
+        // themselves, which is what those paths read.
+        let to_f16 = unorm8_to_f16_lut();
+        let to_u8 = f16_to_unorm8_lut();
         for v in 0u8..=255 {
-            assert_eq!(f16_to_unorm8(unorm8_to_f16(v)), v);
+            assert_eq!(to_u8[to_f16[v as usize] as usize], v);
         }
-        let _ = convert_row_to_rgba8_inplace;
         let _ = f64_to_unorm8(0.5);
         let _ = f16_to_f32(0x3c00); // 1.0
     }

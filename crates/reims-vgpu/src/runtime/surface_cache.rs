@@ -450,21 +450,6 @@ pub fn get_gva_with_owner(
     Some((&e.bgra[..need], e.host_gen, e.producer_object_type))
 }
 
-/// Peek GVA encode without geom filter (tests / diagnostics).
-pub fn get_gva_any(state: &DeviceState, gva: u64) -> Option<(u32, u32, &[u8])> {
-    let e = state.host_gva_surfaces.get(&gva)?;
-    if e.width == 0 || e.height == 0 || e.bgra.is_empty() {
-        return None;
-    }
-    let need = (e.height as usize)
-        .saturating_mul(e.width as usize)
-        .saturating_mul(RGBA8_BPP as usize);
-    if e.bgra.len() < need {
-        return None;
-    }
-    Some((e.width, e.height, &e.bgra[..need]))
-}
-
 
 /// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
@@ -811,11 +796,7 @@ mod tests {
             chunk[3] = 255;
         }
         store_gva(&mut st, gva, w, h, px);
-        assert!(get_gva(&st, gva, w, h).is_some());
-        // Readable with no geometry supplied: the caller after a remap knows the
-        // VA and nothing else.
-        let (gw, gh, got) = get_gva_any(&st, gva).expect("retained on the VA key");
-        assert_eq!((gw, gh), (w, h));
+        let got = get_gva(&st, gva, w, h).expect("retained on the VA key");
         assert_eq!(got[0], 185);
         assert_eq!(got[2], 81);
     }
