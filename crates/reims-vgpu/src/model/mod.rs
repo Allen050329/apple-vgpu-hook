@@ -102,27 +102,6 @@ impl<B: Backend> Device<B> {
         runtime::drain::drain_pending(&mut self.state, host);
     }
 
-    /// Write BGRA8 into a guest mapping (contig HostOps view) and bump generation.
-    pub fn write_mapping_bgra8<H: runtime::host::HostMemory + runtime::host::HostOps>(
-        &mut self,
-        host: &mut H,
-        mapping_id: u32,
-        src: &[u8],
-        src_stride: u32,
-        width: u32,
-        height: u32,
-    ) -> bool {
-        runtime::mapping_write::write_bgra8(
-            &mut self.state,
-            host,
-            mapping_id,
-            src,
-            src_stride,
-            width,
-            height,
-        )
-    }
-
     pub fn fails(&self) -> &[FailEvent] {
         &self.state.fails
     }

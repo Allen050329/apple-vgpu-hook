@@ -999,12 +999,11 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (69, 1566): removing the uncalled `retire_gva_views_for_task`
-        // retired `ViewAliasSite` and its one `view_alias_retire` slug. That
-        // tripwire's "measured zero on two boots" was unreadable — its only
-        // emission site sat inside a function with no callers, so the zero meant
-        // "could never fire", not "did not fire".
-        (68, 1565),
+        // Down from (68, 1565): `iosurface_pages`'s `validate_cached_table` and
+        // `table_first_gpa` had no callers — only the arm64e wrappers that also
+        // had none — so `Status` could not reach their four slugs. The type
+        // count is unchanged; `Status` still writes 40 others.
+        (68, 1561),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

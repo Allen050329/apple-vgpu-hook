@@ -647,14 +647,6 @@ pub fn flush_gva_host_cache_on_map<
     stats
 }
 
-/// Empty cache for tests.
-pub fn clear_all(state: &mut DeviceState) {
-    state.host_surfaces.clear();
-    state.host_texture_surfaces.clear();
-    state.host_gva_surfaces.clear();
-    state.host_linear_textures.clear();
-}
-
 #[cfg(test)]
 mod tests {
 

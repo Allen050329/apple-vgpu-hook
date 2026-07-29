@@ -68,58 +68,6 @@ pub fn write_u32<H: HostMemory + HostOps>(
     write_bytes(host, gpa, &v.to_le_bytes(), page_size)
 }
 
-/// Write a little-endian u16 at `gpa`.
-pub fn write_u16<H: HostMemory + HostOps>(
-    host: &mut H,
-    gpa: u64,
-    v: u16,
-    page_size: usize,
-) -> Result<(), MemError> {
-    write_bytes(host, gpa, &v.to_le_bytes(), page_size)
-}
-
-/// Read `buf.len()` bytes from guest physical `gpa` through map_pages.
-pub fn read_bytes<H: HostMemory + HostOps>(
-    host: &mut H,
-    gpa: u64,
-    buf: &mut [u8],
-    page_size: usize,
-) -> Result<(), MemError> {
-    if buf.is_empty() {
-        return Ok(());
-    }
-    if page_size == 0 || !page_size.is_power_of_two() {
-        return Err(MemError::BadArgs);
-    }
-    let page_size_u = page_size as u64;
-    let page_mask = page_size_u - 1;
-    let start = gpa & !page_mask;
-    let end = gpa
-        .checked_add(buf.len() as u64)
-        .ok_or(MemError::Overflow)?;
-    let mut gpas = Vec::new();
-    let mut p = start;
-    while p < end {
-        gpas.push(p);
-        p = p.checked_add(page_size_u).ok_or(MemError::Overflow)?;
-    }
-    let Some(ptr) = host.map_pages(&gpas, page_size) else {
-        return Err(MemError::Unmapped);
-    };
-    let total = gpas.len() * page_size;
-    let off = (gpa - start) as usize;
-    if ptr == 0 || off + buf.len() > total {
-        host.unmap_pages(ptr, total);
-        return Err(MemError::Unmapped);
-    }
-    // SAFETY: map covers total bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping((ptr as *const u8).add(off), buf.as_mut_ptr(), buf.len());
-    }
-    host.unmap_pages(ptr, total);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

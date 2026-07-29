@@ -807,22 +807,6 @@ pub fn object_type_name(t: u8) -> &'static str {
     }
 }
 
-pub fn descriptor_kind_name(k: DescriptorKind) -> &'static str {
-    match k {
-        DescriptorKind::Buffer => "buffer",
-        DescriptorKind::Texture => "texture",
-        DescriptorKind::Sampler => "sampler",
-        DescriptorKind::Function => "function",
-        DescriptorKind::RenderPipeline => "renderPipeline",
-        DescriptorKind::ComputePipeline => "computePipeline",
-        DescriptorKind::DepthStencil => "depthStencil",
-        DescriptorKind::TextureView => "textureView",
-        DescriptorKind::IOSurfaceTexture => "iosurfaceTexture",
-        DescriptorKind::IndirectCommandBuffer => "indirectCommandBuffer",
-        DescriptorKind::Unknown => "unknown",
-    }
-}
-
 pub fn object_type_producer_coverage(t: u8) -> ProducerCoverage {
     match t {
         OBJECT_TYPE_BUFFER
@@ -833,15 +817,6 @@ pub fn object_type_producer_coverage(t: u8) -> ProducerCoverage {
         | OBJECT_TYPE_TEXTURE_VIEW
         | OBJECT_TYPE_IOSURFACE => ProducerCoverage::Emitted,
         _ => ProducerCoverage::Unknown,
-    }
-}
-
-pub fn producer_coverage_name(c: ProducerCoverage) -> &'static str {
-    match c {
-        ProducerCoverage::Unknown => "unknown",
-        ProducerCoverage::Emitted => "emitted",
-        ProducerCoverage::Rejected => "rejected",
-        ProducerCoverage::HostOnly => "host-only",
     }
 }
 
@@ -897,22 +872,6 @@ pub fn decode_object_entry(bytes: &[u8]) -> Result<ObjectEntry, DecodeStatus> {
 /// Prefer live list offset; keep name for callers.
 pub fn object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
     list_object_entry_offset(ref_, entry_count)
-}
-
-pub fn descriptor_read_len(object_type: u8, declared_len: u32) -> Option<u32> {
-    if declared_len == 0 {
-        return None;
-    }
-    match object_type {
-        OBJECT_TYPE_BUFFER
-        | OBJECT_TYPE_TEXTURE
-        | OBJECT_TYPE_TEXTURE_VARIANT
-        | OBJECT_TYPE_FUNCTION
-        | OBJECT_TYPE_TYPE7
-        | OBJECT_TYPE_TEXTURE_VIEW
-        | OBJECT_TYPE_IOSURFACE => Some(declared_len),
-        _ => None,
-    }
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -2218,15 +2177,6 @@ pub fn decode_pipeline_tlvs(bytes: &[u8]) -> Result<Vec<Tlv>, DecodeStatus> {
         return Err(DecodeStatus::ErrBadLength("res_wide_tlv_trailing_bytes"));
     }
     Ok(out)
-}
-
-/// Extract a u32 from a legacy wide TLV value region.
-pub fn tlv_u32_value(bytes: &[u8], tlv: &Tlv) -> Option<u32> {
-    let start = tlv.value_offset;
-    if start + 4 > bytes.len() {
-        return None;
-    }
-    Some(ld32(&bytes[start..]))
 }
 
 pub fn decode_descriptor(object_type: u8, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {

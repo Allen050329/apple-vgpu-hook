@@ -85,7 +85,6 @@ pub const MAPPING_INTERNAL_PAGE_FIELD_50: u64 = 0x50;
 pub const MAPPING_INTERNAL_PAGE_COUNT: u64 = 0x70;
 pub const MAPPING_PAGE_TABLE_FROM_F48: u64 = 0xb8;
 pub const MAPPING_PAGE_TABLE_FROM_F50: u64 = 0x28;
-pub const MAPPER_SURFACE_TABLE_ENTRY_CAP: u32 = 8192;
 
 pub const ARM_KERNEL_VA_MASK: u64 = 0xffffff00_00000000;
 pub const ARM_KERNEL_VA_BASE: u64 = 0xfffffe00_00000000;
@@ -160,29 +159,6 @@ impl crate::observe::Refusal for Status {
             Self::ErrSpanRange(_) => "span_range",
         };
         vec![("class", class.to_string())]
-    }
-}
-
-pub fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Ok => "ok",
-        Status::ErrArgs(_) => "bad arguments",
-        Status::ErrShortDescriptor(_) => "short descriptor",
-        Status::ErrUnsupportedFormat(_) => "unsupported pixel format",
-        Status::ErrZeroDimension(_) => "zero dimension",
-        Status::ErrOverflow(_) => "integer overflow",
-        Status::ErrMappingIdRange(_) => "mapping id out of range",
-        Status::ErrNotKernelVa(_) => "not a kernel virtual address",
-        Status::ErrInternalRead(_) => "mapper internal read failed",
-        Status::ErrInternalOwner(_) => "mapper internal owner mismatch",
-        Status::ErrInternalMappingId(_) => "mapper internal mapping id mismatch",
-        Status::ErrInternalSize(_) => "mapper internal size mismatch",
-        Status::ErrInternalFields(_) => "mapper internal page fields invalid",
-        Status::ErrPageCount(_) => "page count invalid",
-        Status::ErrPageTableRead(_) => "page table read failed",
-        Status::ErrPageEntry(_) => "page table entry invalid",
-        Status::ErrNoPageTable(_) => "no page table",
-        Status::ErrSpanRange(_) => "span out of range",
     }
 }
 
@@ -314,25 +290,6 @@ pub fn span_page_count_shift(min_size: u64, page_shift: u32) -> u64 {
     } else {
         ((min_size - 1) >> page_shift) + 1
     }
-}
-
-/// **Arm64e only.** Prefer [`span_page_count_shift`] + cast for product.
-pub fn span_page_count_u32_arm64e(min_size: u64) -> u32 {
-    let pages = span_page_count_arm64e(min_size);
-    if pages > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        pages as u32
-    }
-}
-
-/// **Arm64e only.** Prefer [`entry_count_covers_span_shift`].
-pub fn entry_count_covers_span_arm64e(entry_count: u32, min_size: u64) -> bool {
-    entry_count_covers_span_shift(entry_count, min_size, PAGE_SHIFT_ARM64E)
-}
-
-pub fn entry_count_covers_span_shift(entry_count: u32, min_size: u64, page_shift: u32) -> bool {
-    (entry_count as u64) * page_size_of(page_shift) >= min_size
 }
 
 pub fn format_bytes_per_pixel(pixel_format: u16) -> Option<u32> {
@@ -552,17 +509,6 @@ pub fn entry_gpa_shift(entry: u32, page_shift: u32) -> Option<u64> {
     Some(((entry >> PAGE_ENTRY_PFN_SHIFT) as u64) << page_shift)
 }
 
-pub fn mapper_surface_table_count_valid(entry_count: u32) -> bool {
-    entry_count <= MAPPER_SURFACE_TABLE_ENTRY_CAP
-}
-
-pub fn mapper_surface_table_entry_offset(index: u32, entry_count: u32) -> Option<u64> {
-    if !mapper_surface_table_count_valid(entry_count) || index >= entry_count {
-        return None;
-    }
-    Some((index as u64) * U64_SIZE as u64)
-}
-
 pub fn mapper_request_entry_offset(index: u32) -> u64 {
     (index as u64) * MAPPER_REQUEST_ENTRY_LEN as u64
 }
@@ -599,14 +545,6 @@ pub fn required_entry_count(
         ));
     }
     Ok(pages64 as u32)
-}
-
-/// **Arm64e only.** Prefer [`required_entry_count`] with device `page_shift`.
-pub fn required_entry_count_arm64e(
-    fields: &MapperInternalFields,
-    min_size: u64,
-) -> Result<u32, Status> {
-    required_entry_count(fields, min_size, PAGE_SHIFT_ARM64E)
 }
 
 pub fn decode_texture_descriptor(bytes: &[u8]) -> Result<TextureDescriptor, Status> {
@@ -847,44 +785,6 @@ pub fn validate_mapper_internal(
     Status::Ok
 }
 
-pub fn validate_cached_table(
-    mem: &dyn PagesMemory,
-    expected_mapping_id: u32,
-    fields: &MapperInternalFields,
-    min_size: u64,
-    cached: &PageTablePlan,
-    page_shift: u32,
-) -> Status {
-    if cached.entries.is_empty()
-        || !entry_count_covers_span_shift(cached.entries.len() as u32, min_size, page_shift)
-    {
-        return Status::ErrPageCount("iosurface_cached_table_span_uncovered");
-    }
-    let status = validate_mapper_internal(mem, expected_mapping_id, fields);
-    if status != Status::Ok {
-        return status;
-    }
-    Status::Ok
-}
-
-/// **Arm64e only.** Prefer [`validate_cached_table`] with device `page_shift`.
-pub fn validate_cached_table_arm64e(
-    mem: &dyn PagesMemory,
-    expected_mapping_id: u32,
-    fields: &MapperInternalFields,
-    min_size: u64,
-    cached: &PageTablePlan,
-) -> Status {
-    validate_cached_table(
-        mem,
-        expected_mapping_id,
-        fields,
-        min_size,
-        cached,
-        PAGE_SHIFT_ARM64E,
-    )
-}
-
 fn read_table_entries(
     mem: &dyn PagesMemory,
     table_kva: u64,
@@ -1000,43 +900,6 @@ pub fn build_table_plan(
         .unwrap_or(Status::ErrNoPageTable(
             "iosurface_page_table_failure_unattributed",
         )))
-}
-
-/// **Arm64e only.** Prefer [`build_table_plan`] with device `page_shift`.
-pub fn build_table_plan_arm64e(
-    mem: &dyn PagesMemory,
-    expected_mapping_id: u32,
-    fields: &MapperInternalFields,
-    min_size: u64,
-) -> Result<PageTablePlan, Status> {
-    build_table_plan(
-        mem,
-        expected_mapping_id,
-        fields,
-        min_size,
-        PAGE_SHIFT_ARM64E,
-    )
-}
-
-pub fn table_first_gpa(
-    mem: &dyn PagesMemory,
-    table: &PageTablePlan,
-    page_shift: u32,
-) -> Result<u64, Status> {
-    if table.entries.is_empty() {
-        return Err(Status::ErrPageEntry("iosurface_table_first_entry_missing"));
-    }
-    let gpa = entry_gpa_shift(table.entries[0], page_shift)
-        .ok_or(Status::ErrPageEntry("iosurface_table_first_entry_invalid"))?;
-    if !mem.is_ram_gpa(gpa) {
-        return Err(Status::ErrPageEntry("iosurface_table_first_gpa_not_ram"));
-    }
-    Ok(gpa)
-}
-
-/// **Arm64e only.** Prefer [`table_first_gpa`] with device `page_shift`.
-pub fn table_first_gpa_arm64e(mem: &dyn PagesMemory, table: &PageTablePlan) -> Result<u64, Status> {
-    table_first_gpa(mem, table, PAGE_SHIFT_ARM64E)
 }
 
 /// **Arm64e only.** Prefer [`plan_span_shift`] with device page_shift.

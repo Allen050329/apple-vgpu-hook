@@ -269,31 +269,6 @@ pub fn resolve_status_name(status: ResolveStatus) -> &'static str {
     }
 }
 
-pub fn cache_status_name(status: CacheStatus) -> &'static str {
-    match status {
-        CacheStatus::Disabled => "disabled",
-        CacheStatus::Hit => "hit",
-        CacheStatus::Miss => "miss",
-        CacheStatus::MissInserted => "miss-inserted",
-    }
-}
-
-pub fn span_kind_name(kind: SpanKind) -> &'static str {
-    match kind {
-        SpanKind::Empty => "empty",
-        SpanKind::SinglePage => "single-page",
-        SpanKind::MultiPage => "multi-page",
-        SpanKind::Overflow => "overflow",
-    }
-}
-
-pub fn arch_geometry(architecture: Architecture) -> &'static Geometry {
-    match architecture {
-        Architecture::Arm64e => &ARM64E_GEOMETRY,
-        Architecture::X86_64 => &X86_64_GEOMETRY,
-    }
-}
-
 pub fn validate_geometry(geometry: &Geometry) -> ResolveStatus {
     if geometry.page_shift >= 31 || geometry.index_bits >= 31 {
         return ResolveStatus::ErrUnsupportedGeometry;
@@ -469,13 +444,6 @@ pub fn span_first_page_slot(span: &Span, page_slot_count: u32) -> Option<u32> {
     Some(span.first_page_index as u32)
 }
 
-pub fn span_chunk_inserted_page_gpa(chunk: &SpanChunk) -> Option<u64> {
-    if chunk.cache_status != CacheStatus::MissInserted || chunk.gpa < chunk.page_offset as u64 {
-        return None;
-    }
-    Some(chunk.gpa - chunk.page_offset as u64)
-}
-
 pub fn read_task_root(
     reader: &dyn PhysReader,
     task: &Task,
@@ -625,29 +593,6 @@ pub fn translate_root(
     }
     out.status = ResolveStatus::ErrZeroDepth;
     out
-}
-
-pub fn translate_task(
-    reader: &dyn PhysReader,
-    task: &Task,
-    geometry: &Geometry,
-    gva: u64,
-    cache: Option<&mut Cache>,
-) -> Translation {
-    let mut out = Translation {
-        gva,
-        ..Default::default()
-    };
-    let root = match read_task_root(reader, task, geometry) {
-        Ok(r) => r,
-        Err(e) => {
-            out.status = e;
-            return out;
-        }
-    };
-    let mut t = translate_root(reader, geometry, root.root_pfn, root.depth, gva, cache);
-    t.directory_pfn = root.directory_pfn;
-    t
 }
 
 #[allow(

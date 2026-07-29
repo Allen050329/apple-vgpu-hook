@@ -868,33 +868,6 @@ pub mod cap_flush {
 }
 
 
-/// Measure-only: fragment/vertex sample resolved but all-zero payload.
-///
-/// Proxies empty Favourites tiles / zero icon RTs without gating encode.
-/// Logs:
-/// - mid-size textures (32…512) — icon / strip tiles
-/// - **display-sized** (≥1280×720) — wallpaper / multi-bind layer class
-///   (previously filtered out, so empty desktop layers were invisible)
-///
-/// Filters default 1×1 clears and other tiny nulls.
-pub fn note_empty_sample_if(texture_ref: u32, w: u32, h: u32, rgba: &[u8], stage: &str) {
-    let mid_tile = w >= 32 && h >= 32 && w <= 512 && h <= 512;
-    let display = w >= 1280 && h >= 720;
-    if !mid_tile && !display {
-        return;
-    }
-    // RGB-only: covered black (0,0,0,A=255) is empty content for wallpaper
-    // layers — byte nonzero_stats would miss it (alpha alone).
-    let (rgb_nz, max_rgb, _) = observe::rgba_rgb_stats(rgba);
-    if rgb_nz != 0 {
-        return;
-    }
-    let kind = if display { "display" } else { "tile" };
-    thrash_line(&format!(
-        "empty_sample stage={stage} kind={kind} ref={texture_ref} {w}x{h} max_rgb={max_rgb}"
-    ));
-}
-
 /// Record a failed DisplaySwap capture (retain not updated).
 pub fn note_capture_fail(mapping_id: u32, width: u32, height: u32, generation: u32) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());

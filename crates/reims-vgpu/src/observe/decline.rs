@@ -2236,7 +2236,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ("contract/iosurface_pages.rs", "Status::ErrSpanRange("),
         ],
         slugs: &[
-            "iosurface_cached_table_span_uncovered",
             "iosurface_geometry_format_unsupported",
             "iosurface_geometry_height_zero",
             "iosurface_geometry_last_row_end_overflow",
@@ -2281,9 +2280,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "iosurface_span_page_entry_invalid",
             "iosurface_span_page_index_out_of_range",
             "iosurface_span_page_shift_invalid",
-            "iosurface_table_first_entry_invalid",
-            "iosurface_table_first_entry_missing",
-            "iosurface_table_first_gpa_not_ram",
             "iosurface_texture_descriptor_short",
             "iosurface_validate_internal_kva_invalid",
             "iosurface_validate_internal_owner_mismatch",

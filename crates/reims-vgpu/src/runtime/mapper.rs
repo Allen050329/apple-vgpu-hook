@@ -1800,19 +1800,6 @@ mod revalidate_tests {
     }
 }
 
-/// Read ring entry at absolute producer index (for tests).
-pub fn read_request_at_producer<M: HostMemory>(
-    host: &M,
-    ring_base: u64,
-    producer: u32,
-) -> Result<(u32, u32), MemError> {
-    let entry_off = mapper_request_published_entry_offset(producer).ok_or(MemError::BadArgs)?;
-    let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
-    host.read_gpa(ring_base + entry_off, &mut e)?;
-    let req = decode_mapper_request_entry(&e).map_err(|_| MemError::BadArgs)?;
-    Ok((req.request_type, req.mapping_id))
-}
-
 #[cfg(test)]
 mod tests {
 

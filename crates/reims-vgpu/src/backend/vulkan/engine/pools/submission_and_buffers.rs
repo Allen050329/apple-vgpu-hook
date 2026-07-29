@@ -105,10 +105,7 @@ impl ResourcePools {
         // Same ordering rule as the prefetch pool: this submits on its own CB,
         // so flush any open draw batch or the copy would be queued ahead of the
         // draws producing this frame.
-        if let Err(error) = self.batch_flush(ctx, counters) {
-            self.host_scatter.fallback_submit = self.host_scatter.fallback_submit.wrapping_add(1);
-            return Err(error);
-        }
+        self.batch_flush(ctx, counters)?;
 
         // Resolve every run up front: a partial scatter would leave the guest
         // surface torn, so this is all-or-nothing.
@@ -117,8 +114,6 @@ impl ResourcePools {
             match self.host_import_resolve(ctx, run.host_ptr, run.ptr_len) {
                 Ok(b) => bufs.push(b),
                 Err(leaf) => {
-                    self.host_scatter.fallback_unresolved =
-                        self.host_scatter.fallback_unresolved.wrapping_add(1);
                     // `host_import_resolve` emits the typed leaf itself, but that
                     // emission is flood-latched per cause, so after the first
                     // sighting of each the losses that follow carry no leaf at
@@ -168,28 +163,12 @@ impl ResourcePools {
             .map_err(DrawError::Present)?;
 
         let cmd_pool = self.cmd_pool;
-        if let Err(error) = self
-            .host_scatter
-            .scatter(ctx, cmd_pool, image, old_layout, &regions)
-        {
-            self.host_scatter.fallback_submit = self.host_scatter.fallback_submit.wrapping_add(1);
-            // The copy may have partially landed, so the caller must fail the
-            // Store rather than publish those guest pages as complete.
-            return Err(error);
-        }
+        // A failed scatter may have partially landed, so the caller must fail the
+        // Store rather than publish those guest pages as complete.
+        self.host_scatter
+            .scatter(ctx, cmd_pool, image, old_layout, &regions)?;
         self.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        self.host_scatter.gpu_stores = self.host_scatter.gpu_stores.wrapping_add(1);
         Ok(())
-    }
-
-    /// `(gpu_stores, fallback_unresolved, fallback_submit)` for the always-on
-    /// store-path proxy line.
-    pub(crate) fn host_scatter_counters(&self) -> (u64, u64, u64) {
-        (
-            self.host_scatter.gpu_stores,
-            self.host_scatter.fallback_unresolved,
-            self.host_scatter.fallback_submit,
-        )
     }
 
     /// Advance the wall-clock idle-drain clock to `now_ms`, keep the presented

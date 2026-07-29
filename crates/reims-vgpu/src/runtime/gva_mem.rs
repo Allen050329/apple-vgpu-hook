@@ -245,29 +245,6 @@ pub fn write_task_gva<M: HostMemory>(
     Ok(())
 }
 
-/// Same as [`write_task_gva`] with define-task id fallback (`task_id >> 1`).
-///
-/// **Tests / fixtures only** — not product (see [`write_task_gva_product`]).
-pub fn write_task_gva_fallback<M: HostMemory>(
-    host: &mut M,
-    tasks: &[TaskEntry],
-    task_id: u32,
-    gva: u64,
-    buf: &[u8],
-    page_shift: u32,
-) -> Result<(), MemError> {
-    if (task_id as usize) < tasks.len()
-        && write_task_gva(host, &tasks[task_id as usize], gva, buf, page_shift).is_ok()
-    {
-        return Ok(());
-    }
-    let shifted = task_id >> 1;
-    if shifted != task_id && (shifted as usize) < tasks.len() {
-        return write_task_gva(host, &tasks[shifted as usize], gva, buf, page_shift);
-    }
-    Err(MemError::Unmapped)
-}
-
 /// `file:line` of whoever called the `#[track_caller]` function above this one.
 ///
 /// Rendered as the repo-relative tail so the field stays short enough to sit on

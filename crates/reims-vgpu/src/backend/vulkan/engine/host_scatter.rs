@@ -73,11 +73,6 @@ pub(crate) struct ScatterRegion {
 pub(crate) struct HostScatterPool {
     cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
-    /// Presents scattered GPU-direct.
-    pub(crate) gpu_stores: u64,
-    /// Presents that fell back to the CPU readback+scatter, by reason.
-    pub(crate) fallback_unresolved: u64,
-    pub(crate) fallback_submit: u64,
 }
 
 impl HostScatterPool {

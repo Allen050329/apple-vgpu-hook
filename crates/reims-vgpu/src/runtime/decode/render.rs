@@ -45,8 +45,6 @@ pub const OP_MEMORY_BARRIER: u32 = 0x17;
 pub const OP_UPDATE_FENCE: u32 = 0x18;
 pub const OP_WAIT_FENCE: u32 = 0x19;
 pub const OP_RENDER_PASS: u32 = 0x1a;
-pub const OP_RENDER_PASS_SUBRECORD_FIRST: u32 = 0x1e;
-pub const OP_RENDER_PASS_SUBRECORD_LAST: u32 = 0x24;
 
 /// Live render-pass attachment layout (reims_vgpu_render_format.h).
 pub const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
@@ -280,10 +278,6 @@ pub struct Command {
     pub icb_args_buffer_offset: u64,
     /// True when kind is ExecuteCommands with the range layout (`0x15`).
     pub icb_is_range: bool,
-}
-
-pub fn opcode_is_render_pass_subrecord(opcode: u32) -> bool {
-    (OP_RENDER_PASS_SUBRECORD_FIRST..=OP_RENDER_PASS_SUBRECORD_LAST).contains(&opcode)
 }
 
 pub fn opcode_is_apple_rejected(opcode: u32) -> bool {

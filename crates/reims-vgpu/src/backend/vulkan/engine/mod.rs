@@ -1581,11 +1581,6 @@ fn try_gpu_scatter(
     unsafe { pools.present_scatter_gpu(ctx, counters, identity, &scatter_runs, spans) }
 }
 
-/// `(gpu_stores, fallback_unresolved, fallback_submit)` for the store proxy.
-pub fn host_scatter_snapshot() -> (u64, u64, u64) {
-    lock_engine().pools.host_scatter_counters()
-}
-
 /// One reading for the always-on cap-pressure census: current cap occupancy +
 /// the cumulative eviction / reupload counters. The census (
 /// `present_proxy::cap_pressure`) turns these into per-window deltas so a
@@ -1657,11 +1652,6 @@ pub fn reset_draw_counters() {
     lock_engine().counters.reset();
 }
 
-/// Full counter reset including device-loss stats (tests only).
-pub fn reset_all_counters() {
-    lock_engine().counters.reset_all();
-}
-
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
 pub fn test_reset_engine() {
     let mut g = lock_engine();
@@ -1721,29 +1711,6 @@ pub fn test_poison_and_flush() {
     g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
     g.owner.mark_device_lost();
     g.flush_device_derived();
-}
-
-/// Named create counter line for logs (`vk_engine_creates=N` style).
-pub fn creates_this_draw_prefix(delta_creates: u64) -> String {
-    format!("vk_engine_creates={delta_creates}")
-}
-
-/// Negative-cache init so repeated draws after failed init fail fast without re-probing.
-pub fn init_error_cached() -> Option<String> {
-    lock_engine()
-        .owner
-        .init_error
-        .as_ref()
-        .map(ToString::to_string)
-}
-
-/// For tests that need the raw counters atomic snapshot after a cold miss.
-pub fn note_create_for_test() {
-    ENGINE
-        .lock()
-        .counters
-        .creates
-        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Whether the live device has a combined GRAPHICS|COMPUTE queue family.

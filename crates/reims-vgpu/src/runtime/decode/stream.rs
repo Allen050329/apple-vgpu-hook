@@ -147,10 +147,6 @@ pub fn trace_u32(value: u64) -> u32 {
     }
 }
 
-pub fn segment_trace_flags(segment: &Segment) -> u32 {
-    ((segment.cont as u32) << 16) | ((segment.chain as u32) << 8) | (segment.pad as u32)
-}
-
 fn validate_bytes(bytes: &[u8]) -> DecodeStatus {
     if !size_fits_u32(bytes.len()) {
         return DecodeStatus::ErrBadLength("stream_bytes_len_overflow");

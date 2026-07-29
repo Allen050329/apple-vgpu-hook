@@ -26,13 +26,9 @@ pub const X86_64_INDEX_MASK: u32 = 0x3ff;
 pub const X86_64_ENTRIES_PER_TABLE: u32 = 1 << X86_64_INDEX_BITS;
 pub const X86_64_MAX_DEPTH: u32 = MAX_DEPTH;
 
-// No bare `PAGE_SHIFT` / `PAGE_SIZE` — those silently meant arm64e and caused
-// cross-arch bugs. Use PAGE_SHIFT_ARM64E / PAGE_SHIFT_X86 / device page_shift.
-pub const ARM64E_PAGE_OFFSET_MASK_ALIAS: u32 = ARM64E_PAGE_OFFSET_MASK;
-pub const INDEX_BITS: u32 = ARM64E_INDEX_BITS;
-pub const INDEX_MASK: u32 = ARM64E_INDEX_MASK;
-pub const ENTRIES_PER_TABLE: u32 = ARM64E_ENTRIES_PER_TABLE;
-
+// No bare `PAGE_SHIFT`, `PAGE_SIZE`, `INDEX_BITS`, `INDEX_MASK` or
+// `ENTRIES_PER_TABLE`. Every one of those silently meant arm64e and caused
+// cross-arch bugs. Use the arch-prefixed name or the device `page_shift`.
 pub const CACHE_WAYS: usize = 8;
 
 /// PFN → GPA at an explicit guest page shift (12 or 14).

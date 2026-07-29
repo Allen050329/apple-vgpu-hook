@@ -586,12 +586,6 @@ impl FakeHost {
         let _ = self.write_gpa(gpa, &b);
     }
 
-    /// Write a LE u16 at GPA.
-    pub fn put_u16(&mut self, gpa: u64, v: u16) {
-        let b = v.to_le_bytes();
-        let _ = self.write_gpa(gpa, &b);
-    }
-
     /// Read a LE u32 at GPA (zero if unmapped).
     pub fn get_u32(&self, gpa: u64) -> u32 {
         let mut b = [0u8; 4];
@@ -602,12 +596,6 @@ impl FakeHost {
     /// Count actions of a given kind.
     pub fn action_count(&self, kind: HostActionKind) -> usize {
         self.actions.iter().filter(|a| a.kind == kind).count()
-    }
-
-    /// Clear the action log (BH flag untouched).
-    pub fn clear_actions(&mut self) {
-        self.actions.clear();
-        self.bh_scheduled = false;
     }
 
     /// Set a synthetic X-register value (mapper capture tests).

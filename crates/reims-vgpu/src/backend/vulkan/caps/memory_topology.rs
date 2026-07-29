@@ -52,11 +52,6 @@ impl MemoryTopology {
         }
     }
 
-    /// True when a CPU-visible mapping of device memory is cheap enough that a
-    /// staging hop is pure overhead.
-    pub fn maps_device_memory_cheaply(self) -> bool {
-        self == Self::Unified
-    }
 }
 
 /// What a piece of memory is *for*. The engine asks for a class; this module

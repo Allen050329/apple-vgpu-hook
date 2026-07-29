@@ -169,17 +169,6 @@ pub enum RenderTargetClass {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SwizzleSelector {
-    Zero = 0,
-    One = 1,
-    Red = 2,
-    Green = 3,
-    Blue = 4,
-    Alpha = 5,
-}
-
-#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SwizzleSource {
     Zero = 0,
@@ -918,11 +907,6 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
     Some(rgba)
 }
 
-pub fn texel_to_rgba8_swizzled(format: u16, src: &[u8], swizzle: &SwizzlePlan) -> Option<[u8; 4]> {
-    let rgba = texel_to_rgba8(format, src)?;
-    Some(apply_swizzle_rgba8(swizzle, rgba))
-}
-
 pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
     let Some(bpp) = bytes_per_pixel(format) else {
         return false;
@@ -1058,41 +1042,6 @@ fn convert_row_to_rgba8_ex(
         let sp = (i as usize) * bpp as usize;
         let dp = (i as usize) * RGBA8_BPP as usize;
         let Some(rgba) = texel_to_rgba8(format, &src[sp..sp + bpp as usize]) else {
-            return false;
-        };
-        dst_rgba[dp..dp + 4].copy_from_slice(&rgba);
-    }
-    true
-}
-
-pub fn convert_row_to_rgba8_swizzled(
-    format: u16,
-    src: &[u8],
-    pixels: u32,
-    swizzle: &SwizzlePlan,
-    dst_rgba: &mut [u8],
-) -> bool {
-    if pixels == 0 {
-        return true;
-    }
-    let Some(bpp) = bytes_per_pixel(format) else {
-        return false;
-    };
-    let src_len = match (pixels as u64).checked_mul(bpp as u64) {
-        Some(v) => v as usize,
-        None => return false,
-    };
-    let dst_len = match (pixels as u64).checked_mul(RGBA8_BPP as u64) {
-        Some(v) => v as usize,
-        None => return false,
-    };
-    if src.len() < src_len || dst_rgba.len() < dst_len {
-        return false;
-    }
-    for i in 0..pixels {
-        let sp = (i as usize) * bpp as usize;
-        let dp = (i as usize) * RGBA8_BPP as usize;
-        let Some(rgba) = texel_to_rgba8_swizzled(format, &src[sp..], swizzle) else {
             return false;
         };
         dst_rgba[dp..dp + 4].copy_from_slice(&rgba);
