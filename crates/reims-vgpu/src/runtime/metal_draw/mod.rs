@@ -1919,37 +1919,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         let guest_backed = guest_texs.get(i).and_then(|t| t.as_ref()).is_some();
         if c.mapping_id != 0 && guest_backed {
             let _ = state.mark_mapping_written(c.mapping_id);
-            if width >= 1280 && height >= 720 {
-                let nz = type11_window_nz(state, host, c.mapping_id).unwrap_or(0);
-                if nz > 0 {
-                    let (peak, poison) = {
-                        #[cfg(test)]
-                        let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                        crate::runtime::census::present_proxy::note_display_store_nz(
-                            c.mapping_id,
-                            nz,
-                        )
-                    };
-                    if nz < 4_000_000 {
-                        crate::observe::fail(format!(
-                            "incomplete_store mid={} {}x{} nz={} load={} pipe={} peak={} poison={}",
-                            c.mapping_id,
-                            width,
-                            height,
-                            nz,
-                            c.load_action,
-                            req.pipeline_ref,
-                            peak,
-                            poison as u8
-                        ));
-                    } else if poison {
-                        crate::observe::fail(format!(
-                            "store_nz_drop mid={} {}x{} nz={} peak={} load={} pipe={}",
-                            c.mapping_id, width, height, nz, peak, c.load_action, req.pipeline_ref
-                        ));
-                    }
-                }
-            }
             any_write = true;
             continue;
         }
@@ -2043,52 +2012,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     seed_for_store.is_some() as u8,
                     req.pipeline_ref
                 ));
-                // Measure-only: display-sized Store far below settled desktop
-                // nz (~6.2M live). Proxies dual-mid lagging incomplete composite
-                // without gating encode (live thrash mid ~3.0M vs 6.2M).
-                // Also track per-mid peak nz so a drop (poison) is visible next
-                // to incomplete_store without gating product behavior.
-                if width >= 1280 && height >= 720 && nz > 0 {
-                    let seed_nz = load_seed
-                        .map(|s| crate::observe::nonzero_stats(s).0)
-                        .unwrap_or(0);
-                    let (peak, poison) = {
-                        #[cfg(test)]
-                        let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                        crate::runtime::census::present_proxy::note_display_store_nz(
-                            c.mapping_id,
-                            nz,
-                        )
-                    };
-                    if nz < 4_000_000 {
-                        crate::observe::fail(format!(
-                            "incomplete_store mid={} {}x{} nz={} load={} force_full={} pipe={} seed_nz={} peak={} poison={}",
-                            c.mapping_id,
-                            width,
-                            height,
-                            nz,
-                            c.load_action,
-                            force_full_store as u8,
-                            req.pipeline_ref,
-                            seed_nz,
-                            peak,
-                            poison as u8
-                        ));
-                    } else if poison {
-                        crate::observe::fail(format!(
-                            "store_nz_drop mid={} {}x{} nz={} peak={} load={} force_full={} pipe={} seed_nz={}",
-                            c.mapping_id,
-                            width,
-                            height,
-                            nz,
-                            peak,
-                            c.load_action,
-                            force_full_store as u8,
-                            req.pipeline_ref,
-                            seed_nz
-                        ));
-                    }
-                }
             }
             let attr_summary: Vec<String> = pipeline
                 .vertex_attributes
@@ -3092,46 +3015,6 @@ fn type11_attachment_from_window(
     )
 }
 
-/// Nonzero byte count of a type-11 mapping's tight sample window, read from
-/// its contiguous guest view (measure-only display proxies).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn type11_window_nz<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-) -> Option<usize> {
-    let (ptr, len) = mapper::ensure_contig_view(state, host, mapping_id)?;
-    let (w, h, fmt) = {
-        let m = state.mappings.get(&mapping_id)?;
-        if !m.has_geom {
-            return None;
-        }
-        (
-            m.width,
-            m.height,
-            if m.format != 0 {
-                m.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-        )
-    };
-    let (base_off, bpr, span_end) = {
-        let m = state.mappings.get(&mapping_id)?;
-        mapping_write::type11_sample_window(m, w, h, fmt)?
-    };
-    if span_end > len as u64 {
-        return None;
-    }
-    let tight = pixel_format::tight_row_bytes(w, fmt)? as usize;
-    let mut nz = 0usize;
-    for y in 0..h as usize {
-        let off = base_off as usize + y * bpr as usize;
-        let row = unsafe { std::slice::from_raw_parts((ptr + off) as *const u8, tight) };
-        nz += row.iter().filter(|&&b| b != 0).count();
-    }
-    Some(nz)
-}
 
 /// Sample a type-11 mapping as tight RGBA8 from guest pages.
 ///
@@ -3676,14 +3559,6 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.
-        if m.width >= 1280 && m.height >= 720 {
-            crate::observe::line(format!(
-                "rt_resolve type4 tex_ref={resolved_ref} sid={surface_id} {}x{} fmt={fmt:#x} live_type={live_type:?} pages={}",
-                m.width,
-                m.height,
-                m.page_entries.len()
-            ));
-        }
         return Some((surface_id, 0, m.width, m.height, 0, fmt));
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
@@ -3855,19 +3730,9 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             if mapping_id == 0 {
                 seed = Some(solid_rgba_local(mw, mh, &cl.clear_color));
             }
-            if mw >= 1280 && mh >= 720 && mapping_id != 0 {
-                crate::observe::fail(format!(
-                    "display_clear mid={mapping_id} {mw}x{mh} via=pass_clears pipe={pipeline_ref}"
-                ));
-            }
         } else if att.load_action == PASS_LOAD_ACTION_CLEAR {
             if mapping_id == 0 {
                 seed = Some(solid_rgba_local(mw, mh, &att.clear_color));
-            }
-            if mw >= 1280 && mh >= 720 && mapping_id != 0 {
-                crate::observe::fail(format!(
-                    "display_clear mid={mapping_id} {mw}x{mh} via=load_action_clear pipe={pipeline_ref}"
-                ));
             }
         } else if att.load_action == PASS_LOAD_ACTION_LOAD && mapping_id == 0 {
             // GVA linear target: ephemeral host RT needs a CPU seed (archive

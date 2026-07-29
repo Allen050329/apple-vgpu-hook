@@ -18,7 +18,6 @@
 //! `idle_drain`, `store_scatter`, `cap_pressure`, `vram`, `lifecycle_churn`)
 //! each emit one line per window and stay silent while their counters are zero.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::observe;
@@ -173,11 +172,6 @@ pub fn note_t11_large_fallback(mid: u32, map_gen: u32, probe: Option<(u64, bool)
 /// Single mutex so unit tests and concurrent presents cannot interleave counters.
 static STATE: Mutex<ThrashState> = Mutex::new(ThrashState::new());
 
-/// Per-mapping peak display Store nz (measure-only poison detector).
-fn display_store_peak_map() -> &'static Mutex<HashMap<u32, usize>> {
-    static MAP: std::sync::OnceLock<Mutex<HashMap<u32, usize>>> = std::sync::OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 /// Always-on visibility for a **silently-degraded MRT draw**: a draw whose color
 /// list has >1 attachment (the guest asked for multiple render targets) but whose
@@ -260,27 +254,6 @@ pub fn note_mrt_mask_bind_miss(reason: MaskBindMiss, width: u32, height: u32) {
         .fail();
 }
 
-/// Record a display-sized type-11 Store nz. Returns `(peak_before_or_after, poisoned)`.
-///
-/// `poisoned` when this Store falls below 70% of the mid's prior peak — the mid
-/// lost content (Clear invent / incomplete Load base / dual-mid lag class).
-/// Measure-only: never gates encode or present.
-pub fn note_display_store_nz(mapping_id: u32, nz: usize) -> (usize, bool) {
-    if mapping_id == 0 || nz == 0 {
-        return (0, false);
-    }
-    let mut map = display_store_peak_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let peak = map.get(&mapping_id).copied().unwrap_or(0);
-    let poison = peak > 0 && (nz as u64).saturating_mul(10) < (peak as u64).saturating_mul(7);
-    if nz > peak {
-        map.insert(mapping_id, nz);
-        (nz, false)
-    } else {
-        (peak, poison)
-    }
-}
 
 /// Test-only isolation: proxy state is process-global, so parallel tests that
 /// reset a device (`lib.rs device_reset` → [`reset_for_device`]) or drive
@@ -324,18 +297,8 @@ pub fn reset_for_device() {
 fn reset_state_inner() {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     *st = ThrashState::new();
-    drop(st);
-    display_store_peak_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
 }
 
-/// Test/helper: clear display Store peaks (unit tests isolation).
-#[cfg(test)]
-pub fn reset_display_store_peaks_for_test() {
-    reset_state_inner();
-}
 
 fn append_thrash_file(msg: &str) {
     // Dedicated always-on file for `grep THRASH /tmp/reims-vgpu-thrash.log`.
@@ -1891,25 +1854,6 @@ mod tests {
         reset_for_test();
         note_capture_fail(5, 1440, 1080, 2);
         assert_eq!(counters().capture_fail, 1);
-    }
-
-    /// qemu-shim: display Store peak tracks dual-mid poison (nz drop vs mid peak).
-    #[test]
-    fn display_store_nz_poison_on_drop_from_peak() {
-        let _g = test_lock();
-        reset_display_store_peaks_for_test();
-        let (p1, poison1) = note_display_store_nz(3, 6_000_000);
-        assert_eq!(p1, 6_000_000);
-        assert!(!poison1, "first Store establishes peak, not poison");
-        let (p2, poison2) = note_display_store_nz(3, 5_500_000);
-        assert_eq!(p2, 6_000_000);
-        assert!(!poison2, "small drop stays under 30% threshold");
-        let (p3, poison3) = note_display_store_nz(3, 3_000_000);
-        assert_eq!(p3, 6_000_000);
-        assert!(poison3, "drop below 70% of peak is poison");
-        let (p4, poison4) = note_display_store_nz(4, 2_000_000);
-        assert_eq!(p4, 2_000_000);
-        assert!(!poison4, "other mid has independent peak");
     }
 
     /// The sample side and the render side of the MRT-mask class had one name
