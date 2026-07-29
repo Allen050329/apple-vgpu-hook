@@ -2746,96 +2746,6 @@ fn try_recover_sentinel_grid<M: HostMemory + HostOps>(
     Some((gx as u32, gy as u32, 1, t0 as u32, ty as u32, 1))
 }
 
-/// Measure-only census for a compute dispatch (always-on fail log on Linux).
-///
-/// Live x86 wallpaper class (serial-213122): type-3 multi-bind samples stay
-/// mapped zeros while MapMemory2/ReplacePhysical cycle; Core Image fills are
-/// `SEGMENT_TYPE_COMPUTE` dispatches. On non-Apple hosts
-/// [`execute_dispatch`] returns [`ComputeStatus::NoMetal`] and previously
-/// left **no** fail-log line — CI wallpaper drops were invisible next to
-/// m2v_empty_layer. Proxy: `compute_dispatch st=NoMetal …`.
-fn log_compute_dispatch_census<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    acc: &ComputeAccum,
-    cmd: &ComputeCommand,
-    st: ComputeStatus,
-    nested: bool,
-) {
-    let kind = match cmd.kind {
-        Kind::DispatchThreadgroups => "tg",
-        Kind::DispatchThreads => "threads",
-        Kind::DispatchThreadgroupsIndirect => "tg_ind",
-        Kind::DispatchThreadsIndirect => "thr_ind",
-        _ => "other",
-    };
-    let mut tex_parts: Vec<String> = Vec::new();
-    for t in acc.textures.iter().take(8) {
-        if t.texture_ref == 0 {
-            continue;
-        }
-        // Compact geom for wallpaper vs tile discrimination (no content gate).
-        let geom = if let Some(mid) =
-            objects::resolve_type11_ref(state, host, task_id, t.texture_ref)
-        {
-            state
-                .mappings
-                .get(&mid)
-                .filter(|m| m.has_geom)
-                .map(|m| format!("{}x{}", m.width, m.height))
-                .unwrap_or_else(|| "t11".into())
-        } else if let Some(entry) = objects::lookup_list_entry(state, host, task_id, t.texture_ref)
-        {
-            if entry.object_type == OBJECT_TYPE_TEXTURE
-                || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
-            {
-                if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                    if let Ok(tex) = decode_texture_descriptor(&desc) {
-                        format!("{}x{}", tex.width, tex.height)
-                    } else {
-                        format!("ot{}", entry.object_type)
-                    }
-                } else {
-                    format!("ot{}", entry.object_type)
-                }
-            } else {
-                format!("ot{}", entry.object_type)
-            }
-        } else {
-            "?".into()
-        };
-        tex_parts.push(format!("i{}:r{}:{}", t.index, t.texture_ref, geom));
-    }
-    let largest = largest_bound_texture_dims(state, host, task_id, acc)
-        .map(|(w, h)| format!("{w}x{h}"))
-        .unwrap_or_else(|| "none".into());
-    let nest = if nested { " nested=1" } else { "" };
-    // Always-on either way (a wallpaper CI miss must not hide in the env-gated
-    // draw.log only), but a successful dispatch (`st=Ok`) is census — route it
-    // to the `off()` sink so it stays in the log but leaves the curated
-    // real-error view (`grep -v '^OFF '`) clean; a non-Ok dispatch is a genuine
-    // failed guest compute command and stays `fail()`-visible with its reason.
-    let line = format!(
-        "compute_dispatch st={st:?} pipe={} kind={kind} ntex={} nbuf={} largest={largest} grid=[{},{},{}] tg=[{},{},{}] tex=[{}]{nest}",
-        acc.pipeline_ref,
-        acc.textures.len(),
-        acc.buffers.len(),
-        cmd.grid.x,
-        cmd.grid.y,
-        cmd.grid.z,
-        cmd.threads_per_threadgroup.x,
-        cmd.threads_per_threadgroup.y,
-        cmd.threads_per_threadgroup.z,
-        tex_parts.join(","),
-    );
-    if matches!(st, ComputeStatus::Ok) {
-        crate::observe::off(line);
-    } else {
-        crate::observe::fail(line);
-    }
-}
-
 /// Execute a direct or indirect dispatch against the current compute accum state.
 pub fn execute_dispatch<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2846,15 +2756,11 @@ pub fn execute_dispatch<M: HostMemory + HostOps>(
 ) -> ComputeStatus {
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     {
-        let st = execute_dispatch_metal(state, host, task_id, acc, cmd, None);
-        log_compute_dispatch_census(state, host, task_id, acc, cmd, st, false);
-        st
+        execute_dispatch_metal(state, host, task_id, acc, cmd, None)
     }
     #[cfg(feature = "backend-vulkan")]
     {
-        let st = execute_dispatch_linux(state, host, task_id, acc, cmd);
-        log_compute_dispatch_census(state, host, task_id, acc, cmd, st, false);
-        st
+        execute_dispatch_linux(state, host, task_id, acc, cmd)
     }
 }
 
@@ -2869,23 +2775,14 @@ pub(crate) fn execute_dispatch_nested<M: HostMemory + HostOps>(
 ) -> ComputeStatus {
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     {
-        let st = execute_dispatch_metal(state, host, task_id, acc, cmd, Some(session));
-        log_compute_dispatch_census(state, host, task_id, acc, cmd, st, true);
-        st
+        execute_dispatch_metal(state, host, task_id, acc, cmd, Some(session))
     }
     #[cfg(feature = "backend-vulkan")]
     {
-        // Nested/control-flow SPI not yet on Linux compute — fail-visible.
-        let _ = session;
-        log_compute_dispatch_census(
-            state,
-            host,
-            task_id,
-            acc,
-            cmd,
-            ComputeStatus::NoMetal("compute_nested_no_vulkan_path"),
-            true,
-        );
+        // Nested/control-flow SPI has no Linux compute path. Fail-visible via
+        // the returned status: `exec.rs::note_compute_refusal` names the slug
+        // at the rail boundary for every non-`Ok` compute record.
+        let _ = (state, host, task_id, acc, cmd, session);
         ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
     }
 }
