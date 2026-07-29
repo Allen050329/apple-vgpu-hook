@@ -8,7 +8,7 @@
 use crate::model::{
     DeviceState, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
-use crate::runtime::decode::event::{self, Command as EventCommand, Kind as EventCmdKind};
+use crate::runtime::decode::event::{Command as EventCommand, Kind as EventCmdKind};
 use crate::runtime::plan::event_sync::{self, Decision, Domain, EventKind, FenceAction};
 
 /// Outcome of a product-path event or encoder fence operation.
@@ -191,35 +191,6 @@ pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) 
     }
 }
 
-/// Convenience: decode event command bytes then execute.
-pub fn execute_event_bytes(state: &mut DeviceState, task_id: u32, bytes: &[u8]) -> FenceStatus {
-    match event::decode(bytes) {
-        Ok(cmd) => execute_event(state, task_id, &cmd),
-        Err(status) => {
-            let status: event::DecodeStatus = status;
-            // Named here, at the failing site, latched so a guest re-polling a
-            // bad event cannot flood.
-            if let Some(e) = crate::observe::Emit::refusal("event_decode", &status) {
-                // Same latch as the render/compute decode sites: a guest polling
-                // a malformed event re-sends it every drain.
-                e.field("len", bytes.len()).fail_once(0);
-            }
-            // Forward the decode rail's own slug into the value rather than
-            // flattening it, so a caller that re-derives a reason from the status
-            // (the encoder remap in `blit_exec`) reports which decode check fired
-            // instead of a generic "event failed".
-            FenceStatus::Unsupported(match crate::observe::Refusal::refusal(&status) {
-                Some(slug) => slug,
-                // Unreachable while every `DecodeStatus` error variant refuses.
-                // Registered rather than `unreachable!()` so a future variant
-                // that forgets its slug shows up in the log as a named gap
-                // instead of killing the drain worker.
-                None => "event_decode_unclassified",
-            })
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -249,7 +220,7 @@ mod tests {
         st32(&mut bytes[0..4], opcode);
         st32(&mut bytes[4..8], (HEADER_LEN + payload.len()) as u32);
         bytes[HEADER_LEN..].copy_from_slice(&payload);
-        event::decode(&bytes).expect("build event cmd")
+        crate::runtime::decode::event::decode(&bytes).expect("build event cmd")
     }
 
     #[test]

@@ -1951,12 +1951,10 @@ pub const REGISTRY: &[DeclineClass] = &[
         type_name: "DecodeStatus",
         defined_in: "runtime/decode/event.rs",
         slug_blocks: &[],
-        // Two decoders of the same wire records: `fence_exec` for the ch-event
-        // segment, `exec` for event records inside an ExecIndirect2 stream.
-        emission: Emission::At(&[
-            ("runtime/fence_exec.rs", "event_decode"),
-            ("runtime/exec.rs", "event_decode"),
-        ]),
+        // One decoder: `exec`, for event records inside an ExecIndirect2 stream.
+        // `fence_exec` used to decode the same records through a convenience
+        // wrapper with no caller, which is why this row listed two sites.
+        emission: Emission::At(&[("runtime/exec.rs", "event_decode")]),
         slug_calls: &[],
         slugs: &[
             "event_decode_args",
@@ -2187,10 +2185,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "event_kind_unknown",
             "event_wait_timeout_unsupported",
             "event_plan_invalid",
-            // The guard on the forwarding arm in `execute_event_bytes`:
-            // unreachable while every event `DecodeStatus` error refuses, and
-            // registered so that if one stops, the gap is a named log line.
-            "event_decode_unclassified",
         ],
     },
     DeclineClass {

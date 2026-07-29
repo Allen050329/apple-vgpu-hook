@@ -713,27 +713,6 @@ pub fn resolve_type11_ref<M: HostMemory>(
     Some(mapping_id)
 }
 
-/// Resolve a batch of object refs; returns mapping ids that are type-11.
-pub fn resolve_type11_refs<M: HostMemory>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    refs: &[u32],
-) -> Vec<u32> {
-    let mut out = Vec::new();
-    for &r in refs {
-        if r == 0 {
-            continue;
-        }
-        if let Some(m) = resolve_type11_ref(state, host, task_id, r) {
-            if !out.contains(&m) {
-                out.push(m);
-            }
-        }
-    }
-    out
-}
-
 /// Apply a decoded type-4 surface as page-table backing for `surface_id`.
 ///
 /// `backing_pfn` is a GPU-VA page (same source as type-2/3 textures). Translate

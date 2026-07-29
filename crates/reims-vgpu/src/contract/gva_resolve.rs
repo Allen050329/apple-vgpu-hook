@@ -189,9 +189,6 @@ impl Cache {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn invalidate(&mut self) {
-        *self = Self::default();
-    }
 }
 
 /// Callback: read `len` guest physical bytes at `gpa` into `dst`.

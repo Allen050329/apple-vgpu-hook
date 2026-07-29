@@ -277,11 +277,6 @@ pub fn window_present_detach() {
     }
 }
 
-/// Execute one offscreen draw; returns tight RGBA8 pixels (w*h*4).
-pub fn execute_draw(req: DrawRequest) -> Result<DrawOutput, DrawError> {
-    execute_draw_request(&req)
-}
-
 /// Borrow form of [`execute_draw`].
 pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
     let mut guard = lock_engine();
@@ -336,11 +331,6 @@ pub fn flush_batched_draws() {
         // recreate path; here just make the flush failure visible.
         crate::observe::Emit::decline("vk_batch_flush", &e).fail_once(0);
     }
-}
-
-/// Execute one compute dispatch; returns storage buffer + storage image readbacks.
-pub fn execute_compute(req: ComputeRequest) -> Result<ComputeOutput, ComputeError> {
-    execute_compute_request(&req)
 }
 
 /// Borrow form of [`execute_compute`].

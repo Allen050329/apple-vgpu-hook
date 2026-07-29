@@ -389,6 +389,28 @@ So validate the sweep before believing it, on a field you have already confirmed
 `grep -c` for the bare name next to the sweep's count is enough: raw occurrences far above counted
 reads means the counter is broken, not that the field is dead.
 
+The same trap has a second door. Stripping `#[cfg(test)]` blocks by brace matching runs off the end
+whenever the item has no braces — `#[cfg(test)] mod tests;` and `#[cfg(test)] let x = …;` both occur
+here — and swallows the next real block, again reporting live code as unreferenced. An item ends at
+its matching `}` *or* at the first `;`, whichever comes first.
+
+Do not write a fourth one of these. `observe/gate.rs` already carries a correct Rust lexer —
+`result_string_error_offsets` masks line and block comments, raw strings with any hash count, escaped
+string literals and char literals, in one pass — and it exists precisely because the gate it backs
+could not be written with a grep. Reuse it before hand-rolling a scrubber.
+
+**A doc comment keeps a dead function's reference count above one.** The unreferenced-`pub fn` sweep
+counts `grep -rw` hits, and `[`execute_draw`]` in a doc comment is a hit. Five functions sat at two
+or three references made entirely of prose: the two engine facade owning-forms, an event
+decode-then-execute wrapper, a batch ref resolver, and a cache `invalidate`. Run the same sweep over
+comment-stripped text and they drop to one.
+
+Which does not by itself mean delete. `Cache::invalidate` having no caller could equally have meant a
+translation cache was going stale — the failure the idle-drain regression already cost this project
+once. It is safe here only because every `Cache` in the tree is built with `Cache::default()` at the
+top of one walk and dropped at the end of it, so it cannot outlive its own validity. Check that
+before reading "nothing calls the invalidate" as good news.
+
 **Round-trip an extraction the host cannot compile.** `backend-metal` is Apple-only and does not
 build on Linux at all, so a refactor of Metal-gated tests gets no compiler check whatsoever. Textual
 extractions are still verifiable: strip the new helper, mechanically inline every call back to the
