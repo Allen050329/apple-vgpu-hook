@@ -747,11 +747,7 @@ mod tests {
             "qemu_map_pages_null_pointer",
             "qemu_unmap_pages_callback_missing",
         ];
-        let row = crate::observe::REGISTRY
-            .iter()
-            .find(|class| class.type_name == "QemuHostDecline")
-            .expect("QemuHostDecline registry row");
-        assert_eq!(row.slugs, expected);
+        assert_eq!(declines.len(), expected.len());
         for (decline, expected_slug) in declines.iter().zip(expected) {
             assert_eq!(decline.slug(), expected_slug);
             assert!(expected_slug

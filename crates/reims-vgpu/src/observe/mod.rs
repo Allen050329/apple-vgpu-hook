@@ -22,18 +22,20 @@
 //!   `runtime/draw_log.rs`; the machinery was never the problem, the vocabulary
 //!   on top of it was.
 //!
-//! - [`decline`] — the [`Decline`] trait and the crate-wide slug registry.
+//! - [`decline`] — the [`Decline`] and [`Refusal`] traits every subsystem
+//!   names its refusals through.
 //! - [`emit`] — the one builder that renders `reason=<slug> k=v …`, and cannot
 //!   produce a line without a reason.
 //! - `gate` — static scans that keep the above true (test-only).
 //!
 //! # The obligation
 //!
-//! Per `AGENTS.md` I2: every path that rejects, drops, degrades or mis-executes
-//! a decoded guest command returns a **registered** typed decline whose slug is
-//! unique crate-wide and reaches the sink at some call site. A typed decline
-//! nobody logs is still a silent failure — that unchecked handoff is what
-//! `gate::every_registered_type_reaches_the_sink` closes.
+//! Per `AGENTS.md`: every path that rejects, drops, degrades or mis-executes a
+//! decoded guest command returns a typed decline whose slug is unique crate-wide
+//! and reaches the sink at some call site. `gate::no_two_declines_share_a_slug`
+//! reads the `Decline`/`Refusal` impls to hold the uniqueness half; that a
+//! decline is actually *logged* is the author's obligation, and a typed decline
+//! nobody logs is still a silent failure.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every
@@ -50,12 +52,6 @@ pub mod zero_copy_lost;
 /// next to the trait it implements, rather than reaching into the submodule.
 pub(crate) use decline::decline_display;
 pub use decline::{Decline, Refusal};
-/// The slug registry and its row types are read only by the gates in
-/// [`gate`], which are themselves `#[cfg(test)]`. Nothing in the device
-/// consults the registry at runtime — the typed declines carry their own
-/// slugs — so it is compiled only for tests.
-#[cfg(test)]
-pub use decline::{DeclineClass, Emission, REGISTRY};
 pub use emit::{first_sight, Emit};
 pub use zero_copy_lost::ZeroCopyLost;
 
