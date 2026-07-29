@@ -114,19 +114,6 @@ pub enum VkOp {
     /// `vkMapMemory` of the storage readback buffer to copy the bytes out.
     StorageReadMap,
 
-    // ---- mod.rs `export_scanout_from_bgra` — the CPU-capture → dmabuf export
-    //      scanout rail (staging copy of `frame_bgra`, then blit + export) ----
-    /// `vkMapMemory` of the staging buffer to upload the captured BGRA.
-    ExportScanoutMapStaging,
-    /// `vkResetCommandBuffer` before recording the scanout export blit.
-    ExportScanoutResetCb,
-    /// `vkBeginCommandBuffer` for the scanout export blit.
-    ExportScanoutBeginCb,
-    /// `vkEndCommandBuffer` closing the scanout export blit.
-    ExportScanoutEndCb,
-    /// `vkQueueSubmit` of the scanout export blit.
-    ExportScanoutSubmit,
-
     // ---- mod.rs `export_present_from_resident_fd_policy` — the
     //      zero-copy resident → dmabuf present export rail ----
     /// `vkResetCommandBuffer` before recording the present export blit.
@@ -139,8 +126,8 @@ pub enum VkOp {
     ExportPresentSubmit,
 
     // ---- dmabuf_export.rs `export_bgra_scanout_dmabuf` — the low-level dmabuf
-    //      scanout image export (the exportable VkImage the two mod.rs export
-    //      rails above are built on), create + alloc + bind + get_fd ----
+    //      scanout image export (the exportable VkImage the present export rail
+    //      above is built on), create + alloc + bind + get_fd ----
     /// `vkCreateImage` for the exportable LINEAR scanout image.
     DmabufExportCreateImage,
     /// `vkAllocateMemory` for that image (device-local preferred, exportable).
@@ -466,11 +453,6 @@ impl Decline for VkCall {
             VkOp::StorageReadSubmit => "vk_storage_read_submit",
             VkOp::StorageReadMap => "vk_storage_read_map",
 
-            VkOp::ExportScanoutMapStaging => "vk_export_scanout_map_staging",
-            VkOp::ExportScanoutResetCb => "vk_export_scanout_reset_cb",
-            VkOp::ExportScanoutBeginCb => "vk_export_scanout_begin_cb",
-            VkOp::ExportScanoutEndCb => "vk_export_scanout_end_cb",
-            VkOp::ExportScanoutSubmit => "vk_export_scanout_submit",
 
             VkOp::ExportPresentResetCb => "vk_export_present_reset_cb",
             VkOp::ExportPresentBeginCb => "vk_export_present_begin_cb",
@@ -673,11 +655,6 @@ mod tests {
         VkOp::StorageReadEndCb,
         VkOp::StorageReadSubmit,
         VkOp::StorageReadMap,
-        VkOp::ExportScanoutMapStaging,
-        VkOp::ExportScanoutResetCb,
-        VkOp::ExportScanoutBeginCb,
-        VkOp::ExportScanoutEndCb,
-        VkOp::ExportScanoutSubmit,
         VkOp::ExportPresentResetCb,
         VkOp::ExportPresentBeginCb,
         VkOp::ExportPresentEndCb,

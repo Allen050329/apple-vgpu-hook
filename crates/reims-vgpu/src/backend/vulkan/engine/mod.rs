@@ -88,15 +88,11 @@ struct EngineState {
     caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
-    /// One cached exportable dmabuf scanout image (reused across presents; only
-    /// re-created on a geometry change). Empty until the GL/dmabuf scanout path
-    /// runs. Tied to the current device context — dropped on device recreate /
-    /// guest reset alongside the other device-derived state.
-    scanout_export: dmabuf_export::ScanoutExportCache,
     /// Ring of exportable dmabuf images for the direct-present path (host window
     /// route B): a fresh slot each present so the engine never overwrites the
     /// slot the window is mid-blit reading. Empty until `export_present_from_
-    /// resident` runs; torn down with the context like `scanout_export`.
+    /// resident` runs. Tied to the current device context — dropped on device
+    /// recreate / guest reset alongside the other device-derived state.
     present_export_ring: dmabuf_export::ScanoutExportRing,
     #[cfg(all(feature = "host-window", target_os = "macos"))]
     window_presenter: Option<window_present::WindowPresenter>,
@@ -109,7 +105,6 @@ impl EngineState {
             caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
-            scanout_export: dmabuf_export::ScanoutExportCache::new(),
             present_export_ring: dmabuf_export::ScanoutExportRing::new(),
             #[cfg(all(feature = "host-window", target_os = "macos"))]
             window_presenter: None,
@@ -123,11 +118,8 @@ impl EngineState {
                 if let Some(mut presenter) = self.window_presenter.take() {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                if let Some(fd) = self.scanout_export.destroy(&ctx.device) {
-                    // Close via OwnedFd drop (crate idiom; libc is Apple-only).
-                    drop(std::os::fd::OwnedFd::from_raw_fd(fd));
-                }
                 for fd in self.present_export_ring.destroy(&ctx.device) {
+                    // Close via OwnedFd drop (crate idiom; libc is Apple-only).
                     drop(std::os::fd::OwnedFd::from_raw_fd(fd));
                 }
                 self.caches.destroy_all(&ctx.device);
@@ -217,7 +209,6 @@ pub fn reset_guest_state() -> GuestResetStats {
     let EngineState {
         ref owner,
         ref mut pools,
-        ref mut scanout_export,
         ref mut present_export_ring,
         #[cfg(all(feature = "host-window", target_os = "macos"))]
         ref mut window_presenter,
@@ -232,9 +223,6 @@ pub fn reset_guest_state() -> GuestResetStats {
             #[cfg(all(feature = "host-window", target_os = "macos"))]
             if let Some(presenter) = window_presenter.as_mut() {
                 presenter.release_pins_after_idle(pools);
-            }
-            if let Some(fd) = scanout_export.destroy(&ctx.device) {
-                drop(std::os::fd::OwnedFd::from_raw_fd(fd));
             }
             for fd in present_export_ring.destroy(&ctx.device) {
                 drop(std::os::fd::OwnedFd::from_raw_fd(fd));
@@ -1313,218 +1301,6 @@ pub unsafe fn present_into_host_ptr_strided(
     Ok(content)
 }
 
-/// Upload a finished tight-BGRA frame into the cached exportable scanout image
-/// and return `(dup_fd, row_pitch)` for GL/dmabuf scanout (the C shim's
-/// `qemu_console_gl_scanout_dmabuf`). `bgra` is `width*4*height` bytes, top-left
-/// origin. The returned fd is a **dup** the importer (QEMU) owns and closes each
-/// present; the cache keeps its own fd + image across presents (no per-frame
-/// image/fd churn), re-creating only on a geometry change.
-///
-/// This is the display-path source that stays robust against present
-/// identity/grouping: the pixels come from the CPU capture (`frame_bgra`) via a
-/// staging copy, so it never has to reconstruct a `TargetIdentity`. A direct
-/// resident-slot → export blit (no `frame_bgra` at all) is the follow-up perf
-/// step; this establishes the verified display path first.
-///
-/// # Safety
-/// Must be called with no other engine borrow held; allocates + submits on the
-/// engine device.
-pub unsafe fn export_scanout_from_bgra(
-    width: u32,
-    height: u32,
-    bgra: &[u8],
-) -> Result<(i32, u64), DrawError> {
-    if width == 0 || height == 0 {
-        return Err(DrawError::Facade(
-            EngineFacadeDecline::ExportScanoutZeroGeometry { width, height },
-        ));
-    }
-    let expected = (width as usize)
-        .saturating_mul(4)
-        .saturating_mul(height as usize);
-    if bgra.len() != expected {
-        return Err(DrawError::Facade(
-            EngineFacadeDecline::ExportScanoutLengthMismatch {
-                width,
-                height,
-                actual_len: bgra.len(),
-                expected_len: expected,
-            },
-        ));
-    }
-    let mut guard = lock_engine();
-    let EngineState {
-        ref mut owner,
-        ref mut pools,
-        ref mut scanout_export,
-        ref counters,
-        ..
-    } = &mut *guard;
-    let ctx = owner.ensure(counters)?;
-    pools.ensure_init(ctx, counters)?;
-    if ctx.ext_external_memory_fd.is_none() {
-        return Err(DrawError::Unsupported(
-            reason::DrawReason::ScanoutExportUnavailable,
-        ));
-    }
-
-    // Reuse the cached export image; on a geometry change retire the old one.
-    // The previous present's blit into the retired image already retired at the
-    // end of its own call (each call ends with retire_all), so destroying it
-    // here cannot alias in-flight work.
-    if let Some(old) = scanout_export.acquire(ctx, width, height)? {
-        let fd = old.fd;
-        old.destroy(&ctx.device);
-        drop(std::os::fd::OwnedFd::from_raw_fd(fd));
-    }
-    let export = scanout_export
-        .current()
-        .expect("acquire established the current export image");
-    let export_image = export.image;
-    let row_pitch = export.row_pitch;
-    let cached_fd = export.fd;
-
-    // Host-visible staging: memcpy the tight BGRA frame, then copy_buffer_to_image
-    // into the LINEAR export image (the copy honors the image's own row pitch, so
-    // the staging buffer stays tight).
-    let need = expected as u64;
-    let staging =
-        pools.acquire_staging(ctx, need, ash::vk::BufferUsageFlags::TRANSFER_SRC, counters)?;
-    {
-        let ptr = ctx
-            .device
-            .map_memory(staging.memory, 0, need, ash::vk::MemoryMapFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportScanoutMapStaging, e)))?;
-        std::ptr::copy_nonoverlapping(bgra.as_ptr(), ptr as *mut u8, expected);
-        ctx.device.unmap_memory(staging.memory);
-    }
-
-    let (cb, fence) = pools.begin_entry_sync(ctx, counters)?;
-    let color_range = ash::vk::ImageSubresourceRange::default()
-        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-        .base_mip_level(0)
-        .level_count(1)
-        .base_array_layer(0)
-        .layer_count(1);
-    let record = || -> Result<(), DrawError> {
-        ctx.device
-            .reset_command_buffer(cb, ash::vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportScanoutResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
-                cb,
-                &ash::vk::CommandBufferBeginInfo::default()
-                    .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportScanoutBeginCb, e)))?;
-        // Export image UNDEFINED -> TRANSFER_DST (we overwrite every texel).
-        let pre = [ash::vk::ImageMemoryBarrier::default()
-            .src_access_mask(ash::vk::AccessFlags::empty())
-            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(ash::vk::ImageLayout::UNDEFINED)
-            .new_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(export_image)
-            .subresource_range(color_range)];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            ash::vk::PipelineStageFlags::ALL_COMMANDS,
-            ash::vk::PipelineStageFlags::TRANSFER,
-            ash::vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &pre,
-        );
-        // buffer_row_length is in texels; tight BGRA = width texels/row.
-        let region = [ash::vk::BufferImageCopy::default()
-            .buffer_row_length(width)
-            .buffer_image_height(height)
-            .image_subresource(ash::vk::ImageSubresourceLayers {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(ash::vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_buffer_to_image(
-            cb,
-            staging.buffer,
-            export_image,
-            ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &region,
-        );
-        // -> GENERAL, transfer write made available to the external dmabuf reader.
-        let post = [ash::vk::ImageMemoryBarrier::default()
-            .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(ash::vk::AccessFlags::MEMORY_READ)
-            .old_layout(ash::vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(ash::vk::ImageLayout::GENERAL)
-            .image(export_image)
-            .subresource_range(color_range)];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            ash::vk::PipelineStageFlags::TRANSFER,
-            ash::vk::PipelineStageFlags::ALL_COMMANDS,
-            ash::vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &post,
-        );
-        ctx.device
-            .end_command_buffer(cb)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportScanoutEndCb, e)))?;
-        Ok(())
-    };
-    record()?;
-    let queue = ctx.queue();
-    let cbs = [cb];
-    let si = ash::vk::SubmitInfo::default().command_buffers(&cbs);
-    ctx.device
-        .queue_submit(queue, &[si], fence)
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExportScanoutSubmit, e)))?;
-    let sealed = pools.seal_entry(Vec::new(), Vec::new());
-    pools.finish_entry_async(sealed);
-    pools.retire_all(ctx, counters)?;
-
-    // dup for the importer to own+close this present; the cache keeps `cached_fd`.
-    // std OwnedFd dup (libc is Apple-only); into_raw_fd hands ownership to QEMU.
-    let dup_fd = std::os::fd::BorrowedFd::borrow_raw(cached_fd)
-        .try_clone_to_owned()
-        .map_err(|e| DrawError::FdDup(FdDupDecline::new(FdDupRail::ExportScanout, &e)))?
-        .into_raw_fd();
-    Ok((dup_fd, row_pitch))
-}
-
-/// True zero-copy scanout export: blit a content-ready **resident** present
-/// target straight into the next exportable LINEAR ring image (GPU→GPU, no CPU
-/// readback) and return `(dup_fd, row_pitch, width, height, ring_idx)` for the
-/// direct-present path (host window route B). Unlike [`export_scanout_from_bgra`],
-/// this reads no `frame_bgra`: the source is the resident `VkImage` the engine
-/// already rendered, resolved by `identity`. `ring_idx` names which ring slot the
-/// fd backs so the window imports each slot's dmabuf once and re-blits the cached
-/// import (the engine writes fresh content into that slot's shared memory); the
-/// ring hands a different slot each present so no slot is written while the
-/// window still reads it (tear-safety without a cross-device semaphore).
-///
-/// Fails visibly (never silently) when the resident cannot back this export:
-/// `reason=vk_engine_export_present_unknown_identity` (no such identity),
-/// `reason=vk_engine_export_present_not_ready` (resident has no content yet),
-/// `reason=present_export_resident_not_bgra` (an RGBA resident would export
-/// swapped channels), or `reason=present_export_unavailable` (device lacks the
-/// dmabuf export extensions).
-/// The caller falls back to the CPU `export_scanout_from_bgra` / staging path on
-/// any error, so a miss degrades to the copy path, never to a wrong frame.
-///
-/// The blit leaves the resident in `TRANSFER_SRC_OPTIMAL`; the registry layout is
-/// updated to match (mirrors [`read_target_inner`]). The export image ends in
-/// `GENERAL`, ready for the external dmabuf consumer.
-///
-/// # Safety
-/// Must be called with no other engine borrow held; allocates + submits on the
-/// engine device.
 /// Short protocol-kind label for a [`TargetIdentity`] (diagnostics only).
 fn identity_kind(identity: &TargetIdentity) -> &'static str {
     match identity {
@@ -1618,7 +1394,7 @@ pub unsafe fn export_present_from_resident_fd_policy(
     }
 
     // Resolve the resident and snapshot the Copy fields, dropping the pools
-    // borrow before we mutate pools (begin_entry) / scanout_export (acquire).
+    // borrow before we mutate pools (begin_entry) / the export ring (acquire).
     let (src_image, src_layout, width, height) = {
         let slot = match pools.registry_get(identity) {
             Some(s) => s,
@@ -2094,16 +1870,13 @@ pub fn test_reset_engine() {
     let mut g = lock_engine();
     if let Some(mut ctx) = g.owner.ctx.take() {
         unsafe {
-            // The dmabuf export rings hold VkImages bound to THIS device and are
-            // NOT owned by caches/pools. Tear them down here — exactly as the
+            // The dmabuf export ring holds VkImages bound to THIS device and is
+            // NOT owned by caches/pools. Tear it down here — exactly as the
             // production device-recreate path (`flush_device_derived`) does —
-            // before destroying the device. Skipping them orphans stale image
+            // before destroying the device. Skipping it orphans stale image
             // handles that a later `reset_guest_state`/flush destroys against the
             // recreated device, which faults inside the driver (a real SIGSEGV
             // the serial parity suite hit at `guest_reset_evicts_*`).
-            if let Some(fd) = g.scanout_export.destroy(&ctx.device) {
-                drop(std::os::fd::OwnedFd::from_raw_fd(fd));
-            }
             for fd in g.present_export_ring.destroy(&ctx.device) {
                 drop(std::os::fd::OwnedFd::from_raw_fd(fd));
             }

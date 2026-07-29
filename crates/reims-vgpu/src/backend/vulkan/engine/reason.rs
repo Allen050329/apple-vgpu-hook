@@ -105,9 +105,6 @@ pub enum DrawReason {
     NoMemoryTypeForDmabufImport { memory_type_bits: u32 },
     /// dmabuf export extensions absent — the display zero-copy rail.
     DmabufExportUnavailable,
-    /// Scanout export specifically, which is a distinct entry point from the
-    /// per-present export and fails independently.
-    ScanoutExportUnavailable,
     /// Per-present export specifically.
     PresentExportUnavailable,
     /// A resident asked to be exported for present is not in guest scanout
@@ -173,7 +170,6 @@ impl crate::observe::Decline for DrawReason {
             Self::NoMemoryTypeForScanoutExport { .. } => "no_memory_type_for_scanout_export",
             Self::NoMemoryTypeForDmabufImport { .. } => "no_memory_type_for_dmabuf_import",
             Self::DmabufExportUnavailable => "dmabuf_export_unavailable",
-            Self::ScanoutExportUnavailable => "scanout_export_unavailable",
             Self::PresentExportUnavailable => "present_export_unavailable",
             Self::PresentExportResidentNotBgra => "present_export_resident_not_bgra",
             Self::PresentHostPtrImportUnavailable => "present_host_ptr_import_unavailable",
@@ -596,7 +592,6 @@ mod tests {
             memory_type_bits: 0,
         },
         DrawReason::DmabufExportUnavailable,
-        DrawReason::ScanoutExportUnavailable,
         DrawReason::PresentExportUnavailable,
         DrawReason::PresentExportResidentNotBgra,
         DrawReason::PresentHostPtrImportUnavailable,

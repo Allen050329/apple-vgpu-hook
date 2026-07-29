@@ -163,7 +163,8 @@ pub enum ReimsVgpuHostActionKind {
     CursorUpdate = 4,
     Trace = 5,
     CursorGlyph = 6,
-    ScanoutGl = 7,
+    // 7 is retired (the removed GL/dmabuf scanout action); the values below are
+    // spelled out so its removal did not renumber the wire.
     InputKey = 8,
     InputPointerMove = 9,
     InputPointerButton = 10,
@@ -789,7 +790,9 @@ mod tests {
             (K::CursorUpdate, ReimsVgpuHostActionKind::CursorUpdate, 4),
             (K::Trace, ReimsVgpuHostActionKind::Trace, 5),
             (K::CursorGlyph, ReimsVgpuHostActionKind::CursorGlyph, 6),
-            (K::ScanoutGl, ReimsVgpuHostActionKind::ScanoutGl, 7),
+            // 7 is a retired wire value (the removed GL/dmabuf scanout action).
+            // The jump from 6 to 8 is deliberate: the input kinds keep the
+            // values the C shim already dispatches on.
             (K::InputKey, ReimsVgpuHostActionKind::InputKey, 8),
             (
                 K::InputPointerMove,

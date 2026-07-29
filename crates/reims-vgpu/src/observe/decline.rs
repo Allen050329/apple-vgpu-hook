@@ -307,7 +307,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "no_memory_type_for_scanout_export",
             "no_memory_type_for_dmabuf_import",
             "dmabuf_export_unavailable",
-            "scanout_export_unavailable",
             "present_export_unavailable",
             "present_export_resident_not_bgra",
             "present_host_ptr_import_unavailable",
@@ -828,7 +827,6 @@ pub const REGISTRY: &[DeclineClass] = &[
         emission: Emission::At(&[
             ("host_window/present.rs", "host_window_present"),
             ("runtime/storage_flush.rs", "deferred_flush_lost"),
-            ("runtime/drain/mod.rs", "scanout_gl_export_fail"),
             ("lib.rs", "export_present"),
         ]),
         slug_calls: &[],
@@ -836,8 +834,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_engine_window_presenter_not_attached",
             "vk_engine_storage_read_resident_absent",
             "vk_engine_storage_read_generation_mismatch",
-            "vk_engine_export_scanout_zero_geometry",
-            "vk_engine_export_scanout_length_mismatch",
             "vk_engine_export_present_unknown_identity",
             "vk_engine_export_present_not_ready",
             "vk_engine_scatter_present_unknown_identity",
@@ -852,8 +848,8 @@ pub const REGISTRY: &[DeclineClass] = &[
         // by file until the coarse `Vulkan(String)` variant could be deleted.
         // First the stats-reduction pool's eight calls, then
         // `mod.rs`'s two import_present-reaching rails (readback + host present),
-        // its storage-flush rail (`read_resident_storage`), and its two dmabuf
-        // export rails (`export_scanout_from_bgra`, `export_present_*`).
+        // its storage-flush rail (`read_resident_storage`), and its dmabuf
+        // export rail (`export_present_*`).
         type_name: "VkCall",
         defined_in: "backend/vulkan/engine/vk_call.rs",
         slug_blocks: &[],
@@ -868,14 +864,12 @@ pub const REGISTRY: &[DeclineClass] = &[
         // The storage-flush rail (`read_resident_storage`) reaches
         // `runtime/storage_flush.rs`'s `deferred_flush_lost` line, which the same
         // migration converted from a bare-string `err={e}` to `Emit::decline`.
-        // The two dmabuf export rails reach `runtime/drain/mod.rs`'s
-        // `scanout_gl_export_fail` (CPU-capture scanout) and `lib.rs`'s
-        // `export_present` (zero-copy present) — the latter a silent
-        // `Err(_) => None` the same migration closed. `dmabuf_export.rs`'s own
-        // `export_bgra_scanout_dmabuf` (the low-level exportable VkImage those
-        // two rails are built on: create/alloc/bind/get_fd) propagates up
-        // through `ScanoutExportCache`/`ScanoutExportRing` to the very same two
-        // sinks, so its four `vk_dmabuf_export_*` slugs surface there too.
+        // The dmabuf export rail reaches `lib.rs`'s `export_present` (zero-copy
+        // present) — a silent `Err(_) => None` the same migration closed.
+        // `dmabuf_export.rs`'s own `export_bgra_scanout_dmabuf` (the low-level
+        // exportable VkImage that rail is built on: create/alloc/bind/get_fd)
+        // propagates up through `ScanoutExportRing` to the very same sink, so its
+        // four `vk_dmabuf_export_*` slugs surface there too.
         // Its consumer half, `import_bgra_dmabuf_image` (the host window
         // importing that dmabuf fd as a sampleable image: create/fd-props/
         // alloc/bind), is now `vk_dmabuf_import_*`. Its sink is
@@ -941,7 +935,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             ),
             ("runtime/import_present.rs", "import_present"),
             ("runtime/storage_flush.rs", "deferred_flush_lost"),
-            ("runtime/drain/mod.rs", "scanout_gl_export_fail"),
             ("lib.rs", "export_present"),
             ("host_window/present.rs", "host_window_present"),
             ("runtime/metal_draw/mod.rs", "linux_m2v_draw"),
@@ -988,11 +981,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "vk_storage_read_end_cb",
             "vk_storage_read_submit",
             "vk_storage_read_map",
-            "vk_export_scanout_map_staging",
-            "vk_export_scanout_reset_cb",
-            "vk_export_scanout_begin_cb",
-            "vk_export_scanout_end_cb",
-            "vk_export_scanout_submit",
             "vk_export_present_reset_cb",
             "vk_export_present_begin_cb",
             "vk_export_present_end_cb",
@@ -1112,23 +1100,20 @@ pub const REGISTRY: &[DeclineClass] = &[
         ],
     },
     DeclineClass {
-        // The last two `DrawError::Vulkan(String)` sites in `engine/mod.rs` were
-        // not Vulkan calls: both zero-copy export rails `dup(2)` the cached
+        // One `DrawError::Vulkan(String)` site in `engine/mod.rs` was not a
+        // Vulkan call: the zero-copy export rail `dup(2)`s the ring slot's
         // exportable-image fd so the importer owns its own copy, and that
         // `try_clone_to_owned` returns `std::io::Error` (an errno), not a
-        // `vk::Result` — so they are `FdDupDecline`, not `VkCall`. Carried by
+        // `vk::Result` — so it is `FdDupDecline`, not `VkCall`. Carried by
         // `DrawError::FdDup`, which delegates its slug/fields here. Reaches the
-        // same two export sinks the `vk_export_{scanout,present}_*` rails do,
-        // because it fails inside the very same two functions.
+        // same export sink the `vk_export_present_*` rail does, because it fails
+        // inside the very same function.
         type_name: "FdDupDecline",
         defined_in: "backend/vulkan/engine/fd_dup.rs",
         slug_blocks: &[],
-        emission: Emission::At(&[
-            ("runtime/drain/mod.rs", "scanout_gl_export_fail"),
-            ("lib.rs", "export_present"),
-        ]),
+        emission: Emission::At(&[("lib.rs", "export_present")]),
         slug_calls: &[],
-        slugs: &["fd_dup_export_scanout", "fd_dup_export_present"],
+        slugs: &["fd_dup_export_present"],
     },
     DeclineClass {
         type_name: "ZeroCopyDecline",

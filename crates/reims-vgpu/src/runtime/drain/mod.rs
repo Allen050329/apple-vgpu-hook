@@ -1195,88 +1195,8 @@ fn enqueue_present_scanout<H: HostOps>(
             state.present.frame_generation,
         ));
     }
-    // Deprecated GL-console bridge probe. The supported display path is the
-    // custom Rust host window/direct-present route; keep this opt-in inert unless
-    // explicitly doing historical QEMU GL archaeology.
-    maybe_enqueue_scanout_gl(state, host, width, height);
     state.present.unpainted_presents = state.present.unpainted_presents.saturating_add(1);
     state.pending.host_action_yield = true;
-}
-
-/// `fourcc('X','R','2','4')` — the DRM code for a little-endian `[B][G][R][X]`
-/// byte layout, which is exactly the exported `B8G8R8A8_UNORM` image (alpha
-/// ignored: the scanned-out desktop is opaque). Modifier is implicit LINEAR.
-#[cfg(feature = "backend-vulkan")]
-const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
-
-/// Deprecated opt-in toggle for the historical GL/dmabuf scanout bridge probe,
-/// read once from `REIMS_VGPU_SCANOUT_GL=1`. Memoized so the present hot path never
-/// re-reads the environment.
-#[cfg(feature = "backend-vulkan")]
-fn scanout_gl_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("REIMS_VGPU_SCANOUT_GL").is_some_and(|v| v == "1"))
-}
-
-/// Deprecated GL-console bridge: export the current `frame_bgra` capture as a
-/// dmabuf and enqueue a `ScanoutGl` action. Guarded on a fresh, correctly-sized
-/// capture so a stale/short `frame_bgra` never mis-exports; on export failure it
-/// fail-logs the reason. Product display work must stay on the custom host window.
-#[cfg(feature = "backend-vulkan")]
-fn maybe_enqueue_scanout_gl<H: HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    width: u32,
-    height: u32,
-) {
-    if !scanout_gl_enabled() || width == 0 || height == 0 {
-        return;
-    }
-    let need = (width as usize)
-        .saturating_mul(4)
-        .saturating_mul(height as usize);
-    // Only a full-frame capture at this exact geometry is a valid export source;
-    // anything else (empty / clear-only / mismatched) stays on the CPU path.
-    if need == 0 || state.present.frame_bgra.len() != need {
-        return;
-    }
-    match unsafe {
-        crate::backend::vulkan::engine::export_scanout_from_bgra(
-            width,
-            height,
-            &state.present.frame_bgra,
-        )
-    } {
-        Ok((fd, row_pitch)) => {
-            host.enqueue(HostAction::scanout_gl(
-                fd,
-                row_pitch,
-                DRM_FORMAT_XRGB8888,
-                width,
-                height,
-            ));
-        }
-        Err(e) => {
-            // Was a bare-string `reason=export ... err={e}`; the export rail's
-            // Vulkan calls now carry their own `vk_export_scanout_*` slug, so
-            // `Emit::decline` renders the specific failing call as a first-class
-            // `reason=` rather than the coarse fixed `export`.
-            crate::observe::Emit::decline("scanout_gl_export_fail", &e)
-                .field("geom", format!("{width}x{height}"))
-                .fail();
-        }
-    }
-}
-
-/// No-op on non-Vulkan backends (the GL/dmabuf export path is Vulkan-only).
-#[cfg(not(feature = "backend-vulkan"))]
-fn maybe_enqueue_scanout_gl<H: HostOps>(
-    _state: &mut DeviceState,
-    _host: &mut H,
-    _width: u32,
-    _height: u32,
-) {
 }
 
 fn present_page_identity_line(state: &DeviceState, mapping: u32, w: u32, h: u32) -> Option<String> {

@@ -154,11 +154,10 @@ pub enum HostActionKind {
     Trace = 5,
     /// New software cursor glyph ready in device state (C pulls via ABI).
     CursorGlyph = 6,
-    /// Deprecated pre-host-window experiment: exported dmabuf fd for QEMU GL
-    /// scanout (`dpy_gl_scanout_dmabuf`). The supported product display path is
-    /// the Rust host window (`REIMS_VGPU_WINDOW=1`) and direct-present route, not QEMU's
-    /// GL console. Kept only to preserve the existing additive wire value.
-    ScanoutGl = 7,
+    // 7 is a retired wire value: it named a pre-host-window QEMU GL/dmabuf
+    // scanout action that no longer exists on either side. Every discriminant
+    // below is written out so removing it did not renumber the wire; do not
+    // reuse 7 for a new action.
     /// A guest keyboard key from the host-owned window (see
     /// [`crate::runtime::input`]). `a0` = Linux evdev keycode (`KEY_*`),
     /// `a1` = 1 down / 0 up. The window thread maps the platform key into the
@@ -249,32 +248,6 @@ impl HostAction {
             a1: 0,
             a2: 0,
             a3: 0,
-        }
-    }
-
-    /// Deprecated QEMU GL/dmabuf scanout action. The export tuple is packed into
-    /// the four `u64` action slots (the C shim unpacks the same way to build its
-    /// `EGL_LINUX_DMA_BUF_EXT` import):
-    /// - `a0` = the dmabuf `fd` (always `>= 0` — the caller emits only on a
-    ///   successful export; the fd is a process-local handle valid across the
-    ///   in-process C ABI, and the importer owns closing it).
-    /// - `a1` = `row_pitch` (bytes per row of the LINEAR image — the EGL stride).
-    /// - `a2` = `width << 32 | height` (both fit in `u32`).
-    /// - `a3` = DRM `fourcc` (e.g. `DRM_FORMAT_ARGB8888` for the B8G8R8A8 export).
-    ///
-    /// The DRM modifier is **implicitly `DRM_FORMAT_MOD_LINEAR`** (the portable
-    /// baseline per the AGENTS.md portability rule), so it needs no slot; a single
-    /// plane at offset 0 is assumed (the export image binds one allocation at
-    /// offset 0). Coalescing / fd-lifetime policy is decided by the display
-    /// integration that emits this (only the latest present matters). Product
-    /// display work should use the custom host window/direct-present path instead.
-    pub fn scanout_gl(fd: i32, row_pitch: u64, fourcc: u32, width: u32, height: u32) -> Self {
-        Self {
-            kind: HostActionKind::ScanoutGl,
-            a0: fd as u64,
-            a1: row_pitch,
-            a2: (u64::from(width) << 32) | u64::from(height),
-            a3: u64::from(fourcc),
         }
     }
 
@@ -1038,30 +1011,6 @@ mod tests {
             .expect("one ScanoutUpdate");
         assert_eq!(scan.a0, 4, "latest present mid wins");
         assert_eq!(scan.a3, 11);
-    }
-
-    /// The deprecated GL/dmabuf scanout export tuple round-trips through the four
-    /// action slots exactly as the C shim will unpack it (fd, pitch, w|h, fourcc).
-    /// Locks the additive wire packing so historical probes keep decoding.
-    #[test]
-    fn scanout_gl_packs_export_tuple() {
-        // Discriminant must match REIMS_VGPU_HOST_ACTION_SCANOUT_GL in the C header.
-        assert_eq!(HostActionKind::ScanoutGl as u32, 7);
-
-        let (fd, pitch, fourcc, w, h) = (37i32, 7680u64, 0x3432_5241u32, 1920u32, 1080u32);
-        let a = HostAction::scanout_gl(fd, pitch, fourcc, w, h);
-        assert_eq!(a.kind, HostActionKind::ScanoutGl);
-        // C-side unpack: fd = a0, pitch = a1, w = a2>>32, h = a2 low32, fourcc = a3.
-        assert_eq!(a.a0 as i32, fd);
-        assert_eq!(a.a1, pitch);
-        assert_eq!((a.a2 >> 32) as u32, w);
-        assert_eq!((a.a2 & 0xffff_ffff) as u32, h);
-        assert_eq!(a.a3 as u32, fourcc);
-
-        // Full-HD dims never collide across the width|height split.
-        let big = HostAction::scanout_gl(1, 1, 0, 4096, 2160);
-        assert_eq!((big.a2 >> 32) as u32, 4096);
-        assert_eq!((big.a2 & 0xffff_ffff) as u32, 2160);
     }
 
     /// Exactly one refusal means "the guest unmapped this".

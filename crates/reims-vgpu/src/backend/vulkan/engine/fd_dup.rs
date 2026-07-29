@@ -2,7 +2,7 @@
 //!
 //! # Why this is not [`super::vk_call::VkCall`]
 //!
-//! Both zero-copy export rails `dup` the cached exportable-image fd so the
+//! The zero-copy export rail `dup`s the cached exportable-image fd so the
 //! importer (QEMU on Linux, the host window on the arm64 MoltenVK pathway) owns
 //! and closes its own copy of the dmabuf. `dup(2)` can fail — `EMFILE`/`ENFILE`
 //! under host fd pressure — and that is a POSIX syscall failure carrying an
@@ -10,25 +10,22 @@
 //! decline: the shape mirrors `VkCall` (rail + the driver's result code), but the
 //! result code is `std::io::Error::raw_os_error()`, not a Vulkan enum.
 //!
-//! These were the last two `DrawError::Vulkan(String)` sites in `engine/mod.rs`,
-//! spelled `"export_{scanout,present} dup fd: {e}"` around a `try_clone_to_owned`
-//! that returns [`std::io::Error`]. Carried by [`super::types::DrawError::FdDup`],
-//! which delegates its slug and fields here so the export sinks
-//! (`runtime/drain/mod.rs` `scanout_gl_export_fail`, `lib.rs` `export_present`) name
-//! the failing dup rather than flattening it into `vk_engine_vk_untyped`.
+//! It was a `DrawError::Vulkan(String)` site in `engine/mod.rs`, spelled
+//! `"export_present dup fd: {e}"` around a `try_clone_to_owned` that returns
+//! [`std::io::Error`]. Carried by [`super::types::DrawError::FdDup`], which
+//! delegates its slug and fields here so the export sink (`lib.rs`
+//! `export_present`) names the failing dup rather than flattening it into
+//! `vk_engine_vk_untyped`.
 
 use crate::observe::Decline;
 
 /// Which zero-copy export rail's fd dup failed.
 ///
-/// The two rails dup a *different* fd (the scanout export ring vs. the resident
-/// present export ring), so they are distinct reasons even though the syscall is
-/// the same — the [`super::vk_call::VkCall`] *(rail, operation)* principle.
+/// A rail dups its own fd, so each is a distinct reason even though the syscall
+/// is the same — the [`super::vk_call::VkCall`] *(rail, operation)* principle. A
+/// second rail added later gets its own variant rather than sharing this slug.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FdDupRail {
-    /// `export_scanout_from_bgra`'s scanout export fd (the CPU-capture → dmabuf
-    /// scanout rail).
-    ExportScanout,
     /// `export_present_from_resident_fd_policy`'s present export fd
     /// (the zero-copy resident → dmabuf present rail).
     ExportPresent,
@@ -67,7 +64,6 @@ impl Decline for FdDupDecline {
     /// One slug per export rail, `fd_dup_export_<rail>`.
     fn slug(&self) -> &'static str {
         match self.rail {
-            FdDupRail::ExportScanout => "fd_dup_export_scanout",
             FdDupRail::ExportPresent => "fd_dup_export_present",
         }
     }
@@ -91,7 +87,7 @@ impl std::fmt::Display for FdDupDecline {
 mod tests {
     use super::*;
 
-    const ALL: &[FdDupRail] = &[FdDupRail::ExportScanout, FdDupRail::ExportPresent];
+    const ALL: &[FdDupRail] = &[FdDupRail::ExportPresent];
 
     /// Two rails sharing a slug would make a grep of the fail log unable to tell
     /// which export's dup refused. Every slug is also log-safe.
@@ -130,12 +126,12 @@ mod tests {
     #[test]
     fn the_line_carries_the_errno_or_none() {
         let with = FdDupDecline::new(
-            FdDupRail::ExportScanout,
+            FdDupRail::ExportPresent,
             &std::io::Error::from_raw_os_error(24),
         );
-        let line = crate::observe::Emit::decline("scanout_gl_export_fail", &with).render();
+        let line = crate::observe::Emit::decline("export_present", &with).render();
         assert!(
-            line.starts_with("scanout_gl_export_fail reason=fd_dup_export_scanout errno=24"),
+            line.starts_with("export_present reason=fd_dup_export_present errno=24"),
             "{line}"
         );
 

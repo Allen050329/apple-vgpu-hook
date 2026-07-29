@@ -55,11 +55,11 @@ extern "C" {
 #define REIMS_VGPU_HOST_ACTION_TRACE 5u
 #define REIMS_VGPU_HOST_ACTION_CURSOR_GLYPH 6u
 /*
- * Deprecated pre-host-window QEMU GL/dmabuf scanout action. The supported
- * product display path is the Rust host window/direct-present route; this wire
- * value remains allocated only for compatibility with historical probes.
+ * 7 is a retired wire value: it named a pre-host-window QEMU GL/dmabuf scanout
+ * action that no longer exists on either side. The numbering below stays where
+ * it is so the values remain the ones already compiled into the shim; do not
+ * reuse 7 for a new action.
  */
-#define REIMS_VGPU_HOST_ACTION_SCANOUT_GL 7u
 /*
  * Host-owned-window input (see Rust runtime::input / kb host-window). Rust maps
  * the window's platform events into these neutral wire forms; the shim replays

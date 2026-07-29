@@ -1,30 +1,29 @@
-//! GL/dmabuf scanout export — export a finished BGRA present image as a Linux
-//! dmabuf fd so QEMU can import it via EGL (`EGL_EXT_image_dma_buf_import`) and
-//! scan it out with `dpy_gl_scanout_dmabuf` under GTK `gl=on`, keeping the frame
-//! on the GPU (no guest-page read + CPU surface copy on the display path).
+//! dmabuf scanout export/import — carry a finished BGRA present image between
+//! the engine device and the host window's device as a Linux dmabuf fd, keeping
+//! the frame on the GPU (no guest-page read + CPU surface copy on the display
+//! path). This is the transport under direct-present route B.
 //!
-//! This module owns only the **Vulkan producer half**: creating an exportable
-//! image and pulling its dmabuf fd. The finished frame is blitted into this
-//! image (`vkCmdBlitImage`/`vkCmdCopyImage` from the present target), then the
-//! `(fd, row_pitch, modifier=LINEAR)` tuple crosses the C ABI to QEMU. The image
-//! is `LINEAR`-tiled so the exported dmabuf carries the implicit
-//! `DRM_FORMAT_MOD_LINEAR` modifier — the simplest tuple for EGL to import (a
-//! known stride, no explicit-modifier negotiation). Optimal-tiled export via
-//! `VK_EXT_image_drm_format_modifier` is a later refinement.
+//! Both halves live here. The **producer** creates an exportable image and pulls
+//! its dmabuf fd ([`export_bgra_scanout_dmabuf`], ringed by
+//! [`ScanoutExportRing`]); the finished present target is blitted into it by
+//! [`record_blit_present_into_export`]. The **consumer**
+//! ([`import_bgra_dmabuf_image`]) imports that fd on the window's own device as a
+//! `TRANSFER_SRC` image to blit into the swapchain.
+//!
+//! The image is `LINEAR`-tiled so the exported dmabuf carries the implicit
+//! `DRM_FORMAT_MOD_LINEAR` modifier — a known stride with no explicit-modifier
+//! negotiation. Optimal-tiled export via `VK_EXT_image_drm_format_modifier` is a
+//! later refinement.
 //!
 //! Capability is gated on [`DeviceContext::ext_external_memory_fd`]
 //! (`VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` — both are the
 //! portable, Mesa/Intel/AMD/NVIDIA-supported dmabuf path; verified present on the
-//! RTX 5080). When absent, callers keep the CPU display path.
+//! RTX 5080). When absent, callers keep the CPU staging path.
 //!
 //! Portability note: LINEAR-tiled export uses the implicit `DRM_FORMAT_MOD_LINEAR`
-//! modifier, which every driver exports and EGL imports. Explicit optimal-tiling
+//! modifier, which every driver exports and imports. Explicit optimal-tiling
 //! modifiers (`VK_EXT_image_drm_format_modifier`) differ per vendor, so LINEAR is
 //! the portable baseline (see the AGENTS.md portability ground rule).
-//!
-//! The producer half is not yet wired into the present path (that half needs the
-//! QEMU C shim + a VM boot to verify); this scaffolding + its on-GPU test prove
-//! the export mechanism works before the display wiring lands.
 #![allow(dead_code)]
 
 use ash::vk;
@@ -412,79 +411,6 @@ pub(crate) unsafe fn record_blit_present_into_export(
     );
 }
 
-/// Caches one exportable scanout image so the display path does not create a new
-/// image + pull a new dmabuf fd on every present — only when the scanout geometry
-/// changes. Reusing the same image (and thus the same fd) each frame is the
-/// "no per-frame fd churn" the GL/dmabuf export path needs: QEMU imports the fd
-/// once and keeps scanning it out while we blit fresh content into it every frame.
-///
-/// Lifecycle is caller-owned by design, so this cache stays decoupled from the
-/// engine's fence/ring bookkeeping: [`acquire`](Self::acquire) hands the **old**
-/// image back to the caller on a geometry change, and the caller disposes it
-/// (deferred image/memory destroy + `close(2)` on its fd) only once no in-flight
-/// command buffer still references it. The cache never destroys a live image
-/// underneath the GPU.
-///
-/// Boot-path follow-up: a single cached image tears if QEMU reads it while we
-/// blit the next frame in. The display wiring adds double-buffering (a small ring,
-/// like the CPU `capture_scratch`) or a present-complete fence; the cache API is
-/// unchanged by that — it just holds N images keyed by geometry instead of one.
-#[derive(Default)]
-pub(crate) struct ScanoutExportCache {
-    current: Option<ExportedScanoutImage>,
-}
-
-impl ScanoutExportCache {
-    pub(crate) fn new() -> Self {
-        Self { current: None }
-    }
-
-    /// Ensure the cached export image matches `width`x`height`, creating it if
-    /// absent or the geometry changed. Returns the **retired** image (the old
-    /// geometry's) for the caller to dispose once it is no longer in flight;
-    /// `None` when the existing image was reused (same geometry) or nothing was
-    /// displaced. After this returns `Ok`, [`current`](Self::current) is the image
-    /// to blit into and export.
-    ///
-    /// # Safety
-    /// `ctx` must be a live device context; the returned retired image (if any) is
-    /// the caller's to destroy + whose fd to close.
-    pub(crate) unsafe fn acquire(
-        &mut self,
-        ctx: &DeviceContext,
-        width: u32,
-        height: u32,
-    ) -> Result<Option<ExportedScanoutImage>, DrawError> {
-        if let Some(cur) = &self.current {
-            if cur.width == width && cur.height == height {
-                return Ok(None);
-            }
-        }
-        let fresh = export_bgra_scanout_dmabuf(ctx, width, height)?;
-        Ok(self.current.replace(fresh))
-    }
-
-    /// The cached export image to blit into / hand to QEMU, or `None` before the
-    /// first successful [`acquire`](Self::acquire).
-    pub(crate) fn current(&self) -> Option<&ExportedScanoutImage> {
-        self.current.as_ref()
-    }
-
-    /// Destroy the cached image + free its memory, returning its dmabuf fd for the
-    /// caller to `close(2)` (the fd is an independent kernel handle). `None` when
-    /// the cache is empty.
-    ///
-    /// # Safety
-    /// `device` must be the context that produced the image and no in-flight
-    /// command buffer may still reference it.
-    pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) -> Option<i32> {
-        let img = self.current.take()?;
-        let fd = img.fd;
-        img.destroy(device);
-        Some(fd)
-    }
-}
-
 /// Number of exportable images the direct-present ring keeps. The engine blits
 /// frame N into slot `N % RING` while the window is still reading slot
 /// `(N-1) % RING`, so a slot is only reused RING presents after it was last
@@ -495,14 +421,14 @@ impl ScanoutExportCache {
 pub(crate) const SCANOUT_EXPORT_RING: usize = 3;
 
 /// A small ring of exportable scanout images for the direct-present path
-/// ([[host-window]] route B). Unlike [`ScanoutExportCache`] (one image, reused
-/// every frame — correct only for the GL path where QEMU's own console reads it
-/// under GTK's frame pacing), this hands a DIFFERENT slot each present so the
-/// engine never overwrites the slot the host window is mid-blit reading.
+/// ([[host-window]] route B). It hands a DIFFERENT slot each present so the
+/// engine never overwrites the slot the host window is mid-blit reading — a
+/// single reused image would tear against a consumer on its own frame pacing.
 ///
-/// Lifecycle is caller-owned (like the single-image cache): [`acquire_next`]
-/// returns any images displaced by a geometry change for the caller to dispose
-/// once no in-flight work references them; the ring never frees a live image.
+/// Lifecycle is caller-owned by design, so the ring stays decoupled from the
+/// engine's fence/ring bookkeeping: [`acquire_next`] returns any images
+/// displaced by a geometry change for the caller to dispose once no in-flight
+/// work references them; the ring never frees a live image.
 pub(crate) struct ScanoutExportRing {
     slots: [Option<ExportedScanoutImage>; SCANOUT_EXPORT_RING],
     /// Next slot to hand out.
@@ -1268,90 +1194,6 @@ mod tests {
         }
     }
 
-    /// The export cache reuses the same image (and fd) across same-geometry
-    /// presents — no per-frame fd churn — and retires the old image on a geometry
-    /// change for the caller to dispose. This is the display path's steady-state
-    /// contract. Skips cleanly with no GPU / no export extension.
-    #[test]
-    fn export_cache_reuses_same_geometry_and_retires_on_change() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        crate::observe::redirect_logs_for_tests();
-        let mut ctx = match unsafe { DeviceContext::create() } {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("SKIP export cache: no device ({e})");
-                return;
-            }
-        };
-        if ctx.ext_external_memory_fd.is_none() {
-            eprintln!("SKIP export cache: extensions not enabled on this device");
-            unsafe { ctx.destroy() };
-            return;
-        }
-        unsafe {
-            let mut cache = ScanoutExportCache::new();
-            assert!(
-                cache.current().is_none(),
-                "empty cache has no current image"
-            );
-
-            // First acquire creates; nothing retired.
-            let retired = cache.acquire(&ctx, 128, 64).expect("first acquire");
-            assert!(retired.is_none(), "first acquire retires nothing");
-            let (img0, fd0) = {
-                let c = cache.current().expect("current after first acquire");
-                assert_eq!((c.width, c.height), (128, 64));
-                assert!(c.fd >= 0);
-                (c.image, c.fd)
-            };
-
-            // Same geometry → reuse: same image + fd, nothing retired (no churn).
-            let retired = cache.acquire(&ctx, 128, 64).expect("reuse acquire");
-            assert!(
-                retired.is_none(),
-                "same-geometry acquire reuses, retires nothing"
-            );
-            {
-                let c = cache.current().expect("current after reuse");
-                assert_eq!(c.image, img0, "same-geometry reuse keeps the same image");
-                assert_eq!(
-                    c.fd, fd0,
-                    "same-geometry reuse keeps the same fd (no churn)"
-                );
-            }
-
-            // Geometry change → new image, old one retired for disposal.
-            let retired = cache
-                .acquire(&ctx, 256, 128)
-                .expect("resize acquire")
-                .expect("resize retires the old image");
-            assert_eq!((retired.width, retired.height), (128, 64));
-            assert_eq!(retired.image, img0, "retired image is the prior geometry's");
-            {
-                let c = cache.current().expect("current after resize");
-                assert_eq!((c.width, c.height), (256, 128));
-                assert_ne!(c.image, img0, "resize allocates a fresh image");
-            }
-            // Caller disposes the retired image + closes its fd.
-            let retired_fd = retired.fd;
-            retired.destroy(&ctx.device);
-            let _owned = OwnedFd::from_raw_fd(retired_fd);
-
-            // destroy() frees the current image and yields its fd to close.
-            let cur_fd = cache
-                .destroy(&ctx.device)
-                .expect("destroy yields current fd");
-            let _owned2 = OwnedFd::from_raw_fd(cur_fd);
-            assert!(cache.current().is_none(), "destroy empties the cache");
-            assert!(
-                cache.destroy(&ctx.device).is_none(),
-                "destroy on an empty cache is a no-op"
-            );
-
-            ctx.destroy();
-        }
-    }
-
     /// The direct-present ring hands a DIFFERENT slot each present (tear-safety:
     /// the engine never overwrites the slot the window is mid-blit reading),
     /// cycles back after `SCANOUT_EXPORT_RING` slots reusing the same fd (no
@@ -1431,56 +1273,5 @@ mod tests {
             );
             ctx.destroy();
         }
-    }
-
-    /// Exercises the engine-level `export_scanout_from_bgra` end to end on the
-    /// singleton engine: a tight BGRA frame is staged + copied into the cached
-    /// exportable image and a dup'd dmabuf fd + row pitch come back. Proves the
-    /// whole present-time producer path (cache acquire, staging upload, submit,
-    /// retire, fd dup) runs on the real GPU without error; pixel-correctness of
-    /// the exported dmabuf is verified end to end at the live-VM screendump
-    /// stage. Skips cleanly with no GPU / no export extension.
-    #[test]
-    fn export_scanout_from_bgra_returns_usable_fd() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        crate::observe::redirect_logs_for_tests();
-        // Probe device availability the same way the other GPU tests do.
-        let mut ctx = match unsafe { DeviceContext::create() } {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("SKIP export_scanout_from_bgra: no device ({e})");
-                return;
-            }
-        };
-        let has_export = ctx.ext_external_memory_fd.is_some();
-        unsafe { ctx.destroy() };
-        if !has_export {
-            eprintln!("SKIP export_scanout_from_bgra: export extensions unavailable");
-            return;
-        }
-
-        let (w, h) = (64u32, 32u32);
-        let bgra = vec![0x7Fu8; (w as usize) * 4 * (h as usize)];
-        let (fd, pitch) =
-            unsafe { crate::backend::vulkan::engine::export_scanout_from_bgra(w, h, &bgra) }
-                .expect("export_scanout_from_bgra must succeed with export extensions");
-        assert!(fd >= 0, "returned dmabuf fd must be valid");
-        assert!(
-            pitch >= (w as u64) * 4,
-            "row pitch {pitch} must cover {w}px * 4 bytes"
-        );
-        // The fd is a real, closeable kernel handle we now own.
-        let _owned = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        // A wrong-length frame is rejected, not silently mis-copied.
-        assert!(
-            unsafe { crate::backend::vulkan::engine::export_scanout_from_bgra(w, h, &bgra[..8]) }
-                .is_err(),
-            "short frame must be rejected"
-        );
-
-        // Drop the engine's cached export image so the singleton does not leak
-        // it into other tests.
-        crate::backend::vulkan::engine::reset_guest_state();
     }
 }
