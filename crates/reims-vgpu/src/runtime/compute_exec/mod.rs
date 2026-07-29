@@ -2856,20 +2856,6 @@ pub fn execute_dispatch<M: HostMemory + HostOps>(
         log_compute_dispatch_census(state, host, task_id, acc, cmd, st, false);
         st
     }
-    #[cfg(all(not(feature = "backend-vulkan"), feature = "backend-vulkan"))]
-    {
-        // Metal stubs / no vulkan feature: fail-visible census only.
-        log_compute_dispatch_census(
-            state,
-            host,
-            task_id,
-            acc,
-            cmd,
-            ComputeStatus::NoMetal("compute_dispatch_no_backend"),
-            false,
-        );
-        ComputeStatus::NoMetal("compute_dispatch_no_backend")
-    }
 }
 
 /// Nested dispatch onto an open multi-record control-flow session encoder.

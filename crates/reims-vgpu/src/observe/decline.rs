@@ -1695,7 +1695,6 @@ pub const REGISTRY: &[DeclineClass] = &[
             "compute_control_end_if",
             "compute_control_end_while",
             "compute_control_no_vulkan_path",
-            "compute_dispatch_no_backend",
             "compute_grid_dim_range",
             "compute_heap_fmt_bytes",
             "compute_heap_fmt_storage",

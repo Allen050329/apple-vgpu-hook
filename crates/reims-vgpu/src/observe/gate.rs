@@ -999,12 +999,12 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (68, 1541): `execute_event_bytes` — a decode-then-execute
-        // convenience wrapper with no caller — took `event_decode_unclassified`
-        // with it, the guard on its forwarding arm. Event records are still
-        // decoded and still refuse by name, on the one path that has a caller
-        // (`runtime/exec.rs`). The type count is unchanged.
-        (68, 1540),
+        // Down from (68, 1540): `compute_dispatch_no_backend` was written only
+        // inside a block whose cfg is `all(not(backend-vulkan), backend-vulkan)`
+        // — a contradiction, so no configuration ever compiled it. The gates
+        // below cannot see that: they grep for the slug literal in the source,
+        // and the literal was there. The type count is unchanged.
+        (68, 1539),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );

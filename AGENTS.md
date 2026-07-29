@@ -411,6 +411,27 @@ once. It is safe here only because every `Cache` in the tree is built with `Cach
 top of one walk and dropped at the end of it, so it cannot outlive its own validity. Check that
 before reading "nothing calls the invalidate" as good news.
 
+**Ask whether a `cfg` can be satisfied at all — the decline gates cannot.** The gates read the source
+for a slug literal, so a `Emit`/`Status` inside a block that *no configuration compiles* still counts
+as a writer. `compute_dispatch_no_backend` was registered and unwritable for exactly that reason: its
+arm was gated `all(not(feature = "backend-vulkan"), feature = "backend-vulkan")`, a contradiction.
+
+The crate's four hard constraints make more configurations impossible than they look, and each is a
+cheap grep:
+
+- exactly one of `backend-metal` / `backend-vulkan` (`lib.rs`), so any `all(…metal…, …vulkan…)` gate
+  outside the `compile_error!` itself is dead;
+- `backend-metal` implies `target_os = "macos"` (`lib.rs`), so `backend/metal/**` has no non-Apple
+  arm — `host_stub.rs` was 107 lines gated on precisely the refused conjunction, and had been
+  broken long enough for a function it called to move modules unnoticed;
+- `backend-vulkan` implies macOS or Linux;
+- `host-window` implies `backend-vulkan` (Cargo feature dep).
+
+The tell for this class is a build that *never runs*: `--features backend-metal` is Apple-only, so
+nothing on a Linux CI or a Linux agent ever compiles those blocks, and `-D warnings` cannot report
+what it does not build. Grep for the contradiction directly rather than waiting for a compiler that
+is never invoked.
+
 **Round-trip an extraction the host cannot compile.** `backend-metal` is Apple-only and does not
 build on Linux at all, so a refactor of Metal-gated tests gets no compiler check whatsoever. Textual
 extractions are still verifiable: strip the new helper, mechanically inline every call back to the
