@@ -300,47 +300,6 @@ pub fn opcode_supported(opcode: u32) -> bool {
     opcode <= OP_ACCEPTED_LAST
 }
 
-pub fn opcode_name(opcode: u32) -> &'static str {
-    match opcode {
-        OP_SET_PIPELINE => "setRenderPipelineState",
-        OP_SET_VERTEX_BUFFER => "setVertexBuffer",
-        OP_SET_FRAGMENT_BUFFER => "setFragmentBuffer",
-        OP_SET_VERTEX_BUFFER_OFFSET => "setVertexBufferOffset",
-        OP_SET_FRAGMENT_BUFFER_OFFSET => "setFragmentBufferOffset",
-        OP_DRAW => "drawPrimitives",
-        OP_DRAW_INST_COMPACT => "drawPrimitivesInstanced",
-        OP_DRAW_INDEXED_WIDE => "drawIndexedPrimitivesWide",
-        OP_DRAW_INDEXED => "drawIndexedPrimitives",
-        OP_SET_VIEWPORT => "setViewport",
-        OP_SET_SCISSOR => "setScissorRect",
-        OP_UPDATE_FENCE => "updateFence",
-        OP_WAIT_FENCE => "waitForFence",
-        OP_EXECUTE_COMMANDS_INDIRECT => "executeCommandsInBufferIndirect",
-        OP_EXECUTE_COMMANDS_RANGE => "executeCommandsInBuffer",
-        _ if opcode_is_apple_rejected(opcode) => "AppleException",
-        _ if opcode_supported(opcode) => "accepted",
-        _ => "unknown",
-    }
-}
-
-pub fn kind_name(k: Kind) -> &'static str {
-    match k {
-        Kind::SetPipeline => "setPipeline",
-        Kind::SetBuffer => "setBuffer",
-        Kind::SetBufferOffset => "setBufferOffset",
-        Kind::SetTexture => "setTexture",
-        Kind::SetSampler => "setSampler",
-        Kind::Draw => "draw",
-        Kind::SetViewport => "setViewport",
-        Kind::SetScissor => "setScissor",
-        Kind::Fence => "fence",
-        Kind::Barrier => "barrier",
-        Kind::RenderPass => "renderPass",
-        Kind::OtherAccepted => "other",
-        _ => "unknown",
-    }
-}
-
 /// Decode color attachment slot `index` from a render-pass payload.
 pub fn decode_color_attachment(payload: &[u8], index: usize) -> ColorAttachment {
     let mut out = ColorAttachment::default();
