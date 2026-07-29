@@ -54,9 +54,20 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
     // A second delete with no resolve between still tears down for real
     // (`drop_windows`), and the window cap still bounds the population.
     if state.mapping_backing_condemned(mapping_id) {
-        crate::observe::off(format!(
-            "deferred_flush_held mapping={mapping_id} reason=backing_condemned lo={lo} hi={hi}"
-        ));
+        // Latched per mapping. Holding is the *expected* outcome for as long as
+        // the condemnation is undecided, and a reader hits this choke point on
+        // every access: one boot emitted this 15224 times, 13015 of them for a
+        // single mapping that stayed condemned for 121 s, which is 7:1 against
+        // every other line in the log put together. That drowns the channel this
+        // device is diagnosed through, and the rate was never the signal — which
+        // mapping is holding is. A real loss is still reported, by
+        // `deferred_flush_lost` if the resolve reprieves and the write then
+        // fails, or by `deferred_flush_dropped` if it tears down.
+        if crate::observe::first_sight("deferred_flush_held", u64::from(mapping_id)) {
+            crate::observe::off(format!(
+                "deferred_flush_held mapping={mapping_id} reason=backing_condemned lo={lo} hi={hi} (latched)"
+            ));
+        }
         return true;
     }
     // Fixpoint: a taken window may extend past [lo, hi) and drag further
