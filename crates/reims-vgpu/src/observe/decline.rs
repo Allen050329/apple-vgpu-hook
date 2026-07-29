@@ -2193,10 +2193,7 @@ pub const REGISTRY: &[DeclineClass] = &[
             "gva_page_table_read",
             "gva_zero_pfn",
             "gva_malformed_pte",
-            "gva_span_overflow",
-            "gva_visitor_stopped",
             "gva_unsupported_geometry",
-            "gva_span_too_large",
         ],
     },
     DeclineClass {

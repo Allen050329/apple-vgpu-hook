@@ -1026,10 +1026,7 @@ mod tests {
             R::ErrPageTableRead,
             R::ErrZeroPfn,
             R::ErrMalformedPte,
-            R::ErrSpanOverflow,
-            R::ErrVisitorStopped,
             R::ErrUnsupportedGeometry,
-            R::ErrSpanTooLarge,
         ];
         let teardown: Vec<R> = WALK
             .iter()

@@ -76,10 +76,7 @@ pub enum ResolveStatus {
     ErrPageTableRead = 9,
     ErrZeroPfn = 10,
     ErrMalformedPte = 11,
-    ErrSpanOverflow = 12,
-    ErrVisitorStopped = 13,
     ErrUnsupportedGeometry = 14,
-    ErrSpanTooLarge = 15,
 }
 
 impl crate::observe::Refusal for ResolveStatus {
@@ -112,10 +109,7 @@ impl crate::observe::Refusal for ResolveStatus {
             Self::ErrPageTableRead => "gva_page_table_read",
             Self::ErrZeroPfn => "gva_zero_pfn",
             Self::ErrMalformedPte => "gva_malformed_pte",
-            Self::ErrSpanOverflow => "gva_span_overflow",
-            Self::ErrVisitorStopped => "gva_visitor_stopped",
             Self::ErrUnsupportedGeometry => "gva_unsupported_geometry",
-            Self::ErrSpanTooLarge => "gva_span_too_large",
         })
     }
 }
@@ -126,15 +120,6 @@ pub enum CacheStatus {
     Hit,
     Miss,
     MissInserted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SpanKind {
-    #[default]
-    Empty = 0,
-    SinglePage,
-    MultiPage,
-    Overflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,30 +157,6 @@ impl Default for Translation {
             raw_pte: 0,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Span {
-    pub status: ResolveStatus,
-    pub kind: SpanKind,
-    pub gva: u64,
-    pub length: u64,
-    pub first_page_index: u64,
-    pub last_page_index: u64,
-    pub page_count: u64,
-    pub first_page_offset: u32,
-    pub first_chunk_length: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SpanChunk {
-    pub gva: u64,
-    pub gpa: u64,
-    pub length: u64,
-    pub page_index: u64,
-    pub page_offset: u32,
-    pub chunk_index: u64,
-    pub cache_status: CacheStatus,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -252,10 +213,7 @@ pub fn resolve_status_name(status: ResolveStatus) -> &'static str {
         ResolveStatus::ErrPageTableRead => "page-table-read",
         ResolveStatus::ErrZeroPfn => "zero-pfn",
         ResolveStatus::ErrMalformedPte => "malformed-pte",
-        ResolveStatus::ErrSpanOverflow => "span-overflow",
-        ResolveStatus::ErrVisitorStopped => "visitor-stopped",
         ResolveStatus::ErrUnsupportedGeometry => "unsupported-geometry",
-        ResolveStatus::ErrSpanTooLarge => "span-too-large",
     }
 }
 
@@ -351,87 +309,6 @@ fn cache_insert(
         page_index,
         gpa_page,
     };
-}
-
-/// **Arm64e only** (16 KiB geometry). Prefer [`classify_span_with_geometry`].
-pub fn classify_span_arm64e(gva: u64, length: u64) -> Span {
-    classify_span_with_geometry(&ARM64E_GEOMETRY, gva, length)
-}
-
-pub fn classify_span_with_geometry(geometry: &Geometry, gva: u64, length: u64) -> Span {
-    let mut out = Span {
-        status: ResolveStatus::Ok,
-        kind: SpanKind::Empty,
-        gva,
-        length,
-        ..Default::default()
-    };
-    let gs = validate_geometry(geometry);
-    if gs != ResolveStatus::Ok {
-        out.status = gs;
-        return out;
-    }
-    if length == 0 {
-        out.kind = SpanKind::Empty;
-        return out;
-    }
-    if u64::MAX - gva < length - 1 {
-        out.status = ResolveStatus::ErrSpanOverflow;
-        out.kind = SpanKind::Overflow;
-        return out;
-    }
-    let last_byte = gva + (length - 1);
-    out.first_page_index = gva >> geometry.page_shift;
-    out.last_page_index = last_byte >> geometry.page_shift;
-    out.page_count = out.last_page_index - out.first_page_index + 1;
-    if out.page_count > geometry.max_span_pages as u64 {
-        out.status = ResolveStatus::ErrSpanTooLarge;
-        return out;
-    }
-    out.first_page_offset = (gva & geometry.page_offset_mask as u64) as u32;
-    let mut first_chunk = geometry.page_size as u64 - out.first_page_offset as u64;
-    if first_chunk > length {
-        first_chunk = length;
-    }
-    out.first_chunk_length = first_chunk as u32;
-    out.kind = if out.page_count == 1 {
-        SpanKind::SinglePage
-    } else {
-        SpanKind::MultiPage
-    };
-    out
-}
-
-/// **Arm64e only.** Prefer span over [`classify_span_with_geometry`].
-pub fn span_page_count_arm64e(gva: u64, length: u64) -> u32 {
-    let span = classify_span_arm64e(gva, length);
-    if span.status != ResolveStatus::Ok || span.page_count > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        span.page_count as u32
-    }
-}
-
-pub fn strided_span_len(stride: u64, row_bytes: u32, rows: u32) -> Option<u64> {
-    if row_bytes == 0 || rows == 0 {
-        return None;
-    }
-    let repeat = (rows as u64) - 1;
-    if stride != 0 && repeat > (u64::MAX - row_bytes as u64) / stride {
-        return Some(u64::MAX);
-    }
-    Some(repeat * stride + row_bytes as u64)
-}
-
-pub fn span_first_page_slot(span: &Span, page_slot_count: u32) -> Option<u32> {
-    if span.status != ResolveStatus::Ok
-        || span.first_chunk_length == 0
-        || page_slot_count == 0
-        || span.first_page_index >= page_slot_count as u64
-    {
-        return None;
-    }
-    Some(span.first_page_index as u32)
 }
 
 pub fn read_task_root(
@@ -589,127 +466,6 @@ pub fn translate_root(
     clippy::too_many_arguments,
     reason = "the walker exposes each page-table and span input explicitly"
 )]
-pub fn walk_span_root<F>(
-    reader: &dyn PhysReader,
-    geometry: &Geometry,
-    root_pfn: u32,
-    depth: u32,
-    gva: u64,
-    length: u64,
-    cache: Option<&mut Cache>,
-    mut visitor: F,
-) -> Result<(), (ResolveStatus, Translation)>
-where
-    F: FnMut(&SpanChunk) -> bool,
-{
-    let span = classify_span_with_geometry(geometry, gva, length);
-    if span.status != ResolveStatus::Ok {
-        let failure = Translation {
-            status: span.status,
-            gva,
-            ..Translation::default()
-        };
-        return Err((span.status, failure));
-    }
-    if span.kind == SpanKind::Empty {
-        return Ok(());
-    }
-
-    let mut done = 0u64;
-    let mut chunk_index = 0u64;
-    // Re-borrow cache for each iteration without consuming.
-    // Use raw split: store cache as Option pointer via rebind.
-    let mut cache = cache;
-    while done < length {
-        let current_gva = gva + done;
-        let page_off = (current_gva & geometry.page_offset_mask as u64) as u32;
-        let mut chunk_len = geometry.page_size as u64 - page_off as u64;
-        if chunk_len > length - done {
-            chunk_len = length - done;
-        }
-        let translation = {
-            let cache_ref = cache.as_deref_mut();
-            translate_root(reader, geometry, root_pfn, depth, current_gva, cache_ref)
-        };
-        if translation.status != ResolveStatus::Ok {
-            return Err((translation.status, translation));
-        }
-        let chunk = SpanChunk {
-            gva: current_gva,
-            gpa: translation.gpa,
-            length: chunk_len,
-            page_index: translation.gva_page_index,
-            page_offset: page_off,
-            chunk_index,
-            cache_status: translation.cache_status,
-        };
-        if !visitor(&chunk) {
-            let failure = Translation {
-                status: ResolveStatus::ErrVisitorStopped,
-                gva: current_gva,
-                ..Translation::default()
-            };
-            return Err((ResolveStatus::ErrVisitorStopped, failure));
-        }
-        done += chunk_len;
-        chunk_index += 1;
-    }
-    Ok(())
-}
-
-pub fn walk_span_task<F>(
-    reader: &dyn PhysReader,
-    task: &Task,
-    geometry: &Geometry,
-    gva: u64,
-    length: u64,
-    cache: Option<&mut Cache>,
-    visitor: F,
-) -> Result<(), (ResolveStatus, Translation)>
-where
-    F: FnMut(&SpanChunk) -> bool,
-{
-    let span = classify_span_with_geometry(geometry, gva, length);
-    if span.status != ResolveStatus::Ok {
-        let failure = Translation {
-            status: span.status,
-            gva,
-            ..Translation::default()
-        };
-        return Err((span.status, failure));
-    }
-    if span.kind == SpanKind::Empty {
-        return Ok(());
-    }
-    let root = match read_task_root(reader, task, geometry) {
-        Ok(r) => r,
-        Err(e) => {
-            let failure = Translation {
-                status: e,
-                gva,
-                ..Translation::default()
-            };
-            return Err((e, failure));
-        }
-    };
-    match walk_span_root(
-        reader,
-        geometry,
-        root.root_pfn,
-        root.depth,
-        gva,
-        length,
-        cache,
-        visitor,
-    ) {
-        Ok(()) => Ok(()),
-        Err((s, mut t)) => {
-            t.directory_pfn = root.directory_pfn;
-            Err((s, t))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -759,26 +515,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_span_basic() {
-        let s = classify_span_arm64e(0x100, 0x10);
-        assert_eq!(s.status, ResolveStatus::Ok);
-        assert_eq!(s.kind, SpanKind::SinglePage);
-        assert_eq!(s.first_chunk_length, 0x10);
-
-        let s = classify_span_arm64e(0, 0);
-        assert_eq!(s.kind, SpanKind::Empty);
-
-        let s = classify_span_arm64e(PAGE_SIZE_ARM64E as u64 - 1, 2);
-        assert_eq!(s.kind, SpanKind::MultiPage);
-        assert_eq!(s.page_count, 2);
-    }
-
-    #[test]
-    fn strided_and_slot() {
-        assert_eq!(strided_span_len(256, 128, 2), Some(256 + 128));
-        assert!(strided_span_len(0, 0, 1).is_none());
-        let s = classify_span_arm64e(0, 16);
-        assert_eq!(span_first_page_slot(&s, 4), Some(0));
+    fn task_root_reads_directory_root_and_depth() {
+        let mut r = MapReader::new();
+        let dir_gpa = (2u64) << PAGE_SHIFT_ARM64E;
+        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN as u64, 1);
+        r.put_u32(dir_gpa + DIRECTORY_DEPTH as u64, 1);
+        let task = Task {
+            active: true,
+            directory_pfn: 2,
+        };
+        let root = read_task_root(&r, &task, &ARM64E_GEOMETRY).unwrap();
+        assert_eq!(root.directory_pfn, 2);
+        assert_eq!(root.root_pfn, 1);
+        assert_eq!(root.depth, 1);
     }
 
     #[test]
@@ -809,32 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn task_root_and_walk() {
-        let mut r = MapReader::new();
-        let dir_gpa = (2u64) << PAGE_SHIFT_ARM64E;
-        r.put_u32(dir_gpa + DIRECTORY_ROOT_PFN as u64, 1);
-        r.put_u32(dir_gpa + DIRECTORY_DEPTH as u64, 1);
-        let table_gpa = (1u64) << PAGE_SHIFT_ARM64E;
-        r.put_u32(table_gpa, 7);
-        let task = Task {
-            active: true,
-            directory_pfn: 2,
-        };
-        let root = read_task_root(&r, &task, &ARM64E_GEOMETRY).unwrap();
-        assert_eq!(root.root_pfn, 1);
-        assert_eq!(root.depth, 1);
-
-        let mut chunks = Vec::new();
-        walk_span_task(&r, &task, &ARM64E_GEOMETRY, 0x10, 0x20, None, |c| {
-            chunks.push(*c);
-            true
-        })
-        .unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].gpa, ((7u64) << PAGE_SHIFT_ARM64E) + 0x10);
-    }
-
-    #[test]
     fn zero_pfn_and_inactive() {
         let r = MapReader::new();
         let task = Task {
@@ -847,24 +570,5 @@ mod tests {
         );
         let t = translate_root(&r, &ARM64E_GEOMETRY, 0, 1, 0, None);
         assert_eq!(t.status, ResolveStatus::ErrZeroRootPfn);
-    }
-
-    #[test]
-    fn property_span_page_count_arm64e() {
-        // Fuzz-ish: page counts for boundary addresses.
-        for off in [0u64, 1, PAGE_SIZE_ARM64E as u64 - 1] {
-            for len in [
-                1u64,
-                2,
-                PAGE_SIZE_ARM64E as u64,
-                PAGE_SIZE_ARM64E as u64 + 1,
-            ] {
-                let s = classify_span_arm64e(off, len);
-                if s.status == ResolveStatus::Ok && len > 0 {
-                    assert!(s.page_count >= 1);
-                    assert_eq!(span_page_count_arm64e(off, len) as u64, s.page_count);
-                }
-            }
-        }
     }
 }

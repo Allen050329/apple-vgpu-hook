@@ -633,10 +633,7 @@ mod tests {
             R::ErrPageTableRead,
             R::ErrZeroPfn,
             R::ErrMalformedPte,
-            R::ErrSpanOverflow,
-            R::ErrVisitorStopped,
             R::ErrUnsupportedGeometry,
-            R::ErrSpanTooLarge,
         ];
         let mut slugs: Vec<&str> = WALK
             .iter()
@@ -670,7 +667,7 @@ mod tests {
             )
             .collect();
         let total = slugs.len();
-        assert_eq!(total, 36, "15 walk reasons + 21 memory reasons");
+        assert_eq!(total, 33, "12 walk reasons + 21 memory reasons");
         slugs.sort_unstable();
         slugs.dedup();
         assert_eq!(

@@ -999,11 +999,11 @@ fn the_registry_is_what_the_last_migration_recorded() {
     let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
     assert_eq!(
         (types, slugs),
-        // Down from (68, 1565): `iosurface_pages`'s `validate_cached_table` and
-        // `table_first_gpa` had no callers — only the arm64e wrappers that also
-        // had none — so `Status` could not reach their four slugs. The type
-        // count is unchanged; `Status` still writes 40 others.
-        (68, 1561),
+        // Down from (68, 1561): deleting `gva_resolve`'s span walker made
+        // `ResolveStatus::ErrSpanOverflow`, `ErrVisitorStopped` and
+        // `ErrSpanTooLarge` unconstructible — only `classify_span_*` and the
+        // visitor could produce them. The type count is unchanged.
+        (68, 1558),
         "the decline registry moved; update this baseline in the same commit \
          that moves it, and say which way in the journal"
     );
