@@ -1,5 +1,33 @@
 //! Always-on create/alloc and cache hit/miss counters (reuse-gate proxies).
 //!
+//! # The vocabulary is declared once
+//!
+//! [`engine_counters!`] takes the counter names and generates the five things
+//! that used to spell them out separately: the atomic [`EngineCounters`], the
+//! plain-`u64` [`CounterSnapshot`], and the three whole-vocabulary walks
+//! [`EngineCounters::snapshot`], [`EngineCounters::reset`] and
+//! [`CounterSnapshot::delta_since`].
+//!
+//! Writing seventy names five times is how a counter silently stops working, and
+//! neither failure mode is a compile error or a log line:
+//!
+//! * missing from `reset` — the counter reports a lifetime total into a reader
+//!   that asked for a window, so a per-second rate reads as monotonically rising;
+//! * missing from `delta_since` — the field reads **zero in every delta**, which
+//!   is indistinguishable from "this path never ran". That is the
+//!   "an event count is not a state" trap in `AGENTS.md` with the count itself
+//!   broken.
+//!
+//! All five lists were checked against each other before this collapse and all
+//! five agreed, so the macro changes no behaviour. What it changes is that they
+//! can no longer disagree.
+//!
+//! The three groups are a real distinction, not a formatting one. `windowed` is
+//! zeroed by `reset()`; `cumulative` deliberately survives it, because a
+//! device-loss count is a fact about the boot and not about the measurement
+//! window, and only `reset_all()` clears it; `pool_sourced` has no atomic at all
+//! and is merged in from `ResourcePools` by `engine::counter_snapshot`.
+//!
 //! # A field with no named reader is not dead
 //!
 //! [`CounterSnapshot`] is consumed only by the integration tests in `tests/`.
@@ -28,103 +56,202 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Process-wide product-path counters (resettable for tests).
-#[derive(Debug, Default)]
-pub struct EngineCounters {
-    pub creates: AtomicU64,
-    pub allocs: AtomicU64,
-    pub shader_hits: AtomicU64,
-    pub shader_misses: AtomicU64,
-    pub layout_hits: AtomicU64,
-    pub layout_misses: AtomicU64,
-    pub pass_hits: AtomicU64,
-    pub pass_misses: AtomicU64,
-    pub pipeline_hits: AtomicU64,
-    pub pipeline_misses: AtomicU64,
-    pub sampler_hits: AtomicU64,
-    pub sampler_misses: AtomicU64,
-    pub device_lost: AtomicU64,
-    pub recreates: AtomicU64,
-    // --- compute (workstream C) ---
-    pub compute_pipeline_hits: AtomicU64,
-    pub compute_pipeline_misses: AtomicU64,
-    pub dispatches: AtomicU64,
-    pub fence_timeouts: AtomicU64,
-    /// Compute sampled-image bytes staged for host→device upload.
-    pub compute_sampled_uploads: AtomicU64,
-    pub compute_sampled_upload_bytes: AtomicU64,
-    /// Compute storage-image seed bytes staged for host→device upload.
-    pub compute_storage_seed_uploads: AtomicU64,
-    pub compute_storage_seed_upload_bytes: AtomicU64,
-    /// Sampled inputs seeded by a device-local copy of a resident storage
-    /// image (copy-on-sample) — bytes are the elided host upload size.
-    pub compute_sampled_resident_copies: AtomicU64,
-    pub compute_sampled_resident_copy_bytes: AtomicU64,
-    /// Subset of the resident copies that crossed vk formats through the
-    /// image→buffer→image byte-reinterpret hop (row-byte-identical views).
-    pub compute_sampled_reinterpret_copies: AtomicU64,
-    pub compute_sampled_reinterpret_copy_bytes: AtomicU64,
-    /// Compute storage images whose post-dispatch readback was deferred —
-    /// the pinned resident stays authoritative; bytes are the elided
-    /// device→host readback size (the CPU writeback of the same size is
-    /// elided too).
-    pub compute_deferred_writebacks: AtomicU64,
-    pub compute_deferred_writeback_bytes: AtomicU64,
-    /// Deferred-flush reads (read_resident_storage): the on-access GPU→host
-    /// copy that lands deferred content in guest pages.
-    pub compute_deferred_flushes: AtomicU64,
-    pub compute_deferred_flush_bytes: AtomicU64,
-    // --- residency / oracle I/O (workstream D) ---
-    pub readbacks: AtomicU64,
-    pub readback_bytes: AtomicU64,
-    pub seed_uploads: AtomicU64,
-    pub seed_upload_bytes: AtomicU64,
-    /// Present-boundary seeds satisfied by a GPU resident→target image copy
-    /// (no CPU front-frame read, no seed upload); bytes = elided upload size.
-    pub seed_gpu_copies: AtomicU64,
-    pub seed_gpu_copy_bytes: AtomicU64,
-    pub sampled_reuploads: AtomicU64,
-    pub sampled_reupload_bytes: AtomicU64,
-    pub sampled_cache_hits: AtomicU64,
-    pub sampled_identity_hits: AtomicU64,
-    pub sampled_cache_hit_bytes: AtomicU64,
-    pub sampled_cache_misses: AtomicU64,
-    pub sampled_gpu_binds: AtomicU64,
-    /// Guest-run buffer binds snapshotted on the CPU at record time because
-    /// the draw defers its submit (batched CB must not read volatile guest
-    /// RAM at flush time).
-    ///
-    /// Its two former siblings, `sampled_zerocopy_binds` and
-    /// `buffer_zerocopy_binds`, counted guest-run binds the device gathered
-    /// itself out of imported guest pages. That mechanism is gone, so both
-    /// were fixed at zero — the shape the counter census calls out as
-    /// unreadable — and they were deleted rather than left reporting nothing.
-    pub buffer_snapshot_binds: AtomicU64,
-    pub gpu_load_hits: AtomicU64,
-    pub target_evicts: AtomicU64,
-    /// Descriptor-arena growth events: a new pool block was appended because
-    /// every existing block was exhausted (cap-pressure signal; 0 = no growth).
-    pub desc_pool_grow: AtomicU64,
-    pub gen_mismatch: AtomicU64,
-    // timing splits (microseconds, cumulative between resets)
-    /// Post-submit fence waits skipped by all-deferred compute dispatches.
-    pub compute_post_wait_skips: AtomicU64,
-    /// Post-submit fence waits skipped by no-readback (resident-target) draws.
-    pub render_post_wait_skips: AtomicU64,
-    /// Entries that found the ring full and had to block on the oldest
-    /// in-flight fence in begin_entry. This fires only when RING_DEPTH
-    /// consecutive no-wait entries outrun the GPU.
-    pub ring_retire_blocks: AtomicU64,
-    /// Draw batching (deferred submit): draws that OPENED a batch (left their
-    /// CB recording), draws that JOINED an open batch (skipped
-    /// begin_entry+submit entirely), batch submits, and total draws carried by
-    /// those submits (avg batch length = batch_flush_draws / batch_flushes).
-    pub batch_opens: AtomicU64,
-    pub batch_joins: AtomicU64,
-    pub batch_flushes: AtomicU64,
-    pub batch_flush_draws: AtomicU64,
+/// Declare the engine counter vocabulary once; see the module docs for why.
+///
+/// Doc comments written on a name here land on *both* the atomic field and its
+/// snapshot field, which is why the snapshot no longer has to repeat them.
+macro_rules! engine_counters {
+    (
+        windowed { $($(#[$wm:meta])* $win:ident,)* }
+        cumulative { $($(#[$cm:meta])* $cum:ident,)* }
+        pool_sourced { $($(#[$pm:meta])* $pool:ident,)* }
+    ) => {
+        /// Process-wide product-path counters (resettable for tests).
+        #[derive(Debug, Default)]
+        pub struct EngineCounters {
+            $($(#[$wm])* pub $win: AtomicU64,)*
+            $($(#[$cm])* pub $cum: AtomicU64,)*
+        }
+
+        /// One reading of [`EngineCounters`], plus the pool-owned tallies
+        /// `engine::counter_snapshot` merges in.
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub struct CounterSnapshot {
+            $($(#[$wm])* pub $win: u64,)*
+            $($(#[$cm])* pub $cum: u64,)*
+            $($(#[$pm])* pub $pool: u64,)*
+        }
+
+        impl EngineCounters {
+            /// Read every counter at once. The `pool_sourced` fields have no
+            /// atomic here and stay zero; `engine::counter_snapshot` fills them
+            /// from `ResourcePools` immediately after calling this.
+            pub fn snapshot(&self) -> CounterSnapshot {
+                CounterSnapshot {
+                    $($win: self.$win.load(Ordering::Relaxed),)*
+                    $($cum: self.$cum.load(Ordering::Relaxed),)*
+                    $($pool: 0,)*
+                }
+            }
+
+            /// Zero the windowed counters, leaving the cumulative ones alone.
+            pub fn reset(&self) {
+                $(self.$win.store(0, Ordering::Relaxed);)*
+            }
+
+            /// Zero everything, including the counters `reset` preserves.
+            pub fn reset_all(&self) {
+                self.reset();
+                $(self.$cum.store(0, Ordering::Relaxed);)*
+            }
+        }
+
+        impl CounterSnapshot {
+            /// This reading minus an earlier one, field by field. Saturating
+            /// because a `reset` between the two readings makes `earlier`
+            /// larger, and a window of "no work" must read 0 rather than wrap.
+            pub fn delta_since(&self, earlier: &CounterSnapshot) -> CounterSnapshot {
+                CounterSnapshot {
+                    $($win: self.$win.saturating_sub(earlier.$win),)*
+                    $($cum: self.$cum.saturating_sub(earlier.$cum),)*
+                    $($pool: self.$pool.saturating_sub(earlier.$pool),)*
+                }
+            }
+        }
+    };
 }
 
+engine_counters! {
+    windowed {
+        creates,
+        allocs,
+        shader_hits,
+        shader_misses,
+        layout_hits,
+        layout_misses,
+        pass_hits,
+        pass_misses,
+        pipeline_hits,
+        pipeline_misses,
+        sampler_hits,
+        sampler_misses,
+
+        // --- compute ---
+        compute_pipeline_hits,
+        compute_pipeline_misses,
+        dispatches,
+        fence_timeouts,
+        /// Compute sampled-image bytes staged for host→device upload.
+        compute_sampled_uploads,
+        compute_sampled_upload_bytes,
+        /// Compute storage-image seed bytes staged for host→device upload.
+        compute_storage_seed_uploads,
+        compute_storage_seed_upload_bytes,
+        /// Sampled inputs seeded by a device-local copy of a resident storage
+        /// image (copy-on-sample) — bytes are the elided host upload size.
+        compute_sampled_resident_copies,
+        compute_sampled_resident_copy_bytes,
+        /// Subset of the resident copies that crossed vk formats through the
+        /// image→buffer→image byte-reinterpret hop (row-byte-identical views).
+        compute_sampled_reinterpret_copies,
+        compute_sampled_reinterpret_copy_bytes,
+        /// Compute storage images whose post-dispatch readback was deferred —
+        /// the pinned resident stays authoritative; bytes are the elided
+        /// device→host readback size (the CPU writeback of the same size is
+        /// elided too).
+        compute_deferred_writebacks,
+        compute_deferred_writeback_bytes,
+        /// Deferred-flush reads (read_resident_storage): the on-access GPU→host
+        /// copy that lands deferred content in guest pages.
+        compute_deferred_flushes,
+        compute_deferred_flush_bytes,
+
+        // --- residency / oracle I/O ---
+        readbacks,
+        readback_bytes,
+        seed_uploads,
+        seed_upload_bytes,
+        /// Present-boundary seeds satisfied by a GPU resident→target image copy
+        /// (no CPU front-frame read, no seed upload); bytes = elided upload size.
+        seed_gpu_copies,
+        seed_gpu_copy_bytes,
+        sampled_reuploads,
+        sampled_reupload_bytes,
+        sampled_cache_hits,
+        sampled_identity_hits,
+        sampled_cache_hit_bytes,
+        sampled_cache_misses,
+        sampled_gpu_binds,
+        /// Guest-run buffer binds snapshotted on the CPU at record time because
+        /// the draw defers its submit (batched CB must not read volatile guest
+        /// RAM at flush time).
+        ///
+        /// Its two former siblings, `sampled_zerocopy_binds` and
+        /// `buffer_zerocopy_binds`, counted guest-run binds the device gathered
+        /// itself out of imported guest pages. That mechanism is gone, so both
+        /// were fixed at zero — the shape the counter census calls out as
+        /// unreadable — and they were deleted rather than left reporting nothing.
+        buffer_snapshot_binds,
+        gpu_load_hits,
+        target_evicts,
+        /// Descriptor-arena growth events: a new pool block was appended because
+        /// every existing block was exhausted (cap-pressure signal; 0 = no growth).
+        desc_pool_grow,
+        gen_mismatch,
+        /// Post-submit fence waits skipped by all-deferred compute dispatches.
+        compute_post_wait_skips,
+        /// Post-submit fence waits skipped by no-readback (resident-target) draws.
+        render_post_wait_skips,
+        /// Entries that found the ring full and had to block on the oldest
+        /// in-flight fence in begin_entry. This fires only when RING_DEPTH
+        /// consecutive no-wait entries outrun the GPU.
+        ring_retire_blocks,
+        /// Draw batching (deferred submit): draws that OPENED a batch (left their
+        /// CB recording), draws that JOINED an open batch (skipped
+        /// begin_entry+submit entirely), batch submits, and total draws carried by
+        /// those submits (avg batch length = batch_flush_draws / batch_flushes).
+        batch_opens,
+        batch_joins,
+        batch_flushes,
+        batch_flush_draws,
+    }
+
+    cumulative {
+        /// Cumulative across the boot: a device loss is a fact about this run,
+        /// not about the measurement window, so `reset()` leaves it standing.
+        device_lost,
+        /// Cumulative across the boot, for the same reason as `device_lost`.
+        recreates,
+    }
+
+    pool_sourced {
+        /// Sampled-cache pool recycle diagnostics (workstream D lag tail). These
+        /// four come from `ResourcePools`, not the atomic counters — merged in by
+        /// `engine::counter_snapshot`. `free_hits` = `acquire_sampled` reused a
+        /// recycled slot (no `vkAllocateMemory`); `free_allocs` = it had to create
+        /// a fresh image; `recycle_admits` = an evicted slot rejoined the per-key
+        /// free list; `recycle_cap_drops` = an evicted slot was destroyed because
+        /// the per-key cap was full (raising the cap would have kept it). A high
+        /// `free_allocs` with a high `recycle_cap_drops` means the cap is the
+        /// limiter; a high `free_allocs` with low admits means the drain timing is.
+        sampled_free_hits,
+        sampled_free_allocs,
+        sampled_recycle_admits,
+        sampled_recycle_cap_drops,
+        /// Resident render-target recycle diagnostics (same shape as the sampled
+        /// ones). `target_free_hits` = a create reused a recycled image (no
+        /// `vkCreateImage`/`vkAllocateMemory`); `target_free_allocs` = it had to
+        /// allocate fresh; `target_recycle_admits`/`target_recycle_cap_drops` =
+        /// displaced images that rejoined / overflowed the per-key free list. Owned
+        /// by `ResourcePools`; merged in by `engine::counter_snapshot` (zero here).
+        target_free_hits,
+        target_free_allocs,
+        target_recycle_admits,
+        target_recycle_cap_drops,
+    }
+}
+/// The `note_*` helpers: the increments that are not a bare `fetch_add(1)` at
+/// the call site, because they move a count and a byte total together.
 impl EngineCounters {
     pub fn note_create(&self) {
         self.creates.fetch_add(1, Ordering::Relaxed);
@@ -190,386 +317,7 @@ impl EngineCounters {
         self.compute_deferred_flush_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
-
-    pub fn snapshot(&self) -> CounterSnapshot {
-        CounterSnapshot {
-            creates: self.creates.load(Ordering::Relaxed),
-            allocs: self.allocs.load(Ordering::Relaxed),
-            shader_hits: self.shader_hits.load(Ordering::Relaxed),
-            shader_misses: self.shader_misses.load(Ordering::Relaxed),
-            layout_hits: self.layout_hits.load(Ordering::Relaxed),
-            layout_misses: self.layout_misses.load(Ordering::Relaxed),
-            pass_hits: self.pass_hits.load(Ordering::Relaxed),
-            pass_misses: self.pass_misses.load(Ordering::Relaxed),
-            pipeline_hits: self.pipeline_hits.load(Ordering::Relaxed),
-            pipeline_misses: self.pipeline_misses.load(Ordering::Relaxed),
-            sampler_hits: self.sampler_hits.load(Ordering::Relaxed),
-            sampler_misses: self.sampler_misses.load(Ordering::Relaxed),
-            device_lost: self.device_lost.load(Ordering::Relaxed),
-            recreates: self.recreates.load(Ordering::Relaxed),
-            compute_pipeline_hits: self.compute_pipeline_hits.load(Ordering::Relaxed),
-            compute_pipeline_misses: self.compute_pipeline_misses.load(Ordering::Relaxed),
-            dispatches: self.dispatches.load(Ordering::Relaxed),
-            fence_timeouts: self.fence_timeouts.load(Ordering::Relaxed),
-            compute_sampled_uploads: self.compute_sampled_uploads.load(Ordering::Relaxed),
-            compute_sampled_upload_bytes: self.compute_sampled_upload_bytes.load(Ordering::Relaxed),
-            compute_storage_seed_uploads: self.compute_storage_seed_uploads.load(Ordering::Relaxed),
-            compute_storage_seed_upload_bytes: self
-                .compute_storage_seed_upload_bytes
-                .load(Ordering::Relaxed),
-            compute_sampled_resident_copies: self
-                .compute_sampled_resident_copies
-                .load(Ordering::Relaxed),
-            compute_sampled_resident_copy_bytes: self
-                .compute_sampled_resident_copy_bytes
-                .load(Ordering::Relaxed),
-            compute_sampled_reinterpret_copies: self
-                .compute_sampled_reinterpret_copies
-                .load(Ordering::Relaxed),
-            compute_sampled_reinterpret_copy_bytes: self
-                .compute_sampled_reinterpret_copy_bytes
-                .load(Ordering::Relaxed),
-            compute_deferred_writebacks: self.compute_deferred_writebacks.load(Ordering::Relaxed),
-            compute_deferred_writeback_bytes: self
-                .compute_deferred_writeback_bytes
-                .load(Ordering::Relaxed),
-            compute_deferred_flushes: self.compute_deferred_flushes.load(Ordering::Relaxed),
-            compute_deferred_flush_bytes: self.compute_deferred_flush_bytes.load(Ordering::Relaxed),
-            readbacks: self.readbacks.load(Ordering::Relaxed),
-            readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
-            seed_uploads: self.seed_uploads.load(Ordering::Relaxed),
-            seed_upload_bytes: self.seed_upload_bytes.load(Ordering::Relaxed),
-            seed_gpu_copies: self.seed_gpu_copies.load(Ordering::Relaxed),
-            seed_gpu_copy_bytes: self.seed_gpu_copy_bytes.load(Ordering::Relaxed),
-            sampled_reuploads: self.sampled_reuploads.load(Ordering::Relaxed),
-            sampled_reupload_bytes: self.sampled_reupload_bytes.load(Ordering::Relaxed),
-            sampled_cache_hits: self.sampled_cache_hits.load(Ordering::Relaxed),
-            sampled_identity_hits: self.sampled_identity_hits.load(Ordering::Relaxed),
-            sampled_cache_hit_bytes: self.sampled_cache_hit_bytes.load(Ordering::Relaxed),
-            sampled_cache_misses: self.sampled_cache_misses.load(Ordering::Relaxed),
-            sampled_gpu_binds: self.sampled_gpu_binds.load(Ordering::Relaxed),
-            buffer_snapshot_binds: self.buffer_snapshot_binds.load(Ordering::Relaxed),
-            gpu_load_hits: self.gpu_load_hits.load(Ordering::Relaxed),
-            target_evicts: self.target_evicts.load(Ordering::Relaxed),
-            desc_pool_grow: self.desc_pool_grow.load(Ordering::Relaxed),
-            gen_mismatch: self.gen_mismatch.load(Ordering::Relaxed),
-            compute_post_wait_skips: self.compute_post_wait_skips.load(Ordering::Relaxed),
-            render_post_wait_skips: self.render_post_wait_skips.load(Ordering::Relaxed),
-            ring_retire_blocks: self.ring_retire_blocks.load(Ordering::Relaxed),
-            batch_opens: self.batch_opens.load(Ordering::Relaxed),
-            batch_joins: self.batch_joins.load(Ordering::Relaxed),
-            batch_flushes: self.batch_flushes.load(Ordering::Relaxed),
-            batch_flush_draws: self.batch_flush_draws.load(Ordering::Relaxed),
-            // Owned by ResourcePools, not the atomics — engine::counter_snapshot
-            // overwrites these from pools.recycle_stats(); zero here.
-            sampled_free_hits: 0,
-            sampled_free_allocs: 0,
-            sampled_recycle_admits: 0,
-            sampled_recycle_cap_drops: 0,
-            target_free_hits: 0,
-            target_free_allocs: 0,
-            target_recycle_admits: 0,
-            target_recycle_cap_drops: 0,
-        }
-    }
-
-    pub fn reset(&self) {
-        self.creates.store(0, Ordering::Relaxed);
-        self.allocs.store(0, Ordering::Relaxed);
-        self.shader_hits.store(0, Ordering::Relaxed);
-        self.shader_misses.store(0, Ordering::Relaxed);
-        self.layout_hits.store(0, Ordering::Relaxed);
-        self.layout_misses.store(0, Ordering::Relaxed);
-        self.pass_hits.store(0, Ordering::Relaxed);
-        self.pass_misses.store(0, Ordering::Relaxed);
-        self.pipeline_hits.store(0, Ordering::Relaxed);
-        self.pipeline_misses.store(0, Ordering::Relaxed);
-        self.sampler_hits.store(0, Ordering::Relaxed);
-        self.sampler_misses.store(0, Ordering::Relaxed);
-        self.compute_pipeline_hits.store(0, Ordering::Relaxed);
-        self.compute_pipeline_misses.store(0, Ordering::Relaxed);
-        self.dispatches.store(0, Ordering::Relaxed);
-        self.fence_timeouts.store(0, Ordering::Relaxed);
-        self.compute_sampled_uploads.store(0, Ordering::Relaxed);
-        self.compute_sampled_upload_bytes
-            .store(0, Ordering::Relaxed);
-        self.compute_storage_seed_uploads
-            .store(0, Ordering::Relaxed);
-        self.compute_storage_seed_upload_bytes
-            .store(0, Ordering::Relaxed);
-        self.compute_sampled_resident_copies
-            .store(0, Ordering::Relaxed);
-        self.compute_sampled_resident_copy_bytes
-            .store(0, Ordering::Relaxed);
-        self.compute_sampled_reinterpret_copies
-            .store(0, Ordering::Relaxed);
-        self.compute_sampled_reinterpret_copy_bytes
-            .store(0, Ordering::Relaxed);
-        self.compute_deferred_writebacks.store(0, Ordering::Relaxed);
-        self.compute_deferred_writeback_bytes
-            .store(0, Ordering::Relaxed);
-        self.compute_deferred_flushes.store(0, Ordering::Relaxed);
-        self.compute_deferred_flush_bytes
-            .store(0, Ordering::Relaxed);
-        self.readbacks.store(0, Ordering::Relaxed);
-        self.readback_bytes.store(0, Ordering::Relaxed);
-        self.seed_uploads.store(0, Ordering::Relaxed);
-        self.seed_upload_bytes.store(0, Ordering::Relaxed);
-        self.seed_gpu_copies.store(0, Ordering::Relaxed);
-        self.seed_gpu_copy_bytes.store(0, Ordering::Relaxed);
-        self.sampled_reuploads.store(0, Ordering::Relaxed);
-        self.sampled_reupload_bytes.store(0, Ordering::Relaxed);
-        self.sampled_cache_hits.store(0, Ordering::Relaxed);
-        self.sampled_identity_hits.store(0, Ordering::Relaxed);
-        self.sampled_cache_hit_bytes.store(0, Ordering::Relaxed);
-        self.sampled_cache_misses.store(0, Ordering::Relaxed);
-        self.sampled_gpu_binds.store(0, Ordering::Relaxed);
-        self.buffer_snapshot_binds.store(0, Ordering::Relaxed);
-        self.gpu_load_hits.store(0, Ordering::Relaxed);
-        self.target_evicts.store(0, Ordering::Relaxed);
-        self.desc_pool_grow.store(0, Ordering::Relaxed);
-        self.gen_mismatch.store(0, Ordering::Relaxed);
-        self.compute_post_wait_skips.store(0, Ordering::Relaxed);
-        self.render_post_wait_skips.store(0, Ordering::Relaxed);
-        self.ring_retire_blocks.store(0, Ordering::Relaxed);
-        self.batch_opens.store(0, Ordering::Relaxed);
-        self.batch_joins.store(0, Ordering::Relaxed);
-        self.batch_flushes.store(0, Ordering::Relaxed);
-        self.batch_flush_draws.store(0, Ordering::Relaxed);
-        // device_lost / recreates are cumulative across boot; do not zero on draw-gate reset
-    }
-
-    pub fn reset_all(&self) {
-        self.reset();
-        self.device_lost.store(0, Ordering::Relaxed);
-        self.recreates.store(0, Ordering::Relaxed);
-    }
 }
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CounterSnapshot {
-    pub creates: u64,
-    pub allocs: u64,
-    pub shader_hits: u64,
-    pub shader_misses: u64,
-    pub layout_hits: u64,
-    pub layout_misses: u64,
-    pub pass_hits: u64,
-    pub pass_misses: u64,
-    pub pipeline_hits: u64,
-    pub pipeline_misses: u64,
-    pub sampler_hits: u64,
-    pub sampler_misses: u64,
-    pub device_lost: u64,
-    pub recreates: u64,
-    pub compute_pipeline_hits: u64,
-    pub compute_pipeline_misses: u64,
-    pub dispatches: u64,
-    pub fence_timeouts: u64,
-    pub compute_sampled_uploads: u64,
-    pub compute_sampled_upload_bytes: u64,
-    pub compute_storage_seed_uploads: u64,
-    pub compute_storage_seed_upload_bytes: u64,
-    pub compute_sampled_resident_copies: u64,
-    pub compute_sampled_resident_copy_bytes: u64,
-    pub compute_sampled_reinterpret_copies: u64,
-    pub compute_sampled_reinterpret_copy_bytes: u64,
-    pub compute_deferred_writebacks: u64,
-    pub compute_deferred_writeback_bytes: u64,
-    pub compute_deferred_flushes: u64,
-    pub compute_deferred_flush_bytes: u64,
-    pub readbacks: u64,
-    pub readback_bytes: u64,
-    pub seed_uploads: u64,
-    pub seed_upload_bytes: u64,
-    pub seed_gpu_copies: u64,
-    pub seed_gpu_copy_bytes: u64,
-    pub sampled_reuploads: u64,
-    pub sampled_reupload_bytes: u64,
-    pub sampled_cache_hits: u64,
-    pub sampled_identity_hits: u64,
-    pub sampled_cache_hit_bytes: u64,
-    pub sampled_cache_misses: u64,
-    pub sampled_gpu_binds: u64,
-    pub buffer_snapshot_binds: u64,
-    pub gpu_load_hits: u64,
-    pub target_evicts: u64,
-    pub desc_pool_grow: u64,
-    pub gen_mismatch: u64,
-    pub compute_post_wait_skips: u64,
-    pub render_post_wait_skips: u64,
-    pub ring_retire_blocks: u64,
-    pub batch_opens: u64,
-    pub batch_joins: u64,
-    pub batch_flushes: u64,
-    pub batch_flush_draws: u64,
-    /// Sampled-cache pool recycle diagnostics (workstream D lag tail). These
-    /// four come from `ResourcePools`, not the atomic counters — merged in by
-    /// `engine::counter_snapshot`. `free_hits` = `acquire_sampled` reused a
-    /// recycled slot (no `vkAllocateMemory`); `free_allocs` = it had to create
-    /// a fresh image; `recycle_admits` = an evicted slot rejoined the per-key
-    /// free list; `recycle_cap_drops` = an evicted slot was destroyed because
-    /// the per-key cap was full (raising the cap would have kept it). A high
-    /// `free_allocs` with a high `recycle_cap_drops` means the cap is the
-    /// limiter; a high `free_allocs` with low admits means the drain timing is.
-    pub sampled_free_hits: u64,
-    pub sampled_free_allocs: u64,
-    pub sampled_recycle_admits: u64,
-    pub sampled_recycle_cap_drops: u64,
-    /// Resident render-target recycle diagnostics (same shape as the sampled
-    /// ones). `target_free_hits` = a create reused a recycled image (no
-    /// `vkCreateImage`/`vkAllocateMemory`); `target_free_allocs` = it had to
-    /// allocate fresh; `target_recycle_admits`/`target_recycle_cap_drops` =
-    /// displaced images that rejoined / overflowed the per-key free list. Owned
-    /// by `ResourcePools`; merged in by `engine::counter_snapshot` (zero here).
-    pub target_free_hits: u64,
-    pub target_free_allocs: u64,
-    pub target_recycle_admits: u64,
-    pub target_recycle_cap_drops: u64,
-}
-
-impl CounterSnapshot {
-    pub fn delta_since(&self, earlier: &CounterSnapshot) -> CounterSnapshot {
-        CounterSnapshot {
-            creates: self.creates.saturating_sub(earlier.creates),
-            allocs: self.allocs.saturating_sub(earlier.allocs),
-            shader_hits: self.shader_hits.saturating_sub(earlier.shader_hits),
-            shader_misses: self.shader_misses.saturating_sub(earlier.shader_misses),
-            layout_hits: self.layout_hits.saturating_sub(earlier.layout_hits),
-            layout_misses: self.layout_misses.saturating_sub(earlier.layout_misses),
-            pass_hits: self.pass_hits.saturating_sub(earlier.pass_hits),
-            pass_misses: self.pass_misses.saturating_sub(earlier.pass_misses),
-            pipeline_hits: self.pipeline_hits.saturating_sub(earlier.pipeline_hits),
-            pipeline_misses: self.pipeline_misses.saturating_sub(earlier.pipeline_misses),
-            sampler_hits: self.sampler_hits.saturating_sub(earlier.sampler_hits),
-            sampler_misses: self.sampler_misses.saturating_sub(earlier.sampler_misses),
-            device_lost: self.device_lost.saturating_sub(earlier.device_lost),
-            recreates: self.recreates.saturating_sub(earlier.recreates),
-            compute_pipeline_hits: self
-                .compute_pipeline_hits
-                .saturating_sub(earlier.compute_pipeline_hits),
-            compute_pipeline_misses: self
-                .compute_pipeline_misses
-                .saturating_sub(earlier.compute_pipeline_misses),
-            dispatches: self.dispatches.saturating_sub(earlier.dispatches),
-            fence_timeouts: self.fence_timeouts.saturating_sub(earlier.fence_timeouts),
-            compute_sampled_uploads: self
-                .compute_sampled_uploads
-                .saturating_sub(earlier.compute_sampled_uploads),
-            compute_sampled_upload_bytes: self
-                .compute_sampled_upload_bytes
-                .saturating_sub(earlier.compute_sampled_upload_bytes),
-            compute_storage_seed_uploads: self
-                .compute_storage_seed_uploads
-                .saturating_sub(earlier.compute_storage_seed_uploads),
-            compute_storage_seed_upload_bytes: self
-                .compute_storage_seed_upload_bytes
-                .saturating_sub(earlier.compute_storage_seed_upload_bytes),
-            compute_sampled_resident_copies: self
-                .compute_sampled_resident_copies
-                .saturating_sub(earlier.compute_sampled_resident_copies),
-            compute_sampled_resident_copy_bytes: self
-                .compute_sampled_resident_copy_bytes
-                .saturating_sub(earlier.compute_sampled_resident_copy_bytes),
-            compute_sampled_reinterpret_copies: self
-                .compute_sampled_reinterpret_copies
-                .saturating_sub(earlier.compute_sampled_reinterpret_copies),
-            compute_sampled_reinterpret_copy_bytes: self
-                .compute_sampled_reinterpret_copy_bytes
-                .saturating_sub(earlier.compute_sampled_reinterpret_copy_bytes),
-            compute_deferred_writebacks: self
-                .compute_deferred_writebacks
-                .saturating_sub(earlier.compute_deferred_writebacks),
-            compute_deferred_writeback_bytes: self
-                .compute_deferred_writeback_bytes
-                .saturating_sub(earlier.compute_deferred_writeback_bytes),
-            compute_deferred_flushes: self
-                .compute_deferred_flushes
-                .saturating_sub(earlier.compute_deferred_flushes),
-            compute_deferred_flush_bytes: self
-                .compute_deferred_flush_bytes
-                .saturating_sub(earlier.compute_deferred_flush_bytes),
-            readbacks: self.readbacks.saturating_sub(earlier.readbacks),
-            readback_bytes: self.readback_bytes.saturating_sub(earlier.readback_bytes),
-            seed_uploads: self.seed_uploads.saturating_sub(earlier.seed_uploads),
-            seed_gpu_copies: self.seed_gpu_copies.saturating_sub(earlier.seed_gpu_copies),
-            seed_gpu_copy_bytes: self
-                .seed_gpu_copy_bytes
-                .saturating_sub(earlier.seed_gpu_copy_bytes),
-            seed_upload_bytes: self
-                .seed_upload_bytes
-                .saturating_sub(earlier.seed_upload_bytes),
-            sampled_reuploads: self
-                .sampled_reuploads
-                .saturating_sub(earlier.sampled_reuploads),
-            sampled_reupload_bytes: self
-                .sampled_reupload_bytes
-                .saturating_sub(earlier.sampled_reupload_bytes),
-            sampled_cache_hits: self
-                .sampled_cache_hits
-                .saturating_sub(earlier.sampled_cache_hits),
-            sampled_identity_hits: self
-                .sampled_identity_hits
-                .saturating_sub(earlier.sampled_identity_hits),
-            sampled_cache_hit_bytes: self
-                .sampled_cache_hit_bytes
-                .saturating_sub(earlier.sampled_cache_hit_bytes),
-            sampled_cache_misses: self
-                .sampled_cache_misses
-                .saturating_sub(earlier.sampled_cache_misses),
-            sampled_gpu_binds: self
-                .sampled_gpu_binds
-                .saturating_sub(earlier.sampled_gpu_binds),
-            buffer_snapshot_binds: self
-                .buffer_snapshot_binds
-                .saturating_sub(earlier.buffer_snapshot_binds),
-            gpu_load_hits: self.gpu_load_hits.saturating_sub(earlier.gpu_load_hits),
-            target_evicts: self.target_evicts.saturating_sub(earlier.target_evicts),
-            desc_pool_grow: self.desc_pool_grow.saturating_sub(earlier.desc_pool_grow),
-            gen_mismatch: self.gen_mismatch.saturating_sub(earlier.gen_mismatch),
-            compute_post_wait_skips: self
-                .compute_post_wait_skips
-                .saturating_sub(earlier.compute_post_wait_skips),
-            render_post_wait_skips: self
-                .render_post_wait_skips
-                .saturating_sub(earlier.render_post_wait_skips),
-            ring_retire_blocks: self
-                .ring_retire_blocks
-                .saturating_sub(earlier.ring_retire_blocks),
-            batch_opens: self.batch_opens.saturating_sub(earlier.batch_opens),
-            batch_joins: self.batch_joins.saturating_sub(earlier.batch_joins),
-            batch_flushes: self.batch_flushes.saturating_sub(earlier.batch_flushes),
-            batch_flush_draws: self
-                .batch_flush_draws
-                .saturating_sub(earlier.batch_flush_draws),
-            sampled_free_hits: self
-                .sampled_free_hits
-                .saturating_sub(earlier.sampled_free_hits),
-            sampled_free_allocs: self
-                .sampled_free_allocs
-                .saturating_sub(earlier.sampled_free_allocs),
-            sampled_recycle_admits: self
-                .sampled_recycle_admits
-                .saturating_sub(earlier.sampled_recycle_admits),
-            sampled_recycle_cap_drops: self
-                .sampled_recycle_cap_drops
-                .saturating_sub(earlier.sampled_recycle_cap_drops),
-            target_free_hits: self
-                .target_free_hits
-                .saturating_sub(earlier.target_free_hits),
-            target_free_allocs: self
-                .target_free_allocs
-                .saturating_sub(earlier.target_free_allocs),
-            target_recycle_admits: self
-                .target_recycle_admits
-                .saturating_sub(earlier.target_recycle_admits),
-            target_recycle_cap_drops: self
-                .target_recycle_cap_drops
-                .saturating_sub(earlier.target_recycle_cap_drops),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
