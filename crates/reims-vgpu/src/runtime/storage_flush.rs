@@ -388,21 +388,42 @@ pub fn flush_gva_exact<M: HostMemory + HostOps>(
 ///
 /// §8.53/§8.54 measured only the case where the guest zeroed the PTEs, which is
 /// caught by [`crate::runtime::host::MemError::is_guest_teardown`]. Whether a
-/// window's pages can move while still resolving has never been measured, and a
-/// guard for an unmeasured hazard is a guess. So this reads and reports; it does
-/// not decide. A silent counter would be worth nothing, and this cannot flood:
-/// only the alias/read triggers reach it, ten times in a repro boot.
+/// window's pages can move while still resolving was the open question this used
+/// to only report on, on the grounds that a guard for an unmeasured hazard is a
+/// guess.
+///
+/// **It is measured now, and it happens.** One x86/Vulkan boot driving Finder,
+/// Calendar and Safari produced fourteen of these, and in most of them *every*
+/// armed page had moved — `armed_pages=73 live_pages=73 moved=73` for a 196x381
+/// window, and the same total displacement at 5, 4 and 22 pages under the
+/// `clear_store`, `rearm` and `gva_alias` triggers. So the guard has its
+/// measurement and this decides.
+///
+/// It returns `true` when the window may still be written to guest RAM. Drift
+/// means our own bookkeeping is the stale part: the window was armed against one
+/// set of guest pages, the guest has since re-pointed `[gva, gva+span)`
+/// somewhere else, and [`crate::runtime::metal_draw::write_gva_rgba8`] walks
+/// fresh — so the write lands in whatever owns those pages *now*. On this rail
+/// that has been observed as guest heap corruption: WindowServer aborting inside
+/// `small_free_list_remove_ptr_no_clear`, and the guest kernel panicking with
+/// `element modified after free` on a freed allocation overwritten with white
+/// RGBA8 pixels.
+///
+/// Refusing costs stale bytes at a guest address the guest has already
+/// repurposed; permitting costs somebody else's heap. The caller keeps the
+/// content either way — `host_cache_store_gva_layer` runs unconditionally — so
+/// nothing renderable is lost by refusing.
 #[cfg(feature = "backend-vulkan")]
-fn report_window_page_drift<M: HostMemory + HostOps>(
+fn window_pages_still_ours<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     gva: u64,
     entry: &crate::model::GvaDeferredEntry,
     trigger: &str,
-) {
+) -> bool {
     let span = entry.span();
     if span == 0 || entry.pages.is_empty() {
-        return;
+        return true;
     }
     let mut live = std::collections::HashSet::new();
     crate::runtime::gva_mem::visit_task_gva_page_gpas(
@@ -419,17 +440,17 @@ fn report_window_page_drift<M: HostMemory + HostOps>(
         },
     );
     // An empty or short walk is the teardown case the writer below names
-    // precisely; reporting it here too would double-count it under a reason that
-    // does not fit.
+    // precisely; deciding it here too would take it away from the reason that
+    // fits it, and that path already lands cache-only.
     if live.len() < entry.pages.len() {
-        return;
+        return true;
     }
     if live == entry.pages {
-        return;
+        return true;
     }
     crate::observe::fail(format!(
         "deferred_window_page_drift gva={gva:#x} task={} {}x{} trigger={trigger} \
-         armed_pages={} live_pages={} moved={}",
+         armed_pages={} live_pages={} moved={} guest=refused",
         entry.task_id,
         entry.width,
         entry.height,
@@ -437,6 +458,7 @@ fn report_window_page_drift<M: HostMemory + HostOps>(
         live.len(),
         entry.pages.difference(&live).count()
     ));
+    false
 }
 
 /// Land a taken deferred GVA render-Store window: engine resident target →
@@ -474,8 +496,12 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     };
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
-    if guest_write && state.gva_write_allowed(entry.task_id, gva, entry.span()) {
-        report_window_page_drift(state, host, gva, entry, trigger);
+    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
+        // The window's pages moved under us. Cache-only: see
+        // `window_pages_still_ours` for why writing here lands in another
+        // owner's memory.
+        guest = "skip_drift";
+    } else if guest_write && state.gva_write_allowed(entry.task_id, gva, entry.span()) {
         guest = match crate::runtime::metal_draw::write_gva_rgba8(
             state,
             host,
@@ -1586,16 +1612,22 @@ mod tests {
         assert!(state.gva_deferred_flush.contains_key(&0x9100_0000));
     }
 
-    /// The page-drift probe must distinguish the cases it exists to separate.
+    /// Page drift must distinguish the cases it exists to separate, and now
+    /// **decide** them.
     ///
     /// A probe that reports nothing is indistinguishable from a probe that
     /// cannot fire, and this codebase has already paid for three of those. So
     /// drive both controls through the same fixture: a window whose GVA still
-    /// resolves to its armed pages must stay silent, and one whose pages moved
-    /// under it must produce the line — same task, same geometry, only the
-    /// armed set differs.
+    /// resolves to its armed pages must stay silent and stay writable, and one
+    /// whose pages moved under it must produce the line and be refused — same
+    /// task, same geometry, only the armed set differs.
+    ///
+    /// The decision is asserted alongside the line because they are two separate
+    /// claims. Logging drift while still writing is exactly what this used to
+    /// do, and the guest heap corruption that allowed — WindowServer aborting in
+    /// `small_free_list_remove_ptr_no_clear` — is why it decides now.
     #[test]
-    fn window_page_drift_probe_fires_on_drift_and_is_silent_without_it() {
+    fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
         use crate::contract::endian::st32;
         use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
         use crate::runtime::host::{FakeHost, HostMemory};
@@ -1633,12 +1665,16 @@ mod tests {
 
         // Negative control: armed on the page the GVA resolves to right now.
         let at = mark();
-        super::report_window_page_drift(
-            &state,
-            &host,
-            0,
-            &gva_entry(1, 4, 4, &[data0]),
-            "gva_alias",
+        assert!(
+            super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[data0]),
+                "gva_alias",
+            ),
+            "an unmoved window must stay writable — a guard that refuses every \
+             flush means the guest never sees a Store"
         );
         assert_eq!(
             drift_lines(at),
@@ -1648,12 +1684,15 @@ mod tests {
 
         // Positive control: same window, armed on a page it no longer maps to.
         let at = mark();
-        super::report_window_page_drift(
-            &state,
-            &host,
-            0,
-            &gva_entry(1, 4, 4, &[9 * page]),
-            "gva_alias",
+        assert!(
+            !super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[9 * page]),
+                "gva_alias",
+            ),
+            "a window whose pages moved must be refused, not merely reported"
         );
         assert_eq!(drift_lines(at), 1, "a window whose pages moved must report");
     }
