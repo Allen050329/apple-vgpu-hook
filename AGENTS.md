@@ -1061,6 +1061,64 @@ as successes, which means a change that breaks booting reads as a change that fi
 `.agents/repros/panic-rate.sh` keeps `PANIC` / `NOBOOT` / `NOWORK` / `OK` apart and reports
 `PANIC / (PANIC + OK)`.
 
+### The ~950 ms Idle Stall Is The Host GPU Suspending, Not This Device
+
+**This is a property of the x86 rig, not of the product. Do not fix it, and do not measure across
+it.** It has already driven one branch's worth of investigation and it is invisible unless you look
+outside the repo.
+
+The signature is unmistakable once named: a `sync_exec_lock_hold` of **916-979 ms** carrying two to
+eight draws, on a device otherwise reading `duty=0.001`, recurring on a roughly 60-second period
+while the guest sits at a quiet desktop. Seven in one boot, five in another, five in a third. A
+cluster that tight is a fixed cost, not work.
+
+`draw_phase` puts every one of them in the staging span, and `SlowStagingWrite` names the call: a
+**single `acquire_staging` of one 256 KiB bucket**, `kind=acquire us=907112..948954 bytes=262144`.
+Thirteen such events across one boot, median 937 ms. The same draw's *image* allocations in the
+`acquire` phase, microseconds later, cost 3-4 ms. So it is not that allocation is expensive — 12 to
+45 `vkAllocateMemory` calls happen per wake-up and exactly **one** of them stalls. That is a
+first-touch signature.
+
+What it is first-touching is the host GPU. This box is an **RTX 5080 Laptop** with NVIDIA
+fine-grained runtime power management:
+
+```
+/proc/driver/nvidia/params:  DynamicPowerManagement: 2
+/sys/bus/pci/devices/0000:01:00.0/power/control: auto     pstate: P8
+```
+
+Sampled once a second through a 221-second guest-idle window — reading only sysfs, which does not
+touch the GPU and so cannot perturb what it measures — `runtime_suspended_time` advanced **150 203 ms
+of 221 000**, through **seven** `suspended → resuming → active` cycles. Fine-grained RTD3 suspends
+the device even though our Vulkan context holds it open, and the next access pays the resume. Four
+`sync_exec_lock_hold` and three `staging_write_slow` landed in that same window against those seven
+resumes — the counts do not match one-for-one because the host's own compositor resumes it too.
+
+Three consequences, and the second is the expensive one:
+
+- **No product change is warranted.** Keeping the staging pool warm would only move the stall to
+  whichever call touches the device first. Keeping the GPU busy to defeat RTD3 is exactly the
+  overfitted heuristic the rules here forbid, and it would be a battery regression on the only class
+  of host that has this behaviour.
+- **Every idle-boundary measurement on this rig is contaminated**, and the contamination is ~1 s of
+  guest-visible stall that a desktop host will not have. `idle-then-damage.sh` and anything else
+  that measures across a quiet stretch is measuring RTD3. The busy population is clean — a soak
+  window at `duty > 0.8` never lets the GPU idle long enough to suspend — so the per-draw numbers
+  below are unaffected.
+- **It rewrites the black-screen lead.** The `gen=0` uninitialized present was preceded by exactly
+  these stalls, with the guest awake throughout (the user confirmed the guest was awake; an earlier
+  reading blamed display sleep and is retracted). WindowServer re-creating its scanout surfaces after
+  a second of no progress is a plausible response to the *host* going to sleep under it. The gap in
+  our code is still real and `present_unbacked reason=never_stored` still reports it, but the
+  *trigger* may not exist off this laptop.
+
+Note what did not work and why, because the same shortcut will look attractive again. The
+`staging_pool` census reports per-bucket **mean** microseconds per miss; the 262144 bucket showed
+365 us against 1 867 misses, and a handful of 940 ms outliers move that mean by half a millisecond.
+Reasoning "the census shows no slow acquires, therefore it is one of the other three calls in the
+span" was the available shortcut, it was taken, and it was wrong. A mean cannot see an outlier — the
+same rule the speckle work already paid for, in a different disguise.
+
 ### Interleave The Arms Of A Live A/B
 
 A live before/after on the VM rig compares two arms separated by wall-clock time, and neither the
