@@ -2359,6 +2359,85 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
     assert_eq!(&back[..4], &[30, 20, 10, 255]);
 }
 
+/// The RGBA8 target store reads the MapMemory2 gate **without obeying it yet**.
+///
+/// `write_gva_rgba8` is the one product writer into guest RAM with no map-span
+/// authorisation, and its sibling `write_task_gva_product` refuses `Outside`.
+/// Making this one refuse too is the intent, but it cannot be done blind: if
+/// render Stores address a GVA space MapMemory2 does not describe, refusing
+/// blanks the screen. So the arm is read and reported first, and this pins the
+/// report-only contract so the flip to refusing is a visible behaviour change
+/// with a failing test rather than a silent one.
+///
+/// The fixture declares a span for the writing task that deliberately does *not*
+/// cover the target, which is exactly `WriteGate::Outside` — the arm that will
+/// refuse later and must still write now.
+#[test]
+fn an_rgba8_store_outside_the_tasks_declared_span_still_writes_and_is_reported() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::host::FakeHost;
+
+    let page_shift = PAGE_SHIFT_X86;
+    let mut host = FakeHost::new();
+    let dir_gpa = 2u64 << page_shift;
+    let root_gpa = 3u64 << page_shift;
+    let data_gpa = 5u64 << page_shift;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x1000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 5);
+    let _ = host.write_gpa(root_gpa + 4, &d[..4]);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = page_shift;
+    assert!(state.define_task(1, 0x1000, 2));
+
+    let gva = 1u64 << page_shift; // 0x1000
+
+    // Task 1 declares a span far away from the target. The registry is now
+    // non-empty for this task, so the gate has a real bounds check to fail.
+    state.note_task_map(1, 0x9_0000, 0x1000);
+    assert_eq!(
+        state.gva_write_gate(1, gva, 2 * 8),
+        crate::model::WriteGate::Outside,
+        "fixture is not real: the gate must land on the arm under test"
+    );
+
+    let rgba = [
+        10u8, 20, 30, 255, //
+        40, 50, 60, 255, //
+        70, 80, 90, 255, //
+        100, 110, 120, 255,
+    ];
+    assert!(
+        write_gva_rgba8(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            2,
+            2,
+            8,
+            MTL_FORMAT_BGRA8_UNORM,
+            &rgba,
+        )
+        .is_ok(),
+        "the gate is report-only here: an Outside store must still reach guest RAM"
+    );
+
+    // …and the bytes really landed, so this is not passing on a write that
+    // failed for some unrelated reason.
+    let mut back = [0u8; 8];
+    assert!(gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, page_shift).is_ok());
+    assert_eq!(&back[..4], &[30, 20, 10, 255]);
+}
+
 /// Type-2/3 GVA wallpaper layers must be sampleable from texture_ref host
 /// cache (not surface_id mid map) after encode Store.
 #[test]

@@ -3417,6 +3417,72 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     })
 }
 
+/// Read the MapMemory2 write gate for an RGBA8 target store **without acting on
+/// it**, so the arm the gate would decide can be measured before it decides.
+///
+/// [`write_gva_rgba8`] is the one product writer into guest RAM that applies no
+/// map-span authorisation: its only bound is `avail` from its own page-table
+/// walk, which says the pages are mapped and not that this task declared the
+/// range. Its sibling [`crate::runtime::gva_mem::write_task_gva_product`] has
+/// shipped the gate for a long time, and refuses `Outside`.
+///
+/// Flipping this one straight to refusing is not safe on the evidence available:
+/// if render Stores address a GVA space MapMemory2 spans do not describe, every
+/// Store becomes `NoSpans` or `Outside` and refusing blanks the screen. So the
+/// arm is reported first and the refusal follows the reading.
+///
+/// Two lines, because one cannot answer both questions. The latched line gives
+/// **presence** — which arms happen at all, per writer and task, at one line per
+/// distinct case for the life of the process. The periodic line gives
+/// **magnitude**: a latched line cannot distinguish one `Outside` write ever from
+/// every write being `Outside`, and that difference is the whole decision.
+fn report_rgba8_write_gate(
+    state: &DeviceState,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    caller: &'static std::panic::Location<'static>,
+) {
+    use crate::observe::Decline;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static EXACT: AtomicU64 = AtomicU64::new(0);
+    static NO_SPANS: AtomicU64 = AtomicU64::new(0);
+    static OUTSIDE: AtomicU64 = AtomicU64::new(0);
+
+    let gate = state.gva_write_gate(task_id, gva, span);
+    let counter = match gate {
+        crate::model::WriteGate::Exact => &EXACT,
+        crate::model::WriteGate::NoSpans => &NO_SPANS,
+        crate::model::WriteGate::Outside => &OUTSIDE,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+
+    if crate::observe::first_sight(gate.slug(), crate::runtime::gva_mem::latch_key(task_id, 0, caller))
+    {
+        crate::observe::Emit::decline("rgba8_write_gate", &gate)
+            .field("task", task_id)
+            .field("gva", format!("{gva:#x}"))
+            .field("span", format!("{span:#x}"))
+            .field("owners", format!("{:?}", state.tasks_covering(gva, span)))
+            .field("own", state.task_own_span_count(task_id))
+            .field("via", crate::runtime::gva_mem::via_caller_at(caller))
+            .fail();
+    }
+
+    // Totals every 1024 stores. The rate this runs at is one line per 1024
+    // full-target writebacks, which on the measured guest is minutes apart.
+    let exact = EXACT.load(Ordering::Relaxed);
+    let no_spans = NO_SPANS.load(Ordering::Relaxed);
+    let outside = OUTSIDE.load(Ordering::Relaxed);
+    let total = exact + no_spans + outside;
+    if total.is_multiple_of(1024) {
+        crate::observe::fail(format!(
+            "rgba8_write_gate_totals exact={exact} no_spans={no_spans} outside={outside} \
+             total={total}"
+        ));
+    }
+}
+
 /// Archive `apple_pv_gpu_write_gva_rgba`: tight RGBA8 → native rows at GVA.
 /// Packed contig HostOps view when possible; else multi-import per row
 /// ([`gva_view::write_span`]) — no `write_gpa` walk.
@@ -3428,6 +3494,7 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     clippy::too_many_arguments,
     reason = "the archive writer mirrors the target GVA and native row geometry"
 )]
+#[track_caller]
 pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3455,6 +3522,11 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
+    // `write_gva_rgba8` is `#[track_caller]`, so this resolves to *its* caller —
+    // one of the six product writers. `#[track_caller]` does not chain through a
+    // call body, so the location is captured here and passed down rather than
+    // re-read inside the reporter, where it would name this line instead.
+    report_rgba8_write_gate(state, task_id, gva, span, std::panic::Location::caller());
     let mut row = vec![0u8; tight as usize];
     // Guest writes resolve through a fresh PT walk at write time — never a
     // cached view (stale-view heap-corruption class; see gva_view::write_span).

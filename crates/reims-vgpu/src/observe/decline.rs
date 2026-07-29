@@ -2189,9 +2189,16 @@ pub const REGISTRY: &[DeclineClass] = &[
         // The refusal arm rides `gva_write`; the one permissive arm rides
         // `gva_write_gate`. Both are the gate's own answer rather than a label
         // the caller picked, which is the point of the type.
+        //
+        // `rgba8_write_gate` is the same type read at the one product writer
+        // that does not yet obey it. All three arms ride that line, because the
+        // question it exists to answer is which arm render Stores actually land
+        // on — a line carrying only the refusal could not tell "never Outside"
+        // from "never ran".
         emission: Emission::At(&[
             ("runtime/gva_mem.rs", "gva_write"),
             ("runtime/gva_mem.rs", "gva_write_gate"),
+            ("runtime/metal_draw/mod.rs", "rgba8_write_gate"),
         ]),
         slug_calls: &[],
         slugs: &[
