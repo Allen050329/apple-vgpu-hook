@@ -489,6 +489,13 @@ The counter that separates those two worlds is `surface_flush` on the `store_rou
 count cannot tell "the writeback was skipped" from "the writeback happened a millisecond later", and
 `surface_flush / surface_deferred` is the ratio that can.
 
+**That ratio has now been read, and the rail is a real deferral: 0.138.** One 4-round soak boot
+(Finder + Calendar + Safari on wikipedia/apple, desktop drags, session asserted) summed
+`surface_flush=2555` against `surface_deferred=18503`. So 86% of type-11 guest-page writebacks are
+never performed at all, rather than performed a moment later. Note this needs no interleaving and no
+A/B: it is a ratio of two counters inside one boot, which is why it survives the `us_per_draw` drift
+that makes every cross-boot comparison on this rig worthless.
+
 Do not do this by restoring `VK_EXT_external_memory_host`. The deleted `import_present` rail had an
 "ack-fast deferred rung" that looks like the same idea, but what it needed the host pointer for was
 the eventual *DMA*; the deferral itself did not. The flush here is the CPU writeback that already
@@ -558,6 +565,40 @@ One piece of that waste *was* independently removable and is gone: `execute_draw
 whole seed frame twice in fifteen lines — once into `resolved_load` (structural, `req` is a shared
 reference) and again into `seed_bytes`, purely to own a buffer the `output_bgra` arm could mutate in
 place. The second is now a move. Nothing else read `resolved_load` after that point.
+
+**Both are now gone, and the honest accounting is five full-frame CPU passes per composite pass, not
+one.** `resolved_load` was deleted outright: its `Clear(c)` arm was already dead (the primary clear
+value handed to `cmd_begin_render_pass` is hardcoded `[0,0,0,0]` and `c` was never read), so the
+enum existed only to own a buffer for the swizzle. `seed_bytes` is now `Option<&[u8]>` borrowed from
+`req`, and the `output_bgra` swizzle folds into the copy that has to happen anyway
+(`write_staging_rgba_as_bgra`, one pass into the mapped span — the same transformation
+`write_staging_from_runs` already documents for buffer binds).
+
+Count the rest before claiming the round trip is cheap. Under a browser workload `engine_delta` reads
+**readback 448 MB/s ≈ seed 461 MB/s** with `drain_duty` at duty 0.948 and ~1142 chains/s, and each
+type-11 composite pass touches its frame five times:
+
+| side | pass | removable? |
+|---|---|---|
+| seed | `swap_rb_channels(bgra)` in `metal_draw/vulkan.rs` — alloc + copy + swizzle | only with `output_bgra` |
+| seed | `write_staging` into the mapped span | no — this is the upload |
+| readback | mapped buffer → `vec![0u8; rb_size]` | no — this is the download |
+| readback | `swap_rb_channels(&rgba)` back to BGRA for `surface_cache` | only with `output_bgra` |
+| readback | `surface_cache::store` (+ a `.clone()` when `texture_ref != 0`) | yes, independently |
+
+So ~450 MB/s × 5 ≈ **2.2 GB/s of CPU memory traffic**, which explains a drain worker pinned at 0.95
+far better than the 900 MB/s headline does. The two `swap_rb_channels` are the same conversion in
+opposite directions, and they exist only because the cache holds BGRA while the pooled target is
+RGBA — which is exactly what `req.output_bgra` changes. Beware the trap when acting on that: simply
+setting the flag makes the *engine* swizzle instead of the runtime and wins nothing. The win needs
+the runtime to stop converting too, i.e. a way to hand the cache's BGRA bytes through as already
+being in the attachment's physical order.
+
+Also note what the same line says about batching: `batch_opens == batch_flushes` **exactly**, in
+every window measured (912/912, 2036/2036, 504/504, 733/733, 517/517, 1000/1000), at ~1.7
+`batch_flush_draws` per batch. Draw batching is barely engaging, and the reason is the seed:
+`joins` requires `req.target_rgba8.is_none()`, and a CPU-seeded type-11 Load always sets it. The seed
+and the batching are one problem, not two.
 
 **`us_per_draw` has a 1.8x boot-to-boot spread and drifts upward within a session, so it cannot score
 a change sequentially.** This is the interleaving rule above, restated for the perf metric, and it is
@@ -807,6 +848,77 @@ exceeds 100 columns gets wrapped at every call site. Collapsing 173 two-call pai
 argument call took `icb/tests.rs` from 7824 lines to 8499; dropping one redundant argument to get
 under the limit took it to 7314. Same extraction, opposite sign. Run `rustfmt` on the file — by path,
 never bare `cargo fmt`, which reformats pre-existing drift crate-wide — and re-count.
+
+### A Random Victim Is A Memory-Corruption Signature, Not Seven Unrelated Bugs
+
+The guest panics, and every panic looks like somebody else's bug until you line them up. Across 351
+retained `vm/disks/run/serial-*.log`, **7 boots ended in a guest kernel panic and the panicking
+process is a different, unrelated one every time**:
+
+| boot | process | first panic |
+|---|---|---|
+| 0728-154602 | Safari | `pmap_page_protect() pn=0x46b53b vaddr=0x7ff84ab74000` |
+| 0729-174129 | ReportCrash | `pmap_page_protect() pn=0x2a8882 vaddr=0x124007000` |
+| 0729-152409 | WindowServer | page fault, `CR2=0x0` |
+| 0729-155116 | followupd | trap `0xd` (GP), `CR2=0x0` |
+| 0729-175456 | com.apple.AppleU | trap `0xd` (GP), `CR2=0x0` |
+| 0729-183422 | ReportCrash | non-sleepable RW lock with preemption enabled |
+| 0729-195245 | airportd | kernel **NX fault**, `RIP == CR2`, inside `_sysctl` |
+
+Read one at a time each invites a subsystem theory — a WiFi bug, a Safari bug, a WindowServer bug.
+Read together they cannot be seven bugs in seven subsystems. **A defect in one subsystem kills that
+subsystem every time; a defect that kills a uniformly random victim is corrupted memory**, and the
+only component here that can write guest physical memory behind the guest kernel's back is this
+device.
+
+Both `pmap_page_protect` panics are `@pmap_x86_common.c:1788`, which XNU raises when the pv list says
+a physical page is mapped at some `vaddr` but walking that pmap for `vaddr` yields **no PTE**. The pv
+list and the page tables disagree. Overwriting a guest page-table page with framebuffer bytes
+produces exactly that, and also produces the NULL derefs, the GP faults and the NX jump — one
+mechanism covering all seven rather than seven mechanisms covering one each.
+
+**That is a signature, not an attribution.** No probe has yet caught this device writing outside a
+surface, and the mechanism is *unmeasured*. What has been audited, and is sound, is written here so
+the next iteration does not re-read it:
+
+- `mapper::write_mapping_bytes` — re-resolves `mapping_page_gpas` at write time, refuses on
+  `need_end > span_end`, bounds every run copy. Sound.
+- `mapping_write::write_bgra8` / `write_rgba8_image_changed` — validate against the latched geom, and
+  `contig_for_span` enforces `len >= span_end` before the raw poke. Sound.
+- `mapper::plan_adoption_decision` — the check that retires a cached `contig_ptr` is a **full
+  element-wise PFN compare** (`current != plan`), not a length or a first-page test, and it is tested.
+  A subagent audit reported the opposite ("map_generation is not bumped on a successful rewire"); it
+  is wrong, mapper.rs bumps on `pages_changed` three lines below the compare. Read the code, not the
+  summary.
+- `gva_view::write_span` / `map_fresh_span` — walk the task page table **at write time** and never
+  reuse a cached view. Their doc comment names the class this already fixed once (the 2026-07-19
+  WindowServer SIGSEGV).
+
+Two things are known-weak and both were *refuted as the cause by measurement*, which is the only
+reason they are not being worked on:
+
+- `gva_write_gate` returns `NoSpans` when a task declared no `MapMemory2` spans, and
+  `gva_write_allowed` treats that as **allowed** — a fail-open authorization arm on a path that writes
+  megabytes. It is instrumented (`write_gate_no_spans`, latched per task+caller) and it fired **0
+  times** in the panic boot, while `write_gate_outside` fired 13 times and refused. The hole is real
+  in principle and is not being taken in practice.
+- `ensure_gva_view` validates a cached view only when `view_verify_ctr % 32 == 0`, and
+  `view_gpas_current` then checks **only the first and last leaf page**. So 31 of 32 cache hits are
+  unvalidated and the 32nd is a 2-of-N canary. This governs **reads only** — every writer takes the
+  fresh-walk path above — so its failure mode is stale pixels, not corruption.
+
+The hazard those guards exist for is real and frequent, which is what makes the class worth chasing:
+`deferred_window_page_drift` fires ~8 times a boot with `armed_pages=164 live_pages=164 moved=156` —
+**the page count is unchanged while 95% of the PFNs moved**. Any future check that compares a count,
+a length, or one page will pass straight through that. Only a full PFN compare or a generation bumped
+by one will not.
+
+**Do not pool a boot failure with a clean boot.** The same 351 logs contain **15 boots (4.3%) that
+never started macOS at all** — OpenCore `Boot failed - Aborted` — spread across many days and many
+commits, so it is rig flakiness. A harness that scores "did not panic" over all boots counts those 15
+as successes, which means a change that breaks booting reads as a change that fixes panics.
+`.agents/repros/panic-rate.sh` keeps `PANIC` / `NOBOOT` / `NOWORK` / `OK` apart and reports
+`PANIC / (PANIC + OK)`.
 
 ### Interleave The Arms Of A Live A/B
 
