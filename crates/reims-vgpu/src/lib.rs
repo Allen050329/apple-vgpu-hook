@@ -1441,27 +1441,6 @@ pub fn host_console_uses_bar1(frame_flush_seen: bool, early_front_latched: bool)
     !frame_flush_seen && !early_front_latched
 }
 
-/// Early console EFI FB programmed by guest (MMIO 0x1210), if any.
-///
-/// `Some((gpa, width, height, stride_bytes))` when `efi_fb_start != 0`.
-/// C falls back to BAR1 GOP when this is `None`.
-pub fn device_efi_console_target(id: u64) -> Option<(u64, u32, u32, u32)> {
-    let slot = device_slot(id)?;
-    let d = slot.inner.try_lock()?;
-    let gpa = d.device.state.gfx.efi_fb_start;
-    if gpa == 0 {
-        return None;
-    }
-    let w = crate::model::EFI_BOOT_WIDTH;
-    let h = crate::model::EFI_BOOT_HEIGHT;
-    let stride = if d.device.state.gfx.efi_fb_stride != 0 {
-        d.device.state.gfx.efi_fb_stride
-    } else {
-        w.saturating_mul(4)
-    };
-    Some((gpa, w, h, stride))
-}
-
 /// Copy guest EFI console FB (programmed at 0x1210) into a host BGRA8 surface.
 ///
 /// Returns `None` if no efi_fb_start or GPA read fails — C uses BAR1 then.
@@ -1990,27 +1969,6 @@ mod tests {
         drop(inner);
         assert!(device_reset(id));
         assert_eq!(device_present_boundary_seen(id), Some(false));
-        assert!(device_destroy(id));
-    }
-
-    /// Guest-programmed EFI FB (0x1210) is the early-console target when set.
-    #[test]
-    fn efi_console_target_follows_mmio_fb_start() {
-        let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");
-        assert!(device_efi_console_target(id).is_none());
-        {
-            let slot = device_slot(id).expect("device");
-            let mut d = slot.inner.lock();
-            d.device.state.gfx.efi_fb_start = 0xf100_0000;
-            d.device.state.gfx.efi_fb_stride = 1920 * 4;
-        }
-        let t = device_efi_console_target(id).expect("efi target");
-        assert_eq!(t.0, 0xf100_0000);
-        assert_eq!(t.1, 1920);
-        assert_eq!(t.2, 1080);
-        assert_eq!(t.3, 1920 * 4);
-        // Still pre-boundary, no early latch — BAR1/efi feed.
-        assert!(host_console_uses_bar1(false, false));
         assert!(device_destroy(id));
     }
 
