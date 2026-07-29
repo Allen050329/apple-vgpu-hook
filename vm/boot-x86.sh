@@ -158,24 +158,6 @@ build_reims_vgpu_efi() {
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
 }
 
-build_reims_vgpu_standalone() {
-  local backend="$1"
-  case "$backend" in
-    metal)
-      echo "boot-x86.sh: building reims-vgpu crate (backend-metal) ..."
-      (cd "" && cargo build --release -p reims-vgpu --features backend-metal) \
-        || die "reims-vgpu build failed"
-      ;;
-    vulkan)
-      echo "boot-x86.sh: building reims-vgpu crate (backend-vulkan,host-window) ..."
-      (cd "" && cargo build --release -p reims-vgpu \
-        --no-default-features --features backend-vulkan,host-window) \
-        || die "reims-vgpu build failed"
-      ;;
-    *) die "unknown REIMS_VGPU_BACKEND: $backend (metal | vulkan)" ;;
-  esac
-}
-
 ensure_rust_tools
 build_reims_vgpu_efi
 # Product Linux x86 rail needs Vulkan. Override REIMS_VGPU_BACKEND only for an explicit
@@ -186,8 +168,19 @@ if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
   "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend "$REIMS_VGPU_BACKEND" \
     || die "qemu-build failed"
 else
+  # An overridden QEMU_BIN is a binary that already exists, and the reims-vgpu
+  # crate is a *staticlib* linked into it (`ldd` on it names no reims object),
+  # so rebuilding the crate here cannot change a single byte of what this boot
+  # runs. This branch used to do that build anyway, via `(cd "" && cargo
+  # build ...)` — a null `cd` that failed outright, which is why pinning
+  # QEMU_BIN could never boot at all.
+  #
+  # Pinning is what makes it safe to edit the tree while a multi-boot harness
+  # runs: the default branch above rebuilds QEMU every boot and would pick up a
+  # half-finished edit mid-run (AGENTS.md records one run discarded for exactly
+  # that). Keep this branch free of the tree.
   REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
-  build_reims_vgpu_standalone "$REIMS_VGPU_BACKEND"
+  echo "boot-x86.sh: QEMU_BIN pinned ($QEMU_BIN) — not building; the staticlib is already linked in"
 fi
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
 [ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"

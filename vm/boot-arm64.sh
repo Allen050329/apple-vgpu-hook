@@ -134,24 +134,6 @@ build_reims_vgpu_efi() {
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
 }
 
-build_reims_vgpu_standalone() {
-  local backend="$1"
-  case "$backend" in
-    metal)
-      echo "boot-arm64.sh: building reims-vgpu crate (backend-metal) ..."
-      (cd "" && cargo build --release -p reims-vgpu --features backend-metal) \
-        || die "reims-vgpu build failed"
-      ;;
-    vulkan)
-      echo "boot-arm64.sh: building reims-vgpu crate (backend-vulkan,host-window) ..."
-      (cd "" && cargo build --release -p reims-vgpu \
-        --no-default-features --features backend-vulkan,host-window) \
-        || die "reims-vgpu build failed"
-      ;;
-    *) die "unknown REIMS_VGPU_BACKEND: $backend (metal | vulkan)" ;;
-  esac
-}
-
 ensure_rust_tools
 build_reims_vgpu_efi
 if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
@@ -165,7 +147,11 @@ if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
   "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target aarch64 --backend "$REIMS_VGPU_BACKEND" \
     || die "qemu-build failed"
 else
-  build_reims_vgpu_standalone "$REIMS_VGPU_BACKEND"
+  # See the matching note in boot-x86.sh: an overridden QEMU_BIN already has the
+  # reims-vgpu staticlib linked into it, so rebuilding the crate cannot affect
+  # this boot. The build this replaced was `(cd "" && cargo build ...)`, a null
+  # `cd` that failed outright and made a pinned QEMU_BIN unbootable.
+  echo "boot-arm64.sh: QEMU_BIN pinned ($QEMU_BIN) — not building; the staticlib is already linked in"
 fi
 
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
