@@ -2542,9 +2542,15 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // Odd length fails visibly.
     let mut bad = vec![1u8, 2, 3];
     assert!(apply_view_swizzle_rgba8(&mut bad, Some(&plan), 1).is_none());
-    // One non-identity remap ran; the identity and None calls did not, and
-    // neither did the length-rejected one.
-    assert_eq!(crate::runtime::census::view_swizzle_census::counts().1, 1);
+    // One non-identity remap ran and said so; the identity and None calls did
+    // not, and neither did the length-rejected one. Read off the always-on sink
+    // rather than a counter: the line is what a boot actually has to show.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert_eq!(
+        log.match_indices("view_swizzle_cpu_remap").count(),
+        1,
+        "exactly one CPU remap must be reported"
+    );
     crate::runtime::census::view_swizzle_census::reset_for_tests();
 }
 

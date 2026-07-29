@@ -3515,9 +3515,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     }),
                     swizzle: view_swizzle.unwrap_or_default(),
                 });
-                if view_swizzle.is_some() {
-                    crate::runtime::census::view_swizzle_census::note_gpu_mapping();
-                }
                 Ok(())
             };
             for t in &req.vertex_textures {
