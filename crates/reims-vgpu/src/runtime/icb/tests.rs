@@ -1,6 +1,11 @@
 use super::*;
 use crate::contract::endian::{st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+/// Page-entry bits for hand-mapping a draw target. Metal-arm only, same reason
+/// as the compute-pipeline block below.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
@@ -20,6 +25,16 @@ use crate::runtime::decode::resource::{
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
+/// Readback, the draw encoder and the fixture directory. Every Metal-arm ICB
+/// test needs this same set; it was spelled inside 29 test bodies before.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::mapping_write;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::metal_draw::{
+    encode_icb_execute_and_writeback, BufferBind, DrawEncodeRequest, EncodeStatus,
+};
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// The ICB reason survives the hop onto the compute rail.
@@ -218,7 +233,6 @@ fn make_render_icb_desc_bytes_ex(
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
-    use std::path::PathBuf;
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let vtx = std::fs::read(base.join("oracle_draw_vtx.mtlb")).expect("oracle_draw_vtx.mtlb");
     let frag = std::fs::read(base.join("oracle_draw_frag.mtlb")).expect("oracle_draw_frag.mtlb");
@@ -227,7 +241,6 @@ fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
-    use std::path::PathBuf;
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let vtx = std::fs::read(base.join("render_stagein_vtx.mtlb")).expect("render_stagein_vtx.mtlb");
     let frag =
@@ -240,7 +253,6 @@ fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from
 /// header end via tag `0x08`).
 fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, PIPELINE_TAG_COLOR_ATTACH_OFFSET,
         VERTEX_ATTR_TAG_BUFFER_INDEX, VERTEX_ATTR_TAG_FORMAT, VERTEX_ATTR_TAG_LOCATION,
@@ -428,7 +440,6 @@ fn assert_target_is_shader_solid(
     mapping_id: u32,
     what: &str,
 ) {
-    use crate::runtime::mapping_write;
     let mut back = vec![0u8; 4 * 4 * 4];
     assert!(mapping_write::read_rect_raw(
         state, host, mapping_id, 0, 0, 4, 4, &mut back, 16
@@ -471,8 +482,6 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn map_draw_target(host: &mut FakeHost, state: &mut DeviceState, pfn: u32) -> u32 {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     let mapping_id = 9u32;
     host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
     state.map_surface(mapping_id);
@@ -553,7 +562,6 @@ fn materialize_and_execute_empty_range() {
 fn fill_and_execute_mul3add1_writeback() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -945,14 +953,7 @@ fn decode_encode_draw_patches_slot_roundtrip() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_patches_tessellation_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_PATCHES;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1071,14 +1072,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_indexed_patches_tessellation_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1417,14 +1411,7 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_mesh_threads_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1503,14 +1490,7 @@ fn fill_render_draw_mesh_threads_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_mesh_threadgroups_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1664,13 +1644,6 @@ fn decode_encode_signed_base_vertex() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_negative_base_vertex_stagein_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -1847,7 +1820,6 @@ fn decode_encode_command_slot_roundtrip() {
 fn buffer_backed_fill_execute_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -2075,13 +2047,6 @@ fn apply_0x1d1_auto_binds_backing() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_indexed_execute_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -2234,13 +2199,6 @@ fn fill_render_draw_indexed_execute_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn buffer_backed_render_draw_indexed_fill_execute() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -2418,16 +2376,9 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_patches_tessellation_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_PATCHES,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -2560,17 +2511,10 @@ fn wire_backed_draw_patches_tessellation_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_indexed_patches_tessellation_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_indexed_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES,
         OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -2715,14 +2659,7 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_mesh_threadgroups_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -2817,17 +2754,10 @@ fn fill_render_object_mesh_threadgroups_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_dual_export_object_mesh_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
         MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -2938,16 +2868,9 @@ fn wire_backed_dual_export_object_mesh_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_separate_object_mesh_func_refs_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3058,17 +2981,10 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_spi_pipeline_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
         MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3184,14 +3100,7 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_mesh_buffer_bind_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3283,14 +3192,7 @@ fn fill_render_mesh_buffer_bind_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_buffer_bind_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3382,17 +3284,10 @@ fn fill_render_object_buffer_bind_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_buffer_bind_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threads_icb_layout_with_binds, ICB_DESC_LAYOUT,
         ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3509,17 +3404,10 @@ fn wire_backed_mesh_buffer_bind_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_object_buffer_bind_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
         ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3692,7 +3580,6 @@ fn decode_encode_object_tg_memory_mesh_slot() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_tg_memory_bad_length_rejected() {
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3783,14 +3670,7 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_tg_memory_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3888,18 +3768,11 @@ fn fill_render_object_tg_memory_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_object_tg_memory_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
         ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
         OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4004,16 +3877,9 @@ fn wire_backed_object_tg_memory_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_threads_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_mesh_threads_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADS,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4113,16 +3979,9 @@ fn wire_backed_mesh_threads_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_threadgroups_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_mesh_threadgroups_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4225,13 +4084,7 @@ fn wire_backed_mesh_threadgroups_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn inherit_buffers_encoder_fragment_color() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::Stage;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, BufferBind, DrawEncodeRequest, EncodeStatus,
-    };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4387,13 +4240,7 @@ fn inherit_buffers_encoder_fragment_color() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn inherit_pipeline_encoder_fragment_color() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4567,13 +4414,6 @@ fn stagein_pipeline_fixture_decodes_vertex_attrs() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_stagein_draw_execute_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -4726,14 +4566,8 @@ fn fill_render_stagein_draw_execute_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_primitives_stagein_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
-    };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4980,13 +4814,6 @@ fn decode_encode_attribute_stride_table() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_attribute_stride_stagein_execute() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -5107,14 +4934,8 @@ fn fill_render_attribute_stride_stagein_execute() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_attribute_stride_stagein_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
-    };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5312,7 +5133,6 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
     use crate::runtime::decode::resource::compute_icb_layout;
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5436,7 +5256,6 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeBufferBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5560,7 +5379,6 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
     use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5760,7 +5578,6 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5927,7 +5744,6 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -6053,7 +5869,6 @@ fn icb_argument_buffer_sample_and_write() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -6229,13 +6044,6 @@ fn resolve_bind_offset_from_wire_va() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_nonzero_bind_offset_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -6374,13 +6182,6 @@ fn fill_render_nonzero_bind_offset_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn buffer_backed_nonzero_wire_va_offset() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
