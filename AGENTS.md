@@ -179,12 +179,11 @@ that refused. If it did not, the fix is to make the callee carry its reason, not
 about the label. The "one status for N checks" collapse the typed-decline work already ended regrows
 anywhere a `-> bool` crosses a module boundary.
 
-**A measurement that a branch reads has stopped being a measurement. One is still live, and it is
-named here so it is not rediscovered a third time.** `runtime/census/README.md` states the rule
-outright — "Nothing in the device or backend may read one of these back to decide what to present,
-decode or execute. A proxy that changes behaviour has stopped being a proxy and become a content
-heuristic, which the ground rules forbid outright." `metal_draw/vulkan.rs`'s sampled-source resolve
-breaks it:
+**A measurement that a branch reads has stopped being a measurement.** `runtime/census/README.md`
+states the rule outright — "Nothing in the device or backend may read one of these back to decide what
+to present, decode or execute. A proxy that changes behaviour has stopped being a proxy and become a
+content heuristic, which the ground rules forbid outright." `metal_draw/vulkan.rs`'s sampled-source
+resolve broke it, and the shape is worth keeping because it is how this class hides:
 
 ```rust
 if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
@@ -193,17 +192,32 @@ if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
     if nz > 0 || !resident_ready {
 ```
 
-`rgba_rgb_stats` is one of the sink's whole-frame pixel scanners, and `nz` is a count of non-black
-pixels. So *which image gets bound to a sampled texture* depends on whether the host cache's copy
-happens to contain a non-black pixel — an O(w·h) scan per bind whose result is a branch, on content,
-which is exactly the two things forbidden. "All black" is also a perfectly legal frame, so the
-heuristic mistakes a correct black surface for an empty one.
+`rgba_rgb_stats` is one of the sink's whole-frame pixel scanners and `nz` is a count of non-black
+pixels, so *which image gets bound to a sampled texture* depended on whether the host cache's copy
+happened to contain one — an O(w·h) scan per bind whose result is a branch, on content, which is
+exactly the two things forbidden. "All black" is also a legal frame, so it mistook a correct black
+surface for an empty one.
 
-Not changed here, because it selects what gets bound and this rig cannot boot to score the change.
-What it needs is the decoded contract — a resident/cache ready flag — rather than a look at the
-pixels. Flagged rather than fixed, with the caveat that the "measure-only" audits above walked past
-this line several times: a scan whose result is consumed by an `if` will not be found by grepping for
-census modules, because it is spelled as an ordinary function call on the hot path.
+**Deleted 2026-07-30, and it needed no boot to retire — because it could not fire.** `resident_ready`
+is false at that line on both backends: under `backend-vulkan` an `if resident_ready { return
+Target(...) }` twelve lines above returns unconditionally, and under `backend-metal` `resident_ready`
+is bound to a literal `false`. So `!resident_ready` was always true, the disjunction was always taken,
+and `nz` was computed and thrown away. The identical gate on the *guest-pages* branch below had
+already been reasoned out and removed, with a comment stating the argument; this copy sat three lines
+above it and kept paying for the scan.
+
+Three transferable points, in order of how much they cost:
+
+- **"Cannot be scored without a boot" was wrong, and it is what kept this alive for several
+  sessions.** The entry here previously said "not changed, because it selects what gets bound and this
+  rig cannot boot to score the change". A heuristic that cannot execute needs no experiment — reading
+  twelve lines up settles it. Before deferring a removal to a boot, check whether the branch is
+  reachable at all.
+- **A scan whose result is consumed by an `if` is not findable by grepping for census modules.** It is
+  spelled as an ordinary function call on the hot path. The "measure-only" audits walked past this
+  line several times.
+- **A dead disjunct hides its own cost.** `nz > 0 || …` reads as a cheap short-circuit; the expensive
+  part is the statement above it, which runs whatever the condition does.
 
 **A pixel count is not a visual defect — read the magnitude.** `magick compare -metric AE` counts a
 pixel as differing if any channel differs *at all*, so a pixel off by 1/255 scores exactly like one
@@ -382,41 +396,55 @@ the next step has to be a probe, and the census is not where to put it.
 That is where the measurement stops. Which property of an oversized HEIC decode does it is
 **unmeasured**, and no mechanism is named here.
 
-**One candidate found by reading code rather than pixels, and it was invisible for the reason the
-paragraph above gives.** `compute_exec`'s `try_recover_sentinel_grid` fires on a
-`DispatchThreadgroups` whose wire reads `grid = [ceil(ow/tg), u64::MAX, 1]`, `tg = [32, 0, 1]`, and
-**substitutes dispatch dimensions the guest never sent**: both grid axes come from "the largest
-write-capable bound texture by pixel area", and `tg.y` is set to `tg.x` on the assumption that the
-tile is square. Its own doc comment names the driving case as the Live Core Image wallpaper.
+**One candidate was found by reading code rather than pixels, and it is now REFUTED. Do not
+re-nominate it.** `compute_exec`'s `try_recover_sentinel_grid` fired on a `DispatchThreadgroups` whose
+wire read `grid = [ceil(ow/tg), u64::MAX, 1]`, `tg = [32, 0, 1]`, and **substituted dispatch dimensions
+the guest never sent**: both grid axes from "the largest write-capable bound texture by pixel area",
+with `tg.y` set to `tg.x` on the assumption the tile is square. Its doc comment named the driving case
+as the Live Core Image wallpaper, and it fit the measured speckle signature better than anything else
+— errors that are sparse, per-pixel, uniformly scattered with no grid alignment, deterministic, and a
+function of the value being computed — because a wrong grid makes every thread compute its coordinates
+wrongly.
 
-Two things make it a suspect for the speckle class rather than a curiosity:
+It was also invisible: its only report was `observe::line`, the `REIMS_VGPU_DRAW_LOG=1` tier, so every
+boot that took the path said nothing on the channel all the census work above was read from. Moved to
+`observe::off` (always-on, deduped per invented geometry) so the question could be asked.
 
-- **It fits the measured signature, which nothing else has.** If the kernel is not square-tiled, or
-  if the guessed texture is not the one being written, every thread computes its coordinates from
-  the wrong grid — which produces errors that are sparse, per-pixel, uniformly scattered with no
-  grid alignment, deterministic run to run, and a function of the value being computed rather than
-  of position. That is the whole list of properties measured on the native frame above, including
-  the two that refuted the entire format/subsampling/tiling family.
-- **It could not appear in any of the evidence.** Its only report was `observe::line`, the
-  `REIMS_VGPU_DRAW_LOG=1` tier, so every boot that took this path said nothing on the channel all of
-  the census work above was read from. "The defect is invisible to every line this device already
-  emits" was true and this is one reason why.
+**Asked and answered on one x86/Vulkan boot, 2026-07-30. It fires zero times.**
 
-It now emits `compute_sentinel_recover` through `observe::off`, deduped per (threadgroup, texture
-geometry), carrying both the wire values and the invented ones. **So the first thing the next boot of
-the wallpaper repro should do is grep for that slug.** If it fires, this is the probe the section
-above asks for and the lead is live; if it does not fire on a boot that reproduces the speckle, the
-hypothesis is dead and should be struck from here.
+| | |
+|---|---|
+| desktop picture | `/System/Library/CoreServices/DefaultDesktop.heic` — the stock dynamic HEIC, i.e. the reproducing arm |
+| workload | desktop revealed via cmd-H, Safari on apple.com and testufo.com, Calendar, System Settings, Mission Control |
+| slice | 12 841 lines, 2 153 `present_content`, 848 `compute_linux` (302 `storage_access`), 746 `drain_duty` |
+| `compute_sentinel_recover` | **0** |
+| `compute_grid_dim_range` / `BadGrid` | **0** |
 
-State the tradeoff honestly rather than deleting it blind. The heuristic is forbidden by "Do Not
-Overfit Fixes" — it keys on an observed content pattern — and `tg = [32, 0, 1]` is a threadgroup with
-**zero threads** while `grid.y` is `u64::MAX`, so both `y` components are garbage while `x` and `z`
-are sane. That is the signature of a **decode defect**, not of a sentinel the guest is sending on
-purpose, and the real fix is in the decode. But its comment claims that without it "every wallpaper
-VTMTS/CI dispatch hits `BadGrid` and the desktop stays black", and that claim has not been re-tested.
-`u32_dim` already declines both `0` and `u64::MAX` with the typed
-`BadGrid("compute_grid_dim_range")`, so deleting the heuristic leaves the gap fail-visible and named
-— which is what should happen once a boot has established whether it fires at all.
+The zero is readable, which is the part that took care to arrange. `resolve_dispatch_dims` called
+`try_recover_sentinel_grid` on **every** `DispatchThreadgroups` before `u32_dim`, so entry was
+unconditional — this is "instrument the branch, not the arm" satisfied by construction, and the zero
+therefore means "no dispatch carried that shape", not "the branch was never reached". Zero `BadGrid`
+beside it says no dispatch came near the range check either. Two screenshots confirm the guest rendered
+correctly throughout, so it is a healthy boot rather than a rig that failed to drive the case.
+
+So the heuristic is **deleted**, along with `largest_bound_texture_dims`, `ceil_div_u64` and its three
+constants, which had no other caller. The gap it covered is now the typed
+`BadGrid("compute_grid_dim_range")`, and its own claim — "without this every wallpaper VTMTS/CI
+dispatch hits `BadGrid` and the desktop stays black" — is refuted twice: no dispatch reaches that
+check, and a second boot at the deleting commit brings up wallpaper, Safari on apple.com, Dock and menu
+bar with `BadGrid` still at 0. The speckle class is back to having **no named mechanism**.
+
+Two things this cost that are worth carrying forward:
+
+- **The test that covered the heuristic asserted it does not fire.**
+  `sentinel_grid_recovers_from_largest_texture` was named for recovery and its own comment admits the
+  object-list setup was never written, so its single assertion was `.is_none()`. A test named for the
+  behaviour it does not exercise is worse than no test: the grep for coverage finds it. Replaced by
+  `the_zero_threadgroup_wire_shape_is_refused_by_name`, which drives the exact wire shape past a bound
+  1440x1080 write target and asserts the typed refusal.
+- **A "fits the signature" argument is worth one probe, not one iteration.** This one fit better than
+  every hypothesis the format/subsampling/tiling family produced, and it was still wrong. The probe
+  that killed it was a one-line change of output channel plus a grep.
 
 **A transient defect is invisible to a before/after pair.** A repro that captures once before a
 gesture and once after cannot see anything that repairs itself in between, and it will report clean
@@ -875,14 +903,31 @@ direct_present_source presents=1024 uploads=1024 dmabuf_blits=0 staging_blits=10
 ```
 
 So every present into the host window is a full-frame CPU upload and the dmabuf import never once
-took. What makes it a lead rather than a known cost is the pair of capability lines, which name the
-branch and do not agree:
+took.
+
+**The pair of capability lines used to be cited here as corroboration, and that citation is
+withdrawn — the lines were fiction.** They read:
 
 - producer: `vk_caps … handoff=dmabuf_fd handoff_declined=[]`
 - consumer: `host_window_vk_caps role=consumer … dmabuf_import=true handoff=engine_swapchain`
 
-The consumer says it *can* import a dmabuf and that its handoff is `engine_swapchain`; the producer
-says the handoff is `dmabuf_fd` and that nothing declined it.
+which looked like the two halves of the device disagreeing about a live mechanism. Neither `handoff=`
+was a reading. Both came from `caps::HandoffLadder::resolve`, a pure function whose *only* consumers
+were those two format strings — nothing in the present path ever asked it anything — and the consumer
+side hardcoded `dmabuf_export: false, engine_swapchain: true` at the call site so the word
+`engine_swapchain` would come out. The whole classification layer (`frame_interop.rs`, `matrix.rs`,
+`zero_copy.rs`: `FrameHandoff`, `SupportCell`, `DmaSupport`, `GuestRead`, `GuestWrite`,
+`ZeroCopyProfile`) was deleted 2026-07-30 for that reason; `HostGpuCaps` now carries one measured bit,
+`dmabuf`, and both lines report it and agree. `memory_topology` was untouched and stays live, because
+every allocation names a `MemoryClass` and something reads the answer.
+
+That is "a reason the caller writes is not a reading" in its most expensive form: not one `reason=`
+mislabelled by a caller, but a whole taxonomy of them, with a `declined()` list that fired
+`vk_caps_zero_copy_declined reason=no_host_pointer_import` twice on every device create on every host
+because `resolve` built it as a constant. A decline that cannot *not* fire reports a design decision,
+not a loss.
+
+The lead itself survives, on the evidence below, which is about the branch and not about the labels.
 
 The decisive detail is what is **absent**. `present.rs` emits typed
 `direct_present_decline`/`direct_present_degrade` lines for `import_failed` and `fd_missing`, and a
