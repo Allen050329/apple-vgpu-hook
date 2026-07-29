@@ -530,6 +530,38 @@ a `memcpy` and can only be neutral or better. That is the same shape as the 3-of
 result recorded above which survived a full revert of its supposed cause. Interleave, or score the
 change with a counter that measures the thing directly rather than the frame rate downstream of it.
 
+**Open lead: the window handoff is CPU staging on every present, and the two halves disagree about
+which mechanism is in use.** Every boot ends its throttled census the same way:
+
+```
+present skip-ratio uploads=1024 presents=1024 (elided 0 redundant full-frame uploads)
+    source dmabuf=0 staging=1024 fresh_imports=0 redundant_fds=0
+direct_present_source presents=1024 uploads=1024 dmabuf_blits=0 staging_blits=1024 fresh_imports=0
+```
+
+So every present into the host window is a full-frame CPU upload and the dmabuf import never once
+took. What makes it a lead rather than a known cost is the pair of capability lines, which name the
+branch and do not agree:
+
+- producer: `vk_caps … handoff=dmabuf_fd handoff_declined=[]`
+- consumer: `host_window_vk_caps role=consumer … dmabuf_import=true handoff=engine_swapchain`
+
+The consumer says it *can* import a dmabuf and that its handoff is `engine_swapchain`; the producer
+says the handoff is `dmabuf_fd` and that nothing declined it.
+
+The decisive detail is what is **absent**. `present.rs` emits typed
+`direct_present_decline`/`direct_present_degrade` lines for `import_failed` and `fd_missing`, and a
+boot has **zero** of either. Those live *inside* the `if let Some(dm)` arm, so their silence does not
+mean "the import was tried and worked" — it means the arm is never entered and the frame carries no
+dmabuf handle at all. That is the "instrument the branch, not the arm" trap in its most flattering
+form: `fresh_imports=0` with a clean failure channel reads as health.
+
+Not yet established: **why** the frame carries no handle — nothing here has read what populates it,
+and the `handoff=` disagreement is a symptom whose direction is unknown. Note also that this is on
+the host-window present thread, not the drain worker, so `drain_duty`'s `publish_us` of 2-10 ms does
+**not** bound it and it is invisible to the duty measurement. Any claim that it does or does not cost
+frames needs its own measurement.
+
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
 and the measured frame period sat at 252–665 ms, i.e. just under that threshold for entire runs. It
