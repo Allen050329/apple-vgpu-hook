@@ -745,7 +745,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         pools.begin_entry(ctx, counters)?
     };
-    phase.enter(super::draw_phase::Phase::Setup);
+    phase.enter(super::draw_phase::Phase::Pipeline);
 
     // Build layout key from storage / sampled / sampler bindings.
     let mut layout_bindings = Vec::new();
@@ -919,6 +919,7 @@ pub(crate) unsafe fn execute_draw_inner(
         sampler_handles.push((s.binding, h));
     }
 
+    phase.enter(super::draw_phase::Phase::Stage);
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
     let no_vertex_fetch = draw_has_no_invocations(req);
@@ -1059,6 +1060,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         render_pass
     };
+    phase.enter(super::draw_phase::Phase::Acquire);
     // (identity, image, tracked-layout-before-this-draw) per secondary — used
     // to barrier prior sampled reads and to mark ready afterward.
     let mut mrt_secondaries: Vec<(super::types::TargetIdentity, vk::Image, vk::ImageLayout)> =
@@ -1427,6 +1429,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let _ = use_registry;
 
+    phase.enter(super::draw_phase::Phase::Descriptors);
     // Descriptor set
     // Owning pool block travels alongside the set so the flush-time free routes
     // back to the block it was allocated from (arena may grow past block 0).

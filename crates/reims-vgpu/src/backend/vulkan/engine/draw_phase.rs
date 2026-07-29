@@ -5,29 +5,42 @@
 //! time, and `engine_delta` priced the bytes that cross the bus. Neither can
 //! separate the two shapes a slow draw comes in, and they need opposite work:
 //!
-//! - **Bytes.** Seed upload and readback copy dominate → the fix is to move
-//!   less, which is the deferred-rail and `output_bgra` family.
-//! - **Latency.** The post-submit fence wait dominates → the fix is to stop
-//!   round-tripping the GPU per draw, and moving bytes faster buys nothing.
+//! - **Bytes.** `stage` and `readback` dominate → the fix is to move less, which
+//!   is the deferred-rail and `output_bgra` family.
+//! - **Latency.** `wait` dominates → the fix is to stop round-tripping the GPU
+//!   per draw, and moving bytes faster buys nothing.
 //!
-//! One draw's total is charged to exactly one phase at a time, so the six
+//! Measured on one x86/Vulkan boot under the standing soak (442 206 draws over
+//! 342 s): `wait` 43%, the four setup phases 37%, `readback` 13%, and `record` —
+//! encoding the commands — 1.1%. Joined per window against `engine_delta`, only
+//! **14%** of draws read back at all and each of those blocks **1.2 ms** in the
+//! fence wait, while the readback copy itself runs at 8.9 GB/s. So the cost is
+//! latency, not bytes: 61 847 readbacks spent 74 s of that boot waiting for a
+//! single queue to drain.
+//!
+//! One draw's total is charged to exactly one phase at a time, so the nine
 //! numbers sum to the draw. The split points are the calls that change what the
 //! CPU is doing:
 //!
 //! | phase | from | to |
 //! |---|---|---|
 //! | `prep` | entry | `begin_entry` returns a ring slot |
-//! | `setup` | there | the descriptor set is written |
+//! | `pipeline` | there | shaders, layout, pass and pipeline are resolved |
+//! | `stage` | there | vertex/index/storage/seed bytes are in staging |
+//! | `acquire` | there | target, sampled and readback images are held |
+//! | `descriptors` | there | the descriptor set is written |
 //! | `record` | there | the CB is ended |
 //! | `submit` | there | `queue_submit` returns |
 //! | `wait` | there | this draw's fence signals |
 //! | `readback` | there | the mapped buffer is copied out |
 //!
-//! `setup` is split out from `record` because every `vkCreateImage`,
-//! `vkAllocateMemory`, slab block and pipeline compile a draw needs happens
-//! there, after the ring slot is held and before a single command is recorded.
-//! Fusing the two would leave "the driver allocated" and "we encoded a lot of
-//! commands" in one number, and the pool-trim policy is decided by which.
+//! The four middle phases are what a first pass called `setup`, split because
+//! that one number came out at 37% of all draw time while `record` — encoding
+//! the actual commands — came out at 1%, and the four have nothing in common
+//! but their position. `stage` is host memcpy into mapped staging and scales
+//! with bytes; `acquire` is `vkCreateImage`/`vkAllocateMemory`/slab and scales
+//! with churn; `pipeline` is driver compiles; `descriptors` is pool pressure.
+//! Each has a different fix and one bar cannot choose between them.
 //!
 //! A draw that returns early — a decline, a batched deferred submit, a
 //! `skip_readback` target — charges its remainder to whichever phase was open,
@@ -60,23 +73,19 @@ const STALL_REPORT_CAP: u64 = 256;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
     Prep = 0,
-    Setup = 1,
-    Record = 2,
-    Submit = 3,
-    Wait = 4,
-    Readback = 5,
+    Pipeline = 1,
+    Stage = 2,
+    Acquire = 3,
+    Descriptors = 4,
+    Record = 5,
+    Submit = 6,
+    Wait = 7,
+    Readback = 8,
 }
 
-const PHASES: usize = 6;
+const PHASES: usize = 9;
 
-static ACC: [AtomicU64; PHASES] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
+static ACC: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 static DRAWS: AtomicU64 = AtomicU64::new(0);
 static MAX_US: AtomicU64 = AtomicU64::new(0);
 static STALLS: AtomicU64 = AtomicU64::new(0);
@@ -86,7 +95,10 @@ static STALL_LINES: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DrawPhaseWindow {
     pub prep_us: u64,
-    pub setup_us: u64,
+    pub pipeline_us: u64,
+    pub stage_us: u64,
+    pub acquire_us: u64,
+    pub descriptors_us: u64,
     pub record_us: u64,
     pub submit_us: u64,
     pub wait_us: u64,
@@ -102,7 +114,10 @@ pub fn take_window() -> Option<DrawPhaseWindow> {
     let draws = DRAWS.swap(0, Ordering::Relaxed);
     let w = DrawPhaseWindow {
         prep_us: ACC[Phase::Prep as usize].swap(0, Ordering::Relaxed),
-        setup_us: ACC[Phase::Setup as usize].swap(0, Ordering::Relaxed),
+        pipeline_us: ACC[Phase::Pipeline as usize].swap(0, Ordering::Relaxed),
+        stage_us: ACC[Phase::Stage as usize].swap(0, Ordering::Relaxed),
+        acquire_us: ACC[Phase::Acquire as usize].swap(0, Ordering::Relaxed),
+        descriptors_us: ACC[Phase::Descriptors as usize].swap(0, Ordering::Relaxed),
         record_us: ACC[Phase::Record as usize].swap(0, Ordering::Relaxed),
         submit_us: ACC[Phase::Submit as usize].swap(0, Ordering::Relaxed),
         wait_us: ACC[Phase::Wait as usize].swap(0, Ordering::Relaxed),
@@ -183,10 +198,14 @@ impl Drop for DrawTimer {
             ""
         };
         crate::observe::off(format!(
-            "draw_stall us={total} prep_us={} setup_us={} record_us={} submit_us={} \
-             wait_us={} readback_us={} geom={w}x{h} readback_bytes={} exit={:?}{latched}",
+            "draw_stall us={total} prep_us={} pipeline_us={} stage_us={} acquire_us={} \
+             descriptors_us={} record_us={} submit_us={} wait_us={} readback_us={} \
+             geom={w}x{h} readback_bytes={} exit={:?}{latched}",
             self.us[Phase::Prep as usize],
-            self.us[Phase::Setup as usize],
+            self.us[Phase::Pipeline as usize],
+            self.us[Phase::Stage as usize],
+            self.us[Phase::Acquire as usize],
+            self.us[Phase::Descriptors as usize],
             self.us[Phase::Record as usize],
             self.us[Phase::Submit as usize],
             self.us[Phase::Wait as usize],
