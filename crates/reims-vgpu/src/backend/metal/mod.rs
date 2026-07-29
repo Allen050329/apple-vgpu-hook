@@ -1,8 +1,9 @@
 //! Direct host-Metal backend: pure-Rust encode + `reims_vgpu_backend_*` C ABI.
 //!
-//! On Apple hosts this is the full MTL encode path. On non-Apple hosts
-//! (`host_stub`) the same types exist so `backend-metal` still builds and
-//! links; encode stays fail-closed until a real host Metal rail lands.
+//! macOS only. `backend-metal` on any other target is rejected by the
+//! `compile_error!` in `lib.rs`, so there is no non-Apple arm of this module
+//! and every `target_os = "macos"` gate below is a statement of that fact
+//! rather than a branch.
 
 pub mod abi;
 mod constants;
@@ -67,12 +68,3 @@ pub mod c_abi {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Non-Apple: host stub (same public names; encode unsupported)
-// ---------------------------------------------------------------------------
-
-#[cfg(not(target_os = "macos"))]
-mod host_stub;
-
-#[cfg(not(target_os = "macos"))]
-pub use host_stub::{c_abi, runtime, system_device_name, MetalBackend, MetalRuntime};
