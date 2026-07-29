@@ -193,6 +193,23 @@ fn note_read_refusal(task_id: u32, shifted: u32, gva: u64, served: bool, named: 
         .fail();
 }
 
+/// Fixture write at the arm64e page shift, panicking if it does not land.
+///
+/// The page shift is fixed in the name, per the crate rule that portable code
+/// takes `page_shift` and arch-fixed helpers say so. Every unit-test fixture in
+/// this crate writes arm64e and treats a failed write as a broken fixture
+/// rather than a result, which is why the assertion lives here instead of at
+/// each call site.
+#[cfg(test)]
+#[track_caller]
+pub fn write_task_gva_arm64e<M: HostMemory>(host: &mut M, task: &TaskEntry, gva: u64, buf: &[u8]) {
+    assert!(
+        write_task_gva(host, task, gva, buf, crate::model::PAGE_SHIFT_ARM64E).is_ok(),
+        "fixture write of {} bytes at {gva:#x} failed",
+        buf.len()
+    );
+}
+
 /// Translate `gva` under `task` and write `buf` into guest RAM via `write_gpa`.
 ///
 /// **Tests / fixtures only.** Product paths must use [`write_task_gva_product`]

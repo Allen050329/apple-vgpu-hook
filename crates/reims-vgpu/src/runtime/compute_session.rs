@@ -1155,40 +1155,24 @@ mod tests {
         // Condition buffer: u32 == 5 at offset 0.
         let cond = 5u32.to_le_bytes();
         let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            buf_gva,
-            &cond,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &cond);
         let mut bdesc = vec![0u8; 16];
         st64(&mut bdesc[0..], 4);
         st32(&mut bdesc[8..], 5);
         let bdesc_gva = 0x180u64;
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             bdesc_gva,
             &bdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         {
             let off = list_object_entry_offset(7, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
         let mut session = ComputeSession::open(0).expect("metal session");
@@ -1247,78 +1231,46 @@ mod tests {
         // Condition == 1 at buffer ref 8.
         let cond = 1u32.to_le_bytes();
         let cond_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            cond_gva,
-            &cond,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cond_gva, &cond);
         let mut cdesc = vec![0u8; 16];
         st64(&mut cdesc[0..], 4);
         st32(&mut cdesc[8..], 4);
         let cdesc_gva = 0x100u64;
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             cdesc_gva,
             &cdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         {
             let off = list_object_entry_offset(8, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&cdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
         // Kernel function + pipeline + data buffer (same shape as mul3add1 unit).
         let blob_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            blob_gva,
-            &mtlb,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &mtlb);
         let mut fdesc = vec![0u8; 32];
         st64(&mut fdesc[0..], blob_gva);
         st32(&mut fdesc[8..], mtlb.len() as u32);
         let fdesc_gva = 0x140u64;
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             fdesc_gva,
             &fdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         {
             let off = list_object_entry_offset(5, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_FUNCTION as u32) | (32u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&fdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
         let mut pdesc = vec![0u8; 32];
         st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -1328,66 +1280,46 @@ mod tests {
         pdesc[TYPE7_FIRST_TLVS + 2] = 4;
         st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
         let pdesc_gva = 0x180u64;
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             pdesc_gva,
             &pdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         {
             let off = list_object_entry_offset(6, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&pdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
         let data = [1u32, 2, 3, 4];
         let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buf_gva = 6u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             buf_gva,
             &data_bytes,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         let mut bdesc = vec![0u8; 16];
         st64(&mut bdesc[0..], 16);
         st32(&mut bdesc[8..], 6);
         let bdesc_gva = 0x1c0u64;
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             bdesc_gva,
             &bdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         {
             let off = list_object_entry_offset(7, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
         // Phase A: nested dispatch alone on a session (no control SPI).
@@ -1431,14 +1363,12 @@ mod tests {
         // Reset data for phase B (if-wrapped).
         let data = [1u32, 2, 3, 4];
         let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut host,
             &state.tasks[1],
             buf_gva,
             &data_bytes,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
 
         // Phase B: if wraps nested dispatch. Concurrent encoder is the intended
         // SPI host for encodeStartIf. Wire comparison is the Reims VGPU encoder's enum

@@ -1782,7 +1782,6 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     // One-level page table: GVA pages 0..7 → data PFNs (blit_exec pattern).
@@ -1844,27 +1843,13 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 256).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -1911,7 +1896,6 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
@@ -1963,27 +1947,23 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
         st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
         st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
         st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut *host,
             &state.tasks[1],
             desc_gva,
             &desc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
         let off = list_object_entry_offset(view_ref, 256).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        assert!(gva_mem::write_task_gva(
+        crate::runtime::gva_mem::write_task_gva_arm64e(
             &mut *host,
             &state.tasks[1],
             off,
             &list_entry,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        );
     }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2044,7 +2024,6 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_REF, TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_SWIZZLE,
         TEXTURE_VIEW_MTL_TYPE_2D, TEXTURE_VIEW_OPCODE_SWIZZLE,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
@@ -2101,27 +2080,13 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     // Non-identity BGRA → RGBA channel remap.
     desc[TEXTURE_VIEW_DESC_SWIZZLE..TEXTURE_VIEW_DESC_SWIZZLE + 4].copy_from_slice(&[2u8, 1, 0, 3]);
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -2164,7 +2129,6 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
         OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
         TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
@@ -2216,27 +2180,13 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
         MTL_FORMAT_RGBA16_FLOAT,
     );
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(tex_ref, 256).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -2363,7 +2313,6 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
@@ -2418,27 +2367,13 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -2490,7 +2425,6 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
@@ -2542,14 +2476,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         MTL_FORMAT_BGRA8_UNORM,
     );
     let base_desc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        base_desc_gva,
-        &b,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], base_desc_gva, &b);
     let off = list_object_entry_offset(base_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -2557,9 +2484,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
     );
     le[4..12].copy_from_slice(&base_desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
     // Type-8 view: level_base=1 over the type-2 base.
     let view_ref = 8u32;
@@ -2585,14 +2510,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let desc_gva = 0x400u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -2600,9 +2518,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8),
     );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
     let att = ColorAttachment {
         present: true,
@@ -2815,7 +2731,6 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2857,14 +2772,7 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         MTL_FORMAT_BGRA8_UNORM,
     );
     let desc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(tex_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -2872,14 +2780,7 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         (OBJECT_TYPE_TEXTURE_VARIANT as u32) | ((body as u32) << 8),
     );
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
     let bgra = [40u8, 20, 10, 255].repeat((w * h) as usize);
@@ -2923,7 +2824,6 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2960,10 +2860,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     st32(&mut b[TEXTURE_DESC_WIDTH + 4..], 2); // height
     st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
     let desc_gva = 0x200u64;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &b, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
     let off = list_object_entry_offset(tex_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -2971,19 +2868,10 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
         (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
     );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
     let bgra = [7u8, 5, 3, 255].repeat(8);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        texel_gva,
-        &bgra,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &bgra);
 
     // The caller resolves the object-list entry + decodes the descriptor
     // once and threads them in; the list is immutable for the draw.
@@ -3023,14 +2911,12 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
 
     // A direct guest write must be observed on the very next load.
     let bgra_new = [90u8, 60, 30, 255].repeat(8);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         texel_gva,
         &bgra_new,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let (_, _, rgba3, id3, _) =
         load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
             .expect("post-write load must succeed");
@@ -3055,7 +2941,6 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -3096,10 +2981,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     st32(&mut b[TEXTURE_DESC_WIDTH + 4..], h);
     st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
     let desc_gva = 0x200u64;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &b, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
     let off = list_object_entry_offset(tex_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -3107,9 +2989,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
     );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
     // Write two padded rows: each 16 tight BGRA bytes then 8 pad bytes.
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
@@ -3122,14 +3002,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     backing.extend_from_slice(&row1);
     backing.extend_from_slice(&pad);
     assert_eq!(backing.len(), (bpr * h) as usize);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        texel_gva,
-        &backing,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &backing);
 
     let le_entry = objects::lookup_list_entry(&state, &host, 1, tex_ref)
         .expect("object-list entry must resolve");

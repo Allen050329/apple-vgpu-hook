@@ -215,27 +215,18 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
         0,
         0, // IOSurface plane index = 2 (alpha)
     ]);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
         .expect("a type-5 plane view over a mapped surface must stage");
@@ -512,36 +503,19 @@ fn resolve_indirect_threadgroups_from_buffer() {
     let args = [2u32, 3, 1];
     let arg_bytes: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &arg_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &arg_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 12);
     st32(&mut bdesc[8..], 5);
     let bdesc_gva = 0x180u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
     {
         let off = list_object_entry_offset(7, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
         st32(&mut le[0..], packed);
         le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
-        assert!(
-            gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E)
-                .is_ok()
-        );
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
     let mut cmd = ComputeCommand::default();
@@ -786,36 +760,19 @@ fn dispatch_buffer_kernel_mul3add1() {
     setup_task_pages(&mut host, &mut state, 4);
 
     let blob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
     let fdesc_gva = 0x100u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fdesc_gva,
-        &fdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fdesc_gva, &fdesc);
     {
         let off = list_object_entry_offset(5, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_FUNCTION as u32) | (32u32 << 8);
         st32(&mut le[0..], packed);
         le[4..12].copy_from_slice(&fdesc_gva.to_le_bytes());
-        assert!(
-            gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E)
-                .is_ok()
-        );
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
     let mut pdesc = vec![0u8; 32];
@@ -826,59 +783,37 @@ fn dispatch_buffer_kernel_mul3add1() {
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
     let pdesc_gva = 0x140u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], pdesc_gva, &pdesc);
     {
         let off = list_object_entry_offset(6, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8);
         st32(&mut le[0..], packed);
         le[4..12].copy_from_slice(&pdesc_gva.to_le_bytes());
-        assert!(
-            gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E)
-                .is_ok()
-        );
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         buf_gva,
         &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 5);
     let bdesc_gva = 0x180u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
     {
         let off = list_object_entry_offset(7, 32).unwrap();
         let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
         st32(&mut le[0..], packed);
         le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
-        assert!(
-            gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E)
-                .is_ok()
-        );
+        crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
     let mut acc = ComputeAccum::default();
@@ -982,27 +917,18 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E; // data pfn base 4 + 2
     let mut type5_desc = vec![0u8; 16];
     st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
         .expect("type-5→surface stage must succeed after ensure");
@@ -1087,27 +1013,18 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
         0x10,
         0, // trailer
     ]);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 33, true)
         .expect("serialized type-5 view must override base surface geometry");
@@ -1143,14 +1060,12 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
     type5_desc[format_at..format_at + 2].copy_from_slice(&MTL_FORMAT_R32_UINT.to_le_bytes());
     let width_at = objects::TYPE5_ARG_RECORD + objects::TYPE5_RECORD_WIDTH;
     st32(&mut type5_desc[width_at..], 4);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let sampled = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false)
         .expect("sample-only R32Uint view must stage from the same IOSurface bytes");
     assert_eq!((sampled.width, sampled.height), (4, 4));
@@ -1235,27 +1150,18 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
         8, 0, 0, 0, // height
         1, 0, 0, 0, // depth
     ]);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
         .expect("plane record must stage the Y plane of a biplanar surface");
@@ -1324,27 +1230,18 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
     let mut type5_desc = vec![0u8; 8];
     st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((type5_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     match stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true) {
         Err(ComputeStatus::Unsupported(_)) => {}
@@ -1386,27 +1283,18 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
     // Object-list ref 7 = a TEXTURE (ot=2) object with a non-decodable desc.
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
     let bogus_desc = vec![0u8; 16];
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &bogus_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(colliding_mid, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE as u32) | ((bogus_desc.len() as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     // Must fail linear (bogus desc), NOT succeed against surface mid 7.
     if let Ok(s) = stage_texture_raw(&mut state, &mut host, 1, colliding_mid, 32, true) {
@@ -1457,28 +1345,19 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
         .copy_from_slice(&0x20u16.to_le_bytes());
     st32(&mut desc[HEAP_TEXTURE_USE_OFFSET..], 1);
     st64(&mut desc[HEAP_TEXTURE_OFFSET..], 0);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
 
     let entry_offset = list_object_entry_offset(texture_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((HEAP_TEXTURE_LEN as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         entry_offset,
         &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, texture_ref, 33, true)
         .expect("live opcode-0x15 heap texture must stage");
@@ -1611,54 +1490,36 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
     let poison_desc_gva = (4u64 + 1) << PAGE_SHIFT_ARM64E;
     let mut iosurf = vec![0u8; 64];
     st32(&mut iosurf[0..], 99); // fake mapping_id
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         poison_desc_gva,
         &iosurf,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off_sid = list_object_entry_offset(sid, 32).unwrap();
     let mut le_sid = [0u8; OBJECT_LIST_ENTRY_LEN];
     // type-11 = OBJECT_TYPE_IOSURFACE
     let packed_t11 = (OBJECT_TYPE_IOSURFACE as u32) | ((64u32) << 8);
     st32(&mut le_sid[0..], packed_t11);
     le_sid[4..12].copy_from_slice(&poison_desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off_sid,
-        &le_sid,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off_sid, &le_sid);
 
     // type-5 at ref 10 → surface_id 3
     let desc_gva = (4u64 + 2) << PAGE_SHIFT_ARM64E;
     let mut type5_desc = vec![0u8; 16];
     st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let staged = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, true)
         .expect("type-5 must stage mapping sid, not poisoned type-11 slot");
@@ -1684,27 +1545,18 @@ fn stage_texture_type5_without_surface_is_missing() {
     let desc_gva = (4u64 + 3) << PAGE_SHIFT_ARM64E;
     let mut type5_desc = vec![0u8; 16];
     st32(&mut type5_desc[objects::TYPE5_SURFACE_ID..], sid);
-    assert!(gva_mem::write_task_gva(
+    crate::runtime::gva_mem::write_task_gva_arm64e(
         &mut host,
         &state.tasks[1],
         desc_gva,
         &type5_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    );
     let off = list_object_entry_offset(type5_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((16u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    crate::runtime::gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let st = stage_texture_raw(&mut state, &mut host, 1, type5_ref, 32, false);
     assert!(matches!(st, Err(ComputeStatus::MissingTexture(_))));
