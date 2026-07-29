@@ -1798,7 +1798,6 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // Same coherence rule as the CPU read: land any resident-authoritative
     // writeback aliasing the span before the GPU reads the pages (the CPU
     // flush completes before this draw's submit).
-    let t_flush = std::time::Instant::now();
     crate::runtime::storage_flush::flush_intersecting_task_gva(
         state,
         host,
@@ -1806,18 +1805,6 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         gva + offset,
         span,
     );
-    let flush_ns = t_flush.elapsed().as_nanos() as u64;
-    state.tranche.zc_flush_ns = state.tranche.zc_flush_ns.saturating_add(flush_ns);
-    // Count the calls whose wall time zc_flush_ns sums, so the residual can be
-    // divided to a true per-call cost (the isect/walk/sig sub-timers span all
-    // flush call sites, not just this one). zc_flush_slow / zc_flush_max_ns
-    // separate a uniform per-call memory stall (reducible) from rare preemption
-    // spikes (scheduler noise): a > 100 µs call is off-CPU, not steady work.
-    state.tranche.zc_flush_calls = state.tranche.zc_flush_calls.saturating_add(1);
-    if flush_ns > 100_000 {
-        state.tranche.zc_flush_slow = state.tranche.zc_flush_slow.saturating_add(1);
-    }
-    state.tranche.zc_flush_max_ns = state.tranche.zc_flush_max_ns.max(flush_ns);
     // Resolve via the whole-backing memo (bind offsets slide within the same
     // buffer allocation, so one memo entry serves every offset). Fall back to
     // the direct span walk when the whole backing does not resolve (e.g. an
@@ -1830,14 +1817,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         Some(runs) => runs,
         None => task_gva_guest_runs(state, host, task_id, gva + offset, span)?,
     };
-    let t_import = std::time::Instant::now();
-    let imported = engine::ensure_host_imports(&runs);
-    state.tranche.zc_import_ns = state
-        .tranche
-        .zc_import_ns
-        .saturating_add(t_import.elapsed().as_nanos() as u64);
-    if !imported {
-        state.tranche.zc_fail_import = state.tranche.zc_fail_import.saturating_add(1);
+    if !engine::ensure_host_imports(&runs) {
         return None;
     }
     Some(engine::BufferContent::GuestRuns(engine::GuestRunSource {
@@ -1864,24 +1844,14 @@ fn load_buffer_content<M: HostMemory + HostOps>(
     // between the zero-copy attempt and the CPU fallback. Sub-floor binds used
     // to walk the task PT twice — once in the failed ZC attempt, once in the
     // CPU read.
-    let t_resolve = std::time::Instant::now();
     let backing = resolve_buffer_backing(state, host, task_id, buffer_ref)?;
-    state.tranche.buf_resolve_ns = state
-        .tranche
-        .buf_resolve_ns
-        .saturating_add(t_resolve.elapsed().as_nanos() as u64);
     if allow_zero_copy {
         if let Some(content) = try_buffer_zero_copy_resolved(state, host, task_id, &backing, offset)
         {
             return Some(content);
         }
     }
-    let t_read = std::time::Instant::now();
     let bytes = read_buffer_bytes_resolved(state, host, task_id, &backing, offset)?;
-    state.tranche.buf_read_ns = state
-        .tranche
-        .buf_read_ns
-        .saturating_add(t_read.elapsed().as_nanos() as u64);
     Some(crate::backend::vulkan::engine::BufferContent::from(bytes))
 }
 
@@ -2628,225 +2598,6 @@ fn host_cache_store_rgba8(
     crate::runtime::surface_cache::store_texture(state, texture_ref, width, height, bgra);
 }
 
-/// Wall-clock µs since `t0` (saturate on overflow; research host clocks only).
-#[inline]
-fn elapsed_us(t0: std::time::Instant) -> u64 {
-    t0.elapsed().as_micros().min(u64::MAX as u128) as u64
-}
-
-/// Always-on stage timing for the Linux metal2vulkan → engine draw path.
-/// Grep `/tmp/reims-vgpu-fail.log` for `linux_m2v_timing`.
-///
-/// | Field | Meaning |
-/// | --- | --- |
-/// | `total_us` | wall clock for this draw attempt |
-/// | `load_us` | pipeline + MTLB load + AIR extract |
-/// | `m2v_us` | metal2vulkan translate (both stages; cache hit ≈ µs) |
-/// | `setup_us` | binds, seed, SPIR-V reloc, build engine request |
-/// | `setup_spv_us` | SPIR-V byte→word materialization (both stages) |
-/// | `setup_bufs_us` | stream buffer loads + stage-in attrs + fragment reloc |
-/// | `setup_tex_us` | sampled texture loads/binds + sampler descriptors |
-/// | `setup_seed_us` | color0 Load/Clear seed byte resolution |
-/// | `setup_asm_us` | DrawRequest assembly incl. present-boundary seed + coverage eval |
-/// | `engine_us` | complete internal `vk_engine` execute |
-/// | `composite_us` | post-engine CPU path (D3: residual; no content composites) |
-/// | `context_us` / `pool_init_us` | Vulkan context and persistent-pool initialization |
-/// | `cache_us` | shader/layout/pass/pipeline cache resolution |
-/// | `*_create_us` | cold Vulkan object creation nested within cache/resource time |
-/// | `resource_us` | samplers, staging/target resources, and descriptors |
-/// | `*_prepare_us` | non-overlapping resource-preparation subphases |
-/// | `memory_alloc_us` | Vulkan allocation calls nested in preparation subphases |
-/// | `resource_unattributed_us` | residual after non-overlapping preparation subphases |
-/// | `pre_record_wait_us` | prior fence wait + fence reset before recording |
-/// | `record_us` / `submit_us` / `wait_us` / `readback_us` | engine stage splits (D1) |
-/// | `engine_unattributed_us` | residual after the non-overlapping engine phases above |
-/// Non-overlapping sub-spans of `setup_us` (see the table above).
-#[cfg(feature = "backend-vulkan")]
-#[derive(Clone, Copy, Debug, Default)]
-struct SetupSplitUs {
-    spv: u64,
-    bufs: u64,
-    tex: u64,
-    seed: u64,
-    assemble: u64,
-    /// Assemble sub-stages: request prep (index/viewport/attr move), Store
-    /// decision + present-boundary Load seed, CPU coverage eval, and the
-    /// per-draw diag/census construction (content scans + resources line).
-    asm_prep: u64,
-    asm_load: u64,
-    asm_cov: u64,
-    asm_diag: u64,
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[derive(Clone, Copy, Debug, Default)]
-struct M2vTiming {
-    pipe: u32,
-    w: u32,
-    h: u32,
-    total_us: u64,
-    load_us: u64,
-    m2v_us: u64,
-    setup_us: u64,
-    setup_split: SetupSplitUs,
-    engine_us: u64,
-    composite_us: u64,
-}
-
-#[cfg(feature = "backend-vulkan")]
-fn log_linux_m2v_timing(
-    timing: M2vTiming,
-    counters: crate::backend::vulkan::engine::CounterSnapshot,
-) -> crate::model::TrancheStats {
-    let M2vTiming {
-        pipe,
-        w,
-        h,
-        total_us,
-        load_us,
-        m2v_us,
-        setup_us,
-        setup_split,
-        engine_us,
-        composite_us,
-    } = timing;
-    let crate::backend::vulkan::engine::CounterSnapshot {
-        creates,
-        allocs,
-        target_free_hits: target_reuse,
-        pipeline_hits: pipe_hit,
-        pipeline_misses: pipe_miss,
-        context_us,
-        pool_init_us,
-        cache_us,
-        shader_create_us,
-        layout_create_us,
-        pass_create_us,
-        pipeline_create_us,
-        sampler_create_us,
-        resource_us,
-        sampler_prepare_us,
-        vertex_prepare_us,
-        index_prepare_us,
-        storage_prepare_us,
-        seed_prepare_us,
-        target_prepare_us,
-        sampled_prepare_us,
-        readback_prepare_us,
-        descriptor_prepare_us,
-        memory_alloc_us,
-        pre_record_wait_us,
-        record_us,
-        submit_us,
-        wait_us,
-        retire_wait_us,
-        render_post_wait_skips: post_wait_skips,
-        ring_retire_blocks,
-        readback_us,
-        readbacks,
-        seed_uploads,
-        sampled_reuploads,
-        sampled_reupload_bytes,
-        sampled_cache_hits,
-        sampled_cache_hit_bytes,
-        sampled_cache_misses,
-        sampled_gpu_binds,
-        ..
-    } = counters;
-    let resource_unattributed_us = engine_unattributed_us(
-        resource_us,
-        &[
-            sampler_prepare_us,
-            vertex_prepare_us,
-            index_prepare_us,
-            storage_prepare_us,
-            seed_prepare_us,
-            target_prepare_us,
-            sampled_prepare_us,
-            readback_prepare_us,
-            descriptor_prepare_us,
-        ],
-    );
-    let engine_unattributed_us = engine_unattributed_us(
-        engine_us,
-        &[
-            context_us,
-            pool_init_us,
-            cache_us,
-            resource_us,
-            pre_record_wait_us,
-            record_us,
-            submit_us,
-            wait_us,
-            retire_wait_us,
-            readback_us,
-        ],
-    );
-    let SetupSplitUs {
-        spv: setup_spv_us,
-        bufs: setup_bufs_us,
-        tex: setup_tex_us,
-        seed: setup_seed_us,
-        assemble: setup_asm_us,
-        asm_prep: asm_prep_us,
-        asm_load: asm_load_us,
-        asm_cov: asm_cov_us,
-        asm_diag: asm_diag_us,
-    } = setup_split;
-    // Per-draw perf telemetry: verbose-gated so it does not flood the always-on
-    // fail log (~0.5M lines / boot) or build this ~1 KB string on a normal boot.
-    // Set `REIMS_VGPU_DRAW_LOG=1` to collect it in /tmp/reims-vgpu-draw.log for a timing census.
-    if crate::observe::draw_log_enabled() {
-        crate::observe::line(format!(
-            "linux_m2v_timing pipe={pipe} {w}x{h} total_us={total_us} load_us={load_us} m2v_us={m2v_us} setup_us={setup_us} setup_spv_us={setup_spv_us} setup_bufs_us={setup_bufs_us} setup_tex_us={setup_tex_us} setup_seed_us={setup_seed_us} setup_asm_us={setup_asm_us} asm_prep_us={asm_prep_us} asm_load_us={asm_load_us} asm_cov_us={asm_cov_us} asm_diag_us={asm_diag_us} engine_us={engine_us} engine_unattributed_us={engine_unattributed_us} composite_us={composite_us} vk_engine_creates={creates} vk_engine_allocs={allocs} pipe_hit={pipe_hit} pipe_miss={pipe_miss} context_us={context_us} pool_init_us={pool_init_us} cache_us={cache_us} shader_create_us={shader_create_us} layout_create_us={layout_create_us} pass_create_us={pass_create_us} pipeline_create_us={pipeline_create_us} sampler_create_us={sampler_create_us} resource_us={resource_us} resource_unattributed_us={resource_unattributed_us} sampler_prepare_us={sampler_prepare_us} vertex_prepare_us={vertex_prepare_us} index_prepare_us={index_prepare_us} storage_prepare_us={storage_prepare_us} seed_prepare_us={seed_prepare_us} target_prepare_us={target_prepare_us} sampled_prepare_us={sampled_prepare_us} readback_prepare_us={readback_prepare_us} descriptor_prepare_us={descriptor_prepare_us} memory_alloc_us={memory_alloc_us} pre_record_wait_us={pre_record_wait_us} record_us={record_us} submit_us={submit_us} wait_us={wait_us} retire_wait_us={retire_wait_us} post_wait_skips={post_wait_skips} ring_retire_blocks={ring_retire_blocks} readback_us={readback_us} vk_engine_readbacks={readbacks} seed_uploads={seed_uploads} sampled_reuploads={sampled_reuploads} sampled_reupload_bytes={sampled_reupload_bytes} sampled_cache_hits={sampled_cache_hits} sampled_cache_hit_bytes={sampled_cache_hit_bytes} sampled_cache_misses={sampled_cache_misses} sampled_gpu_binds={sampled_gpu_binds}"
-        ));
-    }
-    // Per-tranche attribution: this draw's contribution to the drain lock hold.
-    crate::model::TrancheStats {
-        draws: 1,
-        draw_total_us: total_us,
-        load_us,
-        m2v_us,
-        setup_us,
-        setup_bufs_us,
-        setup_tex_us,
-        setup_seed_us,
-        setup_asm_us,
-        engine_us,
-        engine_resource_us: resource_us,
-        engine_descriptor_us: descriptor_prepare_us,
-        engine_record_us: record_us,
-        engine_submit_us: submit_us,
-        engine_target_us: target_prepare_us,
-        engine_sampled_us: sampled_prepare_us,
-        engine_sampler_prep_us: sampler_prepare_us,
-        engine_vertex_prep_us: vertex_prepare_us,
-        engine_index_prep_us: index_prepare_us,
-        engine_storage_prep_us: storage_prepare_us,
-        engine_seed_prep_us: seed_prepare_us,
-        engine_creates: creates,
-        engine_allocs: allocs,
-        target_reuse,
-        engine_memory_alloc_us: memory_alloc_us,
-        wait_us,
-        retire_wait_us,
-        readback_us,
-        readbacks,
-        reuploads: sampled_reuploads,
-        reupload_bytes: sampled_reupload_bytes,
-        // Non-draw classes (compute, store/flush) are noted at their own sites.
-        ..Default::default()
-    }
-}
-
-fn engine_unattributed_us(engine_us: u64, phases: &[u64]) -> u64 {
-    phases.iter().fold(engine_us, |remaining, phase| {
-        remaining.saturating_sub(*phase)
-    })
-}
-
-
-
 /// Result of a Linux metal2vulkan draw.
 #[cfg(feature = "backend-vulkan")]
 enum M2vDrawSpan {
@@ -3192,8 +2943,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
-    let t_total = std::time::Instant::now();
-    let t_load = std::time::Instant::now();
     let pd = load_render_pipeline(state, host, req.task_id, req.pipeline_ref).ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::PipelineMissing {
@@ -3238,11 +2987,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             )
         })?
         .to_vec();
-    let load_us = elapsed_us(t_load);
 
     // AIR→SPIR-V is content-cached: live boots re-translated the same pipelines
     // dozens of times on the doorbell vCPU and tripped IPI timeout panics.
-    let t_m2v = std::time::Instant::now();
     // Reflected translate: the cached shader carries the metal2vulkan reflection
     // facade so per-draw texture provisioning reads dimensionality straight from
     // the AIR-derived metadata (single source of truth) rather than re-walking the
@@ -3274,7 +3021,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let m2v_us = elapsed_us(t_m2v);
 
     dump_draw_handoff(
         req,
@@ -3297,16 +3043,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     } else if let Some(c0) = req.colors.first() {
         (c0.width, c0.height)
     } else {
-        state.tranche.add(log_linux_m2v_timing(
-            M2vTiming {
-                pipe: req.pipeline_ref,
-                total_us: elapsed_us(t_total),
-                load_us,
-                m2v_us,
-                ..M2vTiming::default()
-            },
-            crate::backend::vulkan::engine::CounterSnapshot::default(),
-        ));
         return Ok(M2vDrawSpan::None);
     };
     if w == 0 || h == 0 || w > 4096 || h > 4096 {
@@ -3319,7 +3055,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     }
 
     // setup_us: SPIR-V words, reloc, guest binds, seed, engine DrawRequest assembly.
-    let t_setup = std::time::Instant::now();
 
     // SPIR-V words for the engine, shared from the translation cache (Arc — no
     // per-draw materialization; fragment reloc variants are cached per shader).
@@ -3333,7 +3068,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             FRAG_BUFFER_BINDING_OFFSET, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET, SAMPLER_BINDING_BASE,
             TEXTURE_BINDING_BASE,
         };
-        let t_spv_done = std::time::Instant::now();
 
         // Materialize stream buffer binds (vertex + fragment). Large spans
         // ride the zero-copy rail (the GPU gathers them from imported guest
@@ -3386,11 +3120,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             };
             frag_storage.push((b.index, content));
         }
-        state.tranche.bufs_load_ns = state
-            .tranche
-            .bufs_load_ns
-            .saturating_add(t_spv_done.elapsed().as_nanos() as u64);
-
         // Stage-in attributes from pipeline vertex block + bound buffer bytes.
         let mut attrs: Vec<crate::backend::vulkan::engine::VertexAttributeResource> = Vec::new();
         let mut stage_in_bufs: std::collections::BTreeSet<u32> = Default::default();
@@ -3594,8 +3323,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             fetch0
         };
-
-        let t_bufs_done = std::time::Instant::now();
         // Sampled textures + samplers (metal2vulkan bands: textures 32+N, samplers 64+M).
         // Texture and sampler **indices are independent** (live logo SPIR-V: image
         // binding 35 = texture(3), sampler binding 64 = sampler(0)). Pairing
@@ -3926,8 +3653,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 );
             }
         }
-
-        let t_tex_done = std::time::Instant::now();
         // Color load seed: CLEAR → solid; LOAD → guest/host seed when present.
         let mut target_rgba8: Option<Vec<u8>> = None;
         #[cfg(feature = "backend-vulkan")]
@@ -4057,8 +3782,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 target_rgba8 = Some(seed.clone());
             }
         }
-
-        let t_seed_done = std::time::Instant::now();
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
             // Metal NDC is Y-up; Vulkan is Y-down.
             flip_viewport_y: true,
@@ -4140,7 +3863,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         resources.sampled_images = images;
         resources.color_input = frag_color_input;
         resources.samplers = samplers;
-        let t_asm_prep_done = std::time::Instant::now();
         // Load seed always goes to the GPU (workstream D3). Premult One/OMSA is
         // hardware blend over the Load-seeded target — identical math to the
         // retired software `src + seed*(1-src.a)` path. Sampled alpha is
@@ -4439,8 +4161,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         } else {
             req.vertex_count.max(1)
         };
-        let t_asm_load_done = std::time::Instant::now();
-        let t_asm_cov_done = std::time::Instant::now();
 
         // Decide FIRST whether a census line will be emitted at all; the
         // resource metas below (per-attr/ssbo format!, hex prefixes, 16-float
@@ -4863,69 +4583,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             resources.secondary_targets = secs;
         }
-        let setup_us = elapsed_us(t_setup);
-        let t_setup_done = std::time::Instant::now();
-        let setup_split = SetupSplitUs {
-            spv: t_spv_done.duration_since(t_setup).as_micros() as u64,
-            bufs: t_bufs_done.duration_since(t_spv_done).as_micros() as u64,
-            tex: t_tex_done.duration_since(t_bufs_done).as_micros() as u64,
-            seed: t_seed_done.duration_since(t_tex_done).as_micros() as u64,
-            assemble: t_setup_done.duration_since(t_seed_done).as_micros() as u64,
-            asm_prep: t_asm_prep_done.duration_since(t_seed_done).as_micros() as u64,
-            asm_load: t_asm_load_done.duration_since(t_asm_prep_done).as_micros() as u64,
-            asm_cov: t_asm_cov_done.duration_since(t_asm_load_done).as_micros() as u64,
-            asm_diag: t_setup_done.duration_since(t_asm_cov_done).as_micros() as u64,
-        };
-
-        // Draw-batching ceiling census (measure-only, never gates behavior):
-        // would this draw have joined the previous draw's command buffer under
-        // a narrow same-pass batching rule? Same (identity, geometry, bgra) as
-        // the previous draw of this packet; joinable additionally requires the
-        // load to fold into the open pass (LoadFromTarget, no CPU/GPU seed),
-        // no readback, no MRT secondaries, and not sampling its own target.
-        let (batch_same_target, batch_joinable) = {
-            use std::hash::{Hash, Hasher};
-            let key = resources.target_identity.as_ref().map(|id| {
-                let mut hh = std::collections::hash_map::DefaultHasher::new();
-                id.hash(&mut hh);
-                (hh.finish(), w, h, resources.output_bgra)
-            });
-            let same = match (&key, &state.last_draw_batch_key) {
-                (Some(k), Some(prev)) => k == prev,
-                _ => false,
-            };
-            let joinable =
-                same && matches!(
-                    resources.load_op,
-                    Some(crate::backend::vulkan::engine::LoadOp::LoadFromTarget)
-                ) && resources.target_rgba8.is_none()
-                    && resources.seed_from_target.is_none()
-                    && resources.skip_readback
-                    && resources.secondary_targets.is_empty()
-                    && !resources.sampled_images.iter().any(|s| {
-                        matches!(
-                            (&s.source, resources.target_identity.as_ref()),
-                            (
-                                crate::backend::vulkan::engine::SampledSource::Target(t),
-                                Some(own)
-                            ) if t == own
-                        )
-                    });
-            state.last_draw_batch_key = key;
-            (same as u64, joinable as u64)
-        };
         let before = crate::backend::vulkan::engine::counter_snapshot();
-        let t_engine = std::time::Instant::now();
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         let out = crate::backend::vulkan::engine::execute_draw_request(&resources)?;
-        let engine_us = elapsed_us(t_engine);
         let after = crate::backend::vulkan::engine::counter_snapshot();
         let d = after.delta_since(&before);
         crate::observe::line(format!(
-            "linux_m2v_draw vk_engine_creates={} vk_engine_allocs={} pipe_hit={} pipe_miss={} sampled_reuploads={} sampled_reupload_bytes={} sampled_cache_hits={} sampled_cache_hit_bytes={} sampled_identity_hits={} sampled_cache_misses={} sampled_gpu_binds={} sampled_free_hits={} sampled_free_allocs={} sampled_recycle_admits={} sampled_recycle_cap_drops={} engine_us={}",
+            "linux_m2v_draw vk_engine_creates={} vk_engine_allocs={} pipe_hit={} pipe_miss={} sampled_reuploads={} sampled_reupload_bytes={} sampled_cache_hits={} sampled_cache_hit_bytes={} sampled_identity_hits={} sampled_cache_misses={} sampled_gpu_binds={} sampled_free_hits={} sampled_free_allocs={} sampled_recycle_admits={} sampled_recycle_cap_drops={}",
             d.creates,
             d.allocs,
             d.pipeline_hits,
@@ -4940,8 +4607,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             d.sampled_free_hits,
             d.sampled_free_allocs,
             d.sampled_recycle_admits,
-            d.sampled_recycle_cap_drops,
-            engine_us
+            d.sampled_recycle_cap_drops
         ));
         // Measure-only: RGB nonzero (ignore alpha) so black+alpha is not mistaken for content.
         // Resident/import path uses skip_readback → empty `out.pixels` is **expected**
@@ -4976,7 +4642,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 out.pixels.get(3).copied().unwrap_or(0),
             ));
         }
-        let t_composite = std::time::Instant::now();
         // D3: no content-gated CPU composites. Premult One/OMSA is hardware
         // Load+blend; keep-seed / alpha0-holes retired (real Metal has neither).
         // Fire-counter proxies still log when the OLD content gates *would* have
@@ -5010,29 +4675,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Engine pixels are authoritative (empty when skip_readback; Store path
         // materializes bytes for surface_cache / guest writeback unless import).
         let pixels = out.pixels;
-        let composite_us = elapsed_us(t_composite);
-        let mut tranche_delta = log_linux_m2v_timing(
-            M2vTiming {
-                pipe: req.pipeline_ref,
-                w,
-                h,
-                total_us: elapsed_us(t_total),
-                load_us,
-                m2v_us,
-                setup_us,
-                setup_split,
-                engine_us,
-                composite_us,
-            },
-            d,
-        );
-        tranche_delta.buf_zc = d.buffer_zerocopy_binds;
-        tranche_delta.buf_snap = d.buffer_snapshot_binds;
-        tranche_delta.batch_same_target = batch_same_target;
-        tranche_delta.batch_joinable = batch_joinable;
-        tranche_delta.batch_opened = d.batch_opens;
-        tranche_delta.batch_joined = d.batch_joins;
-        state.tranche.add(tranche_delta);
         if try_import {
             if let Some(identity) = resources.target_identity.clone() {
                 return Ok(M2vDrawSpan::ResidentBgra {

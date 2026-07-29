@@ -265,9 +265,6 @@ pub fn capture_present_frame(
         state.presented_needs_guest_seed.insert(mapping_id);
         state.present.light_captures = state.present.light_captures.wrapping_add(1);
         maybe_log_capture_sampling(state);
-        // Light capture pays ~no lock hold; attribute a zero to the tranche so the
-        // `capture_us` floor reflects only the frames that actually read back.
-        state.tranche.note_capture(0);
         return true;
     }
     state.present.full_captures = state.present.full_captures.wrapping_add(1);
@@ -275,7 +272,6 @@ pub fn capture_present_frame(
     // Attribute this capture's lock hold to the tranche `capture_us` bucket (it
     // runs on the present drain, not a render draw). Every real return below
     // notes the elapsed time so a capture-bound hitch stops hiding in `other_us`.
-    let capture_started = std::time::Instant::now();
     // Recycle the warm double-buffered scratch instead of a fresh `vec![0u8;
     // need]` per present (which zeroes 8 MiB and faults fresh anon pages every
     // time, only to overwrite them). `resize` is a no-op at steady geometry;
@@ -328,9 +324,6 @@ pub fn capture_present_frame(
         ));
         // Recycle the untouched scratch; the prior retain stays intact.
         state.present.capture_scratch = buf;
-        state
-            .tranche
-            .note_capture(capture_started.elapsed().as_micros() as u64);
         return false;
     }
     let from_last_store = from_host_cache;
@@ -349,17 +342,11 @@ pub fn capture_present_frame(
             crate::model::PaintSrc::None => "guest_pages",
         }
     };
-    // Sub-phase attribution of the capture lock hold: paint (guest-page read /
-    // host_cache copy) vs the measure-only occupancy scan. Localizes which part
-    // of the 13–25 ms/present floor to cut.
-    let paint_us = capture_started.elapsed().as_micros() as u64;
-    let scan_started = std::time::Instant::now();
     // One fused pass over the 8 MiB frame instead of separate byte-nz and
     // rgb-nz scans — this runs on the present drain under the device lock, so
     // halving the measure-only scan cuts per-present lock-hold (present cadence
     // / boot convergence). Byte-exact with nonzero_stats + bgra_rgb_stats.
     let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
-    let scan_us = scan_started.elapsed().as_micros() as u64;
     crate::observe::line(format!(
         "scanout capture_present mid={mapping_id} {width}x{height} gen={generation} nz={nz} max={maxb} last_store={} host_cache={}",
         from_last_store as u8,
@@ -410,15 +397,6 @@ pub fn capture_present_frame(
             "present host_cache mid={mapping_id} {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} gen={generation}"
         ));
     }
-    // Sub-phase split of the capture lock hold (paint = guest read / host_cache
-    // copy; scan = fused occupancy pass). Names which part of the per-present
-    // floor to cut.
-    // Per-present + pure wall-clock (SCHED_IDLE-contaminated under the agent
-    // harness), so this is REIMS_VGPU_DRAW_LOG-only diagnostic trace, not an always-on
-    // signal: the drain-side `tranche` capture_us aggregate carries the floor.
-    crate::observe::line(format!(
-        "present_capture_phase mid={mapping_id} {width}x{height} paint_us={paint_us} scan_us={scan_us} src={src}"
-    ));
     // Publish the new frame and recycle the old retain buffer as the next
     // capture scratch (warm 8 MiB alloc, no per-present malloc/free/zero).
     let old_frame = std::mem::replace(&mut state.present.frame_bgra, buf);
@@ -453,9 +431,6 @@ pub fn capture_present_frame(
     // while +0x188 held logo+pill (live serial-20260715-054015:
     // present_capture rgb_nz≈6k then present_paint Unchanged only).
     state.present.frame_encode_pending = true;
-    state
-        .tranche
-        .note_capture(capture_started.elapsed().as_micros() as u64);
     true
 }
 
@@ -632,7 +607,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             ));
             return ScanoutCopyResult::Unchanged;
         }
-        let paint_started = std::time::Instant::now();
         if blit_present_snapshot(state, dst, dst_stride, width, height) {
             let shown_mid = state.present.frame_mapping;
             let shown_gen = state.present.frame_generation;
@@ -675,19 +649,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             state.present.painted_generation = shown_gen;
             // First successful +0x188 blit after capture clears encode pending.
             state.present.frame_encode_pending = false;
-            // Console-paint lock hold on the QEMU display thread: the 8 MiB
-            // `blit_present_snapshot` copy plus the now-reused stats
-            // (`reused=1` confirms the redundant scans are gone). Per-present +
-            // pure wall-clock (SCHED_IDLE-contaminated), and it runs on the QEMU
-            // display thread — gate behind REIMS_VGPU_DRAW_LOG so a normal boot pays
-            // neither the flood nor a display-thread `write(2)` enqueue per paint.
-            let stats_reused = (state.present.frame_stats.mapping == shown_mid
-                && state.present.frame_stats.generation == shown_gen)
-                as u8;
-            crate::observe::line(format!(
-                "present_paint_us mid={shown_mid} {width}x{height} paint_us={} reused={stats_reused}",
-                paint_started.elapsed().as_micros() as u64
-            ));
             return ScanoutCopyResult::Painted;
         }
     }

@@ -11,13 +11,13 @@ pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
     ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState,
-    DeviceId, DeviceState, DisplayHandshake, ExecAggStats, ExecFault, ExecPacketSample, FailEvent,
+    DeviceId, DeviceState, DisplayHandshake, ExecFault, FailEvent,
     FrameStats, GfxRegs, GuestLinearMemo, GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry,
     GvaHostView, HostLinearTexture, HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture,
     MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc,
     PendingWork,
     PresentState, PresentedGeom, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
-    TaskMapSpan, TrancheStats, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
+    TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
     FENCE_DOMAIN_RENDER,
 };
 
@@ -139,91 +139,6 @@ mod tests {
         complete_async_job, enqueue_async_stamp, FakeHost, HostActionKind, HostMemory,
     };
 
-    /// TrancheStats folds per-draw deltas cumulatively and `take` resets so a
-    /// tranche's breakdown never leaks into the next (the device_drain contract).
-    #[test]
-    fn tranche_stats_accumulate_and_take_reset() {
-        let mut t = TrancheStats::default();
-        t.add(TrancheStats {
-            draws: 1,
-            draw_total_us: 100,
-            setup_tex_us: 40,
-            engine_us: 30,
-            wait_us: 10,
-            reupload_bytes: 2048,
-            ..Default::default()
-        });
-        t.add(TrancheStats {
-            draws: 1,
-            draw_total_us: 50,
-            setup_tex_us: 5,
-            engine_us: 20,
-            reupload_bytes: 1024,
-            ..Default::default()
-        });
-        assert_eq!(t.draws, 2);
-        assert_eq!(t.draw_total_us, 150);
-        assert_eq!(t.setup_tex_us, 45);
-        assert_eq!(t.engine_us, 50);
-        assert_eq!(t.wait_us, 10);
-        assert_eq!(t.reupload_bytes, 3072);
-        // Non-draw classes accumulate via their own note_* entry points.
-        t.note_compute(300);
-        t.note_compute(200);
-        t.note_store(1000);
-        t.note_capture(700);
-        t.note_capture(300);
-        assert_eq!(t.compute_n, 2);
-        assert_eq!(t.compute_us, 500);
-        assert_eq!(t.store_n, 1);
-        assert_eq!(t.store_us, 1000);
-        assert_eq!(t.capture_n, 2);
-        assert_eq!(t.capture_us, 1000);
-        let taken = t.take();
-        assert_eq!(taken.compute_us, 500);
-        assert_eq!(taken.store_us, 1000);
-        assert_eq!(taken.capture_us, 1000);
-        assert_eq!(t.compute_us, 0);
-        assert_eq!(t.store_n, 0);
-        assert_eq!(t.capture_n, 0);
-        assert_eq!(taken.draws, 2);
-        assert_eq!(taken.draw_total_us, 150);
-        // After take the live accumulator is empty — no leak into the next tranche.
-        assert_eq!(t.draws, 0);
-        assert_eq!(t.draw_total_us, 0);
-        assert_eq!(t.setup_tex_us, 0);
-    }
-
-    /// The five resource-prep classes accumulate independently. They reached this
-    /// struct pre-summed as one `engine_bufprep_us`, which named 32% of over-25 ms
-    /// tranche wall clock and no lever inside it; re-fusing any pair (or wiring two
-    /// fields to one source) puts that back. Distinct powers of two so a wrong sum
-    /// cannot land on a right answer by coincidence.
-    #[test]
-    fn the_five_resource_prep_classes_do_not_fold_into_each_other() {
-        let mut t = TrancheStats::default();
-        for scale in [1, 2] {
-            t.add(TrancheStats {
-                engine_sampler_prep_us: scale,
-                engine_vertex_prep_us: scale * 4,
-                engine_index_prep_us: scale * 16,
-                engine_storage_prep_us: scale * 64,
-                engine_seed_prep_us: scale * 256,
-                ..Default::default()
-            });
-        }
-        let taken = t.take();
-        assert_eq!(taken.engine_sampler_prep_us, 3);
-        assert_eq!(taken.engine_vertex_prep_us, 12);
-        assert_eq!(taken.engine_index_prep_us, 48);
-        assert_eq!(taken.engine_storage_prep_us, 192);
-        assert_eq!(taken.engine_seed_prep_us, 768);
-        assert_eq!(t.engine_sampler_prep_us, 0);
-        assert_eq!(t.engine_seed_prep_us, 0);
-    }
-
-    /// x86 stamp page is 4 KiB → 1024 slots; arm 16 KiB → 4096. Indices that fit
-    /// the arm page but not x86 must be rejected on x86 (wild-write class).
     #[test]
     fn stamp_slot_offset_respects_guest_page_size() {
         assert_eq!(stamp_slot_offset(0, PAGE_SIZE_X86), Some(0));

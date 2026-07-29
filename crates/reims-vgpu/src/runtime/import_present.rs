@@ -27,7 +27,6 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::surface_cache;
-use std::time::Instant;
 
 // RGBA8_BPP used only for tight row checks in try_import_present_store.
 
@@ -69,93 +68,6 @@ impl crate::observe::Refusal for ImportPresentResult {
             Self::Fail(r) => Some(r),
         }
     }
-}
-
-/// A Store/import holding the ordered render worker beyond this boundary is
-/// worth decomposing. Measurement only; it never changes Store behavior.
-const IMPORT_STORE_TIMING_SLOW_US: u64 = 1_000;
-
-struct ImportTiming {
-    started: Instant,
-    revalidate_us: u64,
-    window_us: u64,
-}
-
-impl ImportTiming {
-    fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            revalidate_us: 0,
-            window_us: 0,
-        }
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the proxy line records each independent import outcome counter"
-    )]
-    fn log(
-        &self,
-        path: &'static str,
-        mapping_id: u32,
-        width: u32,
-        height: u32,
-        map_us: u64,
-        dma_us: u64,
-        post_us: u64,
-        runs: usize,
-        cache_hits: usize,
-        cache_misses: usize,
-        cached: bool,
-    ) {
-        let total_us = self.started.elapsed().as_micros() as u64;
-        if import_store_timing_is_slow(total_us) {
-            crate::observe::off(import_store_timing_line(
-                path,
-                mapping_id,
-                width,
-                height,
-                total_us,
-                self.revalidate_us,
-                self.window_us,
-                map_us,
-                dma_us,
-                post_us,
-                runs,
-                cache_hits,
-                cache_misses,
-                cached,
-            ));
-        }
-    }
-}
-
-#[inline]
-fn import_store_timing_is_slow(total_us: u64) -> bool {
-    total_us >= IMPORT_STORE_TIMING_SLOW_US
-}
-
-#[allow(clippy::too_many_arguments)]
-fn import_store_timing_line(
-    path: &'static str,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    total_us: u64,
-    revalidate_us: u64,
-    window_us: u64,
-    map_us: u64,
-    dma_us: u64,
-    post_us: u64,
-    runs: usize,
-    cache_hits: usize,
-    cache_misses: usize,
-    cached: bool,
-) -> String {
-    format!(
-        "import_store_timing path={path} mid={mapping_id} {width}x{height} total_us={total_us} revalidate_us={revalidate_us} window_us={window_us} map_us={map_us} dma_us={dma_us} post_us={post_us} runs={runs} cache_hits={cache_hits} cache_misses={cache_misses} cached={} threshold_us={IMPORT_STORE_TIMING_SLOW_US}",
-        cached as u8
-    )
 }
 
 /// Build a protocol-stable resident identity for this mapping at its current
@@ -272,7 +184,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     width: u32,
     height: u32,
 ) -> ImportPresentResult {
-    let mut timing = ImportTiming::new();
     if !eligible(mapping_id, width, height) {
         return ImportPresentResult::Skip("ineligible");
     }
@@ -320,10 +231,7 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     {
         return import_fail(mapping_id, width, height, ImportDecline::Unmapped);
     }
-
-    let revalidate_started = Instant::now();
     let revalidate_reason = mapper::revalidate_mapping_reason(state, host, mapping_id);
-    timing.revalidate_us = revalidate_started.elapsed().as_micros() as u64;
     if let Some(reason) = revalidate_reason {
         // Surface the precise revalidate miss (gone / unmapped / no_pages /
         // resolve_fail) instead of a bare `revalidate`, so a benign teardown
@@ -333,7 +241,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     }
 
     // Sample window (offset + guest BPR) — same contract as former write_bgra8.
-    let window_started = Instant::now();
     let fmt = state
         .mappings
         .get(&mapping_id)
@@ -363,7 +270,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
     }
 
     let need = span_end.max(base_off.saturating_add((bpr as u64).saturating_mul(height as u64)));
-    timing.window_us = window_started.elapsed().as_micros() as u64;
 
     // Pre-DMA guest center row (display-sized surfaces). Packed Stores perform
     // a separate resident diagnostic readback; fragmented Stores reuse the
@@ -379,13 +285,10 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             height,
             base_off,
             bpr,
-            timing,
         );
     }
     // --- Path 1: packed contig zero-copy ---
-    let map_started = Instant::now();
     if let Some((ptr, contig_len)) = mapper::ensure_contig_view(state, host, mapping_id) {
-        let map_us = map_started.elapsed().as_micros() as u64;
         if (contig_len as u64) < need {
             return import_fail(
                 mapping_id,
@@ -405,10 +308,7 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
 
         // SAFETY: contig view is live for this mapping; revalidate + map_gen gate
         // above; execution is sync-per-packet so no concurrent unmap mid-DMA.
-        let dma_started = Instant::now();
         let res = unsafe { engine::present_into_host_ptr_strided(identity, dst, dst_len, bpr) };
-        let dma_us = dma_started.elapsed().as_micros() as u64;
-        let post_started = Instant::now();
         let res_for_finish = res;
         let r = finish_import(
             state,
@@ -419,15 +319,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             base_off,
             res_for_finish,
             "ok",
-        );
-        let post_us = post_started.elapsed().as_micros() as u64;
-        // Per-tranche attribution: present-capture store readback+writeback is
-        // not a render draw; count its lock hold out of the opaque `other_us`.
-        state
-            .tranche
-            .note_store(map_us.saturating_add(dma_us).saturating_add(post_us));
-        timing.log(
-            "contig", mapping_id, width, height, map_us, dma_us, post_us, 1, 0, 0, false,
         );
         // A packed-contig surface needs exactly one window, which looks immune to
         // a budget bound and is not: the budget is global, so one run is refused
@@ -443,7 +334,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
             height,
             base_off,
             bpr,
-            timing,
         );
     }
 
@@ -458,7 +348,6 @@ pub fn try_import_present_store<H: HostMemory + HostOps>(
         base_off,
         bpr,
         need,
-        timing,
     )
 }
 
@@ -568,7 +457,6 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     // via `render_flush_one`, so no content is lost — just landed early) until we
     // are back under the cap. Mirrors the GVA path's `GVA_DEFERRED_WINDOW_CAP`.
     if state.render_deferred_flush.len() > RENDER_DEFERRED_WINDOW_CAP {
-        let flush_started = Instant::now();
         let mut forced = 0u64;
         while state.render_deferred_flush.len() > RENDER_DEFERRED_WINDOW_CAP {
             let Some((old_key, old_entry)) = state.take_oldest_render_deferred_window() else {
@@ -578,10 +466,7 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
                 crate::runtime::storage_flush::render_flush_one(state, host, &old_key, &old_entry);
             forced += 1;
         }
-        crate::runtime::census::present_proxy::cap_flush::note(
-            forced,
-            flush_started.elapsed().as_micros() as u64,
-        );
+        crate::runtime::census::present_proxy::cap_flush::note(forced);
     }
     true
 }
@@ -596,9 +481,7 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
     height: u32,
     base_off: u64,
     bpr: u32,
-    timing: ImportTiming,
 ) -> ImportPresentResult {
-    let read_started = Instant::now();
     let pixels = match engine::read_target(identity) {
         Ok(pixels) => pixels,
         Err(e) => {
@@ -614,8 +497,6 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
             return ImportPresentResult::Fail(reason);
         }
     };
-    let read_us = read_started.elapsed().as_micros() as u64;
-    let write_started = Instant::now();
     let stride = width.saturating_mul(RGBA8_BPP);
     if !mapping_write::write_bgra8(state, host, mapping_id, &pixels, stride, width, height) {
         let reason = "cpu_write";
@@ -625,10 +506,8 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
         log_result(mapping_id, width, height, ImportPresentResult::Fail(reason));
         return ImportPresentResult::Fail(reason);
     }
-    let write_us = write_started.elapsed().as_micros() as u64;
-
-    let post_started = Instant::now();
-    let r = finish_import(
+    
+    finish_import(
         state,
         mapping_id,
         width,
@@ -637,25 +516,7 @@ fn try_import_present_cpu_unstable<H: HostMemory + HostOps>(
         base_off,
         Ok(()),
         "cpu_unstable",
-    );
-    let post_us = post_started.elapsed().as_micros() as u64;
-    state
-        .tranche
-        .note_store(read_us.saturating_add(write_us).saturating_add(post_us));
-    timing.log(
-        "cpu_unstable",
-        mapping_id,
-        width,
-        height,
-        0,
-        read_us,
-        write_us.saturating_add(post_us),
-        0,
-        0,
-        0,
-        false,
-    );
-    r
+    )
 }
 
 /// Fragmented surfaces: map each packed page run and GPU-DMA into it directly.
@@ -673,9 +534,7 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
     base_off: u64,
     bpr: u32,
     need: u64,
-    timing: ImportTiming,
 ) -> ImportPresentResult {
-    let map_started = Instant::now();
     let Some(gpas) = mapper::mapping_page_gpas(state, host, mapping_id) else {
         return import_fail(mapping_id, width, height, ImportDecline::Revalidate);
     };
@@ -749,32 +608,16 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
             linear_len: m.len as u64,
         })
         .collect();
-    let map_us = map_started.elapsed().as_micros() as u64;
 
     // SAFETY: mapped views remain live and disjoint until the synchronous
     // readback/scatter returns; product drain cannot unmap them concurrently.
-    let dma_started = Instant::now();
     let res = unsafe {
         engine::present_into_host_runs(identity, base_off, bpr, &host_runs, host.map_pages_stable())
     };
-    let dma_us = dma_started.elapsed().as_micros() as u64;
-    let post_started = Instant::now();
     unmap_all(host, &mapped);
 
     let result = match res {
-        Ok(present) => {
-            // Phase split of the runs_readback DMA: readback (sync GPU
-            // render/readback fence-wait + copy-out) vs CPU scatter into the
-            // fragmented guest runs. Names which half of the ~11 ms/store lag
-            // Per-store scatter timing — one line per import store, entirely
-            // wall-clock (SCHED_IDLE-contaminated under the agent harness).
-            // Diagnostic-only; gated behind REIMS_VGPU_DRAW_LOG. The always-on
-            // store-rate signal is `present_import` `used_hz`.
-            crate::observe::line(format!(
-                "import_store_split mid={mapping_id} {width}x{height} dma_us={dma_us} scatter_us={} runs={}",
-                present.scatter_us,
-                mapped.len()
-            ));
+        Ok(()) => {
             let _ = state.mark_mapping_written(mapping_id);
             state.note_surface_composite(mapping_id);
             // Full-frame publish: the entire resident target was scattered into
@@ -812,25 +655,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
             ImportPresentResult::Fail(reason)
         }
     };
-    let post_us = post_started.elapsed().as_micros() as u64;
-    // Per-tranche attribution: fragmented present-capture store readback+writeback
-    // is not a render draw; count its lock hold out of the opaque `other_us`.
-    state
-        .tranche
-        .note_store(map_us.saturating_add(dma_us).saturating_add(post_us));
-    timing.log(
-        "runs_readback",
-        mapping_id,
-        width,
-        height,
-        map_us,
-        dma_us,
-        post_us,
-        host_runs.len(),
-        0,
-        0,
-        false,
-    );
     cpu_writeback_on_window_shortage(
         result,
         host_runs.len(),
@@ -842,7 +666,6 @@ fn try_import_present_multi_run<H: HostMemory + HostOps>(
         height,
         base_off,
         bpr,
-        timing,
     )
 }
 
@@ -907,7 +730,6 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
     height: u32,
     base_off: u64,
     bpr: u32,
-    timing: ImportTiming,
 ) -> ImportPresentResult {
     let ImportPresentResult::Fail(reason) = result else {
         return result;
@@ -929,7 +751,6 @@ fn cpu_writeback_on_window_shortage<H: HostMemory + HostOps>(
         height,
         base_off,
         bpr,
-        timing,
     )
 }
 
@@ -1414,47 +1235,6 @@ mod tests {
         assert!(eligible(1, 1920, 1080));
     }
 
-    #[test]
-    fn import_store_timing_proxy_names_every_phase_and_threshold() {
-        assert!(!import_store_timing_is_slow(
-            IMPORT_STORE_TIMING_SLOW_US - 1
-        ));
-        assert!(import_store_timing_is_slow(IMPORT_STORE_TIMING_SLOW_US));
-        let line = import_store_timing_line(
-            "runs_readback",
-            3,
-            1920,
-            1080,
-            11,
-            1,
-            2,
-            4,
-            5,
-            6,
-            507,
-            0,
-            0,
-            false,
-        );
-        for field in [
-            "path=runs_readback",
-            "mid=3",
-            "1920x1080",
-            "total_us=11",
-            "revalidate_us=1",
-            "window_us=2",
-            "map_us=4",
-            "dma_us=5",
-            "post_us=6",
-            "runs=507",
-            "cache_hits=0",
-            "cache_misses=0",
-            "cached=0",
-            "threshold_us=1000",
-        ] {
-            assert!(line.contains(field), "missing {field}: {line}");
-        }
-    }
 
     #[test]
     fn surface_identity_tracks_map_generation() {
@@ -1583,7 +1363,6 @@ mod tests {
                 2,
                 0,
                 8,
-                ImportTiming::new(),
             )
         };
 

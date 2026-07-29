@@ -3119,9 +3119,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
 
     const TEXTURE_BIND_BASE: u32 = 32;
 
-    let total_started = std::time::Instant::now();
-    let stage_started = std::time::Instant::now();
-
     if acc.pipeline_ref == 0 {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero");
     }
@@ -3186,7 +3183,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
     // MTLB → AIR → SPIR-V (LocalSize = threadgroup dims).
-    let translate_started = std::time::Instant::now();
     let Some(mtlb) = load_mtlb(state, host, task_id, pipeline.kernel_func_ref) else {
         return ComputeStatus::MissingMtlb("compute_vk_mtlb_load");
     };
@@ -3238,7 +3234,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_spirv_parse");
         }
     };
-    let translate_us = u64::try_from(translate_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
     // Compute analog of `REIMS_VGPU_M2V_DUMP_DRAW_PIPES`: the failure sites
     // below dump only kernels that were refused, so a kernel that translates and
@@ -3450,11 +3445,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         residency_eligible_bytes,
         residency_hit_bytes,
     );
-    let stage_us = u64::try_from(stage_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     // A dispatch that staged its resources is expected control flow; the
     // refusals on this path each emit their own typed decline.
     crate::observe::line(format!(
-        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] stage_us={} encode=engine",
+        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] encode=engine",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
@@ -3464,9 +3458,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         sampled_count,
         storage_count,
         storage_writeonly_count,
-        stage_us,
     ));
-    let prep_started = std::time::Instant::now();
 
     // Workgroup counts: DispatchThreadgroups already is groups; DispatchThreads
     // is total threads → ceil-div by LocalSize.
@@ -3777,9 +3769,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         samplers,
         storage_images,
     };
-    let prep_us = u64::try_from(prep_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let engine_before = vk_engine::counter_snapshot();
-    let engine_started = std::time::Instant::now();
     let run_engine = |req: &ComputeRequest| {
         let engine_done = spawn_compute_engine_stall_watchdog(
             acc.pipeline_ref,
@@ -3817,10 +3806,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_engine_run");
         }
     };
-    let engine_us = u64::try_from(engine_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let engine_after = vk_engine::counter_snapshot();
-    let engine_delta = engine_after.delta_since(&engine_before);
-    let engine_phase_fields = compute_engine_phase_fields(engine_us, &engine_delta);
 
     if out.buffers.len() != buffer_writable_count
         || out.images.len() != storage_count
@@ -3847,8 +3833,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         images_direct: output_images_direct,
         images_deferred: output_images_deferred,
     } = out;
-
-    let writeback_started = std::time::Instant::now();
     for buffer in output_buffers {
         let Some(s) = staged_bufs
             .iter_mut()
@@ -4015,29 +3999,17 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             continue;
         }
         t.bytes = bytes;
-        let write_started = std::time::Instant::now();
         if let Err(e) = writeback_texture(state, host, task_id, t) {
             return e;
         }
-        let write_us = write_started.elapsed().as_micros() as u64;
         note_storage_residency_writeback(state, t);
-        // A writeback this slow stalls the guest's dispatch ack, so it stays
-        // always-on even though the write itself succeeded.
-        if write_us > 1500 {
-            crate::observe::off(format!(
-                "compute_writeback_slow pipe={} bind={} {}x{} write_us={write_us}",
-                acc.pipeline_ref, t.binding, t.width, t.height
-            ));
-        }
     }
-    let writeback_us = u64::try_from(writeback_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let total_us = u64::try_from(total_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
     let snap = engine_after;
     // A dispatch that completed is expected control flow; every refusal on this
     // path emits its own typed decline.
     crate::observe::line(format!(
-        "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={} stage_us={stage_us} translate_us={translate_us} prep_us={prep_us} engine_us={engine_us} {engine_phase_fields} writeback_us={writeback_us} total_us={total_us} vk_engine_dispatches={} creates={} allocs={}",
+        "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={} vk_engine_dispatches={} creates={} allocs={}",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
@@ -4048,82 +4020,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         snap.creates,
         snap.allocs
     ));
-    // Per-tranche attribution: compute dispatches are not render draws, so their
-    // lock hold otherwise lands in the opaque `other_us` bucket.
-    state.tranche.note_compute(total_us);
     ComputeStatus::Ok
-}
-
-#[cfg(feature = "backend-vulkan")]
-fn compute_engine_phase_fields(
-    engine_us: u64,
-    delta: &crate::backend::vulkan::engine::CounterSnapshot,
-) -> String {
-    let resource_measured_us = delta
-        .sampler_prepare_us
-        .saturating_add(delta.storage_prepare_us)
-        .saturating_add(delta.sampled_prepare_us)
-        .saturating_add(delta.storage_image_prepare_us)
-        .saturating_add(delta.descriptor_prepare_us);
-    let resource_unattributed_us = delta.resource_us.saturating_sub(resource_measured_us);
-    let measured_us = delta
-        .lock_wait_us
-        .saturating_add(delta.context_us)
-        .saturating_add(delta.pool_init_us)
-        .saturating_add(delta.cache_us)
-        .saturating_add(delta.resource_us)
-        .saturating_add(delta.pre_record_wait_us)
-        .saturating_add(delta.record_us)
-        .saturating_add(delta.submit_us)
-        .saturating_add(delta.wait_us)
-        .saturating_add(delta.retire_wait_us)
-        .saturating_add(delta.readback_us)
-        .saturating_add(delta.cleanup_us);
-    let unattributed_us = engine_us.saturating_sub(measured_us);
-    format!(
-        "engine_lock_wait_us={} engine_context_us={} engine_pool_init_us={} engine_cache_us={} engine_shader_create_us={} engine_layout_create_us={} engine_pipeline_create_us={} engine_sampler_create_us={} engine_resource_us={} engine_resource_unattributed_us={} engine_sampler_prepare_us={} engine_storage_buffer_prepare_us={} engine_sampled_image_prepare_us={} engine_storage_image_prepare_us={} engine_descriptor_prepare_us={} engine_memory_alloc_us={} engine_pre_record_wait_us={} engine_record_us={} engine_submit_us={} engine_wait_us={} engine_retire_wait_us={} engine_post_wait_skips={} engine_ring_retire_blocks={} engine_readback_us={} engine_cleanup_us={} engine_unattributed_us={} engine_readbacks={} engine_readback_bytes={} engine_sampled_uploads={} engine_sampled_upload_bytes={} engine_sampled_resident_copies={} engine_sampled_resident_copy_bytes={} engine_sampled_reinterpret_copies={} engine_sampled_reinterpret_copy_bytes={} engine_storage_seed_uploads={} engine_storage_seed_upload_bytes={} engine_direct_writebacks={} engine_direct_writeback_bytes={} engine_direct_writeback_fallbacks={} engine_creates={} engine_allocs={}",
-        delta.lock_wait_us,
-        delta.context_us,
-        delta.pool_init_us,
-        delta.cache_us,
-        delta.shader_create_us,
-        delta.layout_create_us,
-        delta.pipeline_create_us,
-        delta.sampler_create_us,
-        delta.resource_us,
-        resource_unattributed_us,
-        delta.sampler_prepare_us,
-        delta.storage_prepare_us,
-        delta.sampled_prepare_us,
-        delta.storage_image_prepare_us,
-        delta.descriptor_prepare_us,
-        delta.memory_alloc_us,
-        delta.pre_record_wait_us,
-        delta.record_us,
-        delta.submit_us,
-        delta.wait_us,
-        delta.retire_wait_us,
-        delta.compute_post_wait_skips,
-        delta.ring_retire_blocks,
-        delta.readback_us,
-        delta.cleanup_us,
-        unattributed_us,
-        delta.readbacks,
-        delta.readback_bytes,
-        delta.compute_sampled_uploads,
-        delta.compute_sampled_upload_bytes,
-        delta.compute_sampled_resident_copies,
-        delta.compute_sampled_resident_copy_bytes,
-        delta.compute_sampled_reinterpret_copies,
-        delta.compute_sampled_reinterpret_copy_bytes,
-        delta.compute_storage_seed_uploads,
-        delta.compute_storage_seed_upload_bytes,
-        delta.compute_direct_writebacks,
-        delta.compute_direct_writeback_bytes,
-        delta.compute_direct_writeback_fallbacks,
-        delta.creates,
-        delta.allocs
-    )
 }
 
 #[cfg(feature = "backend-vulkan")]

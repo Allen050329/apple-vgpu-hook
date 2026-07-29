@@ -1192,210 +1192,26 @@ pub struct GuestLinearMemo {
 /// stalls) and blocks QEMU's main loop (delayed host display refresh). The
 /// opaque `drain_tranche_us` outlier is attributed here so a hitch can be read as
 /// compile/convert/wait/readback-bound without fragile per-draw log correlation.
-/// Accumulated per draw at the `log_linux_m2v_timing` site; `take`n every tranche
-/// in `device_drain`, which emits the breakdown only on the >25 ms outlier line.
+/// Counters for the two content memos whose only observable effect is a
+/// skipped re-read: the guest-run signature memo (`run_memo_*`) and the
+/// zero-copy flush signature memo (`zc_flush_*`).
+///
+/// These name product behavior, not cost: a memo that stops hitting silently
+/// doubles the work per bind, and `stale` is the memo serving bytes the guest
+/// has since rewritten. The tests for both paths assert on these.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TrancheStats {
-    pub draws: u64,
-    pub draw_total_us: u64,
-    pub load_us: u64,
-    pub m2v_us: u64,
-    pub setup_us: u64,
-    pub setup_bufs_us: u64,
-    pub setup_tex_us: u64,
-    pub setup_seed_us: u64,
-    pub setup_asm_us: u64,
-    pub engine_us: u64,
-    /// Engine per-draw cost split (subset of `engine_us`), so the dominant
-    /// per-draw engine cost is attributable off-main-core without the per-draw
-    /// `linux_m2v_timing` line (which needs `REIMS_VGPU_DRAW_LOG` and inflates timing).
-    /// `engine_resource_us` = the whole resource-prep phase (samplers, staging /
-    /// target resources, descriptor set) — measured ~65 µs/draw, the dominant
-    /// engine cost; `engine_descriptor_us` = the descriptor subset
-    /// (`vkAllocateDescriptorSets` + `vkUpdateDescriptorSets` + free) — measured
-    /// ~0.1 µs/draw, NOT a lever; `engine_record_us` = command-buffer recording
-    /// (barriers + staging copies + the draw); `engine_submit_us` = queue submit.
-    pub engine_resource_us: u64,
-    pub engine_descriptor_us: u64,
-    pub engine_record_us: u64,
-    pub engine_submit_us: u64,
-    /// Resource-prep decomposition (subset of `engine_resource_us`), to locate
-    /// the dominant sub-phase of the ~65 µs/draw resource cost off-main-core.
-    /// `engine_target_us` = render-target image acquire/manage; `engine_sampled_us`
-    /// = sampled-texture load/import; the five `engine_*_prep_us` fields are the
-    /// per-binding-class staging-prep loops. The remainder (`engine_resource_us`
-    /// minus all of these, `engine_descriptor_us`, and readback prep) is the
-    /// resource-phase unattributed residual.
-    ///
-    /// The five prep fields used to reach this struct pre-summed as one
-    /// `engine_bufprep_us`. That sum was 32% of over-25 ms tranche wall clock and
-    /// named no lever: the parts were already measured per draw, and only the
-    /// tranche line threw them away.
-    pub engine_target_us: u64,
-    pub engine_sampled_us: u64,
-    pub engine_sampler_prep_us: u64,
-    pub engine_vertex_prep_us: u64,
-    pub engine_index_prep_us: u64,
-    pub engine_storage_prep_us: u64,
-    pub engine_seed_prep_us: u64,
-    /// GPU-object churn proxy (scheduling-independent, unlike the `*_us` fields):
-    /// `engine_creates` = `vkCreateImage`/framebuffer/view creates this tranche,
-    /// `engine_allocs` = `vkAllocateMemory` calls. On a steady workload these
-    /// stay near zero (targets/samplers are reused). When they track `draws`,
-    /// GPU-backed resources are being recreated per draw — the render-target
-    /// recreate-per-generation path (`registry_ensure`) that makes Safari video
-    /// playback crawl (a full image alloc/free every frame). This is the always-on
-    /// proxy for that bug class; it must not flood (one line per tranche).
-    pub engine_creates: u64,
-    pub engine_allocs: u64,
-    /// Resident render-target images reused from the recycle pool this tranche
-    /// (`target_free` hits). The counterpart to `engine_allocs` for the
-    /// video-realloc fix: when a per-frame-generation target recurs, its image
-    /// is popped from the recycle pool instead of reallocated, so under video
-    /// `target_reuse` tracks `draws` while `engine_allocs` collapses to ~0. A
-    /// high `engine_allocs` with a low `target_reuse` means the recycle pool is
-    /// missing (geometry/format churn or the per-key cap).
-    pub target_reuse: u64,
-    /// Wall-clock spent inside `vkAllocateMemory` this tranche (the timed subset
-    /// of `engine_allocs`; a slice of `engine_resource_us`). Always-on so a
-    /// layout-reflow burst (a fullscreen transition recreates the whole layer
-    /// tree at new geometry: `engine_creates`≈150 `engine_allocs`≈85
-    /// `target_reuse`≈0, which no geometry-keyed recycle pool can absorb) shows
-    /// whether the hitch is *allocation*-bound — i.e. whether a suballocating
-    /// memory pool (one big `vkAllocateMemory`, many image binds) would help —
-    /// without needing the `REIMS_VGPU_DRAW_LOG` per-draw `linux_m2v_timing` line. Like
-    /// every `*_us` field it is SCHED_IDLE-contaminated under the agent harness;
-    /// read it as a fraction of `drain_tranche_us`, and trust the count
-    /// (`engine_allocs`) for the scheduling-independent burst size.
-    pub engine_memory_alloc_us: u64,
-    pub wait_us: u64,
-    pub retire_wait_us: u64,
-    pub readback_us: u64,
-    pub readbacks: u64,
-    pub reuploads: u64,
-    pub reupload_bytes: u64,
-    /// Zero-copy vertex/storage buffer binds (engine GPU-gathered the span
-    /// from imported guest RAM instead of a CPU staging read).
-    pub buf_zc: u64,
-    /// Guest-run buffer binds CPU-snapshotted at record time (deferred-submit
-    /// draw: the batched CB must not read volatile guest RAM at flush).
-    pub buf_snap: u64,
-    /// Compute dispatches (not render draws): `execute_dispatch_linux` total_us.
-    pub compute_n: u64,
-    pub compute_us: u64,
-    /// Store/flush GPU readback+guest-writeback: import-present present captures
-    /// (`import_present` map+dma+post) and deferred render/GVA flushes
-    /// (`storage_flush::render_deferred_flush`). Neither is a render draw.
-    pub store_n: u64,
-    pub store_us: u64,
-    /// Present/scanout capture lock hold: `capture_present_frame` (8 MiB alloc +
-    /// host-cache/guest-page paint + the fused occupancy scan). Runs on the
-    /// present drain, not on a render draw — previously invisible inside the
-    /// opaque `other_us` residual, so a capture-bound present hitch could not be
-    /// distinguished from FIFO-parse / mapper-walk time.
-    pub capture_n: u64,
-    pub capture_us: u64,
-    /// Draw-batching ceiling census (measure-only, never gates behavior):
-    /// `batch_same_target` = this draw's (identity, geometry, bgra) equals the
-    /// previous draw's in the same packet; `batch_joinable` = additionally the
-    /// load folds to LoadFromTarget with no seed, no readback, no MRT
-    /// secondaries, and the draw does not sample its own target — i.e. it
-    /// could have been recorded into the previous draw's render pass.
-    pub batch_same_target: u64,
-    pub batch_joinable: u64,
-    /// ACTUAL deferred-submit batching outcomes (engine-reported, vs the
-    /// census prediction above): `batch_opened` = draws that left their CB
-    /// recording for successors; `batch_joined` = draws appended to an open
-    /// CB, skipping slot claim + submit entirely.
-    pub batch_opened: u64,
-    pub batch_joined: u64,
-    /// Guest-run memo effectiveness (draw-time zero-copy binds): a hit skips
-    /// the per-bind task page-table walk entirely.
+pub struct MemoCounters {
     pub run_memo_hit: u64,
     pub run_memo_miss: u64,
-    /// Sampled memo-hit verifies (1-in-64) that found the fresh walk
-    /// disagreeing with the memoized runs — each one is a draw that would
-    /// have read stale guest pages. Zero on a healthy boot; nonzero means
-    /// the invalidation contract has a hole (fail-logged as `rmemo_stale`).
     pub run_memo_stale: u64,
-    /// Draw-time buffer-bind CPU cost split (subset of `setup_bufs_us`), so the
-    /// dominant per-bind cost is attributable off-main-core without a per-draw
-    /// log. Accumulated in **nanoseconds** (each bind is sub-microsecond; a
-    /// per-call `as_micros()` truncates every sample to 0), emitted as µs:
-    /// `buf_resolve` = object-list lookup + descriptor read/decode + backing
-    /// resolve (FFI PT walks); `buf_read` = the byte materialization (host
-    /// per-page FFI read; host-pointer memcpy on a future fast path).
-    pub buf_resolve_ns: u64,
-    pub buf_read_ns: u64,
-    /// Wall time of the two stream buffer-load loops (vertex + fragment
-    /// `load_buffer_content`) within `setup_bufs`, in nanoseconds. The
-    /// remainder `setup_bufs_us - bufs_load` is the stage-in attribute build +
-    /// fragment SPIR-V reloc + storage-binding classification.
-    pub bufs_load_ns: u64,
-    /// Draw-time zero-copy-attempt cost split (nanoseconds), for binds that ride
-    /// `try_buffer_zero_copy_resolved`. `zc_flush` = the intersecting-deferred
-    /// store flush (per-bind page walk when any deferred surface is live);
-    /// `zc_import` = the `ensure_host_imports` engine-lock + window resolve loop.
-    /// `zc_fail_import` counts ZC attempts that fell back to the CPU read
-    /// because a run was not coverable by a host import window.
-    pub zc_flush_ns: u64,
-    pub zc_import_ns: u64,
-    pub zc_fail_import: u64,
-    /// Deferred-window flushes that actually fired (a buffer bind aliased a
-    /// live deferred-writeback window). Near-zero under pure compositing means
-    /// the per-bind flush walk is detection overhead, not real coherence work.
+    /// Deferred windows a flush-signature check found already landed.
     pub zc_flush_hits: u64,
-    /// Per-bind flush walks skipped via the no-intersection memo (the win). A
-    /// skip replaces a full per-page task-PT walk with a signature compare +
-    /// set lookup.
+    /// Binds the signature memo answered without walking the window map.
     pub zc_flush_skip: u64,
-    /// Sampled full walks (1-in-64 of memo skips) that found a real
-    /// intersection the memo had marked non-intersecting — a missed deferred
-    /// signature change. MUST stay 0 on a healthy boot; each one is
-    /// fail-logged `zc_flush_stale` and self-heals (memo entry dropped, window
-    /// flushed).
+    /// Memo answers invalidated by an intervening arm/disarm.
     pub zc_flush_stale: u64,
-    /// zc_flush sub-path census (subset accounting for `zc_flush_ns`), so the
-    /// dominant cost inside the per-bind flush is attributable off-main-core.
-    /// `zc_flush_walk` = full per-page task-PT walks actually run (the expensive
-    /// path — each per-page FFI translate dominates when the memo key
-    /// `(task,gva,span)` churns and never hits); `zc_flush_walk_ns` = wall time
-    /// inside those walks; `zc_flush_recheck` = cheap `deferred_pages_intersect`
-    /// rechecks (a memo entry whose deferred signature changed, re-validated
-    /// against cached pages with NO PT walk). A high `zc_flush_walk` relative to
-    /// `zc_flush_skip` means the memo is churning (widen the key), not that the
-    /// signature compare is slow.
     pub zc_flush_walk: u64,
-    pub zc_flush_walk_ns: u64,
     pub zc_flush_recheck: u64,
-    /// Wall time (ns) inside `deferred_flush_signature()` — the per-bind O(windows)
-    /// hash over every live deferred window, computed once per flush call
-    /// (~8×/draw). Prime suspect for the non-walk zc_flush residual when the memo
-    /// churns. `zc_flush_isect_ns` = wall time inside the cheap
-    /// `deferred_pages_intersect` rechecks (O(cached_pages × windows), no PT walk).
-    pub zc_flush_sig_ns: u64,
-    pub zc_flush_isect_ns: u64,
-    /// Number of `flush_intersecting_task_gva` invocations made from the
-    /// zero-copy-resolved buffer attempt (`try_buffer_zero_copy_resolved`), i.e.
-    /// the exact population whose wall time is `zc_flush_ns`. Divides
-    /// `zc_flush_ns` to a true per-call cost so the residual can be attributed
-    /// (the sub-timers below span all flush call sites, a different population).
-    pub zc_flush_calls: u64,
-    /// Zero-copy flush calls whose wall time exceeded 100 µs — a preemption /
-    /// off-CPU spike, not steady per-call work. If a few of these dominate
-    /// `zc_flush_ns` the residual is scheduler noise (irreducible); if
-    /// near-zero while the mean stays high the residual is a uniform per-call
-    /// memory stall (reducible by cutting flush-call count / working set).
-    pub zc_flush_slow: u64,
-    /// Largest single zero-copy flush call wall time (ns) seen in the tranche —
-    /// separates a bimodal spike distribution from a uniform-slow one.
-    pub zc_flush_max_ns: u64,
-    /// Wall time (ns) inside the exact-window fast path `flush_gva_exact` (a
-    /// buffer bind whose base GVA is itself a live deferred render window → a
-    /// synchronous engine `read_target` GPU readback). Isolates that stall from
-    /// the cheap detection sub-paths so a rare-but-expensive readback cannot hide
-    /// inside `zc_flush_ns`.
-    pub zc_flush_exact_ns: u64,
 }
 
 /// One host-VA run of a memoized guest span (model mirror of the engine's
@@ -1422,260 +1238,6 @@ pub struct GuestRunMemoEntry {
     pub gva: u64,
     pub length: u64,
     pub runs: Arc<Vec<GuestRunSpan>>,
-}
-
-/// One ExecIndirect2 packet's summary counters, folded into [`ExecAggStats`].
-/// Mirror of the runtime `ExecResult` fields the old per-packet
-/// `exec_indirect2` line carried (model stays independent of runtime types).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ExecPacketSample {
-    pub streams: u64,
-    pub saw_draw: bool,
-    pub clears: u64,
-    pub draws_ok: u64,
-    pub draws_fail: u64,
-    pub rt_resolves: u64,
-    pub guest_stores: u64,
-    pub icb_ok: u64,
-    pub icb_fail: u64,
-    pub compute_ctrl_fail: u64,
-    pub compute_icb_fail: u64,
-    pub load_us: u64,
-    pub render_us: u64,
-    pub blit_us: u64,
-    pub compute_us: u64,
-    pub event_us: u64,
-    pub info_us: u64,
-    pub finish_us: u64,
-    pub total_us: u64,
-}
-
-/// Aggregated ExecIndirect2 packet telemetry (diagnostic only — never gates
-/// behavior). The per-packet `exec_indirect2` line ran ~1k/s under Safari
-/// scroll (the dominant always-on flood after the per-draw telemetry was
-/// verbose-gated); healthy packets fold in here and one `exec_indirect2_agg`
-/// summary per ~1 s window keeps rate/shares/tail visible. Packets carrying
-/// failure counters still log per-packet on the always-on sink at the drain
-/// site, so failure visibility is unchanged.
-#[derive(Debug, Default)]
-pub struct ExecAggStats {
-    pub packets: u64,
-    pub saw_draw: u64,
-    pub streams: u64,
-    pub clears: u64,
-    pub draws_ok: u64,
-    pub draws_fail: u64,
-    pub rt_resolves: u64,
-    pub guest_stores: u64,
-    pub icb_ok: u64,
-    pub icb_fail: u64,
-    pub compute_ctrl_fail: u64,
-    pub compute_icb_fail: u64,
-    pub load_us: u64,
-    pub render_us: u64,
-    pub blit_us: u64,
-    pub compute_us: u64,
-    pub event_us: u64,
-    pub info_us: u64,
-    pub finish_us: u64,
-    pub finish_us_max: u64,
-    pub total_us: u64,
-    pub total_us_max: u64,
-    /// finish_us histogram: <1 ms, 1–4 ms, 4–16 ms, 16–64 ms, ≥64 ms.
-    pub finish_hist: [u64; 5],
-    window_start: Option<std::time::Instant>,
-}
-
-/// Aggregation window for the `exec_indirect2_agg` summary line.
-const EXEC_AGG_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
-
-impl ExecAggStats {
-    pub fn note(&mut self, s: &ExecPacketSample) {
-        if self.window_start.is_none() {
-            self.window_start = Some(std::time::Instant::now());
-        }
-        self.packets = self.packets.saturating_add(1);
-        self.saw_draw = self.saw_draw.saturating_add(s.saw_draw as u64);
-        self.streams = self.streams.saturating_add(s.streams);
-        self.clears = self.clears.saturating_add(s.clears);
-        self.draws_ok = self.draws_ok.saturating_add(s.draws_ok);
-        self.draws_fail = self.draws_fail.saturating_add(s.draws_fail);
-        self.rt_resolves = self.rt_resolves.saturating_add(s.rt_resolves);
-        self.guest_stores = self.guest_stores.saturating_add(s.guest_stores);
-        self.icb_ok = self.icb_ok.saturating_add(s.icb_ok);
-        self.icb_fail = self.icb_fail.saturating_add(s.icb_fail);
-        self.compute_ctrl_fail = self.compute_ctrl_fail.saturating_add(s.compute_ctrl_fail);
-        self.compute_icb_fail = self.compute_icb_fail.saturating_add(s.compute_icb_fail);
-        self.load_us = self.load_us.saturating_add(s.load_us);
-        self.render_us = self.render_us.saturating_add(s.render_us);
-        self.blit_us = self.blit_us.saturating_add(s.blit_us);
-        self.compute_us = self.compute_us.saturating_add(s.compute_us);
-        self.event_us = self.event_us.saturating_add(s.event_us);
-        self.info_us = self.info_us.saturating_add(s.info_us);
-        self.finish_us = self.finish_us.saturating_add(s.finish_us);
-        self.finish_us_max = self.finish_us_max.max(s.finish_us);
-        self.total_us = self.total_us.saturating_add(s.total_us);
-        self.total_us_max = self.total_us_max.max(s.total_us);
-        let bucket = match s.finish_us {
-            0..=999 => 0,
-            1_000..=3_999 => 1,
-            4_000..=15_999 => 2,
-            16_000..=63_999 => 3,
-            _ => 4,
-        };
-        self.finish_hist[bucket] = self.finish_hist[bucket].saturating_add(1);
-    }
-
-    /// When the window has run ≥1 s, return the formatted summary line and
-    /// reset. Called after each note() — cadence is packet-driven, so an idle
-    /// device emits nothing.
-    pub fn flush_if_due(&mut self) -> Option<String> {
-        let started = self.window_start?;
-        let elapsed = started.elapsed();
-        if elapsed < EXEC_AGG_WINDOW {
-            return None;
-        }
-        let line = format!(
-            "exec_indirect2_agg n={} window_ms={} saw_draw={} streams={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} load_us={} render_us={} blit_us={} compute_us={} event_us={} info_us={} finish_us={} finish_us_max={} total_us={} total_us_max={} finish_ms_hist={}/{}/{}/{}/{}",
-            self.packets,
-            elapsed.as_millis(),
-            self.saw_draw,
-            self.streams,
-            self.clears,
-            self.draws_ok,
-            self.draws_fail,
-            self.rt_resolves,
-            self.guest_stores,
-            self.icb_ok,
-            self.icb_fail,
-            self.compute_ctrl_fail,
-            self.compute_icb_fail,
-            self.load_us,
-            self.render_us,
-            self.blit_us,
-            self.compute_us,
-            self.event_us,
-            self.info_us,
-            self.finish_us,
-            self.finish_us_max,
-            self.total_us,
-            self.total_us_max,
-            self.finish_hist[0],
-            self.finish_hist[1],
-            self.finish_hist[2],
-            self.finish_hist[3],
-            self.finish_hist[4],
-        );
-        *self = Self::default();
-        Some(line)
-    }
-}
-
-impl TrancheStats {
-    /// Fold a compute dispatch's lock hold in (not a render draw).
-    pub fn note_compute(&mut self, us: u64) {
-        self.compute_n = self.compute_n.saturating_add(1);
-        self.compute_us = self.compute_us.saturating_add(us);
-    }
-
-    /// Fold a store/flush readback+writeback's lock hold in (not a render draw).
-    pub fn note_store(&mut self, us: u64) {
-        self.store_n = self.store_n.saturating_add(1);
-        self.store_us = self.store_us.saturating_add(us);
-    }
-
-    /// Fold a present/scanout capture's lock hold in (not a render draw).
-    pub fn note_capture(&mut self, us: u64) {
-        self.capture_n = self.capture_n.saturating_add(1);
-        self.capture_us = self.capture_us.saturating_add(us);
-    }
-
-    /// Fold one draw's timing delta in (saturating; all fields are cumulative).
-    pub fn add(&mut self, d: TrancheStats) {
-        self.draws = self.draws.saturating_add(d.draws);
-        self.draw_total_us = self.draw_total_us.saturating_add(d.draw_total_us);
-        self.load_us = self.load_us.saturating_add(d.load_us);
-        self.m2v_us = self.m2v_us.saturating_add(d.m2v_us);
-        self.setup_us = self.setup_us.saturating_add(d.setup_us);
-        self.setup_bufs_us = self.setup_bufs_us.saturating_add(d.setup_bufs_us);
-        self.setup_tex_us = self.setup_tex_us.saturating_add(d.setup_tex_us);
-        self.setup_seed_us = self.setup_seed_us.saturating_add(d.setup_seed_us);
-        self.setup_asm_us = self.setup_asm_us.saturating_add(d.setup_asm_us);
-        self.engine_us = self.engine_us.saturating_add(d.engine_us);
-        self.engine_resource_us = self.engine_resource_us.saturating_add(d.engine_resource_us);
-        self.engine_descriptor_us = self
-            .engine_descriptor_us
-            .saturating_add(d.engine_descriptor_us);
-        self.engine_record_us = self.engine_record_us.saturating_add(d.engine_record_us);
-        self.engine_submit_us = self.engine_submit_us.saturating_add(d.engine_submit_us);
-        self.engine_target_us = self.engine_target_us.saturating_add(d.engine_target_us);
-        self.engine_sampled_us = self.engine_sampled_us.saturating_add(d.engine_sampled_us);
-        self.engine_sampler_prep_us = self
-            .engine_sampler_prep_us
-            .saturating_add(d.engine_sampler_prep_us);
-        self.engine_vertex_prep_us = self
-            .engine_vertex_prep_us
-            .saturating_add(d.engine_vertex_prep_us);
-        self.engine_index_prep_us = self
-            .engine_index_prep_us
-            .saturating_add(d.engine_index_prep_us);
-        self.engine_storage_prep_us = self
-            .engine_storage_prep_us
-            .saturating_add(d.engine_storage_prep_us);
-        self.engine_seed_prep_us = self
-            .engine_seed_prep_us
-            .saturating_add(d.engine_seed_prep_us);
-        self.engine_creates = self.engine_creates.saturating_add(d.engine_creates);
-        self.engine_allocs = self.engine_allocs.saturating_add(d.engine_allocs);
-        self.target_reuse = self.target_reuse.saturating_add(d.target_reuse);
-        self.engine_memory_alloc_us = self
-            .engine_memory_alloc_us
-            .saturating_add(d.engine_memory_alloc_us);
-        self.wait_us = self.wait_us.saturating_add(d.wait_us);
-        self.retire_wait_us = self.retire_wait_us.saturating_add(d.retire_wait_us);
-        self.readback_us = self.readback_us.saturating_add(d.readback_us);
-        self.readbacks = self.readbacks.saturating_add(d.readbacks);
-        self.reuploads = self.reuploads.saturating_add(d.reuploads);
-        self.reupload_bytes = self.reupload_bytes.saturating_add(d.reupload_bytes);
-        self.buf_zc = self.buf_zc.saturating_add(d.buf_zc);
-        self.buf_snap = self.buf_snap.saturating_add(d.buf_snap);
-        self.compute_n = self.compute_n.saturating_add(d.compute_n);
-        self.compute_us = self.compute_us.saturating_add(d.compute_us);
-        self.store_n = self.store_n.saturating_add(d.store_n);
-        self.store_us = self.store_us.saturating_add(d.store_us);
-        self.capture_n = self.capture_n.saturating_add(d.capture_n);
-        self.capture_us = self.capture_us.saturating_add(d.capture_us);
-        self.batch_same_target = self.batch_same_target.saturating_add(d.batch_same_target);
-        self.batch_joinable = self.batch_joinable.saturating_add(d.batch_joinable);
-        self.batch_opened = self.batch_opened.saturating_add(d.batch_opened);
-        self.batch_joined = self.batch_joined.saturating_add(d.batch_joined);
-        self.run_memo_hit = self.run_memo_hit.saturating_add(d.run_memo_hit);
-        self.run_memo_miss = self.run_memo_miss.saturating_add(d.run_memo_miss);
-        self.run_memo_stale = self.run_memo_stale.saturating_add(d.run_memo_stale);
-        self.buf_resolve_ns = self.buf_resolve_ns.saturating_add(d.buf_resolve_ns);
-        self.buf_read_ns = self.buf_read_ns.saturating_add(d.buf_read_ns);
-        self.bufs_load_ns = self.bufs_load_ns.saturating_add(d.bufs_load_ns);
-        self.zc_flush_ns = self.zc_flush_ns.saturating_add(d.zc_flush_ns);
-        self.zc_import_ns = self.zc_import_ns.saturating_add(d.zc_import_ns);
-        self.zc_fail_import = self.zc_fail_import.saturating_add(d.zc_fail_import);
-        self.zc_flush_hits = self.zc_flush_hits.saturating_add(d.zc_flush_hits);
-        self.zc_flush_skip = self.zc_flush_skip.saturating_add(d.zc_flush_skip);
-        self.zc_flush_stale = self.zc_flush_stale.saturating_add(d.zc_flush_stale);
-        self.zc_flush_walk = self.zc_flush_walk.saturating_add(d.zc_flush_walk);
-        self.zc_flush_walk_ns = self.zc_flush_walk_ns.saturating_add(d.zc_flush_walk_ns);
-        self.zc_flush_recheck = self.zc_flush_recheck.saturating_add(d.zc_flush_recheck);
-        self.zc_flush_sig_ns = self.zc_flush_sig_ns.saturating_add(d.zc_flush_sig_ns);
-        self.zc_flush_isect_ns = self.zc_flush_isect_ns.saturating_add(d.zc_flush_isect_ns);
-        self.zc_flush_calls = self.zc_flush_calls.saturating_add(d.zc_flush_calls);
-        self.zc_flush_slow = self.zc_flush_slow.saturating_add(d.zc_flush_slow);
-        self.zc_flush_max_ns = self.zc_flush_max_ns.max(d.zc_flush_max_ns);
-        self.zc_flush_exact_ns = self.zc_flush_exact_ns.saturating_add(d.zc_flush_exact_ns);
-    }
-
-    /// Reset to empty, returning the accumulated tranche total.
-    pub fn take(&mut self) -> TrancheStats {
-        std::mem::take(self)
-    }
 }
 
 /// A map of deferred writeback windows whose page sets feed the union index
@@ -1930,14 +1492,11 @@ pub struct DeviceState {
     /// ClearOnly dual-mid peer-select uses to find the latest-finished
     /// compositor member.
     pub store_seq: u64,
-    /// Per-tranche draw-timing breakdown (diagnostic). See [`TrancheStats`].
-    pub tranche: TrancheStats,
-    /// Aggregated ExecIndirect2 packet telemetry (diagnostic). See [`ExecAggStats`].
-    pub exec_agg: ExecAggStats,
+    /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
+    pub tranche: MemoCounters,
     /// Batch-ceiling census key of the previous engine draw in the current
     /// packet: (hash of the engine target identity, width, height, bgra).
-    /// Measure-only — feeds TrancheStats batch_same_target/batch_joinable;
-    /// reset at every ExecIndirect2 packet start. The identity is stored as a
+    /// Reset at every ExecIndirect2 packet start. The identity is stored as a
     /// std-hash so the model stays independent of backend engine types.
     pub last_draw_batch_key: Option<(u64, u32, u32, bool)>,
     /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
@@ -2071,8 +1630,7 @@ impl DeviceState {
             presented_needs_guest_seed: std::collections::BTreeSet::new(),
             store_seq: 0,
             gva_host_views: Vec::new(),
-            tranche: TrancheStats::default(),
-            exec_agg: ExecAggStats::default(),
+            tranche: MemoCounters::default(),
             last_draw_batch_key: None,
             guest_run_memo: std::collections::VecDeque::new(),
             view_verify_ctr: 0,

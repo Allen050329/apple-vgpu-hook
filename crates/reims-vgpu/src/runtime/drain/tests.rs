@@ -85,7 +85,7 @@ fn assert_coalesced_paint_action(host: &crate::runtime::host::FakeHost, ctx: &st
 }
 
 #[test]
-fn exec_summary_names_each_synchronous_timing_bucket() {
+fn exec_summary_names_the_packet_counters_and_lock_hold() {
     let result = crate::runtime::exec::ExecResult {
         task_id: 3,
         streams_loaded: 1,
@@ -94,28 +94,14 @@ fn exec_summary_names_each_synchronous_timing_bucket() {
         sampler_unbinds: 4,
         render_attachment_resolves: 1,
         render_guest_stores: 1,
-        load_us: 11,
-        render_us: 12,
-        blit_us: 13,
-        compute_us: 14,
-        event_us: 15,
-        info_us: 16,
-        finish_us: 17,
         total_us: 98,
         ..Default::default()
     };
     let line = exec_summary(1, &result, 52);
     for field in [
-        "load_us=11",
-        "render_us=12",
-        "blit_us=13",
-        "compute_us=14",
         "rt_resolves=1",
         "guest_stores=1",
         "render_unbinds=2/3/4",
-        "event_us=15",
-        "info_us=16",
-        "finish_us=17",
         "total_us=98",
     ] {
         assert!(line.contains(field), "missing {field}: {line}");

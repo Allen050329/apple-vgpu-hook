@@ -130,16 +130,9 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         return;
     }
     // Fast exact-window path: a sample of the deferred GVA surface itself
-    // names the same base GVA — no page walk needed to detect it. The flush
-    // itself is a synchronous engine read_target (GPU readback) — time it so a
-    // rare-but-expensive stall cannot hide inside the caller's zc_flush_ns.
+    // names the same base GVA — no page walk needed to detect it.
     if state.gva_deferred_flush.contains_key(&gva) {
-        let t_exact = std::time::Instant::now();
         flush_gva_exact(state, host, gva, true, "gva_alias");
-        state.tranche.zc_flush_exact_ns = state
-            .tranche
-            .zc_flush_exact_ns
-            .saturating_add(t_exact.elapsed().as_nanos() as u64);
     }
     if state.deferred_alias_pages.is_empty()
         && state.linear_deferred_flush.is_empty()
@@ -162,12 +155,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     // (`zc_flush_stale`, must stay 0) — the memo's pages are only as good as the
     // guest telling us it remapped, which is the one invariant here that no local
     // audit can close.
-    let t_sig = std::time::Instant::now();
     let sig = state.deferred_flush_signature();
-    state.tranche.zc_flush_sig_ns = state
-        .tranche
-        .zc_flush_sig_ns
-        .saturating_add(t_sig.elapsed().as_nanos() as u64);
     let memo_key = (task_id, gva, span);
     let mut sampled_verify = false;
     // On the sampled-verify path, what the cheap page recheck concluded — the
@@ -190,12 +178,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             // windows without a PT walk.
             let pages = pages.clone();
             state.tranche.zc_flush_recheck = state.tranche.zc_flush_recheck.saturating_add(1);
-            let t_isect = std::time::Instant::now();
             let isect = state.deferred_pages_intersect(&pages);
-            state.tranche.zc_flush_isect_ns = state
-                .tranche
-                .zc_flush_isect_ns
-                .saturating_add(t_isect.elapsed().as_nanos() as u64);
             if !isect {
                 state.flush_nohit_memo.insert(memo_key, (sig, pages));
                 state.tranche.zc_flush_skip = state.tranche.zc_flush_skip.saturating_add(1);
@@ -219,7 +202,6 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     // true first overlapping page rather than the next sample point after it.
     let mut first_hit_ordinal: Option<u64> = None;
     state.tranche.zc_flush_walk = state.tranche.zc_flush_walk.saturating_add(1);
-    let t_walk = std::time::Instant::now();
     {
         let index = &state.deferred_alias_pages;
         let linear_index = &state.linear_deferred_flush;
@@ -261,10 +243,6 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             },
         );
     }
-    state.tranche.zc_flush_walk_ns = state
-        .tranche
-        .zc_flush_walk_ns
-        .saturating_add(t_walk.elapsed().as_nanos() as u64);
     let hit_ct = (hits.len() + linear_hits.len() + gva_hits.len()) as u64;
     if hit_ct == 0 {
         // Non-intersecting. Cache the resolved pages for the cheap re-check on a

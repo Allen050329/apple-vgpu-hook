@@ -1649,7 +1649,7 @@ enum ChildPacketDisposition {
 
 fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen: usize) -> String {
     format!(
-        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} load_us={} render_us={} blit_us={} compute_us={} event_us={} info_us={} finish_us={} total_us={} plen={plen}",
+        "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} total_us={} plen={plen}",
         result.task_id,
         result.streams_loaded,
         result.saw_draw as u8,
@@ -1665,13 +1665,6 @@ fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen
         result.buffer_unbinds,
         result.texture_unbinds,
         result.sampler_unbinds,
-        result.load_us,
-        result.render_us,
-        result.blit_us,
-        result.compute_us,
-        result.event_us,
-        result.info_us,
-        result.finish_us,
         result.total_us,
     )
 }
@@ -1982,9 +1975,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 }
                 // Failure-carrying packets keep the full per-packet line on the
                 // always-on sink (context for the per-site reason=<slug> lines).
-                // Healthy packets fold into the ~1/s exec_indirect2_agg summary
-                // — the per-packet form ran ~1k lines/s under Safari scroll,
-                // the dominant flood after per-draw telemetry was verbose-gated.
+                // Healthy packets are expected control flow and stay quiet
+                // unless the draw log is on — the per-packet form ran ~1k
+                // lines/s under Safari scroll.
                 let packet_failed = result.metal_draws_fail > 0
                     || result.render_icb_fail > 0
                     || result.compute_control_fail > 0
@@ -1994,36 +1987,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 } else if crate::observe::draw_log_enabled() {
                     crate::observe::line(exec_summary(channel_id, &result, packet.payload.len()));
                 }
-                state.exec_agg.note(&crate::model::ExecPacketSample {
-                    streams: result.streams_loaded as u64,
-                    saw_draw: result.saw_draw,
-                    clears: result.clears_applied as u64,
-                    draws_ok: result.metal_draws_ok as u64,
-                    draws_fail: result.metal_draws_fail as u64,
-                    rt_resolves: result.render_attachment_resolves as u64,
-                    guest_stores: result.render_guest_stores as u64,
-                    icb_ok: result.render_icb_ok as u64,
-                    icb_fail: result.render_icb_fail as u64,
-                    compute_ctrl_fail: result.compute_control_fail as u64,
-                    compute_icb_fail: result.compute_icb_fail as u64,
-                    load_us: result.load_us,
-                    render_us: result.render_us,
-                    blit_us: result.blit_us,
-                    compute_us: result.compute_us,
-                    event_us: result.event_us,
-                    info_us: result.info_us,
-                    finish_us: result.finish_us,
-                    total_us: result.total_us,
-                });
-                if let Some(line) = state.exec_agg.flush_if_due() {
-                    crate::observe::off(line);
-                }
                 if sync_exec_stalled(result.total_us) {
                     crate::observe::fail(format!(
-                        "TRANSPORT reason=sync_exec_lock_hold ch={channel_id} task={} total_us={} finish_us={} draws={} rt_resolves={} guest_stores={} threshold_us={SYNC_EXEC_STALL_US}",
+                        "TRANSPORT reason=sync_exec_lock_hold ch={channel_id} task={} total_us={} draws={} rt_resolves={} guest_stores={} threshold_us={SYNC_EXEC_STALL_US}",
                         result.task_id,
                         result.total_us,
-                        result.finish_us,
                         result.metal_draws_ok.saturating_add(result.metal_draws_fail),
                         result.render_attachment_resolves,
                         result.render_guest_stores

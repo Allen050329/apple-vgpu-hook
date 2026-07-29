@@ -182,15 +182,9 @@ pub struct ExecResult {
     pub event_ops_ok: u32,
     pub event_ops_pending: u32,
     pub event_ops_fail: u32,
-    /// Wall-time census for the synchronous packet body. Render records only
-    /// accumulate state; their backend work is charged to `finish_us`.
-    pub load_us: u64,
-    pub render_us: u64,
-    pub blit_us: u64,
-    pub compute_us: u64,
-    pub event_us: u64,
-    pub info_us: u64,
-    pub finish_us: u64,
+    /// Wall-clock for the whole synchronous packet body. A packet holding the
+    /// device lock past `SYNC_EXEC_STALL_US` starves the guest's read-to-clear
+    /// completion registers; the drain reports that as a typed TRANSPORT line.
     pub total_us: u64,
 }
 
@@ -254,7 +248,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let n_cb = (cmdbuf_count as usize).min(MAX_CMDBUFS);
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
-    let load_started = std::time::Instant::now();
     for i in 0..n_cb {
         let off = (cbufs_off + i as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64) as usize;
         if off + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize > payload.len() {
@@ -297,7 +290,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         out.streams_loaded += 1;
         streams.push(stream);
     }
-    out.load_us = elapsed_us(load_started);
 
     // Plan before execute: cold AIR translation is immutable CPU work and can
     // run without protocol ownership. Keep the packet unconsumed until every
@@ -319,9 +311,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     for stream in streams {
         let mut acc = StreamAccum::default();
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
-        let finish_started = std::time::Instant::now();
         finish_stream(state, host, task_id, &mut out, &acc);
-        out.finish_us = out.finish_us.saturating_add(elapsed_us(finish_started));
     }
     out.total_us = elapsed_us(exec_started);
     out
@@ -547,7 +537,6 @@ fn walk_stream<M: HostMemory + HostOps>(
         }
     };
     for seg in segs {
-        let segment_started = std::time::Instant::now();
         if let Some(e) =
             crate::observe::Emit::refusal("stream_segment", &stream::segment_disposition(seg.type_))
         {
@@ -603,15 +592,6 @@ fn walk_stream<M: HostMemory + HostOps>(
             }
             // Unreachable: `segment_disposition` already answered `Walk` for
             // exactly the five families above, and `continue`d on the rest.
-            _ => {}
-        }
-        let us = elapsed_us(segment_started);
-        match seg.type_ {
-            SEGMENT_TYPE_RENDER => out.render_us = out.render_us.saturating_add(us),
-            SEGMENT_TYPE_BLIT => out.blit_us = out.blit_us.saturating_add(us),
-            SEGMENT_TYPE_COMPUTE => out.compute_us = out.compute_us.saturating_add(us),
-            SEGMENT_TYPE_EVENT => out.event_us = out.event_us.saturating_add(us),
-            SEGMENT_TYPE_INFO => out.info_us = out.info_us.saturating_add(us),
             _ => {}
         }
     }

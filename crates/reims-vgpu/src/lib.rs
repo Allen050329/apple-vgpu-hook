@@ -1168,63 +1168,6 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     true
 }
 
-/// Wall-clock a drain tranche must exceed to earn the per-tranche detail line.
-const TRANCHE_OUTLIER_US: u64 = 25_000;
-
-/// Windowed census over EVERY drain tranche, emitted once per second of tranche
-/// wall-clock.
-///
-/// The `drain_tranche_us` detail line fires only above [`TRANCHE_OUTLIER_US`],
-/// which is right for reading one hitch and useless for reading a rate: it has
-/// no denominator, so "65 lines in 200 s, 40-91 % of each in
-/// `engine_memory_alloc_us`" cannot say whether allocation is most of the drain's
-/// life or a rounding error that happens to show up when a tranche is already
-/// long. Those are opposite conclusions and the detail line reads identically
-/// either way.
-///
-/// This counts all tranches, so `over25` against `tranches` is the outlier rate
-/// and `alloc_us` against `us` is allocation's share of the whole drain — the two
-/// quantities the threshold discarded.
-fn note_drain_tranche_window(tranche_us: u64, tr: &model::TrancheStats) {
-    use std::sync::atomic::AtomicU64;
-    static TRANCHES: AtomicU64 = AtomicU64::new(0);
-    static US: AtomicU64 = AtomicU64::new(0);
-    static OVER: AtomicU64 = AtomicU64::new(0);
-    static DRAWS: AtomicU64 = AtomicU64::new(0);
-    static ENGINE_US: AtomicU64 = AtomicU64::new(0);
-    static ALLOC_US: AtomicU64 = AtomicU64::new(0);
-    static ALLOCS: AtomicU64 = AtomicU64::new(0);
-    static CREATES: AtomicU64 = AtomicU64::new(0);
-    static MAX_US: AtomicU64 = AtomicU64::new(0);
-
-    let add = |c: &AtomicU64, v: u64| c.fetch_add(v, Ordering::Relaxed) + v;
-    add(&TRANCHES, 1);
-    add(&DRAWS, tr.draws);
-    add(&ENGINE_US, tr.engine_us);
-    add(&ALLOC_US, tr.engine_memory_alloc_us);
-    add(&ALLOCS, tr.engine_allocs);
-    add(&CREATES, tr.engine_creates);
-    if tranche_us > TRANCHE_OUTLIER_US {
-        add(&OVER, 1);
-    }
-    MAX_US.fetch_max(tranche_us, Ordering::Relaxed);
-    if add(&US, tranche_us) < 1_000_000 {
-        return;
-    }
-    observe::off(format!(
-        "drain_tranche_window tranches={} us={} max_us={} over25={} draws={} engine_us={} alloc_us={} allocs={} creates={}",
-        TRANCHES.swap(0, Ordering::Relaxed),
-        US.swap(0, Ordering::Relaxed),
-        MAX_US.swap(0, Ordering::Relaxed),
-        OVER.swap(0, Ordering::Relaxed),
-        DRAWS.swap(0, Ordering::Relaxed),
-        ENGINE_US.swap(0, Ordering::Relaxed),
-        ALLOC_US.swap(0, Ordering::Relaxed),
-        ALLOCS.swap(0, Ordering::Relaxed),
-        CREATES.swap(0, Ordering::Relaxed),
-    ));
-}
-
 /// Worker body: drain pending FIFOs using QEMU GPA callbacks; enqueue HostActions.
 pub fn device_drain(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
@@ -1255,98 +1198,12 @@ pub fn device_drain(id: u64) -> bool {
     {
         device.state.present.window_active = false;
     }
-    let tranche_started = std::time::Instant::now();
     device.drain(&mut host);
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
     #[cfg(feature = "backend-vulkan")]
     backend::vulkan::engine::flush_batched_draws();
-    // Lock-hold census: long tranches serialize every producer behind this
-    // worker (translation/GPU work under the device lock). Log only outliers.
-    let tranche_us = tranche_started.elapsed().as_micros() as u64;
-    // Always drain the per-draw accumulator so it never leaks into the next
-    // tranche; attribute the hold only on the >25 ms outlier line.
-    let tr = device.state.tranche.take();
-    note_drain_tranche_window(tranche_us, &tr);
-    if tranche_us > TRANCHE_OUTLIER_US {
-        // `other_us` = tranche wall minus every attributed class (draws, compute
-        // dispatches, store/flush readbacks) = the residual: FIFO parse, mapper
-        // page-table walks, present/scanout capture, iosfc — no per-op timing.
-        let attributed = tr
-            .draw_total_us
-            .saturating_add(tr.compute_us)
-            .saturating_add(tr.store_us)
-            .saturating_add(tr.capture_us);
-        let other_us = tranche_us.saturating_sub(attributed);
-        observe::off(format!(
-            "drain_tranche_us={tranche_us} draws={} draw_total_us={} load_us={} m2v_us={} setup_us={} setup_bufs_us={} setup_tex_us={} setup_seed_us={} setup_asm_us={} engine_us={} engine_resource_us={} engine_descriptor_us={} engine_record_us={} engine_submit_us={} engine_target_us={} engine_sampled_us={} engine_sampler_prep_us={} engine_vertex_prep_us={} engine_index_prep_us={} engine_storage_prep_us={} engine_seed_prep_us={} engine_creates={} engine_allocs={} target_reuse={} engine_memory_alloc_us={} wait_us={} retire_wait_us={} readback_us={} readbacks={} reuploads={} reupload_kb={} buf_zc={} buf_snap={} batch_st={} batch_join={} b_open={} b_joined={} rmemo_hit={} rmemo_miss={} rmemo_stale={} buf_resolve_us={} buf_read_us={} bufs_load_us={} zc_flush_us={} zc_import_us={} zc_fail_import={} zc_flush_hits={} zc_flush_skip={} zc_flush_stale={} zc_flush_walk={} zc_flush_walk_us={} zc_flush_recheck={} zc_flush_sig_us={} zc_flush_isect_us={} zc_flush_calls={} zc_flush_slow={} zc_flush_max_us={} zc_flush_exact_us={} compute_n={} compute_us={} store_n={} store_us={} capture_n={} capture_us={} other_us={other_us}",
-            tr.draws,
-            tr.draw_total_us,
-            tr.load_us,
-            tr.m2v_us,
-            tr.setup_us,
-            tr.setup_bufs_us,
-            tr.setup_tex_us,
-            tr.setup_seed_us,
-            tr.setup_asm_us,
-            tr.engine_us,
-            tr.engine_resource_us,
-            tr.engine_descriptor_us,
-            tr.engine_record_us,
-            tr.engine_submit_us,
-            tr.engine_target_us,
-            tr.engine_sampled_us,
-            tr.engine_sampler_prep_us,
-            tr.engine_vertex_prep_us,
-            tr.engine_index_prep_us,
-            tr.engine_storage_prep_us,
-            tr.engine_seed_prep_us,
-            tr.engine_creates,
-            tr.engine_allocs,
-            tr.target_reuse,
-            tr.engine_memory_alloc_us,
-            tr.wait_us,
-            tr.retire_wait_us,
-            tr.readback_us,
-            tr.readbacks,
-            tr.reuploads,
-            tr.reupload_bytes / 1024,
-            tr.buf_zc,
-            tr.buf_snap,
-            tr.batch_same_target,
-            tr.batch_joinable,
-            tr.batch_opened,
-            tr.batch_joined,
-            tr.run_memo_hit,
-            tr.run_memo_miss,
-            tr.run_memo_stale,
-            tr.buf_resolve_ns / 1000,
-            tr.buf_read_ns / 1000,
-            tr.bufs_load_ns / 1000,
-            tr.zc_flush_ns / 1000,
-            tr.zc_import_ns / 1000,
-            tr.zc_fail_import,
-            tr.zc_flush_hits,
-            tr.zc_flush_skip,
-            tr.zc_flush_stale,
-            tr.zc_flush_walk,
-            tr.zc_flush_walk_ns / 1000,
-            tr.zc_flush_recheck,
-            tr.zc_flush_sig_ns / 1000,
-            tr.zc_flush_isect_ns / 1000,
-            tr.zc_flush_calls,
-            tr.zc_flush_slow,
-            tr.zc_flush_max_ns / 1000,
-            tr.zc_flush_exact_ns / 1000,
-            tr.compute_n,
-            tr.compute_us,
-            tr.store_n,
-            tr.store_us,
-            tr.capture_n,
-            tr.capture_us,
-        ));
-    }
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.

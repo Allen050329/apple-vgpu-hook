@@ -1384,12 +1384,6 @@ pub struct HostMappedRun {
     pub linear_len: u64,
 }
 
-#[derive(Debug)]
-pub struct HostRunPresent {
-    /// Wall-clock of the GPU-direct scatter (plan -> submit -> fence wait).
-    pub scatter_us: u64,
-}
-
 /// Present a resident target into fragmented guest pages.
 ///
 /// Preferred path is a GPU-direct scatter ([`try_gpu_scatter`]): the planned
@@ -1421,7 +1415,7 @@ pub unsafe fn present_into_host_runs(
     buffer_row_bytes: u32,
     runs: &[HostMappedRun],
     runs_stable: bool,
-) -> Result<HostRunPresent, DrawError> {
+) -> Result<(), DrawError> {
     if runs.is_empty() {
         return Err(DrawError::Present(reason::HostPresentDecline::RunsEmpty));
     }
@@ -1545,7 +1539,6 @@ pub unsafe fn present_into_host_runs(
     // GPU-direct scatter: copy the resident straight into the guest's imported
     // pages. No frame bytes touch the CPU on this path — there is no readback
     // and no scatter memcpy.
-    let scatter_started = std::time::Instant::now();
     let spans: Vec<host_scatter::ScatterSpan> = copies
         .iter()
         .map(|c| host_scatter::ScatterSpan {
@@ -1564,10 +1557,7 @@ pub unsafe fn present_into_host_runs(
             reason::DrawReason::PresentRunsUnstable,
         ));
     }
-    try_gpu_scatter(identity, runs, &spans)?;
-    Ok(HostRunPresent {
-        scatter_us: scatter_started.elapsed().as_micros() as u64,
-    })
+    try_gpu_scatter(identity, runs, &spans)
 }
 
 /// Attempt the GPU-direct scatter, preserving the exact initialization,

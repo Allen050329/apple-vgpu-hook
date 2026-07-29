@@ -783,22 +783,18 @@ pub mod cap_flush {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static FLUSHES: AtomicU64 = AtomicU64::new(0);
-    static TOTAL_US: AtomicU64 = AtomicU64::new(0);
-    static MAX_US: AtomicU64 = AtomicU64::new(0);
     static PEAK_BATCH: AtomicU64 = AtomicU64::new(0);
     static WINDOW_START_MS: AtomicU64 = AtomicU64::new(0);
 
     const WINDOW_MS: u64 = 1000;
 
     /// Record one cap-driven force-flush *batch*: `n` windows landed in this
-    /// `try_defer_present_store` call, taking `us` wall-clock total.
-    pub fn note(n: u64, us: u64) {
+    /// `try_defer_present_store` call.
+    pub fn note(n: u64) {
         if n == 0 {
             return;
         }
         FLUSHES.fetch_add(n, Ordering::Relaxed);
-        TOTAL_US.fetch_add(us, Ordering::Relaxed);
-        MAX_US.fetch_max(us, Ordering::Relaxed);
         PEAK_BATCH.fetch_max(n, Ordering::Relaxed);
         if let Some(line) = maybe_line_at(observe::elapsed_ms() as u64) {
             observe::off(line);
@@ -822,29 +818,22 @@ pub mod cap_flush {
             return None;
         }
         let flushes = FLUSHES.swap(0, Ordering::Relaxed);
-        let total_us = TOTAL_US.swap(0, Ordering::Relaxed);
-        let max_us = MAX_US.swap(0, Ordering::Relaxed);
         let peak_batch = PEAK_BATCH.swap(0, Ordering::Relaxed);
         if flushes == 0 {
             return None;
         }
-        Some(format_line(dt, flushes, total_us, max_us, peak_batch))
+        Some(format_line(dt, flushes, peak_batch))
     }
 
-    fn format_line(dt: u64, flushes: u64, total_us: u64, max_us: u64, peak_batch: u64) -> String {
-        let us_avg = total_us / flushes.max(1);
-        // `us_*` are SCHED_IDLE-contaminated under the agent; `flushes`/`peak_batch`
-        // are count-trustworthy. A high, sustained `flushes` means the cap is set
-        // below the workload's live working set (raise it or the drain lags).
-        format!(
-            "cap_flush window_ms={dt} flushes={flushes} peak_batch={peak_batch} \
-             us_avg={us_avg} us_max={max_us}"
-        )
+    fn format_line(dt: u64, flushes: u64, peak_batch: u64) -> String {
+        // A high, sustained `flushes` means the cap is set below the workload's
+        // live working set (raise it, or the drain is lagging).
+        format!("cap_flush window_ms={dt} flushes={flushes} peak_batch={peak_batch}")
     }
 
     #[cfg(test)]
     pub(crate) fn reset() {
-        for a in [&FLUSHES, &TOTAL_US, &MAX_US, &PEAK_BATCH, &WINDOW_START_MS] {
+        for a in [&FLUSHES, &PEAK_BATCH, &WINDOW_START_MS] {
             a.store(0, Ordering::Relaxed);
         }
     }
@@ -854,13 +843,10 @@ pub mod cap_flush {
         use super::*;
 
         #[test]
-        fn format_reports_flushes_batch_and_avg() {
-            // 8 flushes, 5500 us total → avg 687; peak batch 5, max 4000.
-            let line = format_line(1000, 8, 5500, 4000, 5);
+        fn format_reports_flushes_and_peak_batch() {
+            let line = format_line(1000, 8, 5);
             assert!(line.contains("flushes=8"), "{line}");
             assert!(line.contains("peak_batch=5"), "{line}");
-            assert!(line.contains("us_avg=687"), "{line}");
-            assert!(line.contains("us_max=4000"), "{line}");
         }
 
         #[test]
@@ -873,7 +859,6 @@ pub mod cap_flush {
             // A window with no flushes stays silent.
             assert!(maybe_line_at(1 + WINDOW_MS).is_none());
             FLUSHES.fetch_add(8, Ordering::Relaxed);
-            TOTAL_US.fetch_add(5500, Ordering::Relaxed);
             PEAK_BATCH.fetch_max(5, Ordering::Relaxed);
             let line = maybe_line_at(1 + 2 * WINDOW_MS + 5).expect("line");
             assert!(line.contains("flushes=8"), "{line}");
