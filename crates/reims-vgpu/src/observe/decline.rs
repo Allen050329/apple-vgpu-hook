@@ -117,6 +117,7 @@ pub trait Refusal {
 /// otherwise leave open: they are pure and correctly log nothing, but *someone*
 /// must, and until this existed nothing checked that anyone did.
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 pub enum Emission {
     /// `(file, event)` pairs where a value of this type meets an `observe::`
     /// emitter — `event` being the first argument of the `Emit::decline` /
@@ -137,6 +138,7 @@ pub enum Emission {
 /// One registered decline type: what it is, where it lives, where it is logged,
 /// and every slug it can produce.
 #[derive(Clone, Copy, Debug)]
+#[cfg(test)]
 pub struct DeclineClass {
     /// The Rust type name, e.g. `"BlitOptionError"`.
     pub type_name: &'static str,
@@ -175,6 +177,7 @@ pub struct DeclineClass {
 /// Ordered by subsystem so a reader can see at a glance which subsystems can
 /// refuse and which are still silent — the latter being, as of this phase, the
 /// remaining work rather than a claim of completeness.
+#[cfg(test)]
 pub const REGISTRY: &[DeclineClass] = &[
     DeclineClass {
         type_name: "FailEvent",

@@ -45,7 +45,13 @@ pub mod emit;
 mod gate;
 pub mod sink;
 
-pub use decline::{Decline, DeclineClass, Emission, Refusal, REGISTRY};
+pub use decline::{Decline, Refusal};
+/// The slug registry and its row types are read only by the gates in
+/// [`gate`], which are themselves `#[cfg(test)]`. Nothing in the device
+/// consults the registry at runtime — the typed declines carry their own
+/// slugs — so it is compiled only for tests.
+#[cfg(test)]
+pub use decline::{DeclineClass, Emission, REGISTRY};
 /// Re-exported so call sites write `crate::observe::decline_display!(..)`
 /// next to the trait it implements, rather than reaching into the submodule.
 pub(crate) use decline::decline_display;
