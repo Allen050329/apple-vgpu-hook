@@ -894,6 +894,32 @@ Two consequences worth knowing before touching this:
   making the `Entry` a process-wide `OnceLock` leaves the count at exactly 20. The ICD is unloaded
   by `vkDestroyInstance`, not by releasing the loader. Predicted 0, measured 20, hypothesis dead.
 
+**Where the next one of these is hiding: `CounterSnapshot` fields no test ever proves nonzero.**
+The sampled-cache defect was findable in advance by asking which counters the suite only ever
+asserts `== 0`, because that is the signature of a path with no positive coverage. Running that
+question over all 71 fields — folding whitespace so multi-line asserts match, and gated on four
+fields whose bucket is known by hand (`shader_hits`, `dispatches`, `device_lost`,
+`sampled_cache_hits` must all come out "positive"; the first pass failed that gate and had to be
+rewritten) — gives 35 positive, 9 asserted-but-never-nonzero, 25 never named.
+
+The nine: `seed_uploads`, `buffer_zerocopy_binds`, `ring_retire_blocks`,
+`compute_direct_writeback_bytes`, `compute_direct_writeback_fallbacks`,
+`compute_sampled_resident_copy_bytes`, `compute_sampled_reinterpret_copy_bytes`,
+`compute_deferred_writeback_bytes`, `compute_deferred_flush_bytes`.
+
+The sharpest of them is the **guest-gather ("zero-copy") bind pair**,
+`buffer_zerocopy_binds` (`engine/exec.rs:118`) and `sampled_zerocopy_binds` (`engine/exec.rs:1465`).
+Both fire only for `SampledSource::GuestRuns` / buffer guest runs, and **every test in the suite
+builds `SampledSource::Bytes`**, so neither has ever been executed by a test. That is the path that
+copies straight out of imported guest pages instead of staging through the host — the one that
+matters most for a real guest — and it is the same shape the sampled cache was in.
+
+**This is a coverage statement, not a defect claim.** A zero here is equally consistent with the
+path working fine and simply never being driven, and both sites do emit typed declines
+(`BufferGuestRunImportMissing` and its sampled twin) when an import is missing. Do not write "the
+zero-copy path is broken" anywhere on the strength of this table. What it licenses is the next
+*measurement*: drive a `GuestRuns` request and read the counter.
+
 So to exercise a parity case on the GPU, **run it in a filter small enough to stay under the cycle
 limit** and confirm `grep -c SKIP` is 0 for that run. A full-suite count of 20 on a machine with a
 working driver is this ceiling, and says nothing about whether your change works.
