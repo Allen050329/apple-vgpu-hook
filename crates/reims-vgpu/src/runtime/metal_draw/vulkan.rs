@@ -2906,26 +2906,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb)
-        .map_err(|reason| {
-            DrawError::DrawPreparation(
-                crate::backend::vulkan::engine::DrawPreparationDecline::VertexAirExtract {
-                    function_ref: pd.vertex_func_ref,
-                    reason,
-                },
-            )
-        })?
-        .to_vec();
-    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb)
-        .map_err(|reason| {
-            DrawError::DrawPreparation(
-                crate::backend::vulkan::engine::DrawPreparationDecline::FragmentAirExtract {
-                    function_ref: pd.fragment_func_ref,
-                    reason,
-                },
-            )
-        })?
-        .to_vec();
+    // Borrowed from the `*_mtlb` locals above, which outlive every use below.
+    // These were `.to_vec()`, which allocated and copied both AIR blobs on
+    // every chain — `drain_duty` measures ~1142 chains/s, so that is ~2300
+    // allocations a second on the drain worker for bytes that are only ever
+    // read (`translate_cached_reflected` takes `&[u8]`, and its cache is keyed
+    // by hashing them).
+    let v_air = crate::runtime::mtlb::extract_air(&v_mtlb).map_err(|reason| {
+        DrawError::DrawPreparation(
+            crate::backend::vulkan::engine::DrawPreparationDecline::VertexAirExtract {
+                function_ref: pd.vertex_func_ref,
+                reason,
+            },
+        )
+    })?;
+    let f_air = crate::runtime::mtlb::extract_air(&f_mtlb).map_err(|reason| {
+        DrawError::DrawPreparation(
+            crate::backend::vulkan::engine::DrawPreparationDecline::FragmentAirExtract {
+                function_ref: pd.fragment_func_ref,
+                reason,
+            },
+        )
+    })?;
 
     // AIR→SPIR-V is content-cached: live boots re-translated the same pipelines
     // dozens of times on the doorbell vCPU and tripped IPI timeout panics.
@@ -2935,7 +2937,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     // emitted SPIR-V. `_shader.reflection` is used at the sampled-image binding
     // loop below; the SPIR-V walk stays as a cold fallback.
     let v_shader = crate::runtime::m2v_cache::translate_cached_reflected(
-        &v_air,
+        v_air,
         metal2vulkan::passes::Stage::Vertex,
         req.pipeline_ref,
     )
@@ -2948,7 +2950,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         )
     })?;
     let f_shader = crate::runtime::m2v_cache::translate_cached_reflected(
-        &f_air,
+        f_air,
         metal2vulkan::passes::Stage::Fragment,
         req.pipeline_ref,
     )
@@ -2966,8 +2968,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         pd.vertex_func_ref,
         pd.fragment_func_ref,
         [
-            ("vertex", &v_mtlb, &v_air, &v_shader.spirv),
-            ("fragment", &f_mtlb, &f_air, &f_shader.spirv),
+            ("vertex", &v_mtlb, v_air, &v_shader.spirv),
+            ("fragment", &f_mtlb, f_air, &f_shader.spirv),
         ],
     );
 
