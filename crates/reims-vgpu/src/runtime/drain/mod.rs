@@ -3085,6 +3085,9 @@ static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
+        if let Some(routes) = take_store_routes() {
+            crate::observe::off(routes);
+        }
         emit_engine_delta();
     }
 }
@@ -3168,6 +3171,39 @@ pub fn note_drain_skipped() {
 /// Attribute elapsed time since `started` to one phase of the current tranche.
 pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
     DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
+}
+
+/// Count one guest-Store routing decision, by route name.
+///
+/// The routes are the attribution for `engine_delta`'s readback bytes: only
+/// `cpu_portability` reads a full frame back and CPU-copies it into the guest's
+/// pages, and only it is forced to — `gva_store_defer_eligible` refuses any
+/// target with a nonzero `mapping_id`, so a type-11 composite Store has no
+/// deferred rail to take. Whether that is 2 Stores a second or 20 decides
+/// whether building one is worth it, and the route's own first-appearance line
+/// is deduplicated per process and cannot say.
+static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> =
+    std::sync::Mutex::new(None);
+
+pub fn note_store_route(route: &'static str) {
+    if let Ok(mut g) = STORE_ROUTES.lock() {
+        *g.get_or_insert_with(Default::default).entry(route).or_default() += 1;
+    }
+}
+
+/// Drain and format the window's route counts, or `None` if none were taken.
+fn take_store_routes() -> Option<String> {
+    let mut g = STORE_ROUTES.lock().ok()?;
+    let routes = g.as_mut()?;
+    if routes.is_empty() {
+        return None;
+    }
+    let mut out = String::from("store_routes");
+    for (route, n) in routes.iter() {
+        out.push_str(&format!(" {route}={n}"));
+    }
+    routes.clear();
+    Some(out)
 }
 
 fn signal_display_vbl_at<H: HostMemory + HostOps>(

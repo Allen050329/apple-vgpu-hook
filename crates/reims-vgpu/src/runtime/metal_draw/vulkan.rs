@@ -2517,10 +2517,17 @@ enum M2vDrawSpan {
 /// true and that arm cannot be entered. Both are kept as call sites so their
 /// absence is a *denominator* against the routes that do fire, not an
 /// acquittal; if either ever appears, the extension came back.
+/// The first-appearance line answers "is this route reachable" and cannot answer
+/// "how often". Both questions are live: reachability is what the denominator
+/// argument above needs, and the rate is what prices the route — `engine_delta`
+/// shows ~20 full-frame readbacks a second and the routes are what attribute
+/// them. So the dedup'd line stays and the rate is counted alongside it, into
+/// the same one-second window as `drain_duty`.
 #[cfg(feature = "backend-vulkan")]
 fn note_type11_store_route(route: &'static str) {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::BTreeSet<&'static str>>> = Mutex::new(None);
+    crate::runtime::drain::note_store_route(route);
     {
         let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
         if !guard.get_or_insert_with(Default::default).insert(route) {
