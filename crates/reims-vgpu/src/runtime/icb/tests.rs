@@ -415,6 +415,38 @@ fn put_object(
 /// mapped by hand because `map_surface` alone leaves it without page entries,
 /// which is the state a real `MapMemory2` would have already left behind.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Read back [`map_draw_target`]'s 4x4 surface and assert every texel is the
+/// colour the ICB test shaders write: `float4(0.4, 0.267, 0.133, 1)`, which is
+/// BGRA 34, 68, 102, 255.
+///
+/// The tolerance is +/-2 per channel, for float-to-unorm rounding across
+/// different Metal devices. `what` names the command shape under test so a
+/// failure says which of the eighteen callers produced the wrong pixels.
+fn assert_target_is_shader_solid(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    what: &str,
+) {
+    use crate::runtime::mapping_write;
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        state, host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let want = [34u8, 68, 102, 255];
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} ({what})"
+        );
+    }
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 /// The one-triangle draw every ICB pixel test issues into [`map_draw_target`]'s
 /// surface: pipeline 6, three vertices, one instance, triangles, over a
 /// zero-filled 4x4 BGRA8 seed.
@@ -1026,22 +1058,12 @@ fn fill_render_draw_patches_tessellation_oracle() {
         "DrawPatches tessellation ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    // float4(0.4, 0.267, 0.133, 1) → BGRA ≈ 34,68,102,255
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawPatches tessellation)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "DrawPatches tessellation",
+    );
 }
 
 /// Pixel-level ICB DrawIndexedPatches: dummy control point at index 0,
@@ -1164,21 +1186,12 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
         "DrawIndexedPatches tessellation ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawIndexedPatches tessellation)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "DrawIndexedPatches tessellation",
+    );
 }
 
 /// Unknown wire command types still fail closed.
@@ -1483,22 +1496,7 @@ fn fill_render_draw_mesh_threads_oracle() {
         "DrawMeshThreads ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    // float4(0.4, 0.267, 0.133, 1) → BGRA ≈ 34,68,102,255
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawMeshThreads)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "DrawMeshThreads");
 }
 
 /// Pixel-level ICB drawMeshThreadgroups (same solid BGRA).
@@ -1581,21 +1579,7 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
         "DrawMeshThreadgroups ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawMeshThreadgroups)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "DrawMeshThreadgroups");
 }
 
 /// Wire `baseVertex@0x28` is a signed value stored as u64 bits (two's complement).
@@ -2568,21 +2552,7 @@ fn wire_backed_draw_patches_tessellation_e2e() {
         "wire-backed DrawPatches execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed DrawPatches)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed DrawPatches");
 }
 
 /// Dedicated wire-backed E2E: DrawIndexedPatches tessellation (not via
@@ -2732,21 +2702,12 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
         "wire-backed DrawIndexedPatches execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed DrawIndexedPatches)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed DrawIndexedPatches",
+    );
 }
 
 /// Object+mesh host fill: dual-function metallib (object type 8 + mesh type 7)
@@ -2847,21 +2808,7 @@ fn fill_render_object_mesh_threadgroups_oracle() {
         "object+mesh ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (object+mesh)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object+mesh");
 }
 
 /// Dedicated wire-backed E2E: dual-export object+mesh metallib in classic
@@ -2978,21 +2925,12 @@ fn wire_backed_dual_export_object_mesh_e2e() {
         "wire-backed dual-export object+mesh execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed dual-export object+mesh)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed dual-export object+mesh",
+    );
 }
 
 /// Separate object + mesh + fragment function refs via mesh SPI type-7
@@ -3106,21 +3044,12 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
         "separate object/mesh func-ref ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (separate object/mesh refs)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "separate object/mesh refs",
+    );
 }
 
 /// Dedicated wire-backed E2E: mesh SPI pipeline shape (tag 0x14 + object/
@@ -3243,21 +3172,12 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
         "wire-backed mesh SPI pipeline execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed mesh SPI pipeline)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed mesh SPI pipeline",
+    );
 }
 
 /// Pixel: setMeshBuffer — mesh stage reads scale from buffer(0).
@@ -3356,21 +3276,7 @@ fn fill_render_mesh_buffer_bind_oracle() {
         "mesh buffer bind ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (mesh buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "mesh buffer bind");
 }
 
 /// Pixel: setObjectBuffer — object stage reads scale from buffer(0) → payload.
@@ -3468,21 +3374,7 @@ fn fill_render_object_buffer_bind_oracle() {
         "object buffer bind ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (object buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object buffer bind");
 }
 
 /// Wire-backed E2E: encode mesh buffer bind + MeshThreads → command memory
@@ -3604,21 +3496,12 @@ fn wire_backed_mesh_buffer_bind_e2e() {
         "wire-backed mesh buffer bind execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed mesh buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed mesh buffer bind",
+    );
 }
 
 /// Wire-backed E2E: encode object buffer bind + MeshThreadgroups → command
@@ -3740,21 +3623,12 @@ fn wire_backed_object_buffer_bind_e2e() {
         "wire-backed object buffer bind execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed object buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed object buffer bind",
+    );
 }
 
 /// Wire encode↔decode of object TG memory lengths + MeshThreadgroups.
@@ -4007,21 +3881,7 @@ fn fill_render_object_tg_memory_oracle() {
         "object TG memory ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (object TG memory)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object TG memory");
 }
 
 /// Dedicated wire-backed E2E: object TG length 16 through command memory.
@@ -4134,21 +3994,7 @@ fn wire_backed_object_tg_memory_e2e() {
         "wire-backed object TG execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed object TG)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed object TG");
 }
 
 /// Wire-backed E2E: drawMeshThreads.
@@ -4257,21 +4103,7 @@ fn wire_backed_mesh_threads_e2e() {
         "wire-backed MeshThreads execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed MeshThreads)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed MeshThreads");
 }
 
 /// Dedicated wire-backed E2E: drawMeshThreadgroups (no object buffer binds).
@@ -4380,21 +4212,12 @@ fn wire_backed_mesh_threadgroups_e2e() {
         "wire-backed MeshThreadgroups execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed MeshThreadgroups)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed MeshThreadgroups",
+    );
 }
 
 /// inheritBuffers=true: ICB slot records only draw+PSO; fragment color
