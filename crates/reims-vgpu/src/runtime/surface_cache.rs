@@ -26,7 +26,6 @@ fn store_into(
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    log_tag: &str,
 ) {
     if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return;
@@ -37,20 +36,7 @@ fn store_into(
     if bgra.len() < need {
         return;
     }
-    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&bgra[..need]);
     let entry = map.entry(id).or_default();
-    // Measure geom clobber: smaller store replacing a larger encode under the
-    // same key (sky 1920×1152 → 64×64 atlas) — proxy only, no product branch.
-    if entry.width >= 1280
-        && entry.height >= 720
-        && (width < entry.width || height < entry.height)
-        && !entry.bgra.is_empty()
-    {
-        crate::observe::off(format!(
-            "host_cache_geom_clobber tag={log_tag} id={id} was={}x{} now={width}x{height}",
-            entry.width, entry.height
-        ));
-    }
     entry.host_gen = entry.host_gen.wrapping_add(1);
     if entry.host_gen == 0 {
         entry.host_gen = 1;
@@ -58,18 +44,6 @@ fn store_into(
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
-    if width >= 1280 && height >= 720 {
-        // surface path keeps historical `mid=` key for greps; tex uses `tex=`.
-        let id_field = if log_tag == "tex" {
-            format!("tex={id}")
-        } else {
-            format!("mid={id}")
-        };
-        crate::observe::off(format!(
-            "host_cache_store {id_field} {width}x{height} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-            entry.host_gen, px0[0], px0[1], px0[2], px0[3]
-        ));
-    }
 }
 
 fn get_from(
@@ -102,14 +76,7 @@ fn get_from_with_gen(
 
 /// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
 pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
-    store_into(
-        &mut state.host_surfaces,
-        surface_id,
-        width,
-        height,
-        bgra,
-        "surface",
-    );
+    store_into(&mut state.host_surfaces, surface_id, width, height, bgra);
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
@@ -125,14 +92,7 @@ pub fn store_texture(
     height: u32,
     bgra: Vec<u8>,
 ) {
-    store_into(
-        &mut state.host_texture_surfaces,
-        texture_ref,
-        width,
-        height,
-        bgra,
-        "tex",
-    );
+    store_into(&mut state.host_texture_surfaces, texture_ref, width, height, bgra);
 }
 
 pub fn get_texture(
@@ -448,7 +408,6 @@ pub fn store_gva_owned(
     if bgra.len() < need {
         return;
     }
-    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&bgra[..need]);
     let entry = state.host_gva_surfaces.entry(gva).or_default();
     entry.host_gen = entry.host_gen.wrapping_add(1);
     if entry.host_gen == 0 {
@@ -460,12 +419,6 @@ pub fn store_gva_owned(
     entry.producer_task_id = task_id;
     entry.producer_texture_ref = texture_ref;
     entry.producer_object_type = object_type;
-    if width >= 1280 && height >= 720 {
-        crate::observe::off(format!(
-            "host_cache_store tag=gva gva={gva:#x} {width}x{height} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-            entry.host_gen, px0[0], px0[1], px0[2], px0[3]
-        ));
-    }
 }
 
 pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
