@@ -1528,30 +1528,12 @@ fn try_gpu_scatter(
     unsafe { pools.present_scatter_gpu(ctx, counters, identity, &scatter_runs, spans) }
 }
 
-/// One reading for the always-on cap-pressure census: current cap occupancy +
-/// the cumulative eviction / reupload counters. The census (
-/// `present_proxy::cap_pressure`) turns these into per-window deltas so a
-/// cap-blow (eviction/reupload storm) becomes a visible line instead of an
-/// unexplained frame-rate cliff.
-pub fn cap_pressure_snapshot() -> crate::runtime::census::present_proxy::cap_pressure::Sample {
-    use std::sync::atomic::Ordering::Relaxed;
-    let guard = lock_engine();
-    let occ = guard.pools.cap_pressure_occupancy();
-    crate::runtime::census::present_proxy::cap_pressure::Sample {
-        registry_len: occ.registry_len,
-        registry_cap: occ.registry_cap,
-        registry_pinned: occ.registry_pinned,
-        sampled_len: occ.sampled_len,
-        sampled_cap: occ.sampled_cap,
-        sampled_bytes: occ.sampled_bytes,
-        sampled_byte_cap: occ.sampled_byte_cap,
-        graveyard_len: occ.graveyard_len,
-        render_windows: 0,
-        target_evicts: guard.counters.target_evicts.load(Relaxed),
-        gen_mismatch: guard.counters.gen_mismatch.load(Relaxed),
-        sampled_reuploads: guard.counters.sampled_reuploads.load(Relaxed),
-        sampled_reupload_bytes: guard.counters.sampled_reupload_bytes.load(Relaxed),
-    }
+/// The non-pinned resident-target slot cap. Exposed so a test that must blow
+/// past the LRU sweep derives its filler count from the live value instead of
+/// hard-coding one — `vk_engine_parity` previously fixed 70 fillers against a
+/// cap later retuned to 320, so no eviction fired and its assert could not hold.
+pub fn registry_cap() -> usize {
+    pools::REGISTRY_CAP
 }
 
 /// Advance the wall-clock resident-target idle-drain clock to `now_ms`, keep the

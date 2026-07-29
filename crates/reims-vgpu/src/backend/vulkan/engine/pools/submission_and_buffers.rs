@@ -660,24 +660,6 @@ impl ResourcePools {
         }
     }
 
-    pub(crate) fn cap_pressure_occupancy(&self) -> CapPressureOccupancy {
-        let pinned = self
-            .registry
-            .values()
-            .filter(|slot| slot.pin_count > 0)
-            .count();
-        CapPressureOccupancy {
-            registry_len: self.registry_order.len(),
-            registry_cap: REGISTRY_CAP,
-            registry_pinned: pinned,
-            sampled_len: self.sampled_cache.len(),
-            sampled_cap: SAMPLED_CACHE_CAP,
-            sampled_bytes: self.sampled_cache_bytes,
-            sampled_byte_cap: SAMPLED_CACHE_BYTE_CAP,
-            graveyard_len: self.graveyard.len(),
-        }
-    }
-
     /// Cumulative sampled-cache pool recycle diagnostics:
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.

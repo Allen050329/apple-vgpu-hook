@@ -866,23 +866,6 @@ pub(crate) struct RegistryGeomCensus {
     pub gva: usize,
 }
 
-/// One reading of the pool occupancy that feeds the always-on cap-pressure
-/// census ([`ResourcePools::cap_pressure_occupancy`]). `registry_pinned` is the
-/// count of resident targets held against LRU eviction by a deferred write
-/// window — when it approaches `registry_len`, the registry has soft-exceeded
-/// its slot cap (the LRU sweep cannot evict pinned slots) and the non-pinned
-/// tail thrashes.
-pub(crate) struct CapPressureOccupancy {
-    pub registry_len: usize,
-    pub registry_cap: usize,
-    pub registry_pinned: usize,
-    pub sampled_len: usize,
-    pub sampled_cap: usize,
-    pub sampled_bytes: usize,
-    pub sampled_byte_cap: usize,
-    pub graveyard_len: usize,
-}
-
 /// Cap on the **non-pinned** (LRU-evictable) resident-target population — the
 /// active render working set. Pinned slots (deferred-write windows, each holding
 /// content only on the GPU, bounded separately by
@@ -900,7 +883,7 @@ pub(crate) struct CapPressureOccupancy {
 /// working set once the burst ends. So this is sized to absorb the burst's *live*
 /// working set (measured non-pinned peak ~260 during a YouTube page-load), not to
 /// hold it forever. Slots are cheap; the real VRAM guard is per-image bytes.
-const REGISTRY_CAP: usize = 320;
+pub(crate) const REGISTRY_CAP: usize = 320;
 /// Wall-clock milliseconds a non-pinned resident may go untouched before the
 /// idle drain reclaims it. An actively-drawn target is touched every frame (and
 /// the presented target is touched every poll) so it never ages out, while a

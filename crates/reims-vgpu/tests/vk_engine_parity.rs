@@ -1232,7 +1232,7 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     // 64 -> 320, so no eviction ever fired and the "unpinned was evicted" assert
     // below could not hold. `+16` clears the cap with margin so the oldest
     // non-pinned is definitely swept.
-    let cap = engine::cap_pressure_snapshot().registry_cap as u32;
+    let cap = engine::registry_cap() as u32;
     for i in 0..(cap + 16) {
         let mut filler = engine_req(&v, &f, 16, 16);
         filler.target_identity = Some(TargetIdentity::Surface {

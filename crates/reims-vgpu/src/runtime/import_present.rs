@@ -123,11 +123,10 @@ pub fn render_deferred_identity(
 /// Safety backstop on live `render_deferred_flush` windows. Each window pins a
 /// resident, so an unbounded population would grow toward `MAX_MAPPINGS` (4096)
 /// and pin the whole registry. This is deliberately set *above* the measured
-/// YouTube page-load burst peak (~323 windows) and below `REGISTRY_CAP` (512):
-/// normal use — even a heavy compositing burst — stays under it and is *absorbed*
-/// by the registry (evicts=0), so the oldest-first force-flush here **does not
-/// fire** and the drain worker never pays a synchronous readback storm (the
-/// `cap_flush` census stays silent). It only engages for a pathological runaway
+/// YouTube page-load burst peak (~323 windows): normal use — even a heavy
+/// compositing burst — stays under it and is *absorbed* by the registry, so the
+/// oldest-first force-flush here **does not fire** and the drain worker never
+/// pays a synchronous readback storm. It only engages for a pathological runaway
 /// (a workload spraying >384 simultaneously-live deferred surfaces), where
 /// landing the oldest windows early is the lesser evil vs. pinning ~all of VRAM.
 pub const RENDER_DEFERRED_WINDOW_CAP: usize = 384;
@@ -145,8 +144,7 @@ pub const RENDER_DEFERRED_WINDOW_CAP: usize = 384;
 /// unmapped surface whose pages are never touched again never triggers it, so
 /// its pin lingers for the guest lifetime. Enough such leaks pin the registry
 /// past its slot cap (soft-exceed), and the non-pinned tail thrashes eviction —
-/// the measured YouTube "cap blown → 120→5fps" cliff (`cap_pressure pinned=…
-/// render_win=…` ballooning to hundreds).
+/// the measured YouTube "cap blown → 120→5fps" cliff.
 pub fn drop_render_deferred_windows(state: &mut DeviceState, mapping_id: u32) -> u64 {
     let mut dropped = 0u64;
     for (key, entry) in state.take_render_deferred_windows(mapping_id, 0, u64::MAX) {
@@ -411,28 +409,20 @@ pub fn try_defer_present_store<H: HostMemory + HostOps>(
     crate::observe::line(format!(
         "render_writeback_deferred mapping={mapping_id} {width}x{height} gen={map_generation} off={base_off} span_end={span_end}"
     ));
-    // Measure-only consume census: this deferred window is now pending. Whether
-    // it is later flushed (a consumer read the pages) or superseded (dropped
-    // unread) is the signal for whether the writeback is elidable under dmabuf.
     // Bound the outstanding-window population: each window pins a resident, and
     // a compositing burst (YouTube page-load: many short-lived surfaces deferred
     // faster than consumers read them) otherwise balloons the pinned registry to
     // hundreds — past its slot cap, so the LRU cannot shrink and the non-pinned
-    // tail thrashes eviction (measured `cap_pressure reg=332 pinned=323`). Flush
+    // tail thrashes eviction (measured registry 332 slots, 323 of them pinned).
+    // Flush
     // the least-recently-armed windows first (proper GPU->guest writeback + unpin
     // via `render_flush_one`, so no content is lost — just landed early) until we
     // are back under the cap. Mirrors the GVA path's `GVA_DEFERRED_WINDOW_CAP`.
-    if state.render_deferred_flush.len() > RENDER_DEFERRED_WINDOW_CAP {
-        let mut forced = 0u64;
-        while state.render_deferred_flush.len() > RENDER_DEFERRED_WINDOW_CAP {
-            let Some((old_key, old_entry)) = state.take_oldest_render_deferred_window() else {
-                break;
-            };
-            let _ =
-                crate::runtime::storage_flush::render_flush_one(state, host, &old_key, &old_entry);
-            forced += 1;
-        }
-        crate::runtime::census::present_proxy::cap_flush::note(forced);
+    while state.render_deferred_flush.len() > RENDER_DEFERRED_WINDOW_CAP {
+        let Some((old_key, old_entry)) = state.take_oldest_render_deferred_window() else {
+            break;
+        };
+        let _ = crate::runtime::storage_flush::render_flush_one(state, host, &old_key, &old_entry);
     }
     true
 }

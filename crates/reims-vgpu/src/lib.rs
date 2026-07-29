@@ -621,9 +621,6 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             resident_source.candidates.first(),
             now_ms,
         );
-        let mut cap_sample = crate::backend::vulkan::engine::cap_pressure_snapshot();
-        cap_sample.render_windows = state.render_deferred_flush.len();
-        crate::runtime::census::present_proxy::cap_pressure::note(cap_sample);
         crate::backend::vulkan::engine::maintain_idle_residents(
             resident_source.candidates.first(),
             now_ms,
@@ -732,13 +729,6 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         } else {
             None
         };
-        // Always-on cap-pressure census (once per publish, drain worker): surfaces
-        // registry/sampled-cache eviction + reupload storms so a cap-blow cliff is a
-        // visible line, not an unexplained frame-rate collapse. Silent unless a real
-        // eviction/reupload happened in the window.
-        let mut cap_sample = crate::backend::vulkan::engine::cap_pressure_snapshot();
-        cap_sample.render_windows = state.render_deferred_flush.len();
-        crate::runtime::census::present_proxy::cap_pressure::note(cap_sample);
         // Reclaim resident targets idle past the wall-clock age threshold, so VRAM
         // returns to the working-set baseline after a compositing burst instead of
         // sitting at the high REGISTRY_CAP for the guest lifetime. The presented
