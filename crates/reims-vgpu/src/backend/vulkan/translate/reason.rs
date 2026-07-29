@@ -6,8 +6,8 @@
 //! check to carry its own `reason=<slug>` rather than collapsing several causes
 //! into one status. A free-text payload cannot satisfy that mechanically.
 //!
-//! Shape follows [`crate::backend::vulkan::caps::zero_copy::ZeroCopyDecline`]:
-//! a plain enum plus [`TranslateReason::slug`]. The offending numeric value
+//! Shape is a plain enum implementing [`Decline`] plus
+//! [`TranslateReason::slug`]. The offending numeric value
 //! rides along so the fail-visible line carries the load-bearing field, and
 //! [`std::fmt::Display`] renders both.
 

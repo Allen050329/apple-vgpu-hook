@@ -551,4 +551,36 @@ mod tests {
         // Allow it again and it is chosen.
         assert_eq!(select_memory_type(&props, 0b010, &req), Some(1));
     }
+
+    /// Every memory class resolves a type on every device family the support
+    /// matrix names — including the discrete driver with no host-visible
+    /// device-local heap and the software rasterizer. A class that resolves
+    /// only on the dev host is a row that exists on paper: the allocation fails
+    /// on the first machine that lacks the preferred layout, and nothing in the
+    /// crate can see that from a single site.
+    #[test]
+    fn every_class_resolves_on_every_device_family() {
+        for (name, props) in [
+            ("apple_m3_max", apple_m3_max()),
+            ("intel_igpu", intel_igpu()),
+            ("amd_apu_host_heap", amd_apu_host_heap()),
+            ("nvidia_discrete", nvidia_discrete()),
+            ("nvidia_discrete_rebar", nvidia_discrete_rebar()),
+            ("llvmpipe", llvmpipe()),
+        ] {
+            let profile = classify_memory(&props);
+            for class in [
+                MemoryClass::Upload,
+                MemoryClass::Readback,
+                MemoryClass::DeviceLocal,
+                MemoryClass::DeviceLocalPreferred,
+            ] {
+                let req = profile.topology.request(class);
+                assert!(
+                    select_memory_type(&props, !0, &req).is_some(),
+                    "{name}/{class:?} must resolve a memory type"
+                );
+            }
+        }
+    }
 }

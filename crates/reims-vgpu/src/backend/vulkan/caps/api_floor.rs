@@ -15,10 +15,11 @@
 //! own rather than anything the code does: nothing in the engine has ever used a
 //! 1.3 core feature, so the "1.3 row" only ever meant "a host that also happens
 //! to have dmabuf". Zero-copy capability is the property that actually varies
-//! (see [`super::zero_copy`]), and it is orthogonal to the API version — a 1.2
-//! driver can advertise `VK_EXT_external_memory_host` and a 1.3 driver can lack
-//! it. Classifying on the version invited exactly the coupling the matrix exists
-//! to prevent, so the version is now a floor check and nothing more.
+//! — whether the device can share memory with another device at all — and it is
+//! orthogonal to the API version: a 1.2 driver can advertise the dmabuf pair and
+//! a 1.3 driver can lack it. Classifying on the version invited exactly the
+//! coupling that gating on capability exists to prevent, so the version is now a
+//! floor check and nothing more.
 //!
 //! A capability promoted into 1.3 core must therefore be reached through its
 //! `KHR`/`EXT` form, gated on runtime presence, with the 1.2 path still

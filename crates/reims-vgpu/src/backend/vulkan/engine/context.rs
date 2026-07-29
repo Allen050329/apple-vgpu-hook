@@ -13,11 +13,9 @@ use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::api_floor;
 use crate::backend::vulkan::caps::device_select::select_physical_device;
-use crate::backend::vulkan::caps::frame_interop::{HandoffInputs, HandoffLadder};
 use crate::backend::vulkan::caps::memory_topology::{
     classify_memory, select_memory_type, MemoryClass, MemoryRequest,
 };
-use crate::backend::vulkan::caps::zero_copy::{DmaMechanisms, ZeroCopyProfile};
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
 
 /// Max device recreates per process after DEVICE_LOST (named constant).
@@ -520,23 +518,9 @@ impl DeviceContext {
             dmabuf_export.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let props = instance.get_physical_device_properties(pd);
         let memory_properties = instance.get_physical_device_memory_properties(pd);
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
-        let engine_swapchain = swapchain;
-        #[cfg(not(all(feature = "host-window", target_os = "macos")))]
-        let engine_swapchain = false;
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
-            // The display rail rides on dmabuf; both memory rails have no
-            // mechanism left and decline unconditionally inside `resolve`.
-            // Classified in one place so no later site re-derives either answer
-            // from the device context's booleans.
-            zero_copy: ZeroCopyProfile::resolve(DmaMechanisms {
-                dmabuf_share: dmabuf_export,
-            }),
-            handoff: HandoffLadder::resolve(&HandoffInputs {
-                dmabuf_export,
-                engine_swapchain,
-            }),
+            dmabuf: dmabuf_export,
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             portability_subset,
             device_api_version: props.api_version,
@@ -545,32 +529,12 @@ impl DeviceContext {
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
-        // One-shot classification line: the matrix cell, the signal that
-        // decided the memory topology, and the frame-handoff rung actually
-        // chosen with a named reason for every better rung skipped. Load-bearing
-        // for portability debugging — "why is this host slow / blank" should be
-        // answerable from this single line.
+        // One-shot classification line: the memory topology, the signal that
+        // decided it, and whether this device can hand a frame to another
+        // device without a copy. Load-bearing for portability debugging — "why
+        // is this host slow / blank" starts here.
         crate::observe::off(caps.selection_line(&device_name));
-        // …and one line per degraded rail/rung, so each carries its own
-        // `reason=<slug>`. The summary above lists them as `rail:slug` inside a
-        // twenty-field line, which reads well and greps badly: a host running
-        // without `VK_EXT_external_memory_host` is a zero-copy regression, and
-        // "why is this host slow" should be answerable by grepping the slug, not
-        // by parsing a bracketed field. One-shot at device create, so no flood.
-        for (rail, decline) in caps.zero_copy.declined() {
-            let decline: &crate::backend::vulkan::caps::zero_copy::ZeroCopyDecline = decline;
-            crate::observe::Emit::decline("vk_caps_zero_copy_declined", decline)
-                .field("rail", rail)
-                .fail();
-        }
-        for (rung, decline) in caps.handoff.declined() {
-            let decline: &crate::backend::vulkan::caps::frame_interop::HandoffDecline = decline;
-            crate::observe::Emit::decline("vk_caps_handoff_declined", decline)
-                .field("rung", rung.slug())
-                .fail();
-        }
-        // Fine-grained capabilities that are not part of the matrix but do
-        // change what a draw can express.
+        // Fine-grained capabilities that do change what a draw can express.
         crate::observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
             props.device_type,

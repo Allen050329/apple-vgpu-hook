@@ -1,38 +1,25 @@
 //! Host GPU capability classification — the single source of truth for what
 //! the bound Vulkan device can do.
 //!
-//! # The support matrix
-//!
-//! `reims-vgpu` targets **four** host GPU configurations as first-class,
-//! separately-tested rows. They are the cross product of two independent axes:
-//!
-//! | | **DMA** (some crossing is zero-copy) | **non-DMA** (every crossing copies) |
-//! |---|---|---|
-//! | **Unified memory** | Apple M-series via MoltenVK; Intel/AMD iGPU on Mesa | an iGPU exposing no sharing mechanism |
-//! | **Discrete memory** | the RTX 5080 dev host | a GTX 750 Ti-class dGPU on a bare 1.2 driver |
+//! Everything here is *measured* on the device at create time and consumed
+//! either by a decision or by the one-shot `vk_caps` line. There is
+//! deliberately no derived taxonomy on top of it: a classification nothing
+//! branches on cannot be wrong in a way anyone notices, and the one that used
+//! to live here was wrong — it printed `handoff=dmabuf_fd handoff_declined=[]`
+//! on boots where the dmabuf arm was never entered, because the ladder that
+//! produced the string and the branch that picks the present path were separate
+//! pieces of code that had never been made to agree.
 //!
 //! * [`memory_topology::MemoryTopology`] — `Unified` vs `Discrete` selects an
-//!   allocation *preference*, never a different observable result.
-//! * [`zero_copy::DmaSupport`] — can the GPU address memory it did not itself
-//!   allocate? Resolved per rail (guest read, guest write, frame handoff), each
-//!   independently feature-gated with a named decline.
-//! * [`frame_interop::FrameHandoff`] — the display rail specifically: how a
-//!   finished frame reaches **our own window**, which is the only frame sink on
-//!   every row.
+//!   allocation *preference*, never a different observable result. Live: every
+//!   allocation names a [`MemoryClass`] and this module turns it into flags.
+//! * [`device_features`] — which optional device features are queried and
+//!   enabled, in one place, so no site can ask about one it did not request.
+//! * [`DriverQuirk`] — the only place driver identity may change behavior.
 //!
-//! **Vulkan 1.2 is the baseline for all four cells, not an axis.** See
-//! [`api_floor`] for why the API version is a floor check and nothing more.
-//!
-//! # Why this module exists
-//!
-//! Before it, capability lived as a handful of loose booleans on the device
-//! context and behavior was gated on *driver identity* (`portability_subset`,
-//! i.e. "is this MoltenVK") rather than on the capability actually being
-//! decided. That silently coupled unrelated properties: a driver without dmabuf
-//! got the MoltenVK code path's answer to questions MoltenVK was never being
-//! asked. Classification now happens once, in one place, with named reasons on
-//! every decline, and the four rows are asserted by [`matrix`] tests that need
-//! no GPU.
+//! **Vulkan 1.2 is the baseline on every supported host.** See [`api_floor`]
+//! for why the API version is a floor check and nothing more; `gate.rs` scans
+//! the crate to keep it true.
 //!
 //! # Rules for adding a capability gate
 //!
@@ -41,25 +28,19 @@
 //!    keying on the driver, add a named [`DriverQuirk`] with the observed
 //!    failure in its doc comment — so the next reader knows it is a workaround,
 //!    not a design.
-//! 2. Every decline emits a fail-visible line naming the missing capability.
-//! 3. Add the row to [`matrix::MATRIX`] and let the completeness test prove the
-//!    fallback exists on all four cells.
+//! 2. Put the field on [`HostGpuCaps`] only if something reads it. A capability
+//!    that only reaches a log line is a fact, and belongs in the format string
+//!    at the site that measured it.
 
 pub mod api_floor;
 pub mod device_features;
 pub mod device_select;
-pub mod frame_interop;
 #[cfg(test)]
 mod gate;
-pub mod matrix;
 pub mod memory_topology;
-pub mod zero_copy;
 
 pub use device_select::{rank_physical_device, select_physical_device};
-pub use frame_interop::{FrameHandoff, HandoffLadder};
-pub use matrix::{FrameSink, SupportCell};
 pub use memory_topology::{MemoryClass, MemoryProfile, MemoryTopology, TopologySignal};
-pub use zero_copy::{DmaMechanisms, DmaSupport, GuestRead, GuestWrite, ZeroCopyProfile};
 
 use ash::vk;
 
@@ -95,10 +76,15 @@ impl DriverQuirk {
 #[derive(Clone, Debug)]
 pub struct HostGpuCaps {
     pub memory: MemoryProfile,
-    /// Which crossings of the guest → GPU → display path avoid a CPU copy, and
-    /// which degraded and why.
-    pub zero_copy: ZeroCopyProfile,
-    pub handoff: HandoffLadder,
+    /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` were both
+    /// advertised **and** enabled at device create. Linux only; MoltenVK has
+    /// neither and needs neither, because on macOS the engine device owns the
+    /// window surface and a finished frame never crosses a device boundary.
+    ///
+    /// This is one bit because it is one question. Whether a given present
+    /// actually took the dmabuf path is a property of that present, reported by
+    /// `direct_present_source` and `export_present_*` at the site that chose.
+    pub dmabuf: bool,
     pub quirks: DriverQuirk,
     /// `VK_KHR_portability_subset` was advertised. Kept for the selection log
     /// line and for constructing [`DriverQuirk`] — never gate behavior on it
@@ -110,39 +96,26 @@ pub struct HostGpuCaps {
 }
 
 impl HostGpuCaps {
-    /// The matrix cell this device lands in.
-    pub fn cell(&self) -> SupportCell {
-        SupportCell::of(self.memory.topology, self.zero_copy.support())
-    }
-
     /// Flags to request for `class` on this device.
     pub fn memory_request(&self, class: MemoryClass) -> memory_topology::MemoryRequest {
         self.memory.topology.request(class)
     }
 
     /// One-shot, fail-visible summary of the classification. Load-bearing for
-    /// portability debugging: it names the matrix cell, the signal that decided
-    /// the memory topology, the rung each zero-copy rail landed on, and why any
-    /// rail or handoff rung was skipped. "Why is this host slow?" should be
-    /// answerable from this line alone.
+    /// portability debugging: it names the memory topology, the signal that
+    /// decided it, the heap sizes that signal was read from, and whether the
+    /// device can hand a frame to another device without a copy. Every field is
+    /// something the device reported.
     pub fn selection_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps cell={} api={} baseline={} memory={} memory_signal={} dma={} dma_mechanisms={} guest_read={} guest_write={} zero_copy_declined=[{}] device_local_mb={} host_visible_device_local_mb={} handoff={} handoff_declined=[{}] sink={} portability_subset={} type={:?} name={device_name:?}",
-            self.cell().slug(),
+            "vk_caps api={} baseline={} memory={} memory_signal={} dmabuf={} device_local_mb={} host_visible_device_local_mb={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
             self.memory.signal.slug(),
-            self.zero_copy.support().slug(),
-            self.zero_copy.mechanisms.slug(),
-            self.zero_copy.guest_read.slug(),
-            self.zero_copy.guest_write.slug(),
-            self.zero_copy.declined_summary(),
+            self.dmabuf,
             self.memory.device_local_bytes >> 20,
             self.memory.host_visible_device_local_bytes >> 20,
-            self.handoff.chosen().slug(),
-            self.handoff.declined_summary(),
-            FrameSink::HostOwnedWindow.slug(),
             self.portability_subset,
             self.device_type,
         )
@@ -150,22 +123,16 @@ impl HostGpuCaps {
 
     /// Summary for a device that only **consumes** finished frames — the host
     /// window's `VkDevice`, which on a hybrid host may be a different physical
-    /// GPU than the engine's.
-    ///
-    /// Deliberately omits the matrix cell and the memory rails. Those describe
-    /// how guest memory reaches the GPU, which is the engine device's job; a
-    /// consumer reporting `cell=` would contradict the engine's own line for
-    /// the same GPU on any host where the consumer lacks dmabuf (every Mac).
+    /// GPU than the engine's. Omits the heap sizes: they describe how guest
+    /// memory reaches the GPU, which is the engine device's job.
     pub fn consumer_line(&self, device_name: &str) -> String {
         format!(
-            "vk_caps role=consumer api={} baseline={} memory={} memory_signal={} {} handoff={} sink={} portability_subset={} type={:?} name={device_name:?}",
+            "vk_caps role=consumer api={} baseline={} memory={} memory_signal={} dmabuf={} portability_subset={} type={:?} name={device_name:?}",
             api_floor::version_str(self.device_api_version),
             api_floor::version_str(api_floor::MIN_SUPPORTED_API),
             self.memory.topology.slug(),
             self.memory.signal.slug(),
-            self.zero_copy.consumer_summary(),
-            self.handoff.chosen().slug(),
-            FrameSink::HostOwnedWindow.slug(),
+            self.dmabuf,
             self.portability_subset,
             self.device_type,
         )
@@ -177,18 +144,10 @@ mod tests {
     use super::*;
     use memory_topology::fixtures;
 
-    fn caps(
-        api: u32,
-        props: &vk::PhysicalDeviceMemoryProperties,
-        mechanisms: DmaMechanisms,
-    ) -> HostGpuCaps {
+    fn caps(api: u32, props: &vk::PhysicalDeviceMemoryProperties, dmabuf: bool) -> HostGpuCaps {
         HostGpuCaps {
             memory: memory_topology::classify_memory(props),
-            zero_copy: ZeroCopyProfile::resolve(mechanisms),
-            handoff: HandoffLadder::resolve(&frame_interop::HandoffInputs {
-                dmabuf_export: mechanisms.dmabuf_share,
-                engine_swapchain: false,
-            }),
+            dmabuf,
             quirks: DriverQuirk::default(),
             portability_subset: false,
             device_api_version: api,
@@ -196,147 +155,58 @@ mod tests {
         }
     }
 
-    const DMABUF: DmaMechanisms = DmaMechanisms { dmabuf_share: true };
-    const NEITHER: DmaMechanisms = DmaMechanisms {
-        dmabuf_share: false,
-    };
-
-    /// The four matrix cells are reachable from real device shapes, and the API
-    /// version does NOT participate: the same 1.2 device lands in whichever
-    /// cell its topology and mechanisms put it in.
-    ///
-    /// The unified rows changed sides when the host-pointer import went away.
-    /// A unified host reaches `Dma` only through dmabuf now, so the Mesa iGPU
-    /// carries `UnifiedDma` and Apple/MoltenVK — which has no dmabuf and no
-    /// longer has an import — carries `UnifiedNoDma`. That is the real
-    /// classification of the arm64 pathway, not a fixture convenience.
-    #[test]
-    fn every_matrix_cell_is_reachable_from_a_real_device_shape() {
-        let cells = [
-            (fixtures::intel_igpu(), DMABUF, SupportCell::UnifiedDma),
-            (fixtures::apple_m3_max(), NEITHER, SupportCell::UnifiedNoDma),
-            (
-                fixtures::nvidia_discrete_rebar(),
-                DMABUF,
-                SupportCell::DiscreteDma,
-            ),
-            (
-                fixtures::nvidia_discrete(),
-                NEITHER,
-                SupportCell::DiscreteNoDma,
-            ),
-        ];
-        for (props, mechanisms, expected) in cells {
-            assert_eq!(
-                caps(vk::API_VERSION_1_2, &props, mechanisms).cell(),
-                expected
-            );
-        }
-    }
-
-    /// The API version is not an axis: the same device at 1.2 and at 1.4 lands
-    /// in the same cell. Getting this wrong is how the old tier axis smuggled
-    /// "has dmabuf" in under "is 1.3".
-    #[test]
-    fn the_api_version_does_not_change_the_cell() {
-        let props = fixtures::intel_igpu();
-        for api in [
-            vk::API_VERSION_1_2,
-            vk::API_VERSION_1_3,
-            vk::make_api_version(0, 1, 4, 334),
-        ] {
-            assert_eq!(
-                caps(api, &props, DMABUF).cell(),
-                SupportCell::UnifiedDma,
-                "api {}",
-                api_floor::version_str(api)
-            );
-        }
-    }
-
-    /// The selection line names the cell, both signals, every rail's rung, and
-    /// the handoff — what a portability bug report needs.
+    /// The selection line names the topology, the signal that decided it, and
+    /// the frame-sharing answer — what a portability bug report needs. Every
+    /// assertion here is a field a reader greps for.
     #[test]
     fn selection_line_carries_the_diagnosis() {
-        let c = caps(vk::API_VERSION_1_3, &fixtures::nvidia_discrete(), DMABUF);
+        let c = caps(vk::API_VERSION_1_3, &fixtures::nvidia_discrete(), true);
         let line = c.selection_line("NVIDIA GeForce RTX 5080");
-        assert!(line.contains("cell=discrete_dma"), "{line}");
+        assert!(line.contains("memory=discrete"), "{line}");
         assert!(line.contains("memory_signal=separate_host_heap"), "{line}");
-        assert!(line.contains("dma_mechanisms=dmabuf"), "{line}");
-        // The memory rails read as degraded even on the most capable host in
-        // the fixture set — that is the classification after the host-pointer
-        // import removal, and the line has to say so rather than reporting a
-        // bare `dma=dma` that a reader would take for zero-copy throughout.
-        assert!(line.contains("guest_read=staging_copy"), "{line}");
-        assert!(line.contains("guest_write=cpu_readback"), "{line}");
-        assert!(
-            line.contains(
-                "zero_copy_declined=[guest_read:no_host_pointer_import,\
-                 guest_write:no_host_pointer_import]"
-            ),
-            "{line}"
-        );
-        assert!(line.contains("handoff=dmabuf_fd"), "{line}");
+        assert!(line.contains("dmabuf=true"), "{line}");
         assert!(line.contains("device_local_mb=16384"), "{line}");
         // The baseline is stated on every line so no reader mistakes the
         // device's reported version for a requirement.
         assert!(line.contains("baseline=1.2"), "{line}");
     }
 
-    /// The line always names our own window as the sink — on every row, and
-    /// whatever rung was chosen.
+    /// The API version does not change the classification. Getting this wrong is
+    /// how the retired tier axis smuggled "has dmabuf" in under "is 1.3".
     #[test]
-    fn selection_line_always_names_the_host_window_sink() {
-        for (props, mechanisms) in [
-            (fixtures::apple_m3_max(), NEITHER),
-            (fixtures::intel_igpu(), DMABUF),
-            (fixtures::nvidia_discrete_rebar(), DMABUF),
-            (fixtures::nvidia_discrete(), NEITHER),
+    fn the_api_version_does_not_change_the_classification() {
+        let props = fixtures::intel_igpu();
+        for api in [
+            vk::API_VERSION_1_2,
+            vk::API_VERSION_1_3,
+            vk::make_api_version(0, 1, 4, 334),
         ] {
-            let line = caps(vk::API_VERSION_1_2, &props, mechanisms).selection_line("dev");
-            assert!(line.contains("sink=host_window"), "{line}");
+            let line = caps(api, &props, true).selection_line("dev");
+            assert!(line.contains("memory=unified"), "{line}");
+            assert!(line.contains("dmabuf=true"), "{line}");
         }
     }
 
-    /// A degraded memory rail is visible in the line rather than silent — the
-    /// copy-only host must announce itself.
+    /// A host with no frame-sharing mechanism says so. It is fully supported —
+    /// the present path copies — and the line is where "why is this host slow"
+    /// starts.
     #[test]
-    fn a_copy_only_host_names_both_degraded_rails() {
-        let c = caps(vk::API_VERSION_1_2, &fixtures::nvidia_discrete(), NEITHER);
-        let line = c.selection_line("GeForce GTX 750 Ti");
-        assert!(line.contains("cell=discrete_no_dma"), "{line}");
-        assert!(line.contains("dma=no_dma"), "{line}");
-        assert!(line.contains("guest_read=staging_copy"), "{line}");
-        assert!(line.contains("guest_write=cpu_readback"), "{line}");
-        assert!(
-            line.contains(
-                "zero_copy_declined=[guest_read:no_host_pointer_import,\
-                 guest_write:no_host_pointer_import]"
-            ),
-            "{line}"
-        );
+    fn a_copy_only_host_says_it_has_no_dmabuf() {
+        let line = caps(vk::API_VERSION_1_2, &fixtures::apple_m3_max(), false)
+            .selection_line("Apple M3 Max");
+        assert!(line.contains("dmabuf=false"), "{line}");
+        assert!(line.contains("memory=unified"), "{line}");
     }
 
-    /// Both memory rails decline on **every** device, including one that
-    /// advertises every sharing mechanism it can. The dmabuf host below reaches
-    /// the top rung on the display rail and still copies both memory
-    /// crossings — which is the whole point of keeping the rails separate.
+    /// The consumer line answers for the window's own device and does not
+    /// restate the engine's heap classification, which would contradict the
+    /// engine's line for the same GPU on a hybrid host.
     #[test]
-    fn the_memory_rails_decline_even_on_a_fully_capable_host() {
-        let c = caps(
-            vk::API_VERSION_1_3,
-            &fixtures::nvidia_discrete_rebar(),
-            DMABUF,
-        );
-        assert_eq!(c.zero_copy.guest_read, GuestRead::StagingCopy);
-        assert_eq!(c.zero_copy.guest_write, GuestWrite::CpuReadback);
-        let rails: Vec<&str> = c.zero_copy.declined().iter().map(|(r, _)| *r).collect();
-        assert_eq!(rails, vec!["guest_read", "guest_write"]);
-        assert_eq!(
-            c.cell(),
-            SupportCell::DiscreteDma,
-            "the display rail still has dmabuf"
-        );
+    fn consumer_line_omits_the_engine_only_fields() {
+        let line = caps(vk::API_VERSION_1_2, &fixtures::intel_igpu(), false).consumer_line("iGPU");
+        assert!(line.contains("role=consumer"), "{line}");
+        assert!(line.contains("dmabuf=false"), "{line}");
+        assert!(!line.contains("device_local_mb"), "{line}");
     }
 
     /// Quirks are derived from portability-subset in ONE place, so no other

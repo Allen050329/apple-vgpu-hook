@@ -1558,17 +1558,11 @@ impl VkState {
         let device_props = instance.get_physical_device_properties(pd);
         let window_caps = caps::HostGpuCaps {
             memory: caps::memory_topology::classify_memory(&mem_props),
-            // The window's zero-copy story is the import side of the display
-            // rail: it never exports a dmabuf and never imports guest pages
-            // (both memory rails belong to the engine device), so the only
-            // mechanism that means anything here is dmabuf import.
-            zero_copy: caps::ZeroCopyProfile::display_only(have_import),
-            // Always a swapchain — reaching here proved VK_KHR_swapchain is
-            // advertised. Never an export: this device consumes frames.
-            handoff: caps::HandoffLadder::resolve(&caps::frame_interop::HandoffInputs {
-                dmabuf_export: false,
-                engine_swapchain: true,
-            }),
+            // This device only ever consumes finished frames, so the dmabuf
+            // question here is the *import* side: can it take an fd the engine
+            // device exported. It never exports one and never touches guest
+            // pages.
+            dmabuf: have_import,
             quirks: caps::DriverQuirk::for_portability_subset(has_device_extension(
                 vk::KHR_PORTABILITY_SUBSET_NAME,
             )),
