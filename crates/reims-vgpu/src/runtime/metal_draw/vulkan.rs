@@ -272,17 +272,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
         // Store draw result into primary color RT.
         if let Some(c0) = colors.first() {
-            let mut rgb_nz = 0usize;
-            let mut max_rgb = 0u8;
-            for px in rgba.chunks_exact(4) {
-                let m = px[0].max(px[1]).max(px[2]);
-                if m != 0 {
-                    rgb_nz += 1;
-                }
-                if m > max_rgb {
-                    max_rgb = m;
-                }
-            }
+            // `rgb_nz`/`max_rgb` are diagnostic fields of the Store lines below,
+            // and producing them is an O(w*h) pass over a whole framebuffer
+            // readback — 2 073 600 pixels per Store at 1080p, at the 28-111
+            // Stores/s `store_routes` measures under load. Computing it here
+            // paid that on every route, including the type-11 one whose only
+            // consumer is a `observe::line` a normal boot discards. Each arm
+            // now scans only when it is about to write a line.
+            let rgb_stats = || {
+                let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
+                (nz, max)
+            };
             let ok = if c0.mapping_id != 0 {
                 // Unconditional. This used to be `if
                 // type11_cpu_store_fallback_allowed(import_allowed)`, where
@@ -319,16 +319,20 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.height,
                             c0.format,
                         );
-                        crate::observe::line(format!(
-                            "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={}",
-                            c0.mapping_id,
-                            c0.width,
-                            c0.height,
-                            req.pipeline_ref,
-                            rgb_nz,
-                            max_rgb
-                        ));
+                        if crate::observe::draw_log_enabled() {
+                            let (rgb_nz, max_rgb) = rgb_stats();
+                            crate::observe::line(format!(
+                                "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={}",
+                                c0.mapping_id,
+                                c0.width,
+                                c0.height,
+                                req.pipeline_ref,
+                                rgb_nz,
+                                max_rgb
+                            ));
+                        }
                     } else {
+                        let (rgb_nz, max_rgb) = rgb_stats();
                         crate::observe::fail(format!(
                             "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} fmt={:#x}",
                             c0.mapping_id,
@@ -382,6 +386,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         rgba,
                     );
                 }
+                let (rgb_nz, max_rgb) = rgb_stats();
                 crate::observe::fail(format!(
                     "linux_m2v_store gva={:#x} {}x{} pipe={} ok={} rgb_nz={} max={}",
                     c0.target_gva,
@@ -407,6 +412,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
                 gva_ok
             } else {
+                let (rgb_nz, max_rgb) = rgb_stats();
                 crate::observe::fail(format!(
                     "linux_m2v_store no_target pipe={} rgb_nz={} max={}",
                     req.pipeline_ref, rgb_nz, max_rgb
