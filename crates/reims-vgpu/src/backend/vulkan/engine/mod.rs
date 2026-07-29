@@ -1006,11 +1006,9 @@ pub unsafe fn present_into_host_ptr_strided(
         ));
     }
     let (width, height, image) = {
-        let slot = pools
-            .registry_get(identity)
-            .ok_or(DrawError::Present(
-                reason::HostPresentDecline::HostPtrUnknownIdentity,
-            ))?;
+        let slot = pools.registry_get(identity).ok_or(DrawError::Present(
+            reason::HostPresentDecline::HostPtrUnknownIdentity,
+        ))?;
         if !slot.content_ready {
             return Err(DrawError::Present(
                 reason::HostPresentDecline::HostPtrNoReadyContent,

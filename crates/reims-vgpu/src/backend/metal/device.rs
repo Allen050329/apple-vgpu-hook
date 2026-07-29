@@ -33,7 +33,6 @@ impl MetalBackend {
     pub fn name(&self) -> &'static str {
         "metal"
     }
-
 }
 
 impl Backend for MetalBackend {

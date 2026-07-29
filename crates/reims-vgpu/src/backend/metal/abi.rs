@@ -3,7 +3,6 @@
 
 #![allow(non_camel_case_types)]
 
-
 pub const REIMS_VGPU_OK: i32 = 0;
 pub const REIMS_VGPU_ERR_ARGS: i32 = 1;
 pub const REIMS_VGPU_ERR_TRANSLATE: i32 = 2;

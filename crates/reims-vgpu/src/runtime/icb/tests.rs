@@ -377,17 +377,45 @@ fn put_type1_buffer(
     bytes: &[u8],
 ) {
     let gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(host, &state.tasks[1], gva, bytes, PAGE_SHIFT_ARM64E).is_ok());
+    write_gva(host, &state.tasks[1], gva, bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], bytes.len() as u64);
     st64(&mut bdesc[8..], handle as u64);
     // Descriptors must sit past the object-list region (32×12 = 0x180).
     let bdesc_gva = 0x200u64 + (obj_ref as u64) * 0x20;
+    put_object(host, state, obj_ref, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
+}
+
+/// Place `bytes` at `gva` in a task's guest address space, asserting the write
+/// landed. Every fixture in this file writes through the arm64e page shift and
+/// treats a failed write as a broken fixture rather than a result, so the
+/// assertion belongs here rather than at 267 call sites.
+fn write_gva(host: &mut FakeHost, task: &crate::model::TaskEntry, gva: u64, bytes: &[u8]) {
     assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], bdesc_gva, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
+        gva_mem::write_task_gva(host, task, gva, bytes, PAGE_SHIFT_ARM64E).is_ok(),
+        "fixture write of {} bytes at {gva:#x} failed",
+        bytes.len()
     );
-    put_list_entry(host, state, obj_ref, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+}
+
+/// Write `bytes` at `gva` and publish it as object `ref_` in the task's object
+/// list — the pair every fixture here performs together.
+///
+/// The published length is `bytes.len()`. That is not a simplification: the
+/// declared length was carried as its own argument through all 173 of these
+/// call sites and asserted equal to the slice at every one of them across the
+/// whole suite. A test that needs the two to disagree — a short-descriptor
+/// refusal — calls [`put_list_entry`] directly, which still takes both.
+fn put_object(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    ref_: u32,
+    otype: u8,
+    gva: u64,
+    bytes: &[u8],
+) {
+    write_gva(host, &state.tasks[1], gva, bytes);
+    put_list_entry(host, state, ref_, otype, bytes.len() as u32, gva);
 }
 
 fn put_list_entry(
@@ -403,7 +431,7 @@ fn put_list_entry(
     let packed = (otype as u32) | (len << 8);
     st32(&mut le[0..], packed);
     le[4..12].copy_from_slice(&gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok());
+    write_gva(host, &state.tasks[1], off, &le);
 }
 
 #[test]
@@ -415,17 +443,7 @@ fn load_icb_from_object_list() {
     setup_task(&mut host, &mut state);
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
     let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
     assert_eq!(icb.max_command_count, 8);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
@@ -447,17 +465,7 @@ fn materialize_and_execute_empty_range() {
     setup_task(&mut host, &mut state);
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
     let (d, icb) = resolve_metal_icb(&state, &host, 1, 9).expect("materialize");
     assert_eq!(d.max_command_count, 8);
     assert_eq!(icb.size(), 8);
@@ -495,46 +503,23 @@ fn fill_and_execute_mul3add1_writeback() {
     // ICB object ref 9: 1 command, maxKernel=1, no inherit (explicit fills).
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Function + pipeline + data buffer (mul3add1).
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
     let fdesc_gva = 0x100u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        5,
+        OBJECT_TYPE_FUNCTION,
         fdesc_gva,
         &fdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, fdesc_gva);
+    );
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -544,40 +529,17 @@ fn fill_and_execute_mul3add1_writeback() {
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
     let pdesc_gva = 0x140u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
     let bdesc_gva = 0x180u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     // Host fill of command slot 0 (no stream fill opcode yet).
     fill_compute_command(
@@ -939,81 +901,25 @@ fn fill_render_draw_patches_tessellation_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     // Vertex-input Float4 @ buffer0 stride 16 (step defaults to PerPatchControlPoint).
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Full-screen clip-space triangle as 3 control points.
     let tri: [[f32; 4]; 3] = [
@@ -1155,80 +1061,24 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Control points: dummy at 0, real full-screen triangle at 1,2,3.
     let cps: [[f32; 4]; 4] = [
@@ -1589,83 +1439,27 @@ fn fill_render_draw_mesh_threads_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Mesh function lives in the type-7 "vertex" function slot (no guest
     // mesh-pipeline descriptor yet — host-fill only path).
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     // No vertex attributes needed for mesh; reuse stage-in desc helper with empty attrs.
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -1770,80 +1564,24 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -2019,80 +1757,24 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Clip-space full-cover triangle at vertex indices 0,1,2.
     let tri: [[f32; 4]; 3] = [
@@ -2283,45 +1965,22 @@ fn buffer_backed_fill_execute_mul3add1() {
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let layout = compute_only_icb_layout(1);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
     let fdesc_gva = 0x100u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        5,
+        OBJECT_TYPE_FUNCTION,
         fdesc_gva,
         &fdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, fdesc_gva);
+    );
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -2331,40 +1990,17 @@ fn buffer_backed_fill_execute_mul3add1() {
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
     let pdesc_gva = 0x140u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
     let bdesc_gva = 0x180u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     // Guest-style fill: command slot in a type-1 backing buffer (handle 4).
     let slot = encode_compute_command_slot(
@@ -2395,27 +2031,19 @@ fn buffer_backed_fill_execute_mul3add1() {
     .unwrap();
     let cmd_handle = 4u32;
     let cmd_mem_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_mem_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_mem_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
     let cmd_bdesc_gva = 0x1c0u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        10,
+        OBJECT_TYPE_BUFFER,
         cmd_bdesc_gva,
         &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, cmd_bdesc_gva);
+    );
 
     // Auto-bind via type-1 buffer_ref (sync path / 0x1d1 payload).
     let mem = associate_icb_backing_buffer_ref(&state, &host, 1, 9, 10).expect("associate");
@@ -2497,22 +2125,7 @@ fn apply_0x1d1_auto_binds_backing() {
     let layout = compute_only_icb_layout(1);
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let slot = encode_compute_command_slot(
         &layout,
@@ -2535,27 +2148,12 @@ fn apply_0x1d1_auto_binds_backing() {
     .unwrap();
     let handle = 5u32;
     let cmd_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], slot.len() as u64);
     st64(&mut bdesc[8..], handle as u64);
     let bdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 11, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+    put_object(&mut host, &state, 11, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     let mem = apply_icb_host_resource_info(
         &state,
@@ -2595,70 +2193,39 @@ fn fill_render_draw_indexed_execute_oracle() {
     // ICB: DrawIndexed, maxFragment=1 for color constant at fragment buffer 0.
     let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Vertex function (ref 2) + fragment function (ref 3).
     // Descriptor GVAs stay past object-list region (32×12 = 0x180).
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
     let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        2,
+        OBJECT_TYPE_FUNCTION,
         vfdesc_gva,
         &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    );
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
     let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        3,
+        OBJECT_TYPE_FUNCTION,
         ffdesc_gva,
         &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    );
 
     // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
@@ -2674,15 +2241,7 @@ fn fill_render_draw_indexed_execute_oracle() {
     pdesc[TYPE7_FIRST_TLVS + 8] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     // Index buffer (ref 12, handle 4): UInt16 [0,1,2].
     let indices: [u16; 3] = [0, 1, 2];
@@ -2807,68 +2366,37 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
     let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        2,
+        OBJECT_TYPE_FUNCTION,
         vfdesc_gva,
         &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    );
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
     let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        3,
+        OBJECT_TYPE_FUNCTION,
         ffdesc_gva,
         &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    );
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -2883,15 +2411,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     pdesc[TYPE7_FIRST_TLVS + 8] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -2936,27 +2456,19 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
     let cmd_bdesc_gva = 0x1a0u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        10,
+        OBJECT_TYPE_BUFFER,
         cmd_bdesc_gva,
         &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, cmd_bdesc_gva);
+    );
 
     apply_icb_host_resource_info(
         &state,
@@ -3057,80 +2569,24 @@ fn wire_backed_draw_patches_tessellation_e2e() {
     let layout = render_draw_patches_icb_layout(1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -3189,26 +2645,11 @@ fn wire_backed_draw_patches_tessellation_e2e() {
     // Command memory only — never call fill_render_command.
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -3309,80 +2750,24 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     let layout = render_draw_indexed_patches_icb_layout(1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Control points: dummy at 0, real triangle at 1,2,3.
     let cps: [[f32; 4]; 4] = [
@@ -3449,26 +2834,11 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
 
     let cmd_handle = 7u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -3577,81 +2947,25 @@ fn fill_render_object_mesh_threadgroups_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -3764,67 +3078,22 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Dual-export object+mesh in classic "vertex" function slot only.
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     // Classic type-7 shape: tag 0x01/0x02 only (no mesh SPI 0x14).
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
@@ -3836,18 +3105,7 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     assert!(!decoded.has_color_attachment_offset || decoded.color_attachment_offset != 0);
     // Mesh SPI shape uses tag 0x14; classic stagein has tag 0x08.
     // object/mesh refs must stay zero so fill uses dual-export scan of vertex metallib.
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -3870,26 +3128,11 @@ fn wire_backed_dual_export_object_mesh_e2e() {
 
     let cmd_handle = 5u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -4000,90 +3243,30 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
     // Object function ref 2, mesh ref 4, fragment ref 3 — three distinct objects.
     let oblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        oblob_gva,
-        &obj_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], oblob_gva, &obj_mtlb);
     let mut ofdesc = vec![0u8; 32];
     st64(&mut ofdesc[0..], oblob_gva);
     st32(&mut ofdesc[8..], obj_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &ofdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &ofdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let mblob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x260,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 32, 0x260);
+    put_object(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 0x260, &mfdesc);
 
     let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
     let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh pipeline decode");
@@ -4091,18 +3274,7 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
     assert_eq!(decoded.mesh_func_ref, 4);
     assert_eq!(decoded.fragment_func_ref, 3);
     assert_eq!(decoded.vertex_func_ref, 0);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x280, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x280,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
 
     fill_render_command(
         &state,
@@ -4215,89 +3387,29 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Three distinct function objects: object=2, frag=3, mesh=4.
     let oblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        oblob_gva,
-        &obj_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], oblob_gva, &obj_mtlb);
     let mut ofdesc = vec![0u8; 32];
     st64(&mut ofdesc[0..], oblob_gva);
     st32(&mut ofdesc[8..], obj_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &ofdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &ofdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let mblob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x260,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 32, 0x260);
+    put_object(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 0x260, &mfdesc);
 
     let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
     let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh SPI pipeline");
@@ -4306,18 +3418,7 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     assert_eq!(decoded.fragment_func_ref, 3);
     assert_eq!(decoded.vertex_func_ref, 0);
     assert!(decoded.has_color_attachment_offset); // tag 0x14 shape
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x280, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x280,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -4340,26 +3441,11 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
 
     let cmd_handle = 5u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -4456,80 +3542,24 @@ fn fill_render_mesh_buffer_bind_oracle() {
     let icb_desc =
         make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // scale = 1.0f LE (handle must be a setup_task-mapped page pfn).
     let scale_bytes = 1.0f32.to_le_bytes();
@@ -4649,80 +3679,24 @@ fn fill_render_object_buffer_bind_oracle() {
     let icb_desc =
         make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
@@ -4847,80 +3821,24 @@ fn wire_backed_mesh_buffer_bind_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
@@ -4956,26 +3874,11 @@ fn wire_backed_mesh_buffer_bind_e2e() {
 
     let cmd_handle = 5u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -5078,80 +3981,24 @@ fn wire_backed_object_buffer_bind_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
@@ -5187,26 +4034,11 @@ fn wire_backed_object_buffer_bind_e2e() {
 
     let cmd_handle = 5u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -5368,81 +4200,25 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let err = fill_render_command(
         &state,
@@ -5522,81 +4298,25 @@ fn fill_render_object_tg_memory_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -5713,80 +4433,24 @@ fn wire_backed_object_tg_memory_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &om_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -5812,26 +4476,11 @@ fn wire_backed_object_tg_memory_e2e() {
 
     let cmd_handle = 5u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -5931,80 +4580,24 @@ fn wire_backed_mesh_threads_e2e() {
     let layout = render_draw_mesh_threads_icb_layout(0);
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let slot = encode_render_command_slot(
         &layout,
@@ -6030,26 +4623,11 @@ fn wire_backed_mesh_threads_e2e() {
 
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -6149,80 +4727,24 @@ fn wire_backed_mesh_threadgroups_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], mblob_gva, &mesh_mtlb);
     let mut mfdesc = vec![0u8; 32];
     st64(&mut mfdesc[0..], mblob_gva);
     st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &mfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let slot = encode_render_command_slot(
         &layout,
@@ -6248,26 +4770,11 @@ fn wire_backed_mesh_threadgroups_e2e() {
 
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -6364,68 +4871,37 @@ fn inherit_buffers_encoder_fragment_color() {
         ICB_FLAG_INHERIT_BUFFERS,
     );
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
     let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        2,
+        OBJECT_TYPE_FUNCTION,
         vfdesc_gva,
         &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    );
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
     let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        3,
+        OBJECT_TYPE_FUNCTION,
         ffdesc_gva,
         &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    );
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -6440,15 +4916,7 @@ fn inherit_buffers_encoder_fragment_color() {
     pdesc[TYPE7_FIRST_TLVS + 8] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -6577,68 +5045,37 @@ fn inherit_pipeline_encoder_fragment_color() {
         ICB_FLAG_INHERIT_PIPELINE_STATE,
     );
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
     let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        2,
+        OBJECT_TYPE_FUNCTION,
         vfdesc_gva,
         &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    );
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
     let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        3,
+        OBJECT_TYPE_FUNCTION,
         ffdesc_gva,
         &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    );
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -6653,15 +5090,7 @@ fn inherit_pipeline_encoder_fragment_color() {
     pdesc[TYPE7_FIRST_TLVS + 8] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -6801,87 +5230,41 @@ fn fill_render_stagein_draw_execute_oracle() {
     // Draw (not indexed): max_vertex=1 for position buffer bind.
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
     let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        2,
+        OBJECT_TYPE_FUNCTION,
         vfdesc_gva,
         &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    );
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
     let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        3,
+        OBJECT_TYPE_FUNCTION,
         ffdesc_gva,
         &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    );
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        pdesc_gva,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     // Fullscreen triangle positions (clip space), stride 16 Float4.
     let tri: [[f32; 4]; 3] = [
@@ -7021,80 +5404,24 @@ fn wire_backed_draw_primitives_stagein_e2e() {
     let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -7157,26 +5484,11 @@ fn wire_backed_draw_primitives_stagein_e2e() {
 
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -7366,80 +5678,24 @@ fn fill_render_attribute_stride_stagein_execute() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Tight Float4 positions (stride 16) — attributeStride matches layout stride.
     let tri: [[f32; 4]; 3] = [
@@ -7578,80 +5834,24 @@ fn wire_backed_attribute_stride_stagein_e2e() {
     assert!(icb_layout_attribute_stride_slot_count(&layout) >= 1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -7717,26 +5917,11 @@ fn wire_backed_attribute_stride_stagein_e2e() {
 
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
@@ -7873,40 +6058,14 @@ fn fill_compute_barrier_and_tg_memory_execute() {
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 1, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_object(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 0x100, &fdesc);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -7915,31 +6074,16 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     let layout = compute_icb_layout(1, 1);
     fill_compute_command(
@@ -8039,40 +6183,14 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     // inheritBuffers; maxKernel still advertises encoder bind capacity.
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_BUFFERS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_object(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 0x100, &fdesc);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -8081,31 +6199,16 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     // Fill: pipeline + dispatch only — no kernel buffer in the ICB slot.
     fill_compute_command(
@@ -8203,40 +6306,14 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_PIPELINE_STATE);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_object(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 0x100, &fdesc);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -8245,31 +6322,16 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     // Fill: buffers + dispatch only — pipeline_ref 0 (inherited).
     fill_compute_command(
@@ -8373,24 +6435,12 @@ fn put_type2_texture(
     st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], pixel_format);
     // Descriptor GVAs stay below the first resource page (handle<<14).
     let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        host,
-        state,
-        obj_ref,
-        OBJECT_TYPE_TEXTURE,
-        TEXTURE_DESC_BASE_LEN as u32,
-        desc_gva,
-    );
+    put_object(host, state, obj_ref, OBJECT_TYPE_TEXTURE, desc_gva, &desc);
     let data_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
     let mut page = vec![0u8; size as usize];
     let n = seed.len().min(page.len());
     page[..n].copy_from_slice(&seed[..n]);
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], data_gva, &page, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    write_gva(host, &state.tasks[1], data_gva, &page);
 }
 
 /// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
@@ -8419,17 +6469,7 @@ fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, nor
     st32(&mut desc[SAMPLER_DESC_WORD20..], 0f32.to_bits()); // lod min
     st32(&mut desc[SAMPLER_DESC_LOD_MAX..], f32::MAX.to_bits());
     let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        host,
-        state,
-        obj_ref,
-        OBJECT_TYPE_TYPE7,
-        SAMPLER_DESC_LEN as u32,
-        desc_gva,
-    );
+    put_object(host, state, obj_ref, OBJECT_TYPE_TYPE7, desc_gva, &desc);
 }
 
 /// Textures/samplers always bind on the parent compute encoder at ICB
@@ -8466,40 +6506,14 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_object(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 0x100, &fdesc);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -8508,31 +6522,16 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     const W: u32 = 2;
     const H: u32 = 2;
@@ -8674,40 +6673,14 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     // maxKernel=1 for the AB buffer slot; no inheritBuffers — AB recorded on ICB.
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_object(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 0x100, &fdesc);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -8716,11 +6689,7 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     const W: u32 = 4;
     const H: u32 = 4;
@@ -8829,40 +6798,14 @@ fn icb_argument_buffer_sample_and_write() {
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], blob_gva, &mtlb);
     let mut fdesc = vec![0u8; 32];
     st64(&mut fdesc[0..], blob_gva);
     st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_object(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 0x100, &fdesc);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -8871,11 +6814,7 @@ fn icb_argument_buffer_sample_and_write() {
     pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 2] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     const W: u32 = 4;
     const H: u32 = 4;
@@ -9036,68 +6975,37 @@ fn fill_render_nonzero_bind_offset_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
     let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        2,
+        OBJECT_TYPE_FUNCTION,
         vfdesc_gva,
         &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    );
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
     let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        3,
+        OBJECT_TYPE_FUNCTION,
         ffdesc_gva,
         &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    );
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -9112,15 +7020,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
     pdesc[TYPE7_FIRST_TLVS + 8] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     // Index buffer: 4 B pad + 6 B indices (offset 4).
@@ -9247,66 +7147,21 @@ fn buffer_backed_nonzero_wire_va_offset() {
     let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
     let mut vfdesc = vec![0u8; 32];
     st64(&mut vfdesc[0..], vblob_gva);
     st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_object(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 0x200, &vfdesc);
 
     let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
     let mut ffdesc = vec![0u8; 32];
     st64(&mut ffdesc[0..], fblob_gva);
     st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_object(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 0x220, &ffdesc);
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -9320,11 +7175,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
     pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
     pdesc[TYPE7_FIRST_TLVS + 8] = 4;
     st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, 0x240);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let mut index_bytes = vec![0u8; 8]; // pad 8
@@ -9395,26 +7246,11 @@ fn buffer_backed_nonzero_wire_va_offset() {
 
     let cmd_handle = 6u32;
     let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_gva(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    put_object(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
 
     apply_icb_host_resource_info(
         &state,
