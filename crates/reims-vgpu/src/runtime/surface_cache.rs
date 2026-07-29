@@ -503,8 +503,9 @@ pub enum SyncFlushResult {
 /// already writeback_guest on Store is a no-op here (`NoHostCache` or rewrite
 /// same bytes). Does **not** invent pages; requires mapped `page_entries`.
 ///
-/// Type-2/3 GVA cache is **not** flushed here (keyed by GVA, not object_id);
-/// see [`flush_gva_host_cache_on_map`].
+/// Type-2/3 GVA cache is **not** flushed here: it is keyed by GVA rather than
+/// object_id, and nothing flushes it into guest pages at all — see the
+/// MapMemory2 arm in `runtime/drain`.
 pub fn flush_surface_id_to_guest_pages<
     M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
 >(
@@ -543,108 +544,6 @@ pub fn flush_surface_id_to_guest_pages<
         height: h,
         host_gen,
     }
-}
-
-/// Outcome of [`flush_gva_host_cache_on_map`] (MapMemory2 remount).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GvaMapFlushStats {
-    /// Host GVA cache entries written into guest pages.
-    pub wrote: u32,
-    /// Walker failed for cache entry base GVA.
-    pub walk_fail: u32,
-    /// No host_gva entry whose base falls in the Map range.
-    pub no_cache: u32,
-}
-
-/// RE MapMemory2 / UnmapMemory order:
-/// - **Unmap notify:** guest has **already** `PageTable::deallocate` — walker fails;
-///   host cannot flush via GVA (too late). Retain [`host_gva_surfaces`] for sample.
-/// - **Map notify:** guest has **already** installed leaf PPNs — walker works;
-///   new PFNs are empty until host re-writes encode.
-///
-/// Discrete type-2/3 encode lives in `host_gva_surfaces` (keyed by allocation
-/// base GVA). After remount, push that BGRA cache into the new guest pages so
-/// guest RAM matches host-executed content. This is **not** inventing PFNs
-/// (guest already wrote PTEs) and **not** inventing geometry (cache w/h).
-///
-/// `map_gva`/`map_len` are the MapMemory2 wire range; any cache key `k` with
-/// `map_gva <= k < map_gva+map_len` is flushed (allocation bases fall in map).
-pub fn flush_gva_host_cache_on_map<
-    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
->(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    map_gva: u64,
-    map_len: u64,
-) -> GvaMapFlushStats {
-    let mut stats = GvaMapFlushStats::default();
-    if map_gva == 0 || map_len == 0 {
-        return stats;
-    }
-    let map_end = map_gva.saturating_add(map_len);
-    let keys: Vec<u64> = state
-        .host_gva_surfaces
-        .keys()
-        .copied()
-        .filter(|&k| k != 0 && k >= map_gva && k < map_end)
-        .collect();
-    if keys.is_empty() {
-        stats.no_cache = 1;
-        return stats;
-    }
-    for gva in keys {
-        let Some(e) = state.host_gva_surfaces.get(&gva).cloned() else {
-            continue;
-        };
-        if e.bgra.is_empty() || e.width == 0 || e.height == 0 {
-            continue;
-        }
-        let w = e.width;
-        let h = e.height;
-        let bpr = w.saturating_mul(RGBA8_BPP);
-        let span = (h as u64).saturating_mul(bpr as u64);
-        // Texture must fit in the mapped range from its base.
-        if gva.saturating_add(span) > map_end {
-            stats.walk_fail = stats.walk_fail.saturating_add(1);
-            continue;
-        }
-        let row_len = bpr as usize;
-        let mut ok = true;
-        for y in 0..h as usize {
-            let so = y.saturating_mul(row_len);
-            if so + row_len > e.bgra.len() {
-                ok = false;
-                break;
-            }
-            let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
-            if crate::runtime::gva_mem::write_task_gva_product(
-                state,
-                host,
-                task_id,
-                row_gva,
-                &e.bgra[so..so + row_len],
-            )
-            .is_err()
-            {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            stats.wrote = stats.wrote.saturating_add(1);
-            crate::observe::fail(format!(
-                "gva_map_flush ok gva={gva:#x} {w}x{h} task={task_id} host_gen={} map={map_gva:#x}+{map_len:#x}",
-                e.host_gen
-            ));
-        } else {
-            stats.walk_fail = stats.walk_fail.saturating_add(1);
-            crate::observe::fail(format!(
-                "gva_map_flush fail gva={gva:#x} {w}x{h} task={task_id} map={map_gva:#x}+{map_len:#x}"
-            ));
-        }
-    }
-    stats
 }
 
 #[cfg(test)]

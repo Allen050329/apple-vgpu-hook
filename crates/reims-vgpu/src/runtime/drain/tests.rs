@@ -2174,11 +2174,6 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
         [0, 0, 0, 0],
         "product MapMemory2 must stay notify-only for GVA (no auto flush)"
     );
-    // Helper path still works when called explicitly.
-    let fl = surface_cache::flush_gva_host_cache_on_map(&mut state, &mut host, 1, gva, 0x1000);
-    assert_eq!(fl.wrote, 1);
-    host.read_gpa(data_gpa, &mut probe).unwrap();
-    assert_eq!(&probe[..4], &[185, 126, 81, 255]);
 }
 
 /// Synchronize 0x35 is stamp + wait only — no host_cache→guest write (RE audit).

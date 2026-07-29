@@ -4,14 +4,7 @@ use crate::contract::endian::ld32;
 use crate::contract::gva::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Architecture {
-    Arm64e = 0,
-    X86_64 = 1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
-    pub architecture: Architecture,
     pub page_shift: u32,
     pub page_size: u32,
     pub page_offset_mask: u32,
@@ -26,7 +19,6 @@ pub struct Geometry {
 }
 
 pub const ARM64E_GEOMETRY: Geometry = Geometry {
-    architecture: Architecture::Arm64e,
     page_shift: PAGE_SHIFT_ARM64E,
     page_size: PAGE_SIZE_ARM64E,
     page_offset_mask: ARM64E_PAGE_OFFSET_MASK,
@@ -41,7 +33,6 @@ pub const ARM64E_GEOMETRY: Geometry = Geometry {
 };
 
 pub const X86_64_GEOMETRY: Geometry = Geometry {
-    architecture: Architecture::X86_64,
     page_shift: PAGE_SHIFT_X86,
     page_size: PAGE_SIZE_X86,
     page_offset_mask: X86_64_PAGE_OFFSET_MASK,
@@ -204,7 +195,6 @@ pub struct SpanChunk {
     pub page_index: u64,
     pub page_offset: u32,
     pub chunk_index: u64,
-    pub chunk_count: u64,
     pub cache_status: CacheStatus,
 }
 
@@ -651,7 +641,6 @@ where
             page_index: translation.gva_page_index,
             page_offset: page_off,
             chunk_index,
-            chunk_count: span.page_count,
             cache_status: translation.cache_status,
         };
         if !visitor(&chunk) {

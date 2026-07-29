@@ -57,16 +57,12 @@ pub struct ComputeSession {
     /// Nested dispatches encoded on this session; flushed after GPU completion.
     pub(crate) nested_jobs: Vec<compute_exec::NestedDispatchJob>,
     pub control_depth: i32,
-    pub saw_control: bool,
-    pub saw_icb: bool,
     ended: bool,
 }
 
 #[cfg(feature = "backend-vulkan")]
 pub struct ComputeSession {
     pub control_depth: i32,
-    pub saw_control: bool,
-    pub saw_icb: bool,
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -117,8 +113,6 @@ impl ComputeSession {
                 retained_icbs: Vec::new(),
                 nested_jobs: Vec::new(),
                 control_depth: 0,
-                saw_control: false,
-                saw_icb: false,
                 ended: false,
             })
         }
@@ -143,8 +137,6 @@ impl ComputeSession {
                 encode_start_else, encode_start_if, encode_start_while,
             };
             use metal::MTLResourceOptions;
-
-            self.saw_control = true;
 
             let mut stage_cond = |this: &mut Self,
                                   buffer_ref: u32,
@@ -272,7 +264,6 @@ impl ComputeSession {
         cmd: &ComputeCommand,
         acc: &ComputeAccum,
     ) -> ComputeStatus {
-        self.saw_icb = true;
         if cmd.indirect_command_buffer_ref == 0 {
             return ComputeStatus::MissingBuffer("compute_icb_ref_zero");
         }

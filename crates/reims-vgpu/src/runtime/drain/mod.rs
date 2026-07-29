@@ -2143,14 +2143,16 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         );
                     }
                 }
-                // MapMemory2 GVA host_cache→guest flush is **disabled** after
+                // There is deliberately no host_cache→guest GVA flush on
+                // MapMemory2. One existed and was disabled after
                 // serial-20260714-035023: PTE Corruption (freelist-shaped
-                // 0xff100000ff000000) ~135s into boot while map_gva_flush was
-                // writing (incl. one Map len=0x1c3e000 → 13 GVA rewrites).
-                // Samples still use host_gva retain on Unmap. Re-enable only
-                // after A/B without flush is clean and a narrower flush policy
-                // is RE-justified (exact-base only / no multi-key heap maps).
-                // See kb map-memory2 / xnu-pte-corruption-windowserver.
+                // 0xff100000ff000000) ~135s into boot while it was writing —
+                // one Map of len=0x1c3e000 alone drove 13 GVA rewrites. Samples
+                // use the `host_gva_surfaces` retain on Unmap instead. Any
+                // re-introduction has to be a *narrower* policy than that one
+                // (exact-base only, no multi-key heap maps) and RE-justified, so
+                // the broad implementation is not kept around to be switched
+                // back on. See kb map-memory2 / xnu-pte-corruption-windowserver.
             } else if packet.opcode == CHILD_OP_DELETE_IOSURFACE_BACKING2 && plen >= 8 {
                 // Live Ventura payload + current-kext symbol agree with the
                 // resource contract: `{objectID, taskID}`. This is the lifetime

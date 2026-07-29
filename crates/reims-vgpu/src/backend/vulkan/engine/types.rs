@@ -1253,8 +1253,6 @@ pub struct SampledContentIdentity {
 pub struct DrawTicket {
     /// Identity of the color target written by the draw (if residency used).
     pub target: Option<TargetIdentity>,
-    /// Whether a full-frame readback was performed (oracle/Store path).
-    pub readback_performed: bool,
     /// Optional oracle-mode pixels when readback was requested with the draw.
     pub pixels: Option<Vec<u8>>,
 }

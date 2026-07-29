@@ -1179,8 +1179,6 @@ pub struct MemoCounters {
     pub zc_flush_skip: u64,
     /// Memo answers invalidated by an intervening arm/disarm.
     pub zc_flush_stale: u64,
-    pub zc_flush_walk: u64,
-    pub zc_flush_recheck: u64,
 }
 
 /// One host-VA run of a memoized guest span (model mirror of the engine's

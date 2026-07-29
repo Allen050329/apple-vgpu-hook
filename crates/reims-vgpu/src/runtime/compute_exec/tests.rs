@@ -703,8 +703,6 @@ fn dispatch_nometal_with_texture_binds() {
     // Nested short-circuit remains NoMetal on Linux (SPI not wired).
     let mut session = crate::runtime::compute_session::ComputeSession {
         control_depth: 0,
-        saw_control: false,
-        saw_icb: false,
     };
     let st2 = execute_dispatch_nested(&mut state, &mut host, 1, &acc, &cmd, &mut session);
     assert_eq!(st2, ComputeStatus::NoMetal("compute_nested_no_vulkan_path"));

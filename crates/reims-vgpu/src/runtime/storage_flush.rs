@@ -177,7 +177,6 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             // Signature changed: re-check the cached pages against the current
             // windows without a PT walk.
             let pages = pages.clone();
-            state.tranche.zc_flush_recheck = state.tranche.zc_flush_recheck.saturating_add(1);
             let isect = state.deferred_pages_intersect(&pages);
             if !isect {
                 state.flush_nohit_memo.insert(memo_key, (sig, pages));
@@ -201,7 +200,6 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     // Which page produced the first hit. The walk is complete, so this is the
     // true first overlapping page rather than the next sample point after it.
     let mut first_hit_ordinal: Option<u64> = None;
-    state.tranche.zc_flush_walk = state.tranche.zc_flush_walk.saturating_add(1);
     {
         let index = &state.deferred_alias_pages;
         let linear_index = &state.linear_deferred_flush;

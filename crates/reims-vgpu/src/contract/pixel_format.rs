@@ -273,8 +273,6 @@ pub struct DepthStencilPacking {
     pub full_bpp: u32,
     /// Byte offset of the depth field within the texel (if present).
     pub depth_offset: u32,
-    /// Raw depth field size in the packed texel (before buffer expansion).
-    pub depth_raw_size: u32,
     /// Buffer-side depth plane size after Metal extraction.
     pub depth_plane_bpp: u32,
     /// Byte offset of the stencil field within the texel (if present).
@@ -304,7 +302,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 8,
             depth_offset: 0,
-            depth_raw_size: 4,
             depth_plane_bpp: 4,
             stencil_offset: 4,
             stencil_plane_bpp: 1,
@@ -314,7 +311,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_DEPTH24_UNORM_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 4,
             depth_offset: 0,
-            depth_raw_size: 4,
             depth_plane_bpp: 4,
             stencil_offset: 0,
             stencil_plane_bpp: 1,
@@ -324,7 +320,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_X32_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 8,
             depth_offset: 0,
-            depth_raw_size: 0,
             depth_plane_bpp: 0,
             stencil_offset: 4,
             stencil_plane_bpp: 1,
@@ -334,7 +329,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_X24_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 4,
             depth_offset: 0,
-            depth_raw_size: 0,
             depth_plane_bpp: 0,
             stencil_offset: 0,
             stencil_plane_bpp: 1,
