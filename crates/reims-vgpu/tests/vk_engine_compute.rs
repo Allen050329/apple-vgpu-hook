@@ -20,13 +20,27 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-fn engine_test_lock() -> &'static Mutex<()> {
+/// Acquire the process-global engine lock **and** reset the engine, in that
+/// order. Every engine-touching test must start from a fresh context:
+/// `device_loss_named_and_recreate_bounded` deliberately drives the
+/// device-recreate budget to its cap and leaves it there, which is the correct
+/// product behaviour — the cap is a permanent give-up, not a per-draw counter.
+/// A test that acquires the lock without resetting therefore inherits an engine
+/// that refuses every draw with `recreate_cap_exhausted`. Handing the guard out
+/// only from a function that has already reset makes that omission unwritable,
+/// rather than a rule about call order that the next test can forget.
+fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| {
-        // Never share the live product logs with a concurrent boot.
-        reims_vgpu::observe::redirect_logs_for_tests();
-        Mutex::new(())
-    })
+    let guard = LOCK
+        .get_or_init(|| {
+            // Never share the live product logs with a concurrent boot.
+            reims_vgpu::observe::redirect_logs_for_tests();
+            Mutex::new(())
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    engine::test_reset_engine();
+    guard
 }
 
 fn skip_if_no_gpu(err: &str) -> bool {
@@ -131,8 +145,7 @@ fn engine_or_skip(label: &str, req: &ComputeRequest) -> Option<engine::ComputeOu
 /// SSBO-only: b[i] += 1 for 256 floats (known result 11.0 from seed 10.0).
 #[test]
 fn compute_inc_ssbo_known_result() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let Some(words) = inc_comp_spirv() else {
         return;
     };
@@ -174,8 +187,7 @@ fn compute_inc_ssbo_known_result() {
 /// host after the fence.
 #[test]
 fn compute_readonly_ssbo_has_zero_readback() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let spvasm = r#"
                OpCapability Shader
                OpMemoryModel Logical GLSL450
@@ -228,8 +240,7 @@ fn compute_readonly_ssbo_has_zero_readback() {
 /// 2D grid tiling: proves grid.y is not dropped (GlobalInvocationId.y varies).
 #[test]
 fn compute_2d_grid_tiles_global_invocation_xy() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let spvasm = r#"
                OpCapability Shader
                OpMemoryModel Logical GLSL450
@@ -306,8 +317,7 @@ fn compute_2d_grid_tiles_global_invocation_xy() {
 /// Storage image Rgba8Unorm: each invocation writes solid red (known unorm result).
 #[test]
 fn compute_storage_image_rgba8unorm_known_result() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // Kernel: imageStore(out, ivec2(gid.xy), vec4(1,0,0,1)) for 4x4 Rgba8Unorm.
     let spvasm = r#"
                OpCapability Shader
@@ -492,8 +502,7 @@ fn compute_storage_image_rgba8unorm_known_result() {
 /// This is the exact mechanism that rendered the 4K desktop blue before the fix.
 #[test]
 fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     if !engine::supports_storage_image_write_without_format() {
         // The device (or its B8G8R8A8_UNORM storage support) is absent — the
         // product path degrades to the swapped Rgba8Unorm view, so this
@@ -608,8 +617,7 @@ fn compute_storage_image_bgra8unorm_is_not_channel_swapped() {
 /// placeholder.
 #[test]
 fn compute_storage_image_seed_skip_and_lost_resident() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_rgba8unorm_known_result.
     let spvasm = r#"
                OpCapability Shader
@@ -734,8 +742,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
 /// resident is the named error — never silent stale bytes.
 #[test]
 fn compute_storage_image_deferred_readback_and_flush_read() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
     let spvasm = r#"
                OpCapability Shader
@@ -893,8 +900,7 @@ fn compute_storage_image_deferred_readback_and_flush_read() {
 /// `vk_compute_exec_resident_sample_*` — never a silent zero seed.
 #[test]
 fn compute_sampled_resident_copy_and_lost_resident() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // Same red-fill kernel as compute_storage_image_seed_skip_and_lost_resident.
     let fill_spvasm = r#"
                OpCapability Shader
@@ -1126,8 +1132,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
 /// hop — no host upload. A height mismatch stays a visible shape loss.
 #[test]
 fn compute_sampled_resident_reinterpret_copy() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // Same red-fill kernel as compute_sampled_resident_copy_and_lost_resident.
     let fill_spvasm = r#"
                OpCapability Shader
@@ -1354,8 +1359,7 @@ fn compute_sampled_resident_reinterpret_copy() {
 /// exact content. Locks the engine's key-kind agnosticism end-to-end.
 #[test]
 fn compute_linear_resident_deferred_chain() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // Same red-fill + fetch kernels as compute_sampled_resident_copy_and_lost_resident.
     let fill_spvasm = r#"
                OpCapability Shader
@@ -1571,8 +1575,7 @@ fn compute_linear_resident_deferred_chain() {
 /// Sampled inputs must use SAMPLED_IMAGE descriptors and remain input-only.
 #[test]
 fn compute_sampled_image_fetch_preserves_float_bits() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let spvasm = r#"
                OpCapability Shader
                OpMemoryModel Logical GLSL450
@@ -1724,8 +1727,7 @@ fn compute_sampled_image_fetch_preserves_float_bits() {
 /// m2v Kernel fixture (float_mul4_add3): known CPU formula x*4+3.
 #[test]
 fn compute_m2v_float_mul4_add3_known_result() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let Some(words) = translate_kernel("float_mul4_add3") else {
         return;
     };
@@ -1761,8 +1763,7 @@ fn compute_m2v_float_mul4_add3_known_result() {
 /// Warm identical dispatch: zero creates and zero allocs.
 #[test]
 fn warm_identical_dispatch_zero_creates_and_allocs() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let Some(words) = inc_comp_spirv() else {
         return;
     };
@@ -1810,8 +1811,7 @@ fn warm_identical_dispatch_zero_creates_and_allocs() {
 /// 16-bit storage shape: R16Float storage image (capability-gated on device).
 #[test]
 fn compute_storage_image_r16float_if_supported() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     // imageStore half red into R16Float 2x2.
     let spvasm = r#"
                OpCapability Shader

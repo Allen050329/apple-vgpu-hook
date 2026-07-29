@@ -20,13 +20,27 @@ use reims_vgpu::backend::vulkan::engine::{
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-fn engine_test_lock() -> &'static Mutex<()> {
+/// Acquire the process-global engine lock **and** reset the engine, in that
+/// order. Every engine-touching test must start from a fresh context:
+/// `device_loss_named_and_recreate_bounded` deliberately drives the
+/// device-recreate budget to its cap and leaves it there, which is the correct
+/// product behaviour — the cap is a permanent give-up, not a per-draw counter.
+/// A test that acquires the lock without resetting therefore inherits an engine
+/// that refuses every draw with `recreate_cap_exhausted`. Handing the guard out
+/// only from a function that has already reset makes that omission unwritable,
+/// rather than a rule about call order that the next test can forget.
+fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| {
-        // Never share the live product logs with a concurrent boot.
-        reims_vgpu::observe::redirect_logs_for_tests();
-        Mutex::new(())
-    })
+    let guard = LOCK
+        .get_or_init(|| {
+            // Never share the live product logs with a concurrent boot.
+            reims_vgpu::observe::redirect_logs_for_tests();
+            Mutex::new(())
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    engine::test_reset_engine();
+    guard
 }
 
 fn fixtures() -> PathBuf {
@@ -121,8 +135,7 @@ fn draw_or_skip(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
 
 #[test]
 fn plain_triangle_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
     if let Some(px) = draw_or_skip("plain_triangle", &req) {
@@ -132,8 +145,7 @@ fn plain_triangle_known_color() {
 
 #[test]
 fn viewport_scissor_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 32, 32);
     req.viewports.push(ViewportResource {
@@ -169,8 +181,7 @@ fn triangle_covered(px: &[u8], w: u32, h: u32) -> bool {
 /// actually applied AND the front-facing winding selects the right face.
 #[test]
 fn cull_mode_honored_and_winding_correct() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
 
@@ -226,8 +237,7 @@ fn cull_mode_honored_and_winding_correct() {
 /// the wiring without depending on the exact depth compare operand order.
 #[test]
 fn depth_test_honored_compare_and_clear_wired() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
@@ -344,8 +354,7 @@ fn depth_test_honored_compare_and_clear_wired() {
 /// green channel discriminator survives the R/B swap (index 1 unchanged).
 #[test]
 fn depth_test_honored_on_resident_target_path() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
@@ -475,8 +484,7 @@ fn depth_test_honored_on_resident_target_path() {
 /// observe and are the documented follow-up gap.
 #[test]
 fn stencil_test_honored_compare_ref_and_clear_wired() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
@@ -595,8 +603,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
 
 #[test]
 fn load_seed_preserves_uncovered_and_draws() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     // Fullscreen triangle covers everything; seed is Load base then overdrawn.
@@ -608,8 +615,7 @@ fn load_seed_preserves_uncovered_and_draws() {
 
 #[test]
 fn blend_src_alpha_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
@@ -630,8 +636,7 @@ fn blend_src_alpha_known_color() {
 
 #[test]
 fn indexed_u16_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 16, 16);
     req.indexed = Some(IndexedDrawResource {
@@ -653,8 +658,7 @@ fn indexed_u16_known_color() {
 
 #[test]
 fn storage_buffer_binding_still_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.storage_buffers.push(StorageBufferResource {
@@ -678,8 +682,7 @@ fn storage_buffer_binding_still_renders() {
 
 #[test]
 fn sampled_and_sampler_still_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -779,8 +782,7 @@ fn sampled_and_sampler_still_renders() {
 /// does not reap the whole signaled run.
 #[test]
 fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -835,8 +837,7 @@ fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
 /// later LoadFromTarget draw on the source identity.
 #[test]
 fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let source = TargetIdentity::Surface {
         id: 0x51,
@@ -894,8 +895,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
 /// prior-content sampling without binding one image for read and write at once.
 #[test]
 fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 0x52,
@@ -943,8 +943,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
 
 #[test]
 fn vertex_float2_attr_still_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.vertex_attributes.push(VertexAttributeResource {
@@ -976,8 +975,7 @@ fn vertex_float2_attr_still_renders() {
 /// changed bytes falls back to the content-addressed path (miss + reupload).
 #[test]
 fn sampled_identity_fast_path_skips_content_compare() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -1048,8 +1046,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
 
 #[test]
 fn warm_identical_draw_zero_creates_and_allocs() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
     match engine::execute_draw_request(&req) {
@@ -1082,8 +1079,7 @@ fn warm_identical_draw_zero_creates_and_allocs() {
 
 #[test]
 fn warm_draw_byte_identical_hot_cache() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
     let first = match engine::execute_draw_request(&req) {
@@ -1106,8 +1102,7 @@ fn warm_draw_byte_identical_hot_cache() {
 /// Warm non-Store resident draw: zero readbacks, zero seed uploads, zero creates, zero allocs.
 #[test]
 fn warm_non_store_zero_readback_seed_create_alloc() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 42,
@@ -1166,8 +1161,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
 /// synchronous Store).
 #[test]
 fn pinned_resident_target_survives_registry_cap_sweep() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
 
     let absent = TargetIdentity::Surface {
@@ -1248,8 +1242,7 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
 /// because nothing else in this suite reads the same resident twice.
 #[test]
 fn a_bgra_resident_draw_reads_back_identically_twice() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let w = 16u32;
     let h = 16u32;
@@ -1295,8 +1288,7 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
 /// of guest descriptors: shader-visible R/G/B must land as physical B/G/R.
 #[test]
 fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -1428,8 +1420,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
 fn reflected_static_sampler_descriptor_samples_texture() {
     use metal2vulkan::reflect::ResourceKind;
 
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let tmp = std::env::temp_dir().join(format!(
         "paravirt_engine_{}_static_sampler",
@@ -1533,8 +1524,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
 /// loader is switched to stop swizzling.
 #[test]
 fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -1656,8 +1646,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
     use reims_vgpu::contract::pixel_format;
 
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -1770,8 +1759,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
 /// fullscreen tests overwrite the bad upload and cannot catch this class.
 #[test]
 fn partial_draw_preserves_rgba_seed_on_bgra_target() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (vert, frag) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
     let identity = TargetIdentity::Surface {
@@ -1826,8 +1814,7 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
 /// so this cannot pass by both paths being broken the same way.
 #[test]
 fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (vert, frag) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
     // Deliberately asymmetric in R and B, so an omitted or doubled exchange is
@@ -1893,8 +1880,7 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
 /// Premult One/OMSA: GPU Load+blend matches the retired software composite oracle.
 #[test]
 fn premult_one_omsa_gpu_blend_matches_software_oracle() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // Seed: solid gray base (128,128,128,255)
     let w = 16u32;
@@ -1945,8 +1931,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
 /// Product choice is also locked by `type11_load_ready_uses_resident_not_clear`.
 #[test]
 fn skip_readback_store_then_load_from_target_preserves_content() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 91,
@@ -1990,8 +1975,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
 /// resident images even when the next guest reuses the same id/generation.
 #[test]
 fn guest_reset_evicts_resident_targets_without_destroying_context() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 91,
@@ -2021,8 +2005,7 @@ fn guest_reset_evicts_resident_targets_without_destroying_context() {
 /// Chain byte-parity: LoadFromTarget chain matches CPU-seed chain.
 #[test]
 fn chain_load_from_target_byte_parity_vs_cpu_seed() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // CPU-seed chain: draw1 clear → pixels → draw2 LoadSeed(pixels) → pixels2
     let d1 = engine_req(&v, &f, 16, 16);
@@ -2072,8 +2055,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
 /// per record) it replaces.
 #[test]
 fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // CPU round-trip reference chain: every record reads back, next record
     // re-uploads the pixels as its seed (the legacy GVA chain rail).
@@ -2141,8 +2123,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
 /// byte-identical pixels to the synchronous readback Store it replaces.
 #[test]
 fn gva_deferred_store_flush_read_matches_sync_store() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // Sync reference: the legacy Store readback.
     let d_sync = engine_req(&v, &f, 16, 16);
@@ -2191,8 +2172,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
 
 #[test]
 fn device_loss_named_and_recreate_bounded() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 8, 8);
     match engine::execute_draw_request(&req) {
@@ -2239,6 +2219,25 @@ fn device_loss_named_and_recreate_bounded() {
         "device_lost counter must fire, got {}",
         snap.device_lost
     );
+
+    // The cap is a permanent give-up: the engine this test leaves behind refuses
+    // every draw. Suite independence therefore rests entirely on
+    // `test_reset_engine` clearing the budget, which is what
+    // [`engine_test_session`] does for every other case. Pin that here, at the
+    // one site that manufactures the exhausted state — if the reset ever stops
+    // clearing it, the whole suite goes order-dependent, and it fails as a
+    // single unrelated case rather than as anything named "reset".
+    engine::test_reset_engine();
+    assert_eq!(
+        engine::device_recreate_count(),
+        0,
+        "reset must clear the recreate budget"
+    );
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {}
+        Err(e) => panic!("engine must draw again after a reset from an exhausted cap: {e}"),
+    }
 }
 
 /// In-flight ring lock (3-deep): consecutive no-readback resident draws land
@@ -2248,8 +2247,7 @@ fn device_loss_named_and_recreate_bounded() {
 /// If RING_DEPTH changes, the wrap arithmetic below must follow.
 #[test]
 fn ring_overlaps_in_flight_no_readback_draws() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let id_a = TargetIdentity::Surface {
         id: 91,
@@ -2326,8 +2324,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
 /// content byte-exactly.
 #[test]
 fn seed_from_target_gpu_copies_front_frame() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let front = TargetIdentity::Surface {
         id: 71,
@@ -2397,8 +2394,7 @@ fn seed_from_target_gpu_copies_front_frame() {
 /// vibrancy coverage mask) instead of silently discarding it.
 #[test]
 fn mrt_secondary_attachment_becomes_sampleable_resident() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let primary = TargetIdentity::Surface {
         id: 0x60,
@@ -2482,8 +2478,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
 /// image build and render without error, and the mask persists as a resident.
 #[test]
 fn mrt_rg16float_secondary_builds_and_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let primary = TargetIdentity::Surface {
         id: 0x63,
@@ -2529,8 +2524,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
 /// path untouched — same fragment color, zero MRT residents created.
 #[test]
 fn single_rt_draw_unaffected_by_mrt_path() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let target = TargetIdentity::Surface {
         id: 0x64,
@@ -2569,7 +2563,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
 /// unbound read was the arm64 MoltenVK GPU-address-fault class.
 #[test]
 fn framebuffer_fetch_reads_destination_via_input_attachment() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = engine_test_session();
     let (v, _) = triangle_spirv();
     let f = translate_words("render_frag_fetch.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);

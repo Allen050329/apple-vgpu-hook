@@ -1767,6 +1767,62 @@ So to exercise a parity case on the GPU, **run it in a filter small enough to st
 limit** and confirm `grep -c SKIP` is 0 for that run. A full-suite count of 20 on a machine with a
 working driver is this ceiling, and says nothing about whether your change works.
 
+**A serial suite runs in alphabetical order, so renaming a test is a scheduling change.** This is
+the sharpest instance of "instrument the branch, not the arm" that this repo has produced, because
+the control experiment was run, was careful, and did not vary the variable.
+
+`0760635` deleted the dmabuf present rail and replaced one parity case with a differently-named one.
+`vk_engine_parity` went 40/40 → 39/40, failing
+`framebuffer_fetch_reads_destination_via_input_attachment` with
+`vk_device_lost_recreate_cap_exhausted cap=3`. It was written up as a product regression caused by
+that commit, with the three deleted `VK_KHR_external_memory*` device-extension pushes as prime
+suspect, and the branch was handed over red.
+
+**All of it was wrong, and the same failure reproduces at the parent commit.** Two tests, run as a
+filtered pair at `b26c7c8` — the commit *before* the deletion — fail identically:
+
+```sh
+cargo test … --test vk_engine_parity -- --test-threads=1 \
+  device_loss_named_and_recreate_bounded framebuffer_fetch_reads_destination_via_input_attachment
+```
+
+The mechanism is entirely in the suite. `device_loss_named_and_recreate_bounded` exists to drive the
+device-recreate budget to `MAX_DEVICE_RECREATES` and prove it stops there, so it leaves an engine
+that refuses every subsequent draw — correct product behaviour, since the cap is a permanent
+give-up. Every other case opened with `test_reset_engine()`; `framebuffer_fetch` was **the only
+engine-touching case in the suite that did not**, and alphabetically `e…` used to sit between `d…`
+and `f…`. The renamed replacement moved to `a_bgra_…`, the shield went away, and a latent bug that
+had been there for the life of the file surfaced attached to an unrelated commit.
+
+Three transferable points:
+
+- **The control preserved the condition it meant to remove.** "Deleting the replacement test
+  entirely still fails, so it is not a position shift" — but deleting it leaves `framebuffer_fetch`
+  *still* immediately after `device_loss`, which is the whole mechanism. A control that holds the
+  suspect variable fixed reads exactly like a refutation. State what the control changed, not what
+  it removed.
+- **"It passes alone" is evidence *for* order-dependence, not against it.** It was recorded as
+  evidence the test was innocent. A test that passes alone and fails in the suite is the definition
+  of contaminated state; the next command after observing it should be a two-test filter, which
+  costs three seconds and settles it.
+- **The log said so and was not read.** The per-process sink
+  (`/tmp/reims-vgpu-fail-test-<pid>.log`, not the product log — `redirect_logs_for_tests`) showed
+  four `vk_device_select` lines and then the cap-exhausted refusal, with **no device create for the
+  failing test at all**. A device that is never created cannot have been lost by a missing
+  extension. One `cat` of the right file discriminates "the engine lost the device" from "the engine
+  refused before touching it".
+
+Fixed structurally rather than by adding the missing line: `engine_test_lock()` is now
+`engine_test_session()`, which takes the lock *and* resets, and hands back the guard. The omission
+is no longer writable — there is no way to obtain the lock without having reset — and it deleted 53
+lines of two-line preamble across `vk_engine_parity.rs` and `vk_engine_compute.rs`. The product-side
+property it now rests on (a reset clears an exhausted budget) is pinned by an assertion at the tail
+of `device_loss_named_and_recreate_bounded`, verified to fail without it.
+
+Note `tests/vk_engine_batch.rs` still has the raw-lock idiom and **no `test_reset_engine()` in any
+of its six cases**. It passes because nothing in that binary manufactures a poisoned engine — the
+trap is unarmed there, not absent.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
