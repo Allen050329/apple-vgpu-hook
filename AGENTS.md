@@ -489,6 +489,27 @@ Do not assume `flush_one` can be called as-is: the compute flush reads a *storag
 `ComputeStorageResidencyKey`, and a render Store's pixels live in a *target* resident by
 `TargetIdentity`. The index and the triggers are reusable; the read is not.
 
+**`req.output_bgra` is built, tested, and unreachable from product code — turning it on is part of
+this fix.** `grep -rn output_bgra crates/reims-vgpu` finds it read in five places in
+`engine/exec.rs`, and assigned `true` in exactly six places, *all of them in
+`tests/vk_engine_parity.rs`*. No `src/` file ever sets it, so `let output_bgra = req.output_bgra &&
+req.target_identity.is_some()` is permanently false and the engine's "BGRA output, so a raw
+image→buffer copy lands guest scanout order with **no CPU swizzle**" path never runs.
+
+That matters twice over. It is why the runtime still pays `swap_rb_channels` on every type-11 Load
+seed — the cache holds BGRA, `LoadSeed` is defined as semantic RGBA8, and the pooled target is RGBA,
+so the swap is a real conversion and *not* independently removable. And it means the swizzle-free
+resident path already exists with six GPU-executing parity tests behind it
+(`partial_draw_preserves_rgba_seed_on_bgra_target`,
+`sampled_rgba_upload_to_bgra_target_preserves_semantic_channels`,
+`a_view_swizzle_is_performed_by_the_image_view_not_the_cpu` and three more, all `grep -c SKIP` of 0
+when filtered). Do not delete it as dead; it is the other half of the deferred type-11 rail.
+
+One piece of that waste *was* independently removable and is gone: `execute_draw_inner` cloned the
+whole seed frame twice in fifteen lines — once into `resolved_load` (structural, `req` is a shared
+reference) and again into `seed_bytes`, purely to own a buffer the `output_bgra` arm could mutate in
+place. The second is now a move. Nothing else read `resolved_load` after that point.
+
 Two process points are worth as much as the result. First, the decisive probe was a *duty cycle* —
 a state — where the pre-existing `sync_exec_lock_hold` was an event count above a 250 ms threshold,
 and the measured frame period sat at 252–665 ms, i.e. just under that threshold for entire runs. It

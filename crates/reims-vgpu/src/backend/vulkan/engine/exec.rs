@@ -794,13 +794,21 @@ pub(crate) unsafe fn execute_draw_inner(
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
     // copy lands guest scanout order with no CPU swizzle.
-    let seed_bytes: Option<Vec<u8>> = match &resolved_load {
-        LoadOp::LoadSeed(bytes) => {
+    // Consumes `resolved_load` — this is its last use, and the seed is a whole
+    // frame. Cloning here made the second full-frame copy of the same pixels in
+    // fifteen lines: `resolved_load` is already a clone (`req` is a shared
+    // reference, so that one is structural), and this produced another only to
+    // own something the `output_bgra` arm could mutate in place. Moving gets the
+    // same buffer with the same mutation and no allocation. At the measured
+    // ~190 MB/s of seed uploads that is ~190 MB/s of memcpy and ~70 multi-MiB
+    // allocations a second removed, on the drain worker that `drain_duty` shows
+    // pinned at duty 0.99.
+    let seed_bytes: Option<Vec<u8>> = match resolved_load {
+        LoadOp::LoadSeed(mut native) => {
             // LoadSeed is semantic RGBA8. Vulkan buffer→image copies do not
             // perform format conversion, so a BGRA resident attachment needs
             // physical B/G/R/A bytes. Otherwise partial draws preserve an
             // exact R/B-exchanged seed outside their damaged geometry.
-            let mut native = bytes.clone();
             if output_bgra {
                 for pixel in native.chunks_exact_mut(4) {
                     pixel.swap(0, 2);
