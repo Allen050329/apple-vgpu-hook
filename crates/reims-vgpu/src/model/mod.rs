@@ -12,7 +12,7 @@ pub use regs::*;
 pub use state::{
     ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState,
     DeviceId, DeviceState, DisplayHandshake, ExecFault, FailEvent,
-    FrameStats, GfxRegs, GuestLinearMemo, GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry,
+    GfxRegs, GuestLinearMemo, GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry,
     GvaHostView, HostLinearTexture, HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture,
     MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc,
     PendingWork,

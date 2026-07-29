@@ -1883,16 +1883,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut all_write = true;
     if !writeback_guest {
         // Still log + early paint latch only when storing; chain returns RGBA.
-        let out0 = color_outs.first().cloned();
-        if let Some(ref out_rgba) = out0 {
-            let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
-            let c = &color_list[0];
-            crate::observe::line(format!(
-                "metal_draw chain mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={} load={} pipe={}",
-                c.mapping_id, c.target_gva, c.format, width, height, nz, maxb, c.load_action, req.pipeline_ref
-            ));
-        }
-        return (EncodeStatus::Ok, out0);
+        return (EncodeStatus::Ok, color_outs.first().cloned());
     }
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == PASS_STORE_ACTION_DONT_CARE {
@@ -1908,7 +1899,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             continue;
         }
         let out_rgba = &color_outs[i];
-        let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
         // Type-2/3 GVA keeps archive image_changed via store_seed_policy.
         let load_seed = color_seeds.get(i).and_then(|s| s.as_deref());
         let seed_for_store = store_seed_policy(force_full_store, c.load_action, load_seed);
@@ -1981,123 +1971,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         };
         if wrote {
             any_write = true;
-            // Dual-mid census (REIMS_VGPU_DRAW_LOG=1): type-11 Stores after mode switch.
-            if c.mapping_id != 0 {
-                crate::observe::line(format!(
-                    "full_store mid={} ref={} gva={:#x} fmt={:#x} {}x{} nz={} load={} force_full={} seed_diff={} pipe={}",
-                    c.mapping_id,
-                    c.texture_ref,
-                    c.target_gva,
-                    c.format,
-                    width,
-                    height,
-                    nz,
-                    c.load_action,
-                    force_full_store as u8,
-                    seed_for_store.is_some() as u8,
-                    req.pipeline_ref
-                ));
-            }
-            let attr_summary: Vec<String> = pipeline
-                .vertex_attributes
-                .iter()
-                .take(8)
-                .map(|a| {
-                    format!(
-                        "loc{} fmt={} off={} bi={} stride={}",
-                        a.location, a.format, a.offset, a.buffer_index, a.stride
-                    )
-                })
-                .collect();
-            let bind_summary: Vec<String> = req
-                .vertex_buffers
-                .iter()
-                .map(|b| format!("i{}:r{}@{}", b.index, b.buffer_ref, b.offset))
-                .collect();
-            // Fragment/vertex sampled-texture summary (wallpaper composite often
-            // has no vtx buf pattern change — only frag tex content differs).
-            let frag_tex_summary: Vec<String> = frag_tex_items
-                .iter()
-                .map(|it| {
-                    let (tnz, tmax) = crate::observe::nonzero_stats(&it.rgba);
-                    format!("f{}:{}x{} nz={} max={}", it.index, it.w, it.h, tnz, tmax)
-                })
-                .collect();
-            let vtx_tex_summary: Vec<String> = vtx_tex_items
-                .iter()
-                .map(|it| {
-                    let (tnz, tmax) = crate::observe::nonzero_stats(&it.rgba);
-                    format!("v{}:{}x{} nz={} max={}", it.index, it.w, it.h, tnz, tmax)
-                })
-                .collect();
-            // Stage-in first three float4s (position/color) for geometry diagnosis.
-            let mut vtx0 = String::from("-");
-            if let Some(a) = pipeline
-                .vertex_attributes
-                .iter()
-                .find(|a| a.format != 0 && a.stride != 0 && a.buffer_index == 1)
-            {
-                if let Some(pos) = vtx_bind_idx.iter().position(|&bi| bi == 1) {
-                    let data = &vtx_storage[pos];
-                    let stride = a.stride as usize;
-                    let mut parts = Vec::new();
-                    for vi in 0..3 {
-                        let base = a.offset as usize + vi * stride;
-                        if base + 16 <= data.len() {
-                            let x = f32::from_le_bytes(data[base..base + 4].try_into().unwrap());
-                            let y =
-                                f32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap());
-                            let z =
-                                f32::from_le_bytes(data[base + 8..base + 12].try_into().unwrap());
-                            let w =
-                                f32::from_le_bytes(data[base + 12..base + 16].try_into().unwrap());
-                            parts.push(format!("({x:.1},{y:.1},{z:.1},{w:.1})"));
-                        }
-                    }
-                    if !parts.is_empty() {
-                        vtx0 = parts.join("");
-                    }
-                }
-            }
-            let fbuf_summary: Vec<String> = req
-                .fragment_buffers
-                .iter()
-                .map(|b| format!("i{}:r{}@{}", b.index, b.buffer_ref, b.offset))
-                .collect();
-            crate::observe::line(format!(
-                "metal_draw ok mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={} clear=[{:.3},{:.3},{:.3},{:.3}] seed_nz={} load={} blend={} attrs={} attrs_with_data={} pipe={} binds={:?} fbufs={:?} ftex={:?} vtex={:?} vtx0={} vtx_idx={:?} idx={} scissor={:?} vp={:?} attr=[{}]",
-                c.mapping_id,
-                c.target_gva,
-                c.format,
-                width,
-                height,
-                nz,
-                maxb,
-                c.clear_color[0],
-                c.clear_color[1],
-                c.clear_color[2],
-                c.clear_color[3],
-                color_seeds
-                    .get(i)
-                    .and_then(|s| s.as_ref())
-                    .map(|s| crate::observe::nonzero_stats(s).0)
-                    .unwrap_or(0),
-                c.load_action,
-                if pipeline.color0.blending_enabled { 1 } else { 0 },
-                attrs.len(),
-                stage_in_with_data.len(),
-                req.pipeline_ref,
-                bind_summary,
-                fbuf_summary,
-                frag_tex_summary,
-                vtx_tex_summary,
-                vtx0,
-                vtx_bind_idx,
-                req.indexed.as_ref().map(|i| i.index_count).unwrap_or(0),
-                req.scissor,
-                req.viewport.map(|v| [v[0], v[1], v[2], v[3]]),
-                attr_summary.join("; "),
-            ));
             // Early-boot logo+pill: paint type-11 front before first DisplaySwap.
             if c.mapping_id != 0 {
                 crate::runtime::scanout::note_front_buffer_writeback(
@@ -2111,6 +1984,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             }
         } else {
             all_write = false;
+            let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
             crate::observe::fail(format!(
                 "metal_draw writeback fail mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={}",
                 c.mapping_id, c.target_gva, c.format, width, height, nz, maxb

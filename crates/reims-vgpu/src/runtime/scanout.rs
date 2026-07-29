@@ -342,23 +342,15 @@ pub fn capture_present_frame(
             crate::model::PaintSrc::None => "guest_pages",
         }
     };
-    // One fused pass over the 8 MiB frame instead of separate byte-nz and
-    // rgb-nz scans — this runs on the present drain under the device lock, so
-    // halving the measure-only scan cuts per-present lock-hold (present cadence
-    // / boot convergence). Byte-exact with nonzero_stats + bgra_rgb_stats.
-    let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
-    crate::observe::line(format!(
-        "scanout capture_present mid={mapping_id} {width}x{height} gen={generation} nz={nz} max={maxb} last_store={} host_cache={}",
-        from_last_store as u8,
-        from_host_cache as u8
-    ));
-    // Offline: always log capture with RGB-visible stats (not byte-nz/alpha).
-    // The `peers=[...]` field re-scans every same-geometry host surface (up to
-    // several 8 MiB buffers) purely for diagnosis. Build the field only under
-    // REIMS_VGPU_DRAW_LOG so a normal boot does not pay N extra full-frame scans
-    // per present on the drain lock.
-    let mut peers = String::new();
+    // The occupancy scan and the three lines it fed are diagnostic: each is an
+    // O(w*h) walk of the just-captured 8 MiB frame on the present drain, under
+    // the device lock, and the `peers` field walks every same-geometry host
+    // surface on top of that. The always-on alarm for a black console is
+    // `present_black`, which does its own scan at the drain boundary where the
+    // verdict is acted on.
     if crate::observe::draw_log_enabled() {
+        let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
+        let mut peers = String::new();
         for (&mid, e) in state.host_surfaces.iter() {
             if mid == mapping_id || e.width != width || e.height != height || e.bgra.is_empty() {
                 continue;
@@ -374,27 +366,17 @@ pub fn capture_present_frame(
                 ));
             }
         }
-    }
-    // Per-present provenance census — one line on EVERY present. Under a
-    // continuously-animating app this is ~15–30k lines/session of pure diagnostic
-    // trace: `present_black` fires the genuine "console will be black" alarm and
-    // nothing consumes this line's fields beyond diagnosis, so gate it (and the
-    // redundant `present host_cache`, whose info is the `src=host_cache` field
-    // here) behind REIMS_VGPU_DRAW_LOG so a normal boot does not flood the
-    // curated fail view.
-    crate::observe::line(format!(
-        "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
-        px0[0],
-        px0[1],
-        px0[2],
-        px0[3],
-        state.present.present_mapping,
-        state.present.frame_mapping,
-        state.present.frame_flush_seen as u8,
-    ));
-    if from_host_cache {
         crate::observe::line(format!(
-            "present host_cache mid={mapping_id} {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} gen={generation}"
+            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} last_store={} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
+            from_last_store as u8,
+            from_host_cache as u8,
+            px0[0],
+            px0[1],
+            px0[2],
+            px0[3],
+            state.present.present_mapping,
+            state.present.frame_mapping,
+            state.present.frame_flush_seen as u8,
         ));
     }
     // Publish the new frame and recycle the old retain buffer as the next
@@ -406,19 +388,6 @@ pub fn capture_present_frame(
     state.present.frame_height = height;
     state.present.frame_generation = generation;
     state.present.frame_valid = true;
-    // Stash this capture's fused occupancy scan so the console paint
-    // (`copy_to_bgra8`, under the device lock on the QEMU display thread) does
-    // not re-scan the same frozen 8 MiB frame twice just to fill its diagnostic
-    // lines. Keyed by mapping+generation so a mismatch falls back to a rescan.
-    state.present.frame_stats = crate::model::FrameStats {
-        mapping: mapping_id,
-        generation,
-        byte_nz: nz,
-        byte_max: maxb,
-        rgb_nz,
-        max_rgb,
-        px0,
-    };
     // The present declares this mapping's guest pages the finished frame; the
     // guest may CPU-write them next (inter-buffer damage forward-copy). The
     // first LOAD draw after this present must re-seed from guest pages
@@ -616,21 +585,16 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // mapping+generation means the stashed stats describe these exact
             // bytes; a mismatch (e.g. a test-injected frame) falls back to a scan.
             // Per-paint census on the QEMU display thread — ~30k lines/session
-            // each under a continuously-animating app, and (on a frame_stats
-            // miss) an O(w·h) `bgra_present_stats` full-frame scan built PURELY to
+            // each under a continuously-animating app, plus an O(w·h)
+            // `bgra_present_stats` full-frame scan built PURELY to
             // populate the log. Both the scan and the two lines are log-only
             // (nothing below consumes the stats), so gate the whole block behind
             // REIMS_VGPU_DRAW_LOG: a normal boot pays neither the scan nor the flood.
             // The always-on present rate/occupancy signal lives in the
             // present_proxy summary + `present_import`.
             if crate::observe::draw_log_enabled() {
-                let fs = state.present.frame_stats;
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
-                    if fs.mapping == shown_mid && fs.generation == shown_gen {
-                        (fs.byte_nz, fs.byte_max, fs.rgb_nz, fs.max_rgb, fs.px0)
-                    } else {
-                        crate::observe::bgra_present_stats(&state.present.frame_bgra)
-                    };
+                    crate::observe::bgra_present_stats(&state.present.frame_bgra);
                 crate::observe::line(format!(
                     "scanout paint_snapshot mid={} (action mid={} gen={}) {}x{} retain_gen={} nz={} max={}",
                     shown_mid, mapping_id, expected_generation, width, height, shown_gen, nz, maxb
@@ -1835,61 +1799,6 @@ mod tests {
         assert_eq!(
             state.present.last_paint_src,
             crate::model::PaintSrc::GuestPagesFragmented
-        );
-    }
-
-    /// The console paint reuses the stats `capture_present_frame` already scanned
-    /// instead of re-scanning the 8 MiB frame twice under the device lock. Lock
-    /// that the stashed `frame_stats` are byte-exact with a fresh fused scan of
-    /// `frame_bgra` and keyed to the current mapping+generation — so the reused
-    /// diagnostic can never silently diverge from what a rescan would report.
-    #[test]
-    fn capture_stashes_frame_stats_byte_exact_with_rescan() {
-        use crate::runtime::mapping_write::write_bgra8;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut host = FakeHost::new();
-        let mid = 4u32;
-        let pfn = 0x70u32;
-        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(gpa, 0x4000, 0);
-        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![entry];
-        }
-        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-        // Mixed content so byte-nz != rgb-nz (black + alpha-only + colored).
-        let frame = [
-            0x00u8, 0x00, 0x00, 0xFF, // rgb-empty, byte-nonzero (alpha)
-            0x10, 0x20, 0x30, 0xFF, // colored
-            0x00, 0x00, 0x00, 0x00, // fully black
-            0xFF, 0x80, 0x40, 0xFF, // colored
-        ];
-        assert!(write_bgra8(&mut state, &mut host, mid, &frame, 8, 2, 2));
-        let gen = state.mappings.get(&mid).unwrap().content_generation;
-        state.present.frame_flush_seen = true;
-        state.present.width = 2;
-        state.present.height = 2;
-
-        assert!(capture_present_frame(&mut state, mid, 2, 2, gen));
-        let fs = state.present.frame_stats;
-        assert_eq!(fs.mapping, mid, "stats keyed to captured mapping");
-        assert_eq!(fs.generation, gen, "stats keyed to captured generation");
-        let (nz, maxb, rgb_nz, max_rgb, px0) =
-            crate::observe::bgra_present_stats(&state.present.frame_bgra);
-        assert_eq!(
-            (fs.byte_nz, fs.byte_max, fs.rgb_nz, fs.max_rgb, fs.px0),
-            (nz, maxb, rgb_nz, max_rgb, px0),
-            "stashed stats must be byte-exact with a fresh rescan of frame_bgra"
-        );
-        // Sanity: the mixed content really exercises the byte-nz vs rgb-nz split.
-        assert!(
-            fs.byte_nz != fs.rgb_nz,
-            "test frame must separate the two scans"
         );
     }
 

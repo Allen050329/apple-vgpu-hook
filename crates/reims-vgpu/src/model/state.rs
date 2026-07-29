@@ -890,34 +890,6 @@ pub enum PaintSrc {
     GuestPagesFragmented,
 }
 
-/// Occupancy stats of the retained `frame_bgra` snapshot, computed **once** by
-/// [`crate::runtime::scanout::capture_present_frame`]'s fused scan.
-///
-/// The console paint ([`crate::runtime::scanout::copy_to_bgra8`]) runs under the
-/// device lock on the QEMU display thread and previously re-scanned the same
-/// 8 MiB `frame_bgra` twice (a byte-nz pass + an rgb-nz pass) purely to fill its
-/// diagnostic `present_paint` lines — contending with the worker/VBL for the
-/// lock. Since `frame_bgra` is frozen at capture time (only writer is
-/// `capture_present_frame`), those stats are already known; the paint reuses
-/// them, guarded by `mapping`/`generation` so a mismatch falls back to a scan.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameStats {
-    /// The `frame_mapping` these stats were computed for.
-    pub mapping: u32,
-    /// The `frame_generation` these stats were computed for.
-    pub generation: u32,
-    /// Nonzero **bytes** across all four channels (`nonzero_stats`).
-    pub byte_nz: usize,
-    /// Max byte value across all four channels.
-    pub byte_max: u8,
-    /// Pixels with `max(B,G,R) > 0` (`bgra_rgb_stats`).
-    pub rgb_nz: usize,
-    /// Max of B/G/R across the frame.
-    pub max_rgb: u8,
-    /// First pixel BGRA.
-    pub px0: [u8; 4],
-}
-
 /// Present / scanout model state.
 #[derive(Clone, Debug, Default)]
 pub struct PresentState {
@@ -1030,9 +1002,6 @@ pub struct PresentState {
     pub backpressure_hold_count: u64,
     /// Sub-path the most recent `paint_mapping` used (measure-only provenance).
     pub last_paint_src: PaintSrc,
-    /// Occupancy stats of the current `frame_bgra`, computed once at capture so
-    /// the console paint does not re-scan the 8 MiB frame under the device lock.
-    pub frame_stats: FrameStats,
     /// Recycled scratch for the present-capture frame buffer.
     ///
     /// `capture_present_frame` previously did `vec![0u8; need]` on **every**
