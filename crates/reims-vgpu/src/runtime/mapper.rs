@@ -559,6 +559,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     };
 
+    // Read before the `get_mut` below takes `state` mutably.
+    let page_shift = state.page_shift;
     let mut retired = None;
     let mut incarnation_changed = false;
     let mut reprieved = false;
@@ -581,6 +583,34 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
         if pages_changed {
             DeviceState::bump_map_generation(m);
+        }
+        // The guest-physical footprint this incarnation authorises us to write.
+        //
+        // A guest kernel panic names a *physical page* (`pmap_page_protect()
+        // ... pn=0x46b53b`), and nothing this device emitted could be compared
+        // against it — so "did we write there?" was unanswerable, and the
+        // random-victim panic class in AGENTS.md stayed a signature with no way
+        // to confirm or clear this device. Every mapping-rail write is bounded
+        // to the page list adopted here, so the union of these spans over a boot
+        // is exactly the set of pages those writes can reach. A `pn` inside it
+        // is evidence; a `pn` outside every one of them exonerates the rail.
+        //
+        // One line per surface incarnation, not per write: the key is
+        // (mapping, generation) and the generation only moves when the PFNs do,
+        // so this is bounded by how often the guest rewires a surface and is
+        // safe to leave on. min/max over the entries is O(pages) once per
+        // incarnation, against an O(pages) table build that just ran.
+        if pages_changed {
+            if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
+                crate::observe::off(format!(
+                    "mapping_gpa_span mid={mapping_id} gen={} pages={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
+                    m.map_generation,
+                    plan.entries.len(),
+                    hi + (1u64 << page_shift),
+                    lo >> page_shift,
+                    hi >> page_shift,
+                ));
+            }
         }
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
@@ -763,6 +793,27 @@ fn fail_closed_surface_page_collision(
 /// carries different pages (drop the old windows); `reprieved` = the delete
 /// was stale — the plan matches the fingerprint, the same incarnation lives
 /// on (keep generation, resident, deferred windows).
+/// Lowest and highest page-aligned GPA a page-entry list resolves to.
+///
+/// Invalid entries are skipped rather than failing the span: the span is a
+/// *bound* on where writes through this list can land, and an entry that does
+/// not resolve is one that no write can reach. `None` when nothing resolves.
+///
+/// The bound is inclusive of `hi` — it names the first byte of the last page,
+/// not the end of it — so a caller reporting a range must add one page. The
+/// page list is not sorted and is not contiguous, so `[lo, hi]` is a hull and
+/// not a promise that every page inside it belongs to this surface.
+fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u64)> {
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    for &e in entries {
+        if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+            lo = lo.min(gpa);
+            hi = hi.max(gpa);
+        }
+    }
+    (lo != u64::MAX).then_some((lo, hi))
+}
+
 pub(crate) fn plan_adoption_decision(
     condemned: Option<&[u32]>,
     current: &[u32],
@@ -1783,6 +1834,33 @@ mod tests {
         MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
         MAPPING_INTERNAL_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
+
+    /// The span is a hull over the *resolvable* entries, in PFN order-independent
+    /// fashion, and it must not be fooled by an unsorted list or by an invalid
+    /// entry sitting at either end — those are exactly the shapes a real page
+    /// list has, and a span that tracked first/last instead of min/max would
+    /// name a range that does not contain the pages written.
+    #[test]
+    fn entry_gpa_span_is_a_hull_over_resolvable_entries() {
+        let valid = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        // Unsorted, so first/last != min/max.
+        let entries = [valid(9), valid(3), valid(7)];
+        assert_eq!(
+            entry_gpa_span(&entries, 12),
+            Some((3u64 << 12, 9u64 << 12)),
+            "min/max, not first/last"
+        );
+        // An invalid entry is skipped, not treated as GPA 0 — a zero would drag
+        // `lo` to the bottom of RAM and make the span claim pages no write can
+        // reach, which is the wrong direction for a bound used as evidence.
+        let with_hole = [0u32, valid(3), valid(9), 0u32];
+        assert_eq!(entry_gpa_span(&with_hole, 12), Some((3u64 << 12, 9u64 << 12)));
+        // Page shift is honoured rather than assumed to be 12 (arm64 is 14).
+        assert_eq!(entry_gpa_span(&entries, 14), Some((3u64 << 14, 9u64 << 14)));
+        // Nothing resolvable ⇒ no span at all, rather than (u64::MAX, 0).
+        assert_eq!(entry_gpa_span(&[0, 0], 12), None);
+        assert_eq!(entry_gpa_span(&[], 12), None);
+    }
 
     #[test]
     fn plan_adoption_decision_incarnation_semantics() {
