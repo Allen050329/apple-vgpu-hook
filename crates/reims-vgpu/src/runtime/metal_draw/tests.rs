@@ -1628,31 +1628,6 @@ fn present_front_frame_seed_requires_valid_same_geometry_retain() {
     assert_eq!(present_front_frame_rgba(&present, 2, 1), None);
 }
 
-/// Load composite must not restore seed over intentional covered black.
-#[test]
-fn load_composite_keeps_covered_black_restores_alpha0_only() {
-    // Seed: gray base (prior frame / host_cache).
-    let seed = vec![187u8, 187, 187, 255, 187, 187, 187, 255];
-    // Draw: covered black (loginwindow) + uncovered hole (A=0).
-    let draw = vec![0u8, 0, 0, 255, 0, 0, 0, 0];
-    let (out, filled) = load_composite_alpha0_holes(&draw, &seed);
-    assert_eq!(filled, 1, "only alpha-0 hole restored");
-    assert_eq!(&out[0..4], &[0, 0, 0, 255], "covered black stays black");
-    assert_eq!(&out[4..8], &[187, 187, 187, 255], "alpha0 hole gets seed");
-}
-
-/// Fully opaque draw black must never pull seed (would freeze logo base).
-#[test]
-fn load_composite_full_covered_black_no_seed() {
-    let seed = vec![153u8; 16]; // 4 gray pixels
-    let draw = vec![
-        0u8, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255,
-    ];
-    let (out, filled) = load_composite_alpha0_holes(&draw, &seed);
-    assert_eq!(filled, 0);
-    assert_eq!(&out[..], &draw[..]);
-}
-
 /// Premult One/OneMinusSrcAlpha Load: transparent draw keeps seed; opaque black wins.
 #[test]
 fn load_composite_premult_restores_seed_under_transparent() {

@@ -2144,32 +2144,6 @@ pub(crate) fn store_seed_policy(
     }
 }
 
-/// Composite Metal Load seed under **uncovered** draw texels (alpha==0 only).
-///
-/// Covered black `(0,0,0,A>0)` must stay black — restoring seed on zero-RGB alone
-/// froze loginwindow/logo bases and blocked full-screen black/desktop layers
-/// (live pipe-37 Load composites, 2026-07-13).
-///
-/// Returns `(pixels, filled_count)` where `filled_count` is seed texels written.
-#[cfg(test)]
-pub(crate) fn load_composite_alpha0_holes(draw_rgba: &[u8], seed_rgba: &[u8]) -> (Vec<u8>, usize) {
-    if draw_rgba.len() != seed_rgba.len() || !draw_rgba.len().is_multiple_of(4) {
-        return (draw_rgba.to_vec(), 0);
-    }
-    let mut composed = draw_rgba.to_vec();
-    let mut filled = 0usize;
-    for (dst, src) in composed.chunks_exact_mut(4).zip(seed_rgba.chunks_exact(4)) {
-        if dst[3] == 0 && (src[0] | src[1] | src[2] | src[3]) != 0 {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            dst[3] = src[3];
-            filled += 1;
-        }
-    }
-    (composed, filled)
-}
-
 /// How Linux/Vulkan should honor a type-11 color attachment Load.
 ///
 /// Metal type-11 Load reads guest-backed attachment bytes (unified). Discrete
@@ -2310,8 +2284,14 @@ pub(crate) fn resolve_type11_load_decision(
 /// transparent fragments. Opaque black still wins (intentional Clear-like black).
 ///
 /// Returns `(pixels, blended_texels)` where blended counts texels with `src.a < 255`.
-/// Software premult One/OMSA composite — retained as the **byte-parity oracle**
-/// for hardware Load+blend (D3). Product path no longer calls this.
+/// Software premult One/OMSA composite. **The product path does not call this**
+/// — the hardware does Load+blend — and its two unit tests only check it against
+/// hand-written constants, so it reads as dead on both of the obvious checks.
+/// It is not. `premult_one_omsa_gpu_matches_software_composite` in
+/// `tests/vk_engine_parity.rs` runs the real GPU blend and asserts it agrees
+/// with this function to within 1 LSB, which makes this the only independent
+/// statement of what that blend is supposed to compute. Deleting it deletes the
+/// check, not the duplication.
 pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (Vec<u8>, usize) {
     if draw_rgba.len() != seed_rgba.len() || !draw_rgba.len().is_multiple_of(4) {
         return (draw_rgba.to_vec(), 0);
