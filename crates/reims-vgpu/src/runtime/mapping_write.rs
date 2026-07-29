@@ -113,6 +113,36 @@ fn contig_for_span<H: HostMemory + HostOps>(
     Some((ptr, len))
 }
 
+/// One past the last mapping byte a rect transfer touches: the last texel of its
+/// last row, at `bpr` pitch, `x_off` bytes into the row.
+///
+/// Both the raw-pointer read and the raw-pointer write below must compare this
+/// against `span_end`, because `contig_for_span` guarantees the view covers
+/// `span_end` and nothing more — past it a read takes unrelated QEMU heap and a
+/// write smashes unrelated guest pages, both trace-lessly. Written once because
+/// duplicated arithmetic is the only reason the two sides could disagree, and
+/// they did: the write side was hardened for this bound and the read side
+/// shipped without it. Each caller still names its own slug — `read_overrun` and
+/// `writeback_overrun` are different losses.
+fn rect_extent_end(
+    base_off: u64,
+    origin_y: u32,
+    height: u32,
+    bpr: usize,
+    x_off: u64,
+    rb: usize,
+) -> u64 {
+    base_off
+        .saturating_add(
+            (origin_y as u64)
+                .saturating_add(height as u64)
+                .saturating_sub(1)
+                .saturating_mul(bpr as u64),
+        )
+        .saturating_add(x_off)
+        .saturating_add(rb as u64)
+}
+
 /// Write a tight BGRA8 image into the mapping's guest pages.
 ///
 /// Packed contig HostOps view when possible; else multi-import maximal packed
@@ -703,31 +733,11 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // Same bound the write side enforces (`writeback_overrun`), and for the
-        // same reason: `contig_for_span` guarantees the view covers `span_end`
-        // and nothing more, while both branches below reach the last texel of
-        // the last row — `base_off + (origin_y+height-1)*bpr + x_off + rb`. A
-        // geometry that exceeds what `span_end` allows therefore reads past the
-        // view, and past the host mapping it reads whatever is next in the QEMU
-        // process: sampled texture content sourced from unrelated memory, or a
-        // SIGSEGV that takes the VM down with no guest-side trace.
-        //
-        // The write side was hardened for this and the read side was not, which
-        // is the asymmetry to watch for — a raw-pointer fast path added beside a
-        // checked slow path inherits none of its bounds. The fragmented branch
-        // below goes through `mapper::read_mapping_bytes`, which is bounded.
-        //
-        // A correctly-sized read satisfies this exactly (dense tight read:
-        // `read_end == span_end`), so this drops ONLY a genuine overrun.
-        let read_end = base_off
-            .saturating_add(
-                (origin_y as u64)
-                    .saturating_add(height as u64)
-                    .saturating_sub(1)
-                    .saturating_mul(bpr as u64),
-            )
-            .saturating_add(x_off)
-            .saturating_add(rb as u64);
+        // The fragmented branch below goes through `mapper::read_mapping_bytes`,
+        // which is bounded already. A correctly-sized read satisfies this exactly
+        // (dense tight read: `read_end == span_end`), so it drops ONLY a genuine
+        // overrun.
+        let read_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
         if read_end > span_end {
             crate::observe::fail(format!(
                 "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
@@ -977,26 +987,12 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // `contig_for_span` only guarantees the view covers `span_end`, NOT the
-        // full write extent. Both branches below write up to the last texel of
-        // the last row — `base_off + (origin_y+height-1)*bpr + x_off + rb` — so
-        // if the source `height` (or `origin_y`) exceeds what the destination
-        // `span_end` allows, the copy runs past the view into adjacent guest
-        // pages: a trace-less heap smash. The
-        // fragmented full-plane branch below already rejects on the same bound
+        // The fragmented full-plane branch below already rejects on the same bound
         // (`frame_end > span_end`); enforce it here too so the contig fast paths
         // can never overrun. A correctly-sized writeback satisfies this exactly
-        // (dense tight write: write_end == span_end), so this drops ONLY a
-        // genuine overrun — named, never silent.
-        let write_end = base_off
-            .saturating_add(
-                (origin_y as u64)
-                    .saturating_add(height as u64)
-                    .saturating_sub(1)
-                    .saturating_mul(bpr as u64),
-            )
-            .saturating_add(x_off)
-            .saturating_add(rb as u64);
+        // (dense tight write: `write_end == span_end`), so it drops ONLY a genuine
+        // overrun — named, never silent.
+        let write_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
         if write_end > span_end {
             crate::observe::fail(format!(
                 "mapping_write fail reason=writeback_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} write_end={write_end} span_end={span_end}"
