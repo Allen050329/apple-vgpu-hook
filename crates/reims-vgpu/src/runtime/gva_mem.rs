@@ -210,6 +210,46 @@ pub fn write_task_gva_arm64e<M: HostMemory>(host: &mut M, task: &TaskEntry, gva:
     );
 }
 
+/// Define task 1 with an arm64e page table covering `pages` data pages from
+/// `data_base_pfn`: a one-level directory at PFN 2 pointing at a root table at
+/// PFN 3, whose first `pages` entries map consecutive PFNs.
+///
+/// The directory and root PFNs are fixed at 2 and 3 because every fixture in
+/// the crate that walks a task GVA uses exactly this shape — it was defined
+/// verbatim inside nine separate test bodies across four modules, differing
+/// only in `pages`. Callers that also need an object list assert
+/// `set_object_list` themselves; a page table is not one.
+#[cfg(test)]
+#[track_caller]
+pub fn define_task_pages_arm64e(
+    host: &mut crate::runtime::host::FakeHost,
+    state: &mut crate::model::DeviceState,
+    data_base_pfn: u32,
+    pages: u32,
+) {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::model::PAGE_SHIFT_ARM64E;
+    let dir_pfn = 2u32;
+    let root_pfn = 3u32;
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..pages {
+        let pfn = data_base_pfn + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+}
+
 /// Translate `gva` under `task` and write `buf` into guest RAM via `write_gpa`.
 ///
 /// **Tests / fixtures only.** Product paths must use [`write_task_gva_product`]

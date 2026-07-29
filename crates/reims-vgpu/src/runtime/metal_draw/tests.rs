@@ -1198,7 +1198,11 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     // the event prefix and once as `reason=`.
     let downgrade_lines = || {
         std::fs::read_to_string(crate::observe::fail_log_path())
-            .map(|l| l.lines().filter(|l| l.starts_with("srgb_downgraded ")).count())
+            .map(|l| {
+                l.lines()
+                    .filter(|l| l.starts_with("srgb_downgraded "))
+                    .count()
+            })
             .unwrap_or(0)
     };
     let before = downgrade_lines();
@@ -1769,7 +1773,6 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 #[test]
 fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -1783,30 +1786,10 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     use crate::runtime::host::FakeHost;
 
     // One-level page table: GVA pages 0..7 → data PFNs (blit_exec pattern).
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     // Object list at GVA page 0; count covers live residual slot 211.
     assert!(state.set_object_list(1, 0, 256));
 
@@ -1883,7 +1866,6 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 #[test]
 fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -1895,27 +1877,6 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
         TEXTURE_VIEW_OPCODE_RANGED,
     };
     use crate::runtime::host::FakeHost;
-
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     fn write_type8_view(
         host: &mut FakeHost,
@@ -1956,7 +1917,7 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 256));
 
     // type-11 mid 9 as texture ref 3.
@@ -2001,7 +1962,6 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
 #[test]
 fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2014,30 +1974,9 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     };
     use crate::runtime::host::FakeHost;
 
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
-
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
@@ -2109,7 +2048,6 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
 #[test]
 fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2119,30 +2057,9 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     };
     use crate::runtime::host::FakeHost;
 
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..16u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
-
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
     assert!(state.set_object_list(1, 0, 256));
 
     // Stale type-11 latch at ref 199 (guest recycled the ref to type-2).
@@ -2290,7 +2207,6 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 #[test]
 fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2303,30 +2219,9 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     };
     use crate::runtime::host::FakeHost;
 
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
-
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
@@ -2397,7 +2292,6 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
 #[test]
 fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2415,30 +2309,9 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     };
     use crate::runtime::host::FakeHost;
 
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
-
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
     // Type-2 base with 2 mips: L0 64x32 bpr 256; L1 at +0x2000, 32x16 bpr 128.

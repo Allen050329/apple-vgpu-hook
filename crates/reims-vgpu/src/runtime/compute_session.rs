@@ -1125,34 +1125,13 @@ mod tests {
     }
 
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-        assert!(state.set_object_list(1, 0, 32));
-    }
-
     #[test]
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     fn control_if_else_spi_session_commits() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_task_pages(&mut host, &mut state, 4);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(1, 0, 32));
 
         // Condition buffer: u32 == 5 at offset 0.
         let cond = 5u32.to_le_bytes();
@@ -1223,7 +1202,8 @@ mod tests {
 
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_task_pages(&mut host, &mut state, 4);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(1, 0, 32));
 
         // Condition == 1 at buffer ref 8.
         let cond = 1u32.to_le_bytes();

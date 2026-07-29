@@ -123,7 +123,8 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
     let type5_ref = 10u32;
@@ -376,28 +377,6 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     );
 }
 
-fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-    let dir_pfn = 2u32;
-    let root_pfn = 3u32;
-    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(dir_gpa, 0x20, 0);
-    host.map_range(root_gpa, 0x4000, 0);
-    let mut d = [0u8; 8];
-    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-    let _ = host.write_gpa(dir_gpa, &d);
-    for i in 0..8u32 {
-        let pfn = data_base_pfn + i;
-        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-        let mut pte = [0u8; 4];
-        st32(&mut pte, pfn);
-        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-    }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
-    assert!(state.set_object_list(1, 0, 32));
-}
-
 #[test]
 fn accum_pipeline_buffer_texture_sampler() {
     let mut acc = ComputeAccum::default();
@@ -494,7 +473,8 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
 fn resolve_indirect_threadgroups_from_buffer() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let args = [2u32, 3, 1];
     let arg_bytes: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -530,7 +510,8 @@ fn sentinel_grid_recovers_from_largest_texture() {
     // Wire: grid=[45, UINT64_MAX, 1], tg=[32, 0, 1] → recover for 1440×1080.
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 8);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 8, 8);
+    assert!(state.set_object_list(1, 0, 32));
     // type-11 mapping as write target
     assert!(state.map_surface(3));
     assert!(state.set_mapping_geom(3, 1440, 1080, 0x73));
@@ -609,7 +590,8 @@ fn the_buffer_paths_refuse_under_their_own_names() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let window = read_buffer_window(&state, &host, 1, 0, 0, 4);
     assert_eq!(
@@ -651,7 +633,8 @@ fn buffer_backing_gva_requires_explicit_page_shift() {
 fn dispatch_missing_pipeline() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
     let acc = ComputeAccum::default();
     let mut cmd = ComputeCommand::default();
     cmd.kind = Kind::DispatchThreadgroups;
@@ -680,7 +663,8 @@ fn dispatch_missing_pipeline() {
 fn dispatch_nometal_with_texture_binds() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(42);
     acc.bind_textures(0, &[RefBinding { ref_: 111 }]);
@@ -725,7 +709,8 @@ fn dispatch_nometal_with_texture_binds() {
 fn dispatch_missing_pipeline_not_nometal() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
     let acc = ComputeAccum::default();
     let mut cmd = ComputeCommand::default();
     cmd.kind = Kind::DispatchThreadgroups;
@@ -753,7 +738,8 @@ fn dispatch_buffer_kernel_mul3add1() {
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let blob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &mtlb);
@@ -853,7 +839,8 @@ fn dispatch_buffer_kernel_mul3add1() {
 fn dispatch_missing_texture_fails() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
     // Pipeline without function still fails earlier; bind texture only.
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(1);
@@ -886,7 +873,8 @@ fn stage_texture_type5_ref_resolves_surface_mapping() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
     let type5_ref = 10u32;
@@ -940,7 +928,8 @@ fn stage_texture_type5_record_reshapes_stageable_single_plane_surface() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
     let type5_ref = 10u32;
@@ -1073,7 +1062,8 @@ fn stage_texture_type5_record_stages_biplanar_y_plane() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
     let type5_ref = 10u32;
@@ -1174,7 +1164,8 @@ fn stage_texture_type5_multiplanar_without_record_fails_closed() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
     let type5_ref = 10u32;
@@ -1229,7 +1220,8 @@ fn stage_texture_linear_ref_does_not_collide_with_surface_mid() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     // Surface mid 7 exists with full geometry + a mapped page.
     let colliding_mid = 7u32;
@@ -1277,7 +1269,8 @@ fn stage_heap_texture_uses_host_only_residency_identity() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let texture_ref = 20u32;
     let heap_ref = 19u32;
@@ -1424,7 +1417,8 @@ fn stage_texture_type5_ignores_task_object_list_slot_collision() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let sid = 3u32;
     let type5_ref = 10u32;
@@ -1484,7 +1478,8 @@ fn stage_texture_type5_without_surface_is_missing() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+    assert!(state.set_object_list(1, 0, 32));
 
     let type5_ref = 11u32;
     let sid = 99u32; // no mapping
