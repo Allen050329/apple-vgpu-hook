@@ -1243,6 +1243,92 @@ mod tests {
         );
     }
 
+    /// A type-11 render window is found and landed by the *same* mapping-keyed
+    /// trigger the compute rail uses, and is read as a render window.
+    ///
+    /// This is the property the whole deferred type-11 rail rests on. Its
+    /// pixels live in a target resident that `ComputeStorageResidencyKey`
+    /// cannot name, so the flush has to dispatch on the owner; if it did not,
+    /// `flush_intersecting` would hand a render window to the storage read and
+    /// report a compute loss for a window the compute rail never armed. Driving
+    /// it through `flush_intersecting` — rather than calling the flush directly
+    /// — is deliberate: that call is the choke point every guest-page reader
+    /// goes through, so this also pins the trigger wiring.
+    ///
+    /// The map-generation drift is the cheap way to make the flush take a
+    /// decisive branch with no engine present. It doubles as coverage of the
+    /// recycled-pages guard: a mapping rebound since arm time must never have a
+    /// stale framebuffer written through its new pages.
+    #[test]
+    fn a_render_window_flushes_through_the_shared_trigger_and_names_its_rail() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        // The window latched map_generation 1 (from `key`); the mapping has
+        // since moved to 5, so its pages are not the ones the Store rendered
+        // for.
+        m.map_generation = 5;
+        state
+            .compute_deferred_flush
+            .insert(key(9, 0, 256), crate::model::DeferredOwner::Render { armed_seq: 1 });
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window that cannot be written must report the loss"
+        );
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("kind=render"),
+            "a render window must not be reported as a compute one: {line}"
+        );
+        assert!(
+            line.contains("reason=map_generation_drift") && line.contains("current=Some(5)"),
+            "the rebound mapping must be the stated refusal: {line}"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the trigger must consume the window it took"
+        );
+    }
+
+    /// Teardown must name the render rail, because the two rails pin different
+    /// registries and the drop is where the pin is released.
+    ///
+    /// Unpinning storage for a render window succeeds silently and leaves the
+    /// target resident pinned for the life of the boot — a display-sized image
+    /// per window, which is the "~260 stale residents (~516 MiB)" shape. The
+    /// slug on this line is the only always-on evidence that the right registry
+    /// was chosen.
+    #[test]
+    fn dropping_a_render_window_reports_the_render_rail() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state
+            .compute_deferred_flush
+            .insert(key(9, 0, 256), crate::model::DeferredOwner::Render { armed_seq: 7 });
+        state
+            .compute_deferred_flush
+            .insert(key(9, 256, 512), crate::model::DeferredOwner::Storage { generation: 3 });
+        let cap = crate::observe::FailCapture::start();
+        super::drop_windows(&mut state, 9, "unit");
+        let lines: Vec<String> = cap
+            .lines()
+            .into_iter()
+            .filter(|l| l.split_whitespace().next() == Some("deferred_flush_dropped"))
+            .collect();
+        assert_eq!(lines.len(), 2, "both windows drop: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("owner=render")),
+            "the render window must say so: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("owner=compute")),
+            "the compute window must say so: {lines:?}"
+        );
+        assert!(state.compute_deferred_flush.is_empty());
+    }
+
     /// `condemn_surface_backing` keeps a mapping's deferred windows on purpose:
     /// `DeleteIOSurfaceBacking2` may name a prior incarnation of a recycled id,
     /// and `mapper::resolve` settles it later by fingerprint compare. A flush
