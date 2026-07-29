@@ -626,57 +626,6 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
             p.frame_width,
             p.frame_height,
         );
-        // Route-B present-staleness proxy. Compare the resident we are about to
-        // present (frame_mapping) against the freshest surface the guest has
-        // named in a display transaction at the same geometry. A sustained
-        // whole-frame seq gap (`routeb_stale`) means we are presenting a buffer
-        // the guest has moved on from — the "frame rate != rendered" crawl.
-        // Deduped, so a persistent condition logs once, not per present.
-        // Measure-only: the presented surface is the one the display
-        // transaction named.
-        {
-            let fm = p.frame_mapping;
-            let fw = p.frame_width;
-            let fh = p.frame_height;
-            let own_gen = state
-                .mappings
-                .get(&fm)
-                .map(|m| m.content_generation)
-                .unwrap_or(0);
-            let (fresh_mid, fresh_gen, fresh_seq) = state
-                .present
-                .presented_geoms
-                .keys()
-                .copied()
-                .filter(|&mid| state.presented_at(mid, fw, fh))
-                .filter_map(|mid| {
-                    let m = state.mappings.get(&mid)?;
-                    Some((mid, m.content_generation, m.last_store_seq))
-                })
-                .max_by_key(|&(mid, _, seq)| (seq, mid))
-                .unwrap_or((0, 0, 0));
-            let own_seq = state
-                .mappings
-                .get(&fm)
-                .map(|m| m.last_store_seq)
-                .unwrap_or(0);
-            if fresh_mid != 0 && fresh_mid != fm && fresh_seq > own_seq {
-                use std::collections::HashSet;
-                use std::sync::Mutex;
-                static SEEN: Mutex<Option<HashSet<(u32, u32, u64)>>> = Mutex::new(None);
-                let gap_bucket = (fresh_seq - own_seq).min(64) / 4;
-                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                if seen
-                    .get_or_insert_with(HashSet::new)
-                    .insert((fm, fresh_mid, gap_bucket))
-                {
-                    crate::observe::off(format!(
-                        "routeb_stale frame_mid={fm} own_gen={own_gen} own_seq={own_seq} fresh_mid={fresh_mid} fresh_gen={fresh_gen} fresh_seq={fresh_seq} gap_seq={}",
-                        fresh_seq - own_seq
-                    ));
-                }
-            }
-        }
         // Keep the resident this present names alive across the idle sweep below,
         // then reclaim targets idle past the wall-clock age threshold so VRAM returns
         // to the working-set baseline after a compositing burst instead of sitting at

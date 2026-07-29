@@ -525,8 +525,7 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     assert!(write_bgra8(&mut state, &mut host, 5, &stale, stride, w, h));
     state.note_surface_composite(5);
     // Both members are genuine swapchain buffers that alternate as the presented
-    // front; mid 1 has been displayed once at this geometry.
-    state.note_presented_geom(1, w, h);
+    // front.
     state.present.valid = true;
     state.present.width = w;
     state.present.height = h;

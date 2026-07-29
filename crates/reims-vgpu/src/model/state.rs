@@ -573,13 +573,6 @@ pub struct MappingEntry {
     pub height: u32,
     pub format: u16,
     pub content_generation: u32,
-    /// Global store-order stamp: `DeviceState::store_seq` value at this
-    /// mapping's most recent decoded guest write (`mark_mapping_written`).
-    /// Unlike per-mapping `content_generation`, this is comparable ACROSS
-    /// mappings — the compositor-output member with the highest stamp is the
-    /// buffer the guest most recently finished (structural write history,
-    /// never content).
-    pub last_store_seq: u64,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
     /// changes PFNs). Used as [`TargetIdentity`] generation for resident
@@ -954,9 +947,6 @@ pub struct PresentState {
     /// thing that writes it, so it separates a scanout buffer from a sampled
     /// sub-surface (a WebKit content tile publishes full frames every paint and
     /// is never presented).
-    /// Stamped with the mapping lifetime that presented it — see
-    /// [`DeviceState::presented_geom_live`], which is the only way to read it.
-    pub presented_geoms: BTreeMap<u32, PresentedGeom>,
     /// Protocol-structural dense-frame tracking (measure-only, never gates a
     /// present decision): per mapping id, the value of
     /// [`Self::dense_frame_counter`] at the last full-frame (whole-`w`×`h`)
@@ -1054,20 +1044,6 @@ pub struct PresentState {
     /// skipped) captures, so the readback-elision ratio is visible.
     pub full_captures: u64,
     pub light_captures: u64,
-}
-
-/// One surface's present/scanout evidence: the geometry the guest named it at,
-/// and the mapping incarnation that was current when it did.
-///
-/// The generation is what makes the evidence expire on its own. Without it the
-/// entry outlives the surface it describes, and every site that recycles a
-/// mapping has to remember to prune it — five did, and the one that pruned too
-/// eagerly cost the desktop (see [`DeviceState::presented_geom_live`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PresentedGeom {
-    pub width: u32,
-    pub height: u32,
-    pub map_generation: u32,
 }
 
 /// Hardware cursor model.
@@ -1469,11 +1445,6 @@ pub struct DeviceState {
     /// chaining the resident (dual-mid strobe class). Consumed at the type-11
     /// Load seed decision (`metal_draw::resolve_type11_load_choice`).
     pub presented_needs_guest_seed: std::collections::BTreeSet<u32>,
-    /// Global monotonic decoded-write counter feeding
-    /// [`MappingEntry::last_store_seq`] — the cross-mapping store order the
-    /// ClearOnly dual-mid peer-select uses to find the latest-finished
-    /// compositor member.
-    pub store_seq: u64,
     /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
     pub tranche: MemoCounters,
     /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
@@ -1603,7 +1574,6 @@ impl DeviceState {
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo_scratch: Vec::new(),
             presented_needs_guest_seed: std::collections::BTreeSet::new(),
-            store_seq: 0,
             gva_host_views: Vec::new(),
             tranche: MemoCounters::default(),
             guest_run_memo: std::collections::VecDeque::new(),
@@ -1831,73 +1801,6 @@ impl DeviceState {
         self.present.present_epoch
     }
 
-    /// Present/scanout evidence that `mapping_id` was displayed at `w`x`h`
-    /// **by its current incarnation** (see [`Self::note_presented_geom`]).
-    pub fn presented_at(&self, mapping_id: u32, w: u32, h: u32) -> bool {
-        self.presented_geom_live(mapping_id) == Some((w, h))
-    }
-
-    /// The geometry `mapping_id` was presented at, or `None` when there is no
-    /// evidence *or* the evidence belongs to a prior incarnation of this id.
-    ///
-    /// The generation compare is what makes the evidence self-invalidating. It
-    /// replaced five scattered `presented_geoms.remove` sites, every one of
-    /// which was a place that had to *remember* to forget — and one of them was
-    /// wrong in a way that blacked out the desktop. `objects.rs`'s type-4
-    /// attach calls `map_surface` (which pruned unconditionally) and only
-    /// *afterwards* runs the fingerprint compare that decides whether this is a
-    /// new incarnation at all. On an identical page plan that compare says "the
-    /// SAME incarnation, deferred windows and the resident survive" — but the
-    /// presented evidence was already gone, so a proven swapchain buffer was
-    /// demoted, and every draw until the next present landed on the wrong
-    /// resident. The screen kept only the damaged rects and went black
-    /// elsewhere.
-    ///
-    /// Tying the evidence to `map_generation` makes each prune site's own rule
-    /// hold automatically: the sites that mean "genuinely new surface"
-    /// (`unmap_surface`, `attach_mapping_internal`, and `objects.rs`'s refresh,
-    /// which prunes only on the branch that bumps) invalidate it, and the ones
-    /// that deliberately keep the lifetime undecided pending a fingerprint
-    /// compare (`map_surface`, `condemn_surface_backing`) keep it — which is
-    /// exactly what they say they intend for every other piece of state.
-    fn presented_geom_live(&self, mapping_id: u32) -> Option<(u32, u32)> {
-        let seen = self.present.presented_geoms.get(&mapping_id)?;
-        (seen.map_generation == self.map_generation_or_zero(mapping_id))
-            .then_some((seen.width, seen.height))
-    }
-
-    /// A mapping's lifetime counter, or 0 when we hold no entry for the id.
-    ///
-    /// Same convention as `surface_identity`'s per-mid generation. An id we
-    /// have never mapped is not a *different* incarnation, it is the absence of
-    /// one, and must compare equal to itself — the guest can name a surface in
-    /// a display transaction before our mapping entry for it exists, and that
-    /// evidence must not be silently discarded.
-    fn map_generation_or_zero(&self, mapping_id: u32) -> u32 {
-        self.mappings
-            .get(&mapping_id)
-            .map(|m| m.map_generation)
-            .unwrap_or(0)
-    }
-
-    /// Record a present/scanout action displaying `mapping_id` at `w`x`h`.
-    pub fn note_presented_geom(&mut self, mapping_id: u32, w: u32, h: u32) {
-        if mapping_id == 0 || w == 0 || h == 0 {
-            return;
-        }
-        // Stamp the incarnation this evidence belongs to, so it expires on its
-        // own when the id is recycled into a different surface.
-        let map_generation = self.map_generation_or_zero(mapping_id);
-        self.present.presented_geoms.insert(
-            mapping_id,
-            PresentedGeom {
-                width: w,
-                height: h,
-                map_generation,
-            },
-        );
-    }
-
     /// Record that `mapping_id` is being presented and report whether the guest
     /// ever sent a full-frame Store **naming it** for what is about to be shown.
     ///
@@ -1964,11 +1867,6 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
-        // `presented_geoms` is NOT pruned here. It carries the incarnation that
-        // presented it, so an unmap (which bumps `map_generation`) invalidates
-        // it automatically, while a condemned backing — which keeps the
-        // generation on purpose, pending the fingerprint compare — keeps its
-        // evidence too, exactly as it keeps the deferred windows.
         // Prune the present-boundary seed flag too. It marks "this mid was just
         // presented, so its next LOAD re-seeds from the front" — a per-lifetime
         // signal that MUST NOT survive a teardown. Left stale, a recycled
@@ -2717,12 +2615,9 @@ impl DeviceState {
 
     /// Bump content generation after a write into the mapping (0 never skips).
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
-        let seq = self.store_seq.wrapping_add(1);
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
-        self.store_seq = seq;
-        m.last_store_seq = seq;
         m.content_generation = m.content_generation.wrapping_add(1);
         if m.content_generation == 0 {
             m.content_generation = 1;

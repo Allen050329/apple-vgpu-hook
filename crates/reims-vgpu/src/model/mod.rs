@@ -14,9 +14,9 @@ pub use state::{
     DeviceState, DisplayHandshake, ExecFault, FailEvent, GfxRegs, GuestLinearMemo,
     GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface,
     IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, ObjectEntry,
-    PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState, PresentedGeom, StampSlot,
-    SurfaceWriteKind, TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
-    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
+    PacketFault, PaintSrc, PendingWork, PresentBacking, PresentState, StampSlot, SurfaceWriteKind,
+    TaskEntry, TaskMapSpan, WriteGate, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
+    FENCE_DOMAIN_RENDER,
 };
 
 use crate::backend::Backend;

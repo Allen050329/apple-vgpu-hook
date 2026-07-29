@@ -96,20 +96,6 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
     }
 }
 
-/// Record the display action for `mapping_id`.
-///
-/// A capture IS the display action, and `presented_geoms` is where the decoded
-/// display transaction is recorded: the guest naming this surface as plane 0 at
-/// this geometry.
-fn note_display_action(
-    state: &mut crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) {
-    state.note_presented_geom(mapping_id, width, height);
-}
-
 /// Fill `buf` from the mapping's GPU resident, without any guest-page scatter.
 ///
 /// Returns whether the resident supplied the whole frame. On `true` `buf` holds
@@ -184,7 +170,6 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
-    note_display_action(state, mapping_id, width, height);
     state.advance_present_epoch();
     // --- Capture readback elision ---
     // When the previous present's window publish handed the window an engine
@@ -2374,16 +2359,14 @@ mod tests {
         state.note_dense_frame_published(5, 2, 2);
         // The arrangement has to be one a peer-reading capture would act on, or
         // the assertion below passes for the wrong reason: two surfaces of equal
-        // geometry, the peer holding different pixels, and the peer ranking
-        // fresher than the named mid on the write history the model keeps.
+        // geometry, the peer holding different pixels, and the peer written more
+        // recently — mid 5's `write_bgra8` above runs after mid 1's, so it is the
+        // later write by program order. (The model tracks no cross-mapping write
+        // stamp to assert that with: the one it had existed only to feed a
+        // present-staleness census and went with it.)
         let peer = state.mappings.get(&5).unwrap();
         assert_eq!((peer.width, peer.height), (2, 2));
         assert_ne!(&grey[..], &white[..]);
-        assert!(
-            state.mappings.get(&5).unwrap().last_store_seq
-                > state.mappings.get(&1).unwrap().last_store_seq,
-            "the peer must be the fresher of the two for this to discriminate"
-        );
         state.present.frame_bgra.clear();
         state.present.frame_valid = false;
         assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
