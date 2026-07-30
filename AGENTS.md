@@ -1101,6 +1101,52 @@ Do not write a fourth one of these. `observe/gate.rs` already carries a correct 
 string literals and char literals, in one pass — and it exists precisely because the gate it backs
 could not be written with a grep. Reuse it before hand-rolling a scrubber.
 
+**Always print the sweep's denominator, and gate it on a known-live case.** The rule above says this
+family fails low; the cheap defence is to make the sweep state how much it found *before* it states
+what is dead, and to check that count against something already known. Both halves earned their
+place on 2026-07-30:
+
+- The write-only-field sweep was gated on `content_generation`, `map_generation`, `mapped`, `width`,
+  `height` — all known-read — and required them to score high before its zero-read list was believed.
+  They came back 65 / 60 / 132 / 615 / 633, the gate passed, and the list was 10 names of 923.
+- The decline-variant sweep skipped its gate and produced a **clean null**: "0 variants referenced
+  ≤1 time", which reads as "the taxonomy is fully live". It had found **15** `Decline`/`Refusal`
+  impls. There are 72 impl lines. The regex was `impl\s+(?:\w+::)?(?:Decline|Refusal)`, one `::`
+  segment, and 36 of the impls are written `impl crate::observe::Decline for X` — two segments. With
+  `(?:\w+::)*` it finds 58 distinct types and 559 variants, and *then* reports 0 dead, which is the
+  same answer from four times the population and is the one worth quoting.
+
+A null result from a sweep is only as good as its denominator, and a sweep that silently examined a
+quarter of the population announces nothing at all. `grep -c` for the raw construct next to the
+sweep's own count takes one command.
+
+**Sweep results as of 2026-07-30, so they are not re-run blind.** Each is a measurement with a date,
+not a standing guarantee; re-run after any large deletion, since that is exactly when new orphans
+appear.
+
+| sweep | population | flagged | disposition |
+|---|---|---|---|
+| unreferenced `fn` | 1651 | 6 | all false positives — 4 winit trait impls, a `Deref`, an example `main` |
+| unreferenced `pub` item | 1281 | 33 | all `repr(C)` / protocol constant tables (`abi.rs`, `regs.rs`, `decode/`) — wire documentation, keep |
+| write-only field (non-`repr(C)`, non-`decode/`) | 923 names | 10 | 4 derive-`Hash`/`Eq` key fields, 1 regex artefact, 5 wire-layout fields in `contract/iosurface_pages.rs`; the one real hit, `model::ObjectEntry`, is gone |
+| never-constructed decline variant | 559 across 58 types | 0 | taxonomy fully live |
+
+The productive one was the field sweep, and the reason is worth carrying: it is the only one of the
+four that looks at *state* rather than at *code*. Dead code gets noticed because someone reads it;
+dead state gets written on a hot path forever and reads as load-bearing, because the write is right
+there. `presented_geoms`, `last_store_seq`, `store_seq` and `ObjectEntry`'s three fields were all
+found this way within one session. Point the next sweep at fields, not functions.
+
+Two hits from that sweep needed a hand-check that the sweep could not do, and both went the other
+way from the machine's answer:
+
+- **`.field` cannot see a destructuring read**, so a zero is a question, not an answer.
+- **`.field` cannot see that *membership* is the payload.** `DeviceState::objects` scored as an
+  unread map — `objects.get/contains/iter/values/len` returns only tests — and `delete_object`
+  gates the whole host-side resource teardown on `objects.remove(..).is_some()`. The map is
+  load-bearing; only its `ObjectEntry` value was dead. A sweep that had been trusted there would
+  have deleted the teardown gate.
+
 **A doc comment keeps a dead function's reference count above one.** The unreferenced-`pub fn` sweep
 counts `grep -rw` hits, and `[`execute_draw`]` in a doc comment is a hit. Five functions sat at two
 or three references made entirely of prose: the two engine facade owning-forms, an event
