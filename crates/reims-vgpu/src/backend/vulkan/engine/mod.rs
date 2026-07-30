@@ -723,6 +723,22 @@ impl TargetReadback {
         }
         self.pixels
     }
+
+    /// The frame in guest scanout order (BGRA8), exchanging only when needed.
+    ///
+    /// The mirror of `into_rgba8`, for the guest-page writers that are declared in
+    /// scanout order (`mapping_write::write_bgra8`). Both exist so that neither
+    /// caller has to know which namespace it is reading: a `Surface` resident is
+    /// already BGRA and this is a no-op, and a resident that is not stays correct
+    /// instead of landing R and B exchanged in guest memory.
+    pub fn into_bgra8(mut self) -> Vec<u8> {
+        if !self.bgra {
+            for px in self.pixels.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        self.pixels
+    }
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {

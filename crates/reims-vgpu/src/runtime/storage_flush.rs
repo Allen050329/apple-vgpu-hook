@@ -811,8 +811,8 @@ fn flush_one<M: HostMemory + HostOps>(
         crate::model::DeferredOwner::Storage { generation } => {
             flush_storage_one(state, host, key, generation)
         }
-        crate::model::DeferredOwner::Render { bgra, .. } => {
-            flush_render_one(state, host, key, &bgra)
+        crate::model::DeferredOwner::Render { source, .. } => {
+            flush_render_one(state, host, key, &source)
         }
     }
 }
@@ -833,12 +833,33 @@ fn flush_one<M: HostMemory + HostOps>(
 /// takes the cache or the resident and states in situ that it "never touches
 /// guest memory" — so the writeback is owed only to a guest-side reader that
 /// may never come.
+/// The engine resident a [`crate::model::RenderWindowSource::Resident`] window
+/// pinned, rebuilt from the key.
+///
+/// Not stored on the window, for the same reason `flush_gva_one` rebuilds its
+/// own: the key already carries every term of the identity, and two spellings of
+/// one value are two things that can disagree. `key.map_generation` is the field
+/// `present_identity::surface_identity` keys on, and the flush refuses on
+/// generation drift before it reads anything, so the rebuild is always for the
+/// generation the arm pinned.
+#[cfg(feature = "backend-vulkan")]
+fn render_window_identity(
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Surface {
+        id: key.mapping_id,
+        width: key.width,
+        height: key.height,
+        generation: key.map_generation as u64,
+    }
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
-    bgra: &[u8],
+    source: &crate::model::RenderWindowSource,
 ) -> bool {
     let started = std::time::Instant::now();
     // Counted on the same one-line-per-second census as the Store routes, so a
@@ -861,22 +882,75 @@ fn flush_render_one<M: HostMemory + HostOps>(
         .get(&key.mapping_id)
         .map(|m| m.map_generation);
     if current != Some(key.map_generation) {
+        // Release the pin first. This arm returns before touching the frame, and
+        // a `Resident` window holds a registry pin that nothing else will drop —
+        // `evict_registry_to_cap` and the idle drain both skip pinned slots by
+        // design, so a pin leaked here strands a whole framebuffer for the guest
+        // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and this
+        // drift is not rare: one in 85 s on a driven boot.
+        release_window_pin_for_key(key, source);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
     }
-    // The window carries its own frame in guest scanout order, so this copies in
-    // with no channel conversion and cannot miss.
+    // Where the frame comes from, in guest scanout order either way.
     //
-    // It used to read `surface_cache::get(mapping_id, key.width, key.height)`,
-    // and that is one entry per mapping: a later Store at a different geometry
-    // replaced it and every window still armed at the old geometry lost its
-    // pixels — `deferred_flush_lost reason=cache_miss`, 15 whole layers in one
-    // boot, which is a compositing layer going solid black. The bytes are shared
-    // with the cache entry the same readback stored, so owning them costs an
-    // `Arc` clone and no copy.
+    // `Owned` carries its own bytes and cannot miss. It used to read
+    // `surface_cache::get(mapping_id, key.width, key.height)`, and that is one
+    // entry per mapping: a later Store at a different geometry replaced it and
+    // every window still armed at the old geometry lost its pixels —
+    // `deferred_flush_lost reason=cache_miss`, 15 whole layers in one boot, which
+    // is a compositing layer going solid black. The bytes are shared with the
+    // cache entry the same readback stored, so owning them costs an `Arc` clone
+    // and no copy.
+    //
+    // `Resident` names the pinned engine image instead, and pays the readback here
+    // rather than at every Store. It is checked against the epoch it was published
+    // at before being believed: `registry_mark_ready` clears a slot's
+    // `content_epoch` on every draw into it, so a mismatch means something rendered
+    // over this surface after the Store that armed this window, and the resident no
+    // longer holds the frame this window promised the guest. Declining leaves the
+    // guest its pre-Store bytes — stale but coherent — where writing would land a
+    // different layer's pixels in this one's pages.
+    let frame: std::borrow::Cow<'_, [u8]> = match source {
+        crate::model::RenderWindowSource::Owned(bytes) => {
+            std::borrow::Cow::Borrowed(bytes.as_slice())
+        }
+        crate::model::RenderWindowSource::Resident { epoch } => {
+            let identity = render_window_identity(key);
+            let live = crate::backend::vulkan::engine::resident_content_epoch(&identity);
+            if live != Some(*epoch) {
+                crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                crate::observe::fail(format!(
+                    "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={}                      reason=resident_epoch_drift want={epoch} live={live:?}",
+                    key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+                ));
+                return false;
+            }
+            match crate::backend::vulkan::engine::read_target(&identity) {
+                Ok(rb) => {
+                    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    // `into_bgra8`, not the raw bytes: a `Surface` resident is BGRA
+                    // so this is a no-op, and the writer below is declared in
+                    // scanout order. Reading the reported order rather than
+                    // asserting one is what keeps a future format change from
+                    // landing R and B exchanged in guest memory.
+                    std::borrow::Cow::Owned(rb.into_bgra8())
+                }
+                Err(e) => {
+                    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    crate::observe::fail(format!(
+                        "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={}                          reason=resident_read err={e}",
+                        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+                    ));
+                    return false;
+                }
+            }
+        }
+    };
+    let bgra: &[u8] = frame.as_ref();
     let ok = crate::runtime::mapping_write::write_bgra8(
         state,
         host,
@@ -1078,7 +1152,26 @@ pub(crate) fn release_window_pin(
         crate::model::DeferredOwner::Storage { .. } => {
             crate::backend::vulkan::engine::unpin_resident_storage(key)
         }
-        crate::model::DeferredOwner::Render { .. } => {}
+        crate::model::DeferredOwner::Render { source, .. } => {
+            release_window_pin_for_key(key, source)
+        }
+    }
+}
+
+/// Release whatever GPU hold a render window's source carries.
+///
+/// An `Owned` window holds nothing — its pixels are an `Arc` and dropping it is
+/// the release. A `Resident` window holds a counted registry pin, and **every**
+/// exit that abandons the window has to drop it: `evict_registry_to_cap` and the
+/// idle drain both skip pinned slots by design, so a leaked pin strands a whole
+/// framebuffer for the guest lifetime rather than merely delaying a reclaim.
+#[cfg(feature = "backend-vulkan")]
+fn release_window_pin_for_key(
+    key: &crate::model::ComputeStorageResidencyKey,
+    source: &crate::model::RenderWindowSource,
+) {
+    if matches!(source, crate::model::RenderWindowSource::Resident { .. }) {
+        crate::backend::vulkan::engine::unpin_resident_target(&render_window_identity(key));
     }
 }
 
@@ -1112,7 +1205,7 @@ mod tests {
     fn render_owner(armed_seq: u64) -> crate::model::DeferredOwner {
         crate::model::DeferredOwner::Render {
             armed_seq,
-            bgra: std::sync::Arc::new(vec![0u8; 4 * 4 * 4]),
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![0u8; 4 * 4 * 4])),
         }
     }
 
@@ -1324,7 +1417,7 @@ mod tests {
             key(9, 0, 256),
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
-                bgra: std::sync::Arc::new(frame.clone()),
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
             },
         );
         // A later Store re-Stored this mapping at 8x8, replacing the one cache

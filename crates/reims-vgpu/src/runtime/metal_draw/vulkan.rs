@@ -5199,7 +5199,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         key,
         crate::model::DeferredOwner::Render {
             armed_seq,
-            bgra: frame,
+            source: crate::model::RenderWindowSource::Owned(frame),
         },
     );
     // Raw task-GVA reads that alias these physical pages flush through
@@ -5911,7 +5911,7 @@ mod vulkan_split_tests {
                 },
                 crate::model::DeferredOwner::Render {
                     armed_seq: seq,
-                    bgra: std::sync::Arc::new(vec![0u8; 4 * 4 * 4]),
+                    source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![0u8; 4 * 4 * 4])),
                 },
             );
         };

@@ -1842,7 +1842,7 @@ mod tests {
             },
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
-                bgra: std::sync::Arc::new(frame.clone()),
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
             },
         );
 

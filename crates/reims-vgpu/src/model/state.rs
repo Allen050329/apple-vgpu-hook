@@ -1,9 +1,9 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{GFX_MMIO_SIZE, LruBytesMemo, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Opaque device instance id (QEMU handle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -789,10 +789,44 @@ pub enum DeferredOwner {
     /// 1920x24 menu bar, several window-sized rects — which is a compositing
     /// layer rendering solid black with the loss reported only after the fact.
     /// An `Arc` clone costs nothing at arm time and cannot be orphaned.
+    ///
+    /// `source` is the one thing that varies, and it varies for a reason the
+    /// paragraph above states in the other direction: owning the bytes is free
+    /// *when the Store already read them back*. A Store that skips its readback
+    /// has no bytes to own, and the whole point of skipping it is that ~98 % of
+    /// these windows are never flushed at all — so that rail names the resident
+    /// and pays the readback only if someone asks. Everything else about the
+    /// window is identical, which is why this is a field and not a variant:
+    /// `matches!(owner, Render { .. })` still selects the rail for the population
+    /// cap, the alias index, the teardown drop and `owner_slug`, and only the
+    /// pixel read dispatches.
     Render {
         armed_seq: u64,
-        bgra: std::sync::Arc<Vec<u8>>,
+        source: RenderWindowSource,
     },
+}
+
+/// Where a [`DeferredOwner::Render`] window's frame lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderWindowSource {
+    /// The window owns the frame, tight BGRA8 at `key.width x key.height`,
+    /// shared with the [`crate::runtime::surface_cache`] entry stored from the
+    /// same readback. Cannot be orphaned; see the variant's own note.
+    Owned(std::sync::Arc<Vec<u8>>),
+    /// The engine's `TargetIdentity::Surface` resident holds the frame and the
+    /// window holds a pin on it. `epoch` is the
+    /// [`MappingEntry::surface_content_epoch`] this window's pixels were
+    /// published at; the flush compares it against the resident's stamp
+    /// (`engine::resident_content_epoch`) and declines rather than writing a
+    /// frame it cannot vouch for.
+    ///
+    /// The identity is **reconstructed** at flush time from the key rather than
+    /// stored, exactly as `flush_gva_one` does: `key` already carries the mapping
+    /// id, the geometry and the `map_generation` that `surface_identity` keys on,
+    /// and the flush refuses on generation drift before it reads anything. Storing
+    /// it would put a backend type in the model and give the two spellings a way
+    /// to disagree.
+    Resident { epoch: u32 },
 }
 
 /// Everything a later flush needs to land a deferred **GVA render Store**
