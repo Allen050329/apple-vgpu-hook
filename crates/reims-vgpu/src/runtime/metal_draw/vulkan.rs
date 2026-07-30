@@ -2881,6 +2881,19 @@ fn note_guest_rung_blank(
         return;
     }
     crate::runtime::drain::note_store_route("lin_rung_guest_blank");
+    // Identity, latched per span, because the count alone cannot say whether a
+    // blank sample is a transparent layer doing its job or the icon cell that
+    // came out empty. 99.5 % of loads on this rung return content, so the
+    // population that matters is small enough to name each member of, and the
+    // geometry is what joins one of these to something on screen.
+    if crate::observe::first_sight(
+        "lin_rung_guest_blank",
+        gva ^ ((w as u64) << 32) ^ h as u64,
+    ) {
+        crate::observe::off(format!(
+            "lin_rung_guest_blank rung={rung} task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h}"
+        ));
+    }
     if !crate::runtime::surface_cache::has_gva(state, gva, w, h) {
         return;
     }
