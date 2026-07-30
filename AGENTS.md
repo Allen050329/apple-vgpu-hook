@@ -1805,6 +1805,30 @@ Pick the pathway your change affects.
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
 
+**A healthy x86/Vulkan boot, as a baseline to diff against.** Three boots on 2026-07-30, same
+workload each time (guest to a real session with `ps -Ao comm | grep -c "MacOS/Dock$"` asserted 1,
+then Safari on apple.com asserted running by process count, Calendar, System Settings; host window
+verified by screenshot showing wallpaper, Dock, menu bar and all three apps):
+
+| | boot 1 | boot 2 | boot 3 |
+|---|---|---|---|
+| sliced lines | 2586 | 2081 | 1987 |
+| `FAIL` lines | **0** | **0** | **0** |
+| `reason=air_loading` | 165 | 168 | 173 |
+| `reason=generation_match` | 31 | 31 | 31 |
+| `reason=cmd_task_ambiguous` | 11 | 11 | 11 |
+| `reason=write_gate_outside` | 4 | 4 | 4 |
+
+The `reason=` histogram is the comparison worth making, and it is remarkably stable — several slugs
+land on the identical count across all three. **Do not diff the set of line *kinds* instead.** Those
+slices differ in length by 30%, so roughly ten kinds appear in one and not another purely from
+throttling and run duration (`direct_present_source` fires every 1024th present; `staging_write_slow`
+is the RTD3 host artifact documented above). That set difference looks like a finding and is noise;
+the `reason=` counts are what hold still.
+
+Slice a boot with `stat -c%s /tmp/reims-vgpu-fail.log` before it and `tail -c +$((M+1))` after — the
+log appends across boots, so an unsliced `grep -c` answers for every boot ever run on the machine.
+
 For Rust changes, run the relevant native tests serially from the repo root:
 
 ```sh
