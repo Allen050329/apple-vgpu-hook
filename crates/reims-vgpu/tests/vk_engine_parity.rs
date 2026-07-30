@@ -1322,10 +1322,20 @@ fn a_surface_resident_reads_back_in_guest_scanout_order() {
         out.pixels_bgra,
         "a Surface resident must report the BGRA order it rendered in"
     );
-    assert_eq!(
-        &out.pixels[i..i + 4],
-        &[191, 128, 64, 255],
-        "a Surface resident's readback must already be in guest scanout order"
+    // `near`, not `assert_eq!`: green is `0.5 * 255 = 127.5`, an exact tie, and
+    // Vulkan does not pin which way a float→unorm8 tie goes. Intel ANV rounds it
+    // down and this assertion read 127 against a hardcoded 128 on every run since
+    // it was written. The tolerance costs the property nothing — an R/B exchange
+    // moves 191 against 64, which is 127 LSB, not one.
+    let px = [
+        out.pixels[i],
+        out.pixels[i + 1],
+        out.pixels[i + 2],
+        out.pixels[i + 3],
+    ];
+    assert!(
+        near(px[0], 191) && near(px[1], 128) && near(px[2], 64) && near(px[3], 255),
+        "a Surface resident's readback must already be in guest scanout order; got BGRA={px:?}"
     );
 
     // The pooled path is the control: no identity, so no namespace to take an
@@ -1337,10 +1347,15 @@ fn a_surface_resident_reads_back_in_guest_scanout_order() {
         !out.pixels_bgra,
         "a pooled target has no identity to take an order from"
     );
-    assert_eq!(
-        &out.pixels[i..i + 4],
-        &[64, 128, 191, 255],
-        "a pooled target's readback stays semantic RGBA"
+    let px = [
+        out.pixels[i],
+        out.pixels[i + 1],
+        out.pixels[i + 2],
+        out.pixels[i + 3],
+    ];
+    assert!(
+        near(px[0], 64) && near(px[1], 128) && near(px[2], 191) && near(px[3], 255),
+        "a pooled target's readback stays semantic RGBA; got RGBA={px:?}"
     );
 }
 
