@@ -914,6 +914,9 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // longer holds the frame this window promised the guest. Declining leaves the
     // guest its pre-Store bytes — stale but coherent — where writing would land a
     // different layer's pixels in this one's pages.
+    // Set when the frame below came *out of* a resident image, so the write can
+    // hand the currency witness back to it. See the re-stamp after the write.
+    let mut flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
     let frame: std::borrow::Cow<'_, [u8]> = match source {
         crate::model::RenderWindowSource::Owned(bytes) => {
             std::borrow::Cow::Borrowed(bytes.as_slice())
@@ -933,6 +936,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
             match crate::backend::vulkan::engine::read_target(&identity) {
                 Ok(rb) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    flushed_from_resident = Some(identity);
                     // `into_bgra8`, not the raw bytes: a `Surface` resident is BGRA
                     // so this is a no-op, and the writer below is declared in
                     // scanout order. Reading the reported order rather than
@@ -967,6 +971,36 @@ fn flush_render_one<M: HostMemory + HostOps>(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
+    }
+    // Hand the currency witness back to the image the frame came out of.
+    //
+    // `write_bgra8` ends in `mark_mapping_written`, which advances
+    // `surface_content_epoch` — correctly, since the mapping's guest pages did
+    // change. But the *pixels* did not: they are the resident's, copied out of it
+    // one statement ago. Leaving the stamp behind therefore invalidates a resident
+    // that holds exactly the mapping's content, and on the composite rail that is
+    // not a residual — it is a loop. The stale stamp costs the next LOAD its
+    // elision, the CPU seed it falls back to finds the host cache ceded to this
+    // rail, so it reads the mapping's guest pages, and reading them flushes the
+    // window this Store just armed, which advances the epoch again. One boot
+    // measured it at `surface_flush / surface_resident` = 1369/1373 — one flush per
+    // arm, a rail that had become a rescheduling with a GPU round trip added.
+    //
+    // Only on the resident path: an `Owned` window's bytes came from an `Arc`, and
+    // nothing here establishes that the slot under this identity still holds them.
+    // The stamp is refused for a slot that is absent or not content_ready, and a
+    // failed write leaves `flushed_from_resident` unused, so both fall back to a
+    // seed rather than to a wrong frame.
+    if ok {
+        if let Some(identity) = flushed_from_resident {
+            if let Some(epoch) = state
+                .mappings
+                .get(&key.mapping_id)
+                .map(|m| m.surface_content_epoch)
+            {
+                crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
+            }
+        }
     }
     crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::line(format!(

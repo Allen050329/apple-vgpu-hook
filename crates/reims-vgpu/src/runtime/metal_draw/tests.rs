@@ -1037,6 +1037,94 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
     );
 }
 
+/// An intermediate record renders into the surface resident too, so it must be
+/// able to ask whether that image is already current — even though it has no
+/// guest Store of its own to defer.
+///
+/// Keying the LOAD's currency check on the *Store* identity broke this, and the
+/// cost was not a lost elision but a loop. Record 1 of a chain has
+/// `writeback_guest == false`, so the check never ran; its LOAD fell through to a
+/// CPU seed; the seed found the host cache ceded to the resident rail and read the
+/// mapping's guest pages; and reading them landed the window the rail had just
+/// armed, which advanced the epoch and cost the *next* LOAD its elision too. One
+/// boot measured `surface_flush / surface_resident` at 1369/1373 — one flush per
+/// arm.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert!(state.map_surface(7));
+    let mut req = DrawEncodeRequest {
+        width: 128,
+        height: 64,
+        ..Default::default()
+    };
+    req.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 3,
+        mapping_id: 7,
+        width: 128,
+        height: 64,
+        load_action: PASS_LOAD_ACTION_LOAD,
+        store_action: PASS_STORE_ACTION_STORE,
+        ..Default::default()
+    });
+
+    // The query the LOAD actually asks. It takes no `writeback_guest`, so an
+    // intermediate and a final record get the same answer by construction — which
+    // is the property, and it is structural rather than asserted.
+    let (identity, mapping_epoch) = type11_load_currency_query(&state, &req)
+        .expect("a LOAD into a mapped type-11 surface is a candidate the resident could serve");
+    assert_eq!(
+        Some(identity.clone()),
+        render_chain_identity(&state, &req),
+        "the LOAD must ask about the slot the record actually renders into"
+    );
+    assert_eq!(
+        Some(identity),
+        type11_store_identity(&state, &req, true),
+        "the Store identity is the same slot, restricted — not a different one"
+    );
+    assert_eq!(
+        mapping_epoch,
+        Some(0),
+        "a freshly mapped surface has published nothing, and 0 is that value — the \
+         `is_some` guard in `type11_resident_is_current` is what keeps it from \
+         matching an unstamped slot"
+    );
+    assert_eq!(
+        type11_store_identity(&state, &req, false),
+        None,
+        "…while only the packet's last record may leave its frame on the resident"
+    );
+
+    // The refusals. A LOAD the resident cannot serve must not produce a query at
+    // all, or the counters below it would divide all draws instead of candidates.
+    req.colors[0].load_action = crate::runtime::decode::render::PASS_LOAD_ACTION_CLEAR;
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "a CLEAR has no prior content to be current"
+    );
+    req.colors[0].load_action = PASS_LOAD_ACTION_LOAD;
+    req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "an explicit seed was already selected by RT provenance"
+    );
+    req.colors[0].target_seed_rgba = None;
+    req.colors[0].store_action = crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "a record that discards its target renders into no resident worth naming"
+    );
+    req.colors[0].store_action = PASS_STORE_ACTION_STORE;
+    req.colors[0].mapping_id = 0;
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "a GVA target is the other rail's"
+    );
+}
+
 /// Records 2+ of an armed resident chain bind the attachment alias from
 /// the resident target; unarmed LOAD without a seed stays None (guest
 /// reload would expose pre-pass bytes — existing contract).

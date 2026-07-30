@@ -4170,28 +4170,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // and takes the seed.
         #[cfg(feature = "backend-vulkan")]
         if !chain_load_from_target {
-            if let (Some(c0), Some(identity)) =
-                (req.colors.first(), type11_resident_target.as_ref())
-            {
-                let mapping_epoch = state
-                    .mappings
-                    .get(&c0.mapping_id)
-                    .map(|m| m.surface_content_epoch);
-                if type11_load_is_a_seed_candidate(c0, req) {
-                    // Both arms counted, into the same one-second window as
-                    // `drain_duty`. An elision count alone cannot tell "the
-                    // seed was skipped" from "this record was never a
-                    // candidate", and the ratio of the two is a within-boot
-                    // number — the only kind that survives the 1.8x
-                    // `us_per_draw` drift between boots on this rig.
-                    let resident_epoch =
-                        crate::backend::vulkan::engine::resident_content_epoch(identity);
-                    if type11_resident_is_current(mapping_epoch, resident_epoch) {
-                        chain_load_from_target = true;
-                        crate::runtime::drain::note_store_route("type11_seed_elided");
-                    } else {
-                        crate::runtime::drain::note_store_route("type11_seed_uploaded");
-                    }
+            if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
+                // Both arms counted, into the same one-second window as
+                // `drain_duty`. An elision count alone cannot tell "the seed was
+                // skipped" from "this record was never a candidate", and the
+                // ratio of the two is a within-boot number — the only kind that
+                // survives the 1.8x `us_per_draw` drift between boots on this rig.
+                let resident_epoch =
+                    crate::backend::vulkan::engine::resident_content_epoch(&identity);
+                if type11_resident_is_current(mapping_epoch, resident_epoch) {
+                    chain_load_from_target = true;
+                    crate::runtime::drain::note_store_route("type11_seed_elided");
+                } else {
+                    crate::runtime::drain::note_store_route("type11_seed_uploaded");
                 }
             }
         }
@@ -5117,6 +5108,38 @@ fn type11_store_identity(
     if !writeback_guest {
         return None;
     }
+    type11_render_identity(state, req)
+}
+
+/// The registry resident this record renders its type-11 color0 *into*, whatever
+/// its role in the packet — the strict superset of [`type11_store_identity`],
+/// which is this same slot restricted to the record that also stores it for the
+/// guest.
+///
+/// The two are separate because the LOAD and the Store ask different questions of
+/// the same slot. "May I start from what is already in this image?" is answerable
+/// by any record that renders into it; "may I leave my frame there instead of
+/// copying it to guest pages?" is only answerable by the packet's last record.
+/// Conflating them cost the whole seed elision on multi-record packets: record 1
+/// of a chain has `writeback_guest == false`, so the currency check keyed on the
+/// Store identity never ran for it, and its LOAD fell through to
+/// `resolve_type11_load_seed` — which, with the host cache ceded to the resident
+/// rail, reads the mapping's guest pages and therefore lands the very window the
+/// rail armed. One boot measured that loop directly: `surface_flush /
+/// surface_resident` = 1369/1373, one flush per arm, with `type11_load_seed`
+/// reporting `outcome=guest_pages` 110 times against 17 `cache_hit` and
+/// `hostgen=0` on every one.
+///
+/// A record with `mapping_id != 0` and a real Store action renders into this slot
+/// on every route: the chain block claims it for `chain_from_resident` and for a
+/// `!writeback_guest` intermediate, and the composite-Store rail claims it for the
+/// last record. So the condition here is the same one those blocks share, asked
+/// once.
+#[cfg(feature = "backend-vulkan")]
+fn type11_render_identity(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
     if c0.mapping_id == 0 || c0.store_action != PASS_STORE_ACTION_STORE {
         return None;
@@ -5133,6 +5156,37 @@ fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest, req: &DrawEncodeRequest)
     c0.load_action == PASS_LOAD_ACTION_LOAD
         && c0.target_seed_rgba.is_none()
         && req.target_seed_rgba.is_none()
+}
+
+/// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to
+/// decide whether the image it is about to render into already holds the seed —
+/// or `None` when this record's LOAD is not one a resident could serve at all.
+///
+/// **Takes no `writeback_guest`, deliberately.** The record's role in the packet
+/// is not part of this question, and a signature that cannot see the role cannot
+/// be keyed on it. It was: the check read the *Store* identity, so record 1 of a
+/// chain — `writeback_guest == false` — never asked, took a CPU seed, found the
+/// host cache ceded to the resident rail, read the mapping's guest pages, and by
+/// reading them landed the window the packet's Store had just armed. That advanced
+/// the epoch and cost the next LOAD its elision in turn, so the rail degraded into
+/// a rescheduling with a GPU round trip added: `surface_flush / surface_resident`
+/// = 1369/1373 on one boot. Structure rather than a test, because a unit test on
+/// the resolver passes whatever the call site then decides to pass it.
+#[cfg(feature = "backend-vulkan")]
+fn type11_load_currency_query(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
+    let c0 = req.colors.first()?;
+    if !type11_load_is_a_seed_candidate(c0, req) {
+        return None;
+    }
+    let identity = type11_render_identity(state, req)?;
+    let mapping_epoch = state
+        .mappings
+        .get(&c0.mapping_id)
+        .map(|m| m.surface_content_epoch);
+    Some((identity, mapping_epoch))
 }
 
 /// Whether a resident's stamp still vouches for the mapping's current content.
