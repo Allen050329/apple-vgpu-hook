@@ -259,7 +259,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // at 1080p, at the 28-111 Stores/s `store_routes` measures, on the drain
     // worker `drain_duty` shows at duty 0.93-0.99. The deferred type-11 arm is
     // the hot one and it cloned purely to hand back the buffer it already owned.
-    if let Some(rgba) = draw_rgba.take() {
+    if let Some(mut rgba) = draw_rgba.take() {
         // Intermediate multi-draw GVA records: return color0 for chaining without
         // guest Store (archive store plan). Resident type-11 intermediates
         // returned above without materializing CPU pixels.
@@ -275,10 +275,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
             // paid that on every route, including the type-11 one whose only
             // consumer is a `observe::line` a normal boot discards. Each arm
             // now scans only when it is about to write a line.
-            let rgb_stats = || {
-                let (nz, max, _) = crate::observe::rgba_rgb_stats(&rgba);
+            // A free function, not a closure over `rgba`: the deferred arm below
+            // takes ownership of that buffer, and a closure capturing it by
+            // reference would pin it in place — which is the whole cost this
+            // rail is removing.
+            fn rgb_stats(rgba: &[u8]) -> (usize, u8) {
+                let (nz, max, _) = crate::observe::rgba_rgb_stats(rgba);
                 (nz, max)
-            };
+            }
             let ok = if c0.mapping_id != 0 {
                 // Unconditional. This used to be `if
                 // type11_cpu_store_fallback_allowed(import_allowed)`, where
@@ -317,26 +321,43 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.mapping_id,
                             c0.width,
                             c0.height,
-                            &rgba,
+                            rgba,
                         )
                     } else {
-                        None
+                        Err(rgba)
                     };
-                    if let Some(epoch) = deferred {
-                        note_type11_store_route("surface_deferred");
-                        {
-                            let _span = StoreCostSpan::new("t11_publish_us");
-                            publish_surface_store(
-                                state,
-                                host,
-                                c0.mapping_id,
-                                c0.width,
-                                c0.height,
-                                c0.format,
-                            );
+                    match deferred {
+                        Ok(epoch) => {
+                            note_type11_store_route("surface_deferred");
+                            {
+                                let _span = StoreCostSpan::new("t11_publish_us");
+                                publish_surface_store(
+                                    state,
+                                    host,
+                                    c0.mapping_id,
+                                    c0.width,
+                                    c0.height,
+                                    c0.format,
+                                );
+                            }
+                            stamp_type11_resident(state, req, writeback_guest, epoch);
+                            // `None`, not the frame. This route is reached only
+                            // under `writeback_guest`, which `multi_draw_store_plan`
+                            // grants solely to the **last** record of a packet — so
+                            // the returned pixels have no next record to seed
+                            // (`exec.rs` feeds `chain_rgba` into record N+1's
+                            // `target_seed_rgba` at line 1609), and every other
+                            // reader of `chain_rgba` is an abandon arm inside a loop
+                            // that has just ended. Returning the buffer forced this
+                            // arm to clone it; returning nothing lets the arm own it.
+                            return (EncodeStatus::Ok, None);
                         }
-                        stamp_type11_resident(state, req, writeback_guest, epoch);
-                        return (EncodeStatus::Ok, Some(rgba));
+                        // Refused before consuming the frame, and handed it back, so
+                        // the synchronous route below still has it. A `Result` rather
+                        // than a `bool` because a moved buffer cannot be un-moved:
+                        // the type is what makes "refused" and "still have the
+                        // pixels" the same statement.
+                        Err(returned) => rgba = returned,
                     }
                     note_type11_store_route("cpu_portability");
                     let ok = mapping_write::write_rgba8_image_changed(
@@ -379,7 +400,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             stamp_type11_resident(state, req, writeback_guest, epoch);
                         }
                         if crate::observe::draw_log_enabled() {
-                            let (rgb_nz, max_rgb) = rgb_stats();
+                            let (rgb_nz, max_rgb) = rgb_stats(&rgba);
                             crate::observe::line(format!(
                                 "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={}",
                                 c0.mapping_id,
@@ -391,7 +412,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             ));
                         }
                     } else {
-                        let (rgb_nz, max_rgb) = rgb_stats();
+                        let (rgb_nz, max_rgb) = rgb_stats(&rgba);
                         crate::observe::fail(format!(
                             "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} fmt={:#x}",
                             c0.mapping_id,
@@ -445,7 +466,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         &rgba,
                     );
                 }
-                let (rgb_nz, max_rgb) = rgb_stats();
+                let (rgb_nz, max_rgb) = rgb_stats(&rgba);
                 crate::observe::fail(format!(
                     "linux_m2v_store gva={:#x} {}x{} pipe={} ok={} rgb_nz={} max={}",
                     c0.target_gva,
@@ -471,7 +492,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 ));
                 gva_ok
             } else {
-                let (rgb_nz, max_rgb) = rgb_stats();
+                let (rgb_nz, max_rgb) = rgb_stats(&rgba);
                 crate::observe::fail(format!(
                     "linux_m2v_store no_target pipe={} rgb_nz={} max={}",
                     req.pipeline_ref, rgb_nz, max_rgb
@@ -5020,11 +5041,13 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     mapping_id: u32,
     width: u32,
     height: u32,
-    rgba: &[u8],
-) -> Option<u32> {
-    let key = surface_store_defer_eligible(state, req)?;
+    rgba: Vec<u8>,
+) -> Result<u32, Vec<u8>> {
+    let Some(key) = surface_store_defer_eligible(state, req) else {
+        return Err(rgba);
+    };
     if key.mapping_id != mapping_id || key.width != width || key.height != height {
-        return None;
+        return Err(rgba);
     }
     // Supersede — do not flush — the window this Store fully covers.
     //
@@ -5071,7 +5094,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     ) {
         // A window that would not land is a window whose guest bytes are now
         // unknown; arming over it would attribute its loss to this Store.
-        return None;
+        return Err(rgba);
     }
     // Convert once, into guest scanout order, and reference it twice: the Load
     // seed and the present capture read it through `surface_cache`, and the
@@ -5086,7 +5109,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         // is worth doing.
         let _span = StoreCostSpan::new("t11_convert_us");
         std::sync::Arc::new({
-            let mut bgra = rgba.to_vec();
+            let mut bgra = rgba;
             for px in bgra.chunks_exact_mut(4) {
                 px.swap(0, 2);
             }
@@ -5130,7 +5153,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         req.pipeline_ref,
         state.compute_deferred_flush.len()
     ));
-    Some(published_epoch)
+    Ok(published_epoch)
 }
 
 /// Whether the type-11 writeback may be deferred at all. Same engine-level
@@ -5430,6 +5453,37 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// A refused arm must hand the frame back intact, because the synchronous
+    /// route is the next thing to run and those are the only pixels it has.
+    ///
+    /// The `Result<u32, Vec<u8>>` exists for this. With a `bool` the buffer had
+    /// to be borrowed, which forced the success path to clone a whole frame —
+    /// ~4.7 MB at ~200 Stores/s, measured at 152 ms/s of `t11_convert_us`. Moving
+    /// it in makes the refusal responsible for giving it back, and an `Err` built
+    /// with the wrong buffer (or an empty one) would not fail to compile: it
+    /// would write a blank or truncated frame into the guest's pages on every
+    /// refusal, which is the black-layer class.
+    #[test]
+    fn a_refused_deferred_arm_returns_the_frame_it_was_given() {
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let frame: Vec<u8> = (0..(8 * 4 * 4)).map(|i| (i % 251) as u8).collect();
+        let original = frame.clone();
+
+        // A bare request against empty state: no surface window is eligible, so
+        // the arm refuses at its first gate, before touching the frame.
+        let req = DrawEncodeRequest::default();
+        let out = arm_surface_deferred_store_with(&mut state, &mut host, &req, 7, 8, 4, frame);
+
+        match out {
+            Ok(epoch) => panic!("expected a refusal from empty state, armed at epoch {epoch}"),
+            Err(returned) => assert_eq!(
+                returned, original,
+                "the refusal must return the same pixels it was handed"
+            ),
+        }
+    }
 
     /// Both sides absent must not read as agreement.
     ///
