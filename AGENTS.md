@@ -2947,12 +2947,15 @@ meant nothing at all. A **zero over the whole log** does survive the dedup, whic
 has to be run against the file rather than the slice. The same reasoning applies to every
 `fail_once` line in this crate.
 
-Two silent drops on that path are worth fixing on their own account even though neither is firing.
-`resolve_dispatch_dims` failing abandons the dispatch and reports only through `observe::line`, the
-`REIMS_VGPU_DRAW_LOG=1` tier — the identical shape AGENTS.md records for `try_recover_sentinel_grid`,
-where a verbose-only report kept a heuristic alive for several sessions. And the `tg_x == 0 || …`
-guard below it returns `BadGrid("compute_vk_zero_dims")` with no line of its own. Both are covered
-today *only* by the rail-boundary refusal, which is deduped per pipeline.
+Two sites on that path look like silent drops and are **not** — worth stating because both were
+written up as violations here before the propagation was traced. `resolve_dispatch_dims` failing
+abandons the dispatch with only an `observe::line` (the `REIMS_VGPU_DRAW_LOG=1` tier), and the
+`tg_x == 0 || …` guard below it returns `BadGrid("compute_vk_zero_dims")` with no line at all. Both
+statuses propagate out of `execute_dispatch_linux` to `handle_compute_record`, which calls
+`note_compute_refusal` on every non-`Ok` record, so the always-on channel does name them. What the
+verbose line adds is the detail — the actual grid and threadgroup values — and what the arrangement
+costs is that the always-on side is deduped per pipeline, so it reports *that* a pipeline refused and
+never *how often*. That is the designed behaviour of a rail-boundary refusal, not a hole.
 
 So the specialization mismatch is real, unexplained, and **not** the icon defect. What is left is
 that the icon dispatches look entirely ordinary on every line this device emits — `3` samples and
