@@ -930,7 +930,14 @@ fn read_texture_row<M: HostMemory + HostOps>(
     }
 }
 
-/// Write one texture row from `buf`.
+/// Write one texture row from `buf`, bounded to the pages the copy's whole
+/// destination region resolved to before its row loop started
+/// ([`texture_region_window`]).
+///
+/// `allowed` is not consulted on the type-11 arm: that write goes through the
+/// mapping rail, whose authorisation is the page list the guest declared for
+/// the mapping itself. That is a different and equally explicit model, not an
+/// unbounded one.
 #[allow(
     clippy::too_many_arguments,
     reason = "the row helper keeps texture origin and plane geometry explicit"
@@ -946,6 +953,7 @@ fn write_texture_row<M: HostMemory + HostOps>(
     row_i: u64,
     row_bytes: u64,
     buf: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), BlitStatus> {
     if row_bytes as usize > buf.len() {
         return Err(br(BlitStatus::Capacity, "wr_row_buf_cap"));
@@ -964,12 +972,13 @@ fn write_texture_row<M: HostMemory + HostOps>(
                 .base_gva
                 .checked_add(off)
                 .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_gva_overflow"))?;
-            if gva_mem::write_task_gva_product(
+            if gva_mem::write_task_gva_product_within(
                 state,
                 host,
                 task_id,
                 gva,
                 &buf[..row_bytes as usize],
+                allowed,
             )
             .is_err()
             {
@@ -1023,6 +1032,117 @@ fn ranges_overlap(a0: u64, a_len: u64, b0: u64, b_len: u64) -> bool {
     a0 < b1 && b0 < a1
 }
 
+/// Guest pages a blit's destination span resolves to, taken before the loop that
+/// writes them.
+///
+/// A blit does not wait for the GPU, which is why these writes were argued to be
+/// authorised by the page table at the moment they run. That argument confuses
+/// "synchronous with the device thread" with "instantaneous": a full-screen
+/// texture copy is tens of MiB of per-row guest read and guest write, the guest's
+/// own vCPUs run throughout, and the destination is re-resolved from scratch on
+/// every row. The pages `gva + 8000 * stride` names at the end of the loop need
+/// not be the pages the same expression named at the start, and a copy that runs
+/// off its resource paints whatever the guest handed those pages to next — the
+/// heap and kernel corruption this class is made of.
+///
+/// Capturing the whole destination span once, up front, makes every row's write
+/// authorised by the walk the command itself would have been authorised by.
+///
+/// `None` when the span resolves no page at all. That leaves the writer to fail
+/// closed on its own terms rather than refusing a whole blit because the capture
+/// failed for an unrelated reason; it is counted so the arm is measurable
+/// instead of assumed.
+fn dest_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) -> Option<std::collections::HashSet<u64>> {
+    if gva == 0 || span == 0 {
+        return None;
+    }
+    let mut pages = std::collections::HashSet::new();
+    gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            pages.insert(gpa_page);
+            true
+        },
+    );
+    if pages.is_empty() {
+        crate::runtime::drain::note_store_route("blit_dest_unbounded");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("blit_dest_bound");
+    Some(pages)
+}
+
+/// [`dest_window`] over the region of a texture a row loop is about to write.
+///
+/// The span is measured with the texture's own [`LinearTextureLevel::texel_offset`],
+/// first row to last, so a level, slice or plane stride this bound does not
+/// model cannot place a row outside the set it authorises.
+///
+/// `None` for a type-11 texture: that write goes through the mapping rail,
+/// authorised by the page list the guest declared for the mapping. Walking a
+/// GVA span for it would bound the wrong address space.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the window mirrors the copy region the row loop walks"
+)]
+fn texture_region_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    tex: &TextureBacking,
+    ox: u64,
+    oy: u64,
+    oz: u64,
+    copy_w: u32,
+    copy_h: u64,
+    copy_d: u64,
+    bpp: u32,
+) -> Option<std::collections::HashSet<u64>> {
+    let TextureBacking::Linear(t) = tex else {
+        return None;
+    };
+    let first = t.texel_offset(ox, oy, oz)?;
+    let last = t.texel_offset(
+        ox,
+        oy.checked_add(copy_h.checked_sub(1)?)?,
+        oz.checked_add(copy_d.checked_sub(1)?)?,
+    )?;
+    let row_bytes = (copy_w as u64).checked_mul(bpp as u64)?;
+    let span = last.checked_add(row_bytes)?.checked_sub(first)?;
+    dest_window(state, host, task_id, t.base_gva.checked_add(first)?, span)
+}
+
+/// Highest byte offset past `base` a strided plane/row walk reaches.
+///
+/// The bound wants the span the command names, not the resource's whole
+/// allocation: a copy into the top-left corner of a 64 MiB texture must not be
+/// authorised for the other 63. Derived from the walk's own geometry — last
+/// plane, last row, one row of bytes — so it cannot drift from the loop it
+/// bounds.
+fn strided_span(
+    row_bytes: u64,
+    row_stride: u64,
+    row_count: u64,
+    image_stride: u64,
+    image_count: u64,
+) -> Option<u64> {
+    let last_image = image_count.checked_sub(1)?.checked_mul(image_stride)?;
+    let last_row = row_count.checked_sub(1)?.checked_mul(row_stride)?;
+    last_image.checked_add(last_row)?.checked_add(row_bytes)
+}
+
 fn write_fill_range<M: HostMemory + HostOps>(
     host: &mut M,
     state: &mut DeviceState,
@@ -1034,12 +1154,22 @@ fn write_fill_range<M: HostMemory + HostOps>(
     if length == 0 {
         return Ok(());
     }
+    let allowed = dest_window(state, host, task_id, gva, length);
     let mut remaining = length;
     let mut cur = gva;
     let chunk = vec![value; CHUNK];
     while remaining > 0 {
         let n = remaining.min(CHUNK as u64) as usize;
-        if gva_mem::write_task_gva_product(state, host, task_id, cur, &chunk[..n]).is_err() {
+        if gva_mem::write_task_gva_product_within(
+            state,
+            host,
+            task_id,
+            cur,
+            &chunk[..n],
+            allowed.as_ref(),
+        )
+        .is_err()
+        {
             return Err(br(BlitStatus::GuestIo, "fill_write_io"));
         }
         cur = cur
@@ -1057,6 +1187,32 @@ fn copy_bytes<M: HostMemory + HostOps>(
     src_gva: u64,
     dst_gva: u64,
     length: u64,
+) -> Result<(), BlitStatus> {
+    if length == 0 {
+        return Ok(());
+    }
+    let allowed = dest_window(state, host, task_id, dst_gva, length);
+    copy_bytes_within(host, state, task_id, src_gva, dst_gva, length, allowed.as_ref())
+}
+
+/// [`copy_bytes`] with the destination window supplied rather than captured.
+///
+/// The split exists so a test can run the identical loop unbounded and show
+/// where the bytes land without it. Product code calls [`copy_bytes`]; there is
+/// no product caller that should be choosing its own window here, because the
+/// window this copy is entitled to is the destination span it was given.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded form adds the window to the copy's own geometry"
+)]
+fn copy_bytes_within<M: HostMemory + HostOps>(
+    host: &mut M,
+    state: &mut DeviceState,
+    task_id: u32,
+    src_gva: u64,
+    dst_gva: u64,
+    length: u64,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), BlitStatus> {
     if length == 0 {
         return Ok(());
@@ -1079,7 +1235,9 @@ fn copy_bytes<M: HostMemory + HostOps>(
         {
             return Err(br(BlitStatus::GuestIo, "copy_bytes_read_io"));
         }
-        if gva_mem::write_task_gva_product(state, host, task_id, d, &buf[..n]).is_err() {
+        if gva_mem::write_task_gva_product_within(state, host, task_id, d, &buf[..n], allowed)
+            .is_err()
+        {
             return Err(br(BlitStatus::GuestIo, "copy_bytes_write_io"));
         }
         s = s
@@ -1125,6 +1283,15 @@ fn copy_row_region<M: HostMemory + HostOps>(
         .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_total_overflow"))?;
     let row_len = host_alloc_len(row_bytes)
         .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_row_alloc"))?;
+    let dst_span = strided_span(
+        row_bytes,
+        dst_row_stride,
+        row_count,
+        dst_image_stride,
+        image_count,
+    )
+    .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_span_overflow"))?;
+    let allowed = dest_window(state, host, task_id, dst_base, dst_span);
     let mut row_buf = vec![0u8; row_len];
     for z in 0..image_count {
         let src_plane = src_base
@@ -1165,7 +1332,16 @@ fn copy_row_region<M: HostMemory + HostOps>(
                 note_copy_region_io(task_id, false, s, y, z, row_bytes, state.page_shift);
                 return Err(br(BlitStatus::GuestIo, "copy_region_read_io"));
             }
-            if gva_mem::write_task_gva_product(state, host, task_id, d, &row_buf).is_err() {
+            if gva_mem::write_task_gva_product_within(
+                state,
+                host,
+                task_id,
+                d,
+                &row_buf,
+                allowed.as_ref(),
+            )
+            .is_err()
+            {
                 note_copy_region_io(task_id, true, d, y, z, row_bytes, state.page_shift);
                 return Err(br(BlitStatus::GuestIo, "copy_region_write_io"));
             }
@@ -1331,11 +1507,14 @@ fn write_texture_storage_row<M: HostMemory + HostOps>(
     width: u32,
     storage_bpp: u32,
     buf: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), BlitStatus> {
     let row_bytes = (width as u64)
         .checked_mul(storage_bpp as u64)
         .ok_or(BlitStatus::Capacity)?;
-    write_texture_row(state, host, task_id, tex, ox, oy, oz, row_i, row_bytes, buf)
+    write_texture_row(
+        state, host, task_id, tex, ox, oy, oz, row_i, row_bytes, buf, allowed,
+    )
 }
 
 /// Copy buffer plane rows ↔ texture with optional combined-DS plane repack.
@@ -1377,6 +1556,25 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
         .ok_or(BlitStatus::Capacity)? as usize;
     let mut plane = vec![0u8; plane_row];
     let mut packed = vec![0u8; storage_row.max(plane_row)];
+    // Destination pages, taken before the loop below rather than per row. The
+    // loop *is* the copy -- up to `copy_d * copy_h` guest reads and writes -- and
+    // it re-derives its destination from `tex`/`buf_base_gva` on every one of
+    // them, which is the drift `dest_window` exists to close.
+    let allowed = if to_texture {
+        texture_region_window(
+            state, host, task_id, tex, tex_ox, tex_oy, tex_oz, copy_w, copy_h, copy_d, storage_bpp,
+        )
+    } else {
+        let span = strided_span(
+            plane_row as u64,
+            buf_row_stride,
+            copy_h,
+            buf_image_stride,
+            copy_d,
+        )
+        .ok_or(BlitStatus::Capacity)?;
+        dest_window(state, host, task_id, buf_base_gva, span)
+    };
     for z in 0..copy_d {
         for y in 0..copy_h {
             let buf_gva = buf_base_gva
@@ -1437,6 +1635,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                         copy_w,
                         storage_bpp,
                         &packed[..storage_row],
+                        allowed.as_ref(),
                     )?;
                 } else {
                     write_texture_row(
@@ -1450,6 +1649,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                         y,
                         plane_row as u64,
                         &plane,
+                        allowed.as_ref(),
                     )?;
                 }
             } else if repack {
@@ -1476,7 +1676,16 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                 ) {
                     return Err(BlitStatus::Unsupported);
                 }
-                if gva_mem::write_task_gva_product(state, host, task_id, buf_gva, &plane).is_err() {
+                if gva_mem::write_task_gva_product_within(
+                    state,
+                    host,
+                    task_id,
+                    buf_gva,
+                    &plane,
+                    allowed.as_ref(),
+                )
+                .is_err()
+                {
                     return Err(BlitStatus::GuestIo);
                 }
             } else {
@@ -1492,7 +1701,16 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                     plane_row as u64,
                     &mut plane,
                 )?;
-                if gva_mem::write_task_gva_product(state, host, task_id, buf_gva, &plane).is_err() {
+                if gva_mem::write_task_gva_product_within(
+                    state,
+                    host,
+                    task_id,
+                    buf_gva,
+                    &plane,
+                    allowed.as_ref(),
+                )
+                .is_err()
+                {
                     return Err(BlitStatus::GuestIo);
                 }
             }
@@ -1676,6 +1894,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     if src_span > src.size {
         return br(BlitStatus::Bounds, "b2t_t11_src_span_oob");
     }
+    // `None` for the type-11 destination this arm is for, which the mapping rail
+    // authorises instead; a linear destination reaching here is still bounded.
+    let allowed = texture_region_window(
+        state, host, task_id, &dst, ox, oy, oz, copy_w as u32, copy_h, copy_d, copy_bpp,
+    );
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -1711,6 +1934,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
                 y,
                 row_bytes,
                 &row,
+                allowed.as_ref(),
             ) {
                 return st;
             }
@@ -2012,6 +2236,22 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         let mut plane = vec![0u8; plane_row];
         let mut src_packed = vec![0u8; (copy_w as usize).saturating_mul(src_storage as usize)];
         let mut dst_packed = vec![0u8; (copy_w as usize).saturating_mul(dst_storage as usize)];
+        let allowed = texture_region_window(
+            state,
+            host,
+            task_id,
+            &dst,
+            dox,
+            doy,
+            doz,
+            copy_w as u32,
+            copy_h,
+            copy_d,
+            // This loop has two write arms: the repack one stores a packed
+            // `dst_storage` row, the other a `copy_bpp` plane row. The window
+            // has to cover whichever runs, so it is measured on the wider.
+            dst_storage.max(copy_bpp),
+        );
         for z in 0..copy_d {
             for y in 0..copy_h {
                 if repack_src {
@@ -2092,6 +2332,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         copy_w as u32,
                         dst_storage,
                         &dst_packed,
+                        allowed.as_ref(),
                     ) {
                         return st;
                     }
@@ -2106,6 +2347,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                     y,
                     row_bytes,
                     &plane,
+                    allowed.as_ref(),
                 ) {
                     return st;
                 }
@@ -2218,6 +2460,9 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         };
     }
     // Mixed or type-11↔type-11: stage rows.
+    let allowed = texture_region_window(
+        state, host, task_id, &dst, dox, doy, doz, copy_w as u32, copy_h, copy_d, copy_bpp,
+    );
     let mut row = vec![0u8; row_bytes as usize];
     for z in 0..copy_d {
         for y in 0..copy_h {
@@ -2246,6 +2491,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 y,
                 row_bytes,
                 &row,
+                allowed.as_ref(),
             ) {
                 return st;
             }
@@ -2477,15 +2723,27 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
                 return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
             }
             let mut row = vec![0u8; row_bytes as usize];
+            let allowed =
+                texture_region_window(state, host, task_id, &dst, 0, 0, 0, w, h as u64, 1, bpp);
             for y in 0..h as u64 {
                 if let Err(st) =
                     read_texture_row(state, host, task_id, &src, 0, 0, 0, y, row_bytes, &mut row)
                 {
                     return st;
                 }
-                if let Err(st) =
-                    write_texture_row(state, host, task_id, &dst, 0, 0, 0, y, row_bytes, &row)
-                {
+                if let Err(st) = write_texture_row(
+                    state,
+                    host,
+                    task_id,
+                    &dst,
+                    0,
+                    0,
+                    0,
+                    y,
+                    row_bytes,
+                    &row,
+                    allowed.as_ref(),
+                ) {
                     return st;
                 }
             }
@@ -2739,6 +2997,118 @@ mod tests {
         write_task_gva_arm64e(host, &state.tasks[1], off, &entry);
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("entry");
         assert_eq!(e.object_type, OBJECT_TYPE_BUFFER);
+    }
+
+    /// A blit's destination bound is the pages the command named, and it holds
+    /// against a guest that re-points the range while the copy is running.
+    ///
+    /// A blit does not wait for the GPU, which is why these writes were argued
+    /// to need no bound. But a copy is a loop: it re-derives its destination
+    /// from the same base address on every chunk, and the guest's vCPUs run
+    /// throughout. `FakeHost::arm_rewire` puts the guest edit where it actually
+    /// happens -- between two iterations, fired from the source read the loop
+    /// performs anyway -- so this is the mechanism, not a model of it.
+    ///
+    /// Both directions are asserted. Bounded, the copy refuses and the page the
+    /// guest handed to something else is still zero. Unbounded, the identical
+    /// loop reports success and paints that page, which is the guest heap and
+    /// kernel corruption this class is made of.
+    #[test]
+    fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
+        use crate::runtime::host::Rewire;
+        const PAGE: u64 = 1 << PAGE_SHIFT_ARM64E;
+        // Six pages is the smallest copy that spans more than one 64 KiB chunk,
+        // and a second chunk is what gives the guest an instant to edit in.
+        const PAGES: u64 = 6;
+        const LEN: u64 = PAGES * PAGE;
+        // Virtual page N maps to guest frame DATA_BASE + N.
+        const DATA_BASE: u32 = 4;
+        const SRC_PAGE: u64 = 1;
+        const DST_PAGE: u64 = 8;
+        // Outside both buffers: the allocation the guest hands the range to.
+        const VICTIM_PAGE: u64 = 15;
+        let victim_gpa = (DATA_BASE as u64 + VICTIM_PAGE) << PAGE_SHIFT_ARM64E;
+        let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+        // The second chunk starts at source page 4; reading it is the loop
+        // saying "chunk one is written, chunk two is not".
+        let second_chunk_src_gpa = (DATA_BASE as u64 + SRC_PAGE + 4) << PAGE_SHIFT_ARM64E;
+        // Destination virtual page 12 is written by that second chunk.
+        let moved_entry_gpa = root_gpa + 12 * 4;
+
+        // `rig` is a whole scenario because the unbounded arm must run against a
+        // guest in the same state, not against one the bounded arm already
+        // refused half a copy into.
+        let rig = |host: &mut FakeHost, state: &mut DeviceState| {
+            gva_mem::define_task_pages_arm64e(host, state, DATA_BASE, 16);
+            install_buffer(host, state, 7, SRC_PAGE as u32, LEN);
+            install_buffer(host, state, 8, DST_PAGE as u32, LEN);
+            // Distinctive source bytes: a page of zeroes proves nothing about
+            // where a copy landed.
+            let payload = vec![0xabu8; LEN as usize];
+            write_task_gva_arm64e(host, &state.tasks[1], SRC_PAGE << PAGE_SHIFT_ARM64E, &payload);
+            host.arm_rewire(Rewire {
+                on_read_gpa: second_chunk_src_gpa,
+                on_read_len: 1,
+                pte_gpa: moved_entry_gpa,
+                bytes: (DATA_BASE + VICTIM_PAGE as u32).to_le_bytes().to_vec(),
+            });
+        };
+        let victim_head = |host: &FakeHost| {
+            let mut out = [0u8; 8];
+            let _ = host.read_gpa(victim_gpa, &mut out);
+            out
+        };
+
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        rig(&mut host, &mut state);
+        let mut cmd = Command::default();
+        cmd.kind = Kind::Copy;
+        cmd.copy_kind = CopyKind::BufferToBuffer;
+        cmd.source = 7;
+        cmd.destination = 8;
+        cmd.size = LEN;
+        let st = execute_blit(&mut state, &mut host, 1, &cmd);
+        assert_eq!(
+            host.rewires_fired(),
+            1,
+            "the guest edit never fired -- the copy did not read its second chunk, \
+             so this test proved nothing"
+        );
+        assert_eq!(
+            st,
+            BlitStatus::GuestIo,
+            "a destination page the command never named must be refused"
+        );
+        assert_eq!(
+            victim_head(&host),
+            [0u8; 8],
+            "the refused copy still reached the allocation the guest moved the range to"
+        );
+
+        // The same loop with no window, on a guest in the same state.
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        rig(&mut host, &mut state);
+        assert!(
+            copy_bytes_within(
+                &mut host,
+                &mut state,
+                1,
+                SRC_PAGE << PAGE_SHIFT_ARM64E,
+                DST_PAGE << PAGE_SHIFT_ARM64E,
+                LEN,
+                None,
+            )
+            .is_ok(),
+            "without the bound the copy reports success"
+        );
+        assert_eq!(host.rewires_fired(), 1, "same guest, same instant");
+        assert_eq!(
+            victim_head(&host),
+            [0xabu8; 8],
+            "and it succeeds by painting a page it was never given"
+        );
     }
 
     #[test]

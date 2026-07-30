@@ -448,6 +448,38 @@ pub struct FakeHost {
     pub stable_map_pages: bool,
     /// Number of HostOps page-import attempts (test proxy for import amplification).
     pub map_pages_calls: u64,
+    /// Scripted guest page-table edits, armed by [`FakeHost::arm_rewire`].
+    rewires: std::cell::RefCell<Vec<Rewire>>,
+    /// How many armed rewires have fired, so a test can assert its trigger hit.
+    rewires_fired: std::cell::Cell<u64>,
+}
+
+/// A guest page-table edit that fires from inside a device guest read.
+///
+/// The corruption class this harness exists to test is defined by something the
+/// guest does *while a device loop is running*: a copy takes an address from a
+/// command, walks it again per row, and the guest re-points it in between. A
+/// test that edits the page table before or after the call cannot express that,
+/// because the interesting instant is inside it — so a bound that only ever saw
+/// a settled page table would pass whether or not it worked.
+///
+/// The trigger is a guest read overlapping `[on_read_gpa, +on_read_len)` rather
+/// than a read ordinal. Every one of these loops reads its source per row, so
+/// naming the source row that must already have been read states the timing in
+/// the loop's own terms; an ordinal would be a number picked by watching one run
+/// and would move the moment anything else read guest memory.
+///
+/// Fires at most once.
+#[derive(Debug)]
+pub struct Rewire {
+    /// Guest read address whose access fires this.
+    pub on_read_gpa: u64,
+    /// Length of the triggering read window.
+    pub on_read_len: u64,
+    /// Guest physical address of the page-table entry to overwrite.
+    pub pte_gpa: u64,
+    /// Bytes to write there.
+    pub bytes: Vec<u8>,
 }
 
 /// Contiguous bounce for [`FakeHost::map_pages`] on non-macOS (sparse GPA store).
@@ -534,6 +566,68 @@ impl FakeHost {
         self.ranges
             .iter()
             .position(|r| gpa >= r.gpa && gpa < r.gpa + r.len as u64)
+    }
+
+    /// Arm a [`Rewire`]: the guest edits its page table mid-loop.
+    pub fn arm_rewire(&mut self, rewire: Rewire) {
+        self.rewires.borrow_mut().push(rewire);
+    }
+
+    /// Rewires that have fired so far.
+    pub fn rewires_fired(&self) -> u64 {
+        self.rewires_fired.get()
+    }
+
+    /// Fire any armed [`Rewire`] whose trigger window this read touches.
+    ///
+    /// Called from `read_gpa` — the one operation every guest-memory loop
+    /// performs — so the edit lands between two iterations without the loop
+    /// knowing anything about it, which is exactly the guest's position.
+    fn fire_rewires(&self, gpa: u64, len: usize) {
+        if self.rewires.borrow().is_empty() {
+            return;
+        }
+        let end = gpa.saturating_add(len as u64);
+        let mut fired: Vec<Rewire> = Vec::new();
+        self.rewires.borrow_mut().retain(|r| {
+            let hit = gpa < r.on_read_gpa.saturating_add(r.on_read_len) && r.on_read_gpa < end;
+            if hit {
+                fired.push(Rewire {
+                    on_read_gpa: r.on_read_gpa,
+                    on_read_len: r.on_read_len,
+                    pte_gpa: r.pte_gpa,
+                    bytes: r.bytes.clone(),
+                });
+            }
+            !hit
+        });
+        for r in fired {
+            self.poke(r.pte_gpa, &r.bytes);
+            self.rewires_fired.set(self.rewires_fired.get() + 1);
+        }
+    }
+
+    /// Write `bytes` at `gpa` through a live range, from `&self`.
+    ///
+    /// A guest vCPU writes its own page table without asking the device, so the
+    /// harness must be able to as well. Only real ranges: a page table lives in
+    /// mapped guest RAM in every fixture, and silently landing a rewire in the
+    /// sparse side store would let a test that never armed anything pass.
+    fn poke(&self, gpa: u64, bytes: &[u8]) {
+        let Some(i) = self.range_containing(gpa) else {
+            panic!("FakeHost::poke: {gpa:#x} is not in a mapped range");
+        };
+        let r = &self.ranges[i];
+        let off = (gpa - r.gpa) as usize;
+        assert!(
+            off + bytes.len() <= r.len,
+            "FakeHost::poke: {gpa:#x}+{} runs past its range",
+            bytes.len()
+        );
+        // SAFETY: `off + bytes.len() <= r.len` bytes are live at `r.ptr`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (r.ptr + off) as *mut u8, bytes.len());
+        }
     }
 
     /// Register a real range at `gpa`, seeding from any sparse bytes there.
@@ -631,6 +725,7 @@ impl HostMemory for FakeHost {
         if buf.is_empty() {
             return Ok(());
         }
+        self.fire_rewires(gpa, buf.len());
         let mut done = 0usize;
         while done < buf.len() {
             let addr = gpa.checked_add(done as u64).ok_or(MemError::Overflow)?;

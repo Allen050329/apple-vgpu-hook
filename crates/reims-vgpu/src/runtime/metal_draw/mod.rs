@@ -3547,6 +3547,13 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
 /// the scissor rect a partial store touches, because the packed rail maps the
 /// whole image in one view and authorises every page it aliases.
 ///
+/// The capture walk drops pages that do not resolve, while the writer's walk
+/// fails the whole span on one. The set is therefore a subset of what the writer
+/// will ask to write, never a superset, so the disagreement can only refuse and
+/// never wrongly permit. The one case it refuses is a page that was unresolved
+/// at capture and resolvable at write time, which is a re-point — the event this
+/// bound exists to catch.
+///
 /// `None` — unbounded, the pre-existing behaviour — when there is no GVA target,
 /// when the record does not store, or when the walk resolves no page at all.
 /// The last arm is counted (`sync_store_unbounded`) rather than tightened on
