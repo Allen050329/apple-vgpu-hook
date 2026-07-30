@@ -41,6 +41,20 @@ RUN_DIR="${RUN_DIR:-$DISKS_DIR/run}"
 # In-tree QEMU is rebuilt every boot unless QEMU_BIN is overridden. The boot
 # script still builds both Rust products first so stale host code and stale GOP
 # ROMs do not survive a launch.
+#
+# Overriding QEMU_BIN is how a multi-boot batch pins one arm while the Rust tree
+# is edited. Two constraints on what may be pinned, both learned by losing runs
+# to them:
+#
+# - Keep the pinned copy inside `vendor/qemu/build/`. QEMU finds its firmware
+#   through /proc/self/exe -> `<exedir>/qemu-bundle/usr/local/share/qemu`, so a
+#   copy in /tmp prints this script's normal header and then dies on
+#   `failed to find romfile "efi-virtio.rom"` — a boot that looks started.
+# - Keep `qemu-system-x86_64` in the filename. Every VM sweep in this repo and
+#   in the repro scripts matches that pattern. A pin named anything else
+#   survives the sweep, keeps hostfwd 2222, and the next boot fails to bind and
+#   exits — after which the scoring script talks to the *pinned* guest and
+#   reports a clean run of the wrong binary.
 QEMU_BIN_DEFAULT="$REPO_ROOT/vendor/qemu/build/qemu-system-x86_64"
 QEMU_BIN="${QEMU_BIN:-$QEMU_BIN_DEFAULT}"
 REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh"
