@@ -1624,6 +1624,55 @@ Behavior changes need tests that fail without the change. Bug fixes need a focus
 or proxy test for the bug class. Run Rust tests serially with `-- --test-threads=1`; GPU-touching
 tests are not safe to run in parallel.
 
+### The Cheapest Real Reduction Left Is A Helper The File Already Has
+
+Product code is close to its floor — the four sweeps above return almost nothing. The test modules
+are not, and the highest-yield shape there is **not** "extract a helper". It is **"adopt the helper
+that already exists"**, which is strictly safer because it introduces no abstraction and the target
+signature is already fixed by 40-odd existing callers.
+
+`icb/tests.rs` had `put_function_object(host, state, ref_, desc_gva, blob_page, blob)` with 42
+callers, and **fourteen** other sites open-coding its exact body, 14 lines each. Adopting it removed
+**182 lines** and added none. The tell that this was adoption rather than extraction only appeared
+after a `git checkout` and a re-grep: an early attempt wrote a *new* helper with a different argument
+order, and the file already had one. **Before extracting anything from a test module, grep the file
+for a function whose body is the block you are about to hoist.**
+
+The generic method, both halves needed:
+
+1. `clones.py <MIN>` for candidates, and read the line ranges — the huge groups
+   (`abi.rs` 337x, `vk_call.rs` 87x) are sliding-window artefacts on constant tables, visible because
+   their ranges overlap (`6-23`, `7-24`, `8-26`). Real groups have disjoint ranges.
+2. Before substituting, check **every** matched block for uses of its locals *after* the block, in
+   the enclosing fn. That is what makes a substitution total rather than partial, and it is one
+   regex. All 14 `put_function_object` sites were clean; the page-table fixture below is not.
+
+Verify with an **exact round trip**, and build it as a canonical form rather than an inline-back:
+rewrite both `HEAD` and the working tree so every occurrence — hand-rolled *or* helper call —
+collapses to the same token, then compare. A naive inline-back fails when a newly-generated call is
+textually identical to a pre-existing one, and the first attempt here did exactly that and reported a
+false difference. Print the token count on both sides; equal counts plus identical text is the proof.
+
+This matters most where there is no compiler. `backend-metal` never builds on a Linux host, so a
+refactor of Metal-gated test code gets **no** check at all — the round trip is the whole verification.
+One mistake in this class *is* catchable and was caught: an ungated helper over Metal-gated constants
+(`TYPE7_FIRST_TLVS` and friends live behind `#[cfg(all(feature = "backend-metal", target_os =
+"macos"))]`) fails the Vulkan-arm clippy with `cannot find value`. Gate the helper like its callers.
+
+**The yield curve is steep, so stop when it flattens.** Measured on `icb/tests.rs`: 182 lines, then
+44, then the next candidate is worth ~17. Remaining known groups, with the reason each is smaller
+than it looks:
+
+- `metal_draw/tests.rs` page-table directory fixture — the clone report says 5 sites, exact-match is
+  **3**, and each uses `dir_pfn` and `root_gpa` afterwards, so the helper must return a tuple. ~17
+  lines. Not taken.
+- `icb/tests.rs` groups at 4544/4663/4780/4974 and 4720/4837/5057 — not examined.
+- `compute_exec/tests.rs` 887/942/1431 — not examined.
+
+A test helper is only worth extracting when it removes more than it adds *after* rustfmt, and the
+call has to fit in 100 columns or every site wraps to eight lines. The `put_function_object` calls
+land at 73 columns; the same extraction pre-wrapped by hand scored −64 instead of −182.
+
 ### Four Deletion Candidates That Do Not Survive Reading The Code
 
 Audited 2026-07-30 by hand after a subagent sweep nominated each. All four **rejected**, with the
