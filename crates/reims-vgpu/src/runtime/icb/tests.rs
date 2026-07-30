@@ -248,6 +248,28 @@ fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
     (vtx, frag)
 }
 
+/// Minimal render pipeline type-7 descriptor: a first-TLV block carrying only
+/// the vertex and fragment function refs — no vertex-input and no colour
+/// attachment, unlike [`make_stagein_render_pipeline_desc`]. Six call sites
+/// built these same twelve lines. Gated like its constants and all six callers,
+/// which are Metal-arm execute tests.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], vert_ref);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], frag_ref);
+    pdesc
+}
+
 /// Type-7 render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
 ///
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from
@@ -2074,18 +2096,7 @@ fn fill_render_draw_indexed_execute_oracle() {
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -2191,18 +2202,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -3700,18 +3700,7 @@ fn inherit_buffers_encoder_fragment_color() {
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -3822,18 +3811,7 @@ fn inherit_pipeline_encoder_fragment_color() {
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -5423,18 +5401,7 @@ fn fill_render_nonzero_bind_offset_oracle() {
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -5530,18 +5497,7 @@ fn buffer_backed_nonzero_wire_va_offset() {
 
     put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
