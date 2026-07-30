@@ -4042,3 +4042,111 @@ fn only_a_moved_backing_refuses_a_gva_cache_hit() {
         "the address names a different allocation than these bytes are of"
     );
 }
+
+/// The synchronous GVA Store's write must be bounded to the pages the command
+/// named, and that set has to be taken before the GPU round trip.
+///
+/// `encode_draw_chain` encodes, submits, waits and reads back before the Store
+/// resolves `target_gva`. The guest runs on its own vCPUs across that gap and
+/// can hand the range to something else, so a write authorised by a walk taken
+/// after the readback is authorised by the wrong page table -- the same shape
+/// that was scattering deferred render targets into other owners' memory.
+///
+/// The two permissive arms are locked deliberately, because a bound that
+/// refuses when it should not drops live Stores: a record that does not own
+/// guest writeback and a target with no GVA both stay unbounded.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = pt_base + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    // 64x64 BGRA8 with a tight stride is exactly one 16 KiB page.
+    let c0 = ColorRtRequest {
+        slot: 0,
+        texture_ref: 7,
+        mapping_id: 0,
+        target_gva: page,
+        row_stride: 64 * 4,
+        width: 64,
+        height: 64,
+        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        load_action: PASS_LOAD_ACTION_LOAD,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [0.0; 4],
+        target_seed_rgba: None,
+    };
+
+    let armed = sync_store_allowed_pages(&state, &host, 1, Some(&c0), true)
+        .expect("a resolvable GVA target must be bounded");
+    assert_eq!(armed.len(), 1, "64x64 BGRA8 tight covers one 16 KiB page");
+    assert!(armed.contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
+
+    // The guest hands that virtual page to a different allocation while the GPU
+    // is working. The write that follows must not reach the new owner.
+    let mut pte = [0u8; 4];
+    st32(&mut pte, pt_base + 6);
+    let _ = host.write_gpa(root_gpa + 4, &pte);
+    let rgba = vec![0xffu8; 64 * 64 * 4];
+    let err = write_gva_rgba8_within(
+        &mut state,
+        &mut host,
+        1,
+        page,
+        64,
+        64,
+        64 * 4,
+        c0.format,
+        &rgba,
+        Some(&armed),
+    )
+    .expect_err("a page the command never named must be refused");
+    assert!(
+        matches!(err, crate::runtime::host::MemError::WriteOutsideWindow),
+        "expected WriteOutsideWindow, got {err:?}"
+    );
+    // Unbounded, it lands in whatever owns that page now -- this is the write
+    // the crash reports are of, and 0xff is the white pixel run the guest
+    // kernel reported over its freed heap element.
+    assert!(
+        write_gva_rgba8_within(
+            &mut state, &mut host, 1, page, 64, 64, 64 * 4, c0.format, &rgba, None,
+        )
+        .is_ok(),
+        "without the bound the same write succeeds into the new owner's page"
+    );
+
+    // Permissive arms stay permissive.
+    assert!(
+        sync_store_allowed_pages(&state, &host, 1, Some(&c0), false).is_none(),
+        "a record that does not own guest writeback is not this rail"
+    );
+    let no_gva = ColorRtRequest {
+        target_gva: 0,
+        ..c0
+    };
+    assert!(
+        sync_store_allowed_pages(&state, &host, 1, Some(&no_gva), true).is_none(),
+        "no GVA target, nothing to bound"
+    );
+}

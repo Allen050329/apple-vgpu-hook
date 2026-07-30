@@ -160,6 +160,25 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         }
     }
 
+    // Pages the synchronous GVA Store below is allowed to reach, resolved
+    // **before** any GPU work.
+    //
+    // That Store's write was documented as needing no bound because "the command
+    // being executed is what names its destination, and its authorisation is the
+    // page table at the moment it runs". That is true of the CLEAR store above,
+    // which is a solid colour written on this thread with nothing in between. It
+    // is not true here: `try_metal2vulkan_draw` encodes, submits, waits for the
+    // GPU and reads the result back, and only then does the Store resolve
+    // `target_gva`. The guest runs on its own vCPUs across that round trip, so
+    // the walk that finds the destination is not the walk that the command
+    // authorised — which is exactly the shape the deferred rail was corrupting
+    // guest memory through before it was bounded.
+    //
+    // Resolved here rather than at the write so the set predates the submit.
+    // `None` when there is no GVA target, no writeback, or the walk cannot name
+    // the span — an unresolvable span is not an authorisation to write anywhere.
+    let sync_store_pages =
+        sync_store_allowed_pages(state, host, req.task_id, colors.first(), writeback_guest);
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
     // Physical order of `draw_rgba`. A type-11 composite Store renders into a
@@ -550,7 +569,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c0.height,
                     "sync_store",
                 );
-                let gva_ok = write_gva_rgba8(
+                // Bounded to the pages resolved before the GPU round trip
+                // above. `None` only when that walk could not name the span,
+                // which is the pre-existing behaviour for a target this device
+                // cannot resolve at all.
+                let gva_ok = write_gva_rgba8_within(
                     state,
                     host,
                     req.task_id,
@@ -560,6 +583,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     c0.row_stride,
                     c0.format,
                     &rgba,
+                    sync_store_pages.as_ref(),
                 )
                 .is_ok();
                 // Discrete-GPU rail: type-2/3 encode into **texture_ref** + **GVA**
@@ -2923,6 +2947,64 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         rgba.len()
     ));
     None
+}
+
+/// Guest pages a synchronous GVA Store may write, resolved before the draw is
+/// submitted to the GPU.
+///
+/// The Store's write used to be unbounded on the argument that a synchronous
+/// command's authorisation is the page table at the moment it runs. That holds
+/// for the CLEAR store, which is a solid colour written on this thread with
+/// nothing in between. It does not hold for the draw Store: `encode_draw_chain`
+/// encodes, submits, waits for the GPU and reads the result back before the
+/// Store resolves `target_gva`, and the guest runs on its own vCPUs across that
+/// round trip. Resolving here makes the pages the command named and the pages
+/// the bytes reach the same set.
+///
+/// `None` — unbounded, the pre-existing behaviour — when there is no GVA target,
+/// when this record does not own guest writeback, or when the walk resolves no
+/// page at all. The last arm is counted (`sync_store_unbounded`) rather than
+/// tightened on suspicion: a span that resolves nothing here makes the writer's
+/// own walk fail closed on its own terms, and refusing on an empty capture
+/// would drop live Stores whenever the capture failed for an unrelated reason.
+/// If that counter stays at zero it can be tightened with evidence.
+fn sync_store_allowed_pages<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    color0: Option<&ColorRtRequest>,
+    writeback_guest: bool,
+) -> Option<std::collections::HashSet<u64>> {
+    if !writeback_guest {
+        return None;
+    }
+    let c = color0.filter(|c| {
+        c.target_gva != 0
+            && c.store_action == PASS_STORE_ACTION_STORE
+            && c.width > 0
+            && c.height > 0
+    })?;
+    let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
+    let mut pages = std::collections::HashSet::new();
+    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        c.target_gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            pages.insert(gpa_page);
+            true
+        },
+    );
+    if pages.is_empty() {
+        crate::runtime::drain::note_store_route("sync_store_unbounded");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("sync_store_bound");
+    Some(pages)
 }
 
 /// Score a GVA-keyed cache hit against the guest pages it was produced from,
