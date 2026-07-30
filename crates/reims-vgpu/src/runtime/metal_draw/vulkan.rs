@@ -3852,6 +3852,55 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 if sampled_mid != 0 && tw == w && th == h {
                     display_sample_mids.insert(sampled_mid);
                 }
+                if crate::observe::content_probe_enabled() {
+                    // Every sampled bind converges here, whichever of the
+                    // thirteen rungs served it, so this is the one place that
+                    // can name the branch rather than an arm.
+                    //
+                    // The dedup is taken *before* the summary is built, not
+                    // after. A compositor rebinds hundreds of textures per
+                    // frame at 120 Hz, so summarising first and deduping on the
+                    // result would pay a whole-image walk per bind and would
+                    // never dedup an animating texture at all. Keyed on
+                    // (texture, geometry, rung), first sighting only: the icon
+                    // this exists for is static once composited, and the line
+                    // is timestamped, so first sighting still attributes to the
+                    // composite that produced it.
+                    let rung = match &loaded {
+                        SampledSourceRequest::Bytes(..) => "bytes",
+                        #[cfg(feature = "backend-vulkan")]
+                        SampledSourceRequest::Target(_) => "resident",
+                        #[cfg(feature = "backend-vulkan")]
+                        SampledSourceRequest::GuestRuns(..) => "guest_runs",
+                    };
+                    let mut key = std::hash::DefaultHasher::new();
+                    std::hash::Hash::hash(&(texture_ref, tw, th, rung), &mut key);
+                    if crate::observe::first_sight(
+                        "sampled_content",
+                        std::hash::Hasher::finish(&key),
+                    ) {
+                        let detail = match &loaded {
+                            SampledSourceRequest::Bytes(rgba, _, layout) => {
+                                crate::observe::content_summary(
+                                    rgba,
+                                    layout.bytes_per_texel(),
+                                    tw,
+                                    th,
+                                )
+                            }
+                            #[cfg(feature = "backend-vulkan")]
+                            SampledSourceRequest::Target(_) => String::new(),
+                            #[cfg(feature = "backend-vulkan")]
+                            SampledSourceRequest::GuestRuns(_, layout) => {
+                                format!("texel={}", layout.bytes_per_texel())
+                            }
+                        };
+                        crate::observe::off(format!(
+                            "sampled_content stage={} idx={index} ref={texture_ref} {tw}x{th} mid={sampled_mid} rung={rung} {detail}",
+                            if frag_stage { "fragment" } else { "vertex" },
+                        ));
+                    }
+                }
                 let mut bytes_identity = None;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a native
                 // single/dual-channel plane keeps its footprint. The RGBA8-shaped
