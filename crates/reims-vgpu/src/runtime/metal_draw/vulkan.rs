@@ -3266,6 +3266,47 @@ fn note_gva_backing_verdict(
 /// `chain_load_from_target` (the resident target already carries the chain) is
 /// a different arm and never reaches here: it is a seed that does not need
 /// uploading, not a seed that is missing.
+/// Census: does this draw's scissor cover the target the pass declared?
+///
+/// The last surface left on the Finder icon class. Its sample returns content,
+/// the content is the bytes at the address the guest named, the retained image
+/// cache is not swapping it, and no Load seed is being lost — yet a broken cell
+/// is a small block of content inside an otherwise empty square. Whatever
+/// empties the rest of that square acts after the read, and a scissor smaller
+/// than the target is the one mechanism on this path that can leave a
+/// rectangle of an attachment untouched by construction.
+///
+/// A partial scissor is completely ordinary, so this is a rate with its
+/// denominator and not a refusal. What makes it readable is the identity line:
+/// it is latched per (target geometry, scissor rect), so a compositor issuing
+/// the same partial draw thousands of times a second reports once, and a
+/// scissor that covers a fraction of a small square target — the shape an icon
+/// would have — is greppable rather than buried in the count.
+fn note_draw_coverage(x: u32, y: u32, sw: u32, sh: u32, target_w: u32, target_h: u32) {
+    let covers = x == 0 && y == 0 && sw >= target_w && sh >= target_h;
+    crate::runtime::drain::note_store_route(if covers {
+        "draw_scissor_full"
+    } else {
+        "draw_scissor_partial"
+    });
+    if covers || target_w == 0 || target_h == 0 {
+        return;
+    }
+    if crate::observe::first_sight(
+        "draw_scissor_partial",
+        (target_w as u64) << 48
+            ^ (target_h as u64) << 32
+            ^ (sw as u64) << 16
+            ^ sh as u64
+            ^ (x as u64) << 8
+            ^ y as u64,
+    ) {
+        crate::observe::off(format!(
+            "draw_scissor_partial target={target_w}x{target_h} scissor={sw}x{sh}+{x}+{y}"
+        ));
+    }
+}
+
 fn note_load_seed_outcome(
     door: &'static str,
     seeded: bool,
@@ -4872,6 +4913,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 });
         }
         if let Some((x, y, sw, sh)) = req.scissor {
+            note_draw_coverage(x, y, sw, sh, w, h);
             resources
                 .scissors
                 .push(crate::backend::vulkan::engine::ScissorResource {
