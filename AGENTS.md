@@ -3042,6 +3042,76 @@ Two process points, both of which this cost:
   the victim moves, which is worth more than either round alone and is immune to the cross-boot drift
   this rig is documented to have.
 
+### The Icon Class Is A Sampled Bind Falling Off Its Resident Onto Guest Pages That Hold A Fragment
+
+Measured on two x86/Vulkan boots at `757e56c` and `ed8e2c2` with `REIMS_VGPU_CONTENT_PROBE=1`, panel
+held awake, workload asserted by process count. This is where the class stands; **no fix yet**, and
+the last step is not established.
+
+`sampled_content` names which of `resolve_sampled_source`'s thirteen rungs served each bind, plus the
+content fingerprint on the CPU-bytes rung. Keyed as a *transition* per (texture, geometry) rather
+than a first sighting, because the event is the switch between rungs and a first-sighting latch goes
+quiet after one.
+
+**Sort the transitions by order before reading them, or the normal case reads as the defect.** Of 94
+textures that saw more than one rung, the ones worth looking at split exactly in half and the two
+halves mean opposite things:
+
+| order | count | what it is |
+|---|---|---|
+| empty `bytes` **then** `resident` | 17 | **normal.** A surface being created. `type4 pages sid=63 … sample0_nz=0/16` then `mapping_gpa_span … changed=1` then the empty sample then `type11_load_seed outcome=guest_pages`: the guest allocated a 96x96 IOSurface and sampled it before drawing into it. Zeros are the correct answer. |
+| `resident` **then** sparse/empty `bytes` | **17** | **the defect.** A texture whose content the GPU holds is later bound from guest memory that holds a fragment of it. |
+
+Six of the seventeen regressions are `64x64 mid=0` — linear textures, icon-shaped — and they land at
+`t=71619..71986`, bracketing the folder-icon composite at `t=71627..71772`. Their CPU bytes carry
+`nz=0`, `59`, `290`, `618` and `784` of 4096, every one of them confined to the north-west quadrant.
+On screen that is an absent icon and a small dark fragment in the top-left of the cell, which is
+exactly what five rounds of the repro show.
+
+The rung they fall off is `try_sample_deferred_gva`, and its two exit conditions say why it is
+fragile: it needs `state.gva_deferred_flush.get(&gva)` to still hold a window **and**
+`resident_content_ready`. So it serves the resident only while the deferred window is armed. Once the
+window goes, the bind reads guest VA — which is correct only if the window's content was *flushed*
+there. If the window was dropped rather than flushed, guest pages keep whatever the CPU last wrote,
+and for an icon that is a small rasterised fragment.
+
+`deferred_flush_lost` is **0** in that slice, so nothing reported a loss — which is consistent with a
+window being *dropped* (supersede, eviction) rather than failing to flush. AGENTS.md's own supersede
+rule rests on the argument that "those bytes were never observable without a flush, since any reader
+would have taken the window first". **That argument has a hole exactly here**: a reader that requires
+`resident_content_ready` does *not* take the window when the resident is not ready, and falls through
+to guest pages instead. The soundness argument assumes a total reader; the reader is conditional.
+
+One confirmed loss of this shape is in the same window and is *not* silent:
+
+```
+deferred_window_page_drift gva=0x33d000 task=7 140x130 trigger=linear_flush ref=5
+    armed_pages=36 live_pages=36 moved=36 guest=refused @71840
+```
+
+All 36 pages moved under a 140x130 linear compute window and the flush refused — the guard working,
+and the content never reached guest memory. That is the documented page-count-cannot-see-it hazard
+(`armed_pages == live_pages` while every PFN moved) firing during the icon composite.
+
+**Three readings that were nearly written up and are wrong. Do not repeat them.**
+
+- **A `quad` with two zero quadrants is not a defect.** Text labels and glyph atlases legitimately
+  carry content only in their top rows: `185x28 quad=479/469/0/0`, `2048x32 quad=1529/1510/0/0`,
+  `256x28 quad=406/0/0/0` are all ordinary. What survives is `nz` far below the extent *on a texture
+  that also binds from a resident*, not "content sits at the top".
+- **An empty first bind is not a defect** — see the creation-order half of the table above. This one
+  was half-written before the ordering was computed.
+- **A texture ref is not a stable identity**; the guest recycles object refs, so "the same ref was
+  served two ways" could be two textures. What rules that out here is the *span*: several regressions
+  flip within 0-1 ms and one flips five times in 58 ms. Quote the span whenever a per-ref claim is
+  made.
+
+What is **not** established: why the window is gone by the second bind, and whether the six 64x64
+regressions are the six folder icons rather than merely coincident with them. The join from a screen
+cell to a texture ref still does not exist; the argument is geometry plus timestamp plus the shape of
+the fragment, which is circumstantial. The next measurement is the fate of a deferred GVA window
+between the two binds — armed, flushed, superseded or evicted — which nothing currently reports.
+
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
 Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,
