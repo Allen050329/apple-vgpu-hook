@@ -586,10 +586,12 @@ about it is free.
 
 Two facts that attempt established, and which still hold:
 
-- `engine::read_resident_bgra` returns `None` unless `slot.bgra`, and
-  `export_present_from_resident_fd_policy` refuses with `PresentExportResidentNotBgra` for the same
-  reason. A resident-authoritative type-11 rail therefore *needs* `req.output_bgra` — that is why it
-  is listed below as part of the fix, and it is a hard requirement rather than an optimization.
+- `engine::read_resident_bgra` returns `None` unless `slot.bgra`. A resident-authoritative type-11
+  rail therefore *needs* `req.output_bgra` — that is why it is listed below as part of the fix, and it
+  is a hard requirement rather than an optimization. (This bullet used to cite
+  `export_present_from_resident_fd_policy` refusing with `PresentExportResidentNotBgra` for the same
+  reason; both were deleted with the dmabuf rail on 2026-07-30 and `read_resident_bgra` is now the
+  only gate of this shape.)
 - The mapping-keyed flush-trigger backbone described below is real and does work. It is what the
   shipped rail is built on.
 
@@ -769,8 +771,10 @@ two call sites — the confirmation is not optional, since AGENTS.md already rec
 on this same rail that was flatly wrong about `map_generation`.
 
 And the decisive one: **the host-window present path never reads the mapping's guest pages at all.**
-`publish_window_frame` → `export_present_dmabuf` → `export_present_from_resident_fd_policy` exports the
-engine resident directly. `note_front_buffer_writeback`, `note_dense_frame_published` and
+It reads `surface_cache` and the engine resident. (Until 2026-07-30 the chain here was
+`publish_window_frame` → `export_present_dmabuf` → `export_present_from_resident_fd_policy`; those two
+are deleted, and the conclusion is unchanged because neither ever touched a guest page either.)
+`note_front_buffer_writeback`, `note_dense_frame_published` and
 `note_surface_composite` only record metadata and enqueue a `HostAction` — none of them touches a guest
 page. So the ~70 Stores a second are writing bytes that, on the present path, nothing reads. That is
 what makes the deferral a win rather than a rescheduling.
@@ -857,10 +861,13 @@ draw into a declined one.
 **`output_bgra` is still not set anywhere in `src/`** — the above changes no attachment format. But
 the remaining readback swizzle is now the *only* thing it buys, and turning it on makes that
 conversion disappear rather than move, because the seed condition simply goes false. Before flipping
-it, note the blast radius: `read_resident_bgra` returns `None` unless `slot.bgra` and
-`export_present_from_resident_fd_policy` refuses with `PresentExportResidentNotBgra`, so making
-type-11 residents BGRA *enables* two present paths that currently never fire. That is a display-path
-change and wants a live boot, not a test run.
+it, note the blast radius — **which halved on 2026-07-30 and is no longer what this paragraph used
+to say.** It named two gates; `export_present_from_resident_fd_policy` and its
+`PresentExportResidentNotBgra` refusal were deleted with the dmabuf rail, so do not grep for them.
+What remains is one: `read_resident_bgra` returns `None` unless `slot.bgra`, and its only caller is
+`scanout.rs`'s resident capture. Making type-11 residents BGRA therefore enables **one** present path
+that currently never fires, not two. Still a display-path change, and still wants a live boot rather
+than a test run.
 
 Also note what the same line says about batching: `batch_opens == batch_flushes` **exactly**, in
 every window measured (912/912, 2036/2036, 504/504, 733/733, 517/517, 1000/1000), at ~1.7
