@@ -1126,7 +1126,7 @@ fn flush_storage_one<M: HostMemory + HostOps>(
             key.width,
             key.height,
             key.pixel_format,
-            crate::observe::content_summary(&bytes, texel),
+            crate::observe::content_summary(&bytes, texel, key.width, key.height),
         ));
     }
     if !crate::runtime::mapping_write::write_full_rect_raw_at(

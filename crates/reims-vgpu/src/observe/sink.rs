@@ -458,15 +458,24 @@ pub fn content_probe_enabled() -> bool {
 /// at two stages. Counting stops at [`DISTINCT_CAP`] so the cost is bounded on
 /// a display-sized frame rather than proportional to its palette.
 ///
+/// `quad` reports nonzero texels per screen quadrant (`nw/ne/sw/se`), because a
+/// scalar count cannot see *where* the content is. The shape this exists to
+/// catch is an icon rendering shrunken into the top-left of its quad with the
+/// rest transparent — a whole-image `nz` reads that as "some content, looks
+/// plausible", while `quad` reads it as everything in `nw` and nothing
+/// elsewhere.
+///
 /// Caller must gate on [`content_probe_enabled`].
 ///
-/// Cost is bounded at [`SAMPLE_CAP`] texels by striding, not proportional to the
-/// buffer: this probe runs on the same path that flushes 1920x1080 composites
-/// ~200 times a second, and a whole-frame walk there would slow the device
-/// enough to stop reproducing a load-dependent defect. `stride` is reported so
-/// `nz` reads as the sample it is, and the solid/image question the probe exists
-/// to answer survives sampling intact.
-pub fn content_summary(buf: &[u8], texel: u32) -> String {
+/// Cost is bounded at [`SAMPLE_CAP`] texels by a uniform 2-D subsample, not
+/// proportional to the buffer: this probe runs on the same path that flushes
+/// 1920x1080 composites ~200 times a second, and a whole-frame walk there would
+/// slow the device enough to stop reproducing a load-dependent defect. The
+/// subsample is 2-D rather than linear precisely so `quad` keeps its meaning.
+/// `stride` is reported so `nz` reads as the sample it is.
+///
+/// `buf` must be tightly packed at `width * texel` bytes per row.
+pub fn content_summary(buf: &[u8], texel: u32, width: u32, height: u32) -> String {
     /// Enough to separate "one colour" from "an image" — the question this
     /// probe asks — without building a palette of a 1920x1080 frame.
     const DISTINCT_CAP: usize = 64;
@@ -475,22 +484,37 @@ pub fn content_summary(buf: &[u8], texel: u32) -> String {
     const SAMPLE_CAP: usize = 16384;
     let texel = texel.max(1) as usize;
     let texels = buf.len() / texel;
-    let stride = texels.div_ceil(SAMPLE_CAP).max(1);
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || w * h * texel > buf.len() {
+        return format!("texels={texels} geom_mismatch=1 buf={}", buf.len());
+    }
+    // Smallest uniform 2-D step that brings the sample under the cap. Integer
+    // search rather than a sqrt so the bound is exact for every shape.
+    let mut stride = 1usize;
+    while w.div_ceil(stride) * h.div_ceil(stride) > SAMPLE_CAP {
+        stride += 1;
+    }
     let mut distinct: Vec<&[u8]> = Vec::with_capacity(DISTINCT_CAP);
     let mut nz = 0usize;
     let mut sampled = 0usize;
+    let mut quad = [0usize; 4];
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for px in buf.chunks_exact(texel).step_by(stride) {
-        sampled += 1;
-        for &b in px {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x1000_0000_01b3);
-        }
-        if px.iter().any(|&b| b != 0) {
-            nz += 1;
-        }
-        if distinct.len() < DISTINCT_CAP && !distinct.contains(&px) {
-            distinct.push(px);
+    for y in (0..h).step_by(stride) {
+        for x in (0..w).step_by(stride) {
+            let off = (y * w + x) * texel;
+            let px = &buf[off..off + texel];
+            sampled += 1;
+            for &b in px {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x1000_0000_01b3);
+            }
+            if px.iter().any(|&b| b != 0) {
+                nz += 1;
+                quad[usize::from(x >= w / 2) + 2 * usize::from(y >= h / 2)] += 1;
+            }
+            if distinct.len() < DISTINCT_CAP && !distinct.contains(&px) {
+                distinct.push(px);
+            }
         }
     }
     let px0: String = buf
@@ -501,8 +525,12 @@ pub fn content_summary(buf: &[u8], texel: u32) -> String {
         .join("");
     let capped = if distinct.len() >= DISTINCT_CAP { "+" } else { "" };
     format!(
-        "texels={texels} stride={stride} sampled={sampled} distinct={}{capped} nz={nz} px0={px0} hash={hash:016x}",
+        "texels={texels} stride={stride} sampled={sampled} distinct={}{capped} nz={nz} quad={}/{}/{}/{} px0={px0} hash={hash:016x}",
         distinct.len(),
+        quad[0],
+        quad[1],
+        quad[2],
+        quad[3],
     )
 }
 
@@ -891,7 +919,7 @@ mod tests {
     #[test]
     fn a_solid_fill_and_an_image_differ_in_the_distinct_count() {
         let solid = [0xffu8, 0x00, 0x00, 0xff].repeat(66 * 66);
-        let s = content_summary(&solid, 4);
+        let s = content_summary(&solid, 4, 66, 66);
         assert!(s.contains(" stride=1 "), "icon scale must not sample: {s}");
         assert!(s.contains(" distinct=1 "), "solid fill is one colour: {s}");
         assert!(s.contains(" px0=ff0000ff "), "px0 names the colour: {s}");
@@ -899,7 +927,7 @@ mod tests {
         let image: Vec<u8> = (0..66u32 * 66)
             .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8, 0xff])
             .collect();
-        let g = content_summary(&image, 4);
+        let g = content_summary(&image, 4, 66, 66);
         assert!(g.contains(" distinct=64+ "), "an image is many colours: {g}");
         assert_ne!(
             s.split(" hash=").nth(1),
@@ -908,12 +936,51 @@ mod tests {
         );
     }
 
+    /// The shape `quad` exists for: an image shrunken into the top-left of its
+    /// allocated extent has an unremarkable whole-image `nz` and is only
+    /// separable by where the content sits.
+    #[test]
+    fn a_shrunken_top_left_image_is_visible_only_in_the_quadrants() {
+        let (w, h) = (64usize, 64usize);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h / 4 {
+            for x in 0..w / 4 {
+                buf[(y * w + x) * 4..][..4].copy_from_slice(&[0x40, 0x80, 0xc0, 0xff]);
+            }
+        }
+        let s = content_summary(&buf, 4, w as u32, h as u32);
+        assert!(s.contains(" nz=256 "), "a scalar count looks ordinary: {s}");
+        assert!(
+            s.contains(" quad=256/0/0/0 "),
+            "all content must land in nw: {s}"
+        );
+
+        // The same texel count spread over the whole extent is the healthy
+        // shape, and must not read alike.
+        let mut spread = vec![0u8; w * h * 4];
+        for i in (0..w * h).step_by(16) {
+            spread[i * 4..][..4].copy_from_slice(&[0x40, 0x80, 0xc0, 0xff]);
+        }
+        let g = content_summary(&spread, 4, w as u32, h as u32);
+        assert!(g.contains(" nz=256 "), "same scalar count: {g}");
+        assert!(g.contains(" quad=64/64/64/64 "), "evenly spread: {g}");
+    }
+
+    /// A geometry that does not describe the buffer must say so rather than
+    /// index past the end or report a quadrant split it cannot support.
+    #[test]
+    fn a_geometry_that_overruns_the_buffer_is_named_not_indexed() {
+        let buf = vec![0u8; 64 * 4];
+        let s = content_summary(&buf, 4, 64, 64);
+        assert!(s.contains("geom_mismatch=1"), "{s}");
+    }
+
     /// The probe runs on the 1920x1080 flush path, so its cost must be capped
     /// by striding rather than growing with the frame.
     #[test]
     fn a_display_sized_frame_is_sampled_not_walked() {
         let frame = vec![0u8; 1920 * 1080 * 4];
-        let s = content_summary(&frame, 4);
+        let s = content_summary(&frame, 4, 1920, 1080);
         assert!(s.starts_with("texels=2073600 "), "{s}");
         let sampled: usize = s
             .split(" sampled=")

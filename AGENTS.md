@@ -2981,6 +2981,67 @@ confounder, since the corrupt arms are also the busy ones; and the line fires on
 it is an event count and not a state. Treat it as an observation about the environment the defect
 occurs in, not as its mechanism.
 
+**RETRACTED — the compute rail is not where this defect lives, and the "standing shape" above is
+the shape of a wrong subject.** Measured on one x86/Vulkan boot at `2b32fd1` with
+`REIMS_VGPU_CONTENT_PROBE=1`, two icon composites in the same boot. Do not resume the sample-side /
+output-side fork above; it was a fork inside the wrong rail.
+
+The whole attribution to compute rested on a *geometry* correlation: icon-shaped `WxH` values with
+`bytes == w*h*4` appearing in `compute_linux` lines during a corrupt arm. Nothing had ever read what
+those dispatches actually produced. `observe::content_summary` reads it, and every compute output in
+the boot is a real image:
+
+| round | on screen | compute outputs landing in guest pages |
+|---|---|---|
+| 1 | **Movies icon absent**, five correct | 4 icon-geometry mappings (44x26, 46x28, 66x66, 64x65), each `distinct=64+`, `nz` 50-65 % — folder icons with transparent margins |
+| 2 | **Desktop absent, Documents a shrunken dark fragment**, four correct | **two 16x16/28x28 glyphs and nothing else** |
+| whole boot | — | 25 outputs total, none degenerate |
+
+Round 2 is the one that settles it: the folder icons **did not touch the compute rail at all** in the
+arm that corrupted two of them. Round 1 is the converse check — compute *did* run there, and what it
+produced was correct. So compute is exonerated from both directions, which is the pair of readings
+the older entry never had.
+
+Three further facts from the same boot, all of which survive the retraction:
+
+- **The victim moves, so it is ours.** Two `killall Finder; open ~` rounds in one boot corrupted
+  disjoint sets: Movies in the first, Desktop and Documents in the second, with Movies *correct* the
+  second time. A defect that picks a different victim from the same content on the same guest is not
+  content-specific and not a guest-side icon cache holding a bad image. (`~/Movies` exists and is the
+  only home folder without an ACL — a red herring; it rendered perfectly in round 2.)
+- **It is persistent within a round.** Two captures seconds apart are identical, so the frame is not
+  caught mid-composite. Combined with the moving victim: the wrong result is decided once per
+  composite and then held.
+- **The failure channel is silent.** Both slices carry only the documented-benign
+  `gva_zero_pfn` / `cmd_task_ambiguous` / `task_walk_ambiguous` / `type4_pages_stale` /
+  `present_named_pages` / `present_order_hold`. No `linear_sample_miss`, no
+  `draw_prepare_texture_resolve_missing`, no `draw_vk_nothing_stored`. This is a silent loss under
+  the ground rules.
+
+**The shrunken fragment is the informative symptom and it names a geometry, not a colour.** Documents
+rendered as a small dark angular piece in the top-left of its cell with the rest transparent. That is
+what a sampler produces when a texture's *allocated extent is larger than the region actually filled*
+— the quad maps [0,1]² over the whole extent, so content confined to a corner arrives shrunken into
+that corner. An absent icon is the same failure with the filled region empty. Both are one class:
+**the sampled texture bound for the icon did not hold the icon over its full extent.** That is a
+statement about the draw rail's sampled-texture load, which is where the next probe goes.
+
+`content_summary`'s `quad=nw/ne/sw/se` field exists for exactly this and was added because a scalar
+`nz` cannot see it: a 64x64 texture filled only in its top-left sixteenth reports `nz=256` — an
+entirely ordinary count — and `quad=256/0/0/0`. The same 256 texels spread evenly report
+`quad=64/64/64/64`. Pinned by `a_shrunken_top_left_image_is_visible_only_in_the_quadrants`.
+
+Two process points, both of which this cost:
+
+- **A geometry correlation is not an attribution.** "Icon-shaped dimensions appeared in the compute
+  log during a corrupt arm" survived four commits of investigation and a written-up "standing shape"
+  without anyone reading the pixels those dispatches produced. The refutation cost one boot once a
+  probe reported *content* instead of *shape*.
+- **Reproduce twice in one boot before believing a victim list.** The single most useful thing this
+  boot did was run the repro a second time. One round gives a victim; two rounds give the fact that
+  the victim moves, which is worth more than either round alone and is immune to the cross-boot drift
+  this rig is documented to have.
+
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
 Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,

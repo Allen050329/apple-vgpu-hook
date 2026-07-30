@@ -1891,7 +1891,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             crate::observe::off(format!(
                 "compute_content stage=stage_read mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} storage={} gen={seed_generation} {}",
                 is_storage as u8,
-                crate::observe::content_summary(&bytes, bpp),
+                crate::observe::content_summary(&bytes, bpp, width, height),
             ));
         }
         let writeback = if is_storage {
@@ -2521,7 +2521,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                     "compute_content stage=write_out mapping={mapping_id} {width}x{height} fmt={:#x} bind={} {}",
                     tex.pixel_format,
                     tex.binding,
-                    crate::observe::content_summary(&tex.bytes, *bpp),
+                    crate::observe::content_summary(&tex.bytes, *bpp, *width, *height),
                 ));
             }
             if !mapping_write::write_full_rect_raw_at(
