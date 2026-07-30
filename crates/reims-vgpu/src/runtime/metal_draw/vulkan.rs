@@ -3285,7 +3285,7 @@ fn note_gva_backing_verdict(
 ///
 /// **The first boot carrying this found the shape.** Ten recomposites, two
 /// corrupt, x86 / Vulkan: `draw_scissor_full` 888 227, `draw_scissor_partial`
-/// 449 708, and among the partial identities
+/// 449 708 — and among the partial identities
 ///
 ///     target=64x64 scissor=9x29+0+0
 ///     target=64x64 scissor=7x9+0+0
@@ -3297,12 +3297,17 @@ fn note_gva_backing_verdict(
 ///
 /// It does not by itself say the scissor is *wrong*. A scissored draw is
 /// correct whenever the attachment already holds the rest of the picture, which
-/// on this rail means a `MTLLoadActionLoad` whose seed supplied it. The join
-/// that decides it is the load action on these same draws — and note that only
-/// 395 seed resolutions happened on a comparable boot (2870346) against a large
-/// population of partial-scissor draws, so "the seed path is not entered for
-/// these at all" is the reading to test first. A seed that is never resolved is
-/// not a seed that is lost, and `load_seed_lost` cannot see it.
+/// on this rail happens two ways: a `MTLLoadActionLoad` whose CPU seed supplied
+/// it, or one taking the `chain_load_from_target` arm, where the engine
+/// resident already holds the prior frame and `LoadOp::LoadFromTarget`
+/// preserves it with no seed at all. Only the third case — LOAD, no chain, no
+/// seed — destroys what it did not draw.
+///
+/// That third case is also the only one `load_seed_lost` cannot see: it counts
+/// doors opened and found empty, and a pass that never enters the seed block
+/// never reaches it. 395 seed resolutions on a comparable boot (2870346)
+/// against a partial-draw population in the hundreds of thousands is the
+/// signature of a match arm being taken elsewhere, not of a rail that works.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
@@ -3316,6 +3321,7 @@ fn note_draw_coverage(
     target_h: u32,
     load_action: Option<u16>,
     seeded: bool,
+    from_target: bool,
 ) {
     let covers = x == 0 && y == 0 && sw >= target_w && sh >= target_h;
     crate::runtime::drain::note_store_route(if covers {
@@ -3326,33 +3332,18 @@ fn note_draw_coverage(
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
-    // The join, and it found the mechanism. One driven boot, ten Finder
-    // recomposites, two corrupt:
-    //
-    //   draw_scissor_full          1119349
-    //   draw_scissor_partial        592135
-    //     draw_partial_load_unseeded 519715   <-- 88% of every partial draw
-    //     draw_partial_clear          48570
-    //     draw_partial_dontcare       23848
-    //     draw_partial_load_seeded         2
-    //
-    // Half a million draws per session declare `MTLLoadActionLoad`, resolve no
-    // seed, and therefore run as a Vulkan CLEAR — which destroys every texel of
-    // the attachment outside the scissor rect. The identity lines show it at
-    // icon geometry directly:
-    //
-    //   target=64x64 scissor=18x40+12+0 load=Some(1) seeded=0
-    //   target=64x64 scissor=16x54+1+1  load=Some(1) seeded=0
-    //   target=64x64 scissor=12x40+12+0 load=Some(1) seeded=0
-    //
-    // an 18x40 block kept and the other 3376 texels of the icon thrown away,
-    // which is the broken Finder cell as photographed. `load=Some(2)` (CLEAR)
-    // entries are `seeded=1`, so the seeding that does happen is the one the
-    // contract does not need.
-    //
     // A partial draw is correct exactly when the attachment already holds the
     // rest of the picture, so what matters is not that the scissor is small but
-    // what the pass did with the texels outside it:
+    // what the pass did with the texels outside it.
+    //
+    // `from_target` is load-bearing and was missing from the first version of
+    // this census, which is why its first reading has to be discarded. A LOAD
+    // whose prior content lives in the engine resident takes the
+    // `chain_load_from_target` arm above: it deliberately resolves no CPU seed,
+    // sets `LoadOp::LoadFromTarget`, and preserves the attachment. Scoring
+    // `target_rgba8.is_some()` alone put every one of those in the unseeded
+    // bucket and produced a 519 715-strong "defect" that is mostly the rail
+    // working. Splitting it is the difference between the two cases:
     //
     //   load_seeded  — LOAD and a seed was resolved. The rest is the old frame.
     //   load_unseeded— LOAD and no seed. Becomes a Vulkan CLEAR, so every texel
@@ -3362,6 +3353,7 @@ fn note_draw_coverage(
     //   clear        — CLEAR was asked for. Destroying them is the contract.
     //   dontcare     — undefined outside the scissor by declaration.
     crate::runtime::drain::note_store_route(match load_action {
+        Some(PASS_LOAD_ACTION_LOAD) if from_target => "draw_partial_load_from_target",
         Some(PASS_LOAD_ACTION_LOAD) if seeded => "draw_partial_load_seeded",
         Some(PASS_LOAD_ACTION_LOAD) => "draw_partial_load_unseeded",
         Some(PASS_LOAD_ACTION_CLEAR) => "draw_partial_clear",
@@ -3379,8 +3371,9 @@ fn note_draw_coverage(
     ) {
         crate::observe::off(format!(
             "draw_scissor_partial target={target_w}x{target_h} scissor={sw}x{sh}+{x}+{y} \
-             load={load_action:?} seeded={}",
-            u8::from(seeded)
+             load={load_action:?} seeded={} from_target={}",
+            u8::from(seeded),
+            u8::from(from_target)
         ));
     }
 }
@@ -5000,6 +4993,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 h,
                 req.colors.first().map(|c| c.load_action),
                 target_rgba8.is_some(),
+                chain_load_from_target,
             );
             resources
                 .scissors
