@@ -2852,13 +2852,17 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// **none** had a host entry for the same address. We did not have the pixels
 /// and paint nothing; we do not have them at all.
 ///
-/// What survives as the open question is `lin_rung_guest_blank` itself: 3 379
-/// draws in one session sampled an image that was zero end to end, and none of
-/// them declined anything. A genuinely transparent layer is legitimate, so the
-/// count is not yet a defect -- but it is the population the blank icon and the
-/// blank Safari scroll patch must be inside, and the next question is where the
-/// content for a `producer=2` body actually lives if it is neither in this
-/// cache nor in the guest pages the descriptor names.
+/// `lin_rung_guest_blank` is not it either, and the identity line settles that.
+/// Across a ten-recomposite boot in which three rounds came out corrupt, EVERY
+/// blank sample was `1x1` -- six distinct spans, all of them one texel. A 1x1
+/// zero texture is an ordinary solid-colour source. There were no 64x64 blank
+/// samples at all, in the corrupt rounds or the clean ones.
+///
+/// So the icon that renders as a small block of content in an otherwise empty
+/// square is NOT a sample that came back empty. Its sample returns content. The
+/// emptiness around it is therefore produced after the sample -- by what the
+/// draw covers, not by what it reads -- which is where to look next, and which
+/// is also the shape of the Safari scroll-buffer patch.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
