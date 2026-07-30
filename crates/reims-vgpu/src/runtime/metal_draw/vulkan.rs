@@ -2024,14 +2024,32 @@ fn guest_runs_memoized<M: HostMemory + HostOps>(
             && e.length == span
     }) {
         state.tranche.run_memo_hit = state.tranche.run_memo_hit.saturating_add(1);
-        // Sampled staleness verify (1-in-64 hits): the invalidation contract
-        // (Unmap/Map2 overlap, task redefine/delete) should retire every
-        // rewired range, but a PT change our notifies miss would serve stale
-        // host runs silently — wrong-page GPU reads, the black-tile class.
-        // A mismatch is fail-visible, self-heals the entry, and bounds any
-        // contract hole to at most 64 stale draws per entry.
-        if state.tranche.run_memo_hit.is_multiple_of(64) {
-            match task_gva_guest_runs(state, host, task_id, gva, span) {
+        crate::runtime::drain::note_store_route("rmemo_hit");
+        // Staleness verify on EVERY hit. These runs are raw host pointers
+        // aliasing guest RAM that the GPU gathers from, and their validity rests
+        // entirely on the invalidation contract below them (Unmap/Map2 overlap,
+        // task redefine/delete). That contract is a set of guest
+        // *notifications*, and this device has measured that the guest re-points
+        // GPU-mapped ranges without one arriving first — `MapMemory2` is sent
+        // after the PTEs are installed and used, and the deferred-window drift
+        // detector finds every page of a live window moved several dozen times a
+        // boot. A cache whose correctness rests on a contract that has been
+        // measured not to hold is not made correct by checking it one time in
+        // sixty-four; that only bounds the damage to 64 stale draws per entry,
+        // and 64 stale draws is a wrong icon that persists for a second.
+        //
+        // The walk this repeats is what the memo exists to skip, so the memo is
+        // now worth only its allocation — `rmemo_verify_us` measures what that
+        // costs, against `rmemo_hit`, so the trade is a reading rather than an
+        // assumption.
+        {
+            let verify_started = std::time::Instant::now();
+            let fresh = task_gva_guest_runs(state, host, task_id, gva, span);
+            crate::runtime::drain::note_store_route_us(
+                "rmemo_verify_us",
+                verify_started.elapsed().as_micros() as u64,
+            );
+            match fresh {
                 Some(fresh) => {
                     let memo = state.guest_run_memo[pos].runs.clone();
                     let same = fresh.len() == memo.len()
@@ -2042,6 +2060,7 @@ fn guest_runs_memoized<M: HostMemory + HostOps>(
                     if !same {
                         state.tranche.run_memo_stale =
                             state.tranche.run_memo_stale.saturating_add(1);
+                        crate::runtime::drain::note_store_route("rmemo_stale");
                         crate::observe::fail(format!(
                             "rmemo_stale task={task_id} gva={gva:#x} span={span:#x} memo_runs={} fresh_runs={}",
                             memo.len(),
@@ -2065,6 +2084,7 @@ fn guest_runs_memoized<M: HostMemory + HostOps>(
                     // The span no longer walks — the entry outlived its
                     // mapping. Retire it and make the caller fall back.
                     state.tranche.run_memo_stale = state.tranche.run_memo_stale.saturating_add(1);
+                    crate::runtime::drain::note_store_route("rmemo_stale_walk_gone");
                     crate::observe::fail(format!(
                         "rmemo_stale task={task_id} gva={gva:#x} span={span:#x} reason=walk_gone"
                     ));

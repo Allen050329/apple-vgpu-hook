@@ -3859,12 +3859,20 @@ fn slice_runs_to_engine_crosses_run_boundaries() {
     assert!(slice_runs_to_engine(&spans, 0, 0).is_none());
 }
 
-/// A memo hit returns the cached Arc without walking the page table; the
-/// Unmap-overlap retirement drops exactly the aliasing entry (the
-/// gva_host_views invalidation contract).
+/// A memo entry whose range no longer walks is never served, and the
+/// Unmap-overlap retirement drops exactly the aliasing entry.
+///
+/// This test used to assert the opposite of its first half — that a hit
+/// returns the cached Arc "without walking the page table", demonstrated by
+/// giving the fixture a task with **no page table at all** and requiring the
+/// cached runs back anyway. That is precisely the state in which the cached
+/// host pointers must not be handed to the GPU: there is no longer anything at
+/// that address, so the pointers alias whatever the host reused. The property
+/// is now stated the other way round, and the fixture keeps its
+/// page-table-less task because that is the case worth pinning.
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn guest_run_memo_hit_and_unmap_retirement() {
+fn guest_run_memo_never_serves_an_entry_whose_range_no_longer_walks() {
     use crate::model::{GuestRunMemoEntry, GuestRunSpan};
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
@@ -3879,17 +3887,26 @@ fn guest_run_memo_hit_and_unmap_retirement() {
         length: 0x40000,
         runs: runs.clone(),
     });
-    // Hit: same Arc back, no PT walk attempted (FakeHost has no task 3 PT
-    // — a walk would return None), hit counter bumps.
-    let got = guest_runs_memoized(&mut state, &mut host, 3, 0x50_0000, 0x40000).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&got, &runs));
+    // Task 3 has no page table, so the verify walk finds nothing. The entry is
+    // retired rather than served, and the caller falls back to the CPU loader.
+    assert!(guest_runs_memoized(&mut state, &mut host, 3, 0x50_0000, 0x40000).is_none());
     assert_eq!(state.tranche.run_memo_hit, 1);
-    assert_eq!(state.tranche.run_memo_miss, 0);
-    // Different span → miss path → walk fails (no PT) → None, no entry.
-    assert!(guest_runs_memoized(&mut state, &mut host, 3, 0x50_0000, 0x20000).is_none());
-    // Unmap overlapping the span retires the entry; a disjoint unmap does not.
+    assert_eq!(state.tranche.run_memo_stale, 1);
+    assert!(state.guest_run_memo.is_empty());
+
+    // Re-file it and check the retirement contract independently of the verify.
+    state.guest_run_memo.push_back(GuestRunMemoEntry {
+        task_id: 3,
+        gva: 0x50_0000,
+        length: 0x40000,
+        runs,
+    });
     crate::runtime::gva_view::retire_gva_views_overlapping(&mut state, 3, 0x60_0000, 0x1000);
-    assert_eq!(state.guest_run_memo.len(), 1);
+    assert_eq!(
+        state.guest_run_memo.len(),
+        1,
+        "a disjoint unmap must not retire this entry"
+    );
     crate::runtime::gva_view::retire_gva_views_overlapping(&mut state, 3, 0x52_0000, 0x1000);
     assert!(state.guest_run_memo.is_empty());
 }
@@ -3918,10 +3935,15 @@ fn guest_run_memo_declines_on_unstable_host_mappings() {
     assert_eq!(state.tranche.run_memo_miss, 0);
 }
 
-/// The 1-in-64 sampled staleness verify: a PT rewire the notify hooks
-/// missed is detected on the sampled hit, fail-logged, self-heals the
-/// entry to the fresh runs, and counts as rmemo_stale; a dead span
-/// (walk no longer resolves) retires the entry.
+/// The staleness verify runs on EVERY hit: a PT rewire the notify hooks missed
+/// is detected on the very next bind, fail-logged, self-heals the entry to the
+/// fresh runs, and counts as `rmemo_stale`; a dead span (walk no longer
+/// resolves) retires the entry.
+///
+/// The counter manipulation this test used to need — `run_memo_hit = 63` to
+/// land the next hit on a multiple of 64 — is gone with the sampling, and its
+/// absence is the assertion: the rewire is caught on the first bind after it
+/// happens, not up to sixty-four binds later.
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn guest_run_memo_stale_probe_detects_pt_rewire() {
@@ -3957,11 +3979,10 @@ fn guest_run_memo_stale_probe_detects_pt_rewire() {
     let ptr0 = host.map_pages(&[data0], page as usize).unwrap() + gva as usize;
     assert_eq!(first[0].host_ptr, ptr0);
 
-    // Rewire the PTE to data1 with no Unmap notify; force the sampled
-    // verify (hit counter lands on a multiple of 64).
+    // Rewire the PTE to data1 with no Unmap notify. The very next bind must
+    // catch it — no counter is nudged to make the verify happen.
     st32(&mut pte, 10);
     host.write_gpa(root_gpa, &pte).unwrap();
-    state.tranche.run_memo_hit = 63;
     let healed = guest_runs_memoized(&mut state, &mut host, 1, gva, 16).unwrap();
     assert_eq!(
         state.tranche.run_memo_stale, 1,
@@ -3972,15 +3993,15 @@ fn guest_run_memo_stale_probe_detects_pt_rewire() {
         healed[0].host_ptr, ptr1,
         "entry must self-heal to fresh runs"
     );
-    // Healed entry serves subsequent (unsampled) hits.
+    // A healed entry whose range has not moved since keeps serving the same
+    // Arc, so the verify is a check and not a rebuild.
     let again = guest_runs_memoized(&mut state, &mut host, 1, gva, 16).unwrap();
     assert!(std::sync::Arc::ptr_eq(&again, &healed));
 
-    // Dead span: PTE cleared to an unmapped page → sampled verify walks
-    // None → entry retired, caller falls back.
+    // Dead span: PTE cleared to an unmapped page → the verify walks None →
+    // entry retired, caller falls back.
     st32(&mut pte, 0x7fff);
     host.write_gpa(root_gpa, &pte).unwrap();
-    state.tranche.run_memo_hit = 127;
     assert!(guest_runs_memoized(&mut state, &mut host, 1, gva, 16).is_none());
     assert_eq!(state.tranche.run_memo_stale, 2);
     assert!(state.guest_run_memo.is_empty());
