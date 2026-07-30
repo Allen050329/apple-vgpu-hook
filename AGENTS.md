@@ -1882,6 +1882,12 @@ before changing any of them.
 
 ### The Presenter Is Not The Cap, And One Early Return Keeps Every Remaining Readback
 
+**Both halves of this heading are now overturned — see "The Composite Round Trip Is
+Gone, And The Presenter Is Now The Cap" below. The early return is fixed (`bd70e4a`),
+and the presenter *is* the cap once the device stops being one. Kept because the
+reasoning about why `presents` alone could not answer, and the 3.9x spread it
+records, are both still live.**
+
 **Measured on one x86/Vulkan boot at `08110da`** (Safari fullscreen on
 testufo.com/refreshrate, 45 s settle, 2885 sliced lines, 47 cadence windows). Two
 questions the previous boot could not answer, both answered unanimously.
@@ -1950,6 +1956,147 @@ means **no single-boot frame-rate number scores anything on this rig**, in eithe
 direction. Score with within-boot ratios (`offered`/`presents`, `t11_keep_*`/`surface_deferred`,
 `readback_bytes`/`readback_us`) and treat Hz as colour. The 53-60 Hz window is
 encouraging and is not evidence that the 60 fps goal is met.
+
+### The Composite Round Trip Is Gone, And The Presenter Is Now The Cap
+
+**Built by `bd70e4a` + `04dc2f4`, scored on two x86/Vulkan boots.
+`readbacks` 0, `wait_us` 0, `readback_us` 0, `target_read_bytes` 621 MB/s → 2.5 MB/s,
+`drain_duty` 0.88-0.99 → 0.135. Do not rebuild any of it.** Same workload both
+boots (Safari fullscreen on testufo.com/refreshrate, 45 s settle,
+`.agents/repros/testufo-fps.sh`), ~105 one-second windows at the fix.
+
+`type11_store_identity` opened with `if req.chain_from_resident || !writeback_guest
+{ return None }`. `08110da`'s ordered probe had already measured the cost —
+`t11_keep_chain_from_resident` equal to `surface_deferred` in all twelve windows,
+112-132 Stores/s at 366-372 MB/s, every other keep-reason at zero — and the refusal
+had no mechanism under it. `retarget_render_pass_draw` builds every record of a
+packet from one attachment template, so records N-1 and N carry the same
+`mapping_id` and geometry and therefore the same `render_chain_identity`; the
+intermediates already render into that resident under `skip_readback` with
+`LoadOp::LoadFromTarget`. The last record differs only in what happens *after* the
+draw. The gate below it tested `resources.target_identity.is_none()` and so read
+that agreement as a conflict; it now compares the two identities.
+
+**The first boot of that put 100 % of Stores on the resident rail and the readback
+did not go away — it moved to `flush_render_one`, and the shape of how is the
+transferable part.** `surface_flush / surface_resident` came out **1369/1373**: one
+flush per arm, a deferral degraded into a rescheduling with a GPU round trip added.
+`type11_load_seed` named it with no new probe — `outcome=guest_pages` 110 against
+17 `cache_hit`, `hostgen=0` on every one. The resident rail cedes the host cache, so
+**any LOAD that misses the epoch check reads the mapping's guest pages, and reading
+them lands the window the rail just armed.** Two independent gaps fed that loop and
+either alone sustains it:
+
+- **The witness did not survive its own flush.** `write_bgra8` ends in
+  `mark_mapping_written`, which advances `surface_content_epoch` — correctly, the
+  guest pages did change. But the *pixels* did not: they are the resident's, copied
+  out of it one statement earlier. AGENTS.md recorded this asymmetry as designed-for
+  and conservative, "at 95 % elision the residual is not worth chasing" — true while
+  half the Stores kept the cache populated, false at 100 %. `flush_render_one` now
+  hands the epoch back to the image the frame came out of, on the `Resident` path
+  only (an `Owned` window's bytes came from an `Arc`, and nothing there establishes
+  the slot still holds them).
+- **An intermediate record could not ask the question.** The currency check was keyed
+  on `type11_store_identity`, which requires `writeback_guest` — granted solely to a
+  packet's last record. Record 1 of a chain therefore never asked, took a CPU seed,
+  and read guest pages. It renders into the same slot.
+
+Split into `type11_render_identity` (the slot this record renders into) and
+`type11_store_identity` (that slot, restricted to the record that also stores it for
+the guest) — a superset and its restriction, not two derivations. **The LOAD now goes
+through `type11_load_currency_query`, whose signature takes no `writeback_guest`: a
+resolver that cannot see the record's role cannot be keyed on it.** That is
+deliberate in place of a test, and the reason is worth carrying: a unit test on the
+resolver was written first, and with the call site stubbed back to the Store identity
+**it still passed**. It was pinning the function, not the behaviour.
+
+| | at `bd70e4a` | at `04dc2f4` |
+|---|---|---|
+| `surface_flush / surface_resident` | **0.997** (1369/1373) | **0.0034** (146/43912) |
+| type-11 seed elision | 4-15 per window | **99.72 %** (42831 / 120) |
+| `readbacks` / `readback_bytes` | 0 / 0 | **0 / 0** |
+| `target_reads` / bytes, per window | 1051 / 3.24 GB | **p50 1 / 32 KB** |
+| `seed_uploads` / bytes, per window | 1066 / 3.24 GB | **p50 1 / 32 KB** |
+| `wait_us` / `readback_us` per second | — | **0 / 0** |
+| `drain_duty` | — | **0.135** |
+| `surface_deferred` (byte-owning route) | absent | **absent, 0 of 105 windows** |
+| `target_evicts` | 0 | **0**, every window |
+| `batch_joins` / `batch_opens` | 1070 / 1190 | 34396 / 37181 = **0.93** |
+| `deferred_flush_lost` | 0 | **0** |
+| guest's own opinion (testufo) | 88.000 Hz / 88 fps | 78.000 Hz / 78 fps |
+
+Read the ratios, not the Hz. `surface_flush / surface_resident` and the elision
+percentage are two counters from one window of one boot, which is the only kind that
+survives this rig's spread. `wait_us` and `readback_us` at a literal **0** is the
+cost *deleted* — the distinction `ce3f095` split the counter to make visible.
+`target_evicts` at 0 across all 105 windows is the identity-derived BGRA rule still
+holding under a doubled pin rate.
+
+**A pin leak was shipped with the resident rail and is fixed here.**
+`prepare_surface_deferred_window`'s supersede loop took each covered window with a
+bare `take_deferred_flush_window_exact` and discarded it — the one site in the crate
+that took a window and dropped it without `release_window_pin`, whose own doc comment
+declares that mandatory. Pins are counted, and a repainting compositor re-Stores the
+identical range every frame, so the superseded key *equals* the new one: the same
+slot's `pin_count` climbed once per Store without bound. `evict_registry_to_cap`
+rotates pinned slots instead of evicting and the idle drain requires
+`pin_count == 0`, so a slot that got there could never be reclaimed — the "~260 stale
+residents (~516 MiB)" shape, one frame at a time. Fixed at the choke point
+(`storage_flush::supersede_covered_render_windows`, now the only product caller of
+`take_deferred_flush_window_exact`), and `release_window_pin` returns the identity it
+unpinned **because `unpin_resident_target` is a silent no-op on an absent slot and
+the engine logs nothing** — "the pin was released" was a claim no test and no boot
+could read, which is how it went several commits unnoticed. Two existing supersede
+tests modelled the drop with `take_deferred_flush_window_exact` instead of calling
+the real function; as written neither could have caught it.
+
+**The bottleneck is now the swapchain acquire, and this retires the section above.**
+"The Presenter Is Not The Cap" was measured when the device offered ~83 frames/s and
+the window presented ~83. It now offers far more than the window will take:
+
+```
+host_window_cadence presents=20 direct=20 busy=418 busy_fence=0 busy_acquire=418
+    offered=99 present_hz=20.0 offered_hz=99.0 direct_frac=1.00
+```
+
+`presents` p50 **20**, `busy_acquire` p50 **409**, `busy_fence` **0** — so ~438
+`present()` calls a second, 95 % of which fail the non-blocking
+`acquire_next_image(swapchain, 0, …)` at `window_present.rs:793`. The device behind it
+is at `duty=0.135` with 625 tranches and 662 draws a second. Two facts bound the next
+step and neither depends on a cross-boot comparison: **the host panel is 120 Hz**
+(`modetest -c`: eDP-2 3840x2400 @ 120.00, preferred), and **`present_hz` reads exactly
+20.0 in 90 of 106 windows** — a lock, not contention, which would scatter.
+
+Do not read that as a regression, and do not chase it on one boot. AGENTS.md already
+records `present_hz` p50 **20.00** at `3af5832` against **78.20** at `08110da` on
+code differing only by instrumentation, and 20.00 is one of those two arms. What is
+*new* and drift-free is the within-boot ratio: the presenter now refuses 95 % of its
+own attempts while the device idles. Three things to check before touching the
+present mode, in cost order:
+
+- **What `offered` counts.** `cadence_offered` increments only when `present()` is
+  handed `Some(cpu)` (`window_present.rs:779`), so on the resident rail it may be
+  counting something other than "frames the device produced". Confirm what a
+  `capture_sampling full=1 light=6143` boot passes as `cpu` before quoting
+  `offered/presents` as a drop ratio.
+- **Whether 20.0 is ours.** Grep the publish path for an interval or pacing constant
+  before blaming the compositor; a stable 20.0 on a 120 Hz panel is 1/6, and a
+  quantized lock is more consistent with a timer or a fixed image-return cadence than
+  with load.
+- **`PresentModeKHR::FIFO` with `min_image_count + 1`** (`window_present.rs:661`,
+  `:709`). MAILBOX would decouple the acquire from the display, and is a capability
+  question (`get_physical_device_surface_present_modes`), not a vendor one — but
+  changing it changes pacing, so it needs the within-boot `offered/presents` ratio to
+  score it, not Hz.
+
+**Goals 1-3 re-verified green by slug on the fix boot**, 1775 sliced lines:
+`linear_load_span_exceeds_alloc`, `deferred_flush_lost`, `type11_seed_cache_absent`,
+`draw_vk_nothing_stored`, `resident_chain_abandoned_cpu_recovery`, `frame_bgra_short`,
+`chain_resident_land_fail`, all three `surface_resident_*` arm declines,
+`type11_window_invent` and `BadGrid` — **all 0**. The host window rendered testufo
+correctly and the byte-order check passed on pixels: the banner rendered **blue**
+("SYNCING", up from red "SYNC FAILURE" on the previous boot) and the Blur Busters
+header purple, which no failure line can see.
 
 ### The ~2 Hz Frame Rate Was One Bit In A Memory-Type Query
 
