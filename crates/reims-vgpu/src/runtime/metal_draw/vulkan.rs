@@ -303,8 +303,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // shows at duty 0.93-0.99. Nothing on the host-window
                     // present path reads those pages, so most of that work is
                     // owed to a guest reader that may never come.
-                    let deferred = deferred_gpu_only_content_allowed_for_surface()
-                        && arm_surface_deferred_store_with(
+                    let deferred = if deferred_gpu_only_content_allowed_for_surface() {
+                        arm_surface_deferred_store_with(
                             state,
                             host,
                             req,
@@ -312,8 +312,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.width,
                             c0.height,
                             &rgba,
-                        );
-                    if deferred {
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(epoch) = deferred {
                         note_type11_store_route("surface_deferred");
                         publish_surface_store(
                             state,
@@ -323,6 +326,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.height,
                             c0.format,
                         );
+                        stamp_type11_resident(state, req, writeback_guest, epoch);
                         return (EncodeStatus::Ok, Some(rgba));
                     }
                     note_type11_store_route("cpu_portability");
@@ -335,6 +339,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         c0.width,
                         c0.height,
                     );
+                    // The synchronous route publishes through
+                    // `mark_mapping_written`, so the epoch it advanced to is
+                    // simply the mapping's current one — read immediately, for
+                    // the same reason the deferred route captures its own.
+                    let sync_epoch = ok
+                        .then(|| state.mappings.get(&c0.mapping_id))
+                        .flatten()
+                        .map(|m| m.surface_content_epoch);
                     if ok {
                         // Full-frame publish: same completeness proof as the
                         // import-present scatter paths — the write verified
@@ -351,6 +363,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.height,
                             c0.format,
                         );
+                        if let Some(epoch) = sync_epoch {
+                            stamp_type11_resident(state, req, writeback_guest, epoch);
+                        }
                         if crate::observe::draw_log_enabled() {
                             let (rgb_nz, max_rgb) = rgb_stats();
                             crate::observe::line(format!(
@@ -3837,6 +3852,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // content directly from the engine target (no CPU seed, no re-upload).
         #[cfg(feature = "backend-vulkan")]
         let mut chain_load_from_target = false;
+        // Resolved once and read by both the Load gate below and the
+        // `target_identity` assignment further down, so the record that loads
+        // from a resident is by construction the record that renders into it.
+        #[cfg(feature = "backend-vulkan")]
+        let type11_resident_target = type11_store_identity(state, req, writeback_guest);
         #[cfg(feature = "backend-vulkan")]
         if req.chain_from_resident {
             if let Some(identity) = render_chain_identity(state, req) {
@@ -3898,6 +3918,49 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             true,
                             "load_seed",
                         );
+                    }
+                }
+            }
+        }
+        // Type-11 composite Load: when the resident this record is about to
+        // render into was stamped with the mapping's current
+        // `surface_content_epoch`, its image already holds exactly the bytes
+        // `resolve_type11_load_seed` would upload. Load from it and skip the
+        // upload.
+        //
+        // The epoch is the witness, and it is closed by construction rather
+        // than by a list of writers: `mark_mapping_written` advances it, and
+        // every guest-page writer in this crate already calls that, so a blit,
+        // a compute writeback or a guest CPU write all invalidate the stamp
+        // without knowing this rail exists. The deferred type-11 publish — the
+        // one writer that changes the pixels without touching guest pages —
+        // advances it explicitly. Anything that leaves the answer unknown (no
+        // slot, an evicted or recycled image, a draw since the stamp, a
+        // `map_generation` rewire that renames the identity) reads back `None`
+        // and takes the seed.
+        #[cfg(feature = "backend-vulkan")]
+        if !chain_load_from_target {
+            if let (Some(c0), Some(identity)) =
+                (req.colors.first(), type11_resident_target.as_ref())
+            {
+                let mapping_epoch = state
+                    .mappings
+                    .get(&c0.mapping_id)
+                    .map(|m| m.surface_content_epoch);
+                if type11_load_is_a_seed_candidate(c0, req) {
+                    // Both arms counted, into the same one-second window as
+                    // `drain_duty`. An elision count alone cannot tell "the
+                    // seed was skipped" from "this record was never a
+                    // candidate", and the ratio of the two is a within-boot
+                    // number — the only kind that survives the 1.8x
+                    // `us_per_draw` drift between boots on this rig.
+                    let resident_epoch =
+                        crate::backend::vulkan::engine::resident_content_epoch(identity);
+                    if type11_resident_is_current(mapping_epoch, resident_epoch) {
+                        chain_load_from_target = true;
+                        crate::runtime::drain::note_store_route("type11_seed_elided");
+                    } else {
+                        crate::runtime::drain::note_store_route("type11_seed_uploaded");
                     }
                 }
             }
@@ -4091,6 +4154,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     gva_resident_store = true;
                 }
             }
+        }
+        // A type-11 composite Store renders into its registry resident and is
+        // still read back — `skip_readback` stays as the Store rule set it.
+        #[cfg(feature = "backend-vulkan")]
+        if resources.target_identity.is_none() {
+            resources.target_identity = type11_resident_target.clone();
         }
         #[cfg(feature = "backend-vulkan")]
         if chain_load_from_target {
@@ -4688,6 +4757,81 @@ fn render_chain_identity(
     gva_chain_identity(req)
 }
 
+/// The registry resident a type-11 composite Store renders into, if this record
+/// is one.
+///
+/// Unlike the GVA rail this is **not** a `skip_readback` deferral: a composite
+/// Store still reads its target back, because that readback is what feeds
+/// `surface_cache`, the deferred window's owned frame and the guest writeback.
+/// The resident exists so the *next* LOAD on this surface can start from the
+/// image that already holds these pixels instead of re-uploading them through
+/// the staging span — `draw_phase` prices that upload at ~155 ms per second of
+/// wall clock under a browser workload, a copy of bytes the GPU just produced.
+///
+/// Single source of truth on purpose. The draw's `target_identity`, the LOAD's
+/// currency check and the Store's epoch stamp must name the same slot; deriving
+/// it three times from three spellings of the predicate is how a stamp ends up
+/// vouching for an image the draw never rendered into.
+#[cfg(feature = "backend-vulkan")]
+fn type11_store_identity(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+    writeback_guest: bool,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    if req.chain_from_resident || !writeback_guest {
+        return None;
+    }
+    let c0 = req.colors.first()?;
+    if c0.mapping_id == 0 || c0.store_action != PASS_STORE_ACTION_STORE {
+        return None;
+    }
+    render_chain_identity(state, req)
+}
+
+/// Whether this record's color0 LOAD is one the resident could serve at all —
+/// it must be a LOAD, and no explicit seed may already have been selected for
+/// it by RT provenance. Separate from the currency question so the two counters
+/// on the branch below divide candidates, not all draws.
+#[cfg(feature = "backend-vulkan")]
+fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest, req: &DrawEncodeRequest) -> bool {
+    c0.load_action == PASS_LOAD_ACTION_LOAD
+        && c0.target_seed_rgba.is_none()
+        && req.target_seed_rgba.is_none()
+}
+
+/// Whether a resident's stamp still vouches for the mapping's current content.
+///
+/// The `is_some` guard is the whole function. Both values are `Option`, and
+/// `None == None` is `true` in Rust — so a bare equality would read "the
+/// mapping has no entry" and "this image was never stamped" as agreement and
+/// load undefined memory as though it were the guest's prior frame. That is
+/// precisely the black-layer class. Absence on either side is a refusal.
+#[cfg(feature = "backend-vulkan")]
+fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option<u32>) -> bool {
+    mapping_epoch.is_some() && mapping_epoch == resident_epoch
+}
+
+/// Record that the resident this Store rendered into holds the mapping's
+/// content as of `epoch`, so the surface's next LOAD can skip its CPU seed.
+///
+/// Keyed through [`type11_store_identity`] — the same call the draw's
+/// `target_identity` came from — so the slot stamped is the slot rendered into.
+/// A miss is expected and silent: the identity resolves to `None` when this
+/// record never took the resident path, and `stamp_resident_content_epoch`
+/// refuses a slot that was evicted between the draw and here. Both leave the
+/// stamp absent, which costs a seed and never a wrong frame.
+#[cfg(feature = "backend-vulkan")]
+fn stamp_type11_resident(
+    state: &DeviceState,
+    req: &DrawEncodeRequest,
+    writeback_guest: bool,
+    epoch: u32,
+) {
+    if let Some(identity) = type11_store_identity(state, req, writeback_guest) {
+        crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
+    }
+}
+
 /// Engine-resident identity for a GVA (type-2/3) color0 render target.
 ///
 /// Single source of truth for the resident GVA chain rail: the draw path,
@@ -4833,12 +4977,10 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     width: u32,
     height: u32,
     rgba: &[u8],
-) -> bool {
-    let Some(key) = surface_store_defer_eligible(state, req) else {
-        return false;
-    };
+) -> Option<u32> {
+    let key = surface_store_defer_eligible(state, req)?;
     if key.mapping_id != mapping_id || key.width != width || key.height != height {
-        return false;
+        return None;
     }
     // Supersede — do not flush — the window this Store fully covers.
     //
@@ -4885,7 +5027,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     ) {
         // A window that would not land is a window whose guest bytes are now
         // unknown; arming over it would attribute its loss to this Store.
-        return false;
+        return None;
     }
     // Convert once, into guest scanout order, and reference it twice: the Load
     // seed and the present capture read it through `surface_cache`, and the
@@ -4905,6 +5047,14 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         height,
         std::sync::Arc::clone(&frame),
     );
+    // Captured here, not re-read at the end: this is the epoch at which these
+    // exact pixels became the mapping's content. Anything below — an eviction
+    // flush landing a sibling window, which writes guest pages and replaces the
+    // one-per-mapping cache entry — advances the epoch past it, and the
+    // resident stamped with the captured value then reads as stale. That is the
+    // intended direction: a stale stamp costs a CPU seed, a fresh-looking one
+    // costs a wrong frame.
+    let published_epoch = state.note_surface_content_published(mapping_id);
     evict_render_windows_to_cap(state, host);
     state.surface_deferred_seq = state.surface_deferred_seq.wrapping_add(1);
     let armed_seq = state.surface_deferred_seq;
@@ -4927,7 +5077,7 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
         req.pipeline_ref,
         state.compute_deferred_flush.len()
     ));
-    true
+    Some(published_epoch)
 }
 
 /// Whether the type-11 writeback may be deferred at all. Same engine-level
@@ -5227,6 +5377,135 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// Both sides absent must not read as agreement.
+    ///
+    /// `Option<u32> == Option<u32>` makes `None == None` true, so a bare
+    /// equality here would let a mapping with no entry match an image that was
+    /// never stamped, and the pass would `LoadFromTarget` out of undefined
+    /// memory instead of seeding. That is the black-layer class, arrived at
+    /// from a new direction: a whole compositing layer renders as a sharp
+    /// axis-aligned rectangle of garbage or black.
+    #[test]
+    fn an_unstamped_resident_never_matches_a_mapping_with_no_epoch() {
+        assert!(!type11_resident_is_current(None, None));
+        assert!(!type11_resident_is_current(None, Some(0)));
+        assert!(!type11_resident_is_current(Some(7), None));
+    }
+
+    /// Epoch 0 is a legal mapping value — "nothing published since attach" —
+    /// and must not be matchable by a slot's unstamped default. It is only
+    /// current against a resident explicitly stamped with 0.
+    #[test]
+    fn epoch_zero_is_current_only_against_an_explicit_stamp() {
+        assert!(type11_resident_is_current(Some(0), Some(0)));
+        assert!(!type11_resident_is_current(Some(0), None));
+    }
+
+    /// The elision is exact equality, not "at least as new". A resident stamped
+    /// at an older epoch has been overtaken by some writer — a blit, a compute
+    /// writeback, a guest CPU write, a sibling geometry's publish — and must
+    /// fall back to the CPU seed.
+    #[test]
+    fn any_epoch_movement_since_the_stamp_refuses_the_elision() {
+        assert!(type11_resident_is_current(Some(4), Some(4)));
+        assert!(!type11_resident_is_current(Some(5), Some(4)));
+        assert!(!type11_resident_is_current(Some(4), Some(5)));
+    }
+
+    /// Every guest-page writer in this crate goes through
+    /// `mark_mapping_written`, so making that advance the surface epoch is what
+    /// closes the writer set without enumerating it. A blit or a guest CPU
+    /// write invalidates a stamp without knowing this rail exists.
+    #[test]
+    fn a_guest_page_write_advances_the_surface_epoch() {
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        state.set_mapping_geom(7, 8, 4, 0x1e);
+        let before = state.mappings.get(&7).unwrap().surface_content_epoch;
+
+        let published = state.mark_mapping_written(7);
+        let after = state.mappings.get(&7).unwrap().surface_content_epoch;
+
+        assert!(published > 0, "content_generation still advances");
+        assert_ne!(
+            before, after,
+            "a guest-page write must invalidate any resident stamp"
+        );
+    }
+
+    /// The deferred type-11 publish writes only the host shadow — no guest
+    /// page, so `mark_mapping_written` never runs — and it is the one writer
+    /// that would otherwise change the mapping's pixels invisibly to the epoch.
+    /// `surface_cache` holds one entry per mapping, so a sibling Store at
+    /// another geometry replaces the entry an older geometry is compared
+    /// against; without this bump that sibling is silent.
+    #[test]
+    fn a_deferred_publish_advances_the_epoch_without_a_guest_write() {
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        state.set_mapping_geom(7, 8, 4, 0x1e);
+        let gen_before = state.mappings.get(&7).unwrap().content_generation;
+
+        let first = state.note_surface_content_published(7);
+        let second = state.note_surface_content_published(7);
+
+        assert_ne!(first, second, "each publish is a distinct epoch");
+        assert_eq!(
+            gen_before,
+            state.mappings.get(&7).unwrap().content_generation,
+            "a deferred publish touched no guest page, so content_generation \
+             must not move — the compute rail reads it and would re-seed"
+        );
+    }
+
+    /// Re-attaching a mapping resets the epoch to 0, and 0 is unstampable-by-
+    /// default on the resident side, so no resident carried over from the
+    /// previous incarnation can vouch for the new one's pixels.
+    #[test]
+    fn reattaching_a_mapping_resets_the_surface_epoch() {
+        let mut state = DeviceState::new(DeviceId(0), PAGE_SHIFT_X86);
+        state.set_mapping_geom(7, 8, 4, 0x1e);
+        state.mark_mapping_written(7);
+        assert_ne!(state.mappings.get(&7).unwrap().surface_content_epoch, 0);
+
+        // A geometry change is a new surface identity; the same reset guards
+        // the MAP/UNMAP/reattach paths beside it.
+        state.set_mapping_geom(7, 16, 8, 0x1e);
+        assert_eq!(state.mappings.get(&7).unwrap().surface_content_epoch, 0);
+    }
+
+    /// A record carrying an explicit RT-provenance seed is not a candidate:
+    /// that seed was selected for a reason the resident cannot know about, and
+    /// the gate must not silently outvote it.
+    #[test]
+    fn an_explicitly_seeded_load_is_not_an_elision_candidate() {
+        let mut c0 = ColorRtRequest {
+            load_action: PASS_LOAD_ACTION_LOAD,
+            ..Default::default()
+        };
+        let mut req = DrawEncodeRequest::default();
+        assert!(type11_load_is_a_seed_candidate(&c0, &req));
+
+        c0.target_seed_rgba = Some(vec![0u8; 4]);
+        assert!(!type11_load_is_a_seed_candidate(&c0, &req));
+
+        c0.target_seed_rgba = None;
+        req.target_seed_rgba = Some(vec![0u8; 4]);
+        assert!(!type11_load_is_a_seed_candidate(&c0, &req));
+    }
+
+    /// A CLEAR is not a LOAD. Eliding a seed there would replace the guest's
+    /// explicit clear with whatever the resident happened to hold.
+    #[test]
+    fn a_clear_is_not_an_elision_candidate() {
+        let c0 = ColorRtRequest {
+            load_action: PASS_LOAD_ACTION_CLEAR,
+            ..Default::default()
+        };
+        assert!(!type11_load_is_a_seed_candidate(
+            &c0,
+            &DrawEncodeRequest::default()
+        ));
+    }
 
     /// A type-11 `LOAD` whose host cache misses seeds from the surface's own
     /// guest pages, and only refuses when those cannot serve the extent.

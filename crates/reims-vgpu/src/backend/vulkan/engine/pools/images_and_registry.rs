@@ -541,6 +541,7 @@ impl ResourcePools {
                 height,
                 generation,
                 content_ready: false,
+                content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
                 bgra,
                 color_format: format,
@@ -712,6 +713,7 @@ impl ResourcePools {
                 height,
                 generation,
                 content_ready: false,
+                content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
                 bgra: format == translate::pixel::SCANOUT_FORMAT,
                 color_format: format,
@@ -865,6 +867,7 @@ impl ResourcePools {
     ) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
+            slot.content_epoch = None;
             slot.layout = layout;
         }
     }
@@ -890,11 +893,38 @@ impl ResourcePools {
         false
     }
 
+    /// Mark a resident ready after a draw stored into it.
+    ///
+    /// Clears `content_epoch`: this image's pixels just changed, and until
+    /// something publishes them as the mapping's content and stamps the slot,
+    /// nothing may claim they match a mapping epoch. Every path that ends in a
+    /// resident holding new pixels comes through here or
+    /// [`Self::registry_mark_ready_at`], which is what keeps the reset total
+    /// rather than a list of the writers somebody remembered.
     pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
+            slot.content_epoch = None;
             // Draw pass final_layout is TRANSFER_SRC_OPTIMAL.
             slot.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        }
+    }
+
+    /// Record that this resident's pixels are the mapping's content as of
+    /// `epoch`. Refuses (returns false) unless the slot exists and is
+    /// content_ready — stamping an image no draw has stored into would vouch
+    /// for undefined memory.
+    pub(crate) fn registry_stamp_content_epoch(
+        &mut self,
+        identity: &TargetIdentity,
+        epoch: u32,
+    ) -> bool {
+        match self.registry.get_mut(identity) {
+            Some(slot) if slot.content_ready => {
+                slot.content_epoch = Some(epoch);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -924,6 +954,7 @@ mod pin_count_tests {
             height: 16,
             generation: 1,
             content_ready,
+            content_epoch: None,
             layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             bgra: true,
             color_format: translate::pixel::SCANOUT_FORMAT,
@@ -939,6 +970,62 @@ mod pin_count_tests {
             height: 16,
             generation: 0,
         }
+    }
+
+    /// A draw into this identity invalidates any stamp on it. The image's
+    /// pixels just changed, and until something publishes them as the mapping's
+    /// content the type-11 LOAD gate must not treat them as current — otherwise
+    /// an intermediate record's output is loaded as though it were the guest's
+    /// prior frame.
+    ///
+    /// Placed on `registry_mark_ready` rather than on the individual writers on
+    /// purpose: every path that leaves a resident holding new pixels goes
+    /// through here or `registry_mark_ready_at`, so the invalidation is total
+    /// rather than a list of the writers somebody remembered.
+    #[test]
+    fn a_draw_into_a_resident_clears_its_content_stamp() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+
+        assert!(pools.registry_stamp_content_epoch(&id, 9));
+        assert_eq!(pools.registry.get(&id).unwrap().content_epoch, Some(9));
+
+        pools.registry_mark_ready(&id);
+        assert_eq!(
+            pools.registry.get(&id).unwrap().content_epoch,
+            None,
+            "a draw stored new pixels; the old stamp cannot vouch for them"
+        );
+
+        assert!(pools.registry_stamp_content_epoch(&id, 10));
+        pools.registry_mark_ready_at(&id, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        assert_eq!(
+            pools.registry.get(&id).unwrap().content_epoch,
+            None,
+            "the MRT-secondary ready arm must invalidate identically"
+        );
+    }
+
+    /// Stamping an image no draw has stored into would vouch for undefined
+    /// memory, and an absent identity has no image at all. Both refuse, and the
+    /// caller reads the `false` as "the elision is off for this surface".
+    #[test]
+    fn a_stamp_refuses_an_image_no_draw_has_written() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+
+        assert!(
+            !pools.registry_stamp_content_epoch(&id, 1),
+            "an absent identity cannot be stamped"
+        );
+
+        pools.registry.insert(id.clone(), dummy_slot(false));
+        assert!(
+            !pools.registry_stamp_content_epoch(&id, 1),
+            "a resident that is not content_ready holds undefined pixels"
+        );
+        assert_eq!(pools.registry.get(&id).unwrap().content_epoch, None);
     }
 
     /// Two deferred windows on one surface pin the SAME identity; the first

@@ -565,6 +565,28 @@ pub struct MappingEntry {
     pub height: u32,
     pub format: u16,
     pub content_generation: u32,
+    /// Epoch of this mapping's *surface content* in the sense a type-11 render
+    /// LOAD needs: it advances whenever the pixels that Load would seed from
+    /// could have changed, wherever they live.
+    ///
+    /// Strictly coarser than [`Self::content_generation`], and deliberately so.
+    /// `content_generation` counts writes to the mapping's *guest pages*, which
+    /// misses the one publisher that writes only the host shadow: the deferred
+    /// type-11 Store stores into `surface_cache` and arms a window instead of
+    /// scattering into guest pages. `surface_cache` holds exactly one entry per
+    /// mapping, so a sibling Store at a *different* geometry replaces the entry
+    /// an older geometry's resident is being compared against while
+    /// `content_generation` never moves — the same one-entry-per-mapping hazard
+    /// that cost the `deferred_flush_lost reason=cache_miss` class. Bumping here
+    /// on that publish makes the sibling case a mismatch, so the older geometry
+    /// falls back to the CPU seed rather than loading from a resident whose
+    /// currency nothing established.
+    ///
+    /// Compared against [`crate::backend::vulkan::engine::resident_content_epoch`]
+    /// to decide whether a type-11 LOAD may take `LoadOp::LoadFromTarget` and
+    /// skip its CPU seed entirely. Never read to decide *what* to present or
+    /// draw — only whether a known-equal upload can be elided.
+    pub surface_content_epoch: u32,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
     /// changes PFNs). Used as [`TargetIdentity`] generation for resident
@@ -2464,6 +2486,7 @@ impl DeviceState {
         e.page_table_kva = 0;
         e.device_desc.clear();
         e.content_generation = 0;
+        e.surface_content_epoch = 0;
         e.has_geom = false;
         e.width = 0;
         e.height = 0;
@@ -2539,6 +2562,7 @@ impl DeviceState {
         e.condemned_entries = None;
         e.device_desc.clear();
         e.content_generation = 0;
+        e.surface_content_epoch = 0;
         Self::bump_map_generation(e);
         // New MappingInternal ⇒ new surface; force device-desc re-resolve.
         e.has_geom = false;
@@ -2606,6 +2630,7 @@ impl DeviceState {
         // reset content_generation (the guest pages stay authoritative).
         if e.width != width || e.height != height {
             e.content_generation = 0;
+            e.surface_content_epoch = 0;
         }
         e.has_geom = true;
         e.width = width;
@@ -2615,6 +2640,10 @@ impl DeviceState {
     }
 
     /// Bump content generation after a write into the mapping (0 never skips).
+    ///
+    /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
+    /// this crate's guest-page writers keeps that epoch closed for free — the
+    /// completeness property the type-11 `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
@@ -2623,7 +2652,32 @@ impl DeviceState {
         if m.content_generation == 0 {
             m.content_generation = 1;
         }
+        m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
         m.content_generation
+    }
+
+    /// Advance [`MappingEntry::surface_content_epoch`] for a publish that
+    /// changed the mapping's pixels *without* writing its guest pages — the
+    /// deferred type-11 Store, which stores the frame into `surface_cache` and
+    /// arms a window. Returns the new epoch so the caller can stamp the
+    /// resident that holds those pixels in the same breath; the two must not be
+    /// separable, or the stamp records a currency that already moved.
+    pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
+        let Some(m) = self.mappings.get_mut(&mapping_id) else {
+            return 0;
+        };
+        m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        m.surface_content_epoch
+    }
+
+    /// Wrapping increment that never lands on 0, so 0 keeps meaning "no content
+    /// published since attach" and cannot be matched by a resident's own
+    /// unstamped default.
+    fn next_epoch(epoch: u32) -> u32 {
+        match epoch.wrapping_add(1) {
+            0 => 1,
+            n => n,
+        }
     }
 
     pub fn record_fail(&mut self, ev: FailEvent) {

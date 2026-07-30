@@ -348,6 +348,29 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
         .is_some_and(|s| s.content_ready)
 }
 
+/// The mapping content epoch this resident's pixels were stamped with, or
+/// `None` when the identity is absent, evicted, or has not been vouched for
+/// since its last draw.
+///
+/// Compared by the type-11 LOAD against
+/// [`crate::model::MappingEntry::surface_content_epoch`]: equal means the
+/// resident already holds exactly the bytes a CPU seed would upload, so the
+/// pass may take [`LoadOp::LoadFromTarget`] and skip the upload. Every way the
+/// answer can be unknown — no slot, recycled image, a draw since the stamp —
+/// resolves to `None` and therefore to the seed.
+pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
+    let guard = lock_engine();
+    guard.pools.registry_get(identity)?.content_epoch
+}
+
+/// Record that this resident holds the mapping's content as of `epoch`. Returns
+/// false when the identity is absent or not content_ready, which the caller
+/// must treat as "the elision is off for this surface" rather than ignore.
+pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bool {
+    let mut guard = lock_engine();
+    guard.pools.registry_stamp_content_epoch(identity, epoch)
+}
+
 /// Whether this backend may leave guest-visible content only in GPU-resident
 /// engine state.
 ///

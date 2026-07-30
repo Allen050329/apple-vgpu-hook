@@ -493,6 +493,17 @@ pub(crate) struct ResidentTargetSlot {
     pub height: u32,
     pub generation: u64,
     pub content_ready: bool,
+    /// The mapping-level `surface_content_epoch` this image's pixels were last
+    /// stamped with, or `None` when nothing has vouched for them.
+    ///
+    /// `None` is the fail-closed default and it is what every reset restores:
+    /// slot creation, image recycle, and both `registry_mark_ready*` arms — so
+    /// a draw that stores into this identity without going on to publish the
+    /// mapping's content leaves the slot unvouched, and the type-11 LOAD gate
+    /// falls back to its CPU seed. An `Option` rather than a sentinel because
+    /// epoch 0 ("nothing published since attach") is a legal *mapping* value
+    /// and a bare `0 == 0` would match an image that was never stamped at all.
+    pub content_epoch: Option<u32>,
     /// Last known layout (tracked for correct barriers).
     pub layout: vk::ImageLayout,
     /// Attachment format: true = B8G8R8A8_UNORM (guest scanout order), false =
