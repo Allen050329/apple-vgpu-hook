@@ -3112,6 +3112,52 @@ cell to a texture ref still does not exist; the argument is geometry plus timest
 the fragment, which is circumstantial. The next measurement is the fate of a deferred GVA window
 between the two binds — armed, flushed, superseded or evicted — which nothing currently reports.
 
+**REFUTED by a control arm on the very next boot (`41c2423`). The `resident` → sparse-`bytes`
+transition is normal traffic, not the defect. Do not re-derive it, and do not spend another boot on
+`try_sample_deferred_gva`.**
+
+That boot rendered **all six icons correctly** and still produced **18 regressions**, three of them
+`64x64 mid=0`, carrying the *identical* fingerprints to the corrupting boot:
+
+| | corrupting boot (`ed8e2c2`) | clean boot (`41c2423`) |
+|---|---|---|
+| regressions | 17 | **18** |
+| of which `64x64 mid=0` | 6 | **3** |
+| their fingerprints | `nz=0`, `290 quad=290/0/0/0`, `784 quad=784/0/0/0`, … | **`nz=0`, `290 quad=290/0/0/0`, `784 quad=784/0/0/0`** |
+
+Byte-identical `quad` signatures on a screen with no defect. So a 28x28 block of content in the
+top-left of a 64x64 texture is simply what these textures contain — the guest rasterises art into a
+sub-rect and the draw picks it out with texture coordinates — and the "shrunken into the top-left"
+reading of the *screen* symptom does not transfer to the *texture*. Two different things were being
+called the same shape.
+
+And the typed fall-through says the proposed mechanism cannot fire at all. Across the whole slice:
+`no_window` **191**, `window_geometry` **1**, `owner_object_type` **0**, and
+**`resident_not_ready` 0**. The arm named as "the one that matters" — a window armed while the
+resident holds nothing — never happened. `no_window` dominating is the benign case by construction:
+no deferred window means guest pages are authoritative and reading them is correct.
+
+Three transferable points, in order of what they cost:
+
+- **Run the control arm before writing the mechanism up.** The regression population was computed on
+  a boot that reproduced, and every number in it looked like a defect. The same computation on a
+  clean boot returns the same numbers. One boot with a known-good screen would have caught it at any
+  point, and it was available the whole time — this repro corrupts on some rounds and not others, so
+  a clean arm costs nothing but re-running it.
+- **Instrumenting the branch paid for itself in the negative direction.** `41c2423` typed a bare
+  `None` into four reasons purely to find out which one the icons took. The answer was "none of
+  them", which retired the whole lead in one boot instead of a session of narrowing.
+- **A shape argument that crosses domains needs re-checking in the second domain.** "Content confined
+  to the top-left" was read off the *screen* and then matched against `quad` on a *texture*. They are
+  not the same coordinate space — the screen cell is the quad the shader draws, the texture is the
+  atlas it samples from — and the match was coincidence.
+
+So the icon class is back to: **draw rail, silent, victim moves between composites, no named
+mechanism.** What survives from this section is the compute exoneration above it, the moving victim,
+the persistence within a round, and the tooling (`content_summary`, `state_changed`,
+`sampled_content`, `gva_sample_rung`). What does not survive is every sentence about the sampled-bind
+rung transition.
+
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
 Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,
