@@ -2067,27 +2067,42 @@ step and neither depends on a cross-boot comparison: **the host panel is 120 Hz*
 (`modetest -c`: eDP-2 3840x2400 @ 120.00, preferred), and **`present_hz` reads exactly
 20.0 in 90 of 106 windows** — a lock, not contention, which would scatter.
 
-Do not read that as a regression, and do not chase it on one boot. AGENTS.md already
-records `present_hz` p50 **20.00** at `3af5832` against **78.20** at `08110da` on
-code differing only by instrumentation, and 20.00 is one of those two arms. What is
-*new* and drift-free is the within-boot ratio: the presenter now refuses 95 % of its
-own attempts while the device idles. Three things to check before touching the
-present mode, in cost order:
+**All three follow-ups below were answered, and the answer was not in this repo — see
+"The 20 Hz Present Cap Is The Host Panel Being Asleep, Not The Swapchain". The host
+panel's `dpms` was `Off`; waking it moves a `vkcube` FIFO present from 19.5 Hz to
+80.85 Hz at the same geometry on the same GPU. The `busy_acquire=409` reading is
+correct and the refusal is real; the cause is the compositor throttling a blanked
+output, so no present mode can move it. Read the numbered items below only for the
+two facts they settled, both of which still hold.**
 
-- **What `offered` counts.** `cadence_offered` increments only when `present()` is
-  handed `Some(cpu)` (`window_present.rs:779`), so on the resident rail it may be
-  counting something other than "frames the device produced". Confirm what a
-  `capture_sampling full=1 light=6143` boot passes as `cpu` before quoting
-  `offered/presents` as a drop ratio.
-- **Whether 20.0 is ours.** Grep the publish path for an interval or pacing constant
-  before blaming the compositor; a stable 20.0 on a 120 Hz panel is 1/6, and a
-  quantized lock is more consistent with a timer or a fixed image-return cadence than
-  with load.
+Do not read the 20 Hz as a regression, and do not chase it on one boot. AGENTS.md already
+records `present_hz` p50 **20.00** at `3af5832` against **78.20** at `08110da` on
+code differing only by instrumentation, and 20.00 is one of those two arms — **those two
+arms are asleep and awake.** What is *new* and drift-free is the within-boot ratio: the
+presenter refuses 95 % of its own attempts while the device idles.
+
+- **What `offered` counts — settled, and it is a real drop ratio.** `cadence_offered`
+  increments only when `present()` is handed `Some(cpu)` *and* the frame's `seq` differs
+  from the last offered one (`window_present.rs:779`). `draw_engine_window` builds that
+  `cpu` from the `FrameSlot` entry unconditionally, so it is present on the resident rail
+  even when the byte capture is elided — `capture_sampling full=1 light=…` does not
+  suppress it. So `offered` is the count of **distinct device publishes that reached the
+  window**, and `offered_hz=99` against `present_hz=20` is 80 % of produced frames not
+  reaching the screen.
+- **Whether 20.0 is ours — settled, it is not.** Nothing in the publish path paces at
+  20 Hz. `ENGINE_WINDOW_REDRAW_POLL` is 2 ms and `about_to_wait` re-requests a redraw on
+  that grid, which is the ~438 `present()` calls a second; the seq gate holds
+  `engine_redraw_required` set across a `Busy` return, which is why every failed acquire
+  is retried rather than dropping the frame. The 20 Hz is the compositor's release rate
+  for a blanked output, reproduced by `vkcube`.
 - **`PresentModeKHR::FIFO` with `min_image_count + 1`** (`window_present.rs:661`,
   `:709`). MAILBOX would decouple the acquire from the display, and is a capability
   question (`get_physical_device_surface_present_modes`), not a vendor one — but
   changing it changes pacing, so it needs the within-boot `offered/presents` ratio to
-  score it, not Hz.
+  score it, not Hz. **Awake, FIFO on this host tops out near 80 Hz against a device
+  offering 99, so this is worth doing on latency and on the wasted acquires — but it is
+  worth far less than the 5x the asleep reading implied. Score it with the panel held
+  awake or not at all.**
 
 **Goals 1-3 re-verified green by slug on the fix boot**, 1775 sliced lines:
 `linear_load_span_exceeds_alloc`, `deferred_flush_lost`, `type11_seed_cache_absent`,
@@ -2494,6 +2509,73 @@ So gate the comparison on the repaint: `.agents/repros/darkmode-corners.sh` requ
 differing by more than 64 before it will score anything, and aborts otherwise. Same rule as "validate
 the specific thing you drove", applied to a state change rather than a workload — and note the
 failure mode was a *dialog*, which in a downscaled thumbnail looks exactly like a healthy screen.
+
+### The 20 Hz Present Cap Is The Host Panel Being Asleep, Not The Swapchain
+
+**This is a property of the x86 rig, not of the product, and it retires the entry above it. Do not
+work on present modes on the strength of a `present_hz` reading taken with the screen off.** One
+`kscreen-doctor --dpms on` moves the number 4x.
+
+The section above ("The Composite Round Trip Is Gone, And The Presenter Is Now The Cap") measured
+`presents` p50 **20**, `busy_acquire` p50 **409**, `busy_fence` **0** — 95 % of `present()` calls
+failing the non-blocking `acquire_next_image(swapchain, 0, …)` while the device idled at
+`duty=0.135` — and named the swapchain acquire as the next target, with `PresentModeKHR::FIFO` and
+`min_image_count + 1` as the suspects. It also recorded, and could not explain, `present_hz` reading
+p50 **20.00** at `3af5832` against **78.20** at `08110da` on code differing only by instrumentation.
+
+Both are one variable, and it is outside the repo. **`/sys/class/drm/card0-eDP-2/dpms` was `Off`.**
+A compositor with a blanked output stops pacing its clients at the refresh rate and releases
+swapchain images at a slow fixed cadence instead. Measured with `vkcube` — which shares nothing with
+this project but the compositor — 200 frames per run, `VK_PRESENT_MODE_FIFO_KHR`, KWin Wayland:
+
+| panel | GPU | 320x240 | 1920x1080 | 3840x2400 |
+|---|---|---|---|---|
+| asleep | RTX 5080 (dGPU) | 19.42 | 19.50 | 19.36 |
+| asleep | Intel (iGPU) | — | 19.42 | — |
+| **awake** | RTX 5080 (dGPU) | **98.82** | **80.85** | — |
+| **awake** | Intel (iGPU) | — | **109.63** | — |
+
+Four readings that each kill something:
+
+- **Flat across a 300x range of pixel count** (320x240 to 3840x2400, 19.36-19.50) — so it is a
+  frame-callback throttle and not a composite cost, a bandwidth limit or a swapchain-image count.
+- **Identical on both GPUs while asleep** — so it is not the cross-GPU present. (The panel is on
+  `card0`/i915 and the engine renders on the NVIDIA `card1`, whose connectors are all disconnected,
+  so every present *is* a PRIME crossing. Awake, that crossing costs about 25 %: 80.85 against the
+  iGPU's 109.63 at the same size. Real, separate, and still a rig property — we correctly pick the
+  fastest render device.)
+- **Awake is 4x higher, from one command** — `kscreen-doctor --dpms on`, nothing else changed, same
+  binary, same session, one minute apart.
+- **78.20 is the awake dGPU figure and 20.00 is the asleep one.** The >=3.9x boot-to-boot
+  `present_hz` spread this file recorded as unexplained noise on identical code was the screen
+  blanking during one boot and not the other. That is not noise; it is a controlled variable, and
+  controlling it is one line.
+
+VRR is not involved (`Vrr: Never`), the mode is 3840x2400@120 throughout, and the session was
+neither locked nor idle-hinted (`IdleHint=no`, `LockedHint=no`) — only the *output* was off. So none
+of the obvious session-state checks would have caught it; the sysfs `dpms` attribute is the one that
+answers.
+
+**What this costs if unguarded is a whole session.** `busy_acquire=409` is a true reading of a real
+refusal, `busy_fence=0` correctly exonerates the engine queue, and the conclusion drawn from them —
+"the presenter is the cap" — is *also* true. It is just not the presenter's fault, and the three
+fixes it invites (MAILBOX, more images, a blocking acquire) would each have been scored against a
+throttle that no present mode can move. This is "instrument the branch, not the arm" one level out
+from the process: the branch was outside our address space.
+
+So `.agents/repros/lib.sh` now carries `host_panel_hold` / `host_panel_report`, and
+`testufo-fps.sh` calls them. It wakes the panel, re-asserts every 20 s because the idle timer keeps
+running, **samples `dpms` every 5 s for the whole run**, and prints `PANEL: On n/n` — or declares the
+run's host Hz numbers `UNSCOREABLE` if any sample came back `Off`. The sampling is the part that
+matters: a one-shot check at the start cannot see the panel blanking in the middle of a 45 s settle,
+which is exactly how long the idle timer takes to matter.
+
+**Do not read this as "the frame rate is fine".** What it establishes is that no host `present_hz`
+number recorded in this file before 2026-07-30 has a known panel state behind it, so none of them
+bound anything, in either direction. `offered_hz=99` from the `04dc2f4` boot is unaffected — it
+counts distinct device publish seqs handed to `present()` and never touches the swapchain — and 99
+frames/s of device production against a 60 fps goal is the reading to carry forward. Re-measure the
+host side with `PANEL: On n/n` in the output before quoting any of it.
 
 ### The ~950 ms Idle Stall Is The Host GPU Suspending, Not This Device
 
