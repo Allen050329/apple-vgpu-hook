@@ -164,7 +164,11 @@ struct WindowLink {
     /// Dedup latch for the `frame_bgra_short` drop log: the `(w,h)` last logged
     /// as short, so a persistent mismatch logs once per geometry instead of
     /// every present. Cleared when a well-formed frame publishes.
-    #[cfg(not(target_os = "macos"))]
+    ///
+    /// Both platforms: the CPU-fallback publish arm is shared since the two
+    /// publish paths were unified, and a present with no resident behind it
+    /// (firmware framebuffer, a cleared-but-never-rendered mapping, the frames
+    /// after a device reset) is normal on macOS too.
     bgra_short_geom: Option<(u32, u32)>,
     /// Set to ask the window thread to exit (VM teardown); the thread polls it.
     stop: host_window::present::StopFlag,
@@ -495,7 +499,6 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         frames,
         last: (u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
-        #[cfg(not(target_os = "macos"))]
         bgra_short_geom: None,
         stop,
         thread,
