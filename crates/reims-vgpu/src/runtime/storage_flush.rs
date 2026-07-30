@@ -538,17 +538,27 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     };
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
-    if guest_write && !state.gva_write_allowed(entry.task_id, gva, entry.span()) {
-        guest = "skip_uncovered";
-    } else if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
+    if guest_write {
+        // Reported, not skipped. This used to be `skip_uncovered`, which dropped
+        // the whole deferred window — a full compositing layer — whenever the
+        // guest had not yet notified the allocation, and it fired on live boots
+        // for 240x135 and 320x512 surfaces. `MapMemory2` arrives after the guest
+        // has installed the PTEs and used the memory; see `WriteGate`.
+        crate::runtime::gva_mem::report_undeclared_write(
+            state,
+            host,
+            entry.task_id,
+            gva,
+            entry.span(),
+            "gva_deferred_flush",
+        );
+    }
+    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
         // The window's pages moved under us. Cache-only: see
         // `window_pages_still_ours` for why writing here lands in another
-        // owner's memory.
-        //
-        // Ordered after the map gate deliberately. The gate is a scan of this
-        // task's recorded spans; the drift check walks every page of the window
-        // (73 of them for a 196x381 target), so running it for a write the cheap
-        // check has already rejected pays a page walk per flush for nothing.
+        // owner's memory. This is the check that actually protects the write —
+        // it walks every page of the window against the pages it was armed on,
+        // which no scan of a notification log can substitute for.
         guest = "skip_drift";
     } else if guest_write {
         guest = match crate::runtime::metal_draw::write_gva_rgba8(
@@ -688,7 +698,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
         &bytes,
     );
     let tight = (key.width as usize).saturating_mul(texel as usize);
-    let mut guest = "skip_uncovered";
+
     // Same hazard, same answer as the GVA rail: this window was armed against a
     // page set at defer time and `write_linear_guest` walks fresh, so a span the
     // guest has since re-pointed sends a compute-storage image into whatever
@@ -716,10 +726,24 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
         ),
         None => true,
     };
-    if !still_ours {
-        guest = "skip_drift";
-    } else if state.gva_write_allowed(task_id, key.surface_offset, key.span_end) {
-        guest = if crate::runtime::compute_exec::write_linear_guest(
+    // Both arms assign, so this is the whole set of outcomes this rail can
+    // report — `skip_uncovered` was the third and is gone.
+    let guest = if !still_ours {
+        "skip_drift"
+    } else {
+        // `skip_uncovered` used to live on this branch and discarded the whole
+        // linear writeback — up to 1.3 MiB of texture — when the guest had not
+        // yet notified the allocation. Reported and written now; see
+        // `report_undeclared_write`.
+        crate::runtime::gva_mem::report_undeclared_write(
+            state,
+            host,
+            task_id,
+            key.surface_offset,
+            key.span_end,
+            "linear_deferred_flush",
+        );
+        match crate::runtime::compute_exec::write_linear_guest(
             state,
             host,
             task_id,
@@ -730,13 +754,16 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             &bytes,
             &format!("flush ref={texture_ref}"),
         ) {
-            "written"
-        } else {
-            // The per-row failure is already fail-logged; the cache entry
-            // keeps the coherent authoritative bytes.
-            "write_fail"
-        };
-    }
+            crate::runtime::compute_exec::LinearWrite::Written => "written",
+            // Nothing resolves at this GVA, so there is no guest memory to land
+            // in. Distinct from `write_fail`, which means a write was attempted:
+            // one is the guest having taken the pages away, the other is ours.
+            crate::runtime::compute_exec::LinearWrite::Unmapped => "skip_unmapped",
+            // The per-row failure is already fail-logged; the cache entry keeps
+            // the coherent authoritative bytes.
+            crate::runtime::compute_exec::LinearWrite::Failed => "write_fail",
+        }
+    };
     crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::off(format!(
         "linear_deferred_flush task={task_id} ref={texture_ref} {}x{} fmt={:#x} gen={generation} guest={guest} bytes={} us={}",

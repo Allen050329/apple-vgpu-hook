@@ -364,27 +364,41 @@ pub struct TaskEntry {
     pub object_list_count: u32,
 }
 
-/// Why the GVA write gate let a write through — or that it did not.
+/// How the range a host→guest write targets stands against the `MapMemory2`
+/// spans the writing task has notified **so far**.
 ///
-/// The gate is the **only** bounds check on host→guest writes, and it has three
-/// separate ways to say yes that a `bool` cannot tell apart. That matters
-/// because `gva_mem.rs` logs `reason=mem_outside_map` on the refusal while
-/// nothing at all reads the allows, so "the gate passed" has never
-/// distinguished *checked and covered* from *nothing to check against*.
+/// This is a reading of a notification log, and deliberately not an
+/// authorization. `MapMemory2` mutates nothing on our side — the guest has
+/// already installed the PTEs by the time the packet reaches us, which is what
+/// `drain`'s "Map notify: PTEs already live" comment records — and the FIFO
+/// carrying it is ordered against nothing that *uses* the memory. Measured on
+/// one x86/Vulkan boot: the guest allocates a 192 KiB texture backing at
+/// `0x1ada000`, uploads it with three `OP_COPY_BUFFER_TO_TEXTURE` commands, and
+/// notifies `0x1ada000 +0x30000` — the exact base, the exact length — **29 ms
+/// later**. Two of the five cases that boot notified within the same
+/// millisecond as the write.
 ///
-/// `AGENTS.md` names this shape directly: a reason the caller writes is not a
-/// reading, and the collapse regrows wherever a `-> bool` crosses a module
-/// boundary. This carries the answer out of the check that made it.
+/// So `Undeclared` is a statement about a race, not about bounds, and treating
+/// it as a refusal dropped whole textures. What a task may write is what its
+/// page table maps, which every writer here re-walks at write time and fails
+/// closed on (`gva_view::write_span`, `map_fresh_span`) — the same guarantee
+/// the hardware gives, and the only one the wire defines.
+///
+/// Returned rather than collapsed to a `bool` so the always-on line names the
+/// arm that decided instead of the caller's assumption about it: a reason the
+/// caller writes is not a reading, and that collapse regrows wherever a
+/// `-> bool` crosses a module boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteGate {
     /// A span recorded for this exact task covers the whole range.
     Exact,
-    /// This task has no recorded spans at all, so the gate allowed by default.
-    /// `delete_task` calls `clear_task_map_spans`, so a write arriving after a
-    /// teardown lands here.
+    /// This task has notified nothing at all. `delete_task` calls
+    /// `clear_task_map_spans`, so a write arriving after a teardown lands here.
     NoSpans,
-    /// Spans exist for this task and none covers the range.
-    Outside,
+    /// Spans exist for this task and none covers the range — the notification
+    /// for this allocation has not arrived yet, or never will. Reported, not
+    /// refused; see the type doc.
+    Undeclared,
 }
 
 impl crate::observe::Decline for WriteGate {
@@ -392,29 +406,35 @@ impl crate::observe::Decline for WriteGate {
         match self {
             Self::Exact => "write_gate_exact",
             Self::NoSpans => "write_gate_no_spans",
-            Self::Outside => "write_gate_outside",
+            Self::Undeclared => "write_gate_undeclared",
         }
     }
 }
 
-/// A range [`DeviceState::gva_write_gate`] refused, held until a later
-/// MapMemory2 covers it or the ring evicts it.
+/// A range written while [`DeviceState::gva_write_gate`] said `Undeclared`,
+/// held until a later MapMemory2 covers it or the ring evicts it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RefusedWrite {
+pub struct UndeclaredWrite {
     pub task_id: u32,
     pub gva: u64,
     pub len: u64,
-    /// `observe::elapsed_ms` at the refusal, so the report can carry how long
-    /// the declaration took to arrive rather than only that it did.
+    /// `observe::elapsed_ms` at the write, so the report can carry how long the
+    /// notification took to arrive rather than only that it did.
     pub at_ms: u64,
+    /// Which rail wrote it, for the eviction alarm — the write itself is
+    /// reported at the site, but the alarm fires far away and has to say where
+    /// its subject came from.
+    pub via: &'static str,
 }
 
-/// How many refused ranges [`DeviceState::refused_writes`] keeps.
+/// How many outstanding undeclared ranges [`DeviceState::undeclared_writes`]
+/// keeps.
 ///
-/// Not a protocol value. Sized so the four refusals a live boot produces all
-/// stay resident for the whole run: nothing evicts, so a missing report means
-/// no span ever covered the range rather than that the ring wrapped.
-pub const REFUSED_WRITE_RING: usize = 32;
+/// Not a protocol value. On the boot this was measured on, every entry retired
+/// within 29 ms and at most a handful were ever outstanding, so a ring this
+/// size never evicts in healthy operation — which is what makes an eviction
+/// worth an alarm rather than a shrug.
+pub const UNDECLARED_WRITE_RING: usize = 32;
 
 /// Where a refused write sits relative to the spans its own task declared.
 ///
@@ -1407,20 +1427,17 @@ pub struct DeviceState {
     /// Live MapMemory2 spans per task (wire notify ranges). Cleared on Unmap /
     /// delete_task / redefine. Product GVA writes check coverage when non-empty.
     pub task_map_spans: Vec<TaskMapSpan>,
-    /// Ranges the write gate refused, kept so a later MapMemory2 covering one
-    /// can say so.
+    /// Ranges written while undeclared, kept so a later MapMemory2 covering one
+    /// can confirm it.
     ///
-    /// The refusal itself cannot distinguish "the guest never declares this
-    /// memory" from "the guest declares it, and the write raced ahead of the
-    /// declaration". Those call for opposite fixes and an event count at the
-    /// refusal cannot separate them, because the evidence for the second arrives
-    /// *after* the event — the same shape as "an event count is not a state",
-    /// with the state living in the future rather than the past.
-    ///
-    /// Bounded FIFO: a boot produces four of these, and a run that produced
-    /// thousands would be reporting a different defect than the one this is
-    /// built to read.
-    pub refused_writes: Vec<RefusedWrite>,
+    /// The write site cannot distinguish "the guest never declares this memory"
+    /// from "the guest declares it, and the write raced ahead of the
+    /// notification". An event count there cannot separate them either, because
+    /// the evidence for the second arrives *after* the event — the same shape as
+    /// "an event count is not a state", with the state living in the future
+    /// rather than the past. `write_gate_late_map` is the confirming half;
+    /// `write_gate_never_declared`, emitted on eviction, is the alarming one.
+    pub undeclared_writes: Vec<UndeclaredWrite>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// Membership only — deliberately carries no descriptor payload. Every
@@ -1684,7 +1701,7 @@ impl DeviceState {
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
             task_map_spans: Vec::new(),
-            refused_writes: Vec::new(),
+            undeclared_writes: Vec::new(),
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
@@ -2212,22 +2229,17 @@ impl DeviceState {
             gva,
             length,
         });
-        self.report_late_map_for_refused(task_id, gva, length);
+        self.confirm_undeclared_writes(task_id, gva, length);
     }
 
-    /// Say so when a MapMemory2 covers a range the write gate already refused.
+    /// Say so when a MapMemory2 covers a range already written while undeclared.
     ///
-    /// A refusal and a later declaration of the same range is one finding — the
-    /// guest *does* declare this memory and the write ran ahead of the
-    /// declaration — and it is invisible at the refusal, which is the only place
-    /// anything currently reports. Emitting from the map side is what makes the
-    /// two halves one reading.
-    ///
-    /// A range that never gets covered is reported by **absence**, which is only
-    /// legible because the ring does not evict at the observed rate; see
-    /// [`REFUSED_WRITE_RING`].
-    fn report_late_map_for_refused(&mut self, task_id: u32, gva: u64, length: u64) {
-        if self.refused_writes.is_empty() {
+    /// This is the confirming half of the permit. The write site cannot see a
+    /// notification that has not arrived, so "the guest does declare this and we
+    /// were merely early" is only sayable from the map side, and it is the
+    /// evidence that permitting was right rather than a hope.
+    fn confirm_undeclared_writes(&mut self, task_id: u32, gva: u64, length: u64) {
+        if self.undeclared_writes.is_empty() {
             return;
         }
         let span = TaskMapSpan {
@@ -2236,8 +2248,8 @@ impl DeviceState {
             length,
         };
         let now = crate::observe::elapsed_ms() as u64;
-        let mut landed: Vec<RefusedWrite> = Vec::new();
-        self.refused_writes.retain(|r| {
+        let mut landed: Vec<UndeclaredWrite> = Vec::new();
+        self.undeclared_writes.retain(|r| {
             if r.task_id != task_id || !span.covers(r.gva, r.len) {
                 return true;
             }
@@ -2247,35 +2259,87 @@ impl DeviceState {
         for r in landed {
             let late_ms = now.saturating_sub(r.at_ms);
             crate::observe::off(format!(
-                "write_gate_late_map task={} gva={:#x} len={:#x} \
+                "write_gate_late_map task={} gva={:#x} len={:#x} via={} \
                  span_gva={gva:#x} span_len={length:#x} late_ms={late_ms}",
-                r.task_id, r.gva, r.len
+                r.task_id, r.gva, r.len, r.via
             ));
         }
     }
 
-    /// Remember a range the gate refused, for [`Self::report_late_map_for_refused`].
+    /// Hold a range written while undeclared, for
+    /// [`Self::confirm_undeclared_writes`]. Returns whether it was newly
+    /// recorded.
     ///
-    /// Deduplicated on the exact range so a per-row caller re-refusing the same
-    /// bytes cannot fill the ring and evict an older, different finding.
-    pub fn note_refused_write(&mut self, task_id: u32, gva: u64, len: u64) {
-        if len == 0
-            || self
-                .refused_writes
-                .iter()
-                .any(|r| r.task_id == task_id && r.gva == gva && r.len == len)
-        {
-            return;
+    /// The write proceeds — see [`WriteGate`] for why a notification cannot
+    /// authorise anything — but a host→guest write outside everything the guest
+    /// has told us about is the shape the open memory-corruption signature would
+    /// take, so it goes on the record with the rail that issued it. Callers emit
+    /// their own line and use the return value to do so **once per distinct
+    /// range**: a per-row writer touching the same bytes every frame would
+    /// otherwise flood the log and evict older, different findings out of the
+    /// ring, and the readouts worth printing alongside cost a page walk.
+    pub fn note_undeclared_write(
+        &mut self,
+        task_id: u32,
+        gva: u64,
+        len: u64,
+        via: &'static str,
+    ) -> bool {
+        if len == 0 {
+            return false;
         }
-        if self.refused_writes.len() >= REFUSED_WRITE_RING {
-            self.refused_writes.remove(0);
+        let end = gva.saturating_add(len);
+        // Coalesce rather than dedup on the exact range. Several rails write one
+        // region a row at a time — `copy_region` walks `dst_row_stride`, the
+        // linear fallback walks `row_stride` — so an exact-match dedup would
+        // record 135 entries for one 135-row texture, flood the log and evict
+        // every older finding. Overlapping or touching ranges are one region and
+        // one finding; merging them also makes the confirming MapMemory2 prove
+        // coverage of the whole region rather than of its first row.
+        for r in &mut self.undeclared_writes {
+            if r.task_id != task_id || r.via != via {
+                continue;
+            }
+            let r_end = r.gva.saturating_add(r.len);
+            if gva > r_end || end < r.gva {
+                continue;
+            }
+            let lo = r.gva.min(gva);
+            r.len = r_end.max(end).saturating_sub(lo);
+            r.gva = lo;
+            return false;
         }
-        self.refused_writes.push(RefusedWrite {
+        // Evicting an entry means no MapMemory2 ever covered it. That is the
+        // reading this whole pair exists to make legible, and it is the one that
+        // cannot be taken at the write site: it is knowable only by outliving
+        // the notification that should have arrived. Healthy operation retires
+        // every entry in tens of milliseconds and never gets here.
+        //
+        // Latched per (task, rail): a run that is genuinely writing memory the
+        // guest never declares would otherwise emit this at the rate it writes,
+        // and the second line adds nothing the first did not say.
+        if self.undeclared_writes.len() >= UNDECLARED_WRITE_RING {
+            let old = self.undeclared_writes.remove(0);
+            if crate::observe::first_sight(
+                "write_gate_never_declared",
+                (u64::from(old.task_id) << 32) ^ old.via.len() as u64 ^ old.via.as_ptr() as u64,
+            ) {
+                let age_ms = (crate::observe::elapsed_ms() as u64).saturating_sub(old.at_ms);
+                crate::observe::fail(format!(
+                    "write_gate_never_declared task={} gva={:#x} len={:#x} via={} age_ms={age_ms} \
+                     outstanding={UNDECLARED_WRITE_RING}",
+                    old.task_id, old.gva, old.len, old.via
+                ));
+            }
+        }
+        self.undeclared_writes.push(UndeclaredWrite {
             task_id,
             gva,
             len,
             at_ms: crate::observe::elapsed_ms() as u64,
+            via,
         });
+        true
     }
 
     /// Drop MapMemory2 spans overlapping Unmap `[gva, gva+length)`.
@@ -2298,12 +2362,15 @@ impl DeviceState {
         self.task_map_spans.retain(|s| s.task_id != task_id);
     }
 
-    /// Product GVA write gate: if this task has any recorded MapMemory2 spans,
-    /// `[gva, gva+len)` must be fully covered by one span. Empty registry ⇒ allow
-    /// (unit fixtures and pre-Map paths).
+    /// Classify `[gva, gva+len)` against the MapMemory2 spans this task has
+    /// notified so far. **A reading, not a permission** — see [`WriteGate`].
     ///
-    /// Returns [`WriteGate`] rather than `bool` so the always-on line can name
-    /// the arm that decided instead of the caller's assumption about it.
+    /// Callers report `Undeclared` through
+    /// [`Self::note_undeclared_write`] and proceed. The check that actually
+    /// bounds a host→guest write is the page-table walk every writer performs
+    /// at write time, which fails closed on an unmapped page; this one says
+    /// whether the guest has got round to telling us about the allocation yet,
+    /// and the answer is routinely "not yet".
     pub fn gva_write_gate(&self, task_id: u32, gva: u64, len: u64) -> WriteGate {
         if len == 0 {
             return WriteGate::Exact;
@@ -2329,7 +2396,7 @@ impl DeviceState {
             }
         }
         if saw_any {
-            WriteGate::Outside
+            WriteGate::Undeclared
         } else {
             WriteGate::NoSpans
         }
@@ -2389,11 +2456,6 @@ impl DeviceState {
             .iter()
             .filter(|s| s.task_id == task_id)
             .count()
-    }
-
-    /// Whether the gate permits the write. See [`Self::gva_write_gate`] for why.
-    pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
-        self.gva_write_gate(task_id, gva, len) != WriteGate::Outside
     }
 
     /// Where a refused range sits relative to the spans the writing task filed
@@ -3176,7 +3238,7 @@ mod fail_vocabulary_tests {
         state.note_task_map(1, 0x12000, 2 * page);
         assert_eq!(
             state.gva_write_gate(1, 0x11000, 2 * page),
-            WriteGate::Outside
+            WriteGate::Undeclared
         );
         let seam = state.task_span_readout(1, 0x11000, 2 * page, SH);
         assert_eq!(
@@ -3228,35 +3290,55 @@ mod fail_vocabulary_tests {
         const SH: u32 = crate::model::PAGE_SHIFT_X86;
         let page = 1u64 << SH;
         let mut state = DeviceState::new(DeviceId(1), SH);
-        state.note_refused_write(1, 0x20000, page);
+        state.note_undeclared_write(1, 0x20000, page, "test");
 
         // A map that does not cover it, and one for another task, both leave the
         // record standing — otherwise absence would stop meaning "never
         // declared".
         state.note_task_map(1, 0x30000, page);
         state.note_task_map(2, 0x20000, page);
-        assert_eq!(state.refused_writes.len(), 1);
+        assert_eq!(state.undeclared_writes.len(), 1);
 
         // Partial cover is not cover: the write needed all of it.
         state.note_task_map(1, 0x20000, page / 2);
-        assert_eq!(state.refused_writes.len(), 1);
+        assert_eq!(state.undeclared_writes.len(), 1);
 
         state.note_task_map(1, 0x1f000, 4 * page);
         assert!(
-            state.refused_writes.is_empty(),
+            state.undeclared_writes.is_empty(),
             "a covering span retires the record, which is what emits the report"
         );
 
         // A per-row caller re-refusing the same bytes must not evict older,
         // different findings out of the ring.
         let mut state = DeviceState::new(DeviceId(1), SH);
-        for _ in 0..(REFUSED_WRITE_RING * 4) {
-            state.note_refused_write(1, 0x20000, page);
+        for _ in 0..(UNDECLARED_WRITE_RING * 4) {
+            state.note_undeclared_write(1, 0x20000, page, "test");
         }
-        assert_eq!(state.refused_writes.len(), 1);
-        for i in 0..(REFUSED_WRITE_RING as u64 * 2) {
-            state.note_refused_write(1, 0x40000 + i * page, page);
+        assert_eq!(state.undeclared_writes.len(), 1);
+        // Adjacent ranges coalesce into one region rather than filling the ring
+        // — that is what keeps a row-at-a-time writer from evicting every other
+        // finding, and it is why the cap has to be exercised with gaps.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        for i in 0..(UNDECLARED_WRITE_RING as u64 * 2) {
+            state.note_undeclared_write(1, 0x40000 + i * page, page, "test");
         }
-        assert_eq!(state.refused_writes.len(), REFUSED_WRITE_RING);
+        assert_eq!(
+            state.undeclared_writes.len(),
+            1,
+            "one contiguous region, however many calls describe it"
+        );
+        assert_eq!(state.undeclared_writes[0].gva, 0x40000);
+        assert_eq!(
+            state.undeclared_writes[0].len,
+            page * UNDECLARED_WRITE_RING as u64 * 2
+        );
+
+        // Separated by a gap, they are distinct findings and the cap holds.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        for i in 0..(UNDECLARED_WRITE_RING as u64 * 2) {
+            state.note_undeclared_write(1, 0x100000 + i * 4 * page, page, "test");
+        }
+        assert_eq!(state.undeclared_writes.len(), UNDECLARED_WRITE_RING);
     }
 }

@@ -2555,18 +2555,23 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
 /// A render-target Store outside the writing task's MapMemory2 spans still
 /// reaches guest RAM, and that is deliberate.
 ///
-/// `write_task_gva_product` refuses `WriteGate::Outside`, and making
-/// `write_gva_rgba8` match looks like an obvious tidy-up. It was measured
-/// instead: on a driven x86/Vulkan boot the gate read `exact=1155 no_spans=0
-/// outside=893` over 2048 Stores, so refusing here drops 44% of them and blanks
-/// the screen. MapMemory2 does not describe render targets — see the module note
-/// on `write_gva_rgba8` for the span enumeration and for why the `owners=` field
+/// This rail was the first to be exempted, by measurement, and it was right: on
+/// a driven x86/Vulkan boot the gate read `exact=1155 no_spans=0 outside=893`
+/// over 2048 Stores, so refusing here drops 44% of them and blanks the screen.
+/// MapMemory2 does not describe render targets — see the module note on
+/// `write_gva_rgba8` for the span enumeration and for why the `owners=` field
 /// cannot be used as a weaker gate either.
 ///
-/// This test exists so that adding the gate fails loudly rather than silently
-/// costing half the frame. The fixture declares a span for the writing task that
-/// deliberately does *not* cover the target, which is exactly the arm that would
-/// refuse.
+/// Every other rail has since been exempted too, for the same reason arrived at
+/// from the other end: a notification the guest sends *after* installing the
+/// PTEs and using the memory cannot authorise anything. `WriteGate::Undeclared`
+/// is now a reported reading everywhere rather than a refusal anywhere, and
+/// `44%` is the number that says how normal it is.
+///
+/// This test exists so that adding the gate back fails loudly rather than
+/// silently costing half the frame. The fixture declares a span for the writing
+/// task that deliberately does *not* cover the target, which is exactly the arm
+/// that would refuse.
 #[test]
 fn an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram() {
     use crate::contract::endian::st32;
@@ -2600,7 +2605,7 @@ fn an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram() {
     state.note_task_map(1, 0x9_0000, 0x1000);
     assert_eq!(
         state.gva_write_gate(1, gva, 2 * 8),
-        crate::model::WriteGate::Outside,
+        crate::model::WriteGate::Undeclared,
         "fixture is not real: the gate must land on the arm under test"
     );
 

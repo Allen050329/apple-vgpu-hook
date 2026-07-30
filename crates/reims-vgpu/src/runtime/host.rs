@@ -51,9 +51,6 @@ pub enum MemError {
     /// Neither the wire task id nor its `>> 1` define-task form names an active
     /// task, so there is no address space to resolve against.
     NoSuchTask,
-    /// The write span falls outside the mapping the guest declared for this
-    /// task — refused rather than trusted, per the no-scanning rule.
-    OutsideMap,
     /// A page of the span resolves to a GPA that is not guest RAM, so no host
     /// mapping can cover it (mapper / wild-PFN class).
     NotRam,
@@ -119,7 +116,6 @@ impl crate::observe::Decline for MemError {
             Self::UnsupportedPageShift => "mem_unsupported_page_shift",
             Self::TaskRootRead => "mem_task_root_read",
             Self::NoSuchTask => "mem_no_such_task",
-            Self::OutsideMap => "mem_outside_map",
             Self::NotRam => "mem_not_ram",
             Self::MapPagesRefused => "mem_map_pages_refused",
             Self::RunOutOfRange => "mem_run_out_of_range",
@@ -1043,7 +1039,6 @@ mod tests {
             MemError::UnsupportedPageShift,
             MemError::TaskRootRead,
             MemError::NoSuchTask,
-            MemError::OutsideMap,
             MemError::NotRam,
             MemError::MapPagesRefused,
             MemError::RunOutOfRange,

@@ -2355,9 +2355,17 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     else {
         return false;
     };
-    if !state.gva_write_allowed(task_id, gva, span_len) {
-        return false;
-    }
+    // Reported, not refused: a MapMemory2 span is a notification the guest sends
+    // after installing the PTEs and using the memory, so it cannot authorise
+    // anything. The fresh walk below is the check that bounds this write.
+    crate::runtime::gva_mem::report_undeclared_write(
+        state,
+        host,
+        task_id,
+        gva,
+        span_len,
+        "write_linear_guest",
+    );
     // Fresh PT walk at write time — never a cached view (stale-view class).
     let Some(span_map) =
         crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span_len)
@@ -2441,7 +2449,10 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 *height,
                 &tex.bytes,
             );
-            let Some(span) = row_stride.checked_mul(*height as u64) else {
+            // Kept although the span is no longer needed here: the overflow is
+            // a real refusal with a name, and `write_linear_guest` would only
+            // return a bare `false` for it.
+            let Some(_span) = row_stride.checked_mul(*height as u64) else {
                 crate::observe::fail(format!(
                     "compute_writeback_tex fail reason=linear_span_overflow task={task_id} ref={texture_ref} bind={} gva={gva:#x} dims={}x{} row_stride={row_stride}",
                     tex.binding, width, height
@@ -2450,14 +2461,14 @@ fn writeback_texture<M: HostMemory + HostOps>(
                     "compute_wb_tex_linear_span_overflow",
                 ));
             };
-            if !state.gva_write_allowed(task_id, *gva, span) {
-                crate::observe::fail(format!(
-                    "compute_writeback_tex cache_only reason=linear_unmapped task={task_id} ref={texture_ref} bind={} gva={gva:#x} span={span:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={row_stride}",
-                    tex.binding, width, height, bpp
-                ));
-                return Ok(());
-            }
-            if write_linear_guest(
+            // This used to return early on `reason=linear_unmapped` whenever the
+            // range fell outside the task's notified spans, which on a live boot
+            // discarded six glyph-atlas writebacks a boot (79x52, 90x20, 8x8 …)
+            // whose pages were mapped the whole time — only the notification had
+            // not arrived. The graceful degradation it provided is real and is
+            // kept; what changed is that it is now keyed on the condition itself
+            // rather than on a proxy that also catches healthy writes.
+            match write_linear_guest(
                 state,
                 host,
                 task_id,
@@ -2468,9 +2479,21 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 &tex.bytes,
                 &format!("bind={}", tex.binding),
             ) {
-                Ok(())
-            } else {
-                Err(ComputeStatus::GuestIo("compute_wb_tex_linear_guest_write"))
+                LinearWrite::Written => Ok(()),
+                // Nothing resolves under this task, so there is nowhere to put
+                // the result. The host cache keeps the authoritative bytes and
+                // sampling still serves them, so failing the whole dispatch
+                // would cost more than it protects.
+                LinearWrite::Unmapped => {
+                    crate::observe::fail(format!(
+                        "compute_writeback_tex cache_only reason=linear_unmapped task={task_id} ref={texture_ref} bind={} gva={gva:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={row_stride}",
+                        tex.binding, width, height, bpp
+                    ));
+                    Ok(())
+                }
+                LinearWrite::Failed => {
+                    Err(ComputeStatus::GuestIo("compute_wb_tex_linear_guest_write"))
+                }
             }
         }
         TextureWriteback::Type11 {
@@ -2513,9 +2536,28 @@ fn writeback_texture<M: HostMemory + HostOps>(
     }
 }
 
+/// What a linear guest writeback did, for callers that must tell "there is
+/// nowhere to put this" apart from "putting it there went wrong".
+///
+/// A bare `bool` collapsed those, and the collapse was load-bearing: the only
+/// caller able to degrade gracefully was doing so off a *different* condition
+/// (the range being outside the task's notified spans) that also caught healthy
+/// writes. `-> bool` crossing a module boundary is exactly where that regrows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinearWrite {
+    /// Every row landed in guest memory.
+    Written,
+    /// The task's page tables resolve nothing at this GVA, so no write was
+    /// possible. Callers keep the host cache and carry on.
+    Unmapped,
+    /// A write was attempted and did not complete — bad layout, an arithmetic
+    /// overflow, or a per-row refusal. Already fail-logged with its own reason.
+    Failed,
+}
+
 /// Write tight-row `bytes` into a strided linear guest window through fresh
 /// task page-table walks (bulk view when packable, per-row fallback). Fail
-/// lines carry `ctx` for the call site. Returns `false` on any failed write.
+/// lines carry `ctx` for the call site.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2527,9 +2569,23 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
     height: u32,
     bytes: &[u8],
     ctx: &str,
-) -> bool {
+) -> LinearWrite {
     if write_linear_texture_bulk(state, host, task_id, gva, row_stride, tight, height, bytes) {
-        return true;
+        return LinearWrite::Written;
+    }
+    // The bulk path declines for several reasons and the per-row fallback below
+    // covers all but one of them. The exception is "nothing is mapped here",
+    // which no amount of retrying per row can fix, so it is answered once here
+    // rather than discovered `height` times.
+    if !crate::runtime::gva_mem::any_task_gva_page_resolves(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        1,
+        state.page_shift,
+    ) {
+        return LinearWrite::Unmapped;
     }
     let mut row = vec![0u8; row_stride as usize];
     for y in 0..height {
@@ -2540,13 +2596,13 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_row_offset_overflow {ctx} gva={gva:#x} y={y} row_stride={row_stride}"
             ));
-            return false;
+            return LinearWrite::Failed;
         };
         let Some(row_gva) = gva.checked_add(row_offset) else {
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_gva_overflow {ctx} gva={gva:#x} y={y} row_offset={row_offset:#x}"
             ));
-            return false;
+            return LinearWrite::Failed;
         };
         if let Err(e) = gva_mem::write_task_gva_product(
             state,
@@ -2558,10 +2614,10 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_gva_write task={task_id} {ctx} gva={row_gva:#x} y={y} row_stride={row_stride} height={height} err={e:?}"
             ));
-            return false;
+            return LinearWrite::Failed;
         }
     }
-    true
+    LinearWrite::Written
 }
 
 fn writeback_buffer<M: HostMemory + HostOps>(
@@ -3627,31 +3683,40 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 let key = candidate.key;
                 state.disarm_linear_deferred_window(&key);
                 let span = key.span_end;
-                let guest_flush = state.gva_write_allowed(task_id, *gva, span);
-                let mut indexed = 0usize;
-                if guest_flush {
-                    let mut pages = std::collections::HashSet::new();
-                    crate::runtime::gva_mem::visit_task_gva_page_gpas(
-                        host,
-                        &state.tasks,
-                        task_id,
-                        *gva,
-                        span,
-                        state.page_shift,
-                        1,
-                        &mut |gpa_page| {
-                            pages.insert(gpa_page);
-                            true
-                        },
-                    );
-                    indexed = pages.len();
-                    state.arm_linear_deferred_window(key, generation, pages);
-                }
+                // The window is armed whatever the notification log says. Gating
+                // it on span coverage meant a compute result the guest had not
+                // yet notified an allocation for never got a flush obligation at
+                // all, so its writeback simply never happened. `pages` is the
+                // reading that matters here and it comes from the page tables:
+                // an empty index is a window over memory nothing resolves.
+                crate::runtime::gva_mem::report_undeclared_write(
+                    state,
+                    host,
+                    task_id,
+                    *gva,
+                    span,
+                    "compute_writeback_deferred",
+                );
+                let mut pages = std::collections::HashSet::new();
+                crate::runtime::gva_mem::visit_task_gva_page_gpas(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    *gva,
+                    span,
+                    state.page_shift,
+                    1,
+                    &mut |gpa_page| {
+                        pages.insert(gpa_page);
+                        true
+                    },
+                );
+                let indexed = pages.len();
+                state.arm_linear_deferred_window(key, generation, pages);
                 crate::observe::off(format!(
-                    "compute_writeback_deferred kind=linear pipe={} bind={} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} fmt={pixel_format:#x} gen={generation} guest_flush={} pages={indexed}",
+                    "compute_writeback_deferred kind=linear pipe={} bind={} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} fmt={pixel_format:#x} gen={generation} pages={indexed}",
                     acc.pipeline_ref,
                     t.binding,
-                    guest_flush as u32
                 ));
                 continue;
             }
