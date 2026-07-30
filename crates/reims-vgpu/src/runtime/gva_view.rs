@@ -383,9 +383,21 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
         // freshly zeroed memory (the black-tile class). A mismatch retires
         // the view fail-visibly and rebuilds fresh below.
         state.view_verify_ctr = state.view_verify_ctr.wrapping_add(1);
-        if !state.view_verify_ctr.is_multiple_of(32) || view_gpas_current(host, state, &view) {
+        // The denominator. `gva_view_stale` reading zero says nothing on its
+        // own: it is equally the sound of a cache that never goes stale and of
+        // a check that never runs. `view_reuse` is every read served from a
+        // cached host pointer and `view_verify` is the subset that proved
+        // itself, so the two together say what fraction of reads are trusting
+        // a page table nobody re-walked.
+        crate::runtime::drain::note_store_route("view_reuse");
+        if !state.view_verify_ctr.is_multiple_of(32) {
             return Some((vptr, vlen));
         }
+        crate::runtime::drain::note_store_route("view_verify");
+        if view_gpas_current(host, state, &view) {
+            return Some((vptr, vlen));
+        }
+        crate::runtime::drain::note_store_route("view_stale");
         state.view_stale_reads = state.view_stale_reads.saturating_add(1);
         let n = state.view_stale_reads;
         if n == 1 || n.is_multiple_of(256) {
@@ -447,7 +459,6 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
         ptr,
         ptr_len,
         first_gpa: gpas.first().copied().unwrap_or(0),
-        last_gpa: gpas.last().copied().unwrap_or(0),
     });
     Some((ptr, ptr_len))
 }
@@ -471,20 +482,29 @@ fn view_gpas_current<H: HostMemory>(
     let page_shift = state.page_shift;
     let page = 1u64 << page_shift;
     let first_page = v.gva & !(page - 1);
-    match collect_span_gpas(host, task, first_page, 1, page_shift) {
-        Ok(g) if g.first() == Some(&v.first_gpa) => {}
-        _ => return false,
-    }
-    if v.last_gpa != 0 {
-        let last_page = v.gva.saturating_add(v.length).saturating_sub(1) & !(page - 1);
-        if last_page != first_page {
-            match collect_span_gpas(host, task, last_page, 1, page_shift) {
-                Ok(g) if g.first() == Some(&v.last_gpa) => {}
-                _ => return false,
-            }
-        }
-    }
-    true
+    let span = (v.gva - first_page).saturating_add(v.length);
+    let Ok(gpas) = collect_span_gpas(host, task, first_page, span, page_shift) else {
+        return false;
+    };
+    // Every page, not the first and the last.
+    //
+    // Checking the ends was checking the two pages a partial remap is least
+    // likely to move: the guest recycles allocations, and an allocation that
+    // keeps its head and tail while its middle goes elsewhere passes an
+    // ends-only check while the view aliases somebody else's memory for every
+    // read through the middle of it.
+    //
+    // It costs nothing extra to be exhaustive here. `ensure_gva_view` only ever
+    // registers a span whose GPAs form ONE contiguous run — a fragmented span
+    // is refused before `map_pages` — so "unchanged" is fully determined by the
+    // first GPA and the page count, with no per-view GPA list to store. And the
+    // ends-only form already paid for two page-table walks; this is one walk
+    // over the span with the level cache warm for all of it.
+    gpas.len() == v.ptr_len >> page_shift
+        && gpas
+            .iter()
+            .enumerate()
+            .all(|(i, &g)| g == v.first_gpa.wrapping_add((i as u64).wrapping_mul(page)))
 }
 
 /// Always-on line when views are retired (proxy for Unmap/Map teardown).
@@ -1018,6 +1038,83 @@ mod tests {
         );
     }
 
+    /// A cached view's reuse verify has to check every page it aliases, not the
+    /// two a partial remap is least likely to move.
+    ///
+    /// The guest recycles allocations. One that keeps its head and its tail
+    /// while its middle goes somewhere else passes an ends-only check forever,
+    /// and every read through the middle of that view returns another owner's
+    /// bytes -- freshly zeroed memory, if the guest has not filled them yet,
+    /// which is a blank tile on screen rather than a crash.
+    ///
+    /// The view here is three pages so it HAS a middle. Moving only the middle
+    /// page is the exact case the ends-only form could not see.
+    #[test]
+    fn a_view_reuse_verify_checks_every_page_it_aliases() {
+        let page_shift = PAGE_SHIFT_X86;
+        let page = 1u64 << page_shift;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << page_shift;
+        let root_gpa = 3u64 << page_shift;
+        host.map_range(dir_gpa, page as usize, 0);
+        host.map_range(root_gpa, page as usize, 0);
+        // Virtual page i maps to frame 4+i; the view is virtual pages 1..4, so
+        // frames 5,6,7. Frame 9 is the allocation the guest moves to. Virtual
+        // page 0 is left out of the view because gva 0 is not a view address.
+        for pfn in [4u64, 5, 6, 7, 9] {
+            host.map_range(pfn << page_shift, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        for i in 0..4u32 {
+            st32(&mut pte, 4 + i);
+            host.write_gpa(root_gpa + (i as u64) * 4, &pte).unwrap();
+        }
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let (ptr, ptr_len) = ensure_gva_view(&mut state, &mut host, 1, page, 3 * page)
+            .expect("three packed pages map as one view");
+        assert_eq!(ptr_len as u64, 3 * page);
+        let view = crate::model::GvaHostView {
+            task_id: 1,
+            gva: page,
+            length: 3 * page,
+            ptr,
+            ptr_len,
+            first_gpa: 5 << page_shift,
+        };
+        assert!(
+            view_gpas_current(&host, &state, &view),
+            "nothing has moved yet"
+        );
+
+        // The guest re-points the MIDDLE page only -- virtual page 2, frame 6.
+        // Head and tail are untouched, which is all an ends-only check looked
+        // at.
+        st32(&mut pte, 9);
+        host.write_gpa(root_gpa + 8, &pte).unwrap();
+        assert!(
+            !view_gpas_current(&host, &state, &view),
+            "the view now aliases frame 9 for its middle page and called itself current"
+        );
+
+        // A page dropping out of the walk is a change too: the view keeps
+        // aliasing three frames whatever the page table says.
+        st32(&mut pte, 6);
+        host.write_gpa(root_gpa + 8, &pte).unwrap();
+        assert!(view_gpas_current(&host, &state, &view), "restored");
+        st32(&mut pte, 0);
+        host.write_gpa(root_gpa + 12, &pte).unwrap();
+        assert!(
+            !view_gpas_current(&host, &state, &view),
+            "the last page no longer resolves and the view still spans it"
+        );
+    }
+
     #[test]
     fn ranges_overlap_basic() {
         assert!(ranges_overlap(0x1000, 0x1000, 0x1800, 0x1000));
@@ -1202,7 +1299,6 @@ mod tests {
             ptr: 0x4000,
             ptr_len: 0x1000,
             first_gpa: 0,
-            last_gpa: 0,
         });
 
         let before = log_mark();

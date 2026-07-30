@@ -980,11 +980,14 @@ pub struct GvaHostView {
     pub ptr: usize,
     /// Host view length in bytes (`gpas.len() * page_size`).
     pub ptr_len: usize,
-    /// Leaf GPA of the first/last page at build time — the sampled reuse
-    /// verify re-translates these and retires the view on mismatch (stale
-    /// cached-view read class). `0` = unverifiable (fixtures), skip.
+    /// Leaf GPA of the view's first page at build time.
+    ///
+    /// A registered view is always ONE contiguous run of guest frames —
+    /// `ensure_gva_view` refuses a fragmented span before mapping it — so this
+    /// plus `ptr_len` is the whole GPA list, and the reuse verify re-walks the
+    /// span and compares every page against it. `0` = unverifiable (fixtures),
+    /// skip.
     pub first_gpa: u64,
-    pub last_gpa: u64,
 }
 
 /// Which guest pages a GVA-keyed encode was stored against.

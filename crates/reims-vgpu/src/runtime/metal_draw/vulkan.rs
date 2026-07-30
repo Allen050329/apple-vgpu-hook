@@ -2987,6 +2987,25 @@ fn sync_store_allowed_pages<M: HostMemory>(
 /// `gvac_hit` is the denominator — every read this census sees — and the four
 /// verdict counters partition it. `site` names the read that asked, the sampled
 /// texture path or the Load seed, so a rate can be attributed to its rail.
+///
+/// **This refusal did not close the icon class, and what survives it is held.**
+/// x86/Vulkan, six Finder recomposites under load, each sampled fourteen times
+/// over 65 s with nothing driven in between: two rounds were wrong at the first
+/// sample and identically wrong at the last (5 of 7 icons, and 6 of 7), four
+/// rounds were clean at every sample, and **no round recovered**. So the
+/// remainder is another wrong-content state that holds, not a frame that
+/// arrives late — an important distinction, because a defect that heals itself
+/// would have to be chased in the present path and this one cannot be.
+///
+/// Two things the same run rules out as its cause. `gvac_moved` was *higher* on
+/// all four clean rounds (4, 4, 8) than on the corrupt one (2), so falling
+/// through this refusal is not what breaks an icon. And the corrupt rounds
+/// carried zero `deferred_window_page_drift` refusals and zero
+/// `linear_sample_miss` declines, so neither the guest-memory bounds nor a
+/// declining loader is starving them — whatever serves those icons believes it
+/// succeeded. The shape on screen is a fragment roughly a quarter of the icon's
+/// width at full height, which is a geometry defect rather than a stale-bytes
+/// one.
 #[must_use]
 fn note_gva_backing_verdict(
     verdict: crate::runtime::surface_cache::BackingVerdict,
