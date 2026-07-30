@@ -2877,6 +2877,38 @@ Two things were checked there and are **not** the answer, so they do not need re
   mirror. The comment above the skip gate in `compute_exec/mod.rs` calls it "exact-window
   invalidation" and is stale — the code is right and the comment is wrong.
 
+**It is persistent, and that is what makes it tractable.** Two captures 25 s apart of an untouched
+screen are pixel-identical in the icon row — the same red square, the same black bar, the same tiny
+fragment, the same three correct folders. So this is not a frame caught mid-composition, and the
+whole "we presented a partial composite" family is out. The wrong pixels are **computed once and
+then reused**: the guest asks us to composite an icon, we return the wrong image, the guest caches
+it, and it renders from that cache until something forces a recomposite. `killall Finder; open ~`
+on an idle device repairs every icon, which is the same statement from the other side.
+
+That narrows the subject to **one compute dispatch's output**, which is a far smaller thing than a
+present path or a swap chain. It also explains the intermittency without any timing argument: which
+icons are wrong is decided once, when they happen to be composited under load.
+
+Note what is *not* affected in the same window: the sidebar's small SF-Symbol glyphs (Recents,
+Applications, Desktop, Documents, Downloads) all render correctly in the same frame as the broken
+64x64 folder icons. Whatever this is, it does not touch every compute-composited image.
+
+**Two mechanisms were nominated and eliminated by reading, so they need no boot.** Both are the
+shape a load-dependent defect invites, which is why they are worth recording as dead:
+
+- *Staging buffers recycled under a dispatch still reading them.* `recycle_staging` does drain every
+  live slot back to the free pool with no fence check — but all four of its call sites are unit
+  tests or the pre-submit `force_loss` arm, where nothing has been submitted. The real path moves
+  `staging_live` into the submission entry (`std::mem::take`), which is retired on its fence. Pool
+  wrap-around under load is therefore not reachable here.
+- *A fresh resident matching a stale mirror at generation 0.* `ensure_resident_storage_image`
+  creates evicted-and-recreated residents at `generation: 0` with `layout: UNDEFINED`, and the seed
+  skip gate is `mirror == engine_generation` — so a mirror holding 0 would skip the seed into an
+  uninitialized image, which fits "solid colour" exactly. It cannot: every mirror insert goes
+  through `next_mapping_content_generation`, which skips 0 the way `mark_mapping_written` does, or
+  through `flush_one`, whose value came from an armed window. The newly-created arm also hardcodes
+  `generation_match: false`.
+
 One reading is **open and unmeasured**: `compute_linux storage_format_specialize` reports
 `spirv=R32Float specialized=Rgba16Float engine=Rgba16Float guest=Rgba16Float guest_bpp=8
 shader_bpp=4` nine times in the slice. The shader declares a 4-byte storage-image format for an
