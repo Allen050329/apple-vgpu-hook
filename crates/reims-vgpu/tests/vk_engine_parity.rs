@@ -2112,6 +2112,114 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     );
 }
 
+/// The type-11 composite Store's shape: `LoadFromTarget` on a resident that the
+/// *previous* pass read back, rather than one it left GPU-only.
+///
+/// Every other `LoadFromTarget` case in this suite sets `skip_readback = true`
+/// on the producing pass, so the image goes attachment-write → attachment-load
+/// with nothing in between. A composite Store keeps its readback — that copy is
+/// what feeds `surface_cache`, the deferred window's owned frame and the guest
+/// writeback — so the image is additionally read as a transfer source between
+/// the two passes, and the next pass's load barrier has to source its scope from
+/// the tracked `TRANSFER_SRC_OPTIMAL` rather than from a color write.
+///
+/// Scored against the CPU-seed chain it replaces, byte for byte: eliding the
+/// seed upload is only sound if the resident holds exactly what the upload
+/// would have carried. A dropped or mis-scoped barrier shows up here as the
+/// prior frame, a torn frame, or a black one — the class the elision gate
+/// exists to avoid.
+///
+/// Both passes are **scissored to 1x1**, and that is what makes the test mean
+/// anything. The default triangle covers the whole attachment, so with a
+/// full-viewport draw `LoadFromTarget`, `LoadSeed` and even `Clear` all produce
+/// identical pixels and the assertion holds no matter what the load action did.
+/// Verified: substituting `Clear` for `LoadFromTarget` in the unscissored form
+/// still passed. Scissored, 255 of the 256 pixels carry only loaded content, so
+/// the load action is the only thing under test.
+#[test]
+fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // A prior frame the draw cannot manufacture, so a lost load reads as black
+    // rather than as a coincidentally-correct fragment colour.
+    let prior = [17u8, 91, 203, 255].repeat((w * h) as usize);
+    let dot = |x: u32, y: u32| ScissorResource {
+        x,
+        y,
+        width: 1,
+        height: 1,
+    };
+
+    // Arm A — the round trip this rail removes: seed from host bytes, draw a
+    // corner, read back, re-upload those pixels as the next pass's seed.
+    let mut d1 = engine_req(&v, &f, w, h);
+    d1.load_op = Some(LoadOp::LoadSeed(prior.clone()));
+    d1.scissors.push(dot(0, 0));
+    let p1 = match engine::execute_draw_request(&d1) {
+        Ok(o) => o.pixels,
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP load_from_target_after_readback: {e}");
+            return;
+        }
+        Err(e) => panic!("readback chain d1: {e}"),
+    };
+    let mut d2_cpu = engine_req(&v, &f, w, h);
+    d2_cpu.load_op = Some(LoadOp::LoadSeed(p1.clone()));
+    d2_cpu.scissors.push(dot(8, 8));
+    let p2_cpu = engine::execute_draw_request(&d2_cpu)
+        .expect("cpu seed after readback")
+        .pixels;
+
+    // The two arms are only comparable if the seed actually survives the draw.
+    let untouched = ((h / 2) * w + 2) as usize * 4;
+    assert_eq!(
+        &p2_cpu[untouched..untouched + 4],
+        &prior[0..4],
+        "a scissored draw must leave the rest of the seed intact, or neither \
+         arm is testing the load action"
+    );
+
+    // Arm B — the elision: the same two passes, both still reading back, the
+    // second loading from the resident the first stored into.
+    engine::test_reset_engine();
+    let identity = TargetIdentity::Surface {
+        id: 311,
+        width: w,
+        height: h,
+        generation: 1,
+    };
+    let mut g1 = engine_req(&v, &f, w, h);
+    g1.target_identity = Some(identity.clone());
+    g1.load_op = Some(LoadOp::LoadSeed(prior));
+    g1.scissors.push(dot(0, 0));
+    g1.skip_readback = false;
+    let p1_resident = engine::execute_draw_request(&g1)
+        .expect("resident store with readback")
+        .pixels;
+    assert_eq!(
+        p1_resident, p1,
+        "the resident pass must read back the same pixels as the pooled one, \
+         or the two arms are not comparing the same content"
+    );
+
+    let mut g2 = engine_req(&v, &f, w, h);
+    g2.target_identity = Some(identity.clone());
+    g2.load_op = Some(LoadOp::LoadFromTarget);
+    g2.target_rgba8 = None;
+    g2.scissors.push(dot(8, 8));
+    g2.skip_readback = false;
+    let p2_gpu = engine::execute_draw_request(&g2)
+        .expect("load from a target that was read back")
+        .pixels;
+
+    assert_eq!(
+        p2_gpu, p2_cpu,
+        "a LOAD elided against a read-back resident must land the same frame \
+         the seed upload would have"
+    );
+}
+
 /// Resident GVA chain (type-2/3 rail): a 3-record chain keeps intermediate
 /// content on the engine target — exactly one readback (the final contract
 /// Store), zero CPU seed uploads, two post-submit wait skips — and the final
