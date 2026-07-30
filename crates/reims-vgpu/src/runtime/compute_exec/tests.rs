@@ -2057,3 +2057,72 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
     let payload = [0xABu8; 8];
     assert!(gva_mem::write_task_gva_product(&mut state, &mut host, 1, gva, &payload).is_ok());
 }
+
+/// A staged compute buffer records the pages it resolved to, and the writeback
+/// that runs after the dispatch is bounded to them.
+///
+/// `stage_buffer` reads the guest bytes before the dispatch; `writeback_buffer`
+/// runs at the far end of the dispatch and, in a nested session, after however
+/// many more jobs accumulated. That is the longest arm-to-write gap on this
+/// rail, and the guest can hand the range to something else across it.
+#[test]
+fn a_staged_buffer_carries_the_pages_its_writeback_is_bounded_to() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
+    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    for i in 0..8u32 {
+        let pfn = pt_base + i;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+    }
+    assert!(state.define_task(1, 0x1000, dir_pfn));
+
+    let page = 1u64 << PAGE_SHIFT_ARM64E;
+    let pages = staged_span_pages(&state, &host, 1, page, 0x100);
+    assert_eq!(pages.len(), 1, "a 256-byte span sits in one page");
+    assert!(pages.contains(&((pt_base as u64 + 1) << PAGE_SHIFT_ARM64E)));
+
+    // The guest re-points that virtual page while the dispatch is in flight.
+    let mut pte = [0u8; 4];
+    st32(&mut pte, pt_base + 6);
+    let _ = host.write_gpa(root_gpa + 4, &pte);
+    let bytes = vec![0xffu8; 0x100];
+    let err = crate::runtime::gva_mem::write_task_gva_product_within(
+        &mut state,
+        &mut host,
+        1,
+        page,
+        &bytes,
+        Some(&pages),
+    )
+    .expect_err("a page the dispatch never named must be refused");
+    assert!(
+        matches!(err, crate::runtime::host::MemError::WriteOutsideWindow),
+        "expected WriteOutsideWindow, got {err:?}"
+    );
+    // Unbounded, the same write lands in whatever owns that page now.
+    assert!(
+        crate::runtime::gva_mem::write_task_gva_product_within(
+            &mut state, &mut host, 1, page, &bytes, None,
+        )
+        .is_ok(),
+        "without the bound the write reaches the new owner"
+    );
+
+    // An unresolvable span records nothing rather than an empty authorisation,
+    // so the writeback stays unbounded and the writer fails closed itself.
+    assert!(staged_span_pages(&state, &host, 1, 0, 0x100).is_empty());
+    assert!(staged_span_pages(&state, &host, 1, page, 0).is_empty());
+}

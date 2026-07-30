@@ -737,6 +737,14 @@ pub(crate) struct StagedBuffer {
     pub bind: ComputeBufferBind,
     pub gva: u64,
     pub bytes: Vec<u8>,
+    /// Guest pages this buffer resolved to when it was staged — before the
+    /// dispatch, and before a nested session accumulated however many more
+    /// jobs before flushing. `writeback_buffer` runs at the far end of that
+    /// gap, so a walk taken there answers where the address points now rather
+    /// than whether it is still this buffer's memory. Empty when the
+    /// stage-time walk resolved nothing, which leaves the write unbounded as
+    /// it was; the writer's own walk then fails closed on its own terms.
+    pub pages: std::collections::HashSet<u64>,
 }
 
 pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
@@ -837,10 +845,12 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
         ));
         return Err(ComputeStatus::GuestIo("compute_stage_buf_gva_read"));
     }
+    let pages = staged_span_pages(state, host, task_id, gva, bytes.len() as u64);
     Ok(StagedBuffer {
         bind: bind.clone(),
         gva,
         bytes,
+        pages,
     })
 }
 
@@ -890,13 +900,24 @@ fn staged_window_pages<M: HostMemory>(
     row_stride: u64,
     height: u32,
 ) -> std::collections::HashSet<u64> {
+    let Some(span) = row_stride.checked_mul(height as u64) else {
+        return std::collections::HashSet::new();
+    };
+    staged_span_pages(state, host, task_id, gva, span)
+}
+
+/// [`staged_window_pages`] for a flat span — the buffer rail's shape.
+fn staged_span_pages<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+) -> std::collections::HashSet<u64> {
     let mut pages = std::collections::HashSet::new();
-    if gva == 0 {
+    if gva == 0 || span == 0 {
         return pages;
     }
-    let Some(span) = row_stride.checked_mul(height as u64) else {
-        return pages;
-    };
     gva_mem::visit_task_gva_page_gpas(
         host,
         &state.tasks,
@@ -2722,8 +2743,14 @@ fn writeback_buffer<M: HostMemory + HostOps>(
     context: &str,
     staged: &StagedBuffer,
 ) -> Result<(), ComputeStatus> {
-    if let Err(e) = gva_mem::write_task_gva_product(state, host, task_id, staged.gva, &staged.bytes)
-    {
+    if let Err(e) = gva_mem::write_task_gva_product_within(
+        state,
+        host,
+        task_id,
+        staged.gva,
+        &staged.bytes,
+        (!staged.pages.is_empty()).then_some(&staged.pages),
+    ) {
         crate::observe::fail(format!(
             "compute_writeback_buf fail reason=task_gva_write task={task_id} pipe={} context={context} idx={} ref={} gva={:#x} len={} off={:#x} err={e:?}",
             pipe_ref
