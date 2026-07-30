@@ -924,7 +924,8 @@ fn flush_render_one<M: HostMemory + HostOps>(
             if live != Some(*epoch) {
                 crate::backend::vulkan::engine::unpin_resident_target(&identity);
                 crate::observe::fail(format!(
-                    "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={}                      reason=resident_epoch_drift want={epoch} live={live:?}",
+                    "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
+                     reason=resident_epoch_drift want={epoch} live={live:?}",
                     key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
                 ));
                 return false;
@@ -942,7 +943,8 @@ fn flush_render_one<M: HostMemory + HostOps>(
                 Err(e) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
                     crate::observe::fail(format!(
-                        "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={}                          reason=resident_read err={e}",
+                        "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
+                         reason=resident_read err={e}",
                         key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
                     ));
                     return false;
@@ -1205,7 +1207,10 @@ mod tests {
     fn render_owner(armed_seq: u64) -> crate::model::DeferredOwner {
         crate::model::DeferredOwner::Render {
             armed_seq,
-            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![0u8; 4 * 4 * 4])),
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                0u8;
+                4 * 4 * 4
+            ])),
         }
     }
 
@@ -1377,6 +1382,106 @@ mod tests {
             state.compute_deferred_flush.is_empty(),
             "the trigger must consume the window it took"
         );
+    }
+
+    /// A `Resident` window whose resident no longer vouches for the frame
+    /// declines, and leaves the guest's pages exactly as it found them.
+    ///
+    /// This is the whole safety argument for the `skip_readback` rail. An `Owned`
+    /// window carries its pixels and cannot be wrong about them; a `Resident`
+    /// window carries only a *claim* that a GPU image still holds them, and the
+    /// epoch is what tests the claim. `registry_mark_ready` clears a slot's
+    /// `content_epoch` on every draw into it, so a mismatch means another layer
+    /// rendered over this surface after the Store that armed the window — and
+    /// writing then lands that other layer's pixels in these pages, which is the
+    /// black/torn-layer class rather than a merely stale frame.
+    ///
+    /// No engine is initialized here, so `resident_content_epoch` answers `None`
+    /// for the reconstructed identity, which is the same reading an evicted slot
+    /// produces and the one this arm must fail closed on. The assertion that
+    /// matters is the *guest memory*: a decline that still wrote would pass a
+    /// log-only check.
+    #[test]
+    fn a_resident_window_that_cannot_be_vouched_for_declines_without_writing() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x4500_0000u64;
+        host.map_range(gpa, page as usize, 0);
+        // A recognizable pre-Store pattern, so "did not write" is checkable
+        // rather than indistinguishable from a zeroed page.
+        let pre = [0x5Cu8; 256];
+        host.write_gpa(gpa, &pre).unwrap();
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.mapped = true;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                source: crate::model::RenderWindowSource::Resident { epoch: 7 },
+            },
+        );
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window whose resident cannot be vouched for must report the loss"
+        );
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("kind=render")
+                && line.contains("reason=resident_epoch_drift")
+                && line.contains("want=7"),
+            "the epoch witness must be the stated refusal, with the value it wanted: {line}"
+        );
+        let mut after = [0u8; 256];
+        host.read_gpa(gpa, &mut after).unwrap();
+        assert_eq!(
+            &after[..],
+            &pre[..],
+            "a declined resident window must leave the guest's own bytes untouched"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the trigger must consume the window it took"
+        );
+    }
+
+    /// The identity a `Resident` window's flush rebuilds from its key is the one
+    /// the draw rendered into, pinned and stamped.
+    ///
+    /// Four separate places name this slot — the draw's `target_identity`, the
+    /// arm's `pin_resident_target`, the arm's `stamp_resident_content_epoch`, and
+    /// the flush's `read_target` — and all four resolve through
+    /// `present_identity::surface_identity` except the last, which has only the
+    /// key. If those two spellings ever disagree the pin protects one image while
+    /// the flush reads another: the frame is silently the wrong one, and no
+    /// assertion in the crate is watching for it because both lookups *succeed*.
+    #[test]
+    fn a_render_windows_key_rebuilds_the_identity_the_draw_rendered_into() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for generation in [1u32, 5, u32::MAX] {
+            let m = state.mappings.entry(9).or_default();
+            m.map_generation = generation;
+            let mut k = key(9, 0, 256);
+            k.map_generation = generation;
+            assert_eq!(
+                super::render_window_identity(&k),
+                crate::runtime::present_identity::surface_identity(&state, 9, k.width, k.height),
+                "the flush's rebuilt identity must equal the one the draw and the pin used"
+            );
+        }
     }
 
     /// A render window lands its own pixels even when `surface_cache` has moved
