@@ -1538,6 +1538,55 @@ when the two agree. That is maintainable only if the writer set is closed — wh
 completeness question the flush-trigger backbone had to answer, and which "enumerate the paths inside
 each reader, not the readers" says how to get wrong.
 
+**That witness already exists, and the compute rail already implements the whole pattern. The render
+rail's version is a port, not a design.** Hand-verified 2026-07-30 (a subagent produced the writer
+survey; every claim below was then read at the cited line, because AGENTS.md records two subagent
+audits on this rail that were flatly wrong):
+
+- `MappingEntry.content_generation: u32` — `model/state.rs:567`. Bumped by
+  `DeviceState::mark_mapping_written` (`state.rs:2618`), wrapping and skipping 0 so 0 means "no host
+  write since attach". Reset to 0 at `state.rs:2466`, `2541`, `2608` (attach / re-attach / the path
+  whose comment says the guest pages stay authoritative).
+- **Every guest-page writer bumps it.** Callers: `mapping_write.rs:283` (`write_bgra8`), `442`
+  (`write_rgba8_image_changed`), `549` (`write_raw_rows`), `1065` and `1100` (the `write_rect_raw_at`
+  family, which is what `blit_exec` and `compute_exec`'s type-11 writeback reach guest pages through);
+  `compute_exec/mod.rs:3705`; `exec.rs:1901` and `1903`.
+- **No render path reads it.** Its only product reader is the compute rail's `seed_generation`
+  (`compute_exec/mod.rs:1665`).
+- `TargetIdentity::Surface` carries `generation` = **`map_generation`**, not the content epoch, and
+  `ResidentTargetSlot` (`pools/mod.rs:486`) has `generation: u64` + `content_ready: bool` and **no
+  content epoch**. So a render resident cannot currently answer "are my pixels current".
+- `ResidentStorageImageSlot.generation: u32` **is** a content epoch. It is compared at
+  `pools/images_and_registry.rs:181` (`generation_match: resident.generation == seed_generation`) and
+  consumed at `exec_compute.rs:540`:
+
+  ```rust
+  let st = if generation_match { None } else { /* acquire_staging + write_staging */ };
+  ```
+
+  which is exactly the seed elision this section is asking for, shipped and tested on the compute rail.
+- It is **fail-closed**. `exec_compute.rs:527` refuses with the typed
+  `ComputeExecutionDecline::ResidentSeedGenerationLost` when the caller skipped the guest read on the
+  strength of a generation that has since moved, rather than seeding a placeholder — "the named failure
+  instead", in its own comment.
+- `state.compute_storage_residency` is the mapping-keyed mirror of that currency, maintained by
+  `note_storage_residency_writeback` (`compute_exec/mod.rs:955`). Read its comment before copying: the
+  mirror stores `next(seed_generation)`, **not** the mapping-level content generation, precisely so
+  that two disjoint sibling windows on one mapping (ping-pong canvases) cannot desync the pair — and it
+  bounds the sibling count per mapping.
+
+So the work is: give `ResidentTargetSlot` a content epoch, record it when a type-11 Store's readback
+lands, and gate `LoadOp::LoadFromTarget` + `target_rgba8 = None` on agreement, fail-closed, with the
+sibling-currency rule the compute mirror already learned. Expected saving is `stage_us` (~155 ms/s) and
+the `target_rgba8.is_none()` half of the `joins` predicate; the readback itself is a separate step and
+`skip_readback` is the other half.
+
+**One asymmetry to design for rather than discover.** The deferred writeback rail arms a window and does
+*not* write guest pages, so it does not bump `content_generation` at arm time — the bump comes later at
+flush. A resident stamped at arm time therefore goes stale on its own flush even though the pixels never
+changed. That is conservative (it falls back to the CPU seed, which is correct), so ship it that way
+first and only then decide whether the flush should carry the resident's stamp forward.
+
 ### A Bounds Check That Charges A Stride For The Last Row Squares Window Corners
 
 **Fixed by `e181e0f`, reproduced and scored either side. Do not re-derive.** This was the
