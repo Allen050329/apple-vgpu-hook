@@ -1603,16 +1603,46 @@ That leaves exactly two consumers to re-source, and their combined rate is ~0.19
 `materialize_linear_resident` around it, and `get_linear_texture` returning `None` while it is set.
 `HostSurface` wants the same three, keyed on the `surface_content_epoch` witness that already exists.
 
-**What is genuinely at risk, and must be answered before writing it: durability.** AGENTS.md already
-records the rule this deliberately trades against — "a deferred obligation that names its data
-indirectly is only as durable as the indirection … prefer owning the bytes; with `Arc` it is free."
-Here owning the bytes *is* the readback, so the trade is the whole point and the mitigation has to be
-explicit: the window must pin the resident (`pin_resident_target`, as the GVA rail does), compare the
-epoch at flush, and emit a typed `deferred_flush_lost` rather than writing a wrong frame. Enumerate
-every path that can destroy a `Surface` resident — registry LRU/capacity eviction,
-`registry_ensure`'s destroy-on-mismatch, mapping teardown, the idle sweep, `test_reset_engine` — and
-confirm each honours the pin, before trusting it. A `deferred_flush_lost` on this rail is a whole
-compositing layer, which is the black-layer class this project has already paid for twice.
+**Durability is the risk, and the eviction audit came back clean.** AGENTS.md records the rule this
+deliberately trades against — "a deferred obligation that names its data indirectly is only as durable
+as the indirection … prefer owning the bytes; with `Arc` it is free." Here owning the bytes *is* the
+readback, so the trade is the point and the mitigation has to be explicit. Audited by hand at
+`f5e9418`, every path that can drop a `TargetIdentity::Surface` resident:
+
+| path | honours a pin? |
+|---|---|
+| `evict_registry_to_cap` (LRU / `REGISTRY_CAP`) | **yes** — `pin_count > 0` rotates to the back instead of evicting |
+| the same function's cap arithmetic | **yes** — `non_pinned_registry_len()` excludes pinned slots, so a pinned burst cannot force the active set out (thrash) |
+| the idle target drain (`submission_and_buffers.rs:110`) | **yes** — victims require `pin_count == 0` |
+| `registry_ensure` destroy-and-recreate | **no**, and it does not need to: geometry *and* generation are in the identity key, and the `bgra` mismatch that remains is now structurally impossible for `Surface` since `e2c2dee` derives the order from the key |
+| mapping teardown / unmap / device reset / `test_reset_engine` | drops the window through `take_deferred_flush_window*`, which is the same choke point `release_window_pin` guards |
+
+`pin_resident_target` is **counted, not boolean** (`slot.pin_count`), so several windows on one surface
+each hold a count and the slot survives until the last unpins — which is exactly the sibling-geometry
+case that produced the `cache_miss` black-layer class from the other side. It also refuses when
+`!content_ready`, so the caller has a fail-closed fallback to the synchronous Store.
+
+**The insertion point for the unpin already exists and is already documented as mandatory.**
+`storage_flush::release_window_pin` says "every site that takes a window and does not flush it must go
+through this rather than calling `unpin_resident_storage` directly", and its `Render` arm is an empty
+`{}` *because a render window owns nothing on the GPU today*. That arm becoming
+`unpin_resident_target(&identity)` covers every drop-without-flush site at once — teardown, supersede,
+the population cap — which is the difference between auditing one function and auditing a dozen callers.
+
+**One leak hazard is already visible in the code and must be fixed in the same change.**
+`flush_render_one` returns `false` early on `reason=map_generation_drift` (and on `write_refused`)
+*before* doing anything else, because today it holds no pin to release. Add a pin without touching
+those exits and each drifted mapping strands a full framebuffer pinned for the guest lifetime — the
+"~260 stale residents (~516 MiB)" shape this file already records. The GVA rail is the template and
+it gets this right: `flush_gva_one` calls `unpin_resident_target` on **both** the read-failure path and
+the success path. That drift is not rare — the `e62bb9e` boot logged one in 85 s, and
+`deferred_window_page_drift` fires ~8 times a boot elsewhere.
+
+So the shape is: window carries `(identity, epoch)` instead of `Arc<Vec<u8>>`; arm pins and marks the
+cache entry resident-authoritative; flush reads the resident, compares the epoch, unpins on every exit,
+and emits a typed `deferred_flush_lost` rather than writing a frame it cannot vouch for. A loss on this
+rail is a whole compositing layer, so the epoch comparison is not optional and neither is
+`pin_resident_target`'s `false` return being honoured.
 
 Consumers `skip_readback` must then re-source: `surface_cache` (present capture at `scanout.rs:248`,
 the ~4 % of LOADs that still seed, and the sampled bind), the deferred window's owned frame, and the
