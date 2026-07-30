@@ -2042,6 +2042,21 @@ fn guest_runs_memoized<M: HostMemory + HostOps>(
         // now worth only its allocation — `rmemo_verify_us` measures what that
         // costs, against `rmemo_hit`, so the trade is a reading rather than an
         // assumption.
+        //
+        // **Measured, and the contract held.** One 245 s driven boot verified
+        // 1 639 738 hits in full and found **zero** stale entries, at a median
+        // 5 358 hits and 32.6 ms of verify per second — 3.3 % of wall clock,
+        // peaking at 11 %. So this is a soundness change and not a bug fix, and
+        // saying otherwise would be the broad claim the ground rules forbid: the
+        // memo was not the source of any observed wrong-texture defect, and the
+        // sampled check it replaces was never going to catch one either.
+        //
+        // It stays exhaustive anyway, for a reason the measurement supports
+        // rather than undermines. What the boot established is that the
+        // notification contract holds *for the code as it stands*; the sampling
+        // established nothing either way, and a reader could not tell those
+        // apart, because `rmemo_stale=0` with no denominator is not a reading.
+        // Now the denominator is in the same line.
         {
             let verify_started = std::time::Instant::now();
             let fresh = task_gva_guest_runs(state, host, task_id, gva, span);
