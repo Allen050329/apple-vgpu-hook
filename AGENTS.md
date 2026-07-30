@@ -2737,6 +2737,20 @@ three separate full-suite runs: `vk_engine_parity` **40 passed, `grep -c SKIP` =
 execute barriers, layout transitions, descriptor writes and readback, and a change to them is
 test-covered rather than unverified.
 
+**And the pass count in the line above was wrong when it was written — this is the failure mode the
+paragraph below warns about, committed in the same breath as the warning.** At `93f8a26` the suite is
+**44 passed / 0 failed / 1 ignored, 0 SKIP**. It reached 0 failed only at that commit: since
+`e2c2dee` introduced it, `a_surface_resident_reads_back_in_guest_scanout_order` had failed on every
+run on this host, asserting green `== 128` where `triangle_spirv` writes `0.5 * 255 = 127.5` — an
+exact float→unorm8 tie that Vulkan does not pin, and that Intel ANV rounds down. The file already
+carried `near()` with the doc comment "allow ±1 LSB" and the sibling case already used it.
+
+Two things to take from it. A suite quoted as "40 passed" while it was really 39-and-a-known-red is
+indistinguishable from a healthy suite *unless the failures are named*, so quote the failing test
+names or quote nothing. And a test whose assertion sits exactly on a rounding tie will be red on some
+drivers and green on others forever — when a constant comes from `f * 255`, check whether it lands on
+a `.5` before asserting it exactly.
+
 This does not retire the rule or the ceiling described below — it says the ceiling is a property of
 the environment, and the environment the ceiling was measured in was an agent sandbox, not this
 machine. The command above is one line and answers for the box you are actually on. Run it; quoting
