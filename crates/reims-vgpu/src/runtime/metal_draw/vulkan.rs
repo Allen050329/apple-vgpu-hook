@@ -3256,13 +3256,21 @@ fn note_load_seed_outcome(
         "load_seed_lost"
     });
     // Per door, because the doors fail for unrelated reasons and a pooled zero
-    // hides a door that never opens. `gva_or_ref` in particular draws its seed
-    // from the two host caches the sampled ladder measured as nearly always
-    // empty for these spans (`gvac_hit` 305 and `lin_rung_texref` 2 against
-    // 725 233 loads), so it is the door most likely to be losing seeds, and a
-    // lost seed turns a LOAD attachment into a CLEAR — every texel the draw
-    // does not cover goes to the clear colour. That is the shape of both the
-    // broken icon cell and the Safari scroll patch.
+    // hides a door that never opens.
+    //
+    // Measured, and the split earns its keep by refuting what it was added to
+    // test. One driven boot, ten Finder recomposites, two of them corrupt:
+    //
+    //   load_seed_ok 395   ok_mapping 346   ok_color 49
+    //   ok_gva_or_ref 0    lost_gva_or_ref 0    lost_<any door> 0
+    //
+    // `gva_or_ref` was the suspect — it draws its seed from the two host caches
+    // the sampled ladder found nearly always empty for these spans — and it is
+    // never taken. Nor does any door lose a seed, so the earlier pooled
+    // `load_seed_lost=0` was a real zero and not a door standing idle. A lost
+    // seed turning LOAD into CLEAR is therefore NOT how a broken icon gets its
+    // empty square, and the whole rail is small besides: 395 seed resolutions
+    // across a boot that composited ten Finder windows.
     crate::runtime::drain::note_store_route(match (door, seeded) {
         ("color_seed", true) => "load_seed_ok_color",
         ("color_seed", false) => "load_seed_lost_color",
