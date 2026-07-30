@@ -80,37 +80,11 @@ pub fn read_task_gva<M: HostMemory>(
     Ok(())
 }
 
-/// What the deleted `task_id >> 1` read arm **would** have done, had it stayed.
-///
-/// A tripwire, not a decision. [`read_task_gva_by_id`] refuses whenever the task
-/// the guest named cannot serve the read; this records whether the neighbouring
-/// task could have, so the count stays directly comparable across the deletion
-/// rather than simply vanishing with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReadRefusal {
-    /// The named task's walk failed and `task_id >> 1`'s walk **would** have
-    /// succeeded — this is exactly where the old code substituted another
-    /// task's bytes. Measured 9-11 times per boot before the deletion, all from
-    /// object-list resolution.
-    ShiftedWouldServe,
-    /// Neither task could serve the read, so the old code refused here too.
-    NeitherServes,
-}
-
-impl crate::observe::Decline for ReadRefusal {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::ShiftedWouldServe => "read_refused_shifted_would_serve",
-            Self::NeitherServes => "read_refused_neither",
-        }
-    }
-}
-
 /// Read `[gva, gva+len)` under the task the guest named. **That task, or an
 /// error.**
 ///
 /// This used to fall back to walking `task_id >> 1`'s page table at the same
-/// address, and it is the last of the three `>> 1` arms this crate improvised.
+/// address, and it was the last of the three `>> 1` arms this crate improvised.
 /// The other two were deleted after measuring zero. This one measured **9-11
 /// substitutions per boot**, every boot, all from `objects::lookup_list_entry` —
 /// and the contract says every one of them was wrong:
@@ -126,8 +100,8 @@ impl crate::observe::Decline for ReadRefusal {
 ///
 /// The failure mode is now a typed refusal the caller already handles
 /// (`lookup_list_entry` returns `None`, which is its "the guest has not told us"
-/// answer). `#[track_caller]` names the site; the census above records where the
-/// old substitution would have happened.
+/// answer), carrying **which** of the walk's checks refused.
+/// `#[track_caller]` names the site.
 #[track_caller]
 pub fn read_task_gva_by_id<M: HostMemory>(
     host: &M,
@@ -145,50 +119,32 @@ pub fn read_task_gva_by_id<M: HostMemory>(
     } else {
         MemError::NoSuchTask
     };
-    // Counterfactual only — the result is logged and discarded. It runs on the
-    // refusal path, which is a few dozen reads per boot, so the extra walk costs
-    // nothing measurable and keeps the before/after numbers comparable.
-    let shifted = task_id >> 1;
-    let would_serve = shifted != task_id
-        && (shifted as usize) < tasks.len()
-        && read_task_gva(
-            host,
-            &tasks[shifted as usize],
-            gva,
-            &mut vec![0u8; buf.len()],
-            page_shift,
-        )
-        .is_ok();
-    note_read_refusal(task_id, shifted, gva, would_serve, named);
+    note_read_refusal(task_id, gva, named);
     Err(named)
 }
 
-/// Record a refused read, latched per `(arm, task, site)`.
+/// Record a refused read, latched per `(reason, task, site)`.
+///
+/// The reason is the [`MemError`] the walk itself returned, so the line names
+/// which of the walk's checks refused rather than a label chosen here.
 ///
 /// The latch is taken before the line is built: `Emit::field` renders eagerly,
 /// and this sits one level below per-row blit loops, so building and dropping
 /// strings on every refused read would make the probe cost scale with the
 /// traffic it is measuring.
 #[track_caller]
-fn note_read_refusal(task_id: u32, shifted: u32, gva: u64, served: bool, named: MemError) {
+fn note_read_refusal(task_id: u32, gva: u64, named: MemError) {
     use crate::observe::Decline;
-    let arm = if served {
-        ReadRefusal::ShiftedWouldServe
-    } else {
-        ReadRefusal::NeitherServes
-    };
     // Key off the raw location, not its rendering — a refused read can repeat
     // per row, and formatting before the latch would allocate on every one.
     let loc = std::panic::Location::caller();
-    if !crate::observe::first_sight(arm.slug(), latch_key(task_id, shifted, loc)) {
+    if !crate::observe::first_sight(named.slug(), latch_key(task_id, 0, loc)) {
         return;
     }
     let via = via_caller();
-    crate::observe::Emit::decline("gva_read_refused", &arm)
+    crate::observe::Emit::decline("gva_read_refused", &named)
         .field("task", task_id)
-        .field("shifted", shifted)
         .field("gva", format!("{gva:#x}"))
-        .field("named_err", named.slug())
         .field("via", via)
         .fail();
 }
@@ -982,19 +938,6 @@ mod tests {
             latch_key(1, 0, loc),
             latch_key(1, 0, loc),
             "and it is stable"
-        );
-    }
-
-    /// Both refusal arms must keep their own slug. They are the same *decision*
-    /// now — the read is refused either way — but only one of them marks a spot
-    /// where the deleted arm used to hand back a neighbour's bytes, and that is
-    /// the number the deletion is judged on.
-    #[test]
-    fn the_read_refusal_arms_do_not_share_a_reason() {
-        use crate::observe::Decline;
-        assert_ne!(
-            ReadRefusal::ShiftedWouldServe.slug(),
-            ReadRefusal::NeitherServes.slug()
         );
     }
 
