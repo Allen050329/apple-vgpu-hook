@@ -115,10 +115,56 @@ struct StreamAccum {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
+    /// Draw records this stream decoded but did not keep, and why. See
+    /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
+    dropped_cap: u32,
+    dropped_unbound: u32,
 }
 
 /// Cap multi-draw records per stream (archive REIMS_VGPU_MAX_DRAWS_PER_JOB order).
 const MAX_DRAWS_PER_STREAM: usize = 64;
+
+/// Why a decoded `RenderKind::Draw` record never became a `PendingDraw`.
+///
+/// A serialized Metal render stream is one render pass, and every draw in it
+/// contributes to one attachment set. Dropping any of them leaves the pixels
+/// that draw would have written as whatever the earlier records put there —
+/// which, for a compositor doing per-element damage draws, is a rectangle of
+/// the target holding the wrong picture and holding it until the next full
+/// redraw. Both arms below used to be a bare `if` with no `else`, so a stream
+/// could lose arbitrarily many draws and say nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamDrawDrop {
+    /// The stream decoded more than [`MAX_DRAWS_PER_STREAM`] eligible draws.
+    ///
+    /// The cap is this crate's, not the protocol's: the guest emits as many
+    /// records as its encoder recorded and Apple's device runs all of them.
+    Cap { cap: usize, dropped: u32 },
+    /// The record arrived with no pipeline bound or a zero primitive count.
+    ///
+    /// Kept separate because it is a different claim with a different fix: the
+    /// cap is a resource decision, this is either a genuinely empty draw (legal,
+    /// and nothing is lost) or a `SetPipeline` this decoder failed to latch.
+    Unbound { dropped: u32 },
+}
+
+impl crate::observe::Decline for StreamDrawDrop {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Cap { .. } => "stream_draw_dropped_cap",
+            Self::Unbound { .. } => "stream_draw_dropped_unbound",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Cap { cap, dropped } => {
+                vec![("cap", cap.to_string()), ("dropped", dropped.to_string())]
+            }
+            Self::Unbound { dropped } => vec![("dropped", dropped.to_string())],
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ExecResult {
@@ -1149,7 +1195,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.indexed = None;
             }
             // Snapshot bind state for this draw (archive multi-draw job).
-            if acc.draws.len() < MAX_DRAWS_PER_STREAM && acc.pipeline_ref != 0 && count > 0 {
+            if acc.pipeline_ref == 0 || count == 0 {
+                acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
+            } else if acc.draws.len() >= MAX_DRAWS_PER_STREAM {
+                acc.dropped_cap = acc.dropped_cap.saturating_add(1);
+            } else {
                 acc.draws.push(PendingDraw {
                     pipeline_ref: acc.pipeline_ref,
                     draw: (
@@ -1337,6 +1387,64 @@ fn upsert_sampler(list: &mut Vec<SamplerBind>, bind: SamplerBind) {
     }
 }
 
+/// Report what this stream's draw list cost, and anything it lost building it.
+///
+/// The distribution is the half that has to be readable even when nothing is
+/// dropped: `stream_draws_at_cap` alone cannot say whether the cap is a ceiling
+/// real workloads press against or a number no stream ever approaches, and the
+/// difference decides whether [`MAX_DRAWS_PER_STREAM`] is a latent defect or an
+/// irrelevance. Buckets rather than a mean because the question is about the
+/// tail: one 400-draw compositor stream among thousands of 2-draw ones is
+/// exactly the case that matters and is exactly what a mean hides.
+fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
+    let kept = acc.draws.len();
+    if kept == 0 && acc.dropped_cap == 0 && acc.dropped_unbound == 0 {
+        return;
+    }
+    crate::runtime::drain::note_store_route(match kept {
+        0 => "stream_draws_0",
+        1 => "stream_draws_1",
+        2..=4 => "stream_draws_2_4",
+        5..=8 => "stream_draws_5_8",
+        9..=16 => "stream_draws_9_16",
+        17..=32 => "stream_draws_17_32",
+        33..=63 => "stream_draws_33_63",
+        _ => "stream_draws_at_cap",
+    });
+    // Latched on the *magnitude* of the loss, not on the task: the same stream
+    // shape recurs every frame, so a per-task key would print once and hide a
+    // loss that grew, while a bucket key prints again when it gets worse.
+    if acc.dropped_cap > 0 {
+        let d = StreamDrawDrop::Cap {
+            cap: MAX_DRAWS_PER_STREAM,
+            dropped: acc.dropped_cap,
+        };
+        if crate::observe::first_sight(
+            crate::observe::Decline::slug(&d),
+            u64::from(acc.dropped_cap.next_power_of_two()),
+        ) {
+            crate::observe::Emit::decline("stream_draw", &d)
+                .field("task", task_id)
+                .field("kept", kept)
+                .fail();
+        }
+    }
+    if acc.dropped_unbound > 0 {
+        let d = StreamDrawDrop::Unbound {
+            dropped: acc.dropped_unbound,
+        };
+        if crate::observe::first_sight(
+            crate::observe::Decline::slug(&d),
+            u64::from(acc.dropped_unbound.next_power_of_two()),
+        ) {
+            crate::observe::Emit::decline("stream_draw", &d)
+                .field("task", task_id)
+                .field("kept", kept)
+                .fail();
+        }
+    }
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1344,6 +1452,7 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    note_stream_draw_drops(task_id, acc);
     // Archive ApplePVGPUDrawJob: clear/load seed is private initial_rgba for the
     // async job; guest pages are written once at completion. Apply clear-to-guest
     // only for clear-only streams (no draws). When draws run, CLEAR is the Metal
@@ -2514,6 +2623,59 @@ mod tests {
         assert_eq!(indexed.index_count, 6);
         assert_eq!(indexed.index_buffer_offset, 0x10100);
         assert_eq!(acc.draws[0].draw, (6, 1, 3, 0));
+    }
+
+    /// A stream that decodes more draws than the crate keeps must say so.
+    ///
+    /// The cap silently truncated `acc.draws`, so a compositor stream with more
+    /// records than [`MAX_DRAWS_PER_STREAM`] lost every draw past the 64th with
+    /// nothing on any channel — no counter, no line, and an `ExecResult` that
+    /// reports the truncated list as fully executed. The two arms are asserted
+    /// apart because they are different claims: an over-cap draw is guest work
+    /// this crate refused to run, an unbound one may be a legal empty draw.
+    #[test]
+    fn a_stream_past_the_draw_cap_accounts_for_what_it_dropped() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            ..Default::default()
+        };
+        let mut command = vec![0u8; 0x20];
+        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        let rec = stream::Record {
+            segment_index: 0,
+            segment_type: 0,
+            offset: 0,
+            length: command.len() as u32,
+            opcode: render::OP_DRAW_INDEXED_WIDE,
+            bytes_offset: 0,
+        };
+
+        let over = 7;
+        for _ in 0..MAX_DRAWS_PER_STREAM + over {
+            handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+        }
+
+        assert_eq!(acc.draws.len(), MAX_DRAWS_PER_STREAM, "cap still holds");
+        assert_eq!(
+            acc.dropped_cap, over as u32,
+            "every draw past the cap must be counted, not vanish"
+        );
+        assert_eq!(acc.dropped_unbound, 0, "all of these had a pipeline bound");
+
+        // With no pipeline latched the same record is the other arm, and must
+        // not be charged to the cap.
+        let mut unbound = StreamAccum::default();
+        handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut unbound);
+        assert_eq!(unbound.dropped_unbound, 1);
+        assert_eq!(unbound.dropped_cap, 0);
+        assert!(unbound.draws.is_empty());
     }
 
     #[test]
