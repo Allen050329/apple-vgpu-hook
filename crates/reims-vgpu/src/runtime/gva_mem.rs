@@ -372,15 +372,38 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     Err(err)
 }
 
-/// Resolve pages of `[gva, gva + span)` under the same task selection as
-/// [`read_task_gva_by_id`] (wire id first, then `id >> 1`) and call `visit`
-/// with each page-aligned GPA. Stops early when `visit` returns `false`.
+/// Resolve pages of `[gva, gva + span)` under the task the guest named — the
+/// same selection as [`read_task_gva_by_id`] and
+/// [`crate::runtime::gva_view::write_span`]'s resolver — and call `visit` with
+/// each page-aligned GPA. Stops early when `visit` returns `false`.
 /// `stride_pages` visits every Nth page plus always the last (1 = every page);
 /// callers trade probe density against walk cost.
 ///
 /// This is a lookup, not a validator: pages that fail to translate are
 /// skipped silently — the content read that follows fails (and fail-logs) on
 /// its own terms. One page-walk cache and one root read span the whole range.
+///
+/// **The named task, or no pages.** This was the last of four sites that fell
+/// back to `task_id >> 1` when the named slot had no page table to walk. The
+/// other three are gone — `resolve_task_word` decides raw-only
+/// (`raw_live.then_some(raw)`), `read_task_gva_by_id` refuses, and
+/// `gva_view::resolve_task_for_walk` returns `None` — all on the same contract
+/// argument: a GVA has no meaning apart from the page table it is resolved
+/// against, and slots run densely from 0, so `task_id >> 1` is almost always
+/// some *other* live task whose table happens to have something mapped there.
+///
+/// Here the substitution was invisible rather than merely wrong, because
+/// `storage_flush::deferred_pages_still_ours` — the drift guard that decides
+/// whether a deferred window may still be written to guest RAM — re-resolves
+/// through *this* function with the *same* task id the window was armed under.
+/// A window indexed under the neighbour's table was therefore re-indexed under
+/// the neighbour's table, the two sets matched, and the guard reported "still
+/// ours". It could not see a hazard it reproduced.
+///
+/// A short walk is what every caller already fails closed on: the guest-run
+/// builder and the deferred-Store arm both compare the page count against the
+/// span and decline, and the compute rail reports its count as `pages=` on an
+/// always-on line.
 #[allow(
     clippy::too_many_arguments,
     reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
@@ -402,26 +425,17 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
         return;
     };
     let reader = HostPhys(host);
-    let mut root = None;
-    for id in [task_id, task_id >> 1] {
-        if root.is_some() {
-            break;
-        }
-        let Some(task) = tasks.get(id as usize) else {
-            continue;
-        };
-        if !task.active || task.directory_pfn == 0 {
-            continue;
-        }
-        let gr_task = Task {
-            active: true,
-            directory_pfn: task.directory_pfn,
-        };
-        if let Ok(r) = read_task_root(&reader, &gr_task, geom) {
-            root = Some(r);
-        }
+    let Some(task) = tasks.get(task_id as usize) else {
+        return;
+    };
+    if !task.active || task.directory_pfn == 0 {
+        return;
     }
-    let Some(root) = root else {
+    let gr_task = Task {
+        active: true,
+        directory_pfn: task.directory_pfn,
+    };
+    let Ok(root) = read_task_root(&reader, &gr_task, geom) else {
         return;
     };
     let page = geom.page_size as u64;
@@ -988,6 +1002,81 @@ mod tests {
         assert_eq!(
             buf, [0u8; 4],
             "and no neighbour's bytes may reach the caller"
+        );
+    }
+
+    /// A page walk for a task with no page table yields **no pages**, even when
+    /// the `>> 1` neighbour's table resolves the same address.
+    ///
+    /// This is the fourth and last `>> 1` arm, and the one whose substitution no
+    /// guard could see: `storage_flush::deferred_pages_still_ours` re-resolves an
+    /// armed window through this same function under the same task id, so a
+    /// window indexed under the neighbour's table was re-indexed under the
+    /// neighbour's table and the drift check reported the pages "still ours".
+    ///
+    /// Task 2 maps GVA page 1; task 5 (`5 >> 1 == 2`) is live with no directory,
+    /// which is the state `define_task` really produces — the slot is active and
+    /// only the walk fails.
+    #[test]
+    fn a_page_walk_for_a_task_with_no_page_table_visits_nothing() {
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x100, 0xab);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(2, 0x1_0000, 2));
+        assert!(state.define_task(5, 0x1_0000, 0));
+        assert!(
+            state.tasks[5].active,
+            "the slot is live; only the page table is missing"
+        );
+
+        // The donor really can serve it — otherwise this test would pass for the
+        // wrong reason.
+        let mut donor = Vec::new();
+        visit_task_gva_page_gpas(
+            &host,
+            &state.tasks,
+            2,
+            0x1000,
+            4,
+            PAGE_SHIFT_X86,
+            1,
+            &mut |gpa| {
+                donor.push(gpa);
+                true
+            },
+        );
+        assert_eq!(donor, vec![data_gpa], "task 2 resolves GVA page 1");
+
+        let mut pages = Vec::new();
+        visit_task_gva_page_gpas(
+            &host,
+            &state.tasks,
+            5,
+            0x1000,
+            4,
+            PAGE_SHIFT_X86,
+            1,
+            &mut |gpa| {
+                pages.push(gpa);
+                true
+            },
+        );
+        assert!(
+            pages.is_empty(),
+            "no neighbour's pages may be indexed under task 5, got {pages:x?}"
         );
     }
 
