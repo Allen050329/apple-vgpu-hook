@@ -2820,6 +2820,88 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     ))
 }
 
+/// Probe only: does the GVA cache entry we just served still agree with the
+/// guest's own pages?
+///
+/// The `Moved` refusal answers a different question -- whether this address
+/// still names the allocation the bytes are of -- and an entry can pass it and
+/// still be wrong, because a guest CPU write into pages that never moved
+/// produces no notify and no verdict. That is the one way a cache here can hold
+/// a *partial* picture of a resource and hold it forever, which is what the
+/// surviving Finder icon class looks like on screen: content in the corner of
+/// an otherwise empty cell, identical at t=1 s and t=65 s.
+///
+/// So the reading that separates it from every other wrong-content mechanism is
+/// this one: read the guest pages the entry claims to be of, and say whether
+/// they still hold what we are serving. `zero_tail` is on the line for both
+/// sides because "the cache is a prefix of the truth" and "the cache is
+/// different content" are different defects, and only the first is a partial
+/// snapshot.
+///
+/// Gated on `REIMS_VGPU_CONTENT_PROBE=1`: it re-reads and re-converts the whole
+/// texture on every sampled bind that hits this rung.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the audit line carries the identity of the entry it scored"
+)]
+fn audit_gva_cache_against_guest<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    w: u32,
+    h: u32,
+    producer_type: u8,
+    cached: Option<Vec<u8>>,
+) {
+    let Some(cached) = cached else {
+        return;
+    };
+    crate::runtime::drain::note_store_route("gvac_content_checked");
+    // Only a native BGRA8 load is comparable byte for byte with the cache,
+    // which is BGRA8. Anything else is counted rather than converted, so a
+    // format this probe cannot read does not quietly become an agreement.
+    let (guest, layout) =
+        match load_linear_texture_native_host(state, host, task_id, texture_ref, 0, None) {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                crate::runtime::drain::note_store_route("gvac_content_unreadable");
+                return;
+            }
+        };
+    if layout != TexelLayout::Bgra8 || guest.len() != cached.len() {
+        crate::runtime::drain::note_store_route("gvac_content_incomparable");
+        return;
+    }
+    if guest == cached {
+        crate::runtime::drain::note_store_route("gvac_content_agree");
+        return;
+    }
+    crate::runtime::drain::note_store_route("gvac_content_differ");
+    let first = guest
+        .iter()
+        .zip(cached.iter())
+        .position(|(a, b)| a != b)
+        .unwrap_or(0);
+    let differing = guest
+        .iter()
+        .zip(cached.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    let zero_tail = |v: &[u8]| v.len() - v.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    if crate::observe::first_sight("gvac_content_differ", gva ^ ((w as u64) << 32) ^ h as u64) {
+        crate::observe::fail(format!(
+            "gvac_content_differ task={task_id} ref={texture_ref} gva={gva:#x} {w}x{h} \
+             producer={producer_type} bytes={} first={first} differing={differing} \
+             cache_zero_tail={} guest_zero_tail={}",
+            cached.len(),
+            zero_tail(&cached),
+            zero_tail(&guest),
+        ));
+    }
+}
+
 fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2861,6 +2943,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         .flatten()
     {
         if gva_cache_owner_allows_object_type(producer_type, entry.object_type) {
+            let cached = crate::observe::content_probe_enabled().then(|| bgra.to_vec());
             let identity = Some(LinearSampleIdentity {
                 key: gva,
                 generation: host_gen,
@@ -2885,6 +2968,17 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
                     rgba: rgba.clone(),
                 },
                 entry_bytes,
+            );
+            audit_gva_cache_against_guest(
+                state,
+                host,
+                task_id,
+                texture_ref,
+                gva,
+                w,
+                h,
+                producer_type,
+                cached,
             );
             return Some((w, h, rgba, identity, TexelLayout::Rgba8));
         }
