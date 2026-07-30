@@ -546,10 +546,45 @@ pub fn write_span<H: HostMemory + HostOps>(
     gva: u64,
     buf: &[u8],
 ) -> Result<(), MemError> {
+    write_span_within(state, host, task_id, gva, buf, None)
+}
+
+/// Pages a deferred write is allowed to reach, or `None` for a write whose
+/// authorisation is the command that issued it.
+pub type WindowPages<'a> = Option<&'a std::collections::HashSet<u64>>;
+
+/// Every page of a resolved span is one the caller may write.
+///
+/// The check belongs beside the walk rather than in the caller because the walk
+/// that authorises has to be the walk that writes. A caller that walks, checks,
+/// and then calls a writer which walks again has proved something about a page
+/// table it is no longer using: between the two walks the guest can re-point
+/// the range, and the second walk — the one whose answer the bytes actually go
+/// to — was never checked. Passing the set down means there is only one walk
+/// and its result is both the authorisation and the destination.
+///
+/// `gpas` are page bases ([`collect_span_gpas`] masks them), so no masking is
+/// needed here.
+fn span_within_window(gpas: &[u64], allowed: WindowPages<'_>) -> bool {
+    match allowed {
+        None => true,
+        Some(pages) => gpas.iter().all(|g| pages.contains(g)),
+    }
+}
+
+/// [`write_span`] bounded to the pages a deferred window was armed on.
+pub fn write_span_within<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    buf: &[u8],
+    allowed: WindowPages<'_>,
+) -> Result<(), MemError> {
     if buf.is_empty() {
         return Ok(());
     }
-    write_span_multi(state, host, task_id, gva, buf)
+    write_span_multi(state, host, task_id, gva, buf, allowed)
 }
 
 /// Ephemeral fresh-walk host mapping of `[gva, gva+length)` for guest writes.
@@ -577,6 +612,21 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     gva: u64,
     length: u64,
 ) -> Option<FreshSpan> {
+    map_fresh_span_within(state, host, task_id, gva, length, None)
+}
+
+/// [`map_fresh_span`] bounded to the pages a deferred window was armed on.
+///
+/// See [`span_within_window`]: the check sits on this walk because this walk is
+/// what the returned pointer aliases.
+pub fn map_fresh_span_within<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    allowed: WindowPages<'_>,
+) -> Option<FreshSpan> {
     if gva == 0 || length == 0 {
         return None;
     }
@@ -585,6 +635,9 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
         let (_tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
         collect_span_gpas(host, task, gva, length, page_shift).ok()?
     };
+    if !span_within_window(&gpas, allowed) {
+        return None;
+    }
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
     }
@@ -671,6 +724,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
     task_id: u32,
     gva: u64,
     buf: &[u8],
+    allowed: WindowPages<'_>,
 ) -> Result<(), MemError> {
     let length = buf.len() as u64;
     let page_shift = state.page_shift;
@@ -682,6 +736,9 @@ fn write_span_multi<H: HostMemory + HostOps>(
         };
         collect_span_gpas(host, task, gva, length, page_shift)?
     };
+    if !span_within_window(&gpas, allowed) {
+        return Err(MemError::WriteOutsideWindow);
+    }
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return Err(MemError::NotRam);
     }
@@ -1036,6 +1093,67 @@ mod tests {
         st32(&mut pte, 4);
         host.write_gpa(root_gpa, &pte).unwrap();
         (host, root_gpa, data0, data1, page)
+    }
+
+    /// A deferred write is bounded by the pages it was armed on, and the bound
+    /// is enforced by the same walk that produces the destination.
+    ///
+    /// The scenario is the one the guest actually produces: a window armed on
+    /// `data0`, and by flush time the guest has re-pointed that GVA at `data1`.
+    /// A guard that walked separately and then called an unbounded writer would
+    /// have to win a race against the guest's own vCPUs to catch this; a bound
+    /// carried into the walk cannot lose it, because there is only one walk.
+    ///
+    /// Both writers are covered — `write_span_within` for the fragmented
+    /// per-row path, `map_fresh_span_within` for the packed one — because
+    /// which of the two a real Store takes depends on how the guest happened to
+    /// lay the pages out, and a bound present on only one of them is a bound
+    /// that holds on some machines.
+    #[test]
+    fn a_deferred_write_cannot_reach_a_page_its_window_was_not_armed_on() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        let armed: std::collections::HashSet<u64> = [data0].into_iter().collect();
+
+        // Control: while the GVA still resolves inside the window, the write
+        // lands. A bound that refused everything would silently blank the guest.
+        assert!(
+            write_span_within(&mut state, &mut host, 1, 8, &[0xaa; 4], Some(&armed)).is_ok(),
+            "a window writing its own page must still write"
+        );
+        let mut back = [0u8; 4];
+        host.read_gpa(data0 + 8, &mut back).unwrap();
+        assert_eq!(back, [0xaa; 4]);
+        assert!(map_fresh_span_within(&mut state, &mut host, 1, 8, 16, Some(&armed)).is_some());
+
+        // The guest re-points the range. Nothing about the walk is unhealthy —
+        // it resolves, it is RAM, it is current. It is simply not ours.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        assert_eq!(
+            write_span_within(&mut state, &mut host, 1, 8, &[0xbb; 4], Some(&armed)),
+            Err(crate::runtime::host::MemError::WriteOutsideWindow),
+            "a re-pointed range is another owner's memory, not this window's"
+        );
+        assert!(
+            map_fresh_span_within(&mut state, &mut host, 1, 8, 16, Some(&armed)).is_none(),
+            "the packed path must carry the same bound as the per-row path"
+        );
+        host.read_gpa(data1 + 8, &mut back).unwrap();
+        assert_eq!(back, [0u8; 4], "the new owner's page must be untouched");
+
+        // Unbounded callers are unaffected: a synchronous Store's authorisation
+        // is the page table at the moment it runs, and it passes `None`.
+        assert!(
+            write_span(&mut state, &mut host, 1, 8, &[0xbb; 4]).is_ok(),
+            "an unbounded write must keep following the live page table"
+        );
+        host.read_gpa(data1 + 8, &mut back).unwrap();
+        assert_eq!(back, [0xbb; 4]);
     }
 
     /// Read the always-on log from `from` to the end.

@@ -62,6 +62,19 @@ pub enum MemError {
     /// A packed run's copy window fell outside the bytes `map_pages` returned or
     /// outside the caller's buffer. Run arithmetic, not a guest condition.
     RunOutOfRange,
+    /// The walk resolved a page the caller was not authorised to write.
+    ///
+    /// Only a *deferred* write carries an authorisation set: it was armed
+    /// against a page list at defer time, and the write that lands it much later
+    /// must reach those pages and no others. A synchronous Store has no such set
+    /// — the command being executed is what names its destination — and passes
+    /// `None`, which can never produce this.
+    ///
+    /// Distinct from every other variant here because nothing is wrong with the
+    /// walk: the page table is healthy and its answer is current. What is stale
+    /// is the window, and the guest has already given that memory to somebody
+    /// else.
+    WriteOutsideWindow,
 }
 
 impl MemError {
@@ -119,6 +132,7 @@ impl crate::observe::Decline for MemError {
             Self::NotRam => "mem_not_ram",
             Self::MapPagesRefused => "mem_map_pages_refused",
             Self::RunOutOfRange => "mem_run_out_of_range",
+            Self::WriteOutsideWindow => "mem_write_outside_window",
         }
     }
 

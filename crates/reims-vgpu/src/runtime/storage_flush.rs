@@ -566,12 +566,14 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
         // The window's pages moved under us. Cache-only: see
         // `window_pages_still_ours` for why writing here lands in another
-        // owner's memory. This is the check that actually protects the write —
-        // it walks every page of the window against the pages it was armed on,
-        // which no scan of a notification log can substitute for.
+        // owner's memory. This is the REPORT — it walks every page of the window
+        // against the pages it was armed on and names the event with counts a
+        // reader can score. The BOUND is `Some(&entry.pages)` below, which the
+        // writer's own walk enforces; a decision taken before a second walk is
+        // a decision about a page table the bytes do not go through.
         guest = "skip_drift";
     } else if guest_write {
-        guest = match crate::runtime::metal_draw::write_gva_rgba8(
+        guest = match crate::runtime::metal_draw::write_gva_rgba8_within(
             state,
             host,
             entry.task_id,
@@ -581,6 +583,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             entry.row_stride,
             entry.format,
             &rgba,
+            Some(&entry.pages),
         ) {
             Ok(()) => "written",
             // The guest already tore this window down and its Unmap notify has

@@ -3488,11 +3488,11 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
 /// contains almost every other task's range. `owners` is not evidence that a
 /// range is legitimate and nothing may gate on it.
 ///
-/// What does bound these writes: the deferred path checks that the window's
-/// guest pages have not moved since it was armed
-/// (`storage_flush::window_pages_still_ours`), and the synchronous Store paths
-/// run inline with the guest command that asked for them, so the target cannot
-/// be freed underneath them.
+/// What does bound these writes: a deferred Store carries the page set it was
+/// armed on and goes through [`write_gva_rgba8_within`], so the walk that
+/// resolves its destination is also the walk that authorises it. A synchronous
+/// Store has no such set — the command being executed is what names its
+/// destination — and its authorisation is the page table at the moment it runs.
 #[allow(
     clippy::too_many_arguments,
     reason = "the archive writer mirrors the target GVA and native row geometry"
@@ -3507,6 +3507,42 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
     bpr: u32,
     format: u16,
     rgba: &[u8],
+) -> Result<(), crate::runtime::host::MemError> {
+    write_gva_rgba8_within(
+        state, host, task_id, gva, width, height, bpr, format, rgba, None,
+    )
+}
+
+/// [`write_gva_rgba8`] bounded to the guest pages a deferred window was armed
+/// on.
+///
+/// A deferred window IS those pages: it was armed when they were the window's,
+/// and it lands an unbounded time later. Re-walking is necessary — a cached view
+/// goes stale silently — but a fresh walk answers *where this address points
+/// now*, which is a different question from *is this still our memory*. Handing
+/// the armed set into the walk makes them one question, so the bytes cannot
+/// reach a page the window was not given, whatever the guest did in between.
+///
+/// This is what closes the gap `storage_flush::deferred_pages_still_ours`
+/// leaves open. That guard walks, decides, and returns; the writer then walks
+/// again, and the guest runs on its own vCPUs between the two. The guard stays —
+/// it names the event in the always-on log with the counts a reader needs — but
+/// it is the report, and this is the bound.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the archive writer mirrors the target GVA and native row geometry"
+)]
+pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+    bpr: u32,
+    format: u16,
+    rgba: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> Result<(), crate::runtime::host::MemError> {
     use crate::runtime::host::MemError;
     if gva == 0 || width == 0 || height == 0 || bpr == 0 {
@@ -3526,9 +3562,11 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
     let span = (height as u64).saturating_mul(bpr as u64);
     let mut row = vec![0u8; tight as usize];
     // Guest writes resolve through a fresh PT walk at write time — never a
-    // cached view (stale-view heap-corruption class; see gva_view::write_span).
+    // cached view (stale-view heap-corruption class; see gva_view::write_span) —
+    // and that walk carries `allowed`, so a deferred window cannot alias a page
+    // outside itself even if the guest re-points the range mid-flush.
     if let Some(span_map) =
-        crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span)
+        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
     {
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut res = Ok(());
@@ -3558,8 +3596,9 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
             return Err(MemError::BadArgs);
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
-        if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
-        {
+        if let Err(err) = crate::runtime::gva_view::write_span_within(
+            state, host, task_id, row_gva, &row, allowed,
+        ) {
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
                 "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
