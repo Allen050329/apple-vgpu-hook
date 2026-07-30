@@ -96,6 +96,22 @@ impl MemoryTopology {
     ///   read is cached. On `Discrete` the buffer must live in system RAM
     ///   (`HOST_CACHED`); reading a BAR window from the CPU is uncached and
     ///   catastrophically slow.
+    ///
+    /// `Readback` requires only `HOST_VISIBLE`, and that is the whole point of
+    /// the class. Adding `HOST_COHERENT` to the requirement reads as harmless —
+    /// Vulkan guarantees a `HOST_VISIBLE|HOST_COHERENT` type exists, so the
+    /// selection never fails — and on any driver whose cached type is *not*
+    /// coherent it silently discards both preferences and lands every readback
+    /// in uncached memory. Intel ANV is exactly that driver: its five types are
+    /// `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` (0x07) and
+    /// `DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED` (0x0b), and nothing carries both
+    /// bits. Measured cost of the fallback on an Intel ARL iGPU: 460 MB/s for a
+    /// full-target readback, 7-11 ms per 3.2 MB frame, 70-86 % of all draw time.
+    ///
+    /// So coherence is the *last* preference rather than a requirement, and a
+    /// caller that gets a non-coherent type owes
+    /// `vkInvalidateMappedMemoryRanges` before it reads. [`MemoryRequest`] is
+    /// only a query; `Pools::create_readback_buffer` records which it got.
     pub fn request(self, class: MemoryClass) -> MemoryRequest {
         use vk::MemoryPropertyFlags as F;
         let host = F::HOST_VISIBLE | F::HOST_COHERENT;
@@ -109,12 +125,16 @@ impl MemoryTopology {
                 preferred: Vec::new(),
             },
             (MemoryClass::Readback, Self::Unified) => MemoryRequest {
-                required: host,
-                preferred: vec![F::DEVICE_LOCAL | F::HOST_CACHED, F::HOST_CACHED],
+                required: F::HOST_VISIBLE,
+                preferred: vec![
+                    F::DEVICE_LOCAL | F::HOST_CACHED,
+                    F::HOST_CACHED,
+                    F::HOST_COHERENT,
+                ],
             },
             (MemoryClass::Readback, Self::Discrete) => MemoryRequest {
-                required: host,
-                preferred: vec![F::HOST_CACHED],
+                required: F::HOST_VISIBLE,
+                preferred: vec![F::HOST_CACHED, F::HOST_COHERENT],
             },
             (MemoryClass::DeviceLocal, _) => MemoryRequest {
                 required: F::DEVICE_LOCAL,
@@ -242,6 +262,32 @@ pub fn select_memory_type(
         .or_else(|| find(req.required))
 }
 
+/// The host-side cost properties of a selected memory type, for a caller that
+/// maps it.
+///
+/// A mapping is only free to read if it is cached, and only free of explicit
+/// `vkInvalidate`/`vkFlushMappedMemoryRanges` if it is coherent. Those two are
+/// independent, and [`MemoryClass::Readback`] deliberately ranks the first above
+/// the second, so an allocation site cannot assume either. Reading the bits is
+/// the topology policy's job (nothing outside `caps/` may name a
+/// `MemoryPropertyFlags`), which is why this lives here rather than at the site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedMemoryKind {
+    pub cached: bool,
+    pub coherent: bool,
+}
+
+impl MappedMemoryKind {
+    pub fn of(props: &vk::PhysicalDeviceMemoryProperties, index: u32) -> Self {
+        use vk::MemoryPropertyFlags as F;
+        let flags = props.memory_types[index as usize].property_flags;
+        Self {
+            cached: flags.contains(F::HOST_CACHED),
+            coherent: flags.contains(F::HOST_COHERENT),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     //! Synthetic `VkPhysicalDeviceMemoryProperties` for every device family in
@@ -294,16 +340,29 @@ pub(crate) mod fixtures {
     }
 
     /// Intel integrated (Mesa ANV): one DEVICE_LOCAL heap over system RAM.
+    ///
+    /// Transcribed from `vulkaninfo` on the x86 dev host (Intel ARL,
+    /// 2026-07-30): one 70 GiB DEVICE_LOCAL heap and five types, `0x07` and
+    /// `0x0b` each appearing twice with a PROTECTED type between them.
+    ///
+    /// **Nothing here carries `HOST_COHERENT` and `HOST_CACHED` together**, and
+    /// that is the load-bearing property. The previous version of this fixture
+    /// gave type 1 both bits — invented, not measured — which made every
+    /// `MemoryClass::Readback` selection test pass while the real device fell
+    /// through to uncached type 0 on every allocation. A fixture more capable
+    /// than the hardware it stands for cannot fail the way the hardware does.
     pub fn intel_igpu() -> vk::PhysicalDeviceMemoryProperties {
         use vk::MemoryPropertyFlags as F;
+        let coherent = F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT;
+        let cached = F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_CACHED;
         build(
-            &[(16 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL)],
+            &[(70 * GIB, vk::MemoryHeapFlags::DEVICE_LOCAL)],
             &[
-                (0, F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT),
-                (
-                    0,
-                    F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
-                ),
+                (0, coherent),
+                (0, cached),
+                (0, F::DEVICE_LOCAL | F::PROTECTED),
+                (0, coherent),
+                (0, cached),
             ],
         )
     }
@@ -454,17 +513,106 @@ mod tests {
         assert_eq!(profile.device_local_bytes, 0);
     }
 
-    /// Readback prefers cached memory on BOTH topologies — an uncached CPU read
-    /// of a present frame is the difference between a copy and a stall.
+    /// Readback lands in cached memory on every device in the matrix — an
+    /// uncached CPU read of a present frame is the difference between a copy and
+    /// a stall (measured: 460 MB/s, 70-86 % of all draw time on an Intel iGPU).
+    ///
+    /// This asserts the **selected type**, not the request. The version it
+    /// replaces checked that `preferred` mentioned `HOST_CACHED` and that
+    /// `required` contained `HOST_VISIBLE | HOST_COHERENT` — both true, and
+    /// together they guaranteed the opposite of what the test was named for on
+    /// any device whose cached type is not coherent, because the preference is
+    /// only ever tried *with* the requirement. A test that reads the query
+    /// cannot see a preference that never matches.
     #[test]
-    fn readback_prefers_cached_on_every_topology() {
+    fn readback_lands_in_cached_memory_on_every_device() {
+        let devices: [(&str, _, MemoryTopology); 6] = [
+            ("apple", apple_m3_max(), MemoryTopology::Unified),
+            ("intel", intel_igpu(), MemoryTopology::Unified),
+            ("amd-apu", amd_apu_host_heap(), MemoryTopology::Unified),
+            ("llvmpipe", llvmpipe(), MemoryTopology::Unified),
+            ("nvidia", nvidia_discrete(), MemoryTopology::Discrete),
+            (
+                "nvidia-rebar",
+                nvidia_discrete_rebar(),
+                MemoryTopology::Discrete,
+            ),
+        ];
+        for (name, props, topology) in devices {
+            let req = topology.request(MemoryClass::Readback);
+            let index =
+                select_memory_type(&props, !0, &req).unwrap_or_else(|| panic!("{name}: no type"));
+            let kind = MappedMemoryKind::of(&props, index);
+            assert!(
+                kind.cached,
+                "{name}: readback took uncached type {index}, so every full-frame \
+                 read on that host is an uncached copy"
+            );
+        }
+    }
+
+    /// Coherence is a preference, not a requirement, and the readback path is
+    /// what owes the invalidate when it does not get it.
+    ///
+    /// Intel ANV is the device that forces the distinction: its cached type is
+    /// not coherent and its coherent types are not cached, so requiring both
+    /// silently selects the uncached one. Apple's single type carries both, so
+    /// the same request needs no invalidate there — both rows are asserted
+    /// because a change that "fixes" one by breaking the other would otherwise
+    /// look green.
+    #[test]
+    fn a_readback_type_may_be_cached_without_being_coherent() {
+        let intel = intel_igpu();
+        let req = MemoryTopology::Unified.request(MemoryClass::Readback);
+        let index = select_memory_type(&intel, !0, &req).expect("intel readback type");
+        assert_eq!(index, 1, "the first cached type, not the coherent type 0");
+        assert_eq!(
+            MappedMemoryKind::of(&intel, index),
+            MappedMemoryKind {
+                cached: true,
+                coherent: false,
+            },
+            "so `BufferSlot::coherent` is false and the reader must invalidate"
+        );
+
+        let apple = apple_m3_max();
+        let index = select_memory_type(&apple, !0, &req).expect("apple readback type");
+        assert_eq!(
+            MappedMemoryKind::of(&apple, index),
+            MappedMemoryKind {
+                cached: true,
+                coherent: true,
+            },
+            "a device with both bits still gets both, and pays no invalidate"
+        );
+    }
+
+    /// A device with no cached type at all must still allocate, and the last
+    /// preference is what keeps it coherent rather than leaving the choice to
+    /// whatever type happens to sit at index 0.
+    #[test]
+    fn a_device_with_no_cached_type_falls_back_to_a_coherent_one() {
         use vk::MemoryPropertyFlags as F;
+        // Type 0 is host-visible and NOT coherent — a shape no real driver is
+        // required to avoid, and the one that would be picked by a bare
+        // `HOST_VISIBLE` requirement with no coherence preference behind it.
+        let props = build(
+            &[(1 << 30, vk::MemoryHeapFlags::DEVICE_LOCAL)],
+            &[
+                (0, F::HOST_VISIBLE),
+                (0, F::HOST_VISIBLE | F::HOST_COHERENT),
+            ],
+        );
         for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
             let req = topology.request(MemoryClass::Readback);
-            assert!(req.required.contains(F::HOST_VISIBLE | F::HOST_COHERENT));
-            assert!(
-                req.preferred.iter().any(|p| p.contains(F::HOST_CACHED)),
-                "{topology:?} readback must prefer HOST_CACHED"
+            let index = select_memory_type(&props, !0, &req).expect("host-visible type exists");
+            assert_eq!(
+                MappedMemoryKind::of(&props, index),
+                MappedMemoryKind {
+                    cached: false,
+                    coherent: true,
+                },
+                "{topology:?}: with nothing cached, coherence is the next best thing"
             );
         }
     }

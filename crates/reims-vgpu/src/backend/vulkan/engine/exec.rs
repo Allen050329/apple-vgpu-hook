@@ -2382,18 +2382,14 @@ pub(crate) unsafe fn execute_draw_inner(
     pools.wait_entry_fence(ctx, counters, fence)?;
 
     phase.enter(super::draw_phase::Phase::Readback);
-    let out = {
-        let ptr = ctx
-            .device
-            .map_memory(rb.memory, 0, rb_size, vk::MemoryMapFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecMapReadback, e)))?
-            as *const u8;
-        let mut pixels = vec![0u8; rb_size as usize];
-        std::ptr::copy_nonoverlapping(ptr, pixels.as_mut_ptr(), rb_size as usize);
-        ctx.device.unmap_memory(rb.memory);
-        counters.note_readback(rb_size);
-        pixels
-    };
+    let out = super::pools::read_back_slot(
+        ctx,
+        rb,
+        rb_size,
+        VkOp::ExecMapReadback,
+        VkOp::ExecInvalidateReadback,
+    )?;
+    counters.note_readback(rb_size);
 
     Ok(DrawOutput { pixels: out })
 }

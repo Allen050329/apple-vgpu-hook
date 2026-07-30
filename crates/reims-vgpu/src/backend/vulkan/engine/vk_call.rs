@@ -51,6 +51,8 @@ pub enum VkOp {
     ReadbackSubmit,
     /// `vkMapMemory` of the readback buffer to copy the pixels out.
     ReadbackMap,
+    /// `vkInvalidateMappedMemoryRanges` of the readback buffer.
+    ReadbackInvalidate,
 
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
@@ -64,6 +66,8 @@ pub enum VkOp {
     StorageReadSubmit,
     /// `vkMapMemory` of the storage readback buffer to copy the bytes out.
     StorageReadMap,
+    /// `vkInvalidateMappedMemoryRanges` of the storage readback buffer.
+    StorageReadInvalidate,
 
     // ---- caches.rs `ObjectCaches` — the L2–L7 immutable-object create caches.
     //      Each op is cached negatively as a `VkCall`, so the cheap re-attempt
@@ -107,6 +111,10 @@ pub enum VkOp {
     ExecSubmit,
     /// `vkMapMemory` of the draw readback buffer.
     ExecMapReadback,
+    /// `vkInvalidateMappedMemoryRanges` of the draw readback buffer, needed
+    /// whenever `MemoryClass::Readback` landed on a host-cached type that is
+    /// not also coherent.
+    ExecInvalidateReadback,
 
     // ---- exec_compute.rs — the compute command-buffer record/submit/readback
     //      rail (a distinct queue submission from the draw rail above) ----
@@ -120,8 +128,12 @@ pub enum VkOp {
     ComputeExecSubmit,
     /// `vkMapMemory` of the storage-buffer readback after the dispatch.
     ComputeExecMapStorageReadback,
+    /// `vkInvalidateMappedMemoryRanges` of the storage-buffer readback.
+    ComputeExecInvalidateStorageReadback,
     /// `vkMapMemory` of the storage-image readback after the dispatch.
     ComputeExecMapImageReadback,
+    /// `vkInvalidateMappedMemoryRanges` of the storage-image readback.
+    ComputeExecInvalidateImageReadback,
 
     // ---- mod.rs guest reset — quiesce before dropping guest-owned state ----
     /// `vkDeviceWaitIdle` before a guest reset destroys device-derived objects.
@@ -305,12 +317,14 @@ impl Decline for VkCall {
             VkOp::ReadbackEndCb => "vk_readback_end_cb",
             VkOp::ReadbackSubmit => "vk_readback_submit",
             VkOp::ReadbackMap => "vk_readback_map",
+            VkOp::ReadbackInvalidate => "vk_readback_invalidate",
 
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
             VkOp::StorageReadSubmit => "vk_storage_read_submit",
             VkOp::StorageReadMap => "vk_storage_read_map",
+            VkOp::StorageReadInvalidate => "vk_storage_read_invalidate",
 
             VkOp::CachesCreateShaderModule => "vk_caches_create_shader_module",
             VkOp::CachesCreateDescriptorSetLayout => "vk_caches_create_descriptor_set_layout",
@@ -332,13 +346,20 @@ impl Decline for VkCall {
             VkOp::ExecEndCb => "vk_exec_end_cb",
             VkOp::ExecSubmit => "vk_exec_submit",
             VkOp::ExecMapReadback => "vk_exec_map_readback",
+            VkOp::ExecInvalidateReadback => "vk_exec_invalidate_readback",
 
             VkOp::ComputeExecResetCb => "vk_compute_exec_reset_cb",
             VkOp::ComputeExecBeginCb => "vk_compute_exec_begin_cb",
             VkOp::ComputeExecEndCb => "vk_compute_exec_end_cb",
             VkOp::ComputeExecSubmit => "vk_compute_exec_submit",
             VkOp::ComputeExecMapStorageReadback => "vk_compute_exec_map_storage_readback",
+            VkOp::ComputeExecInvalidateStorageReadback => {
+                "vk_compute_exec_invalidate_storage_readback"
+            }
             VkOp::ComputeExecMapImageReadback => "vk_compute_exec_map_image_readback",
+            VkOp::ComputeExecInvalidateImageReadback => {
+                "vk_compute_exec_invalidate_image_readback"
+            }
 
             VkOp::GuestResetDeviceWaitIdle => "vk_guest_reset_device_wait_idle",
 
@@ -456,11 +477,13 @@ mod tests {
         VkOp::ReadbackEndCb,
         VkOp::ReadbackSubmit,
         VkOp::ReadbackMap,
+        VkOp::ReadbackInvalidate,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,
         VkOp::StorageReadSubmit,
         VkOp::StorageReadMap,
+        VkOp::StorageReadInvalidate,
         VkOp::CachesCreateShaderModule,
         VkOp::CachesCreateDescriptorSetLayout,
         VkOp::CachesCreatePipelineLayout,
@@ -478,12 +501,15 @@ mod tests {
         VkOp::ExecEndCb,
         VkOp::ExecSubmit,
         VkOp::ExecMapReadback,
+        VkOp::ExecInvalidateReadback,
         VkOp::ComputeExecResetCb,
         VkOp::ComputeExecBeginCb,
         VkOp::ComputeExecEndCb,
         VkOp::ComputeExecSubmit,
         VkOp::ComputeExecMapStorageReadback,
+        VkOp::ComputeExecInvalidateStorageReadback,
         VkOp::ComputeExecMapImageReadback,
+        VkOp::ComputeExecInvalidateImageReadback,
         VkOp::GuestResetDeviceWaitIdle,
         VkOp::SlabAllocateMemory,
         VkOp::PoolsCreateCommandPool,

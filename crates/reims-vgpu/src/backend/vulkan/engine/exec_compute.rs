@@ -1178,13 +1178,13 @@ pub(crate) unsafe fn execute_compute_inner(
         if !writable {
             continue;
         }
-        let ptr = ctx
-            .device
-            .map_memory(slot.memory, 0, *len as u64, vk::MemoryMapFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecMapStorageReadback, e)))?
-            as *const u8;
-        let out = copy_mapped_output(ptr, *len);
-        ctx.device.unmap_memory(slot.memory);
+        let out = crate::backend::vulkan::engine::pools::read_back_slot(
+            ctx,
+            slot,
+            *len as u64,
+            VkOp::ComputeExecMapStorageReadback,
+            VkOp::ComputeExecInvalidateStorageReadback,
+        )?;
         counters.note_readback(*len as u64);
         buffers.push(ComputeBufferOutput {
             binding: *binding,
@@ -1208,18 +1208,13 @@ pub(crate) unsafe fn execute_compute_inner(
             }
             ComputeImageDst::Readback(slot) => slot,
         };
-        let ptr = ctx
-            .device
-            .map_memory(
-                readback.memory,
-                0,
-                prepared.len as u64,
-                vk::MemoryMapFlags::empty(),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ComputeExecMapImageReadback, e)))?
-            as *const u8;
-        let out = copy_mapped_output(ptr, prepared.len);
-        ctx.device.unmap_memory(readback.memory);
+        let out = crate::backend::vulkan::engine::pools::read_back_slot(
+            ctx,
+            readback,
+            prepared.len as u64,
+            VkOp::ComputeExecMapImageReadback,
+            VkOp::ComputeExecInvalidateImageReadback,
+        )?;
         counters.note_readback(prepared.len as u64);
         images.push(out);
         images_deferred.push(false);

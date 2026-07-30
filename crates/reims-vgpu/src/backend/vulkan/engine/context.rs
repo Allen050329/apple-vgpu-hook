@@ -14,7 +14,7 @@ use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::api_floor;
 use crate::backend::vulkan::caps::device_select::select_physical_device;
 use crate::backend::vulkan::caps::memory_topology::{
-    classify_memory, select_memory_type, MemoryClass, MemoryRequest,
+    classify_memory, select_memory_type, MappedMemoryKind, MemoryClass, MemoryRequest,
 };
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
 
@@ -682,6 +682,15 @@ impl DeviceContext {
     /// (the dmabuf import path, which must match a foreign allocation).
     pub(crate) fn memory_type_with(&self, type_bits: u32, req: &MemoryRequest) -> Option<u32> {
         select_memory_type(&self.memory_properties, type_bits, req)
+    }
+
+    /// Whether a selected memory type is host-cached and whether it is coherent.
+    ///
+    /// [`MemoryClass::Readback`] ranks cached above coherent, so a readback
+    /// allocation can legitimately be non-coherent and its reader owes an
+    /// invalidate. A site that maps memory must ask rather than assume.
+    pub(crate) fn mapped_memory_kind(&self, memory_type_index: u32) -> MappedMemoryKind {
+        MappedMemoryKind::of(&self.memory_properties, memory_type_index)
     }
 
     pub(crate) fn queue(&self) -> vk::Queue {

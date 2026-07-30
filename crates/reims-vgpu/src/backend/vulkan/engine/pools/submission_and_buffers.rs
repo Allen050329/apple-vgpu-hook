@@ -1410,6 +1410,9 @@ impl ResourcePools {
             memory,
             size: bucket,
             mapped,
+            // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
+            // needs no flush and the persistent mapping above is sound.
+            coherent: true,
         };
         self.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
@@ -1600,11 +1603,14 @@ impl ResourcePools {
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(bind_op, e))
             })?;
+        let kind = ctx.mapped_memory_kind(mt);
+        note_readback_memory(ctx, mt, req.memory_type_bits, kind);
         Ok(BufferSlot {
             buffer,
             memory,
             size: bucket,
             mapped: 0,
+            coherent: kind.coherent,
         })
     }
 
@@ -2085,6 +2091,70 @@ impl ResourcePools {
             let sk = slot.key();
             self.sampled_free.entry(sk).or_default().push(slot);
         }
+    }
+}
+
+/// Why a readback allocation is slower than the class asked for.
+///
+/// `MemoryClass::Readback` ranks `HOST_CACHED` first because the CPU read that
+/// follows is the whole reason the buffer exists. When no type in the buffer's
+/// `memoryTypeBits` carries it, the fallback still *works* — every readback is
+/// correct — and every one of them reads uncached at roughly a tenth of memcpy
+/// speed. Measured on an Intel ARL iGPU before the class stopped requiring
+/// `HOST_COHERENT`: 460 MB/s, 7-11 ms per 3.2 MB frame, 70-86 % of all draw time
+/// and a device pinned at duty 1.000.
+///
+/// That is exactly the shape the ground rules forbid going unreported: no guest
+/// work is lost, so nothing else in the device has any reason to say a word.
+pub(crate) struct ReadbackMemoryDegrade {
+    memory_type: u32,
+    type_bits: u32,
+}
+
+impl crate::observe::Decline for ReadbackMemoryDegrade {
+    fn slug(&self) -> &'static str {
+        "readback_memory_not_cached"
+    }
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("memory_type", self.memory_type.to_string()),
+            ("type_bits", format!("{:#x}", self.type_bits)),
+        ]
+    }
+}
+
+/// Report which memory type a readback buffer landed in, once per type per boot.
+///
+/// Both outcomes are reported. A zero on the degraded arm has to be readable as
+/// "the cached type was available and taken", which it cannot be if the healthy
+/// case says nothing — so the healthy case emits an always-on notice naming the
+/// type, and only the uncached case is a typed decline.
+fn note_readback_memory(
+    ctx: &DeviceContext,
+    memory_type: u32,
+    type_bits: u32,
+    kind: MappedMemoryKind,
+) {
+    if !crate::observe::first_sight("readback_memory", u64::from(memory_type)) {
+        return;
+    }
+    let topology = ctx.caps.memory.topology.slug();
+    if kind.cached {
+        crate::observe::off(format!(
+            "readback_memory type={memory_type} cached=1 coherent={} topology={topology}",
+            u8::from(kind.coherent),
+        ));
+    } else {
+        crate::observe::Emit::decline(
+            "readback_memory",
+            &ReadbackMemoryDegrade {
+                memory_type,
+                type_bits,
+            },
+        )
+        .field("coherent", u8::from(kind.coherent))
+        .field("topology", topology)
+        .off();
     }
 }
 

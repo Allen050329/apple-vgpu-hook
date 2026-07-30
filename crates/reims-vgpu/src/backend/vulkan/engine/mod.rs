@@ -559,7 +559,7 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
     Some(px)
 }
 
-/// The five fallible Vulkan calls a whole-image readback makes, named per rail.
+/// The six fallible Vulkan calls a whole-image readback makes, named per rail.
 ///
 /// The rails differ in nothing else, but they must not share slugs: a
 /// `reason=vk_readback_submit` that could have come from either the present
@@ -571,6 +571,9 @@ struct ReadbackOps {
     end_cb: VkOp,
     submit: VkOp,
     map: VkOp,
+    /// `vkInvalidateMappedMemoryRanges`, which the readback owes whenever
+    /// `MemoryClass::Readback` landed on a host-cached non-coherent type.
+    invalidate: VkOp,
 }
 
 /// Copy level 0 of a resident color image to host bytes, tightly packed.
@@ -667,21 +670,7 @@ unsafe fn copy_image_level0_to_host(
     let cleanup = pools.seal_entry(Vec::new(), Vec::new());
     pools.finish_entry_async(cleanup);
     pools.wait_entry_fence(ctx, counters, fence)?;
-    let ptr = ctx
-        .device
-        .map_memory(
-            readback.memory,
-            0,
-            rb_size,
-            ash::vk::MemoryMapFlags::empty(),
-        )
-        .map_err(|e| DrawError::VkCall(VkCall::new(ops.map, e)))? as *const u8;
-    // No pre-zero: every one of `rb_size` bytes is written by the copy below, so
-    // `vec![0u8; rb_size]`'s zeroing of a full 8 MiB frame is pure waste on a
-    // guest-blocking drain. Allocate uninit and fill in one pass.
-    let out = exec_compute::copy_mapped_output(ptr, rb_size as usize);
-    ctx.device.unmap_memory(readback.memory);
-    Ok(out)
+    pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
 }
 
 fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
@@ -726,6 +715,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
                 end_cb: VkOp::ReadbackEndCb,
                 submit: VkOp::ReadbackSubmit,
                 map: VkOp::ReadbackMap,
+                invalidate: VkOp::ReadbackInvalidate,
             },
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -797,6 +787,7 @@ pub fn read_resident_storage(
                 end_cb: VkOp::StorageReadEndCb,
                 submit: VkOp::StorageReadSubmit,
                 map: VkOp::StorageReadMap,
+                invalidate: VkOp::StorageReadInvalidate,
             },
         )?;
         pools.set_resident_storage_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);

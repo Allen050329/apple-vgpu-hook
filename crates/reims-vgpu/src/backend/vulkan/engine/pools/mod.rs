@@ -16,7 +16,7 @@ use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::types::{DrawError, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use crate::backend::vulkan::caps::MemoryClass;
+use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
 
@@ -44,6 +44,15 @@ pub(crate) struct BufferSlot {
     /// Vulkan permits a memory object to stay mapped for its lifetime, and
     /// `vkFreeMemory` unmaps implicitly, so no teardown changes.
     pub mapped: usize,
+    /// Whether `memory`'s type carries `HOST_COHERENT`.
+    ///
+    /// `MemoryClass::Readback` prefers `HOST_CACHED` over coherence, because a
+    /// cached read is an order of magnitude faster and several drivers (Intel
+    /// ANV among them) expose no type carrying both. A reader of a slot whose
+    /// memory is not coherent owes `vkInvalidateMappedMemoryRanges` before it
+    /// touches the mapping, so the slot states the property rather than leaving
+    /// each reader to re-derive it from the type index.
+    pub coherent: bool,
 }
 
 pub(crate) struct TargetSlot {
@@ -1029,6 +1038,77 @@ unsafe fn staging_write_ptr(
         .device
         .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
         .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))? as *mut u8)
+}
+
+/// Copy the first `len` bytes out of a readback slot, invalidating first when the
+/// slot's memory is not coherent.
+///
+/// **Every reader of a `MemoryClass::Readback` slot goes through here.** That
+/// class ranks `HOST_CACHED` above `HOST_COHERENT` — a cached read is an order of
+/// magnitude faster and several drivers expose no type carrying both — so the
+/// mapping can hold cache lines predating the GPU's writes, and a reader that
+/// skips `vkInvalidateMappedMemoryRanges` does not fail: it silently returns
+/// whatever it last read through that pooled buffer.
+///
+/// Which is to say the failure mode is *the previous frame*, and it is not
+/// theoretical. Adding the invalidate at only the draw rail left three others —
+/// `read_target_inner`, the compute storage-buffer readback and the compute
+/// storage-image readback — and two GPU parity cases went red with the second of
+/// two renders reporting the first one's pixels (`a_view_swizzle_…` read the
+/// identity result out of the swizzled draw; `depth_test_honored_on_resident_…`
+/// scored `Less` and `Greater` as equal). One reader means the next rail added
+/// cannot reintroduce that.
+///
+/// `WHOLE_SIZE` needs no `nonCoherentAtomSize` rounding, and the copy allocates
+/// uninitialized: every one of `len` bytes is written before the length becomes
+/// visible, so pre-zeroing a full frame is pure waste on a guest-blocking path.
+///
+/// A slot that is already mapped is read through that mapping. `vkMapMemory` on
+/// an already-mapped memory object fails `VK_ERROR_MEMORY_MAP_FAILED`, and the
+/// compute rail reads *back* out of slots it acquired from the staging pool
+/// (`acquire_staging`, which maps for the slot's lifetime) — so the persistent
+/// staging mapping had made 8 of `vk_engine_compute`'s 14 cases fail with
+/// `reason=vk_compute_exec_map_storage_readback
+/// vk_result=Mapping_of_a_memory_object_has_failed`, i.e. every SSBO dispatch on
+/// this host. This mirrors `staging_write_ptr`'s rule for the write direction.
+///
+/// `map_op` and `invalidate_op` stay per-rail so an exhaustion or a driver
+/// refusal still names which readback failed.
+pub(super) unsafe fn read_back_slot(
+    ctx: &DeviceContext,
+    slot: &BufferSlot,
+    len: u64,
+    map_op: VkOp,
+    invalidate_op: VkOp,
+) -> Result<Vec<u8>, DrawError> {
+    let persistent = slot.mapped != 0;
+    let ptr = if persistent {
+        slot.mapped as *const u8
+    } else {
+        ctx.device
+            .map_memory(slot.memory, 0, len, vk::MemoryMapFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(map_op, e)))? as *const u8
+    };
+    // Unmapping is only ours to do when the mapping is ours; a persistent one
+    // belongs to the slot and outlives this read.
+    let release = |ctx: &DeviceContext| {
+        if !persistent {
+            ctx.device.unmap_memory(slot.memory);
+        }
+    };
+    if !slot.coherent {
+        let range = vk::MappedMemoryRange::default()
+            .memory(slot.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        if let Err(e) = ctx.device.invalidate_mapped_memory_ranges(&[range]) {
+            release(ctx);
+            return Err(DrawError::VkCall(VkCall::new(invalidate_op, e)));
+        }
+    }
+    let out = super::exec_compute::copy_mapped_output(ptr, len as usize);
+    release(ctx);
+    Ok(out)
 }
 
 #[cfg(test)]

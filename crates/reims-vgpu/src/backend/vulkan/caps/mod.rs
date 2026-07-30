@@ -42,7 +42,9 @@ mod gate;
 pub mod memory_topology;
 
 pub use device_select::{rank_physical_device, select_physical_device};
-pub use memory_topology::{MemoryClass, MemoryProfile, MemoryTopology, TopologySignal};
+pub use memory_topology::{
+    MappedMemoryKind, MemoryClass, MemoryProfile, MemoryTopology, TopologySignal,
+};
 
 use ash::vk;
 
