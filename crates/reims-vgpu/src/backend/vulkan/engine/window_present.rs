@@ -110,6 +110,41 @@ impl crate::observe::Decline for SlateReason {
     }
 }
 
+/// Why the CPU fallback source could not be staged.
+///
+/// Its own type rather than a `DrawError` because the present does not abort on
+/// it: the swapchain image is already acquired, so the frame degrades to slate
+/// and the window stays alive. Each variant names the exact call that refused,
+/// so the fix is not a guess about which of five allocations failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagingError {
+    Call(VkCall),
+    /// No memory type satisfies `MemoryClass::Upload` for the staging image.
+    /// Vulkan guarantees a `HOST_VISIBLE|HOST_COHERENT` type exists, so this
+    /// means the image's own `memoryTypeBits` excluded every one of them.
+    NoUploadMemoryType {
+        type_bits: u32,
+    },
+}
+
+impl crate::observe::Decline for StagingError {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Call(call) => call.slug(),
+            Self::NoUploadMemoryType { .. } => "window_staging_no_upload_memory_type",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Call(call) => call.fields(),
+            Self::NoUploadMemoryType { type_bits } => {
+                vec![("type_bits", format!("{type_bits:#x}"))]
+            }
+        }
+    }
+}
+
 /// What the registry knows about one candidate identity, flattened so the
 /// classification below is pure and testable without a GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -153,6 +188,169 @@ pub(crate) fn classify_slate(
     SlateReason::ContentNotReady
 }
 
+/// A CPU-BGRA frame offered as the present source when no resident carries the
+/// display.
+///
+/// The resident is always preferred: taking it is the whole point of presenting
+/// on the engine device, and it costs no host memory traffic. This exists for
+/// the presents that have no resident at all — the firmware/boot framebuffer, a
+/// mapping the compositor has cleared but never rendered into, and the frames
+/// after a device reset. Without it those presents would show slate, which on
+/// Linux would be a blank window for the whole of early boot.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowCpuFrame<'a> {
+    pub bgra: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    /// Publish sequence of the frame these bytes came from. The staging image
+    /// keeps the last one it uploaded, so a forced redraw (resize, suboptimal
+    /// self-heal) re-blits without re-copying 8 MB that have not changed.
+    pub seq: u64,
+}
+
+/// Whether a published CPU frame holds every byte of the geometry it claims.
+///
+/// A short buffer is not a degraded frame, it is a torn one: the blit would
+/// read whatever the staging image held below the copied rows, which is the
+/// previous frame at whatever geometry it had. Kept out of the staging code so
+/// the rejection is a value test rather than a length check buried in an unsafe
+/// copy loop.
+fn cpu_frame_complete(frame: &WindowCpuFrame<'_>) -> bool {
+    if frame.width == 0 || frame.height == 0 {
+        return false;
+    }
+    let need = (frame.width as usize)
+        .saturating_mul(frame.height as usize)
+        .saturating_mul(4);
+    need != 0 && frame.bgra.len() >= need
+}
+
+/// The staging image's persistent host mapping.
+///
+/// A raw pointer is not `Send`, and [`WindowPresenter`] lives inside the global
+/// engine mutex, which must be. The mapping is created with the image, lives
+/// exactly as long as it, and is only ever dereferenced by the thread holding
+/// that mutex — so moving the address across threads is sound. Saying so in a
+/// wrapper keeps it a pointer in the type system; laundering it through a
+/// `usize` would hide the same claim behind an integer.
+struct MappedStaging(*mut u8);
+
+// SAFETY: see the type's documentation — ownership is exclusive under the engine
+// mutex and the mapping outlives every dereference.
+unsafe impl Send for MappedStaging {}
+
+/// Host-visible LINEAR image the CPU fallback frame is copied into, then
+/// scale-blitted into the acquired swapchain image.
+///
+/// LINEAR because the copy is a host write through a persistent map, and a host
+/// write to an OPTIMAL image has no defined layout. Row pitch comes from the
+/// driver rather than from the width: it is free to pad, and copying tightly
+/// into a padded image shears the picture.
+struct StagingImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    mapped: MappedStaging,
+    width: u32,
+    height: u32,
+    row_pitch: u64,
+    offset: u64,
+    /// Whether the image has ever been transitioned out of `PREINITIALIZED`.
+    /// The first blit must declare that layout as the old one so the host
+    /// writes are not discarded; every later blit declares `GENERAL`.
+    transitioned: bool,
+    /// [`WindowCpuFrame::seq`] of the bytes currently held, or `None` for a
+    /// freshly created image that holds no frame.
+    staged_seq: Option<u64>,
+}
+
+impl StagingImage {
+    unsafe fn destroy(self, device: &ash::Device) {
+        device.unmap_memory(self.memory);
+        device.destroy_image(self.image, None);
+        device.free_memory(self.memory, None);
+    }
+}
+
+/// The image this present blits from, and what it takes to make it readable.
+///
+/// A resident lives in whatever layout its last draw left it and moves to
+/// `TRANSFER_SRC_OPTIMAL`. The staging image is host-written through a
+/// persistent map, so it must stay in a layout that permits host access —
+/// `GENERAL` — and needs a `HOST_WRITE → TRANSFER_READ` barrier instead of a
+/// layout transition. Reading a host-written image from `TRANSFER_SRC_OPTIMAL`
+/// is the defect this distinction exists to prevent.
+#[derive(Clone, Copy)]
+enum BlitSource {
+    Resident {
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        width: u32,
+        height: u32,
+    },
+    Staged {
+        image: vk::Image,
+        /// The image has never left `PREINITIALIZED`, so that is the layout the
+        /// barrier must declare — only `PREINITIALIZED` and `GENERAL` preserve
+        /// contents, and declaring the wrong one discards the frame just
+        /// uploaded.
+        first_use: bool,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl BlitSource {
+    fn image(&self) -> vk::Image {
+        match self {
+            Self::Resident { image, .. } | Self::Staged { image, .. } => *image,
+        }
+    }
+
+    fn extent(&self) -> (u32, u32) {
+        match self {
+            Self::Resident { width, height, .. } | Self::Staged { width, height, .. } => {
+                (*width, *height)
+            }
+        }
+    }
+
+    /// Record the barrier that makes this source readable by the blit, and
+    /// return the layout the blit must name.
+    unsafe fn record_read_barrier(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+    ) -> vk::ImageLayout {
+        match self {
+            Self::Resident { image, layout, .. } => {
+                transition_source(device, cmd, *image, *layout);
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+            }
+            Self::Staged {
+                image, first_use, ..
+            } => {
+                let old = if *first_use {
+                    vk::ImageLayout::PREINITIALIZED
+                } else {
+                    vk::ImageLayout::GENERAL
+                };
+                image_barrier(
+                    device,
+                    cmd,
+                    *image,
+                    old,
+                    vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::HOST_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::TRANSFER,
+                );
+                vk::ImageLayout::GENERAL
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowPresentOutcome {
     Busy,
@@ -186,13 +384,23 @@ pub(crate) struct WindowPresenter {
     /// Consecutive presents whose acquire or present reported a suboptimal
     /// surface. Each one arms a recreation; see [`SUBOPTIMAL_ALARM_STREAK`].
     suboptimal_streak: u32,
-    /// Reason for the slate run currently in progress, `None` while presenting
-    /// guest content. A line is emitted when a run STARTS or its reason
-    /// CHANGES, and a summary when it ends — so a window blank for a minute at
-    /// 120 Hz costs two lines, not 7200.
+    /// Reason the resident could not carry the run currently in progress,
+    /// `None` while presenting a resident directly. A line is emitted when a
+    /// run STARTS or its reason CHANGES, and a summary when it ends — so a
+    /// window blank for a minute at 120 Hz costs two lines, not 7200.
     slate_reason: Option<SlateReason>,
-    /// Consecutive slate presents in the current run.
+    /// Consecutive presents in the current non-resident run.
     slate_run: u64,
+    /// Whether the run in progress is being covered by CPU bytes. A covered run
+    /// shows the guest's frame and only costs the host copy the resident rail
+    /// exists to remove; an uncovered one is a blank window. They share a
+    /// `SlateReason` and have completely different severities, so the run
+    /// tracker carries which it is rather than reporting both as blank.
+    slate_covered: bool,
+    /// Host-visible staging for the CPU fallback source. Allocated on the first
+    /// present that needs it and kept until the geometry changes, so a boot that
+    /// never falls back never allocates it.
+    staging: Option<StagingImage>,
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     image_available: vk::Semaphore,
@@ -330,6 +538,8 @@ impl WindowPresenter {
             suboptimal_streak: 0,
             slate_reason: None,
             slate_run: 0,
+            slate_covered: false,
+            staging: None,
             cmd_pool,
             cmd,
             image_available,
@@ -544,6 +754,7 @@ impl WindowPresenter {
         pools: &mut ResourcePools,
         counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
+        cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentOutcome, DrawError> {
         if !self.retire(ctx, pools)? {
             self.note_cadence(false, false);
@@ -581,26 +792,26 @@ impl WindowPresenter {
         let selected = source.and_then(|source| {
             source.candidates.iter().find_map(|identity| {
                 let slot = pools.registry_get(identity)?;
-                (slot.content_ready
-                    && slot.bgra
-                    && slot.width == source.width
-                    && slot.height == source.height)
-                    .then(|| {
-                        (
-                            identity.clone(),
-                            slot.image,
-                            slot.layout,
-                            slot.width,
-                            slot.height,
-                        )
-                    })
+                super::pools::slot_presentable(slot, source.width, source.height).then(|| {
+                    (
+                        identity.clone(),
+                        slot.image,
+                        slot.layout,
+                        slot.width,
+                        slot.height,
+                    )
+                })
             })
         });
-        if selected.is_some() {
+        // Only reached when no resident carries this present: upload the CPU
+        // bytes instead. `None` here means the window shows slate.
+        let staged = if selected.is_some() {
             self.note_slate_end();
+            None
         } else {
-            // Failure path only: re-walk the candidates to name WHY nothing
-            // could be presented. Cheap because it never runs on a good frame.
+            // Failure path only: re-walk the candidates to name WHY the
+            // resident could not carry. Cheap because it never runs on a good
+            // frame.
             let states: Vec<CandidateState> = source
                 .map(|source| {
                     source
@@ -620,12 +831,13 @@ impl WindowPresenter {
                 })
                 .unwrap_or_default();
             let want = source.map_or((0, 0), |s| (s.width, s.height));
-            self.note_slate(
-                classify_slate(source.is_some(), want, &states),
-                want,
-                &states,
-            );
-        }
+            let reason = classify_slate(source.is_some(), want, &states);
+            let staged = cpu
+                .filter(cpu_frame_complete)
+                .and_then(|frame| self.stage_cpu_frame(ctx, frame));
+            self.note_slate(reason, want, &states, staged.is_some());
+            staged
+        };
         let mut pinned = Vec::with_capacity(1);
         if let Some((identity, _, _, _, _)) = selected.as_ref() {
             if !pools.pin_resident_target(identity, true) {
@@ -637,6 +849,22 @@ impl WindowPresenter {
             }
             pinned.push(identity.clone());
         }
+
+        // One blit body for both sources: they differ only in which image is
+        // read and how it is made readable. Keeping them separate is how the
+        // aspect-fit and letterbox-clear rules drift apart between the two
+        // rails.
+        let blit = selected
+            .as_ref()
+            .map(
+                |(_, image, layout, base_width, base_height)| BlitSource::Resident {
+                    image: *image,
+                    layout: *layout,
+                    width: *base_width,
+                    height: *base_height,
+                },
+            )
+            .or(staged);
 
         let submit_result = (|| {
             ctx.device
@@ -673,14 +901,15 @@ impl WindowPresenter {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
             );
-            if let Some((identity, image, layout, base_width, base_height)) = selected.as_ref() {
+            if let Some(blit) = blit {
+                let (base_width, base_height) = blit.extent();
                 // Aspect-fit placement: the guest frame keeps its aspect ratio
                 // inside whatever drawable exists right now (a guest-driven
                 // native resize normally makes this the full window within
                 // milliseconds). The window input path maps pointer positions
                 // through this same transform.
                 let vp = crate::host_window::viewport::aspect_fit(
-                    (*base_width, *base_height),
+                    (base_width, base_height),
                     (self.extent.width, self.extent.height),
                 );
                 if !vp.covers((self.extent.width, self.extent.height)) {
@@ -696,16 +925,19 @@ impl WindowPresenter {
                         &[color_range],
                     );
                 }
-                transition_source(&ctx.device, self.cmd, *image, *layout);
+                let src_layout = blit.record_read_barrier(&ctx.device, self.cmd);
                 blit_rect(
                     &ctx.device,
                     self.cmd,
-                    *image,
+                    blit.image(),
                     dst,
-                    (0, 0, *base_width, *base_height),
+                    src_layout,
+                    (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
-                pools.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                if let Some((identity, _, _, _, _)) = selected.as_ref() {
+                    pools.registry_set_layout(identity, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                }
             } else {
                 ctx.device.cmd_clear_color_image(
                     self.cmd,
@@ -755,6 +987,15 @@ impl WindowPresenter {
         }
         self.pinned = pinned;
         self.submitted = true;
+        if matches!(blit, Some(BlitSource::Staged { .. })) {
+            // The barrier that leaves the staging image in GENERAL is now
+            // queued. Recorded only after the submit succeeds: a failed submit
+            // never executes it, and declaring GENERAL as the old layout of an
+            // image still in PREINITIALIZED discards the frame it holds.
+            if let Some(staging) = self.staging.as_mut() {
+                staging.transitioned = true;
+            }
+        }
 
         let swapchains = [self.swapchain];
         let indices = [image_index];
@@ -813,10 +1054,169 @@ impl WindowPresenter {
         }
     }
 
-    /// Record a slate present. Emits a fail-visible line when a run starts or
-    /// its reason changes; silent for every repeat within a run.
-    fn note_slate(&mut self, reason: SlateReason, want: (u32, u32), states: &[CandidateState]) {
-        if self.slate_reason == Some(reason) {
+    /// Copy a published CPU frame into the staging image and describe it as a
+    /// blit source. `None` means the staging image could not be provided, and
+    /// the present falls through to slate with the reason already named.
+    ///
+    /// Seq-gated: a forced redraw (resize, suboptimal self-heal) re-blits the
+    /// bytes already staged rather than copying a full frame again.
+    unsafe fn stage_cpu_frame(
+        &mut self,
+        ctx: &DeviceContext,
+        frame: WindowCpuFrame<'_>,
+    ) -> Option<BlitSource> {
+        if let Err(error) = self.ensure_staging(ctx, frame.width, frame.height) {
+            // A host that cannot allocate staging cannot allocate it next frame
+            // either, so this latches to one line per boot rather than one per
+            // present.
+            crate::observe::Emit::decline("host_window_staging", &error).fail_once(0);
+            return None;
+        }
+        let staging = self.staging.as_mut()?;
+        if staging.staged_seq != Some(frame.seq) {
+            // Row by row: the driver is free to pad a LINEAR image's rows, and
+            // copying tightly into a padded image shears the picture.
+            let src_row = frame.width as usize * 4;
+            for y in 0..frame.height as usize {
+                let dst = staging
+                    .mapped
+                    .0
+                    .add(staging.offset as usize + y * staging.row_pitch as usize);
+                std::ptr::copy_nonoverlapping(frame.bgra.as_ptr().add(y * src_row), dst, src_row);
+            }
+            staging.staged_seq = Some(frame.seq);
+        }
+        Some(BlitSource::Staged {
+            image: staging.image,
+            first_use: !staging.transitioned,
+            width: staging.width,
+            height: staging.height,
+        })
+    }
+
+    /// Provide a host-visible LINEAR staging image at exactly `width`x`height`.
+    ///
+    /// A geometry change destroys the previous one, which is safe here because
+    /// [`Self::present`] retires the in-flight fence before reaching this point,
+    /// so no queued blit still reads it.
+    unsafe fn ensure_staging(
+        &mut self,
+        ctx: &DeviceContext,
+        width: u32,
+        height: u32,
+    ) -> Result<(), StagingError> {
+        if self
+            .staging
+            .as_ref()
+            .is_some_and(|s| s.width == width && s.height == height)
+        {
+            return Ok(());
+        }
+        if let Some(old) = self.staging.take() {
+            old.destroy(&ctx.device);
+        }
+        let image = ctx
+            .device
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(translate::pixel::SCANOUT_FORMAT)
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::LINEAR)
+                    .usage(vk::ImageUsageFlags::TRANSFER_SRC)
+                    .initial_layout(vk::ImageLayout::PREINITIALIZED),
+                None,
+            )
+            .map_err(|result| {
+                StagingError::Call(VkCall::new(VkOp::WindowCreateStagingImage, result))
+            })?;
+        let req = ctx.device.get_image_memory_requirements(image);
+        let Some(mem_type) = ctx.memory_type_for(
+            req.memory_type_bits,
+            crate::backend::vulkan::caps::MemoryClass::Upload,
+        ) else {
+            ctx.device.destroy_image(image, None);
+            return Err(StagingError::NoUploadMemoryType {
+                type_bits: req.memory_type_bits,
+            });
+        };
+        let memory = match ctx.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type),
+            None,
+        ) {
+            Ok(memory) => memory,
+            Err(result) => {
+                ctx.device.destroy_image(image, None);
+                return Err(StagingError::Call(VkCall::new(
+                    VkOp::WindowAllocateStagingMemory,
+                    result,
+                )));
+            }
+        };
+        if let Err(result) = ctx.device.bind_image_memory(image, memory, 0) {
+            ctx.device.destroy_image(image, None);
+            ctx.device.free_memory(memory, None);
+            return Err(StagingError::Call(VkCall::new(
+                VkOp::WindowBindStagingMemory,
+                result,
+            )));
+        }
+        let layout = ctx.device.get_image_subresource_layout(
+            image,
+            vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
+        );
+        let mapped = match ctx
+            .device
+            .map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
+        {
+            Ok(pointer) => MappedStaging(pointer as *mut u8),
+            Err(result) => {
+                ctx.device.destroy_image(image, None);
+                ctx.device.free_memory(memory, None);
+                return Err(StagingError::Call(VkCall::new(
+                    VkOp::WindowMapStagingMemory,
+                    result,
+                )));
+            }
+        };
+        self.staging = Some(StagingImage {
+            image,
+            memory,
+            mapped,
+            width,
+            height,
+            row_pitch: layout.row_pitch,
+            offset: layout.offset,
+            transitioned: false,
+            staged_seq: None,
+        });
+        Ok(())
+    }
+
+    /// Record a present that no resident carried. Emits a line when a run
+    /// starts or its reason changes; silent for every repeat within a run.
+    ///
+    /// `covered` splits two very different outcomes that share a reason: the
+    /// window showing the guest's frame from CPU bytes (correct, and only as
+    /// expensive as the host copy this rail exists to remove — a census line),
+    /// and the window showing nothing at all (a visible loss — a failure line).
+    fn note_slate(
+        &mut self,
+        reason: SlateReason,
+        want: (u32, u32),
+        states: &[CandidateState],
+        covered: bool,
+    ) {
+        if self.slate_reason == Some(reason) && self.slate_covered == covered {
             self.slate_run = self.slate_run.saturating_add(1);
             return;
         }
@@ -824,6 +1224,7 @@ impl WindowPresenter {
             self.note_slate_end();
         }
         self.slate_reason = Some(reason);
+        self.slate_covered = covered;
         self.slate_run = 1;
         let seen = states
             .iter()
@@ -839,14 +1240,29 @@ impl WindowPresenter {
             })
             .collect::<Vec<_>>()
             .join(",");
-        crate::observe::Emit::decline("host_window_slate", &reason)
-            .field("want", format!("{}x{}", want.0, want.1))
-            .field("candidates", states.len())
-            .field("seen", format!("[{seen}]"))
-            .fail();
+        let emit = crate::observe::Emit::decline(
+            if covered {
+                "host_window_cpu_fallback"
+            } else {
+                "host_window_slate"
+            },
+            &reason,
+        )
+        .field("want", format!("{}x{}", want.0, want.1))
+        .field("candidates", states.len())
+        .field("seen", format!("[{seen}]"));
+        if covered {
+            // The guest's frame IS on screen; what was lost is the direct
+            // handoff, which costs host copies rather than pixels. Expected for
+            // the whole of firmware boot, so a failure line here would cry wolf
+            // on every run.
+            emit.off();
+        } else {
+            emit.fail();
+        }
     }
 
-    /// Close an in-progress slate run, reporting how long the window was blank.
+    /// Close an in-progress non-resident run, reporting how long it lasted.
     fn note_slate_end(&mut self) {
         let Some(reason) = self.slate_reason.take() else {
             return;
@@ -855,8 +1271,10 @@ impl WindowPresenter {
         // it is a census line rather than a drop, per the curated-fail rule.
         crate::observe::Emit::decline("host_window_slate_end", &reason)
             .field("frames", self.slate_run)
+            .field("covered", u8::from(self.slate_covered))
             .off();
         self.slate_run = 0;
+        self.slate_covered = false;
     }
 
     fn note_cadence(&mut self, presented: bool, direct: bool) {
@@ -906,6 +1324,9 @@ impl WindowPresenter {
             self.pinned.clear();
         }
         self.submitted = false;
+        if let Some(staging) = self.staging.take() {
+            staging.destroy(&ctx.device);
+        }
         ctx.device.destroy_fence(self.in_flight, None);
         ctx.device.destroy_semaphore(self.render_finished, None);
         ctx.device.destroy_semaphore(self.image_available, None);
@@ -1002,6 +1423,7 @@ unsafe fn blit_rect(
     cmd: vk::CommandBuffer,
     src: vk::Image,
     dst: vk::Image,
+    src_layout: vk::ImageLayout,
     src_rect: PresentRect,
     dst_rect: PresentRect,
 ) {
@@ -1011,7 +1433,7 @@ unsafe fn blit_rect(
     device.cmd_blit_image(
         cmd,
         src,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        src_layout,
         dst,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         &[vk::ImageBlit::default()
@@ -1062,6 +1484,60 @@ mod tests {
         assert_eq!(
             swapchain_recreated_line(from, to, "resize"),
             "host_window_swapchain status=recreated from=1920x1080 to=1440x1080 trigger=resize"
+        );
+    }
+
+    /// The staging upload copies `height` rows of `width * 4` bytes out of the
+    /// published buffer. A buffer short of that would read whatever the staging
+    /// image held below the copied rows — the previous frame, at whatever
+    /// geometry it had — and blit the result as though it were current.
+    ///
+    /// The short case is not hypothetical: every present the device elides the
+    /// readback for publishes an EMPTY buffer, because the resident is carrying
+    /// that frame. Those arrive here whenever the resident then turns out not to
+    /// be presentable, which is exactly when the fallback runs.
+    #[test]
+    fn a_cpu_frame_shorter_than_its_own_geometry_is_refused() {
+        let full = vec![0u8; 8 * 4 * 4];
+        assert!(cpu_frame_complete(&WindowCpuFrame {
+            bgra: &full,
+            width: 8,
+            height: 4,
+            seq: 1,
+        }));
+        // Slop is fine — the copy reads exactly what the geometry names.
+        assert!(cpu_frame_complete(&WindowCpuFrame {
+            bgra: &full,
+            width: 8,
+            height: 3,
+            seq: 1,
+        }));
+        assert!(
+            !cpu_frame_complete(&WindowCpuFrame {
+                bgra: &full[..full.len() - 1],
+                width: 8,
+                height: 4,
+                seq: 1,
+            }),
+            "one byte short is still a torn last row"
+        );
+        assert!(
+            !cpu_frame_complete(&WindowCpuFrame {
+                bgra: &[],
+                width: 8,
+                height: 4,
+                seq: 1,
+            }),
+            "the elided-readback publish carries no bytes at all"
+        );
+        assert!(
+            !cpu_frame_complete(&WindowCpuFrame {
+                bgra: &full,
+                width: 0,
+                height: 4,
+                seq: 1,
+            }),
+            "a zero dimension names no pixels and blits nothing"
         );
     }
 

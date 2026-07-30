@@ -58,7 +58,7 @@ pub use types::{
 };
 pub use vk_call::{VkCall, VkOp};
 #[cfg(feature = "host-window")]
-pub use window_present::WindowPresentOutcome;
+pub use window_present::{WindowCpuFrame, WindowPresentOutcome};
 
 use caches::ObjectCaches;
 use context::ContextOwner;
@@ -198,6 +198,31 @@ pub fn window_present_attach(
     Ok(())
 }
 
+/// Whether the host window is presenting from the engine's own device.
+///
+/// Read by the present-capture path on the drain worker, which must decide
+/// whether to read the finished frame back into host memory *before* it does so
+/// — deciding at publish time leaves the readback already paid for. A relaxed
+/// atomic rather than [`lock_engine`] because that call site runs once per
+/// present on the only thread that executes guest work, and taking the engine
+/// lock there to read one bit would serialize it against the window thread's
+/// own present.
+#[cfg(feature = "host-window")]
+static WINDOW_PRESENT_ATTACHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the window's rail choice. Called by the window thread from exactly
+/// the two places that create and destroy the presenter.
+#[cfg(feature = "host-window")]
+pub fn note_window_present_attached(attached: bool) {
+    WINDOW_PRESENT_ATTACHED.store(attached, Ordering::Release);
+}
+
+#[cfg(feature = "host-window")]
+pub fn window_present_attached() -> bool {
+    WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire)
+}
+
 #[cfg(feature = "host-window")]
 pub fn window_present_resize(width: u32, height: u32) {
     let mut guard = lock_engine();
@@ -206,11 +231,13 @@ pub fn window_present_resize(width: u32, height: u32) {
     }
 }
 
-/// Present the current compositor resident through the engine-owned MoltenVK
-/// swapchain. Acquire is nonblocking, so a vblank wait never holds `ENGINE`.
+/// Present the current compositor resident through the engine-owned swapchain,
+/// falling back to `cpu` for presents no resident carries. Acquire is
+/// nonblocking, so a vblank wait never holds `ENGINE`.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
+    cpu: Option<WindowCpuFrame<'_>>,
 ) -> Result<WindowPresentOutcome, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
@@ -224,7 +251,7 @@ pub fn window_present_frame(
     let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
         EngineFacadeDecline::WindowPresenterNotAttached,
     ))?;
-    unsafe { presenter.present(ctx, pools, counters, source) }
+    unsafe { presenter.present(ctx, pools, counters, source, cpu) }
 }
 
 /// Destroy the engine-owned surface while the native AppKit window still
@@ -340,6 +367,18 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
 /// Used by type-11 sample dig (`sample_src=… resident_ready=`) to detect the
 /// resident-vs-guest split without a full readback. Does not create devices or
 /// allocate; returns false if the engine is uninit or the key is absent.
+/// Whether the window presenter would take this resident for a present at
+/// `width`x`height`. Shares [`pools::slot_presentable`] with the presenter's own
+/// selection so the two cannot answer differently.
+#[cfg(feature = "host-window")]
+pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) -> bool {
+    let guard = lock_engine();
+    guard
+        .pools
+        .registry_get(identity)
+        .is_some_and(|slot| pools::slot_presentable(slot, width, height))
+}
+
 pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
     let guard = lock_engine();
     guard

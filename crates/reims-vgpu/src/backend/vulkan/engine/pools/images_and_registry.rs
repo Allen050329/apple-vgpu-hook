@@ -972,6 +972,41 @@ mod pin_count_tests {
         }
     }
 
+    /// The window presenter blits a resident with no format conversion and no
+    /// source scaling, so every one of these four conditions is load-bearing.
+    ///
+    /// It matters that this is ONE function: the device's publish path asks it
+    /// a frame ahead of the presenter to decide whether to read the frame back
+    /// into host memory. A looser predicate there elides the readback for a
+    /// frame the presenter then refuses, and the window goes blank with no CPU
+    /// pixels behind it — a disagreement neither call site can see on its own.
+    #[test]
+    fn only_a_ready_bgra_resident_at_the_exact_geometry_is_presentable() {
+        let ready = dummy_slot(true);
+        assert!(slot_presentable(&ready, 16, 16));
+
+        assert!(
+            !slot_presentable(&dummy_slot(false), 16, 16),
+            "content that has not landed would present the previous frame"
+        );
+
+        let mut rgba = dummy_slot(true);
+        rgba.bgra = false;
+        assert!(
+            !slot_presentable(&rgba, 16, 16),
+            "the blit does no channel swap; RGBA would present with red and blue exchanged"
+        );
+
+        assert!(
+            !slot_presentable(&ready, 32, 16),
+            "a wider present than the resident holds would blit a stretched frame"
+        );
+        assert!(
+            !slot_presentable(&ready, 16, 32),
+            "a taller present than the resident holds would blit a stretched frame"
+        );
+    }
+
     /// A draw into this identity invalidates any stamp on it. The image's
     /// pixels just changed, and until something publishes them as the mapping's
     /// content the type-11 LOAD gate must not treat them as current — otherwise

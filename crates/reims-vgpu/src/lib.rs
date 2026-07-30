@@ -567,119 +567,89 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
     if key == link.last {
         return;
     }
-    let need = (p.frame_width as usize)
-        .saturating_mul(p.frame_height as usize)
+    // Copied out rather than held behind `p`: the branches below assign
+    // `state.present.display_from_resident`, and the frame bytes are the only
+    // thing that still has to be read through the borrow.
+    let (mapping, width, height, generation) = (
+        p.frame_mapping,
+        p.frame_width,
+        p.frame_height,
+        p.frame_generation,
+    );
+    let need = (width as usize)
+        .saturating_mul(height as usize)
         .saturating_mul(4);
     if need == 0 {
         return;
     }
-    #[cfg(target_os = "macos")]
+    let present_identity =
+        crate::runtime::present_identity::surface_identity(state, mapping, width, height);
+    // Keep the resident this present names alive across the idle sweep below,
+    // then reclaim targets idle past the wall-clock age threshold so VRAM returns
+    // to the working-set baseline after a compositing burst instead of sitting at
+    // the high REGISTRY_CAP for the guest lifetime.
+    let now_ms = crate::observe::elapsed_ms() as u64;
+    crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
+    crate::backend::vulkan::engine::maintain_idle_residents(Some(&present_identity), now_ms);
+    // The window presenting from the engine's own device can take the resident
+    // as it stands, so the frame never crosses host memory. `display_from_resident`
+    // is what tells the NEXT capture not to read it back, and it is only set
+    // when a resident actually carried this one.
+    if crate::backend::vulkan::engine::window_present_attached()
+        && crate::backend::vulkan::engine::resident_presentable(&present_identity, width, height)
     {
-        // Only the engine-swapchain handoff consumes a resident source, and it is
-        // macOS-only. Building it unconditionally walked present state once per
-        // frame for nothing on every other host.
-        let resident_source =
-            window_present_source(state, p.frame_mapping, p.frame_width, p.frame_height);
-        let direct_ready = resident_source
-            .candidates
-            .iter()
-            .any(crate::backend::vulkan::engine::resident_content_ready);
-        if !direct_ready {
-            // The captured frame never reaches the window: no candidate
-            // resident carries its content, so the window keeps showing its
-            // previous frame (or slate). Counted rather than logged per-frame —
-            // this fires at present rate during boot and idle, and the
-            // interesting signal is a SUSTAINED run, which the windowed proxy
-            // reports as `dropped=N reason=resident_not_ready`.
-            crate::runtime::census::present_proxy::window_publish::note(false);
-            state.present.display_from_resident = false;
-            return;
-        }
-        let now_ms = crate::observe::elapsed_ms() as u64;
-        crate::backend::vulkan::engine::touch_resident_target(
-            resident_source.candidates.first(),
-            now_ms,
-        );
-        crate::backend::vulkan::engine::maintain_idle_residents(
-            resident_source.candidates.first(),
-            now_ms,
-        );
-        let published = window_write_frame(
-            link,
-            p.frame_width,
-            p.frame_height,
-            Vec::new(),
-            None,
-            Some(resident_source),
-        );
+        let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
+            width,
+            height,
+            candidates: vec![present_identity],
+        };
+        let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
         crate::runtime::census::present_proxy::window_publish::note(published);
         if published {
             link.last = key;
             state.present.display_from_resident = true;
         }
+        return;
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let present_identity = crate::runtime::present_identity::surface_identity(
-            state,
-            p.frame_mapping,
-            p.frame_width,
-            p.frame_height,
-        );
-        // Keep the resident this present names alive across the idle sweep below,
-        // then reclaim targets idle past the wall-clock age threshold so VRAM returns
-        // to the working-set baseline after a compositing burst instead of sitting at
-        // the high REGISTRY_CAP for the guest lifetime.
-        let now_ms = crate::observe::elapsed_ms() as u64;
-        crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
-        crate::backend::vulkan::engine::maintain_idle_residents(Some(&present_identity), now_ms);
-        let bgra = {
-            if p.frame_bgra.len() < need {
-                // No usable CPU frame: nothing to publish. Reachable via keep-prior
-                // when a capture FAILS at a new/larger geometry (dims advanced, the
-                // buffer kept the smaller prior). Skipping is correct (never publish a
-                // short/torn frame; the window holds its last good frame), but silence
-                // would hide "the window froze because captures keep failing at this
-                // geometry". Fail-visible + deduped per geometry so a persistent
-                // mismatch logs once, not every present (no flood).
-                if link.bgra_short_geom != Some((p.frame_width, p.frame_height)) {
-                    link.bgra_short_geom = Some((p.frame_width, p.frame_height));
-                    observe::off(format!(
-                        "publish_window_frame DROP reason=frame_bgra_short mid={} {}x{} \
-                     have={} need={need} gen={}",
-                        p.frame_mapping,
-                        p.frame_width,
-                        p.frame_height,
-                        p.frame_bgra.len(),
-                        p.frame_generation
-                    ));
-                }
-                return;
-            }
-            // A well-formed frame cleared the short-buffer condition; re-arm the latch
-            // so a later mismatch at the same geometry logs again.
-            link.bgra_short_geom = None;
-            p.frame_bgra[..need].to_vec()
-        };
-        if window_write_frame(link, p.frame_width, p.frame_height, bgra, None) {
-            link.last = key;
+    // No resident carries this present (firmware framebuffer, a mapping the
+    // compositor cleared but never rendered into, the frames after a device
+    // reset), or the window is driving its own device because the engine's
+    // cannot present to this surface. Either way the window needs CPU pixels,
+    // and the next capture must read them back.
+    state.present.display_from_resident = false;
+    if state.present.frame_bgra.len() < need {
+        // No usable CPU frame: nothing to publish. Reachable via keep-prior
+        // when a capture FAILS at a new/larger geometry (dims advanced, the
+        // buffer kept the smaller prior), and on the present right after a
+        // resident-carried one, whose capture deliberately left the buffer
+        // empty. Skipping is correct (never publish a short/torn frame; the
+        // window holds its last good frame), but silence would hide "the window
+        // froze because captures keep failing at this geometry". Fail-visible +
+        // deduped per geometry so a persistent mismatch logs once, not every
+        // present (no flood).
+        if link.bgra_short_geom != Some((width, height)) {
+            link.bgra_short_geom = Some((width, height));
+            observe::off(format!(
+                "publish_window_frame DROP reason=frame_bgra_short mid={} {}x{} \
+                 have={} need={need} gen={}",
+                mapping,
+                width,
+                height,
+                state.present.frame_bgra.len(),
+                generation
+            ));
         }
+        crate::runtime::census::present_proxy::window_publish::note(false);
+        return;
     }
-}
-
-#[cfg(all(feature = "host-window", target_os = "macos"))]
-fn window_present_source(
-    state: &crate::model::DeviceState,
-    mapping: u32,
-    width: u32,
-    height: u32,
-) -> crate::backend::vulkan::engine::WindowPresentSource {
-    crate::backend::vulkan::engine::WindowPresentSource {
-        width,
-        height,
-        candidates: vec![crate::runtime::present_identity::surface_identity(
-            state, mapping, width, height,
-        )],
+    // A well-formed frame cleared the short-buffer condition; re-arm the latch
+    // so a later mismatch at the same geometry logs again.
+    link.bgra_short_geom = None;
+    let bgra = state.present.frame_bgra[..need].to_vec();
+    let published = window_write_frame(link, width, height, bgra, None);
+    crate::runtime::census::present_proxy::window_publish::note(published);
+    if published {
+        link.last = key;
     }
 }
 

@@ -287,6 +287,14 @@ pub enum VkOp {
     WindowQueuePresent,
     /// `vkQueueWaitIdle` before destroying the window presenter.
     WindowDestroyQueueWaitIdle,
+    /// `vkCreateImage` for the presenter's host-visible LINEAR staging image.
+    WindowCreateStagingImage,
+    /// `vkAllocateMemory` for the presenter's staging image.
+    WindowAllocateStagingMemory,
+    /// `vkBindImageMemory` binding the presenter's staging image.
+    WindowBindStagingMemory,
+    /// `vkMapMemory` persistently mapping the presenter's staging image.
+    WindowMapStagingMemory,
 }
 
 /// A failed Vulkan call: which operation refused, and the driver's `vk::Result`.
@@ -357,9 +365,7 @@ impl Decline for VkCall {
                 "vk_compute_exec_invalidate_storage_readback"
             }
             VkOp::ComputeExecMapImageReadback => "vk_compute_exec_map_image_readback",
-            VkOp::ComputeExecInvalidateImageReadback => {
-                "vk_compute_exec_invalidate_image_readback"
-            }
+            VkOp::ComputeExecInvalidateImageReadback => "vk_compute_exec_invalidate_image_readback",
 
             VkOp::GuestResetDeviceWaitIdle => "vk_guest_reset_device_wait_idle",
 
@@ -432,6 +438,10 @@ impl Decline for VkCall {
             VkOp::WindowSubmitPresent => "vk_window_submit_present",
             VkOp::WindowQueuePresent => "vk_window_queue_present",
             VkOp::WindowDestroyQueueWaitIdle => "vk_window_destroy_queue_wait_idle",
+            VkOp::WindowCreateStagingImage => "vk_window_create_staging_image",
+            VkOp::WindowAllocateStagingMemory => "vk_window_allocate_staging_memory",
+            VkOp::WindowBindStagingMemory => "vk_window_bind_staging_memory",
+            VkOp::WindowMapStagingMemory => "vk_window_map_staging_memory",
         }
     }
 

@@ -483,6 +483,23 @@ struct ResidentStorageImageSlot {
 }
 
 /// Persistent GPU render-target slot (identity-keyed registry, workstream D).
+/// Whether a resident can be blitted to the host window exactly as it stands.
+///
+/// The window presenter does no format conversion and no scaling of the source
+/// rect, so all four conditions are hard: content landed, guest scanout byte
+/// order, and the exact geometry the present names.
+///
+/// It is a free function because two callers must ask the *same* question at
+/// two different moments. The presenter asks it to pick a source; the device's
+/// publish path asks it a frame earlier to decide whether to read the frame back
+/// into host memory at all. If publish's predicate were the looser one, it would
+/// elide the readback for a frame the presenter then refuses — a blank window
+/// with no CPU pixels behind it, and no single site able to see the
+/// disagreement.
+pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u32) -> bool {
+    slot.content_ready && slot.bgra && slot.width == width && slot.height == height
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,

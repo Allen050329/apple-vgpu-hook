@@ -103,6 +103,22 @@ pub struct Frame {
 /// 8 MiB deep copy of an unchanged frame.
 pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 
+/// Offer a published frame's CPU bytes to the engine presenter.
+///
+/// The presenter prefers the resident and only reads these when none carries the
+/// display — the firmware framebuffer, and any mapping the compositor has not
+/// rendered into. `bgra` is empty on presents the device elided the readback
+/// for, and the presenter rejects a short buffer rather than blitting a torn
+/// frame.
+fn window_cpu_frame(frame: &Frame) -> crate::backend::vulkan::engine::WindowCpuFrame<'_> {
+    crate::backend::vulkan::engine::WindowCpuFrame {
+        bgra: &frame.bgra,
+        width: frame.width,
+        height: frame.height,
+        seq: frame.seq,
+    }
+}
+
 /// Whether a present must upload `incoming`'s frame into the staging image.
 /// True unless the staging image already holds that exact `seq` — the seq-gated
 /// fast path that elides the per-vblank full-frame re-upload of unchanged
@@ -460,11 +476,9 @@ pub fn run(
         window: None,
         vk: None,
         cursor: (0, 0),
-        #[cfg(target_os = "macos")]
+        engine_attached: false,
         first_engine_present_logged: false,
-        #[cfg(target_os = "macos")]
         first_engine_guest_logged: false,
-        #[cfg(target_os = "macos")]
         engine_error_logged: false,
         next_engine_redraw: std::time::Instant::now(),
         last_engine_seq: None,
@@ -527,6 +541,7 @@ pub fn start_main_thread(
             window: None,
             vk: None,
             cursor: (0, 0),
+            engine_attached: false,
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
             engine_error_logged: false,
@@ -611,11 +626,12 @@ struct App {
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
-    #[cfg(target_os = "macos")]
+    /// The window presents from the engine's own `VkDevice`. False means the
+    /// engine presenter refused this surface and [`VkState`] is driving the
+    /// swapchain from a second device instead.
+    engine_attached: bool,
     first_engine_present_logged: bool,
-    #[cfg(target_os = "macos")]
     first_engine_guest_logged: bool,
-    #[cfg(target_os = "macos")]
     engine_error_logged: bool,
     /// When the event loop should next look for a new guest frame. The loop
     /// sleeps until then rather than re-requesting a redraw immediately, which
@@ -664,37 +680,62 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        #[cfg(target_os = "macos")]
-        {
-            let attach = window
-                .display_handle()
-                .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))
-                .and_then(|display| {
-                    window
-                        .window_handle()
-                        .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))
-                        .map(|handle| (display.as_raw(), handle.as_raw()))
-                })
-                .and_then(|(display, handle)| {
-                    let size = window.inner_size();
-                    crate::backend::vulkan::engine::window_present_attach(
-                        display,
-                        handle,
-                        size.width.max(1),
-                        size.height.max(1),
-                    )
-                    .map_err(|error| WindowError::AttachEngine(error.to_string()))
-                });
-            match attach {
-                Ok(()) => {
-                    window.request_redraw();
-                    self.window = Some(window);
-                }
-                Err(error) => {
+        // Prefer the engine's own device. Presenting the compositor resident
+        // from the device that rendered it is what removes the three full-frame
+        // host copies every presented layer otherwise pays: the drain's
+        // `read_target`, the publish copy, and the window's staging upload.
+        let attach = window
+            .display_handle()
+            .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))
+            .and_then(|display| {
+                window
+                    .window_handle()
+                    .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))
+                    .map(|handle| (display.as_raw(), handle.as_raw()))
+            })
+            .and_then(|(display, handle)| {
+                let size = window.inner_size();
+                crate::backend::vulkan::engine::window_present_attach(
+                    display,
+                    handle,
+                    size.width.max(1),
+                    size.height.max(1),
+                )
+                .map_err(|error| WindowError::AttachEngine(error.to_string()))
+            });
+        match attach {
+            Ok(()) => {
+                self.engine_attached = true;
+                crate::backend::vulkan::engine::note_window_present_attached(true);
+                window.request_redraw();
+                self.window = Some(window);
+                return;
+            }
+            Err(error) => {
+                // macOS has no second rail: MoltenVK surface creation failing
+                // is fatal for the window either way, and opening a second
+                // `VkInstance` against the same `CAMetalLayer` would not fix
+                // it. Elsewhere the presenter's typed capability refusals
+                // (`SwapchainUnavailable`, `QueueCannotPresent`) name a host
+                // whose engine device cannot drive this surface — a hybrid
+                // laptop where the engine picked the discrete GPU, or a build
+                // without the swapchain extension — and the window falls back
+                // to its own device and CPU pixels.
+                #[cfg(target_os = "macos")]
+                {
                     crate::observe::Emit::decline("host_window_init", &error).fail();
                     eprintln!("reims-vgpu-window: engine swapchain init failed: {error}");
                     self.request_shutdown();
                     event_loop.exit();
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    crate::observe::Emit::decline("host_window_engine_attach", &error).fail();
+                    eprintln!(
+                        "reims-vgpu-window: engine present unavailable ({error}); \
+                         falling back to the window's own device"
+                    );
                 }
             }
         }
@@ -727,21 +768,21 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                #[cfg(target_os = "macos")]
-                {
-                    let applied = (size.width.max(1), size.height.max(1));
+                let applied = (size.width.max(1), size.height.max(1));
+                if self.engine_attached {
                     crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
-                    self.engine_redraw_required = true;
+                    #[cfg(target_os = "macos")]
                     self.note_guest_resize_applied(applied);
+                } else {
+                    #[cfg(not(target_os = "macos"))]
+                    if let Some(vk) = self.vk.as_mut() {
+                        unsafe { vk.recreate_swapchain(applied.0, applied.1) };
+                    }
                 }
-                #[cfg(not(target_os = "macos"))]
-                if let Some(vk) = self.vk.as_mut() {
-                    unsafe { vk.recreate_swapchain(size.width.max(1), size.height.max(1)) };
-                    // Fresh swapchain images hold nothing; the seq gate would
-                    // otherwise skip until the guest happened to produce a new
-                    // frame, leaving the resized window blank.
-                    self.engine_redraw_required = true;
-                }
+                // Fresh swapchain images hold nothing; the seq gate would
+                // otherwise skip until the guest happened to produce a new
+                // frame, leaving the resized window blank.
+                self.engine_redraw_required = true;
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -781,8 +822,11 @@ impl ApplicationHandler for App {
         // first makes the driver marshal to a freed wl_proxy and crash. winit
         // calls this before the loop ends, so the ordering is explicit here
         // rather than relying on struct field order alone.
-        #[cfg(target_os = "macos")]
-        crate::backend::vulkan::engine::window_present_detach();
+        if self.engine_attached {
+            crate::backend::vulkan::engine::window_present_detach();
+            crate::backend::vulkan::engine::note_window_present_attached(false);
+            self.engine_attached = false;
+        }
         #[cfg(not(target_os = "macos"))]
         {
             self.vk = None;
@@ -854,10 +898,13 @@ impl App {
     }
 
     fn surface_dims(&self) -> (u32, u32) {
-        #[cfg(target_os = "macos")]
-        if let Some(window) = self.window.as_ref() {
-            let size = window.inner_size();
-            return (size.width.max(1), size.height.max(1));
+        // The engine presenter owns the swapchain, so the native window is the
+        // only thing that knows the drawable size on that rail.
+        if self.engine_attached {
+            if let Some(window) = self.window.as_ref() {
+                let size = window.inner_size();
+                return (size.width.max(1), size.height.max(1));
+            }
         }
         self.vk
             .as_ref()
@@ -890,9 +937,9 @@ impl App {
     }
 
     fn draw(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
+        if self.engine_attached {
             self.draw_engine_window();
+            return;
         }
         #[cfg(not(target_os = "macos"))]
         let Some(vk) = self.vk.as_mut() else {
@@ -927,10 +974,11 @@ impl App {
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn draw_engine_window(&mut self) {
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
+        #[cfg(target_os = "macos")]
         self.request_guest_geometry(frame.as_deref());
+        #[cfg(target_os = "macos")]
         if self.pending_guest_resize.is_some() {
             // A guest mode change is being applied to the native window
             // (normally single-digit milliseconds; bounded by the 1 s alarm).
@@ -950,6 +998,7 @@ impl App {
         }
         let result = crate::backend::vulkan::engine::window_present_frame(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
+            frame.as_deref().map(window_cpu_frame),
         );
         match result {
             Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Busy) => {}
