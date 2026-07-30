@@ -1659,15 +1659,32 @@ One mistake in this class *is* catchable and was caught: an ungated helper over 
 (`TYPE7_FIRST_TLVS` and friends live behind `#[cfg(all(feature = "backend-metal", target_os =
 "macos"))]`) fails the Vulkan-arm clippy with `cannot find value`. Gate the helper like its callers.
 
-**The yield curve is steep, so stop when it flattens.** Measured on `icb/tests.rs`: 182 lines, then
-44, then the next candidate is worth ~17. Remaining known groups, with the reason each is smaller
-than it looks:
+**The yield curve is steep, and this vein is now exhausted.** Measured on `icb/tests.rs`, in the
+order taken: **−182** (adopt `put_function_object`, 14 sites), **−44**
+(`make_render_pipeline_desc`, 6 sites), **−33** (`make_compute_pipeline_desc`, 8 sites). Then it
+stops, and the reason is worth knowing because it is a property of test code rather than of this
+file.
+
+A whole-file scan for any 6-to-16-line block recurring 4+ times, with integer literals normalised so
+near-identical blocks group, returns nothing else worth taking. Every remaining group is a **struct
+literal carrying that test's own values** — `IcbRenderFill { command_index, pipeline_ref, … }`,
+`IcbRenderDraw::MeshThreadgroups { threadgroups_x, …, mesh_tg_z }`, buffer-bind descriptors — at 13
+to 22 sites each. Those are not duplication, they are the specifications: the literal *is* what the
+case asserts about, a builder would need one parameter per field so the call would be no shorter, and
+hiding the values behind it would make the suite harder to read for no line saving. Leave them.
+
+The two remaining non-literal groups were checked and rejected on size:
 
 - `metal_draw/tests.rs` page-table directory fixture — the clone report says 5 sites, exact-match is
   **3**, and each uses `dir_pfn` and `root_gpa` afterwards, so the helper must return a tuple. ~17
-  lines. Not taken.
-- `icb/tests.rs` groups at 4544/4663/4780/4974 and 4720/4837/5057 — not examined.
-- `compute_exec/tests.rs` 887/942/1431 — not examined.
+  lines.
+- `icb/tests.rs` around 4043/4250/4358 — already helper-based after the three changes above; what
+  repeats now is a prologue of *distinct* helper calls with per-test refs and GVAs.
+
+So the rule that falls out: **a repeated block is reducible when it is repeated *code*, and not when
+it is repeated *shape around different data*.** The clone detector cannot tell those apart — it
+normalises literals precisely so it can group them — so the last step is always to read one instance
+and ask which of the two it is.
 
 A test helper is only worth extracting when it removes more than it adds *after* rustfmt, and the
 call has to fit in 100 columns or every site wraps to eight lines. The `put_function_object` calls
