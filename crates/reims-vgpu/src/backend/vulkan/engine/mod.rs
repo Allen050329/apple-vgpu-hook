@@ -370,7 +370,13 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
 /// Whether the window presenter would take this resident for a present at
 /// `width`x`height`. Shares [`pools::slot_presentable`] with the presenter's own
 /// selection so the two cannot answer differently.
-#[cfg(feature = "host-window")]
+///
+/// Not gated on `host-window`, because the question is about the target registry
+/// rather than about a window: `runtime::drain`'s `present_unbacked` gate asks it
+/// to tell "the guest sent no full frame for this mid AND nothing can carry the
+/// present" (a black frame) from "no full frame, but a resident carries it
+/// anyway" (a census). That distinction has to be available on every Vulkan
+/// build, not only the ones that opened a window.
 pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) -> bool {
     let guard = lock_engine();
     guard

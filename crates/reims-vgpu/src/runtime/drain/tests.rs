@@ -2513,6 +2513,91 @@ fn present_backing_gate_reports_a_surface_nothing_ever_stored() {
     );
 }
 
+/// An unbacked present is only a *loss* when nothing carries it, and a build
+/// that cannot answer must keep the loud reading.
+///
+/// The structural gate above reads `dense_frame_seq`, which only
+/// `publish_surface_store` advances — i.e. only when a Store's pixels reached the
+/// mapping's guest pages. The resident rail renders into the registry and skips
+/// that write, so "unbacked" stopped implying "shows black": one 524 s boot
+/// emitted four `reason=…never_stored` lines each claiming the surface was
+/// uninitialized, against exactly one `host_window_slate*` line in the whole run
+/// (a `covered=1` boot run) with `presents == offered` and `direct_frac=1.00` in
+/// every cadence window bracketing them. A resident carried all four.
+///
+/// So the channel turns on the carrier, and the `None` arm is the whole content
+/// of the rule: `carried != Some(true)` and `carried == Some(false)` differ only
+/// where the build cannot tell, which is precisely where demoting a possible
+/// black frame to a census would go unnoticed.
+#[test]
+fn an_unbacked_present_fails_unless_a_resident_positively_carries_it() {
+    use super::{carrier_word, unbacked_present_is_a_loss};
+
+    assert!(
+        !unbacked_present_is_a_loss(Some(true)),
+        "a resident carried the frame, so no guest work was lost — census"
+    );
+    assert!(
+        unbacked_present_is_a_loss(Some(false)),
+        "nothing can carry this present, so it shows black — failure channel"
+    );
+    assert!(
+        unbacked_present_is_a_loss(None),
+        "a build that cannot answer must not downgrade a possible black frame"
+    );
+
+    // The field has to distinguish all three, or the log cannot tell "nothing
+    // carried it" from "we did not look" — the difference between a defect and
+    // an unmeasured build.
+    let words = [
+        carrier_word(Some(true)),
+        carrier_word(Some(false)),
+        carrier_word(None),
+    ];
+    assert_eq!(words, ["resident", "nothing", "unknown"]);
+    assert_eq!(
+        words.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3,
+        "each carrier state needs its own word"
+    );
+}
+
+/// The two arms of the gate must name themselves, and `Restaled` must carry the
+/// seq that did not move — two presents quoting the same number are the same
+/// guest frame shown twice, which is the whole diagnostic.
+#[test]
+fn present_backing_names_its_own_reason_and_restale_carries_its_seq() {
+    use crate::model::PresentBacking;
+    use crate::observe::Decline;
+
+    let restaled = PresentBacking::Restaled { seq: 41 };
+    let never = PresentBacking::NeverStored;
+    assert_ne!(
+        restaled.slug(),
+        never.slug(),
+        "two distinct findings must not share a slug"
+    );
+    assert_eq!(
+        restaled.fields(),
+        vec![("since_seq", "41".to_string())],
+        "a restale without its seq is half a diagnostic"
+    );
+    assert!(
+        never.fields().is_empty(),
+        "never-stored has no seq to report — there was never one"
+    );
+
+    // Rendered through the same builder the emission site uses, so the test pins
+    // the line a reader will grep rather than the accessor.
+    let line = crate::observe::Emit::decline("present_unbacked", &restaled)
+        .field("mid", 4u32)
+        .field("carried", super::carrier_word(Some(false)))
+        .render();
+    assert!(line.contains("reason=present_backing_restaled"), "{line}");
+    assert!(line.contains("since_seq=41"), "{line}");
+    assert!(line.contains("carried=nothing"), "{line}");
+}
+
 /// An AIR-load hold is control flow; a hold that outlives the device is the
 /// failure. The two must not share a channel.
 ///

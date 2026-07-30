@@ -1510,25 +1510,47 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         // the log; nothing here papers over it.
         //
         // The line says "naming this mid" rather than "received", because that
-        // is the whole of what was read. The peer-seed half of the old wording
-        // named a mechanism `62587b1` deleted, and "received" would claim the
-        // resident was checked, which it is not — see `note_present_backing`.
-        match state.note_present_backing(mapping) {
-            Some(crate::model::PresentBacking::Restaled { seq }) => {
-                crate::observe::fail(format!(
-                    "present_unbacked mid={mapping} {w}x{h} gen={gen} reason=restaled \
-                     since_seq={seq} (no full-frame store named this mid since its last \
-                     present; the resident it will read was not checked)"
-                ));
+        // is the whole of what `note_present_backing` read: decoded Store
+        // bookkeeping, never the resident.
+        //
+        // WHICH IS WHY IT ALSO HAS TO READ THE CARRIER. The gate's witness is
+        // `dense_frame_seq`, advanced only by `publish_surface_store` — i.e. when
+        // a Store's pixels reached the mapping's GUEST PAGES. The resident rail
+        // renders into the registry and skips that write, so "no full frame was
+        // published for this mid" no longer implies "nothing can show one". A
+        // 524 s boot measured four `reason=…never_stored` lines, each claiming
+        // the surface was uninitialized and therefore black, against exactly one
+        // `host_window_slate*` line in the whole run — a `covered=1` boot run at
+        // t=22 s — with `presents == offered` and `direct_frac=1.00` in every
+        // cadence window bracketing all four. A resident carried every one of
+        // them. The message asserted a visual consequence the check cannot see,
+        // which is "a reason the caller writes is not a reading" applied to an
+        // outcome instead of a cause.
+        //
+        // So ask the presenter's own question, through the rule it shares
+        // (`pools::slot_presentable`), and split on the answer the same way
+        // `host_window_slate` / `host_window_slate_end` already split: a present
+        // nothing can carry is a black frame and belongs on the failure channel;
+        // one a resident carries cost no guest work and is a census. Reporting
+        // both as black cries wolf every boot and — worse — leaves the real case
+        // indistinguishable from the benign one, which is how a genuine
+        // black-screen boot once produced zero lines here.
+        //
+        // Priced where it runs: one registry lookup under the engine lock, inside
+        // the arm, so only on a present the structural gate has already refused —
+        // four times in that boot, not 60 times a second.
+        if let Some(backing) = state.note_present_backing(mapping) {
+            let carried = present_resident_carries(state, mapping, w, h);
+            let emit = crate::observe::Emit::decline("present_unbacked", &backing)
+                .field("mid", mapping)
+                .field("geom", format!("{w}x{h}"))
+                .field("gen", gen)
+                .field("carried", carrier_word(carried));
+            if unbacked_present_is_a_loss(carried) {
+                emit.fail();
+            } else {
+                emit.off();
             }
-            Some(crate::model::PresentBacking::NeverStored) => {
-                crate::observe::fail(format!(
-                    "present_unbacked mid={mapping} {w}x{h} gen={gen} reason=never_stored \
-                     (first present since this mapping was created and no full-frame store \
-                     has ever named it; the surface is uninitialized, so this shows black)"
-                ));
-            }
-            None => {}
         }
         // The transaction payload carries exactly one field: plane 0's surface
         // id. So the capture source is the surface the guest named, and no
@@ -3133,6 +3155,64 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 /// One line per second, one atomic load per field. Emitted from the same window
 /// as `drain_duty` so the two divide against each other; a delta on its own
 /// clock would not.
+/// Would a resident carry the present this mapping names, at this geometry?
+///
+/// `Some(true)` a presentable resident exists, `Some(false)` none does — so a
+/// present with no guest-page frame behind it shows black — and `None` on a
+/// backend with no target registry to ask, where the honest answer is that this
+/// build cannot tell.
+///
+/// It asks through [`crate::backend::vulkan::engine::resident_presentable`],
+/// which shares `pools::slot_presentable` with the window presenter's own
+/// selection. Sharing the rule is the point rather than tidiness: a looser
+/// predicate here would report a frame as carried that the presenter then
+/// refuses, which is a disagreement neither call site can see on its own — the
+/// same shape as the publish/present split that once blanked the window.
+#[cfg(feature = "backend-vulkan")]
+fn present_resident_carries(
+    state: &crate::model::DeviceState,
+    mapping: u32,
+    width: u32,
+    height: u32,
+) -> Option<bool> {
+    let identity =
+        crate::runtime::present_identity::surface_identity(state, mapping, width, height);
+    Some(crate::backend::vulkan::engine::resident_presentable(
+        &identity, width, height,
+    ))
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn present_resident_carries(
+    _state: &crate::model::DeviceState,
+    _mapping: u32,
+    _width: u32,
+    _height: u32,
+) -> Option<bool> {
+    None
+}
+
+/// Which channel an unbacked present belongs on: `true` is the failure channel.
+///
+/// A separate function because the `None` arm is the whole content of the rule
+/// and it is one character away from being wrong. `carried != Some(true)` and
+/// `carried == Some(false)` differ only when the build cannot answer, and that is
+/// exactly the case where a possible black frame would be downgraded to a census
+/// with nothing to notice it. Fail-closed: only a resident that positively
+/// carries the frame demotes the line.
+fn unbacked_present_is_a_loss(carried: Option<bool>) -> bool {
+    carried != Some(true)
+}
+
+/// The `carried=` field: what answered for this present, or that nothing could.
+fn carrier_word(carried: Option<bool>) -> &'static str {
+    match carried {
+        Some(true) => "resident",
+        Some(false) => "nothing",
+        None => "unknown",
+    }
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn emit_engine_delta() {
     use crate::backend::vulkan::engine::CounterSnapshot;

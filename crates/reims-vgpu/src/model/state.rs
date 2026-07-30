@@ -736,17 +736,41 @@ impl ComputeStorageResidencyKey {
 /// Why a present is not backed by guest work, as reported by
 /// [`DeviceState::note_present_backing`].
 ///
-/// Two distinct losses, and the callee names which so the caller cannot supply
-/// the word. They differ in what the viewer sees: `Restaled` shows the previous
-/// frame again, `NeverStored` shows an uninitialized surface — a black screen.
+/// Two distinct findings, and the callee names which so the caller cannot supply
+/// the word. Both are statements about **decoded Store bookkeeping only** —
+/// `dense_frame_seq`, advanced when a Store's pixels reached the mapping's guest
+/// pages. Neither says what the viewer sees, and that limit is the point: on the
+/// resident rail a Store renders into the registry without writing guest pages,
+/// so a mapping can be "unbacked" here while a perfectly good resident carries
+/// its present. What the viewer sees takes the carrier reading the emission site
+/// pairs with this (`resident_presentable`), never this value alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentBacking {
     /// Presented again with no full-frame Store naming this mapping since its
     /// own previous present. Carries the unchanged `dense_frame_seq`.
     Restaled { seq: u64 },
     /// First present since this mapping was created, and no full-frame Store has
-    /// ever named it. The surface is uninitialized.
+    /// ever named it.
     NeverStored,
+}
+
+impl crate::observe::Decline for PresentBacking {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Restaled { .. } => "present_backing_restaled",
+            Self::NeverStored => "present_backing_never_stored",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            // The seq the witness did NOT advance past, which is what makes a
+            // restale readable: two presents quoting the same number are the
+            // same guest frame shown twice.
+            Self::Restaled { seq } => vec![("since_seq", seq.to_string())],
+            Self::NeverStored => Vec::new(),
+        }
+    }
 }
 
 /// Which rail holds the authoritative pixels of a mapping-keyed deferred
