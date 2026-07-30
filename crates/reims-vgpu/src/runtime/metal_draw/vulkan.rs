@@ -2719,6 +2719,29 @@ fn native_scratch_to_upload(
     Some((out, TexelLayout::Rgba8))
 }
 
+/// The sampled linear ladder's hot rung: read the guest's own rows for this
+/// texture, reuse the converted copy when the bytes have not changed.
+///
+/// It carries essentially all of this pathway's sampled traffic — 725 231 of
+/// 725 233 loads on a driven boot — so it is where a wrong-content defect would
+/// have to live, and it is worth stating plainly that nothing here guesses:
+///
+/// - The address chain is resolved fresh on every call.
+///   `objects::lookup_list_entry` re-reads the object-list entry out of guest
+///   memory, `read_descriptor` re-reads the descriptor, and `level_gva` derives
+///   the span from that. No step caches, so a recycled `texture_ref` cannot
+///   hand this the previous resource's address.
+/// - The staleness check is exact, not sampled. The full `bpr * h` native span
+///   is re-read every call and compared byte for byte against the memo
+///   (`m.native == scratch`), padding included, so a guest write anywhere in
+///   the span misses the memo.
+/// - The read does not go through a cached host view. `gva_view`'s registered
+///   views measured a zero hit rate on this pathway (`view_reuse` = 0 over four
+///   boots), so `read_task_gva_by_id` walks the page table here.
+///
+/// That is measured, not asserted, and it is why the surviving Finder icon
+/// class is not a wrong-bytes defect on this rung: the bytes served are the
+/// bytes at the address the guest named, checked afresh each time.
 #[allow(clippy::too_many_arguments)]
 fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
