@@ -1385,6 +1385,132 @@ latched, so 138 `outcome=guest_pages` lines are distinct first sightings, not oc
 mapping's Store keeps failing, its LOAD would gather guest pages every frame; `outcome=guest_pages`
 count against `drain_duty` is how that gets read.
 
+### A Bounds Check That Charges A Stride For The Last Row Squares Window Corners
+
+**Fixed by `e181e0f`, reproduced and scored either side. Do not re-derive.** This was the
+dark-mode square-corner report, and the whole chain is four lines of always-on log.
+
+`load_linear_texture_impl` bounded a linear texture level with `offset + row_stride * height`
+against `TextureDescriptor::allocation_size`. What it *reads* is `(height - 1) * row_stride +
+tight_row` — every path in this crate walks `gva + y * row_stride` for one tight row, and never
+touches the padding after the last one. So the bound demanded a stride's worth of trailing bytes
+that no row occupies, and refused allocations the guest had sized exactly right.
+
+The measured instance, on an x86/Vulkan boot with the guest in Dark appearance:
+
+    linear_sample_miss reason=linear_load_span_exceeds_alloc end=12496 alloc=12288
+        task=1 ref=368 objtype=3 gva=0xca3850 fmt=0x1e geom=27x27 bpr=384
+    linux_m2v_draw reason=draw_prepare_texture_resolve_missing stage=fragment index=3
+        pipe=65 task=1 geom=1920x1080
+    draw_encode_fail reason=draw_vk_nothing_stored class=no_metal pipe=65
+    writeback_chain_rgba reason=resident_chain_abandoned_cpu_recovery mid=1 1920x1080
+
+A 27x27 `RG8Unorm` mask at offset 0x850 in a 12 288-byte allocation: `2128 + 384*27 = 12496`
+refuses, `2128 + 26*384 + 54 = 12166` fits with 122 bytes to spare. Refusing it drops the fragment
+draw that samples it, and that draw is the WindowServer's full-screen composite — so the layer is
+abandoned to CPU recovery and **the window renders with hard rectangular corners and no drop
+shadow**. Rounded corners and window shadows are the same alpha, which is why both vanish together;
+that pairing is the tell for this class rather than a second symptom.
+
+Scored on two boots, same repro (`.agents/repros/darkmode-corners.sh`), light and dark captures of a
+Finder window over bare wallpaper with the corners cropped and magnified 8x:
+
+| | before `e181e0f` | at `e181e0f` |
+|---|---|---|
+| dark-mode top-left corner | hard 90°, no shadow | rounded, antialiased, shadowed — same as light |
+| `linear_load_span_exceeds_alloc` | 2 | **0** |
+| `draw_prepare_texture_resolve_missing` | 1 | **0** |
+| `draw_vk_nothing_stored` | 1 | **0** |
+| `resident_chain_abandoned_cpu_recovery` | 2-4 | **0** |
+| light/dark diff bbox | `1695x611+54+0` (whole strip incl. menu bar) | `929x450+496+157` (the window) |
+
+The bbox row is worth reading: with the composite draw failing, the difference between the two
+appearances spanned the whole screen; with it fixed, it is confined to the window that actually
+changed.
+
+The rule now lives once, as `TextureLevelLayout::read_span`, because **three readers had
+independently written the loose form**: the sampling loader and both mipmap paths, the write side
+included — where the same over-strict bound refuses a level the guest can legally hold. A fourth
+would have written it too.
+
+Two transferable points:
+
+- **A bounds check has to bound what is touched.** `stride * height` reads as conservative and is
+  not: it converts correct guest allocations into refusals, and this one was routed through a path
+  that drops an entire draw rather than degrading one texture.
+- **The typed refusal is what found it, in one boot.** The caller printed
+  `linear_sample_miss reason=guest_load` for all fifteen of the loader's refusals — object-list
+  miss, undecodable descriptor, missing row conversion and unmapped guest page all under one word,
+  with four different fixes. `3320dcb` made the callee carry its reason (`LinearLoadRefusal`,
+  fifteen variants, each printing what it saw); the next boot named the check and the arithmetic
+  was then a two-line check. This is the third time the "a reason the caller writes is not a
+  reading" rule has paid here, and the first where it converted an open class into a fix directly.
+
+### `MTLColorWriteMask` Is Tag `0x09`, And It Is Not The Corner Mechanism
+
+Read off a live guest by `17e916c`'s census, honoured by `7c669d1` (Vulkan) and `0d91e23` (Metal).
+Recorded because it is a real closed gap and because it was the leading hypothesis for the corner
+class and **is refuted as that** — the corners still squared with it honoured, and `e181e0f` fixed
+them without touching it.
+
+`translate/coverage.rs` had recorded the field as `absent` with "where it sits in the type-7
+colour-attachment block is unknown — an RE task, not a guess". The entry is self-describing, so
+`note_color_entry_fields` now reports every tag it walks past. One x86/Vulkan boot, nine distinct
+entry shapes:
+
+    type7_color_attach_shape slot=0 nfields=5 tags=[00:4*,01:4,02:4,06:4,09:4*] unconsumed=2
+    type7_color_attach reason=color_attachment_field_dropped tag=0x09 len=4 value=1
+
+Tag `0x09` is `writeMask` by the argument that already names `0x01..0x08`:
+`MTLRenderPipelineColorAttachmentDescriptor` has exactly nine properties and `MTLRenderPipeline.h`
+declares them in the order those eight tags follow, so the tag is the property's one-based header
+index. `value=1` is `MTLColorWriteMaskAlpha`. The identification is *checked*, not asserted:
+`ColorWriteMask::new` refuses anything above `0xf` and reports
+`color_write_mask_out_of_range` with the value, so a wrong identification says so by name.
+
+Three things worth carrying:
+
+- **Metal's mask bits are alpha-first and Vulkan's are red-first** — bit-reversed over four bits,
+  not equal. A cast turns alpha-only into red-only. `metal-0.33`'s own `MTLColorWriteMask` bitflags
+  (`Red = 0x1 << 3` … `Alpha = 0x1 << 0`) independently confirm the constants.
+- **The mask is independent of `blendingEnabled`**, so it cannot ride inside
+  `Option<BlendStateResource>` and is applied on both arms of `attachment_blend`.
+- **Tag `0x00` rides every entry, `len=4`, `value=0` in every workload measured, and is still
+  unconsumed.** Position and constancy suggest the attachment index, which is currently derived
+  from entry order instead. Not honoured, deliberately: no boot has produced a nonzero value, so
+  honouring it would be a guess with no evidence. It keeps reporting.
+
+### The Guest Answering `:2222` Is Not Necessarily The One You Booted
+
+`boot-x86.sh` fails with `Could not set up host forwarding rule 'tcp::2222-:22'` and exits
+immediately when a previous guest still holds the port — and then `wait_ssh` succeeds against that
+*previous* guest. A full repro ran to completion this way, drove the old guest (which already had
+the appearance flipped by the run before it), and produced a complete set of scored arms with no
+error anywhere. AGENTS.md already recorded this shape for `watchdog.sh`; it applies to every repro.
+
+Two guards, both cheap. Wait for the *new* boot rather than for any QEMU — `until grep -q "first
+frame presented" <bootlog>` beats `until pgrep -f qemu-system`, which matches the one still running.
+And assert the guest's age before driving it: `.agents/repros/darkmode-corners.sh` reads
+`kern.boottime` and aborts above `MAX_GUEST_AGE` (900 s).
+
+Parse that field carefully. `sysctl -n kern.boottime` prints
+`{ sec = 1785377446, usec = 560316 } Thu Jul 30 ...`, and the obvious
+`sed -n 's/.*sec = \([0-9]*\).*/\1/p'` matches **`usec = `** because `.*` is greedy — it captures
+the microseconds. Anchor on the brace. The wrong parse produced an age of 1 784 817 149 s, which at
+least failed loudly; a value that merely looked plausible would not have.
+
+### Appearance Flips Need To Be Asserted On Pixels, Not On A Preference
+
+`defaults read -g AppleInterfaceStyle` returning `Dark` says a preference moved. One run scored a
+"dark" capture that was **byte-identical** to its light one — `imgdiff` gave 0 differing pixels
+across the whole frame — because a modal quit dialog had frozen the session and nothing repainted.
+The preference had genuinely changed; the screen had not.
+
+So gate the comparison on the repaint: `.agents/repros/darkmode-corners.sh` requires >100 000 pixels
+differing by more than 64 before it will score anything, and aborts otherwise. Same rule as "validate
+the specific thing you drove", applied to a state change rather than a workload — and note the
+failure mode was a *dialog*, which in a downscaled thumbnail looks exactly like a healthy screen.
+
 ### The ~950 ms Idle Stall Is The Host GPU Suspending, Not This Device
 
 **This is a property of the x86 rig, not of the product. Do not fix it, and do not measure across
