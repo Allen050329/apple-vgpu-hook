@@ -248,6 +248,21 @@ fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
     (vtx, frag)
 }
 
+/// Minimal compute pipeline type-7 descriptor: one first-TLV entry naming the
+/// kernel function ref. Eight call sites built these same seven lines. Gated
+/// like its constants and all eight callers, which are Metal-arm execute tests.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_compute_pipeline_desc(kernel_ref: u32) -> Vec<u8> {
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], kernel_ref);
+    pdesc
+}
+
 /// Minimal render pipeline type-7 descriptor: a first-TLV block carrying only
 /// the vertex and fragment function refs — no vertex-input and no colour
 /// attachment, unlike [`make_stagein_render_pipeline_desc`]. Six call sites
@@ -703,13 +718,7 @@ fn fill_and_execute_mul3add1_writeback() {
     // Function + pipeline + data buffer (mul3add1).
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     let pdesc_gva = 0x140u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -1883,13 +1892,7 @@ fn buffer_backed_fill_execute_mul3add1() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     let pdesc_gva = 0x140u64;
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
@@ -4524,13 +4527,7 @@ fn fill_compute_barrier_and_tg_memory_execute() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
@@ -4643,13 +4640,7 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
@@ -4760,13 +4751,7 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
@@ -4954,13 +4939,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
@@ -5115,13 +5094,7 @@ fn icb_argument_buffer_storage_texture_xyplane() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     const W: u32 = 4;
@@ -5234,13 +5207,7 @@ fn icb_argument_buffer_sample_and_write() {
 
     put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     const W: u32 = 4;
