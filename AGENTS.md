@@ -3256,6 +3256,37 @@ that separates "the wrong bytes were resolved" from "the right bytes were resolv
 image was bound in their place". Unused so far — the audit answered first — and it costs one upload
 per bind, so a boot that sets it must not be read for frame rate.
 
+**Scored on a boot at the fix, and the honest reading is: the stale bind is gone and THE ICON CLASS
+IS NOT FIXED.** Same repro, same workload, `PANEL: On 27/27`:
+
+| | at `1d8b718` (probe only) | at `81e2163` (fix) |
+|---|---|---|
+| `sampled_identity_stale` | **6** | **0** |
+| identity claims checked | 299 008 | 294 912 |
+| rounds corrupt / driven | 4 / 6 | **5 / 6** |
+| cells that move between rounds | 3 of 7 | **7 of 8** |
+| failure-channel lines | 13 | 12 |
+
+The first two rows are a within-boot ratio at a comparable denominator, so 6 → 0 is the fix working
+and is not subject to this rig's cross-boot spread. **The bottom two rows are the point of this
+entry.** The corruption did not improve, and if anything more cells moved. A user watching the same
+screen confirmed it independently.
+
+So a proven invariant violation, on the exact geometry, in the exact repro, with a mechanism that
+predicts every property of the class, was **not the cause of the class** — or not the only one. The
+transferable lesson is the one this file keeps paying for from a new direction each time: *a defect
+that fits the signature and is real is still not thereby the defect you are chasing*. The audit
+measured a claim, and the claim was false; nothing in it ever measured that this claim was what put a
+black rectangle on the screen. The scoring boot is what says that, and it had to be run.
+
+What the fix is still worth, stated so it is not reverted by someone reading the table above: it
+removes a silent wrong-image bind on the routine compositor path, it is proven by a test that fails
+without it, and it deletes a namespace constant. Keep it. Do not credit it with the icons.
+
+**The audit stays as the standing instrument.** It is the only thing in this crate that can see a
+wrong *image* rather than a wrong *rate*, it costs nothing unless the probe is on, and the next
+producer to invent a second generation source will be reported by name rather than by a screenshot.
+
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
 Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,
