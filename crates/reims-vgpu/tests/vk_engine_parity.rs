@@ -11,11 +11,11 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendFactor, BlendOp, BlendStateResource, CullMode, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, LoadOp, MAX_DEVICE_RECREATES, PrimitiveTopology, SampledContentIdentity,
-    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
-    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
-    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
-    ViewportResource,
+    IndexedDrawResource, LoadOp, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
+    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
+    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
+    MAX_DEVICE_RECREATES,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -1391,6 +1391,75 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
     );
 }
 
+/// A deferred composite Store moves its device→host copy; it does not delete
+/// it. `readbacks` pooled both populations, so it read the same whether the
+/// deferral worked or merely rescheduled the copy — which is how a boot came
+/// back with `readbacks / surface_deferred` at 1.39 and no way to say why.
+///
+/// The split is the measurement: a `skip_readback` draw must land in
+/// `render_post_wait_skips` and leave `readbacks` alone, and the `read_target`
+/// a consumer later asks for must land in `target_reads` and *still* leave
+/// `readbacks` alone.
+#[test]
+fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let w = 16u32;
+    let h = 16u32;
+    let identity = TargetIdentity::Surface {
+        id: 93,
+        width: w,
+        height: h,
+        generation: 1,
+    };
+    let mut req = engine_req(&v, &f, w, h);
+    req.target_identity = Some(identity.clone());
+    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
+    req.skip_readback = true;
+
+    let before_draw = engine::counter_snapshot();
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP readback split: {e}");
+            return;
+        }
+        Err(e) => panic!("resident draw: {e}"),
+    }
+    let draw = engine::counter_snapshot().delta_since(&before_draw);
+    assert_eq!(
+        draw.readbacks, 0,
+        "a skip_readback draw took a draw readback anyway"
+    );
+    assert_eq!(
+        draw.render_post_wait_skips, 1,
+        "a skip_readback draw did not record its skipped fence wait"
+    );
+    assert_eq!(
+        draw.target_reads, 0,
+        "a draw that reads nothing back recorded a resident read"
+    );
+
+    let before_read = engine::counter_snapshot();
+    let px = engine::read_target(&identity)
+        .expect("read resident")
+        .pixels;
+    let read = engine::counter_snapshot().delta_since(&before_read);
+    assert_eq!(
+        read.target_reads, 1,
+        "read_target did not record a resident read"
+    );
+    assert_eq!(
+        read.target_read_bytes,
+        px.len() as u64,
+        "resident read bytes disagree with the frame it returned"
+    );
+    assert_eq!(
+        read.readbacks, 0,
+        "read_target was pooled into the draw rail's readback count"
+    );
+}
+
 /// The live window-transition failure samples CPU-decoded RGBA bytes and stores
 /// into a resident BGRA target. Lock that complete format chain independently
 /// of guest descriptors: shader-visible R/G/B must land as physical B/G/R.
@@ -2461,7 +2530,18 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
         .expect("flush read_target")
         .into_rgba8();
     let df = engine::counter_snapshot().delta_since(&before_flush);
-    assert_eq!(df.readbacks, 1, "flush is the single readback: {df:?}");
+    // The flush's copy is a resident read, not a draw readback — the two are
+    // counted apart so that moving a copy from one rail to the other cannot look
+    // like removing it. Both halves are asserted: one read happened, and the
+    // draw rail stayed out of it.
+    assert_eq!(
+        df.target_reads, 1,
+        "flush is the single resident read: {df:?}"
+    );
+    assert_eq!(
+        df.readbacks, 0,
+        "flush must not take a draw readback: {df:?}"
+    );
     engine::unpin_resident_target(&identity);
     assert_eq!(
         p_flush, p_sync,

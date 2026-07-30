@@ -788,7 +788,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawEr
             },
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        counters.note_readback(rb_size);
+        counters.note_target_read(rb_size);
         Ok(TargetReadback { pixels: out, bgra })
     }
 }

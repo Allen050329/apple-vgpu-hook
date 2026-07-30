@@ -167,8 +167,24 @@ engine_counters! {
         compute_deferred_flush_bytes,
 
         // --- residency / oracle I/O ---
+        /// Device→host copies taken as the tail of a draw or a compute dispatch,
+        /// i.e. work a submission did for itself.
+        ///
+        /// Deliberately *not* pooled with `target_reads`. A composite Store that
+        /// takes `skip_readback` moves its copy from here to there rather than
+        /// deleting it, so one number over both populations cannot say whether the
+        /// deferral worked — it reads the same either way. On a desktop workload
+        /// `computes` is 0, so this is the draw rail alone.
         readbacks,
         readback_bytes,
+        /// Full-frame reads of a pinned resident through `read_target`: the present
+        /// capture and the deferred render window's on-access flush.
+        ///
+        /// These are the copies a deferred rail *keeps*, paid once when a consumer
+        /// asks instead of once per Store. `target_reads / readbacks` is what
+        /// separates "the readback moved" from "the readback went away".
+        target_reads,
+        target_read_bytes,
         seed_uploads,
         seed_upload_bytes,
         /// Present-boundary seeds satisfied by a GPU resident→target image copy
@@ -264,6 +280,11 @@ impl EngineCounters {
     pub fn note_readback(&self, bytes: u64) {
         self.readbacks.fetch_add(1, Ordering::Relaxed);
         self.readback_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_target_read(&self, bytes: u64) {
+        self.target_reads.fetch_add(1, Ordering::Relaxed);
+        self.target_read_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn note_seed_upload(&self, bytes: u64) {

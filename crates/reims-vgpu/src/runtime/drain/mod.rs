@@ -3118,6 +3118,12 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 ///   own. Per-draw submission is a full CPU-GPU round trip.
 /// - `readbacks` / `readback_bytes` — whether every draw drags its target back
 ///   to host memory, which is a fence wait plus a copy.
+/// - `render_post_wait_skips` / `target_reads` — the two halves of the deferred
+///   composite Store. The first counts draws that returned without a fence wait
+///   because they kept their pixels on the GPU; the second counts the reads a
+///   consumer later asked for. A rail that only *moves* the copy raises the
+///   second by as much as it raises the first, and `readbacks` alone — which
+///   pooled both until it was split — reported no change at all in that case.
 /// - `creates` / `*_misses` — pipeline, shader and descriptor churn, where a
 ///   miss is a driver compile rather than a lookup.
 /// - `sampled_reuploads` — re-staging texture content a cache hit should have
@@ -3139,7 +3145,8 @@ fn emit_engine_delta() {
     *prev = Some(now);
     crate::observe::off(format!(
         "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
-         batch_flush_draws={} readbacks={} readback_bytes={} pipeline_misses={} \
+         batch_flush_draws={} readbacks={} readback_bytes={} render_post_wait_skips={} \
+         target_reads={} target_read_bytes={} pipeline_misses={} \
          shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
          sampled_cache_hits={} sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} seed_uploads={} seed_upload_bytes={} \
@@ -3152,6 +3159,9 @@ fn emit_engine_delta() {
         d.batch_flush_draws,
         d.readbacks,
         d.readback_bytes,
+        d.render_post_wait_skips,
+        d.target_reads,
+        d.target_read_bytes,
         d.pipeline_misses,
         d.shader_misses,
         d.pass_misses,
@@ -3255,7 +3265,9 @@ pub fn note_store_route(route: &'static str) {
 /// cannot be used to choose what to fix.
 pub fn note_store_route_us(name: &'static str, us: u64) {
     if let Ok(mut g) = STORE_ROUTES.lock() {
-        *g.get_or_insert_with(Default::default).entry(name).or_default() += us;
+        *g.get_or_insert_with(Default::default)
+            .entry(name)
+            .or_default() += us;
     }
 }
 
