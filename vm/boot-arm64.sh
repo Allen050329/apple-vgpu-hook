@@ -121,6 +121,16 @@ done
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-arm64.sh: $*" >&2; exit 1; }
 
+# metal2vulkan spawns `llvm-dis` and `spirv-val` on every uncached shader
+# translate, and QEMU inherits this script's PATH — resolve them here so a
+# missing toolchain fails now, not at the guest's first shader.
+require_shader_toolchain() {
+  command -v llvm-dis >/dev/null 2>&1 || die \
+    "llvm-dis not found in PATH (install the LLVM tools, e.g. brew install llvm, then put \"\$(brew --prefix llvm)/bin\" on PATH)"
+  command -v spirv-val >/dev/null 2>&1 || die \
+    "spirv-val not found in PATH (ships in SPIRV-Tools, not LLVM: brew install spirv-tools)"
+}
+
 ensure_rust_tools() {
   if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/cargo" ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
@@ -134,6 +144,7 @@ build_reims_vgpu_efi() {
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
 }
 
+require_shader_toolchain
 ensure_rust_tools
 build_reims_vgpu_efi
 if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
