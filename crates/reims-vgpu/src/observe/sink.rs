@@ -460,6 +460,16 @@ pub fn content_probe_enabled() -> bool {
 ///
 /// This costs one upload per bind — it is a diagnostic arm, never a product
 /// configuration, and a boot that sets it must not be read for frame rate.
+///
+/// **Run against the Finder icon class, and it clears the cache.** Ten
+/// recomposites with the cache off produced two corrupt rounds (5 and 6 of 7
+/// icons), against two corrupt rounds on the matching cache-on boot. The rate
+/// comparison at n=10 is weak, but the knob does not rely on it: with every
+/// bind re-uploading the producer's bytes, a defect that lives in the retained
+/// image cannot survive the arm at all, and corrupt rounds did. So for that
+/// class the wrong pixels are already wrong when the runtime hands them over,
+/// or the draw that consumes them covers the wrong region — the cache is not
+/// binding a different image than the one it was given.
 pub fn sampled_cache_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
