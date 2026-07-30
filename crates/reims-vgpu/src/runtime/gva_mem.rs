@@ -307,6 +307,65 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
 /// and a length, and finding the code that produced them meant guessing from
 /// the size. Reading `Location::caller()` keeps that a reading — the callee
 /// asks who called it, rather than each caller passing a label it chose.
+/// How many pages of a refused write actually resolve, and under whose tables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteGateProbe {
+    /// Pages of the refused span this probe examined (see the cap below).
+    pub pages: u64,
+    /// Of those, how many the **writing** task's page tables resolve.
+    pub named_mapped: u64,
+    /// How many the first declaring task in `owners` resolves, or 0 when the
+    /// range is declared by nobody.
+    pub owner_mapped: u64,
+}
+
+/// Upper bound on the pages [`probe_write_gate_pages`] walks.
+///
+/// Not a protocol value: it bounds the cost of a diagnostic that runs on a
+/// refusal path, where the span is whatever the caller happened to hand in. The
+/// largest refusal this rail has produced is a single 64 KiB blit row, 16 pages
+/// at a 12-bit shift, so this covers the observed cases by ~32x while keeping a
+/// pathological span from turning one refusal into a long walk. A truncated
+/// probe still reads correctly because `pages` is the denominator the line
+/// prints — it says how many were examined, never how many exist.
+const WRITE_GATE_PROBE_PAGE_CAP: u64 = 512;
+
+/// Walk a refused span under the writing task, and under whichever task declared
+/// it, reporting how many pages each resolves.
+///
+/// Read-only: [`visit_task_gva_page_gpas`] calls its visitor only on
+/// `ResolveStatus::Ok`, so counting visits counts resolved pages and an unmapped
+/// page is simply never offered.
+fn probe_write_gate_pages<H: HostMemory>(
+    state: &crate::model::DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    len: u64,
+    owners: &[u32],
+) -> WriteGateProbe {
+    let shift = state.page_shift;
+    let page = 1u64 << shift;
+    let first = gva & !(page - 1);
+    let last = gva.saturating_add(len.saturating_sub(1)) & !(page - 1);
+    let spanned = ((last - first) >> shift).saturating_add(1);
+    let pages = spanned.min(WRITE_GATE_PROBE_PAGE_CAP);
+    let span = pages << shift;
+    let count_for = |who: u32| -> u64 {
+        let mut n = 0u64;
+        visit_task_gva_page_gpas(host, &state.tasks, who, first, span, shift, 1, &mut |_| {
+            n += 1;
+            true
+        });
+        n
+    };
+    WriteGateProbe {
+        pages,
+        named_mapped: count_for(task_id),
+        owner_mapped: owners.first().copied().map(count_for).unwrap_or(0),
+    }
+}
+
 #[track_caller]
 pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut crate::model::DeviceState,
@@ -327,12 +386,34 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     let gate = state.gva_write_gate(task_id, gva, buf.len() as u64);
     if gate == crate::model::WriteGate::Outside {
         let owners = state.tasks_covering(gva, buf.len() as u64);
+        // `owners` says which task DECLARED the range; it does not say whether
+        // the range is reachable through the page tables of the task that tried
+        // to write it, and those are the two readings the refusal has to be told
+        // apart by. Walk it and report the state.
+        //
+        //   named == pages  the range IS mapped for the writing task, so
+        //                   `task_map_spans` is not a complete authorization set
+        //                   for it and this gate is over-strict — guest work is
+        //                   being dropped that would have landed correctly.
+        //   named == 0      the write could never have landed under this task
+        //                   anyway (`write_span` fails closed on an unmapped
+        //                   page), so the gate costs nothing here and the real
+        //                   question is upstream: how the named task came to
+        //                   reference an address only another task mapped.
+        //
+        // A state, not an event count, and on the branch that is unconditionally
+        // taken when the refusal fires — so a zero is readable rather than
+        // meaning "we never got here".
+        let probe = probe_write_gate_pages(state, host, task_id, gva, buf.len() as u64, &owners);
         crate::observe::Emit::decline("gva_write", &gate)
             .field("task", task_id)
             .field("gva", format!("{gva:#x}"))
             .field("len", format!("{:#x}", buf.len()))
             .field("owners", format!("{owners:?}"))
             .field("own", state.task_own_span_count(task_id))
+            .field("pages", probe.pages)
+            .field("named_mapped", probe.named_mapped)
+            .field("owner_mapped", probe.owner_mapped)
             .field("via", via)
             .fail();
         return Err(MemError::OutsideMap);
@@ -1171,6 +1252,71 @@ mod tests {
             state.task_own_span_count(0),
             1,
             "counts are per task, not total"
+        );
+    }
+
+    /// A refusal has to say whether the range was reachable, because `owners`
+    /// alone cannot tell an over-strict gate from a bad address.
+    ///
+    /// `owners` reports who *declared* the range. It says nothing about whose
+    /// page tables *resolve* it, and those are the two readings the refusal has
+    /// to be told apart by. On the live rail this is the open question behind
+    /// five dropped 64 KiB `OP_COPY_BUFFER_TO_TEXTURE` uploads a boot:
+    /// `task=1 gva=0x1ada000 len=0x10000 owners=[0] own=4` — with the log's
+    /// `map_memory2_key` lines confirming task 0 declared `0x101000 +0x4000000`
+    /// and task 1 declared `0x9f9000 +0x20000`, and `define_task` confirming the
+    /// two hold **different** `dir=` roots, so they are genuinely separate
+    /// address spaces.
+    ///
+    /// `named_mapped == pages` means the range IS mapped for the writing task,
+    /// so `task_map_spans` is not a complete authorization set and the gate is
+    /// dropping guest work that would have landed. `named_mapped == 0` means the
+    /// write could never have landed anyway (`write_span` fails closed on an
+    /// unmapped page) and the gate costs nothing. Both must be distinguishable
+    /// or the line is unreadable.
+    #[test]
+    fn a_refused_write_reports_whether_the_range_resolves_under_the_writer() {
+        use crate::model::PAGE_SHIFT_ARM64E;
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        // Task 1 gets a page table mapping its first 4 pages from GVA 0.
+        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+
+        // Mapped for the writer, and declared by somebody else: the over-strict
+        // reading. Every page the probe examines resolves under task 1.
+        let mapped = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[0]);
+        assert_eq!(mapped.pages, 2);
+        assert_eq!(
+            mapped.named_mapped, 2,
+            "task 1's own tables resolve this range, so refusing it drops a write \
+             that would have landed"
+        );
+        assert_eq!(
+            mapped.owner_mapped, 0,
+            "task 0 has no page table here, so the declaring task cannot reach it either"
+        );
+
+        // Past the end of task 1's table: the write could never have landed, so
+        // the gate loses nothing and the question is upstream.
+        let unmapped = super::probe_write_gate_pages(&state, &host, 1, 64 * page, 2 * page, &[0]);
+        assert_eq!(unmapped.pages, 2);
+        assert_eq!(
+            unmapped.named_mapped, 0,
+            "nothing resolves, so a refusal here costs no guest work"
+        );
+
+        // The two readings must not render the same, or the line cannot be acted
+        // on either way.
+        assert_ne!(mapped.named_mapped, unmapped.named_mapped);
+
+        // The cap bounds the walk without lying about it: `pages` is the
+        // denominator printed, so a truncated probe still reads correctly.
+        let huge = super::probe_write_gate_pages(&state, &host, 1, 0, u32::MAX as u64, &[]);
+        assert_eq!(huge.pages, super::WRITE_GATE_PROBE_PAGE_CAP);
+        assert_eq!(
+            huge.owner_mapped, 0,
+            "no declaring task means no owner column, not a panic"
         );
     }
 
