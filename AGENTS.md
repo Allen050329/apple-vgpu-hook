@@ -2510,6 +2510,84 @@ differing by more than 64 before it will score anything, and aborts otherwise. S
 the specific thing you drove", applied to a state change rather than a workload — and note the
 failure mode was a *dialog*, which in a downscaled thumbnail looks exactly like a healthy screen.
 
+### 60 fps Is Reached, The Presenter Drops Nothing, And The Remaining Cap Is The Guest's Compositor
+
+**Measured on one x86/Vulkan boot at `bbfb567` with the host panel held awake and the hold
+verified (`PANEL: On 14/14 samples`).** This is the first frame-rate reading in this file taken with
+its confounder controlled, and it settles the present-mode question in the negative: there is
+nothing to gain there.
+
+`.agents/repros/testufo-fps.sh /tmp/ufo-awake 45`, Safari fullscreen on testufo.com/refreshrate,
+sliced to this boot by the `t=` reset (the log appends across boots and an unsliced read mixed 1314
+windows from many boots into this measurement on the first attempt — slice first):
+
+| | whole boot (121 windows) | the 46-window settle |
+|---|---|---|
+| `presents` | p50 60 | p50 **61**, min 58, max 62 |
+| `offered` | p50 60 | p50 **61**, min 58, max 62 |
+| `busy_acquire` | p50 0, max 51 | p50 **0**, max **1** |
+| `busy_fence` | p50 0, max 2 | **0** |
+| `present_hz` | p50 59.6 | p50 **60.00**, min 56.10, max 61.60 |
+| `direct_frac` | — | **1.00** |
+
+The guest's own opinion, read off the capture: **`61.000 Hz`, `Frame Rate 60 fps`, `Refresh Rate
+60 Hz`.** Device side on the same boot: `drain_duty duty=0.121` at 481 tranches and 445 draws a
+second, `store_routes surface_resident=252 type11_seed_elided=252` (100 % resident rail, 100 % seed
+elision, `surface_deferred` absent), `capture_sampling full=1 light=7167` — one CPU capture in the
+whole boot.
+
+**`offered == presents` in every window, and `busy_acquire` is 0.** That is the within-boot ratio the
+previous entry asked for, and it retires the entire present-mode work list: FIFO is not dropping a
+single frame, so MAILBOX, a larger `min_image_count` and a blocking acquire would each buy exactly
+nothing. Do not spend a session on `PresentModeKHR`. The 95 %-refusal reading that motivated it was
+the blanked panel, per the section below.
+
+**Goals 1-3 re-verified on the same slice**, and two of the three apparent hits are the documented
+grep traps:
+
+| sentinel | count |
+|---|---|
+| `deferred_flush_lost … reason=cache_miss` (the black-layer class) | **0** |
+| `linear_load_span_exceeds_alloc`, `type11_seed_cache_absent`, `draw_vk_nothing_stored` | **0** |
+| `resident_chain_abandoned_cpu_recovery`, `frame_bgra_short`, `chain_resident_land_fail` | **0** |
+| `surface_resident_*`, `type11_window_invent`, `BadGrid`, `read_overrun`, `write_gate_no_spans` | **0** |
+| bare `cache_miss` | 175 — **all `engine_delta`'s `sampled_cache_misses` field name** |
+| `deferred_flush_lost` | 1, `reason=map_generation_drift` — the guard doing its job |
+| `host_window_slate_end` | 1, `frames=567 covered=1` — the firmware-boot run, guest frame on screen throughout; **no uncovered `host_window_slate` line at all** |
+| `present_unbacked` | 1, `mid=4 gen=0 reason=never_stored` — the documented boot-time class |
+
+Byte order was checked on pixels, since no failure line can see it: the testufo stutter banner
+renders **orange**, hyperlinks **blue**, the "Problems?" text **red**.
+
+**The remaining cap is the guest's compositor, and every cheap explanation for it is already
+refuted.** Do not re-derive these:
+
+- *We advertise 60.* No — `DISPLAY_REFRESH_HZ` is **120**, and the guest latched it:
+  `system_profiler SPDisplaysDataType` reads `UI Looks like: 1920 x 1080 @ 120.00Hz`.
+- *Our VBL delivery is starving or jittering the display link.* No — `display_vbl` reads
+  `window_hz=125.0` against `grid_hz=125.0` in **40 consecutive census windows** from t=38 s to
+  t=349 s, with one 124.7 outlier. Rock steady, and 4 % *above* the advertised rate rather than
+  below it. `not_claimed` tracks `delivered` at 1.04:1, which is the 8 ms limiter rejecting exactly
+  the every-other 4 ms poll it is meant to.
+- *It is Safari's rAF policy.* No — Mission Control, driven six times through `ctrl+up`/`ctrl+down`
+  with no browser in the path, measures `offered` p50 **61**, min 59, max 62. Core Animation paces
+  the same as the browser did.
+- *The device has no headroom.* No — `duty=0.121`.
+
+So the guest knows the display is 120 Hz, receives a steady 125 VBL/s, has an 88 %-idle device
+underneath it, and composites 60. Across 343 windows only 2 exceed 65 offered frames/s (70 and 76,
+both in a multi-layer burst phase). Whether macOS's paravirtualized display can be made to pace its
+compositor above 60 is **unmeasured and has no named mechanism**; the four obvious levers above are
+spent. It is also not required: the goal is 60+ fps stable and the guest reports 61.000 Hz while we
+present every frame it produces.
+
+One genuine contract mismatch is worth recording even though it is refuted as the cause: we advertise
+120 Hz (8.333 ms) and deliver VBL on an **8 ms integer grid** (125 Hz), because
+`DISPLAY_VBL_MIN_INTERVAL_MS` is whole milliseconds and the poll heartbeat is 4 ms — a grid that
+cannot express 120 Hz at all. It errs fast, so it cannot starve the guest, which is why the steady
+125.0 reading exonerates it. Deriving the grid from `DISPLAY_REFRESH_HZ` in microseconds would be the
+principled form, and it needs a finer poll than 4 ms to be worth anything.
+
 ### The 20 Hz Present Cap Is The Host Panel Being Asleep, Not The Swapchain
 
 **This is a property of the x86 rig, not of the product, and it retires the entry above it. Do not
