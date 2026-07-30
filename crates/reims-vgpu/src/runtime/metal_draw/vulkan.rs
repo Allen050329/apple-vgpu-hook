@@ -3282,6 +3282,27 @@ fn note_gva_backing_verdict(
 /// the same partial draw thousands of times a second reports once, and a
 /// scissor that covers a fraction of a small square target — the shape an icon
 /// would have — is greppable rather than buried in the count.
+///
+/// **The first boot carrying this found the shape.** Ten recomposites, two
+/// corrupt, x86 / Vulkan: `draw_scissor_full` 888 227, `draw_scissor_partial`
+/// 449 708, and among the partial identities
+///
+///     target=64x64 scissor=9x29+0+0
+///     target=64x64 scissor=7x9+0+0
+///     target=64x64 scissor=6x8+0+0
+///
+/// A draw covering 48 texels of a 4096-texel icon target, anchored at its
+/// top-left corner. That is the broken cell as seen on screen: a small block of
+/// content with an empty square around it.
+///
+/// It does not by itself say the scissor is *wrong*. A scissored draw is
+/// correct whenever the attachment already holds the rest of the picture, which
+/// on this rail means a `MTLLoadActionLoad` whose seed supplied it. The join
+/// that decides it is the load action on these same draws — and note that only
+/// 395 seed resolutions happened on a comparable boot (2870346) against a large
+/// population of partial-scissor draws, so "the seed path is not entered for
+/// these at all" is the reading to test first. A seed that is never resolved is
+/// not a seed that is lost, and `load_seed_lost` cannot see it.
 fn note_draw_coverage(x: u32, y: u32, sw: u32, sh: u32, target_w: u32, target_h: u32) {
     let covers = x == 0 && y == 0 && sw >= target_w && sh >= target_h;
     crate::runtime::drain::note_store_route(if covers {
