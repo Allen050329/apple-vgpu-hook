@@ -1319,6 +1319,72 @@ as successes, which means a change that breaks booting reads as a change that fi
 `.agents/repros/panic-rate.sh` keeps `PANIC` / `NOBOOT` / `NOWORK` / `OK` apart and reports
 `PANIC / (PANIC + OK)`.
 
+### A Seedless LOAD Is A Wipe, And That Was The Black-Rectangle Class
+
+**Fixed by `c47efca`, measured before and after. Do not re-derive the mechanism.**
+
+`engine/exec.rs` resolves a pass load action as "explicit `load_op` > `target_rgba8` > **Clear**". So
+a `LOAD` that resolves no seed does not degrade — it begins the render pass with `LoadOp::CLEAR`
+against the hardcoded `[0,0,0,0]` primary clear, and the matching Store reads that wipe back and
+publishes it. **One whole compositing layer goes solid black.** The type-11 arm of the seed ladder
+(`runtime/metal_draw/vulkan.rs`, `PASS_LOAD_ACTION_LOAD`) had exactly one source,
+`surface_cache::get_shared(mid, w, h)`, and left `target_rgba8` unset on a miss — with **no report of
+any kind**.
+
+The always-on probe is `type11_load_seed`, latched per (mapping, requested geometry, outcome), and it
+reports **every** outcome (`outcome=cache_hit`, `outcome=guest_pages`, or a typed decline) because a
+zero on the miss arm has to be readable. Both arms carry `mapgeom` and `mapgen`: `want == mapgeom` is
+the condition under which the guest-pages rung can serve, so the pair says whether a miss was
+recoverable.
+
+Two sequential x86/Vulkan boots, `.agents/repros/seed-loss.sh` (3 phases sliced on log byte offsets,
+Dock hidden, native captures), scored as the fraction of near-black pixels (`max(r,g,b) < 0.03`) in
+the host window:
+
+| | phase 1 idle 30 s | phase 2 desktop selection drag 60 s | phase 3 testufo + 8 Safari window drags |
+|---|---|---|---|
+| seed misses, at `7502518` (probe only) | **0** | **5** | **116** |
+| seed misses, at `c47efca` (fix) | 0 | **0** | **0** |
+| black fraction, pre-fix | 0.0013 % | 0.6 / **62** / **90** / 0.6 / **62** / **62** % | 11.6 - **45.4** % |
+| black fraction, at the fix | 0.0013 % | **0.0013 %** ×6 | 11.1 - 11.5 % |
+| failure-channel lines | 0 → 2 | 9 → 4 | 205 → **76** |
+
+Read three things off it. **Phase 2 is the reported wallpaper/drag class and it is gone**: six of six
+captures during the drag now sit at `1.30261e-05`, which is the *same* six-figure constant the idle
+frame produces in both boots — a within-boot positive control that also replicates across boots, so
+this is "measure against known input" rather than a cross-boot brightness comparison. **Phase 3's
+settled frame went 45.4 % → 11.1 %**, and the residual ~11.3 % is stable across every phase-3 capture
+in both arms (it is the Safari window's own content, not a defect). **The phase-3 window-drag captures
+barely moved** (11.6-11.9 % → 11.1-11.5 %), so do not claim that gesture as scored by this.
+
+Every one of the 121 pre-fix misses was `reason=type11_seed_cache_absent` with `hostgen=0`, and every
+one had `want == mapgeom`. `type11_seed_cache_geom` fired **0** times, so this was *not* the
+geometry-replacement hole the earlier `deferred_flush_lost cache_miss` work closed — that fix covered
+the deferred *flush*, and the Load seed read the same cache under the same rule and was never covered.
+Four of phase 2's five were at the full **1920x1080** composite extent (mids 1, 4, 5, 21): a
+whole-screen surface wiped. Several carried `mapgen` 2-5 — a mapping whose backing is replaced has its
+cache entry evicted by `unmap_surface`, and nothing re-established the content, so its next LOAD wiped
+it.
+
+The fix is one rung, and it is a contract statement rather than a heuristic: **the host cache is an
+accelerator, not the surface.** What a type-11 attachment *contains* is its guest IOSurface pages, so
+a cache miss is a reason to read them (`load_type11_rgba_static`, whose `paint_mapping` lands every
+intersecting deferred window first). The hit path is byte-for-byte unchanged, so the change can only
+replace a wipe with the surface's actual bytes. **The sibling Metal path already did this** — type-11
+`seed_color_load` reaches the same reader through `load_sampled_rgba_static`; only the Vulkan arm
+stopped at the cache, which is the tell worth generalising: when two backends share a decode and only
+one has a rung, the missing rung is a defect and not a design.
+
+The ladder is now `resolve_type11_load_seed`, extracted so it is unit-testable —
+`a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages` was verified to fail with the rung
+stubbed to `None`.
+
+What this does **not** close: the guest-pages rung's cost is unpriced. It runs only on a miss and the
+following Store repopulates the cache, so it should be once per surface incarnation — but the probe is
+latched, so 138 `outcome=guest_pages` lines are distinct first sightings, not occurrences. If a
+mapping's Store keeps failing, its LOAD would gather guest pages every frame; `outcome=guest_pages`
+count against `drain_duty` is how that gets read.
+
 ### The ~950 ms Idle Stall Is The Host GPU Suspending, Not This Device
 
 **This is a property of the x86 rig, not of the product. Do not fix it, and do not measure across
