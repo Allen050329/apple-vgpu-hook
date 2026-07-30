@@ -1494,6 +1494,50 @@ second of wall clock, at ~280 draws/s and `duty` still 0.96-0.98:
 and `begin_entry` flushes the open batch every time. That is a *scheduling* problem, not the join
 predicate AGENTS.md's older note points at.
 
+**`wait_us` is a fixed ~1.5 ms per readback submission and does not scale with the bytes copied. The
+regression that says so needed no boot** — it is 89 one-second windows of the boot already taken,
+joined on timestamp between `draw_phase` and `engine_delta`. Splitting them by bytes-per-readback into
+outer quartiles:
+
+| | MB per readback | us per readback | us per MB |
+|---|---|---|---|
+| smallest quartile | 4.18 | **1499** | 361 |
+| largest quartile | 5.18 | **1551** | 300 |
+
+24 % more bytes bought **3.5 %** more time, and `us/MB` moved *inversely*. Across all 89 windows
+`us/readback` has CV **0.042** against `us/MB`'s **0.103**. So the wait is per-submission, not
+per-byte.
+
+**Say exactly what that excludes.** It rules out the image→buffer *copy* as the cost of `wait_us`. It
+does **not** rule out GPU render time: the quartiles were split on readback bytes, and the render work
+of a full-screen composite layer is not proportional to them. So `wait_us` is either fixed submission
+latency or per-pass render time, and this measurement cannot separate those two — it only kills the
+third candidate. The first probe on this path must vary *pass* size, not readback size.
+
+Either way the actionable form is the same: **250 ms per second is spent with the drain worker — the
+device's only executor, holding the device lock — blocked on a fence 167 times a second.** Cutting it
+means fewer submit-and-wait round trips, not fewer bytes.
+
+**And the three remaining costs are one item.** `wait_us` 250 + `stage_us` 155 + `readback_us` 135 =
+540 ms of the 880 ms `draw_us`, and all three are the same type-11 composite round trip: seed the
+target's prior contents from host memory, draw, read the whole target back. Removing it is what the
+"give the type-11 render Store a deferred rail" note above is about, and the note's own retraction
+records why the obvious form does not work.
+
+**The hazard that retraction actually named, restated so the next attempt starts from it.** A
+`LoadFromTarget` on a type-11 surface trusts the resident to hold the mapping's current pixels, and
+**every non-draw writer to that mapping breaks it**: a blit into the surface, a compute storage
+writeback, a guest CPU write through `mapper::write_mapping_bytes` all land in guest pages and/or
+`surface_cache` and leave the resident untouched. With a CPU seed the LOAD picks those up; with
+`LoadFromTarget` it silently renders on top of a stale frame, which is the black/torn-layer class. The
+front-buffer ping-pong that boot reported is one instance of it, not the whole of it.
+
+So the rail needs a **witness, not an argument**: a monotonic per-mapping content epoch that every
+writer bumps, recorded on the resident when a draw stores into it, and `LoadFromTarget` taken only
+when the two agree. That is maintainable only if the writer set is closed — which is the same
+completeness question the flush-trigger backbone had to answer, and which "enumerate the paths inside
+each reader, not the readers" says how to get wrong.
+
 ### A Bounds Check That Charges A Stride For The Last Row Squares Window Corners
 
 **Fixed by `e181e0f`, reproduced and scored either side. Do not re-derive.** This was the
