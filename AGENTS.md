@@ -1614,8 +1614,33 @@ readback, so the trade is the point and the mitigation has to be explicit. Audit
 | `evict_registry_to_cap` (LRU / `REGISTRY_CAP`) | **yes** — `pin_count > 0` rotates to the back instead of evicting |
 | the same function's cap arithmetic | **yes** — `non_pinned_registry_len()` excludes pinned slots, so a pinned burst cannot force the active set out (thrash) |
 | the idle target drain (`submission_and_buffers.rs:110`) | **yes** — victims require `pin_count == 0` |
-| `registry_ensure` destroy-and-recreate | **no**, and it does not need to: geometry *and* generation are in the identity key, and the `bgra` mismatch that remains is now structurally impossible for `Surface` since `e2c2dee` derives the order from the key |
+| `registry_ensure` destroy-and-recreate | **no** — and it cannot fire for a `Surface`; see below |
 | mapping teardown / unmap / device reset / `test_reset_engine` | drops the window through `take_deferred_flush_window*`, which is the same choke point `release_window_pin` guards |
+
+**A subagent sweep nominated that one row as the "critical hazard" of the whole design — "a live
+deferred window's resident can be yanked by a re-resolve with different generation". It cannot, and the
+refutation is three lines of reading.** `registry_ensure`'s reuse test is
+`slot.width == width && slot.height == height && slot.generation == generation && slot.bgra == bgra`,
+and for a `Surface` every one of those is fixed by the key:
+
+- `generation` is not an independent argument. `exec.rs` does `let gen = identity.generation();` and
+  passes *that*, so `slot.generation == generation` can only fail if a slot were created under a
+  different generation for the same key — and the generation is *in* the key.
+- `width`/`height` likewise: `render_chain_identity` builds the identity from `req.width`/`req.height`
+  when both are nonzero and returns `None` when either is zero, so there is no identity to ensure in
+  the case where they could disagree.
+- `bgra` became structurally impossible at `e2c2dee`, which derives the order from the key.
+
+`target_evicts` reading **0 across all 85 windows** of the `e62bb9e` boot is consistent with that, but
+it is not what establishes it — one boot's zero is not a state, per the rule above. The construction
+argument is, and it is the third time an audit of this rail has had to be checked by reading rather
+than believed (see the `map_generation` and `task_id >> 1` notes).
+
+Note the consequence would also have been mild rather than critical, which is worth stating so the
+next reader prices it correctly: a destroyed resident makes `read_target` return `UnknownIdentity`, the
+flush emits a typed `deferred_flush_lost`, and the guest keeps its pre-Store bytes — stale but coherent,
+not corrupt. And `registry_ensure` runs at the *start of a draw into that same identity*, so a new Store
+is about to overwrite the surface anyway and the supersede rule already drops fully-covered windows.
 
 `pin_resident_target` is **counted, not boolean** (`slot.pin_count`), so several windows on one surface
 each hold a count and the slot survives until the last unpins — which is exactly the sibling-geometry
