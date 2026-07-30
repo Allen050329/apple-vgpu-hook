@@ -1987,6 +1987,15 @@ impl ResourcePools {
             format,
             swizzle,
         };
+        // Bisection arm: every bind misses and re-uploads the producer's bytes,
+        // so a boot can separate "the wrong bytes were resolved" from "the right
+        // bytes were resolved and a retained image was bound in their place".
+        if crate::observe::sampled_cache_disabled() {
+            counters
+                .sampled_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         // Identity fast path: same producer key + generation means the bytes
         // are unchanged by the producer's coherence model — bind the retained
         // image without hashing or comparing content.
@@ -1996,6 +2005,19 @@ impl ResourcePools {
                 .iter()
                 .position(|entry| entry.slot.key() == key && entry.identity == Some(id))
             {
+                // The producer's claim is checked against the digest the entry
+                // was admitted with. Probe-gated because the whole point of the
+                // fast path is not to hash, and the retained frames here run to
+                // 8 MiB.
+                if crate::observe::content_probe_enabled() {
+                    audit_sampled_identity(
+                        sampled_content_hash(content),
+                        self.sampled_cache[index].content_hash,
+                        id,
+                        width,
+                        height,
+                    );
+                }
                 let mut entry = self.sampled_cache.remove(index);
                 entry.last_touch_ms = self.idle_clock_ms;
                 let handles = entry.slot.handles();
@@ -2094,6 +2116,89 @@ impl ResourcePools {
     }
 }
 
+/// The identity fast path bound a retained image whose admitted fingerprint
+/// disagrees with the bytes this bind was handed.
+///
+/// [`SampledContentIdentity`](crate::backend::vulkan::engine::SampledContentIdentity)
+/// is a *claim*, not a reading: the runtime asserts that two binds carrying the
+/// same `(key, generation)` hold byte-identical content, and the cache then
+/// binds the retained image without looking at either. Neither side ever
+/// re-reads the claim, so a producer whose generation fails to move across a
+/// content change binds a stale picture with no decline anywhere — the silent
+/// loss the ground rules forbid, in the one shape no counter in this crate was
+/// watching for. A mismatch here *is* the defect, caught at the bind that
+/// commits it and carrying the producer key that made the claim.
+struct SampledIdentityMismatch {
+    identity_key: u64,
+    generation: u64,
+    retained: u128,
+    incoming: u128,
+}
+
+impl crate::observe::Decline for SampledIdentityMismatch {
+    fn slug(&self) -> &'static str {
+        "sampled_identity_stale"
+    }
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("identity_key", format!("{:#x}", self.identity_key)),
+            ("generation", self.generation.to_string()),
+            ("retained", format!("{:032x}", self.retained)),
+            ("incoming", format!("{:032x}", self.incoming)),
+        ]
+    }
+}
+
+/// Running audit of the identity fast path (`REIMS_VGPU_CONTENT_PROBE=1`).
+///
+/// Returns whether the producer's claim held. Both outcomes are reported: a
+/// mismatch on the failure channel, and the *denominator* on the census channel
+/// every [`IDENTITY_AUDIT_STRIDE`] checks, because a zero on the mismatch arm is
+/// unreadable without the count of claims that were actually tested.
+///
+/// Free of `self` and of Vulkan so the reporting rule is unit-testable.
+fn audit_sampled_identity(
+    incoming: u128,
+    retained: u128,
+    identity: crate::backend::vulkan::engine::SampledContentIdentity,
+    width: u32,
+    height: u32,
+) -> bool {
+    use std::sync::atomic::AtomicU64;
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    static MISMATCHED: AtomicU64 = AtomicU64::new(0);
+
+    let held = incoming == retained;
+    let checked = CHECKED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !held {
+        let mismatched = MISMATCHED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::observe::Emit::decline(
+            "sampled_identity_audit",
+            &SampledIdentityMismatch {
+                identity_key: identity.key,
+                generation: identity.generation,
+                retained,
+                incoming,
+            },
+        )
+        .field("geom", format!("{width}x{height}"))
+        .field("checked", checked)
+        .field("mismatched", mismatched)
+        .fail();
+    } else if checked.is_multiple_of(IDENTITY_AUDIT_STRIDE) {
+        crate::observe::off(format!(
+            "sampled_identity_audit checked={checked} mismatched={}",
+            MISMATCHED.load(Ordering::Relaxed)
+        ));
+    }
+    held
+}
+
+/// How many identity claims one census line stands for. A claim is checked per
+/// sampled bind, so a per-check line would be ~100k/boot; the count on the line
+/// is cumulative, so the last one printed is the whole run's denominator.
+const IDENTITY_AUDIT_STRIDE: u64 = 4096;
+
 /// Why a readback allocation is slower than the class asked for.
 ///
 /// `MemoryClass::Readback` ranks `HOST_CACHED` first because the CPU read that
@@ -2155,6 +2260,73 @@ fn note_readback_memory(
         .field("coherent", u8::from(kind.coherent))
         .field("topology", topology)
         .off();
+    }
+}
+
+#[cfg(test)]
+mod identity_audit_tests {
+    use super::*;
+    use crate::backend::vulkan::engine::SampledContentIdentity;
+    use crate::observe::Decline as _;
+
+    fn id(key: u64, generation: u64) -> SampledContentIdentity {
+        SampledContentIdentity { key, generation }
+    }
+
+    /// The audit's whole purpose is to disagree with the producer when the
+    /// producer is wrong. A verdict wired to the claim rather than to the bytes
+    /// would report health forever, which is the state this probe exists to
+    /// distinguish from a genuine zero.
+    #[test]
+    fn a_stale_identity_claim_is_refused_by_the_digest_not_by_the_claim() {
+        crate::observe::redirect_logs_for_tests();
+        assert!(
+            audit_sampled_identity(7, 7, id(0x1000, 5), 64, 64),
+            "equal digests are the healthy case"
+        );
+        assert!(
+            !audit_sampled_identity(8, 7, id(0x1000, 5), 64, 64),
+            "identical (key, generation) over different bytes is the defect"
+        );
+    }
+
+    /// The line has to name the producer that made the claim: without the key
+    /// and generation a mismatch says only "something was stale", and the two
+    /// generation namespaces (host-cache `host_gen`, guest-memo base) are what
+    /// separate the candidate producers.
+    #[test]
+    fn the_mismatch_line_names_the_claiming_producer_and_both_digests() {
+        let line = crate::observe::Emit::decline(
+            "sampled_identity_audit",
+            &SampledIdentityMismatch {
+                identity_key: 0xca3850,
+                generation: 1 << 32,
+                retained: 0xdead,
+                incoming: 0xbeef,
+            },
+        )
+        .field("geom", "64x64")
+        .render();
+        assert!(line.starts_with("sampled_identity_audit reason=sampled_identity_stale "));
+        assert!(line.contains(" identity_key=0xca3850"));
+        assert!(line.contains(" generation=4294967296"));
+        assert!(line.contains(" retained=0000000000000000000000000000dead"));
+        assert!(line.contains(" incoming=0000000000000000000000000000beef"));
+        assert!(line.contains(" geom=64x64"));
+    }
+
+    #[test]
+    fn the_mismatch_slug_is_its_own() {
+        assert_eq!(
+            SampledIdentityMismatch {
+                identity_key: 0,
+                generation: 0,
+                retained: 0,
+                incoming: 0,
+            }
+            .slug(),
+            "sampled_identity_stale"
+        );
     }
 }
 

@@ -448,6 +448,27 @@ pub fn content_probe_enabled() -> bool {
     })
 }
 
+/// Bisection knob (`REIMS_VGPU_SAMPLED_CACHE_OFF=1`): force every sampled bind
+/// to miss the engine's retained-image cache and re-upload the producer's bytes.
+///
+/// The cache is the one place a draw binds pixels that were resolved for some
+/// *earlier* draw, so it is the seam that separates "the wrong bytes were
+/// chosen" from "the right bytes were chosen and the wrong image was bound".
+/// Nothing else can bisect there: the retained `VkImage` has no CPU mirror to
+/// compare against, and a boot with the cache off answers the question by
+/// construction rather than by a correlation.
+///
+/// This costs one upload per bind — it is a diagnostic arm, never a product
+/// configuration, and a boot that sets it must not be read for frame rate.
+pub fn sampled_cache_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_SAMPLED_CACHE_OFF")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Summarise a tightly packed `texel`-byte-per-pixel image so a *wrong* image
 /// identifies itself in the log without a screen-to-mapping join.
 ///
