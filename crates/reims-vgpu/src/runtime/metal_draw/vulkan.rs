@@ -4404,6 +4404,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let mut surface_resident_store = false;
         #[cfg(feature = "backend-vulkan")]
+        let identity_taken_by_another_rail = resources.target_identity.is_some();
+        #[cfg(feature = "backend-vulkan")]
         if resources.target_identity.is_none() {
             resources.target_identity = type11_resident_target.clone();
             if type11_resident_target.is_some()
@@ -4412,6 +4414,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             {
                 resources.skip_readback = true;
                 surface_resident_store = true;
+            }
+        }
+        // Every rail that could skip this Store's readback has now had its say.
+        // A composite Store that still reads back costs a full-surface GPU→CPU
+        // copy plus the fence wait that is charged per byte, and the always-on
+        // channel could not say which of six conditions kept it: `store_routes`
+        // counts the route TAKEN, so the 256/s that land on `surface_deferred`
+        // are indistinguishable from each other. Ordered first-failure, into the
+        // same per-second window `drain_duty` divides, so the count sits beside
+        // the `readbacks` it explains.
+        #[cfg(feature = "backend-vulkan")]
+        if !resources.skip_readback && store_is_store && writeback_guest {
+            if let Some(c0) = req.colors.first() {
+                if c0.mapping_id != 0 {
+                    crate::runtime::drain::note_store_route(if req.chain_from_resident {
+                        // `type11_store_identity` refuses outright for a chained
+                        // Store, so this Store can never reach the rail however
+                        // eligible its mapping is.
+                        "t11_keep_chain_from_resident"
+                    } else if identity_taken_by_another_rail {
+                        "t11_keep_identity_taken"
+                    } else if c0.store_action != PASS_STORE_ACTION_STORE {
+                        "t11_keep_store_action"
+                    } else if type11_resident_target.is_none() {
+                        "t11_keep_no_chain_identity"
+                    } else if !deferred_gpu_only_content_allowed_for_surface() {
+                        "t11_keep_gpu_only_denied"
+                    } else {
+                        "t11_keep_not_defer_eligible"
+                    });
+                }
             }
         }
         #[cfg(feature = "backend-vulkan")]

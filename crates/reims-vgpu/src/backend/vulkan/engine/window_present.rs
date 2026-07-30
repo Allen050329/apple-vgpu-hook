@@ -412,6 +412,22 @@ pub(crate) struct WindowPresenter {
     cadence_presents: u64,
     cadence_direct: u64,
     cadence_busy: u64,
+    /// Distinct frame sequences offered in the window, and the last one seen.
+    ///
+    /// `presents` alone cannot separate "the device published 20 frames this
+    /// second" from "the device published 100 and the presenter could only show
+    /// 20": a `Busy` return leaves the window's seq gate unchanged, so the same
+    /// frame is re-offered every poll and `busy` counts retries, not frames.
+    /// Offered-vs-presented is the ratio that says which side is the limit.
+    cadence_offered: u64,
+    cadence_last_offered: Option<u64>,
+    /// `Busy` returns split by which of the two gates refused: the previous
+    /// present's blit fence still running (`fence` — the engine queue is behind,
+    /// since the blit is submitted to the same queue as every guest draw), or
+    /// the swapchain having no free image (`acquire` — the display's own pacing).
+    /// They have opposite fixes, and one `busy` count cannot tell them apart.
+    cadence_busy_fence: u64,
+    cadence_busy_acquire: u64,
 }
 
 impl WindowPresenter {
@@ -551,6 +567,10 @@ impl WindowPresenter {
             cadence_presents: 0,
             cadence_direct: 0,
             cadence_busy: 0,
+            cadence_offered: 0,
+            cadence_last_offered: None,
+            cadence_busy_fence: 0,
+            cadence_busy_acquire: 0,
         };
         if let Err(error) = presenter.recreate_swapchain(ctx) {
             presenter.destroy(ctx, None);
@@ -756,7 +776,14 @@ impl WindowPresenter {
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentOutcome, DrawError> {
+        if let Some(seq) = cpu.map(|frame| frame.seq) {
+            if self.cadence_last_offered != Some(seq) {
+                self.cadence_last_offered = Some(seq);
+                self.cadence_offered = self.cadence_offered.saturating_add(1);
+            }
+        }
         if !self.retire(ctx, pools)? {
+            self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
             return Ok(WindowPresentOutcome::Busy);
         }
@@ -771,12 +798,14 @@ impl WindowPresenter {
         ) {
             Ok((index, suboptimal)) => (index, suboptimal),
             Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
+                self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
                 return Ok(WindowPresentOutcome::Busy);
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_pending = true;
                 self.recreate_reason = "acquire_out_of_date";
+                self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
                 self.note_cadence(false, false);
                 return Ok(WindowPresentOutcome::Busy);
             }
@@ -1292,12 +1321,20 @@ impl WindowPresenter {
             elapsed.as_millis() as u64,
             self.cadence_presents,
             self.cadence_direct,
-            self.cadence_busy,
+            CadenceBusy {
+                total: self.cadence_busy,
+                fence: self.cadence_busy_fence,
+                acquire: self.cadence_busy_acquire,
+            },
+            self.cadence_offered,
         ));
         self.cadence_started = Instant::now();
         self.cadence_presents = 0;
         self.cadence_direct = 0;
         self.cadence_busy = 0;
+        self.cadence_offered = 0;
+        self.cadence_busy_fence = 0;
+        self.cadence_busy_acquire = 0;
     }
 
     pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePools) {
@@ -1347,12 +1384,31 @@ fn swapchain_recreated_line(from: vk::Extent2D, to: vk::Extent2D, reason: &str) 
     )
 }
 
-fn window_cadence_line(window_ms: u64, presents: u64, direct: u64, busy: u64) -> String {
+/// The two gates that can refuse a present, kept apart because they have
+/// opposite fixes: `fence` is the engine queue still running the previous blit
+/// behind however much guest work was submitted ahead of it, `acquire` is the
+/// swapchain having no free image, which is the display's own pacing.
+struct CadenceBusy {
+    total: u64,
+    fence: u64,
+    acquire: u64,
+}
+
+fn window_cadence_line(
+    window_ms: u64,
+    presents: u64,
+    direct: u64,
+    busy: CadenceBusy,
+    offered: u64,
+) -> String {
     let hz = presents as f64 * 1_000.0 / window_ms.max(1) as f64;
     let direct_fraction = direct as f64 / presents.max(1) as f64;
+    let offered_hz = offered as f64 * 1_000.0 / window_ms.max(1) as f64;
     format!(
         "host_window_cadence window_ms={window_ms} presents={presents} direct={direct} \
-         busy={busy} present_hz={hz:.1} direct_frac={direct_fraction:.2}"
+         busy={} busy_fence={} busy_acquire={} offered={offered} present_hz={hz:.1} \
+         offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2}",
+        busy.total, busy.fence, busy.acquire
     )
 }
 
@@ -1543,12 +1599,47 @@ mod tests {
 
     #[test]
     fn cadence_proxy_reports_actual_queue_presents_and_direct_fraction() {
-        let line = window_cadence_line(1_000, 120, 119, 131);
+        let line = window_cadence_line(
+            1_000,
+            120,
+            119,
+            CadenceBusy {
+                total: 131,
+                fence: 100,
+                acquire: 31,
+            },
+            240,
+        );
         assert!(line.contains("presents=120"), "{line}");
         assert!(line.contains("direct=119"), "{line}");
         assert!(line.contains("busy=131"), "{line}");
+        assert!(line.contains("busy_fence=100"), "{line}");
+        assert!(line.contains("busy_acquire=31"), "{line}");
         assert!(line.contains("present_hz=120.0"), "{line}");
         assert!(line.contains("direct_frac=0.99"), "{line}");
+    }
+
+    /// `offered` is the denominator `presents` needs. A window that presents 20
+    /// frames is healthy if 20 were published and a 6x drop if 120 were, and
+    /// `busy` cannot tell them apart — a `Busy` return leaves the window's seq
+    /// gate unchanged, so one frame is re-offered every poll and `busy` counts
+    /// retries.
+    #[test]
+    fn the_cadence_line_carries_the_rate_frames_were_offered_at() {
+        let line = window_cadence_line(
+            1_000,
+            20,
+            20,
+            CadenceBusy {
+                total: 420,
+                fence: 400,
+                acquire: 20,
+            },
+            109,
+        );
+        assert!(line.contains("offered=109"), "{line}");
+        assert!(line.contains("offered_hz=109.0"), "{line}");
+        assert!(line.contains("present_hz=20.0"), "{line}");
     }
 
     fn ready(width: u32, height: u32) -> CandidateState {
