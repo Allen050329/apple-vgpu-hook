@@ -1499,13 +1499,61 @@ packet's chain value, and that binding **has no reader**. `writeback_guest` is g
 `di == last_i`, so there is no record N+1 to seed and every other reader in `exec.rs` is inside the
 record loop that just ended. Now `None`.
 
-**Not yet scored on a boot.** The within-boot numbers to read are `t11_convert_us` per Store (expected
-to collapse toward zero — the call is now a compare, and
-`reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree` is what stops a future edit restoring
-the cost with the pixels still correct) and `target_evicts` (expected to stay 0). Not the host frame
-rate, per the 1.8x spread above. `read_resident_bgra`'s present rung is now *reachable* for the first
-time and is still never taken, because the present capture prefers `surface_cache` and the Store keeps
-refreshing it — that rung is the gate for the work below and this commit does not exercise it.
+**Scored on one x86/Vulkan boot at `e62bb9e`** (Safari fullscreen on testufo.com/refreshrate, 45 s
+settle, `.agents/repros/testufo-fps.sh`; 8543 sliced lines, 80 `store_routes` / `draw_phase` windows,
+85 `engine_delta` windows):
+
+| | at `fb89924` | at `e2c2dee` |
+|---|---|---|
+| `t11_convert_us` **per Store** | 627 us | **0.00 us** (7 us total over 20 079 Stores) |
+| `t11_store_us` per Store | ~920 us | **152 us** |
+| `t11_store_us` per second | ~180 ms | **40 ms** |
+| unaccounted share of `draw_us` | 22-28 % | **11 %** |
+| `target_evicts` | 0 | **0**, in all 85 windows |
+| `deferred_flush_lost reason=cache_miss` | 0 | **0** |
+| failure-channel lines | — | no new kind; 1 `map_generation_drift` |
+
+The numbers that establish it are within-boot: 7 us of convert across 20 079 Stores is the pass being
+*gone* rather than cheaper, and the phase table going from covering 72 % of `draw_us` to **89 %** says
+the time came out of the bucket `b872e43` instrumented rather than moving somewhere unmeasured.
+`target_evicts` at 0 across every window is the identity-derived rule working — that counter is what a
+per-path predicate would have moved. Host presents read 25.03 Hz and the guest read 48.000 Hz / 89 fps;
+neither scores this, per the 1.8x spread.
+
+**Correctness is the screenshot, because a wrong byte order emits no line at all.** The captured frame
+has the SYNC-FAILURE banner **red** (an R/B exchange makes it blue), hyperlinks **blue**, the Blur
+Busters banner **purple** and the mascot **green**. That is the check to repeat for any future change
+to attachment format; the failure channel cannot see this class.
+
+Two counts on that slice were mis-read first time, and both traps are cheap to repeat:
+
+- **`grep -c cache_miss` returned 85 and meant nothing.** It matches `sampled_cache_misses`, a *field
+  name* printed on every `engine_delta` line whatever its value. The black-layer class is
+  `deferred_flush_lost.*reason=cache_miss`, which is 0. Grep the whole slug, not a fragment of it.
+- **`grep -c FAIL` returned 0 while a `deferred_flush_lost` was present.** `observe::fail` does not
+  prefix its lines with `FAIL`; the failure channel is the lines *without* the `OFF ` prefix. Counting
+  `FAIL` measures a different, smaller set — and it reads as a clean boot.
+
+`read_resident_bgra`'s present rung is now *reachable* for the first time (`slot.bgra` can be true) and
+is still never taken, because the present capture prefers `surface_cache` and the Store keeps
+refreshing it. That rung is the gate for the work below and this boot does not exercise it.
+
+**The bottleneck after this is sharper than the entry below predicted.** Same boot, `draw_phase` p50
+per second of wall clock against a busy `draw_us` of 832 ms and `duty` 0.983:
+
+| phase | us/s | share of `draw_us` |
+|---|---|---|
+| `wait_us` | **371 000** | **44.6 %** |
+| `readback_us` | **194 000** | **23.4 %** |
+| `stage_us` | 51 600 | 6.2 % |
+| `prep_us` | 45 900 | 5.5 % |
+| `acquire_us` | 36 100 | 4.3 % |
+| `submit_us` | 33 300 | 4.0 % |
+| `record_us` / `pipeline_us` / `descriptors_us` | ≤ 8 500 | ~1.4 % |
+
+`wait_us + readback_us` is **565 ms/s, 68 % of `draw_us`** — not "half", as recorded below — and
+`surface_deferred` runs 251/s against `readbacks` ~250/s, so essentially every readback is still a
+type-11 composite Store. `skip_readback` drops both together.
 
 Consumers `skip_readback` must then re-source: `surface_cache` (present capture at `scanout.rs:248`,
 the ~4 % of LOADs that still seed, and the sampled bind), the deferred window's owned frame, and the
