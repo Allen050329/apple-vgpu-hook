@@ -317,6 +317,25 @@ pub struct WriteGateProbe {
     /// How many the first declaring task in `owners` resolves, or 0 when the
     /// range is declared by nobody.
     pub owner_mapped: u64,
+    /// Whether every examined page resolves under **both** the writing task and
+    /// the first declaring owner, to the **same** guest physical page.
+    ///
+    /// This is the reading that separates two very different worlds behind the
+    /// same `named_mapped == owner_mapped == pages`. Two tasks resolving a range
+    /// says only that both address spaces have *something* there; it does not
+    /// say they have the *same* thing. If the GPAs agree, the declaring task's
+    /// `MapMemory2` and the writing task's usage name one physical buffer — a
+    /// shared allocation reached through two page tables — and a declaration
+    /// over those pages is transferable. If they disagree, the writing task has
+    /// its own private memory at that address and honouring the neighbour's
+    /// declaration would write a framebuffer into somebody's heap, which is
+    /// precisely the corruption class the gate exists for.
+    ///
+    /// **Fail-closed by construction**: false unless both walks returned exactly
+    /// `pages` entries and every pair matched. A hole in either walk — an
+    /// unmapped page in the middle of the range — is a disagreement, not a
+    /// shortened comparison.
+    pub gpa_match: bool,
 }
 
 /// Upper bound on the pages [`probe_write_gate_pages`] walks.
@@ -351,18 +370,30 @@ fn probe_write_gate_pages<H: HostMemory>(
     let spanned = ((last - first) >> shift).saturating_add(1);
     let pages = spanned.min(WRITE_GATE_PROBE_PAGE_CAP);
     let span = pages << shift;
-    let count_for = |who: u32| -> u64 {
-        let mut n = 0u64;
-        visit_task_gva_page_gpas(host, &state.tasks, who, first, span, shift, 1, &mut |_| {
-            n += 1;
+    // Collect rather than count, because the two questions this answers need
+    // different reductions of the same walk: how many pages resolve, and whether
+    // they resolve to the same physical pages. The walk is bounded by
+    // `WRITE_GATE_PROBE_PAGE_CAP`, so the vector is too.
+    let gpas_for = |who: u32| -> Vec<u64> {
+        let mut out = Vec::with_capacity(pages as usize);
+        visit_task_gva_page_gpas(host, &state.tasks, who, first, span, shift, 1, &mut |gpa| {
+            out.push(gpa);
             true
         });
-        n
+        out
     };
+    let named = gpas_for(task_id);
+    let owned = owners.first().copied().map(gpas_for).unwrap_or_default();
     WriteGateProbe {
         pages,
-        named_mapped: count_for(task_id),
-        owner_mapped: owners.first().copied().map(count_for).unwrap_or(0),
+        named_mapped: named.len() as u64,
+        owner_mapped: owned.len() as u64,
+        // `visit_task_gva_page_gpas` calls its visitor only on a successful
+        // translate, so a short vector means the walk had a hole and the entries
+        // after it no longer line up with the page they came from. Requiring
+        // both to be exactly `pages` long is what makes the elementwise compare
+        // a compare of the same page rather than of the same index.
+        gpa_match: named.len() as u64 == pages && owned == named,
     }
 }
 
@@ -400,6 +431,12 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
         //                   page), so the gate costs nothing here and the real
         //                   question is upstream: how the named task came to
         //                   reference an address only another task mapped.
+        //   gpa_match == 1  both tasks resolve the range to the *same* physical
+        //                   pages, so the owner's declaration and this write name
+        //                   one shared allocation and the declaration transfers.
+        //                   Without this column `named == owner == pages` is
+        //                   equally consistent with two private buffers that
+        //                   merely happen to sit at the same address.
         //
         // A state, not an event count, and on the branch that is unconditionally
         // taken when the refusal fires — so a zero is readable rather than
@@ -414,6 +451,7 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
             .field("pages", probe.pages)
             .field("named_mapped", probe.named_mapped)
             .field("owner_mapped", probe.owner_mapped)
+            .field("gpa_match", u8::from(probe.gpa_match))
             .field("via", via)
             .fail();
         return Err(MemError::OutsideMap);
@@ -436,7 +474,10 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
                 .field("task", task_id)
                 .field("gva", format!("{gva:#x}"))
                 .field("len", format!("{:#x}", buf.len()))
-                .field("owners", format!("{:?}", state.tasks_covering(gva, buf.len() as u64)))
+                .field(
+                    "owners",
+                    format!("{:?}", state.tasks_covering(gva, buf.len() as u64)),
+                )
                 .field("spans", state.task_map_span_count())
                 .field("via", via)
                 .fail();
@@ -895,7 +936,7 @@ mod tests {
         assert!(state.gva_write_allowed(1, 0x2f00, 0x100));
         assert!(!state.gva_write_allowed(1, 0x1000, 0x100)); // outside
         assert!(!state.gva_write_allowed(1, 0x2f00, 0x200)); // straddles end
-                                                             // Product path fails closed with outside_map.
+        // Product path fails closed with outside_map.
         let err = write_task_gva_product(&mut state, &mut host, 1, 0x1000, &[1, 2, 3, 4]);
         assert!(err.is_err());
         state.note_task_unmap(1, 0x2000, 0x1000);
@@ -954,7 +995,6 @@ mod tests {
         other.note_task_map(6, 0x4000, 0x1000);
         assert_eq!(other.gva_write_gate(6, 0x4000, 0x100), WriteGate::Exact);
     }
-
 
     /// The unfiltered owner scan sees what the gate does not, and it does not
     /// change what the gate decides.
@@ -1317,6 +1357,143 @@ mod tests {
         assert_eq!(
             huge.owner_mapped, 0,
             "no declaring task means no owner column, not a panic"
+        );
+    }
+
+    /// Give `task_id` its own directory mapping `pages` pages from GVA 0 onto
+    /// `data_base_pfn..`, so two tasks can be pointed at the same physical pages
+    /// or at different ones with everything else held.
+    ///
+    /// Deliberately separate from [`define_task_pages_arm64e`], which fixes the
+    /// directory and root PFN and has 51 callers; a second task needs its own
+    /// tables or the two are the same address space and the comparison is
+    /// vacuous.
+    fn define_second_task_pages_arm64e(
+        host: &mut crate::runtime::host::FakeHost,
+        state: &mut DeviceState,
+        task_id: u32,
+        dir_pfn: u32,
+        root_pfn: u32,
+        data_base_pfn: u32,
+        pages: u32,
+    ) {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::model::PAGE_SHIFT_ARM64E;
+        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x4000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        for i in 0..pages {
+            let pfn = data_base_pfn + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+        }
+        assert!(state.define_task(task_id, 0x1000, dir_pfn));
+    }
+
+    /// Two tasks resolving a range is not two tasks resolving the *same* range,
+    /// and the refusal line cannot be acted on until it says which.
+    ///
+    /// On the live rail every refused write comes back `named_mapped ==
+    /// owner_mapped == pages`, which reads as "the declaring task and the writing
+    /// task are looking at one shared buffer". It is equally consistent with the
+    /// writing task having its own private heap at that address — and those two
+    /// call for opposite fixes: the first says the declaration transfers and the
+    /// gate is over-strict, the second says honouring the neighbour's declaration
+    /// would write into a heap, which is the corruption class the gate exists
+    /// for. Only the physical pages tell them apart.
+    #[test]
+    fn a_refusal_says_whether_the_two_tasks_share_the_physical_pages() {
+        use crate::model::PAGE_SHIFT_ARM64E;
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+
+        // Aliased: task 2's tables land on the very pages task 1's do.
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
+        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x100, 4);
+        let shared = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[2]);
+        assert_eq!(
+            (shared.pages, shared.named_mapped, shared.owner_mapped),
+            (2, 2, 2)
+        );
+        assert!(
+            shared.gpa_match,
+            "both tasks translate these GVAs to the same GPAs, so the declaration \
+             names the buffer this write targets"
+        );
+
+        // Private: same GVAs, same page counts, different physical memory. Every
+        // column the line carried before this one is identical to the aliased
+        // case above, which is what makes that reading unsafe on its own.
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
+        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x200, 4);
+        let private = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[2]);
+        assert_eq!(
+            (private.pages, private.named_mapped, private.owner_mapped),
+            (shared.pages, shared.named_mapped, shared.owner_mapped),
+            "the counts cannot separate these two, which is the whole point"
+        );
+        assert!(
+            !private.gpa_match,
+            "task 2 declared a range that resolves to its own pages, so its \
+             declaration says nothing about where this write would land"
+        );
+
+        // A hole under either walk is a disagreement, not a shortened compare:
+        // page 5 is past task 2's four-page table, so the owner walk returns one
+        // entry for a two-page span and the indices no longer name the same page.
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        define_task_pages_arm64e(&mut host, &mut state, 0x100, 8);
+        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x100, 4);
+        let ragged = super::probe_write_gate_pages(&state, &host, 1, 3 * page, 2 * page, &[2]);
+        assert_eq!(
+            (ragged.pages, ragged.named_mapped, ragged.owner_mapped),
+            (2, 2, 1)
+        );
+        assert!(
+            !ragged.gpa_match,
+            "fail closed: a walk that skipped a page cannot be compared elementwise"
+        );
+
+        // No declaring task means nothing to compare against, not a match by
+        // default — the empty owner vector must not equal a full named one.
+        let orphan = super::probe_write_gate_pages(&state, &host, 1, 0, 2 * page, &[]);
+        assert!(
+            !orphan.gpa_match,
+            "no owner is not agreement with the owner"
+        );
+
+        // Both walks short by the *same* pages: two aliased four-page tables,
+        // probed across the end of both. Vector equality alone reads "agreed",
+        // because the two walks skip the hole in step and the entries that
+        // survive do match. `pages` is 2 and only one was examined, so that
+        // agreement covers half the range, and the length guard is the only
+        // thing that notices. The equality test cannot reach this arm.
+        let mut host = crate::runtime::host::FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        define_task_pages_arm64e(&mut host, &mut state, 0x100, 4);
+        define_second_task_pages_arm64e(&mut host, &mut state, 2, 8, 9, 0x100, 4);
+        let overrun = super::probe_write_gate_pages(&state, &host, 1, 3 * page, 2 * page, &[2]);
+        assert_eq!(
+            (overrun.pages, overrun.named_mapped, overrun.owner_mapped),
+            (2, 1, 1),
+            "one page inside both tables and one past the end of both"
+        );
+        assert!(
+            !overrun.gpa_match,
+            "the two walks agree on the one page they both resolved and neither \
+             resolved the other, so agreement here covers half the range"
         );
     }
 
