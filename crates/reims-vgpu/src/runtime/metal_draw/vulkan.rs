@@ -794,20 +794,55 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
-    let win = state.gva_deferred_flush.get(&gva)?;
+    // Every rung below this point declines to a bare `None`, and the caller then
+    // reads guest pages — so which of four different situations produced the
+    // fall-through is invisible at the call site, and the four are not equally
+    // safe. A window that is armed but whose resident is not ready is the one
+    // that matters: the window's existence is itself the statement that guest
+    // pages are stale. Named per (gva, geometry, reason), transition-keyed.
+    let decline = |reason: &str, win_geom: (u32, u32)| {
+        if crate::observe::content_probe_enabled() {
+            let mut subject = std::hash::DefaultHasher::new();
+            std::hash::Hash::hash(&(gva, layout.width, layout.height), &mut subject);
+            let mut st = std::hash::DefaultHasher::new();
+            std::hash::Hash::hash(&(reason, win_geom), &mut st);
+            if crate::observe::state_changed(
+                "gva_sample_rung",
+                std::hash::Hasher::finish(&subject),
+                std::hash::Hasher::finish(&st),
+            ) {
+                crate::observe::off(format!(
+                    "gva_sample_rung reason={reason} task={task_id} ref={texture_ref} gva={gva:#x} desc={}x{} win={}x{}",
+                    layout.width, layout.height, win_geom.0, win_geom.1,
+                ));
+            }
+        }
+        None::<(u32, u32, u32, SampledSourceRequest)>
+    };
+    let Some(win) = state.gva_deferred_flush.get(&gva) else {
+        return decline("no_window", (0, 0));
+    };
+    let win_geom = (win.width, win.height);
     if !deferred_gva_sample_eligible(win, layout.width, layout.height, entry.object_type) {
-        return None;
+        let reason = if win.width != layout.width || win.height != layout.height {
+            "window_geometry"
+        } else {
+            "owner_object_type"
+        };
+        return decline(reason, win_geom);
     }
     let id = TargetIdentity::Gva {
         gva,
-        width: win.width,
-        height: win.height,
+        width: win_geom.0,
+        height: win_geom.1,
         generation: 0,
     };
     if !engine::resident_content_ready(&id) {
-        return None;
+        // The window says guest pages are stale and the resident says it has
+        // nothing — the two together mean this sample has no correct source.
+        return decline("resident_not_ready", win_geom);
     }
-    Some((win.width, win.height, 0, SampledSourceRequest::Target(id)))
+    Some((win_geom.0, win_geom.1, 0, SampledSourceRequest::Target(id)))
 }
 
 /// Sibling of [`try_sample_deferred_gva`] for MRT secondary attachments (the
