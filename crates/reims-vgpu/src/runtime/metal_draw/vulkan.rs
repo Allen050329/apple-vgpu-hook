@@ -3308,6 +3308,35 @@ fn note_gva_backing_verdict(
 /// never reaches it. 395 seed resolutions on a comparable boot (2870346)
 /// against a partial-draw population in the hundreds of thousands is the
 /// signature of a match arm being taken elsewhere, not of a rail that works.
+///
+/// # The scissor is not the icon defect, and the shape above was misread
+///
+/// Two later readings retire this lead. First, the rect is the guest's own: it
+/// is decoded verbatim from `OP_SET_SCISSOR` (`decode::render`, four u64 fields)
+/// and latched only when both extents are non-zero — this device computes,
+/// clamps and derives nothing, so a 12x40 scissor over a 64x64 icon is the
+/// compositor's damage rect faithfully carried. Second, `draw_partial_load_
+/// unseeded` measured **zero** over a full driven boot (233ba1c), so no partial
+/// draw on this rail destroys what it did not cover.
+///
+/// What retires it for good is a photograph of the defect at pixel scale. A
+/// 14-round recomposite reproduced it (rounds 3-6 corrupt, held — one cell never
+/// recovers), and the corrupt cell magnified is **not** a small block of correct
+/// content in an empty square. It is a narrow tall block of *garbage*: black at
+/// the top fading to grey, with saturated red, green and violet texels along its
+/// bottom edge, and the white background immediately around it carries
+/// low-amplitude noise (240, 232, 245, 254 where the clean round is 255 exactly).
+/// The clean round's same columns are the folder's light-blue left edge.
+///
+/// So the cell is not a correct draw with an emptied surround. The whole region
+/// holds uninitialized-looking content, which means the question this census was
+/// built to ask — "what emptied the texels outside the scissor" — was the wrong
+/// one. The question is what *filled* this rectangle, and neither a clear
+/// (`[0,0,0,0]`, transparent black, not noise) nor a lost seed (blank, not noise)
+/// produces that signature. Uninitialized device memory does.
+///
+/// The census stays because the partition it prints is cheap and is the
+/// denominator any future claim about this rail needs. It is no longer a lead.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
