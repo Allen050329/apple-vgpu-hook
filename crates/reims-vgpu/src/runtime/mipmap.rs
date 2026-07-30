@@ -259,10 +259,9 @@ fn load_level_tight_native<M: HostMemory + HostOps>(
         None => return Err(MipmapStatus::Capacity),
     };
     let need = host_alloc_len(need).ok_or(MipmapStatus::Capacity)?;
-    let span = match bpr.checked_mul(h as u64) {
-        Some(v) => v,
-        None => return Err(MipmapStatus::Capacity),
-    };
+    // Row-by-row of `tight_row` bytes below, so the bound is the extent read
+    // rather than `bpr * h` — see `TextureLevelLayout::read_span`.
+    let span = layout.read_span(tight_row).ok_or(MipmapStatus::Capacity)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return Err(MipmapStatus::IncompleteLayout);
     }
@@ -321,10 +320,9 @@ fn store_level_tight_native<M: HostMemory + HostOps>(
     if tight.len() < need {
         return Err(MipmapStatus::IncompleteLayout);
     }
-    let span = match bpr.checked_mul(h as u64) {
-        Some(v) => v,
-        None => return Err(MipmapStatus::Capacity),
-    };
+    // Same rule on the write side: each row writes `tight_row` bytes at
+    // `gva + y * bpr`, so a trailing stride is never touched.
+    let span = layout.read_span(tight_row).ok_or(MipmapStatus::Capacity)?;
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return Err(MipmapStatus::IncompleteLayout);
     }

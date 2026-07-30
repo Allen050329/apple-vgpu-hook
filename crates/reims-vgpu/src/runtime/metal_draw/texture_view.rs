@@ -594,7 +594,8 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         .and_then(|n| n.checked_mul(RGBA8_BPP as u64))
         .and_then(host_alloc_len)
         .ok_or(R::SizeOverflow)?;
-    let span = bpr.checked_mul(h as u64).ok_or(R::SizeOverflow)?;
+    // The extent actually read, not `bpr * h` — see `TextureLevelLayout::read_span`.
+    let span = layout.read_span(tight).ok_or(R::SizeOverflow)?;
     let end = layout.offset.saturating_add(span);
     if tex.allocation_size != 0 && end > tex.allocation_size {
         return Err(R::SpanExceedsAllocation {

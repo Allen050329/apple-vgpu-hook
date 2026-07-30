@@ -260,6 +260,33 @@ pub struct TextureLevelLayout {
     pub depth: u32,
 }
 
+impl TextureLevelLayout {
+    /// Bytes from [`Self::offset`] that a row-by-row reader or writer of this
+    /// level actually touches, given one tight row of its format.
+    ///
+    /// `row_stride * height` is the obvious answer and it overcounts by one
+    /// row of trailing padding: the last row occupies `tight_row` bytes, and
+    /// every reader in this crate walks `base + y * row_stride` for `tight_row`
+    /// bytes. Used as a bound against `TextureDescriptor::allocation_size`,
+    /// the looser form rejects allocations the guest sized correctly.
+    ///
+    /// Measured: a 27x27 `RG8Unorm` window-corner mask at offset 0x850 with a
+    /// 384-byte stride in a 12 288-byte allocation scores 12 496 under
+    /// `stride * height` and is refused, while its true extent is 12 166. That
+    /// refusal dropped the WindowServer's whole full-screen composite draw, so
+    /// the guest's rounded window corners and drop shadows rendered square.
+    ///
+    /// `None` for zero height (no rows) or on overflow. A bound this feeds must
+    /// treat `None` as a refusal, never as "no limit".
+    pub fn read_span(&self, tight_row: u32) -> Option<u64> {
+        self.height
+            .checked_sub(1)
+            .map(u64::from)?
+            .checked_mul(self.row_stride)?
+            .checked_add(u64::from(tight_row))
+    }
+}
+
 /// Type-2/3 linear texture geometry (`REIMS_VGPU_RESOURCE_TEXTURE_DESC_*`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextureDescriptor {
@@ -2962,6 +2989,86 @@ mod tests {
                 .any(|l| l.contains("reason=color_write_mask_out_of_range")
                     && l.contains("value=305419896")),
             "the refusal names the value that refuted it: {lines:?}"
+        );
+    }
+
+    /// The measured case, from an x86/Vulkan boot in Dark appearance: a 27x27
+    /// `RG8Unorm` corner mask at offset 0x850, 384-byte rows, in a 12 288-byte
+    /// allocation. `row_stride * height` scores 12 496 and refuses it; the
+    /// bytes actually read end at 12 166, with 122 to spare.
+    ///
+    /// The guest's allocation is exactly right, and the old bound demanded
+    /// trailing padding that no row occupies — so the refusal dropped the
+    /// WindowServer's whole composite draw and the window rendered with square
+    /// corners and no shadow.
+    #[test]
+    fn a_levels_read_span_stops_at_the_last_row_not_a_last_stride() {
+        const OFFSET: u64 = 0x850;
+        const STRIDE: u64 = 384;
+        const HEIGHT: u32 = 27;
+        const TIGHT: u32 = 27 * 2;
+        const ALLOCATION: u64 = 12288;
+
+        let span = TextureLevelLayout {
+            offset: OFFSET,
+            size: 0,
+            row_stride: STRIDE,
+            width: 27,
+            height: HEIGHT,
+            depth: 1,
+        }
+        .read_span(TIGHT)
+        .unwrap();
+        assert_eq!(span, 26 * STRIDE + TIGHT as u64);
+        assert_eq!(OFFSET + span, 12166);
+        assert!(
+            OFFSET + span <= ALLOCATION,
+            "the guest sized this allocation for exactly this image"
+        );
+        // The bound this replaced, stated so the regression is visible here
+        // rather than only on a live guest.
+        assert!(OFFSET + STRIDE * HEIGHT as u64 > ALLOCATION);
+
+        // A tight image (no padding) is unchanged: the two forms agree.
+        let tight_span = TextureLevelLayout {
+            offset: OFFSET,
+            size: 0,
+            row_stride: TIGHT as u64,
+            width: 27,
+            height: HEIGHT,
+            depth: 1,
+        }
+        .read_span(TIGHT)
+        .unwrap();
+        assert_eq!(tight_span, (TIGHT as u64) * HEIGHT as u64);
+
+        // A single row is its own tight length, with no stride charged at all.
+        assert_eq!(
+            TextureLevelLayout {
+                offset: OFFSET,
+                size: 0,
+                row_stride: STRIDE,
+                width: 27,
+                height: 1,
+                depth: 1
+            }
+            .read_span(TIGHT),
+            Some(TIGHT as u64)
+        );
+
+        // Zero height has no rows and therefore no span; the caller rejects
+        // that extent separately, and this must not underflow into a huge one.
+        assert_eq!(
+            TextureLevelLayout {
+                offset: OFFSET,
+                size: 0,
+                row_stride: STRIDE,
+                width: 27,
+                height: 0,
+                depth: 1
+            }
+            .read_span(TIGHT),
+            None
         );
     }
 
