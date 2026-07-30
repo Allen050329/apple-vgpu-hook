@@ -2651,3 +2651,92 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
         );
     }
 }
+
+/// An instrument, not a gate: how a draw's cost splits between a fixed
+/// submit-and-wait floor and the bytes it moves.
+///
+/// `#[ignore]` deliberately. It asserts nothing — a timing assertion in this
+/// suite would flake — and it must not occupy an executed slot, because the
+/// suite is serial and alphabetical and every engine-touching case it runs
+/// changes what the next one sees. Run it on purpose:
+///
+/// ```sh
+/// cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window \
+///   --test vk_engine_parity -- --ignored --nocapture --exact \
+///   measure_draw_cost_against_pass_size
+/// ```
+///
+/// It exists because the boot-log evidence could not separate fixed submission
+/// latency from per-pass render cost: `draw_phase`'s `wait_us` was split by
+/// *readback* bytes, and a composite pass's render work is not proportional to
+/// those. Sweeping the geometry varies both together and the intercept falls out.
+///
+/// Measured on the x86 dev host (Intel ARL iGPU), 40 draws per point, all caches
+/// warmed first, no `target_rgba8` so no seed upload is included:
+///
+/// | geometry | MB | us/draw | us/MB |
+/// |---|---|---|---|
+/// | 16x16 | 0.001 | 278 | — |
+/// | 64x64 | 0.016 | 258 | — |
+/// | 256x256 | 0.262 | 299 | 1139 |
+/// | 960x540 | 2.074 | 894 | 431 |
+/// | 1920x1080 | 8.294 | 2386 | 288 |
+///
+/// A 256x range of pixel count at the small end moves the time by 8 %, so the
+/// floor is ~270 us and everything above ~256x256 is linear at ~270 us/MB. That
+/// model predicts the guest's measured 5.1 MB average readback at 1647 us against
+/// 1523 measured.
+///
+/// The consequence is what makes it worth keeping: the fixed floor is only
+/// ~45 ms per second at the guest's 167 readbacks/s, so **draw batching cannot be
+/// the frame-rate lever** — the cost is the bytes. Re-run this after any change
+/// that claims otherwise.
+#[test]
+#[ignore]
+fn measure_draw_cost_against_pass_size() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    // Warm pipeline, pass, target and staging caches at every geometry first, so
+    // the timed runs measure steady state rather than first-sight allocation.
+    for (w, h) in [
+        (16u32, 16u32),
+        (64, 64),
+        (256, 256),
+        (960, 540),
+        (1920, 1080),
+    ] {
+        let req = engine_req(&v, &f, w, h);
+        if draw_or_skip("warm", &req).is_none() {
+            eprintln!("SKIP draw-cost measurement: no GPU");
+            return;
+        }
+    }
+    const RUNS: u32 = 40;
+    eprintln!(
+        "\n  {:>12} {:>10} {:>10} {:>10}",
+        "geometry", "MB/draw", "us/draw", "us/MB"
+    );
+    for (w, h) in [
+        (16u32, 16u32),
+        (64, 64),
+        (256, 256),
+        (960, 540),
+        (1920, 1080),
+    ] {
+        let req = engine_req(&v, &f, w, h);
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            engine::execute_draw_request(&req).expect("timed draw");
+        }
+        let us = start.elapsed().as_micros() as f64 / f64::from(RUNS);
+        let mb = f64::from(w) * f64::from(h) * 4.0 / 1e6;
+        eprintln!(
+            "  {:>12} {:>10.3} {:>10.0} {:>10.0}",
+            format!("{w}x{h}"),
+            mb,
+            us,
+            us / mb
+        );
+    }
+    eprintln!();
+}
