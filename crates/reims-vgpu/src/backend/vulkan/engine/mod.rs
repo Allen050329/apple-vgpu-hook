@@ -565,7 +565,9 @@ pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<
         }
     }
     let mut px = match read_target_inner(identity) {
-        Ok(pixels) => pixels,
+        // The `slot.bgra` gate above already established the order, so the
+        // reported one cannot disagree and the bytes pass through untouched.
+        Ok(rb) => rb.pixels,
         Err(e) => {
             let mut emit = crate::observe::Emit::decline("present_capture", &e);
             for (key, value) in draw_execution::identity_fields(identity) {
@@ -696,7 +698,34 @@ unsafe fn copy_image_level0_to_host(
     pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
 }
 
-fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
+/// A resident target's pixels plus the physical channel order they came out in.
+///
+/// Reported rather than derivable, and read from the registry slot under the
+/// same lock as the copy, so it is the order of the image the bytes were
+/// actually copied out of. A caller that re-derived it from the identity would
+/// be restating a rule the engine owns; when the two disagree the symptom is an
+/// R/B exchange on a whole frame, which is a colour defect no assertion in this
+/// crate was watching for.
+pub struct TargetReadback {
+    pub pixels: Vec<u8>,
+    /// BGRA8 when true, semantic RGBA8 otherwise.
+    pub bgra: bool,
+}
+
+impl TargetReadback {
+    /// The frame in semantic RGBA8, exchanging R and B only when it is not
+    /// already in that order.
+    pub fn into_rgba8(mut self) -> Vec<u8> {
+        if self.bgra {
+            for px in self.pixels.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        self.pixels
+    }
+}
+
+fn read_target_inner(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
@@ -718,6 +747,7 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
     let height = slot.height;
     let image = slot.image;
     let old_layout = slot.layout;
+    let bgra = slot.bgra;
     let rb_size = (width as u64) * (height as u64) * 4;
     unsafe {
         let out = copy_image_level0_to_host(
@@ -743,12 +773,12 @@ fn read_target_inner(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
         )?;
         pools.registry_set_layout(identity, ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         counters.note_readback(rb_size);
-        Ok(out)
+        Ok(TargetReadback { pixels: out, bgra })
     }
 }
 
 /// Full-frame readback of a resident target (present / Synchronize / Map / Store boundary).
-pub fn read_target(identity: &TargetIdentity) -> Result<Vec<u8>, DrawError> {
+pub fn read_target(identity: &TargetIdentity) -> Result<TargetReadback, DrawError> {
     read_target_inner(identity)
 }
 

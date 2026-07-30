@@ -827,6 +827,34 @@ fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
     }
 }
 
+/// `reorder_rb_in_place` must touch nothing when the order it holds is already
+/// the order asked for, and match `swap_rb_channels` when it is not.
+///
+/// The no-op half is the whole point of threading the order rather than
+/// normalizing: a type-11 composite Store's readback now arrives BGRA, so this is
+/// the call that used to be a 776 us whole-frame pass and is now a compare. A
+/// future edit that made it exchange unconditionally would restore that cost
+/// silently — the pixels would still be right.
+#[test]
+fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
+    for len in [0usize, 4, 8, 5, 260, 263] {
+        let src: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+        for order in [false, true] {
+            let mut same = src.clone();
+            crate::runtime::metal_draw::reorder_rb_in_place(&mut same, order, order);
+            assert_eq!(same, src, "len={len} order={order}: agreement must not copy");
+        }
+        // Disagreement in either direction is exactly the established swizzle,
+        // tail included.
+        let mut to_bgra = src.clone();
+        crate::runtime::metal_draw::reorder_rb_in_place(&mut to_bgra, false, true);
+        assert_eq!(to_bgra, swap_rb_channels(&src), "len={len} rgba->bgra");
+        let mut to_rgba = src.clone();
+        crate::runtime::metal_draw::reorder_rb_in_place(&mut to_rgba, true, false);
+        assert_eq!(to_rgba, swap_rb_channels(&src), "len={len} bgra->rgba");
+    }
+}
+
 /// Vulkan-arm only: SPIR-V storage-binding reflection has no Metal analogue.
 #[cfg(feature = "backend-vulkan")]
 #[test]

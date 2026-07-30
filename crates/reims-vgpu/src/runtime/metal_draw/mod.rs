@@ -82,6 +82,29 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Bring a frame into the channel order a consumer wants, in place and only when
+/// the two disagree.
+///
+/// The parameters name what the buffer *holds* and what is *wanted*, rather than
+/// a direction, because that is what makes the call sites auditable: a readback's
+/// order is a property of the attachment it came out of, so the caller states the
+/// fact it was told and the ordering logic lives here. Spelled as a direction
+/// ("swizzle if type-11") each site would re-derive the predicate, which is how
+/// the two halves of a conversion end up disagreeing.
+///
+/// The exchange is an involution, so one routine serves both directions. Trailing
+/// bytes that do not fill a whole pixel pass through untouched, matching
+/// [`swap_rb_channels`].
+#[inline]
+fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: bool) {
+    if have_bgra == want_bgra {
+        return;
+    }
+    for p in px.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+}
+
 /// Whether a bound vertex buffer at Metal index `idx` must be exposed to the
 /// engine as a StorageBuffer descriptor (binding `idx`).
 ///

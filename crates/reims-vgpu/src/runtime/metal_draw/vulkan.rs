@@ -128,7 +128,11 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 )
                 .is_ok()
             } else if c.mapping_id != 0 {
-                // Type-11 CLEAR: contig HostOps path (write_bgra8 is contig-only).
+                // Type-11 CLEAR. `write_bgra8` takes guest scanout order and
+                // converts to the mapping's native format per row; it handles a
+                // fragmented mapping too, staging native rows and landing them
+                // through `mapper::write_mapping_bytes`. (A comment here used to
+                // call it contig-only, which it has not been.)
                 let bgra = swap_rb_channels(&rgba);
                 let stride = c.width.saturating_mul(RGBA8_BPP);
                 mapping_write::write_bgra8(
@@ -158,6 +162,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 
     // metal2vulkan path: load MTLB → AIR → SPIR-V → internal Vulkan engine offscreen.
     let mut draw_rgba: Option<Vec<u8>> = None;
+    // Physical order of `draw_rgba`. A type-11 composite Store renders into a
+    // BGRA `Surface` resident, so its readback is already in guest scanout
+    // order; the pooled and GVA targets stay RGBA. Carried instead of assumed —
+    // which of those a record hit depends on whether an identity resolved, and
+    // that is not a condition the Store block can re-derive.
+    let mut draw_bgra = false;
     #[cfg(feature = "backend-vulkan")]
     // GVA Store landed as a deferred-writeback window (resident authoritative).
     #[cfg(feature = "backend-vulkan")]
@@ -165,8 +175,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
         match try_metal2vulkan_draw(state, host, req, writeback_guest) {
-            Ok(M2vDrawSpan::Rgba(rgba)) => {
-                draw_rgba = Some(rgba);
+            Ok(M2vDrawSpan::Pixels { bytes, bgra }) => {
+                draw_rgba = Some(bytes);
+                draw_bgra = bgra;
                 crate::observe::line(format!(
                     "linux_m2v_draw ok pipe={} {}x{} vtx={}",
                     req.pipeline_ref, req.width, req.height, req.vertex_count
@@ -264,6 +275,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
         // guest Store (archive store plan). Resident type-11 intermediates
         // returned above without materializing CPU pixels.
         if !writeback_guest {
+            // A chain value seeds the next record, and `DrawRequest` states a
+            // seed's order as `SeedOrder::Rgba8` for this rail.
+            reorder_rb_in_place(&mut rgba, draw_bgra, false);
             return (EncodeStatus::Ok, Some(rgba));
         }
         // Store draw result into primary color RT.
@@ -295,24 +309,36 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 {
                     // Brackets the whole type-11 arm, into the same per-second
                     // window it divides into. `draw_phase` stops at the engine
-                    // boundary, so this arm — the BGRA conversion, the cache
-                    // publish, the window arm, the guest scatter — is the bulk
-                    // of the ~245 ms/s (28 % of `draw_us`) that no phase claimed.
+                    // boundary, so this arm — the cache publish, the window arm,
+                    // the guest scatter — is the bulk of the ~245 ms/s (28 % of
+                    // `draw_us`) that no phase claimed.
                     let _span = StoreCostSpan::new("t11_store_us");
+                    // Every consumer below wants guest scanout order: the
+                    // deferred window's `write_bgra8`, `surface_cache`, and the
+                    // synchronous route. A `Surface` resident reads back in that
+                    // order already, so this is a no-op on the hot path and the
+                    // ~152 ms/s whole-frame swizzle it replaces is gone. It still
+                    // has to be written, because a record whose identity did not
+                    // resolve rendered into a pooled RGBA target.
+                    let mut bgra = rgba;
+                    {
+                        let _span = StoreCostSpan::new("t11_convert_us");
+                        reorder_rb_in_place(&mut bgra, draw_bgra, true);
+                    }
                     // Deferred writeback: publish the frame to `surface_cache`
                     // — the source every other consumer already reads, so the
                     // Load seed and the present capture see exactly what they
                     // would have — and arm a window instead of scattering the
                     // frame into the mapping's guest pages now.
                     //
-                    // That scatter is the cost. `write_rgba8_image_changed`
-                    // converts every row RGBA→native and then copies it out,
-                    // per row when the mapping's pages are fragmented: ~8 MB of
-                    // CPU conversion and copy per Store, at the 28-111 Stores/s
-                    // `store_routes` measures, on the drain worker `drain_duty`
-                    // shows at duty 0.93-0.99. Nothing on the host-window
-                    // present path reads those pages, so most of that work is
-                    // owed to a guest reader that may never come.
+                    // That scatter is the cost. `write_bgra8` converts every row
+                    // to the mapping's native format and then copies it out, per
+                    // row when the mapping's pages are fragmented: ~8 MB of CPU
+                    // work per Store, at the 28-111 Stores/s `store_routes`
+                    // measures, on the drain worker `drain_duty` shows at duty
+                    // 0.93-0.99. Nothing on the host-window present path reads
+                    // those pages, so most of that work is owed to a guest reader
+                    // that may never come.
                     let deferred = if deferred_gpu_only_content_allowed_for_surface() {
                         arm_surface_deferred_store_with(
                             state,
@@ -321,10 +347,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.mapping_id,
                             c0.width,
                             c0.height,
-                            rgba,
+                            bgra,
                         )
                     } else {
-                        Err(rgba)
+                        Err(bgra)
                     };
                     match deferred {
                         Ok(epoch) => {
@@ -357,15 +383,23 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // than a `bool` because a moved buffer cannot be un-moved:
                         // the type is what makes "refused" and "still have the
                         // pixels" the same statement.
-                        Err(returned) => rgba = returned,
+                        Err(returned) => bgra = returned,
                     }
                     note_type11_store_route("cpu_portability");
-                    let ok = mapping_write::write_rgba8_image_changed(
+                    // `write_bgra8`, not `write_rgba8_image_changed`: the frame is
+                    // already in guest scanout order, and that entry point would
+                    // have to exchange every row back to read it. Both share the
+                    // same tail — residency-window invalidation,
+                    // `mark_mapping_written`, and the `surface_cache` republish —
+                    // so this is a substitution and not a narrowing. Its
+                    // changed-span rung is not lost either: this call site has
+                    // always passed `None` for the seed.
+                    let ok = mapping_write::write_bgra8(
                         state,
                         host,
                         c0.mapping_id,
-                        &rgba,
-                        None,
+                        &bgra,
+                        c0.width.saturating_mul(RGBA8_BPP),
                         c0.width,
                         c0.height,
                     );
@@ -400,7 +434,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             stamp_type11_resident(state, req, writeback_guest, epoch);
                         }
                         if crate::observe::draw_log_enabled() {
-                            let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                            // Order-independent: both fields reduce over the three
+                            // colour channels, so an R/B exchange cannot move them.
+                            let (rgb_nz, max_rgb) = rgb_stats(&bgra);
                             crate::observe::line(format!(
                                 "linux_m2v_store mid={} {}x{} pipe={} import=0 reason=cpu_portability pages=1 rgb_nz={} max={}",
                                 c0.mapping_id,
@@ -412,7 +448,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             ));
                         }
                     } else {
-                        let (rgb_nz, max_rgb) = rgb_stats(&rgba);
+                        let (rgb_nz, max_rgb) = rgb_stats(&bgra);
                         crate::observe::fail(format!(
                             "linux_m2v_store mid={} {}x{} pipe={} reason=cpu_portability_write_fail rgb_nz={} max={} fmt={:#x}",
                             c0.mapping_id,
@@ -424,7 +460,19 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             c0.format
                         ));
                     }
-                    ok
+                    if ok {
+                        // `None`, for the same reason the deferred arm above
+                        // returns it: this whole block runs only under
+                        // `writeback_guest`, which `multi_draw_store_plan` grants
+                        // solely to the **last** record of a packet, so there is no
+                        // record N+1 for the chain value to seed. Returning it also
+                        // could not be done honestly here — the frame is in guest
+                        // scanout order and a chain seed is declared RGBA — so the
+                        // alternative is a whole-frame exchange for a buffer with
+                        // no reader.
+                        return (EncodeStatus::Ok, None);
+                    }
+                    false
                 }
             } else if c0.target_gva != 0 {
                 supersede_gva_window(
@@ -504,7 +552,14 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 false
             };
             if ok {
-                return (EncodeStatus::Ok, Some(rgba));
+                // `None`: everything from here up is under `writeback_guest`,
+                // which `multi_draw_store_plan` grants only to `di == last_i`, so
+                // the chain value has no record N+1 to seed and every other
+                // reader of it in `exec.rs` sits inside the record loop that just
+                // ended. The intermediate handoff that *is* live returned above,
+                // before the Store arms. Returning the frame here handed a whole
+                // framebuffer to a binding that is dropped unread.
+                return (EncodeStatus::Ok, None);
             }
         }
     }
@@ -2795,8 +2850,14 @@ fn host_cache_store_rgba8(
 enum M2vDrawSpan {
     /// No drawable color0 geom.
     None,
-    /// CPU-side RGBA8 pixels (readback path).
-    Rgba(Vec<u8>),
+    /// CPU-side pixels (readback path), in the order the engine reports.
+    ///
+    /// The order is carried rather than normalized because a type-11 composite
+    /// Store's consumers — `surface_cache`, the deferred window, the guest-page
+    /// writeback — all want guest scanout order, and a BGRA resident hands them
+    /// exactly that. Normalizing to RGBA here would restate a whole framebuffer
+    /// per Store purely to have the Store restate it back.
+    Pixels { bytes: Vec<u8>, bgra: bool },
     /// Intermediate record of a resident render-pass chain: content stays on
     /// the protocol-keyed engine target (no CPU pixels, no fence wait, no guest
     /// Store this record). The final record reads back and performs the
@@ -4767,6 +4828,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // instead — no pixels at all, the resident staying authoritative until
         // the import-present rail DMA'd it into the mapping's guest pages.
         // That span is unreachable without the import and its variant is gone.
+        let pixels_bgra = out.pixels_bgra;
         let pixels = out.pixels;
         #[cfg(feature = "backend-vulkan")]
         if resident_render_chain {
@@ -4776,7 +4838,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if gva_resident_store {
             return Ok(M2vDrawSpan::ResidentGvaStore);
         }
-        Ok(M2vDrawSpan::Rgba(pixels))
+        Ok(M2vDrawSpan::Pixels {
+            bytes: pixels,
+            bgra: pixels_bgra,
+        })
     }
     #[cfg(not(feature = "backend-vulkan"))]
     {
@@ -4935,7 +5000,14 @@ pub(crate) fn gva_chain_identity(
 pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) -> Option<Vec<u8>> {
     let identity = render_chain_identity(state, req)?;
     match crate::backend::vulkan::engine::read_target(&identity) {
-        Ok(rgba) => Some(rgba),
+        // Every caller of this function — `writeback_chain_rgba` and the GVA
+        // arm-refusal fallback — has an RGBA contract, so the exchange happens
+        // here, once, rather than at three call sites that would each have to
+        // remember which namespace they were reading. `into_rgba8` uses the order
+        // the engine reports for the image it copied, so it is a no-op on the
+        // pooled and GVA residents and a single pass on a BGRA surface. Both are
+        // abandon paths, so neither is on a hot rail.
+        Ok(rb) => Some(rb.into_rgba8()),
         Err(e) => {
             crate::observe::fail(format!(
                 "chain_resident_land_fail reason=read_target target={identity:?} \
@@ -5041,13 +5113,13 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     mapping_id: u32,
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    bgra: Vec<u8>,
 ) -> Result<u32, Vec<u8>> {
     let Some(key) = surface_store_defer_eligible(state, req) else {
-        return Err(rgba);
+        return Err(bgra);
     };
     if key.mapping_id != mapping_id || key.width != width || key.height != height {
-        return Err(rgba);
+        return Err(bgra);
     }
     // Supersede — do not flush — the window this Store fully covers.
     //
@@ -5094,28 +5166,17 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     ) {
         // A window that would not land is a window whose guest bytes are now
         // unknown; arming over it would attribute its loss to this Store.
-        return Err(rgba);
+        return Err(bgra);
     }
-    // Convert once, into guest scanout order, and reference it twice: the Load
-    // seed and the present capture read it through `surface_cache`, and the
-    // window below owns it so the writeback it defers can always be performed.
-    // This is the one copy this rail still pays.
-    let frame = {
-        // The one copy this rail still pays, and the first candidate for the
-        // unattributed share of `draw_us`: an allocation and a copy of a whole
-        // frame, then a read-modify-write pass over it, at ~218 Stores/s and
-        // ~4.7 MB each. `output_bgra` would delete it outright — the readback
-        // would already be in this order — so pricing it decides whether that
-        // is worth doing.
-        let _span = StoreCostSpan::new("t11_convert_us");
-        std::sync::Arc::new({
-            let mut bgra = rgba;
-            for px in bgra.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            bgra
-        })
-    };
+    // Referenced twice, copied never: the Load seed and the present capture read
+    // it through `surface_cache`, and the window below owns it so the writeback
+    // it defers can always be performed.
+    //
+    // This used to allocate a second frame and swizzle into it — 776 us per
+    // Store, 84 % of everything `draw_phase` could not attribute. The Store's
+    // attachment is a BGRA `Surface` resident now, so the readback arrives in
+    // this order and the whole pass is gone rather than moved.
+    let frame = std::sync::Arc::new(bgra);
     crate::runtime::surface_cache::store_shared(
         state,
         mapping_id,

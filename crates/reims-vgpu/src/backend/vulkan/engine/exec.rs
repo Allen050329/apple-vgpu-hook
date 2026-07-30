@@ -786,7 +786,20 @@ pub(crate) unsafe fn execute_draw_inner(
     // submit entirely. Every other draw claims a slot via begin_entry, which
     // flushes any open batch first (queue order = record order).
     let is_mrt = !req.secondary_targets.is_empty();
-    let output_bgra = req.output_bgra && req.target_identity.is_some();
+    // The resolved attachment decides its own channel order: a resident target
+    // takes the identity's (`TargetIdentity::is_bgra` — every type-11 surface is
+    // BGRA), and the pooled path stays RGBA. `req.output_bgra` remains an
+    // explicit opt-in for identities whose namespace does not imply an order.
+    //
+    // Derived here rather than at each runtime call site so that all the draws
+    // sharing one identity in a frame agree by construction. `registry_ensure`
+    // destroys and recreates the image on an order mismatch, so a per-path
+    // predicate that one path spells differently is a full reallocation per
+    // composite, not a wrong colour.
+    let output_bgra = req
+        .target_identity
+        .as_ref()
+        .is_some_and(|id| req.output_bgra || id.is_bgra());
     // A sampled zero-copy source reads guest RAM when the CB *executes*, and
     // ack-fast means the guest may repaint that buffer as soon as the command
     // is consumed — deferred submit stretches record→execute from ~0 to a
@@ -2325,7 +2338,10 @@ pub(crate) unsafe fn execute_draw_inner(
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput { pixels: Vec::new() });
+        return Ok(DrawOutput {
+            pixels: Vec::new(),
+            pixels_bgra: output_bgra,
+        });
     }
 
     // Park the owed cleanup (descriptor set, transient pool slots, cache
@@ -2367,7 +2383,10 @@ pub(crate) unsafe fn execute_draw_inner(
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput { pixels: Vec::new() });
+        return Ok(DrawOutput {
+            pixels: Vec::new(),
+            pixels_bgra: output_bgra,
+        });
     };
 
     // Wait ONLY this draw's fence, not the whole ring. The readback copy is the
@@ -2391,7 +2410,10 @@ pub(crate) unsafe fn execute_draw_inner(
     )?;
     counters.note_readback(rb_size);
 
-    Ok(DrawOutput { pixels: out })
+    Ok(DrawOutput {
+        pixels: out,
+        pixels_bgra: output_bgra,
+    })
 }
 
 fn color_range() -> vk::ImageSubresourceRange {

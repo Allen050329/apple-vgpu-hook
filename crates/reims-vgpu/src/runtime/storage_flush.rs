@@ -521,8 +521,12 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         height: entry.height,
         generation: 0,
     };
+    // `into_rgba8` rather than the raw bytes: a GVA resident is RGBA today, so
+    // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
+    // semantic RGBA and the readback states its own order. Asserting the order
+    // here instead would be the caller writing a fact it did not read.
     let rgba = match crate::backend::vulkan::engine::read_target(&identity) {
-        Ok(px) => px,
+        Ok(rb) => rb.into_rgba8(),
         Err(e) => {
             crate::backend::vulkan::engine::unpin_resident_target(&identity);
             crate::observe::fail(format!(

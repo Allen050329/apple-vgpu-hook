@@ -164,7 +164,9 @@ fn batched_draws_compose_and_flush_on_read() {
     assert_eq!(mid.batch_joins, 1, "second draw joins the open CB");
     assert_eq!(mid.batch_flushes, 0, "no flush before a consumer arrives");
 
-    let px = engine::read_target(&identity).expect("read_target flushes the batch");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the batch")
+        .into_rgba8();
     let after = engine::counter_snapshot().delta_since(&before);
     assert_eq!(after.batch_flushes, 1, "read_target submitted the batch");
     assert_eq!(
@@ -240,7 +242,7 @@ fn cross_target_draw_flushes_open_batch() {
 
     // A: left half colored, right half untouched clear — single-draw batch
     // content is exact after its flush.
-    let px = engine::read_target(&a).expect("read A");
+    let px = engine::read_target(&a).expect("read A").into_rgba8();
     let left = ((10 * W + 8) * 4) as usize;
     let right = ((10 * W + W / 2 + 8) * 4) as usize;
     assert!(
@@ -412,7 +414,9 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
         "GuestRuns content was CPU-snapshotted"
     );
 
-    let px = engine::read_target(&identity).expect("read_target flushes the batch");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the batch")
+        .into_rgba8();
     for y in [0u32, H / 2, H - 1] {
         let i = ((y * W + W / 4) * 4) as usize;
         assert!(
@@ -555,7 +559,9 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         }
     }
     outcome.expect("a CPU-gathered guest-run sampled draw must execute");
-    let px = engine::read_target(&identity).expect("read_target flushes the batch");
+    let px = engine::read_target(&identity)
+        .expect("read_target flushes the batch")
+        .into_rgba8();
     engine::test_quiesce_ring();
     // The gather reads the page during `execute_draw_request`, so the page must
     // outlive that call and only that call.

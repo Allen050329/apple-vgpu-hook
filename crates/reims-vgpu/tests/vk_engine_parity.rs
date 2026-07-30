@@ -11,11 +11,11 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendFactor, BlendOp, BlendStateResource, CullMode, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, LoadOp, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
-    SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
-    StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
-    VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
-    MAX_DEVICE_RECREATES,
+    IndexedDrawResource, LoadOp, MAX_DEVICE_RECREATES, PrimitiveTopology, SampledContentIdentity,
+    SampledImageResource, SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource,
+    SecondaryColorTarget, StencilFaceOps, StencilOp, StencilState, StorageBufferResource,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
+    ViewportResource,
 };
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -103,6 +103,27 @@ fn near(got: u8, want: u8) -> bool {
     (got as i32 - want as i32).abs() <= 1
 }
 
+/// A draw's pixels in semantic RGBA8, whatever physical order the attachment
+/// read back in.
+///
+/// The engine picks the attachment format from the resolved target — a
+/// `TargetIdentity::Surface` resident is `B8G8R8A8_UNORM` so a type-11 composite
+/// Store's readback lands in guest scanout order with no CPU pass — and reports
+/// which it used in `DrawOutput::pixels_bgra`. These cases assert *colour*, not
+/// byte layout, so they normalize here from the reported order rather than
+/// assuming one. The physical contract has its own case
+/// (`a_surface_resident_reads_back_in_guest_scanout_order`); assuming an order
+/// here would let this whole suite silently follow the engine.
+fn semantic_rgba(out: &engine::DrawOutput) -> Vec<u8> {
+    let mut px = out.pixels.clone();
+    if out.pixels_bgra {
+        for p in px.chunks_exact_mut(4) {
+            p.swap(0, 2);
+        }
+    }
+    px
+}
+
 fn assert_fullscreen_fragment_color(label: &str, px: &[u8], w: u32, h: u32) {
     assert_eq!(px.len(), (w * h * 4) as usize, "{label}: readback size");
     let i = ((h / 2) * w + w / 2) as usize * 4;
@@ -120,7 +141,7 @@ fn assert_fullscreen_fragment_color(label: &str, px: &[u8], w: u32, h: u32) {
 
 fn draw_or_skip(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
     match engine::execute_draw_request(req) {
-        Ok(o) => Some(o.pixels),
+        Ok(o) => Some(semantic_rgba(&o)),
         Err(e) => {
             let s = e.to_string();
             if skip_if_no_gpu(&s) {
@@ -440,7 +461,9 @@ fn depth_test_honored_on_resident_target_path() {
             }
             Err(e) => panic!("resident depth draw: {e}"),
         }
-        let px = engine::read_target(&identity).expect("read resident depth target");
+        let px = engine::read_target(&identity)
+            .expect("read resident depth target")
+            .into_rgba8();
         Some(triangle_covered(&px, w, h))
     };
 
@@ -666,7 +689,7 @@ fn storage_buffer_binding_still_renders() {
         content: vec![0u8; 64].into(),
     });
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("storage", &o.pixels, 8, 8),
+        Ok(o) => assert_fullscreen_fragment_color("storage", &semantic_rgba(&o), 8, 8),
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP storage: {e}"),
         Err(e) => {
             // Unused binding may fail pipeline create on some SPIR-V/ICD combos — named only.
@@ -704,7 +727,7 @@ fn sampled_and_sampler_still_renders() {
     req.samplers.push(SamplerResource::normalized_default(2));
     match engine::execute_draw_request(&req) {
         Ok(o) => {
-            assert_fullscreen_fragment_color("sampled", &o.pixels, 8, 8);
+            assert_fullscreen_fragment_color("sampled", &semantic_rgba(&o), 8, 8);
             let warm_before = engine::counter_snapshot();
             let warm = engine::execute_draw_request(&req).expect("exact sampled cache hit");
             assert_eq!(warm.pixels, o.pixels, "cache hit must preserve draw bytes");
@@ -849,7 +872,9 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     let mut make_source = engine_req(&v, &f, 16, 16);
     make_source.target_identity = Some(source.clone());
     match engine::execute_draw_request(&make_source) {
-        Ok(o) => assert_fullscreen_fragment_color("resident_sample_source", &o.pixels, 16, 16),
+        Ok(o) => {
+            assert_fullscreen_fragment_color("resident_sample_source", &semantic_rgba(&o), 16, 16)
+        }
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP resident_sample_bind: {e}");
             return;
@@ -875,7 +900,12 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
     let consumed = engine::execute_draw_request(&consume).expect("bind resident sample");
-    assert_fullscreen_fragment_color("resident_sample_consumer", &consumed.pixels, 16, 16);
+    assert_fullscreen_fragment_color(
+        "resident_sample_consumer",
+        &semantic_rgba(&consumed),
+        16,
+        16,
+    );
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(delta.sampled_gpu_binds, 1, "direct-bind proxy: {delta:?}");
     assert_eq!(delta.sampled_reuploads, 0, "no sampled reupload: {delta:?}");
@@ -888,7 +918,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     load_again.target_identity = Some(source.clone());
     load_again.load_op = Some(LoadOp::LoadFromTarget);
     let loaded = engine::execute_draw_request(&load_again).expect("load after direct sample");
-    assert_fullscreen_fragment_color("resident_sample_reloaded", &loaded.pixels, 16, 16);
+    assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
 }
 
 /// Attachment feedback is represented as a GPU snapshot, matching Metal's
@@ -934,7 +964,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
     let out = engine::execute_draw_request(&alias).expect("resident alias GPU snapshot");
-    assert_fullscreen_fragment_color("resident_sample_alias", &out.pixels, 16, 16);
+    assert_fullscreen_fragment_color("resident_sample_alias", &semantic_rgba(&out), 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(delta.sampled_gpu_binds, 1, "GPU snapshot proxy: {delta:?}");
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
@@ -957,7 +987,7 @@ fn vertex_float2_attr_still_renders() {
         content: vec![0u8; 24].into(),
     });
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("attr", &o.pixels, 8, 8),
+        Ok(o) => assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8),
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP attr: {e}"),
         Err(e) => {
             let s = e.to_string();
@@ -1116,7 +1146,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     cold.skip_readback = false;
     match engine::execute_draw_request(&cold) {
-        Ok(o) => assert_fullscreen_fragment_color("resident_cold", &o.pixels, 16, 16),
+        Ok(o) => assert_fullscreen_fragment_color("resident_cold", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP warm_non_store: {e}");
             return;
@@ -1151,7 +1181,9 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     );
     // Boundary materialization still works: read_target waits the shared
     // fence first, so it returns the exact content of the skipped-wait draw.
-    let px = engine::read_target(&identity).expect("read_target after warm");
+    let px = engine::read_target(&identity)
+        .expect("read_target after warm")
+        .into_rgba8();
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
 }
 
@@ -1240,6 +1272,78 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
 /// [`engine::read_target`] can read back twice with the same answer — the
 /// property the deleted dmabuf-export case used as its precondition, kept
 /// because nothing else in this suite reads the same resident twice.
+/// A `TargetIdentity::Surface` resident renders and reads back in guest scanout
+/// order **without the caller asking**, and says so; a pooled target does not.
+///
+/// This is the contract the type-11 composite Store rests on. That Store's
+/// consumers are all defined in BGRA — `mapping_write::write_bgra8`,
+/// `surface_cache`, the deferred window the flush reads — so when the attachment
+/// is BGRA the readback lands ready to use, and when it is not the runtime pays a
+/// whole-frame R/B exchange per Store. Measured at 776 us on a 1080p frame, 84 %
+/// of the drain worker's draw time that `draw_phase` could not attribute.
+///
+/// Both halves are asserted, and the second is the one that would rot quietly:
+/// `pixels_bgra` is what every consumer branches on, so a resident that came out
+/// BGRA while reporting `false` is a silent R/B exchange on every composite —
+/// the reported order has to be the order the bytes are actually in, not a
+/// constant that happens to agree today.
+///
+/// `output_bgra` is deliberately left unset. The point is that the *identity*
+/// carries the order, so that a composite Store, a chain intermediate and an MRT
+/// primary sharing one surface all agree without coordinating: `registry_ensure`
+/// destroys and recreates the image whenever a draw disagrees with the slot, so a
+/// per-path predicate one path spelled differently would cost a full
+/// reallocation per frame rather than a wrong colour.
+#[test]
+fn a_surface_resident_reads_back_in_guest_scanout_order() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // The fragment writes semantic (64, 128, 191, 255) — asymmetric in R and B,
+    // so an omitted or doubled exchange shows rather than cancelling.
+    let i = ((h / 2) * w + w / 2) as usize * 4;
+
+    let mut resident = engine_req(&v, &f, w, h);
+    resident.target_identity = Some(TargetIdentity::Surface {
+        id: 4711,
+        width: w,
+        height: h,
+        generation: 1,
+    });
+    let out = match engine::execute_draw_request(&resident) {
+        Ok(o) => o,
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP surface scanout order: {e}");
+            return;
+        }
+        Err(e) => panic!("surface resident draw: {e}"),
+    };
+    assert!(
+        out.pixels_bgra,
+        "a Surface resident must report the BGRA order it rendered in"
+    );
+    assert_eq!(
+        &out.pixels[i..i + 4],
+        &[191, 128, 64, 255],
+        "a Surface resident's readback must already be in guest scanout order"
+    );
+
+    // The pooled path is the control: no identity, so no namespace to take an
+    // order from, and the bytes stay semantic. Without it an engine that had
+    // simply been switched to BGRA everywhere would pass the arm above.
+    let pooled = engine_req(&v, &f, w, h);
+    let out = engine::execute_draw_request(&pooled).expect("pooled draw");
+    assert!(
+        !out.pixels_bgra,
+        "a pooled target has no identity to take an order from"
+    );
+    assert_eq!(
+        &out.pixels[i..i + 4],
+        &[64, 128, 191, 255],
+        "a pooled target's readback stays semantic RGBA"
+    );
+}
+
 #[test]
 fn a_bgra_resident_draw_reads_back_identically_twice() {
     let _g = engine_test_session();
@@ -1266,9 +1370,13 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
         Err(e) => panic!("bgra resident draw: {e}"),
     }
     let i = ((h / 2) * w + w / 2) as usize * 4;
-    let first = engine::read_target(&identity).expect("read resident");
+    let first = engine::read_target(&identity)
+        .expect("read resident")
+        .pixels;
     let center_first = [first[i], first[i + 1], first[i + 2], first[i + 3]];
-    let second = engine::read_target(&identity).expect("re-read resident");
+    let second = engine::read_target(&identity)
+        .expect("re-read resident")
+        .pixels;
     let center_second = [second[i], second[i + 1], second[i + 2], second[i + 3]];
     assert_eq!(
         center_first, center_second,
@@ -1361,7 +1469,9 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         }
         Err(e) => panic!("sampled RGBA to BGRA target: {e}"),
     }
-    let raw = engine::read_target(&identity).expect("read BGRA target");
+    let raw = engine::read_target(&identity)
+        .expect("read BGRA target")
+        .pixels;
     let center = ((h / 2) * w + w / 2) as usize * 4;
     assert_eq!(
         &raw[center..center + 4],
@@ -1377,7 +1487,9 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         warm_delta.sampled_reuploads, 0,
         "warm upload: {warm_delta:?}"
     );
-    let warm_raw = engine::read_target(&identity).expect("read warm BGRA target");
+    let warm_raw = engine::read_target(&identity)
+        .expect("read warm BGRA target")
+        .pixels;
     assert_eq!(
         &warm_raw[center..center + 4],
         &[rgba[2], rgba[1], rgba[0], rgba[3]],
@@ -1398,7 +1510,9 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         changed_delta.sampled_reuploads, 1,
         "changed upload: {changed_delta:?}"
     );
-    let changed_raw = engine::read_target(&identity).expect("read changed BGRA target");
+    let changed_raw = engine::read_target(&identity)
+        .expect("read changed BGRA target")
+        .pixels;
     assert_eq!(
         &changed_raw[center..center + 4],
         &[
@@ -1597,7 +1711,11 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         match engine::execute_draw_request(&req) {
-            Ok(_) => Some(engine::read_target(&identity).expect("read BGRA target")),
+            Ok(_) => Some(
+                engine::read_target(&identity)
+                    .expect("read BGRA target")
+                    .pixels,
+            ),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP bgra8 bytes upload: {e}");
                 None
@@ -1715,7 +1833,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         match engine::execute_draw_request(&req) {
-            Ok(_) => Some(engine::read_target(&identity).expect("read target")),
+            Ok(_) => Some(engine::read_target(&identity).expect("read target").pixels),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP view swizzle: {e}");
                 None
@@ -1789,7 +1907,9 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         }
         Err(e) => panic!("BGRA partial seed: {e}"),
     }
-    let raw = engine::read_target(&identity).expect("read BGRA partial-seed target");
+    let raw = engine::read_target(&identity)
+        .expect("read BGRA partial-seed target")
+        .pixels;
     let outside = ((h / 2) * w + w / 2) as usize * 4;
     assert_eq!(
         &raw[outside..outside + 4],
@@ -1862,8 +1982,8 @@ fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
     );
 }
 
-/// A `SeedOrder::Bgra8` seed into the default RGBA target must land the same
-/// semantic pixels as the equivalent `SeedOrder::Rgba8` seed.
+/// A `SeedOrder::Bgra8` seed must land the same semantic pixels as the
+/// equivalent `SeedOrder::Rgba8` seed.
 ///
 /// This is the type-11 composite Load. `surface_cache` holds guest scanout order
 /// while the pooled target is RGBA, so the runtime used to allocate, copy and
@@ -1918,7 +2038,16 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
             }
             Err(e) => panic!("seed order draw: {e}"),
         }
-        Some(engine::read_target(&identity).expect("read seed-order target"))
+        // Normalized through the order the engine reports, so this case tests the
+        // seed exchange and not the attachment's format: a `Surface` resident is
+        // BGRA, and asserting a literal against raw bytes would make this case
+        // fail whenever that choice changed while the property it names still
+        // held.
+        Some(
+            engine::read_target(&identity)
+                .expect("read seed-order target")
+                .into_rgba8(),
+        )
     };
 
     let Some(rgba_arm) = read_back(engine::SeedOrder::Rgba8, semantic_rgba, 91) else {
@@ -1932,12 +2061,12 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
         &rgba_arm[outside..outside + 4],
         "the same pixels described in two orders must land identically"
     );
-    // And that they landed as the semantic colour, not as some agreed-upon
-    // wrong one: the target is RGBA, so untouched storage is the seed verbatim.
+    // And that they landed as the semantic colour, not as some agreed-upon wrong
+    // one: the scissor left this pixel untouched, so it still holds the seed.
     assert_eq!(
         &rgba_arm[outside..outside + 4],
         &semantic_rgba[..],
-        "an RGBA-ordered seed into an RGBA target must be stored verbatim"
+        "an unwritten pixel must still hold the seed's semantic colour"
     );
 }
 
@@ -2028,7 +2157,9 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     store2.skip_readback = true;
     store2.target_rgba8 = None;
     engine::execute_draw_request(&store2).expect("store2 LoadFromTarget");
-    let px = engine::read_target(&identity).expect("read_target after progressive Stores");
+    let px = engine::read_target(&identity)
+        .expect("read_target after progressive Stores")
+        .into_rgba8();
     assert_fullscreen_fragment_color("progressive_skip_readback", &px, 16, 16);
     // No seed_uploads on pass 2 (LoadFromTarget, not CPU seed).
     // Counters are process-global; just ensure content survived.
@@ -2074,7 +2205,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     // CPU-seed chain: draw1 clear → pixels → draw2 LoadSeed(pixels) → pixels2
     let d1 = engine_req(&v, &f, 16, 16);
     let p1 = match engine::execute_draw_request(&d1) {
-        Ok(o) => o.pixels,
+        Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP chain: {e}");
             return;
@@ -2083,9 +2214,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     };
     let mut d2_cpu = engine_req(&v, &f, 16, 16);
     d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
-    let p2_cpu = engine::execute_draw_request(&d2_cpu)
-        .expect("cpu seed chain")
-        .pixels;
+    let p2_cpu = semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed chain"));
 
     // GPU-resident chain: same identity LoadFromTarget.
     engine::test_reset_engine();
@@ -2103,9 +2232,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     g2.target_identity = Some(identity.clone());
     g2.load_op = Some(LoadOp::LoadFromTarget);
     g2.skip_readback = false; // read back for compare
-    let p2_gpu = engine::execute_draw_request(&g2)
-        .expect("gpu chain d2")
-        .pixels;
+    let p2_gpu = semantic_rgba(&engine::execute_draw_request(&g2).expect("gpu chain d2"));
     assert_eq!(
         p2_gpu, p2_cpu,
         "LoadFromTarget chain must match CPU-seed chain"
@@ -2157,7 +2284,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     d1.load_op = Some(LoadOp::LoadSeed(prior.clone()));
     d1.scissors.push(dot(0, 0));
     let p1 = match engine::execute_draw_request(&d1) {
-        Ok(o) => o.pixels,
+        Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP load_from_target_after_readback: {e}");
             return;
@@ -2167,9 +2294,8 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     let mut d2_cpu = engine_req(&v, &f, w, h);
     d2_cpu.load_op = Some(LoadOp::LoadSeed(p1.clone()));
     d2_cpu.scissors.push(dot(8, 8));
-    let p2_cpu = engine::execute_draw_request(&d2_cpu)
-        .expect("cpu seed after readback")
-        .pixels;
+    let p2_cpu =
+        semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
 
     // The two arms are only comparable if the seed actually survives the draw.
     let untouched = ((h / 2) * w + 2) as usize * 4;
@@ -2194,9 +2320,8 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g1.load_op = Some(LoadOp::LoadSeed(prior));
     g1.scissors.push(dot(0, 0));
     g1.skip_readback = false;
-    let p1_resident = engine::execute_draw_request(&g1)
-        .expect("resident store with readback")
-        .pixels;
+    let p1_resident =
+        semantic_rgba(&engine::execute_draw_request(&g1).expect("resident store with readback"));
     assert_eq!(
         p1_resident, p1,
         "the resident pass must read back the same pixels as the pooled one, \
@@ -2209,9 +2334,9 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g2.target_rgba8 = None;
     g2.scissors.push(dot(8, 8));
     g2.skip_readback = false;
-    let p2_gpu = engine::execute_draw_request(&g2)
-        .expect("load from a target that was read back")
-        .pixels;
+    let p2_gpu = semantic_rgba(
+        &engine::execute_draw_request(&g2).expect("load from a target that was read back"),
+    );
 
     assert_eq!(
         p2_gpu, p2_cpu,
@@ -2332,7 +2457,9 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
 
     // Flush-on-access landing: one readback, byte parity with the sync Store.
     let before_flush = engine::counter_snapshot();
-    let p_flush = engine::read_target(&identity).expect("flush read_target");
+    let p_flush = engine::read_target(&identity)
+        .expect("flush read_target")
+        .into_rgba8();
     let df = engine::counter_snapshot().delta_since(&before_flush);
     assert_eq!(df.readbacks, 1, "flush is the single readback: {df:?}");
     engine::unpin_resident_target(&identity);
@@ -2439,7 +2566,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         cold.target_identity = Some((*identity).clone());
         cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         match engine::execute_draw_request(&cold) {
-            Ok(o) => assert_fullscreen_fragment_color(label, &o.pixels, 16, 16),
+            Ok(o) => assert_fullscreen_fragment_color(label, &semantic_rgba(&o), 16, 16),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP ring_overlaps: {e}");
                 return;
@@ -2484,9 +2611,13 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         "each subsequent draw flushes its predecessor's batch: {d:?}"
     );
     // Boundary reads retire the in-flight work and see the final content.
-    let px = engine::read_target(&id_a).expect("ring boundary read a");
+    let px = engine::read_target(&id_a)
+        .expect("ring boundary read a")
+        .into_rgba8();
     assert_fullscreen_fragment_color("ring_read_a", &px, 16, 16);
-    let px = engine::read_target(&id_b).expect("ring boundary read b");
+    let px = engine::read_target(&id_b)
+        .expect("ring boundary read b")
+        .into_rgba8();
     assert_fullscreen_fragment_color("ring_read_b", &px, 16, 16);
 }
 
@@ -2516,7 +2647,7 @@ fn seed_from_target_gpu_copies_front_frame() {
     cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     let front_pixels = match engine::execute_draw_request(&cold) {
         Ok(o) => {
-            assert_fullscreen_fragment_color("gpu_seed_front", &o.pixels, 16, 16);
+            assert_fullscreen_fragment_color("gpu_seed_front", &semantic_rgba(&o), 16, 16);
             o.pixels
         }
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2597,7 +2728,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
     });
     match engine::execute_draw_request(&mrt) {
         // Slot 0 (primary) still receives the shader's location-0 output.
-        Ok(o) => assert_fullscreen_fragment_color("mrt_primary", &o.pixels, 16, 16),
+        Ok(o) => assert_fullscreen_fragment_color("mrt_primary", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP mrt_secondary: {e}");
             return;
@@ -2681,7 +2812,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         color_write_mask: Default::default(),
     });
     match engine::execute_draw_request(&mrt) {
-        Ok(o) => assert_fullscreen_fragment_color("mrt_rg16f_primary", &o.pixels, 32, 32),
+        Ok(o) => assert_fullscreen_fragment_color("mrt_rg16f_primary", &semantic_rgba(&o), 32, 32),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP mrt_rg16float: {e}");
             return;
@@ -2710,7 +2841,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
     req.target_identity = Some(target.clone());
     assert!(req.secondary_targets.is_empty());
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("single_rt_guard", &o.pixels, 16, 16),
+        Ok(o) => assert_fullscreen_fragment_color("single_rt_guard", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP single_rt_guard: {e}");
             return;

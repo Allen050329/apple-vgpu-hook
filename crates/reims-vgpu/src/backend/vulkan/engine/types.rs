@@ -354,6 +354,17 @@ pub struct SecondaryColorTarget {
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
+    /// otherwise. Empty when `skip_readback`, in which case this states the
+    /// order the attachment *would* have read back in.
+    ///
+    /// Reported rather than re-derived. The order follows the resolved
+    /// attachment — [`TargetIdentity::is_bgra`] for a resident target, RGBA for
+    /// the pooled path — and a caller that recomputes the predicate is a caller
+    /// that can disagree with the image the readback actually came out of. This
+    /// is the same rule the typed-decline work applies to a `reason=`: the side
+    /// that performed the operation says what it did.
+    pub pixels_bgra: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1149,6 +1160,27 @@ impl TargetIdentity {
             Self::Anonymous { .. } => 0,
         }
     }
+
+    /// Physical channel order of the resident image behind this identity.
+    ///
+    /// A `Surface` resident backs a type-11 guest IOSurface, whose pages are
+    /// BGRA8 — so rendering it as `B8G8R8A8_UNORM` makes a raw image→buffer
+    /// readback land in guest scanout order and deletes the whole-frame CPU
+    /// swizzle the Store used to pay. Every other namespace stays RGBA.
+    ///
+    /// This is a property of the *identity*, not of the draw, and that is the
+    /// whole point: `ResourcePools::registry` is keyed by identity and
+    /// `registry_ensure` destroys and recreates the image whenever a draw's
+    /// requested order disagrees with the slot's. Several runtime paths render
+    /// into one surface identity in a frame — a composite Store, a chain
+    /// intermediate, an MRT primary — and deriving the order from the key they
+    /// already agree on is what makes them agree here too. A per-path
+    /// predicate would let one of them recreate the image every frame, which
+    /// reads as `target_evicts` climbing and costs a fresh allocation plus a
+    /// lost `content_ready` per composite.
+    pub fn is_bgra(&self) -> bool {
+        matches!(self, Self::Surface { .. })
+    }
 }
 
 /// Byte order of a CPU load seed, relative to the attachment it seeds.
@@ -1373,5 +1405,47 @@ mod tests {
         assert_eq!(compute.grid, [0, 0, 0]);
         assert!(compute.storage_buffers.is_empty());
         assert!(compute.storage_images.is_empty());
+    }
+
+    /// The order is a property of the identity's namespace, and the two halves
+    /// matter for different reasons.
+    ///
+    /// `Surface` must be BGRA: every CPU consumer of a type-11 composite Store is
+    /// declared in guest scanout order, so an RGBA resident costs a whole-frame
+    /// exchange per Store.
+    ///
+    /// Everything else must *not* be, and that is the half a future edit is
+    /// likely to get wrong. `Gva` residents are read by
+    /// `storage_flush::flush_gva_one` into `write_gva_rgba8`, and `Anonymous`
+    /// covers the pooled path the parity suite uses as its semantic control —
+    /// flipping either silently exchanges R and B on a whole rail.
+    #[test]
+    fn only_a_surface_identity_carries_guest_scanout_order() {
+        assert!(
+            TargetIdentity::Surface {
+                id: 1,
+                width: 8,
+                height: 8,
+                generation: 0,
+            }
+            .is_bgra()
+        );
+        for other in [
+            TargetIdentity::Gva {
+                gva: 0x1000,
+                width: 8,
+                height: 8,
+                generation: 0,
+            },
+            TargetIdentity::Texture {
+                ref_: 2,
+                width: 8,
+                height: 8,
+                generation: 0,
+            },
+            TargetIdentity::Anonymous { slot: 0 },
+        ] {
+            assert!(!other.is_bgra(), "{other:?} must stay semantic RGBA");
+        }
     }
 }
