@@ -1,11 +1,11 @@
-//! Always-on proxy for the type-8 view-swizzle bug class.
+//! Always-on declines for the type-8 view-swizzle bug class.
 //!
 //! # The class
 //!
 //! A guest texture view (type-8, opcode `0x1b`) can remap which channel each
 //! output component reads. Vulkan performs exactly that for free through the
 //! image view's `VkComponentMapping`. Doing it any other way is a defect with
-//! two shapes, and this proxy tells them apart:
+//! two shapes, and these declines tell them apart:
 //!
 //! * **Dropped.** The bind refuses because the swizzle is not identity, so the
 //!   draw loses its sampled input entirely and renders without the texture.
@@ -15,128 +15,61 @@
 //! * **CPU-remapped.** The bind rewrites every texel on the CPU. Correct, but
 //!   it forces the texture onto the upload path and **costs it the zero-copy
 //!   property** — the guest→GPU crossing that the whole present path is built
-//!   to avoid.
+//!   to avoid. It is the one that needs saying out loud, precisely because it
+//!   is invisible in the output.
 //!
 //! # Reading it
 //!
-//! `/tmp/reims-vgpu-fail.log`, always-on:
+//! `/tmp/reims-vgpu-fail.log`, always-on, one line per (reason, texture ref):
 //!
-//! * `OFF view_swizzle gpu=<n> cpu=<n> declined=<n>` — cumulative, on a
-//!   doubling schedule.
-//! * `view_swizzle_declined reason=<slug> ref=<n> …` — first sight of each
-//!   decline reason, deduplicated.
+//! * `view_swizzle_cpu_remap reason=swizzle_cpu_remap ref=<n>`
+//! * `view_swizzle_declined reason=<slug> ref=<n>`
 //!
-//! **`cpu=0` is the invariant this proxy exists to hold.** A nonzero `cpu`
-//! means some rail is remapping texels by hand again and has quietly given up
-//! zero-copy for those textures. `gpu` counting up is the healthy signal:
-//! swizzled views are binding, and the hardware is doing the work.
+//! **Zero lines is the invariant.** Any `swizzle_cpu_remap` means some rail is
+//! remapping texels by hand again; any `swizzle_resident_direct_bind` means a
+//! swizzled bind was dropped. The healthy path — the swizzle riding a
+//! `VkComponentMapping` — is silent, because a bind that worked is not news.
 //!
 //! Measure-only: nothing here gates decode, execute or present.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use crate::observe;
 
-#[derive(Default)]
-struct Census {
-    /// Swizzled binds served by a `VkComponentMapping` on the image view.
-    gpu: u64,
-    /// Swizzled binds served by rewriting texels on the CPU. Must stay 0.
-    cpu: u64,
-    /// Swizzled binds refused, by reason slug.
-    declined: BTreeMap<&'static str, u64>,
-    /// (reason, texture ref) pairs already reported once.
-    seen: std::collections::BTreeSet<(&'static str, u32)>,
-    next_emit: u64,
-}
+/// `(reason slug, texture ref)` pairs already reported, so a per-draw rail
+/// fires once per distinct pair rather than once per bind. Bounded by the live
+/// swizzled-texture set.
+static SEEN: Mutex<BTreeSet<(&'static str, u32)>> = Mutex::new(BTreeSet::new());
 
-impl Census {
-    fn total(&self) -> u64 {
-        self.gpu + self.cpu + self.declined.values().sum::<u64>()
-    }
-}
-
-static CENSUS: Mutex<Option<Census>> = Mutex::new(None);
-
-fn with<R>(f: impl FnOnce(&mut Census) -> R) -> R {
-    let mut guard = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
-    let census = guard.get_or_insert_with(|| Census {
-        next_emit: 1,
-        ..Census::default()
-    });
-    f(census)
-}
-
-fn emit_if_due(c: &mut Census) -> Option<String> {
-    let total = c.total();
-    if total < c.next_emit {
-        return None;
-    }
-    c.next_emit = total.saturating_mul(2);
-    let declined = c
-        .declined
-        .iter()
-        .map(|(r, n)| format!("{r}:{n}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    Some(format!(
-        "view_swizzle gpu={} cpu={} declined={} by_reason=[{declined}]",
-        c.gpu,
-        c.cpu,
-        c.declined.values().sum::<u64>(),
-    ))
-}
-
-/// A non-identity view swizzle was handed to the GPU as a component mapping.
-/// The healthy path: no texel was touched and the bind kept its content rail.
-pub fn note_gpu_mapping() {
-    if let Some(line) = with(|c| {
-        c.gpu += 1;
-        emit_if_due(c)
-    }) {
-        observe::off(line);
-    }
+fn first_sight(slug: &'static str, texture_ref: u32) -> bool {
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((slug, texture_ref))
 }
 
 /// A non-identity view swizzle was performed by rewriting texels on the CPU.
 ///
 /// Always fail-visible on first sight, because this is the regression the GPU
-/// mapping replaced: it is *correct* and therefore invisible in the output,
-/// while costing the texture its zero-copy crossing.
+/// component mapping replaced: it is *correct* and therefore invisible in the
+/// output, while costing the texture its zero-copy crossing.
 pub fn note_cpu_remap(texture_ref: u32) {
     use crate::observe::Decline as _;
     let reason = SwizzleDecline::CpuRemap;
-    let (first, line) = with(|c| {
-        c.cpu += 1;
-        let first = c.seen.insert((reason.slug(), texture_ref));
-        (first, emit_if_due(c))
-    });
-    if first {
+    if first_sight(reason.slug(), texture_ref) {
         observe::Emit::decline("view_swizzle_cpu_remap", &reason)
             .field("ref", texture_ref)
             .fail();
-    }
-    if let Some(line) = line {
-        observe::off(line);
     }
 }
 
 /// A swizzled bind was refused, naming the specific check.
 pub fn note_declined(reason: SwizzleDecline, texture_ref: u32) {
     use crate::observe::Decline as _;
-    let (first, line) = with(|c| {
-        *c.declined.entry(reason.slug()).or_default() += 1;
-        let first = c.seen.insert((reason.slug(), texture_ref));
-        (first, emit_if_due(c))
-    });
-    if first {
+    if first_sight(reason.slug(), texture_ref) {
         observe::Emit::decline("view_swizzle_declined", &reason)
             .field("ref", texture_ref)
             .fail();
-    }
-    if let Some(line) = line {
-        observe::off(line);
     }
 }
 
@@ -170,56 +103,16 @@ impl crate::observe::Decline for SwizzleDecline {
     }
 }
 
-/// `(gpu, cpu, declined_total)`. Test/diagnostic accessor.
-pub fn counts() -> (u64, u64, u64) {
-    with(|c| (c.gpu, c.cpu, c.declined.values().sum()))
-}
-
+/// Drop the first-sight set. Test-only: it is process-global, so a test that
+/// asserts a line was emitted must start from a known point.
 #[cfg(test)]
 pub fn reset_for_tests() {
-    with(|c| {
-        *c = Census {
-            next_emit: 1,
-            ..Census::default()
-        }
-    });
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The three outcomes are counted separately, because they are three
-    /// different situations: working, working-but-slow, and not working.
-    #[test]
-    fn the_three_outcomes_are_counted_apart() {
-        reset_for_tests();
-        note_gpu_mapping();
-        note_gpu_mapping();
-        note_cpu_remap(7);
-        note_declined(SwizzleDecline::ResidentDirectBind, 9);
-        assert_eq!(counts(), (2, 1, 1));
-        reset_for_tests();
-    }
-
-    /// The cumulative line separates them too, and names which check declined —
-    /// "some swizzles failed" is not an actionable report.
-    #[test]
-    fn the_summary_line_separates_them() {
-        reset_for_tests();
-        note_declined(SwizzleDecline::ResidentDirectBind, 3);
-        let line = with(emit_if_due).unwrap_or_else(|| {
-            with(|c| {
-                c.next_emit = 0;
-                emit_if_due(c).unwrap()
-            })
-        });
-        assert!(line.contains("gpu=0"), "{line}");
-        assert!(line.contains("cpu=0"), "{line}");
-        assert!(line.contains("declined=1"), "{line}");
-        assert!(line.contains("swizzle_resident_direct_bind:1"), "{line}");
-        reset_for_tests();
-    }
 
     /// Both slugs name the rail that wrote them.
     ///
@@ -243,20 +136,21 @@ mod tests {
         );
     }
 
-    /// A hot rail must cost a logarithmic number of lines, not one per bind.
+    /// A hot rail must cost one line per distinct (reason, ref), not one per
+    /// bind — the dedup is what makes it safe to leave on forever.
     #[test]
-    fn emission_doubles_rather_than_tracking_every_bind() {
+    fn each_reason_and_ref_pair_reports_once() {
         reset_for_tests();
-        let mut emits = 0;
-        for _ in 0..4096 {
-            if with(|c| {
-                c.gpu += 1;
-                emit_if_due(c).is_some()
-            }) {
-                emits += 1;
-            }
-        }
-        assert_eq!(emits, 13);
+        assert!(first_sight("swizzle_cpu_remap", 7));
+        assert!(!first_sight("swizzle_cpu_remap", 7));
+        assert!(
+            first_sight("swizzle_cpu_remap", 8),
+            "a new ref is a new event"
+        );
+        assert!(
+            first_sight("swizzle_resident_direct_bind", 7),
+            "a new reason on the same ref is a new event"
+        );
         reset_for_tests();
     }
 }

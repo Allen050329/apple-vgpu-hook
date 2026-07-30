@@ -31,9 +31,6 @@ pub mod host;
 /// Type-7 ICB (0x36) materialization, host command fills, execute writeback.
 pub mod icb;
 
-/// Safe zero-copy import-present (resident BGRA → guest pages, stride-correct).
-#[cfg(feature = "backend-vulkan")]
-pub mod import_present;
 pub mod input;
 /// Process-global metal2vulkan SPIR-V cache (AIR content hash → SPIR-V).
 pub mod m2v_cache;
@@ -51,31 +48,31 @@ pub mod mtlb;
 /// Object-list lookup and type-11 registration.
 pub mod objects;
 pub mod plan;
-/// GVA resolver traits (wraps [`crate::contract::gva_resolve`]).
-pub mod resolve;
+/// The resident identity a type-11 guest surface renders into.
+#[cfg(feature = "backend-vulkan")]
+pub mod present_identity;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).
 pub mod spirv_bind;
 mod spirv_layout;
 /// Bounded structural evaluation of vertex clip positions (coverage proof).
-pub mod spirv_vertex_eval;
 /// Deferred compute-writeback flush (flush-on-access; resident authoritative).
 pub mod storage_flush;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
+/// The wire task word a command payload carries → a live task slot.
+pub mod task_slot;
 /// Texture / type-11 geometry registration.
 pub mod texture;
 
 pub use drain::{
     complete_async_job, drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending,
-    drain_stranded_fifos, enqueue_async_stamp, enqueue_async_stamp_surface, signal_display_vbl,
-    wait_surface_mapping, wait_surface_other_channels, wait_surface_snapshot_once, write_stamp,
-    Packet, PacketError,
+    enqueue_async_stamp_surface, signal_display_vbl, wait_surface_mapping,
+    wait_surface_other_channels, write_stamp, Packet, PacketError,
 };
 pub use host::{
-    read_u16, read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps,
-    MemError,
+    read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
 };
 
 #[cfg(test)]

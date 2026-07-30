@@ -45,6 +45,7 @@ impl ReimsVgpuButton {
     /// Reconstruct a button from its wire value (`a0`). Used by tests and any
     /// consumer that needs to round-trip the packed action; returns `None` for
     /// an unknown code rather than inventing a fallback button.
+    #[cfg(test)]
     pub fn from_wire(v: u32) -> Option<Self> {
         Some(match v {
             0 => Self::Left,
@@ -62,6 +63,7 @@ impl ReimsVgpuButton {
 
     /// True for the wheel codes, which the window thread emits as a momentary
     /// down+up pair (a wheel button has no held state).
+    #[cfg(test)]
     pub fn is_wheel(self) -> bool {
         matches!(
             self,

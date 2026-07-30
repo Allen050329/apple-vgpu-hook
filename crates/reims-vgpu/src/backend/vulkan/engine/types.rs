@@ -6,6 +6,7 @@
 use ash::vk;
 
 use crate::backend::vulkan::translate;
+pub use crate::runtime::decode::resource::ColorWriteMask;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,8 +20,6 @@ pub enum DrawError {
     /// Engine façade or host-window presenter state changed under a valid
     /// request, or a façade input cannot describe a scanout.
     Facade(super::facade_decline::EngineFacadeDecline),
-    /// A host-pointer import violated its non-driver preconditions.
-    HostImport(super::host_import_decline::HostImportDecline),
     /// Runtime pipeline/MTLB/AIR preparation failed before an engine request
     /// could be validated.
     DrawPreparation(super::draw_preparation::DrawPreparationDecline),
@@ -32,18 +31,14 @@ pub enum DrawError {
     ComputeValidation(super::compute_validation::ComputeValidationDecline),
     /// A validated compute request lost or mismatched resident execution state.
     ComputeExecution(super::compute_execution::ComputeExecutionDecline),
-    /// A host-present request that violated the guest-mapping layout contract.
-    /// See [`super::reason::HostPresentDecline`].
-    Present(super::reason::HostPresentDecline),
+    /// A resident-target readback could not find its content.
+    /// See [`super::reason::TargetReadDecline`].
+    TargetRead(super::reason::TargetReadDecline),
     /// A specific Vulkan call that returned an error, typed by *(rail,
     /// operation)*. Former `Vulkan(String)` sites move here so the log names
     /// which call refused.
     /// See [`super::vk_call::VkCall`].
     VkCall(super::vk_call::VkCall),
-    /// A `dup(2)` of an export dmabuf fd failed — a POSIX syscall failure
-    /// carrying an errno, not a `vk::Result`, so it is not [`Self::VkCall`].
-    /// See [`super::fd_dup::FdDupDecline`].
-    FdDup(super::fd_dup::FdDupDecline),
     /// The image-memory slab rejected an impossible allocation/invariant
     /// without pretending the driver returned OOM.
     Slab(super::slab::SlabDecline),
@@ -59,15 +54,13 @@ impl std::fmt::Display for DrawError {
             Self::Init(d) => write!(f, "vk_engine_init: {d}"),
             Self::Unsupported(r) => write!(f, "vk_engine_unsupported: {r}"),
             Self::Facade(d) => write!(f, "vk_engine_facade: {d}"),
-            Self::HostImport(d) => write!(f, "vk_engine_host_import: {d}"),
             Self::DrawPreparation(d) => write!(f, "vk_engine_draw_preparation: {d}"),
             Self::DrawValidation(d) => write!(f, "vk_engine_draw_validation: {d}"),
             Self::DrawExecution(d) => write!(f, "vk_engine_draw_execution: {d}"),
             Self::ComputeValidation(d) => write!(f, "vk_engine_compute_validation: {d}"),
             Self::ComputeExecution(d) => write!(f, "vk_engine_compute_execution: {d}"),
-            Self::Present(d) => write!(f, "vk_engine_present: {d}"),
+            Self::TargetRead(d) => write!(f, "vk_engine_target_read: {d}"),
             Self::VkCall(c) => write!(f, "vk_engine_vk: {c}"),
-            Self::FdDup(d) => write!(f, "vk_engine_fd_dup: {d}"),
             Self::Slab(d) => write!(f, "vk_engine_slab: {d}"),
             Self::FenceTimeout => write!(f, "vk_engine_fence_timeout"),
             Self::DeviceLost(d) => write!(f, "vk_engine_device_lost: {d}"),
@@ -82,17 +75,15 @@ impl crate::observe::Decline for DrawError {
     /// one event has one reason at every layer.
     fn slug(&self) -> &'static str {
         match self {
-            Self::Present(d) => d.slug(),
+            Self::TargetRead(d) => d.slug(),
             Self::Unsupported(r) => r.slug(),
             // Delegates like the two typed variants above: the call names itself,
             // so one event has one name whether it is read here or on `VkCall`.
             Self::VkCall(c) => c.slug(),
-            Self::FdDup(d) => d.slug(),
             Self::Slab(d) => d.slug(),
             Self::FenceTimeout => "vk_engine_fence_timeout",
             Self::Init(d) => d.slug(),
             Self::Facade(d) => d.slug(),
-            Self::HostImport(d) => d.slug(),
             Self::DrawPreparation(d) => d.slug(),
             Self::DrawValidation(d) => d.slug(),
             Self::DrawExecution(d) => d.slug(),
@@ -104,10 +95,9 @@ impl crate::observe::Decline for DrawError {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Present(d) => d.fields(),
+            Self::TargetRead(d) => d.fields(),
             Self::Unsupported(r) => r.fields(),
             Self::VkCall(c) => c.fields(),
-            Self::FdDup(d) => d.fields(),
             Self::Slab(d) => d.fields(),
             Self::Init(d) => d.fields(),
             Self::DrawValidation(d) => d.fields(),
@@ -117,7 +107,6 @@ impl crate::observe::Decline for DrawError {
             Self::DeviceLost(d) => d.fields(),
             Self::FenceTimeout => Vec::new(),
             Self::Facade(d) => d.fields(),
-            Self::HostImport(d) => d.fields(),
             Self::DrawPreparation(d) => d.fields(),
         }
     }
@@ -245,10 +234,30 @@ pub struct DrawRequest {
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
     pub samplers: Vec<SamplerResource>,
-    /// RGBA8 Load seed for the color target (None = clear black).
-    /// Preferred when `load_op` is not set; still honored as `LoadOp::LoadSeed`.
-    pub target_rgba8: Option<Vec<u8>>,
+    /// CPU Load seed for the color target (None = clear black), in the order
+    /// [`DrawRequest::target_seed_order`] names. Preferred when `load_op` is not
+    /// set; still honored as `LoadOp::LoadSeed`.
+    ///
+    /// Shared rather than owned so a caller holding the frame behind an `Arc` —
+    /// `surface_cache` does — can seed a draw with a refcount instead of a
+    /// whole-framebuffer copy.
+    pub target_rgba8: Option<std::sync::Arc<Vec<u8>>>,
+    /// Byte order of the CPU seed above, relative to the attachment it seeds.
+    ///
+    /// The attachment is BGRA when [`DrawRequest::output_bgra`] and RGBA
+    /// otherwise. When the two disagree the exchange is folded into the copy
+    /// into the mapped staging span, which has to happen regardless — so a
+    /// caller whose pixels are already in guest scanout order never has to
+    /// materialize a converted frame to seed a draw with them.
+    pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
+    /// Which channels the primary colour attachment writes.
+    ///
+    /// Separate from `blend` because `MTLColorWriteMask` is independent of
+    /// `blendingEnabled`: an unblended attachment with a mask still leaves the
+    /// unwritten channels alone, so folding it into `Option<BlendStateResource>`
+    /// would drop it on every unblended draw.
+    pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
     /// Explicit load action. When `None`, derived from `target_rgba8`
@@ -337,11 +346,25 @@ pub struct SecondaryColorTarget {
     /// long as MRT has existed. Only the Vulkan `PipelineKey` collapsed them to
     /// one, so a guest MRT pipeline that blended slot 1 got a raw store.
     pub blend: Option<BlendStateResource>,
+    /// This slot's own `MTLColorWriteMask`, for the same reason the primary
+    /// carries one: it is not part of the blend state.
+    pub color_write_mask: ColorWriteMask,
 }
 
 #[derive(Debug, Default)]
 pub struct DrawOutput {
     pub pixels: Vec<u8>,
+    /// Physical channel order of `pixels`: BGRA8 when true, semantic RGBA8
+    /// otherwise. Empty when `skip_readback`, in which case this states the
+    /// order the attachment *would* have read back in.
+    ///
+    /// Reported rather than re-derived. The order follows the resolved
+    /// attachment — [`TargetIdentity::is_bgra`] for a resident target, RGBA for
+    /// the pooled path — and a caller that recomputes the predicate is a caller
+    /// that can disagree with the image the readback actually came out of. This
+    /// is the same rule the typed-decline work applies to a `reason=`: the side
+    /// that performed the operation says what it did.
+    pub pixels_bgra: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -567,8 +590,13 @@ impl BufferContent {
 
     /// CPU view of the content. `Bytes` borrows; `GuestRuns` copies the runs
     /// out of guest RAM (same freshness as the CPU staging path's encode-time
-    /// read). Callers are runtime diagnostics/coverage proofs — the hot draw
-    /// path never materializes a `GuestRuns` span on the CPU.
+    /// read).
+    ///
+    /// Every `GuestRuns` bind is a CPU gather now — the GPU has no way to reach
+    /// guest pages — but the hot path does that gather straight into mapped
+    /// staging with `write_staging_from_runs`, which is what avoids the
+    /// intermediate heap `Vec` this builds. Callers here are diagnostics and
+    /// coverage proofs, which want the bytes as a slice.
     pub fn cpu_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match self {
             Self::Bytes(b) => std::borrow::Cow::Borrowed(b.as_slice()),
@@ -583,7 +611,7 @@ impl BufferContent {
                     // SAFETY: `host_ptr` is a stable RAMBlock alias from
                     // `HostOps::map_pages`, valid for the VM lifetime; the
                     // read races guest CPU writes exactly like the staging
-                    // path's `read_task_gva_fallback` copy does.
+                    // path's `read_task_gva_by_id` copy does.
                     unsafe {
                         let slice = std::slice::from_raw_parts(run.host_ptr as *const u8, n);
                         out.extend_from_slice(slice);
@@ -611,6 +639,11 @@ pub struct SampledImageResource {
     pub arrayed: bool,
     pub volume: bool,
     pub cube: bool,
+    /// Metal `texture1d` / `texture1d_array` (color-transfer LUTs): the image is
+    /// created as a Vulkan 1D image so the sampled descriptor type matches the
+    /// shader's declared 1D image. `height` is 1; `arrayed` selects
+    /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
+    pub one_dim: bool,
     pub source: SampledSource,
     /// Format the image and its view are created with, and the layout
     /// [`SampledSource::Bytes`] / [`SampledSource::GuestRuns`] content is read
@@ -898,19 +931,13 @@ pub struct ComputeOutput {
     /// device→host boundary after dispatch.
     pub buffers: Vec<ComputeBufferOutput>,
     /// Image readbacks in request order (same length as `storage_images`).
-    /// Empty for images the GPU copied straight into the caller's imported
-    /// host window (see `images_direct`).
+    /// Empty only for a deferred image (see `images_deferred`).
+    ///
+    /// A third case used to leave this empty too: the dispatch copied into an
+    /// imported view of the caller's guest window and `images_direct` said so,
+    /// so the caller skipped its own writeback. That window is gone, and with
+    /// it the flag — every non-deferred image now comes back through here.
     pub images: Vec<Vec<u8>>,
-    /// Color8 content stats fused into each image readback copy (same order
-    /// and length as `images`; `None` when the readback is not whole RGBA8
-    /// texels or the image went direct). Saves the runtime a second full scan
-    /// for its output census.
-    pub image_stats: Vec<Option<crate::backend::vulkan::engine::Color8ContentStats>>,
-    /// Per image (request order): true when the GPU copy landed in the
-    /// caller's `host_writeback` window — the caller must skip its own CPU
-    /// writeback for that image. False = the readback in `images` is
-    /// authoritative and the caller writes back as before.
-    pub images_direct: Vec<bool>,
     /// Per image (request order): true when the readback was deferred — the
     /// pinned resident storage image is authoritative, no bytes crossed the
     /// device→host boundary, and the caller owns flushing it to guest pages
@@ -950,14 +977,8 @@ pub struct ComputeStorageImageResource {
     /// The caller skipped reading guest pages into `bytes` because the
     /// resident generation matched at stage time. The engine must fail
     /// visibly (never seed the zero placeholder) if the resident image is
-    /// gone by acquire time — the caller restages and retries.
+    /// gone by acquire time.
     pub seed_skipped: bool,
-    /// GPU-direct writeback window (VK_EXT_external_memory_host): when set
-    /// and importable, the post-dispatch copy lands in this guest-memory
-    /// window instead of the host-visible readback buffer, and the matching
-    /// `ComputeOutput::images` entry stays empty with `images_direct` true.
-    /// Import failure falls back to the readback path (never an error).
-    pub host_writeback: Option<ComputeHostWriteback>,
     /// Deferred writeback: skip the post-dispatch GPU→host readback entirely —
     /// the resident storage image (requires `residency`) stays the
     /// authoritative copy, pinned against LRU eviction until the caller
@@ -974,27 +995,13 @@ pub struct ComputeStorageImageResource {
 /// of uploading `bytes` (which is a zero placeholder and must never reach the
 /// GPU): the copy never aliases the live resident, so the same dispatch may
 /// also storage-write that identity. A missing/mismatched resident fails
-/// visibly (`compute_resident_sample_lost`) — the caller restages and retries.
+/// visibly with a `vk_compute_exec_resident_sample_*` decline naming the check
+/// that refused.
 #[derive(Clone, Copy, Debug)]
 pub struct ComputeResidentSampleBind {
     pub identity: crate::model::ComputeStorageResidencyKey,
     /// Generation the caller verified against the registry at stage time.
     pub generation: u32,
-}
-
-/// Imported-host-pointer writeback target for one storage image. `ptr` is the
-/// contig host view of the destination mapping (base of the mapping, not of
-/// the surface) and must stay valid for `len` bytes across the engine call;
-/// `buffer_offset` / `row_bytes` describe the guest surface window inside it.
-#[derive(Clone, Copy, Debug)]
-pub struct ComputeHostWriteback {
-    pub ptr: usize,
-    pub len: usize,
-    /// Byte offset of texel (0,0) inside the imported window; must be a
-    /// multiple of the texel size and of 4 (Vulkan bufferOffset VUs).
-    pub buffer_offset: u64,
-    /// Guest row stride in bytes (>= width * texel size, texel-size multiple).
-    pub row_bytes: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1105,31 +1112,19 @@ pub enum TargetIdentity {
     },
     /// Anonymous / no protocol identity (oracle / one-shot draws).
     Anonymous { slot: u64 },
-    /// Unified compositor-output group: proven same-geometry dual-mid members
-    /// are alternating storage for ONE logical framebuffer (guest copy-swap
-    /// contract — see). All member mids at this geometry
-    /// resolve to this identity, so their draws chain one shared resident and
-    /// per-member content divergence (the a/b residue class) is structurally
-    /// impossible. Dedicated variant: guest mapping ids can never collide
-    /// with it.
-    OutputGroup {
-        id: u32,
-        width: u32,
-        height: u32,
-        generation: u64,
-    },
 }
 
 pub type PresentRect = (u32, u32, u32, u32);
 
-/// Ordered resident candidates and optional cross-member tile correction for a
-/// host-window present. The first content-ready BGRA candidate is authoritative.
+/// Ordered resident candidates for a host-window present. The first
+/// content-ready BGRA candidate at `width`x`height` is authoritative; the list
+/// resolves the ONE surface the display transaction named, never a choice
+/// between surfaces.
 #[derive(Clone, Debug)]
 pub struct WindowPresentSource {
     pub width: u32,
     pub height: u32,
     pub candidates: Vec<TargetIdentity>,
-    pub peer: Option<(TargetIdentity, Vec<PresentRect>)>,
 }
 
 impl Default for TargetIdentity {
@@ -1141,10 +1136,9 @@ impl Default for TargetIdentity {
 impl TargetIdentity {
     pub fn width(&self) -> u32 {
         match self {
-            Self::Surface { width, .. }
-            | Self::Texture { width, .. }
-            | Self::Gva { width, .. }
-            | Self::OutputGroup { width, .. } => *width,
+            Self::Surface { width, .. } | Self::Texture { width, .. } | Self::Gva { width, .. } => {
+                *width
+            }
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1153,8 +1147,7 @@ impl TargetIdentity {
         match self {
             Self::Surface { height, .. }
             | Self::Texture { height, .. }
-            | Self::Gva { height, .. }
-            | Self::OutputGroup { height, .. } => *height,
+            | Self::Gva { height, .. } => *height,
             Self::Anonymous { .. } => 0,
         }
     }
@@ -1163,11 +1156,49 @@ impl TargetIdentity {
         match self {
             Self::Surface { generation, .. }
             | Self::Texture { generation, .. }
-            | Self::Gva { generation, .. }
-            | Self::OutputGroup { generation, .. } => *generation,
+            | Self::Gva { generation, .. } => *generation,
             Self::Anonymous { .. } => 0,
         }
     }
+
+    /// Physical channel order of the resident image behind this identity.
+    ///
+    /// A `Surface` resident backs a type-11 guest IOSurface, whose pages are
+    /// BGRA8 — so rendering it as `B8G8R8A8_UNORM` makes a raw image→buffer
+    /// readback land in guest scanout order and deletes the whole-frame CPU
+    /// swizzle the Store used to pay. Every other namespace stays RGBA.
+    ///
+    /// This is a property of the *identity*, not of the draw, and that is the
+    /// whole point: `ResourcePools::registry` is keyed by identity and
+    /// `registry_ensure` destroys and recreates the image whenever a draw's
+    /// requested order disagrees with the slot's. Several runtime paths render
+    /// into one surface identity in a frame — a composite Store, a chain
+    /// intermediate, an MRT primary — and deriving the order from the key they
+    /// already agree on is what makes them agree here too. A per-path
+    /// predicate would let one of them recreate the image every frame, which
+    /// reads as `target_evicts` climbing and costs a fresh allocation plus a
+    /// lost `content_ready` per composite.
+    pub fn is_bgra(&self) -> bool {
+        matches!(self, Self::Surface { .. })
+    }
+}
+
+/// Byte order of a CPU load seed, relative to the attachment it seeds.
+///
+/// Vulkan buffer→image copies perform no format conversion, so the staged bytes
+/// must already be in the attachment's physical order. Stating the seed's own
+/// order — rather than assuming one — lets the exchange fold into the copy into
+/// the mapped staging span instead of being paid as a separate converted frame:
+/// `surface_cache` holds guest scanout order and the pooled target is RGBA, so
+/// the runtime used to allocate, copy and swizzle a whole framebuffer per seeded
+/// draw purely to restate the pixels it already had.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOrder {
+    /// Semantic RGBA8 — R, G, B, A in memory.
+    #[default]
+    Rgba8,
+    /// Guest scanout order — B, G, R, A in memory.
+    Bgra8,
 }
 
 /// Color attachment load action for resident targets.
@@ -1219,7 +1250,7 @@ pub struct GuestRun {
 /// the guest row stride in texels for padded layouts, and the window then
 /// spans `(height-1) * stride_bytes + tight_row_bytes` (the final row needs
 /// only its texels — padding past the last row may not be mapped). The
-/// caller must have verified import coverage via `ensure_host_import` for
+/// caller must have verified import coverage via `ensure_host_imports` for
 /// every run.
 #[derive(Clone, Debug)]
 pub struct GuestRunSource {
@@ -1251,8 +1282,6 @@ pub struct SampledContentIdentity {
 pub struct DrawTicket {
     /// Identity of the color target written by the draw (if residency used).
     pub target: Option<TargetIdentity>,
-    /// Whether a full-frame readback was performed (oracle/Store path).
-    pub readback_performed: bool,
     /// Optional oracle-mode pixels when readback was requested with the draw.
     pub pixels: Option<Vec<u8>>,
 }
@@ -1376,5 +1405,47 @@ mod tests {
         assert_eq!(compute.grid, [0, 0, 0]);
         assert!(compute.storage_buffers.is_empty());
         assert!(compute.storage_images.is_empty());
+    }
+
+    /// The order is a property of the identity's namespace, and the two halves
+    /// matter for different reasons.
+    ///
+    /// `Surface` must be BGRA: every CPU consumer of a type-11 composite Store is
+    /// declared in guest scanout order, so an RGBA resident costs a whole-frame
+    /// exchange per Store.
+    ///
+    /// Everything else must *not* be, and that is the half a future edit is
+    /// likely to get wrong. `Gva` residents are read by
+    /// `storage_flush::flush_gva_one` into `write_gva_rgba8`, and `Anonymous`
+    /// covers the pooled path the parity suite uses as its semantic control —
+    /// flipping either silently exchanges R and B on a whole rail.
+    #[test]
+    fn only_a_surface_identity_carries_guest_scanout_order() {
+        assert!(
+            TargetIdentity::Surface {
+                id: 1,
+                width: 8,
+                height: 8,
+                generation: 0,
+            }
+            .is_bgra()
+        );
+        for other in [
+            TargetIdentity::Gva {
+                gva: 0x1000,
+                width: 8,
+                height: 8,
+                generation: 0,
+            },
+            TargetIdentity::Texture {
+                ref_: 2,
+                width: 8,
+                height: 8,
+                generation: 0,
+            },
+            TargetIdentity::Anonymous { slot: 0 },
+        ] {
+            assert!(!other.is_bgra(), "{other:?} must stay semantic RGBA");
+        }
     }
 }

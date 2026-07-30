@@ -53,30 +53,6 @@ pub enum ScanoutCopyResult {
 }
 
 #[cfg(feature = "backend-vulkan")]
-mod gpu_direct_census {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static PRESENTS: AtomicU64 = AtomicU64::new(0);
-    static FALLBACKS: AtomicU64 = AtomicU64::new(0);
-    static BYTES: AtomicU64 = AtomicU64::new(0);
-
-    pub(super) fn note_success(bytes: u64) {
-        let presents = PRESENTS.fetch_add(1, Ordering::Relaxed) + 1;
-        let total = BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        if presents == 1 || presents.is_multiple_of(256) {
-            crate::observe::off(format!(
-                "console_gpu_direct presents={presents} fallbacks={} gpu_mb={}",
-                FALLBACKS.load(Ordering::Relaxed),
-                total / (1024 * 1024)
-            ));
-        }
-    }
-
-    pub(super) fn note_fallback() {
-        FALLBACKS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 /// Read mapping pages into `dst` without updating present/paint generation.
 ///
 /// Used by draw bind materialization (sampled type-11 textures). Returns true
@@ -106,10 +82,11 @@ pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     paint_mapping(state, host, mapping_id, dst, dst_stride, width, height)
 }
 
-/// Always-on census of the direct-present readback-elision ratio (never silent):
-/// `full` = readback + proxy scan ran; `light` = dmabuf-carried, readback
-/// skipped. Deduped to one line per 1024 total captures (a line every ~8 s at
-/// 120 Hz), so it confirms the elision engages without flooding the fail view.
+/// Always-on census of the capture readback-elision ratio (never silent):
+/// `full` = readback + proxy scan ran; `light` = the window is carrying the frame
+/// from the engine resident, readback skipped. Deduped to one line per 1024 total
+/// captures (a line every ~8 s at 120 Hz), so it confirms the elision engages
+/// without flooding the fail view.
 fn maybe_log_capture_sampling(state: &DeviceState) {
     let full = state.present.full_captures;
     let light = state.present.light_captures;
@@ -117,143 +94,6 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
     if total != 0 && total.is_multiple_of(1024) {
         crate::observe::off(format!("capture_sampling full={full} light={light}"));
     }
-}
-
-/// Arm a GPU stats reduction for this present and consume the previous one.
-///
-/// This is the zero-copy oracle. `capture_present_frame`'s CPU path only runs
-/// when the DISPLAY needs pixels (no dmabuf carrying the frame); on every other
-/// present the proxies would otherwise go dark. Instead we dispatch the
-/// reduction kernel over the resident the display already holds and read back a
-/// 32-byte block — so the always-on proxies keep measuring every present with
-/// **no** full-frame copy on any path.
-///
-/// Asynchronous by construction: `arm` submits and returns, `take` polls a fence
-/// without blocking. Stats therefore describe a present one or more frames back.
-/// That is safe because the block is matched on the exact
-/// `(identity, generation, seq)` it was armed with, so a proxy is never handed
-/// another frame's numbers — it sees the same sequence, shifted. Proxies that
-/// compare consecutive captures (`mid_switch`, `nz_swing`) are unaffected by a
-/// uniform shift.
-#[cfg(feature = "backend-vulkan")]
-fn run_gpu_stats_oracle(
-    state: &mut crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    generation: u32,
-) {
-    use crate::backend::vulkan::engine;
-
-    // 1. Collect the previous present's reduction, if the GPU has finished it.
-    if let Some(p) = state.present.pending_stats {
-        let identity = pending_stats_identity(&p);
-        match engine::take_present_stats(&identity, p.map_generation, p.seq) {
-            Some(stats) => {
-                state.present.pending_stats = None;
-                // Reject a block whose geometry disagrees with what we armed:
-                // the resident was recreated under us and the numbers describe a
-                // different surface.
-                if stats.width == p.width && stats.height == p.height {
-                    crate::runtime::census::present_proxy::note_capture_ok(
-                        crate::runtime::census::present_proxy::PresentCaptureSample {
-                            mapping_id: p.mapping_id,
-                            generation: p.generation,
-                            width: p.width,
-                            height: p.height,
-                            nz: stats.byte_nz as usize,
-                            max_byte: stats.byte_max,
-                            rgb_nz: stats.rgb_nz as usize,
-                            max_rgb: stats.max_rgb,
-                            // GPU-sourced: never the deferred-store CPU reuse.
-                            from_last_store: false,
-                            edge_energy: stats.edge_energy,
-                            named_peer: state.is_compositor_output_member(p.mapping_id),
-                        },
-                    );
-                } else {
-                    crate::observe::off(format!(
-                        "present_stats DROP reason=geom_drift mid={} armed={}x{} got={}x{} seq={}",
-                        p.mapping_id, p.width, p.height, stats.width, stats.height, p.seq
-                    ));
-                }
-            }
-            None => {
-                // Not finished yet. Leave it pending so a later present collects
-                // it — unless a newer arm is about to displace it, handled below.
-            }
-        }
-    }
-
-    // 2. Arm this present. If one is still pending, cancel it first: the pool is
-    //    small and a stale key would pin a slot forever.
-    if let Some(p) = state.present.pending_stats.take() {
-        engine::cancel_present_stats(p.seq);
-        crate::runtime::census::present_proxy::stats_oracle::note_superseded();
-    }
-    let grouped = state.output_group_for(mapping_id, width, height).is_some();
-    let map_generation = if grouped {
-        0
-    } else {
-        state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.map_generation as u64)
-            .unwrap_or(0)
-    };
-    let seq = state.present.stats_seq.wrapping_add(1).max(1);
-    state.present.stats_seq = seq;
-    let pending = crate::model::PendingStats {
-        mapping_id,
-        width,
-        height,
-        generation,
-        map_generation,
-        grouped,
-        seq,
-    };
-    let identity = pending_stats_identity(&pending);
-    if engine::arm_present_stats(&identity, seq) {
-        state.present.pending_stats = Some(pending);
-        crate::runtime::census::present_proxy::stats_oracle::note_armed(true);
-    } else {
-        crate::runtime::census::present_proxy::stats_oracle::note_armed(false);
-    }
-}
-
-/// Rebuild the exact identity a [`crate::model::PendingStats`] was armed with.
-/// Never re-resolves group membership (see the type's docs).
-#[cfg(feature = "backend-vulkan")]
-fn pending_stats_identity(
-    p: &crate::model::PendingStats,
-) -> crate::backend::vulkan::engine::types::TargetIdentity {
-    use crate::backend::vulkan::engine::types::TargetIdentity;
-    if p.grouped {
-        TargetIdentity::OutputGroup {
-            id: crate::runtime::import_present::OUTPUT_GROUP_ID,
-            width: p.width,
-            height: p.height,
-            generation: 0,
-        }
-    } else {
-        TargetIdentity::Surface {
-            id: p.mapping_id,
-            width: p.width,
-            height: p.height,
-            generation: p.map_generation,
-        }
-    }
-}
-
-/// Non-Vulkan backends have no resident registry and so no GPU oracle.
-#[cfg(not(feature = "backend-vulkan"))]
-fn run_gpu_stats_oracle(
-    _state: &mut crate::model::DeviceState,
-    _mapping_id: u32,
-    _width: u32,
-    _height: u32,
-    _generation: u32,
-) {
 }
 
 /// Fill `buf` from the mapping's GPU resident, without any guest-page scatter.
@@ -273,85 +113,15 @@ fn try_capture_from_resident(
 ) -> bool {
     let need = buf.len();
     let identity =
-        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    let mut divergent_rects = Vec::new();
-    let peer_identity = state
-        .compositor_geometry_peer(mapping_id, width, height)
-        .map(|peer_mid| {
-            state.collect_divergent_tile_rects(
-                mapping_id,
-                peer_mid,
-                width,
-                height,
-                &mut divergent_rects,
-            );
-            crate::runtime::import_present::member_surface_identity(state, peer_mid, width, height)
-        });
-    let member_peer = match &peer_identity {
-        Some(peer_identity) if !divergent_rects.is_empty() => {
-            Some((peer_identity, divergent_rects.as_slice()))
-        }
-        _ => None,
-    };
-    let identity_peer = matches!(
-        identity,
-        crate::backend::vulkan::engine::TargetIdentity::Surface { .. }
-    )
-    .then_some(member_peer)
-    .flatten();
-    let primary = crate::backend::vulkan::engine::read_resident_bgra_composited(
-        &identity,
-        identity_peer,
-        need,
-    );
-    let member =
-        crate::runtime::import_present::member_surface_identity(state, mapping_id, width, height);
-    let bgra = primary.or_else(|| {
-        (member != identity)
-            .then(|| {
-                crate::backend::vulkan::engine::read_resident_bgra_composited(
-                    &member,
-                    member_peer,
-                    need,
-                )
-            })
-            .flatten()
-    });
-    let Some(bgra) = bgra else {
-        crate::runtime::census::present_proxy::capture_source::note(false);
+        crate::runtime::present_identity::surface_identity(state, mapping_id, width, height);
+    let Some(bgra) = crate::backend::vulkan::engine::read_resident_bgra(&identity, need) else {
         return false;
     };
     debug_assert_eq!(bgra.len(), need);
     // Move (not copy) the readback in; the untouched scratch returns to the pool.
     state.present.capture_scratch = std::mem::replace(buf, bgra);
     state.present.last_paint_src = crate::model::PaintSrc::Resident;
-    crate::runtime::census::present_proxy::capture_source::note(true);
     true
-}
-
-#[cfg(feature = "backend-vulkan")]
-fn physical_tile_divergence_vs_peer(
-    state: &crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> Option<(u32, u32, [u32; 4])> {
-    let (peer_mid, tiles, bbox) = state.tile_divergence_vs_peer(mapping_id, width, height)?;
-    let presented_identity =
-        crate::runtime::import_present::surface_identity(state, mapping_id, width, height);
-    let peer_identity =
-        crate::runtime::import_present::surface_identity(state, peer_mid, width, height);
-    (presented_identity != peer_identity).then_some((peer_mid, tiles, bbox))
-}
-
-#[cfg(not(feature = "backend-vulkan"))]
-fn physical_tile_divergence_vs_peer(
-    state: &crate::model::DeviceState,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-) -> Option<(u32, u32, [u32; 4])> {
-    state.tile_divergence_vs_peer(mapping_id, width, height)
 }
 
 /// Non-Vulkan backends have no resident registry; capture stays on guest pages.
@@ -373,8 +143,8 @@ fn try_capture_from_resident(
 /// CmdDisplaySwap after wait_surface drains — before the packet stamp lets the
 /// guest recycle the mid (BH-deferred freeze captured mid-recycle partials).
 ///
-/// Unified memory: guest pages ARE the surface content — GPU Stores land in
-/// them via the guest-backed attachment. There is exactly one capture source.
+/// Guest pages ARE the surface content — the draw path's CPU writeback lands
+/// Stores in them. There is exactly one capture source.
 /// Takes no `HostOps`: with the guest-page capture path gone this reads the GPU
 /// resident and the host surface cache only — it never touches guest memory.
 pub fn capture_present_frame(
@@ -400,67 +170,50 @@ pub fn capture_present_frame(
     if need == 0 {
         return false;
     }
-    // A capture IS the display action: record the present evidence that
-    // qualifies this mapping for OutputGroup unification (see
-    // `DeviceState::output_group_for` — publish-only surfaces never unify).
-    state.note_presented_geom(mapping_id, width, height);
-    // Advance the per-present tile-epoch clock and measure per-tile
-    // damage-coverage divergence against the freshest same-geometry peer
-    //. The CPU-display capture below
-    // composites those divergent tiles in its GPU readback command; direct
-    // export applies the same rect policy in `export_present_dmabuf`.
-    state.advance_tile_epoch();
-    if let Some((peer_mid, tiles, bbox)) =
-        physical_tile_divergence_vs_peer(state, mapping_id, width, height)
-    {
-        crate::runtime::census::present_proxy::note_tile_divergence(
-            mapping_id, peer_mid, tiles, bbox, width, height,
-        );
-    }
-    // --- Direct-present readback elision (step 2 of the CPU-readback removal) ---
-    // When the previous present's window publish carried the frame as a zero-copy
-    // dmabuf (route B, `dmabuf_active`), the display reads the GPU resident
-    // directly and does NOT consume this CPU capture. The ~8-12 ms guest-page
-    // gather + full-frame proxy scan below is then pure present-hot-path overhead
-    // that serializes the guest behind the drain lock (the fullscreen-video
-    // slowdown class). Skip it on those presents. The cheap protocol-structural
-    // a/b guard still runs on every light present, and the GPU stats oracle feeds
-    // content proxies without a framebuffer copy. Never taken on non-host-window
-    // or non-import-capable builds: `dmabuf_active` only becomes true after a
-    // successful direct export.
-    // The full-frame readback now has EXACTLY ONE reason to exist: the DISPLAY
-    // needs CPU pixels because no dmabuf is carrying the frame, and the window
-    // will blit `frame_bgra`. Nothing else reads it.
+    state.advance_present_epoch();
+    // --- Capture readback elision ---
+    // When the previous present's window publish handed the window an engine
+    // resident (`display_from_resident` — the macOS engine-swapchain handoff), the
+    // display reads that resident directly and does NOT consume this CPU capture.
+    // The ~8-12 ms guest-page gather + full-frame proxy scan below is then pure
+    // present-hot-path overhead that serializes the guest behind the drain lock
+    // (the fullscreen-video slowdown class). Skip it on those presents; the cheap
+    // protocol-structural a/b guard still runs on every light present.
     //
-    // The proxies used to be the other reason, and that was the last full-frame
-    // GPU→CPU copy on the present path. They are now fed by a compute reduction
-    // over the resident (`run_gpu_stats_oracle`), which returns 32 bytes, so the
-    // oracle costs no full-frame copy and needs no opt-in.
+    // Never taken where the window owns its swapchain and uploads CPU pixels —
+    // every non-macOS host — because `display_from_resident` only becomes true
+    // after a resident publish succeeds.
     //
-    // Consequence: with dmabuf carrying, `frame_bgra` is never filled and stays
-    // empty. `publish_window_frame` must not require it when it produced a
-    // dmabuf — it does not; the export runs before the bgra check.
-    let display_needs_cpu_frame = !state.present.dmabuf_active;
+    // The full-frame readback has EXACTLY ONE reason to exist: the DISPLAY needs
+    // CPU pixels because no resident is carrying the frame, and the window will
+    // blit `frame_bgra`. Nothing else reads it.
+    //
+    // Consequence: with a resident carrying, `frame_bgra` holds no frame for this
+    // present, and the branch below drops it so that stays literally true.
+    let display_needs_cpu_frame = !state.present.display_from_resident;
     if !display_needs_cpu_frame {
-        // Protocol-structural a/b retention-gap guard (cheap map lookup, no pixel
-        // scan): never skipped, so a/b divergence is still caught on light frames.
-        if let Some((peer_mid, presented_seq, peer_seq)) =
-            state.dense_retention_gap(mapping_id, width, height)
-        {
-            crate::runtime::census::present_proxy::note_dense_retention_gap(
-                mapping_id,
-                peer_mid,
-                presented_seq,
-                peer_seq,
-                width,
-                height,
-            );
-        }
-        // Publish the new resident (fresh direct export in `publish_window_frame`)
-        // and leave `frame_bgra` empty: the window ignores CPU pixels while the
-        // resident carries the display. An export miss costs one dropped frame
-        // (the window holds its last good frame and publish logs the drop), then
-        // `dmabuf_active=false` forces the next capture to read back for fallback.
+        // Publish the new resident and leave `frame_bgra` empty: the window
+        // ignores CPU pixels while the resident carries the display. A publish
+        // miss costs one dropped frame (the window holds its last good frame and
+        // publish logs the drop), then `display_from_resident=false` forces the
+        // next capture to read back for fallback.
+        //
+        // Dropping it is what makes "no CPU pixels for this present" a fact
+        // rather than an inference. Skipping the readback only leaves the buffer
+        // empty if it was already empty, and it is not: the first present of a
+        // boot runs the full path — before the guest has painted anything, so it
+        // captures black — and every light present after it retained those bytes.
+        // Everything downstream that asks "were there pixels" asks
+        // `frame_bgra.is_empty()`, so all of them read that one stale frame as
+        // the current one. `present_content_verdict` judged it Black on 481 of
+        // 481 presents of a boot whose screen was correct throughout (0
+        // `present_content`, 0 `present_content_unsampled`), sending
+        // `present_black_retain` to the always-on failure sink 481 times with no
+        // guest work lost — the wolf-cry the `Unsampled` verdict exists to
+        // prevent, reintroduced through a buffer it could not see was stale. The
+        // console blit is gated on the same emptiness and would have painted
+        // those bytes as the live frame.
+        state.present.frame_bgra.clear();
         state.present.frame_mapping = mapping_id;
         state.present.frame_width = width;
         state.present.frame_height = height;
@@ -471,16 +224,8 @@ pub fn capture_present_frame(
         // The present declares this mapping's pages the finished frame; the first
         // LOAD draw after must re-seed from guest pages (dual-mid strobe class).
         state.presented_needs_guest_seed.insert(mapping_id);
-        // Zero-copy oracle: the proxies still get measured on this present, they
-        // just get measured ON THE GPU. Arm a reduction over the resident and
-        // collect whichever earlier one has finished. No frame crosses the bus,
-        // and neither call blocks.
-        run_gpu_stats_oracle(state, mapping_id, width, height, generation);
         state.present.light_captures = state.present.light_captures.wrapping_add(1);
         maybe_log_capture_sampling(state);
-        // Light capture pays ~no lock hold; attribute a zero to the tranche so the
-        // `capture_us` floor reflects only the frames that actually read back.
-        state.tranche.note_capture(0);
         return true;
     }
     state.present.full_captures = state.present.full_captures.wrapping_add(1);
@@ -488,7 +233,6 @@ pub fn capture_present_frame(
     // Attribute this capture's lock hold to the tranche `capture_us` bucket (it
     // runs on the present drain, not a render draw). Every real return below
     // notes the elapsed time so a capture-bound hitch stops hiding in `other_us`.
-    let capture_started = std::time::Instant::now();
     // Recycle the warm double-buffered scratch instead of a fresh `vec![0u8;
     // need]` per present (which zeroes 8 MiB and faults fresh anon pages every
     // time, only to overwrite them). `resize` is a no-op at steady geometry;
@@ -513,8 +257,10 @@ pub fn capture_present_frame(
     //
     // The proxies need the finished frame's BYTES; they do not need those bytes
     // to be in guest pages. This reads the resident and nothing else: no
-    // `flush_intersecting`, so the guest-page writeback stays deferred on the
-    // `render_deferred_flush` rail, which already flushes on a genuine guest read
+    // `flush_intersecting`. Nothing is owed — a type-11 render Store lands its
+    // own guest-page writeback (`mapping_write::write_rgba8_image_changed`), and
+    // the deferred rails that remain (compute storage, linear, GVA) are keyed on
+    // resources this capture does not touch and flush on a genuine guest read
     // (LOAD re-seed / SynchronizeResources / guest CPU read). The retained
     // `frame_bgra` filled here is unchanged, so the present-boundary seed (which
     // reads the retained front frame first, guest pages only as fallback) is
@@ -541,9 +287,6 @@ pub fn capture_present_frame(
         ));
         // Recycle the untouched scratch; the prior retain stays intact.
         state.present.capture_scratch = buf;
-        state
-            .tranche
-            .note_capture(capture_started.elapsed().as_micros() as u64);
         return false;
     }
     let from_last_store = from_host_cache;
@@ -562,49 +305,15 @@ pub fn capture_present_frame(
             crate::model::PaintSrc::None => "guest_pages",
         }
     };
-    // Sub-phase attribution of the capture lock hold: paint (guest-page read /
-    // host_cache copy) vs the measure-only occupancy scan vs the diagnostic
-    // proxy block. Localizes which part of the 13–25 ms/present floor to cut.
-    let paint_us = capture_started.elapsed().as_micros() as u64;
-    let scan_started = std::time::Instant::now();
-    // One fused pass over the 8 MiB frame instead of separate byte-nz and
-    // rgb-nz scans — this runs on the present drain under the device lock, so
-    // halving the measure-only scan cuts per-present lock-hold (present cadence
-    // / boot convergence). Byte-exact with nonzero_stats + bgra_rgb_stats.
-    let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
-    let edge = crate::runtime::census::present_proxy::edge_energy_bgra(&buf, width, height);
-    let scan_us = scan_started.elapsed().as_micros() as u64;
-    // Protocol-structural a/b retention-gap guard (measure-only, cheap map
-    // lookup — no content scan): this present shows `mapping_id`; if it is a
-    // compositor member whose last full frame lags a same-geometry peer by a
-    // margin (missed both a full-frame Store and the inter-buffer seed), the
-    // undamaged region is stale (the inter-buffer wallpaper-retention class,
-    //). Runs on the present drain, off the QEMU main core.
-    if let Some((peer_mid, presented_seq, peer_seq)) =
-        state.dense_retention_gap(mapping_id, width, height)
-    {
-        crate::runtime::census::present_proxy::note_dense_retention_gap(
-            mapping_id,
-            peer_mid,
-            presented_seq,
-            peer_seq,
-            width,
-            height,
-        );
-    }
-    crate::observe::line(format!(
-        "scanout capture_present mid={mapping_id} {width}x{height} gen={generation} nz={nz} max={maxb} edge={edge} last_store={} host_cache={}",
-        from_last_store as u8,
-        from_host_cache as u8
-    ));
-    // Offline: always log capture with RGB-visible stats (not byte-nz/alpha).
-    // The `peers=[...]` field re-scans every same-geometry host surface (up to
-    // several 8 MiB buffers) purely for diagnosis; the real peer-divergence
-    // signal is the always-on `selected_peer_divergence` proxy (cached per-Store
-    // rgb_nz, no rescan). Build the field only under REIMS_VGPU_DRAW_LOG so a normal
-    // boot does not pay N extra full-frame scans per present on the drain lock.
-    let mut peers = String::new();
+    // The occupancy scan and the three lines it fed are diagnostic: each is an
+    // O(w*h) walk of the just-captured 8 MiB frame on the present drain, under
+    // the device lock, and the `peers` field walks every same-geometry host
+    // surface on top of that. The always-on alarm for a black console is
+    // `present_black`, which does its own scan at the drain boundary where the
+    // verdict is acted on.
     if crate::observe::draw_log_enabled() {
+        let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
+        let mut peers = String::new();
         for (&mid, e) in state.host_surfaces.iter() {
             if mid == mapping_id || e.width != width || e.height != height || e.bgra.is_empty() {
                 continue;
@@ -620,99 +329,19 @@ pub fn capture_present_frame(
                 ));
             }
         }
-    }
-    // Per-present provenance census — one line on EVERY present. Under a
-    // continuously-animating app this is ~15–30k lines/session of pure diagnostic
-    // trace: the always-on present-health signal (rate, occupancy, mid/nz/struct
-    // swings, sparse/converge) lives in the `note_capture_ok` windowed `summary`
-    // line + the on-anomaly THRASH proxies below, and `present_black` fires the
-    // genuine "console will be black" alarm. Nothing consumes this line's fields
-    // beyond diagnosis, so gate it (and the redundant `present host_cache`, whose
-    // info is the `src=host_cache` field here) behind REIMS_VGPU_DRAW_LOG so a normal
-    // boot does not flood the curated fail view.
-    crate::observe::line(format!(
-        "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} edge={edge} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
-        px0[0],
-        px0[1],
-        px0[2],
-        px0[3],
-        state.present.present_mapping,
-        state.present.frame_mapping,
-        state.present.frame_flush_seen as u8,
-    ));
-    if from_host_cache {
         crate::observe::line(format!(
-            "present host_cache mid={mapping_id} {width}x{height} rgb_nz={rgb_nz} max_rgb={max_rgb} gen={generation}"
+            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} last_store={} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
+            from_last_store as u8,
+            from_host_cache as u8,
+            px0[0],
+            px0[1],
+            px0[2],
+            px0[3],
+            state.present.present_mapping,
+            state.present.frame_mapping,
+            state.present.frame_flush_seen as u8,
         ));
     }
-    // PGDisplay presentFrame always installs the named surface into +0x188
-    // Do not gate present on nonzero/sparsity measurements. Capture-fail
-    // (return false above)
-    // already keeps the prior retain via drain keep_prior frame_valid.
-    let proxy_started = std::time::Instant::now();
-    crate::runtime::census::present_proxy::note_capture_ok(
-        crate::runtime::census::present_proxy::PresentCaptureSample {
-            mapping_id,
-            generation,
-            width,
-            height,
-            nz,
-            max_byte: maxb,
-            rgb_nz,
-            max_rgb,
-            from_last_store,
-            edge_energy: edge,
-            // Decoded-protocol provenance: captures of proven compositor-output
-            // members switching mids is guest double-buffer alternation, not
-            // the dual-mid thrash class (present_proxy routes accordingly).
-            named_peer: state.is_compositor_output_member(mapping_id),
-        },
-    );
-    // Measure-only stable black-region proxy (never gates ownership/present).
-    // Reuses the fused-scan `rgb_nz` so the proxy adds no extra full-frame pass.
-    if let Some(void) = crate::runtime::census::present_proxy::note_rect_void(
-        mapping_id, generation, width, height, &buf, rgb_nz,
-    ) {
-        // A void fired: discriminate whether the black band existed in the
-        // still-live retained frame (`frame_bgra`, replaced below at the publish
-        // step) and was LOST this present (host retention failure) vs was never
-        // there. Deduped + only on a real firing, so this second band scan is
-        // rare on a healthy boot. `src` names which capture source produced the
-        // black band (a resident `reuse_store` vs raw `guest_pages` split tells
-        // us whether the seeded resident or the stale guest pages were shown).
-        crate::runtime::census::present_proxy::note_rect_void_origin(
-            &void,
-            &buf,
-            &state.present.frame_bgra,
-            state.present.frame_width,
-            state.present.frame_height,
-            width,
-            height,
-            src,
-        );
-    }
-    // Measure-only retained-old-frame rectangle inside a large transition.
-    crate::runtime::census::present_proxy::note_damage_hole(
-        mapping_id, generation, width, height, &buf,
-    );
-    // Measure-only dock glass residual (does not gate present).
-    crate::runtime::census::present_proxy::note_dock_strip(
-        mapping_id, generation, width, height, &buf, nz,
-    );
-    // Measure-only menu-bar top band (rainbow chrome residual; does not gate present).
-    crate::runtime::census::present_proxy::note_menu_strip(
-        mapping_id, generation, width, height, &buf,
-    );
-    let proxy_us = proxy_started.elapsed().as_micros() as u64;
-    // Sub-phase split of the capture lock hold (paint = guest read / host_cache
-    // copy; scan = fused occupancy pass + edge; proxy = the measure-only
-    // diagnostic proxy block). Names which part of the per-present floor to cut.
-    // Per-present + pure wall-clock (SCHED_IDLE-contaminated under the agent
-    // harness), so this is REIMS_VGPU_DRAW_LOG-only diagnostic trace, not an always-on
-    // signal: the drain-side `tranche` capture_us aggregate carries the floor.
-    crate::observe::line(format!(
-        "present_capture_phase mid={mapping_id} {width}x{height} paint_us={paint_us} scan_us={scan_us} proxy_us={proxy_us} src={src}"
-    ));
     // Publish the new frame and recycle the old retain buffer as the next
     // capture scratch (warm 8 MiB alloc, no per-present malloc/free/zero).
     let old_frame = std::mem::replace(&mut state.present.frame_bgra, buf);
@@ -722,19 +351,6 @@ pub fn capture_present_frame(
     state.present.frame_height = height;
     state.present.frame_generation = generation;
     state.present.frame_valid = true;
-    // Stash this capture's fused occupancy scan so the console paint
-    // (`copy_to_bgra8`, under the device lock on the QEMU display thread) does
-    // not re-scan the same frozen 8 MiB frame twice just to fill its diagnostic
-    // lines. Keyed by mapping+generation so a mismatch falls back to a rescan.
-    state.present.frame_stats = crate::model::FrameStats {
-        mapping: mapping_id,
-        generation,
-        byte_nz: nz,
-        byte_max: maxb,
-        rgb_nz,
-        max_rgb,
-        px0,
-    };
     // The present declares this mapping's guest pages the finished frame; the
     // guest may CPU-write them next (inter-buffer damage forward-copy). The
     // first LOAD draw after this present must re-seed from guest pages
@@ -747,9 +363,6 @@ pub fn capture_present_frame(
     // while +0x188 held logo+pill (live serial-20260715-054015:
     // present_capture rgb_nz≈6k then present_paint Unchanged only).
     state.present.frame_encode_pending = true;
-    state
-        .tranche
-        .note_capture(capture_started.elapsed().as_micros() as u64);
     true
 }
 
@@ -784,104 +397,19 @@ fn blit_present_snapshot(
     blit_bgra_buffer(&state.present.frame_bgra, dst, dst_stride, width, height)
 }
 
-/// Copy the retained resident directly into a stable host display buffer.
-///
-/// The caller owns an aligned `ptr_len`-byte buffer that remains valid for the
-/// device lifetime. The engine imports it through `VK_EXT_external_memory_host`
-/// and records a resident-to-buffer GPU copy, so no framebuffer bytes pass
-/// through the CPU. Early EFI/GOP remains on the software console path.
-///
-/// # Safety
-///
-/// `host_ptr` must point to a writable `ptr_len`-byte allocation that remains
-/// valid for the duration of the call and satisfies the active Vulkan
-/// implementation's host-pointer import alignment.
-#[cfg(feature = "backend-vulkan")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the GPU copy API mirrors its host buffer and present geometry"
-)]
-pub unsafe fn copy_to_host_ptr_gpu(
-    state: &mut DeviceState,
-    mapping_id: u32,
-    host_ptr: *mut std::ffi::c_void,
-    ptr_len: u64,
-    dst_stride: u32,
-    width: u32,
-    height: u32,
-    expected_generation: u32,
-) -> ScanoutCopyResult {
-    if host_ptr.is_null()
-        || width == 0
-        || height == 0
-        || width > MAX_SCANOUT_DIM
-        || height > MAX_SCANOUT_DIM
-        || dst_stride < width.saturating_mul(RGBA8_BPP)
-    {
-        return ScanoutCopyResult::Failed;
-    }
-    if !state.present.frame_valid
-        || !state.present.frame_flush_seen
-        || state.present.frame_width != width
-        || state.present.frame_height != height
-    {
-        return ScanoutCopyResult::Failed;
-    }
-    if !state.present.frame_encode_pending
-        && state.present.painted_mapping == state.present.frame_mapping
-        && state.present.painted_generation == state.present.frame_generation
-    {
-        return ScanoutCopyResult::Unchanged;
-    }
-
-    let shown_mid = state.present.frame_mapping;
-    let shown_gen = state.present.frame_generation;
-    let identity =
-        crate::runtime::import_present::surface_identity(state, shown_mid, width, height);
-    let result = unsafe {
-        crate::backend::vulkan::engine::present_into_host_ptr_strided(
-            &identity, host_ptr, ptr_len, dst_stride, false,
-        )
-    };
-    if let Err(err) = result {
-        gpu_direct_census::note_fallback();
-        crate::observe::fail(format!(
-            "console_gpu_direct status=fallback reason=resident_to_host_failed \
-             action_mid={mapping_id} shown_mid={shown_mid} {width}x{height} \
-             action_gen={expected_generation} shown_gen={shown_gen} err={err}"
-        ));
-        // After direct presentation starts, `frame_bgra` deliberately contains
-        // no current frame. Hold the already displayed snapshot and force the
-        // next capture back onto the full path; never paint stale CPU bytes.
-        if state.present.dmabuf_active {
-            state.present.dmabuf_active = false;
-            return ScanoutCopyResult::Unchanged;
-        }
-        return ScanoutCopyResult::Failed;
-    }
-
-    state.present.valid = true;
-    state.present.mapping_id = shown_mid;
-    state.present.width = width;
-    state.present.height = height;
-    state.present.generation = shown_gen;
-    state.present.painted_mapping = shown_mid;
-    state.present.painted_generation = shown_gen;
-    state.present.frame_encode_pending = false;
-    // Reuse the direct-present light-capture gate: the QEMU surface now carries
-    // the display, so later captures need only the 32-byte GPU stats oracle.
-    state.present.dmabuf_active = true;
-    state.present.frame_bgra.clear();
-    gpu_direct_census::note_success((dst_stride as u64).saturating_mul(height as u64));
-    ScanoutCopyResult::Painted
-}
-
 /// Fill `dst` (BGRA8, `dst_stride` bytes/row) for the named mapping.
 ///
 /// `expected_generation` is from the HostAction (0 = always paint).
 /// After DisplaySwap, the first copy **encodes** the stable snapshot from live
 /// pages (host paint time); later copies re-show that snapshot
 /// (`hostPresentCount`) without re-reading guest pages.
+///
+/// This is now the only console paint. `copy_to_host_ptr_gpu` used to get first
+/// refusal on a QEMU-allocated, alignment-negotiated display buffer: the engine
+/// imported it and recorded a resident→buffer GPU copy, so no framebuffer bytes
+/// crossed the CPU. It went out with the host-pointer import that made it
+/// possible — the mechanism is the same one that can address guest RAM, and it
+/// is not requested any more, whichever allocation is on the other end.
 #[allow(
     clippy::too_many_arguments,
     reason = "the scanout copy API mirrors its destination and present geometry"
@@ -908,7 +436,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     if dst.len() < need {
         return ScanoutCopyResult::Failed;
     }
-
     // PGDisplay encodeCurrentFrame always re-shows +0x188 when the retain
     // matches paint geom — frozen at presentFrame (present boundary only).
     if state.present.frame_valid
@@ -926,7 +453,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             ));
             return ScanoutCopyResult::Unchanged;
         }
-        let paint_started = std::time::Instant::now();
         if blit_present_snapshot(state, dst, dst_stride, width, height) {
             let shown_mid = state.present.frame_mapping;
             let shown_gen = state.present.frame_generation;
@@ -936,21 +462,16 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // mapping+generation means the stashed stats describe these exact
             // bytes; a mismatch (e.g. a test-injected frame) falls back to a scan.
             // Per-paint census on the QEMU display thread — ~30k lines/session
-            // each under a continuously-animating app, and (on a frame_stats
-            // miss) an O(w·h) `bgra_present_stats` full-frame scan built PURELY to
+            // each under a continuously-animating app, plus an O(w·h)
+            // `bgra_present_stats` full-frame scan built PURELY to
             // populate the log. Both the scan and the two lines are log-only
             // (nothing below consumes the stats), so gate the whole block behind
             // REIMS_VGPU_DRAW_LOG: a normal boot pays neither the scan nor the flood.
             // The always-on present rate/occupancy signal lives in the
             // present_proxy summary + `present_import`.
             if crate::observe::draw_log_enabled() {
-                let fs = state.present.frame_stats;
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
-                    if fs.mapping == shown_mid && fs.generation == shown_gen {
-                        (fs.byte_nz, fs.byte_max, fs.rgb_nz, fs.max_rgb, fs.px0)
-                    } else {
-                        crate::observe::bgra_present_stats(&state.present.frame_bgra)
-                    };
+                    crate::observe::bgra_present_stats(&state.present.frame_bgra);
                 crate::observe::line(format!(
                     "scanout paint_snapshot mid={} (action mid={} gen={}) {}x{} retain_gen={} nz={} max={}",
                     shown_mid, mapping_id, expected_generation, width, height, shown_gen, nz, maxb
@@ -969,19 +490,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             state.present.painted_generation = shown_gen;
             // First successful +0x188 blit after capture clears encode pending.
             state.present.frame_encode_pending = false;
-            // Console-paint lock hold on the QEMU display thread: the 8 MiB
-            // `blit_present_snapshot` copy plus the now-reused stats
-            // (`reused=1` confirms the redundant scans are gone). Per-present +
-            // pure wall-clock (SCHED_IDLE-contaminated), and it runs on the QEMU
-            // display thread — gate behind REIMS_VGPU_DRAW_LOG so a normal boot pays
-            // neither the flood nor a display-thread `write(2)` enqueue per paint.
-            let stats_reused = (state.present.frame_stats.mapping == shown_mid
-                && state.present.frame_stats.generation == shown_gen)
-                as u8;
-            crate::observe::line(format!(
-                "present_paint_us mid={shown_mid} {width}x{height} paint_us={} reused={stats_reused}",
-                paint_started.elapsed().as_micros() as u64
-            ));
             return ScanoutCopyResult::Painted;
         }
     }
@@ -1334,7 +842,8 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         return fail(CaptureDecline::TightRowUnknown { format });
     };
     // Same sample window as writeback (device descriptor base/bpr when present).
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
+    else {
         return fail(CaptureDecline::NoSampleWindow);
     };
     let bpr = bpr_u32 as usize;
@@ -1482,103 +991,6 @@ pub fn present_dims(state: &DeviceState, mapping_id: u32) -> (u32, u32) {
     (0, 0)
 }
 
-/// Record a successful full-display compositor dependency `source -> output`.
-///
-/// Both mappings must have the exact render-target geometry and the edge must
-/// be non-self.  This is resource provenance from decoded texture/attachment
-/// bindings, not a content or object-id ranking.  ClearOnly DisplaySwap may use
-/// the latest edge target as a completed compositor-output candidate.
-pub fn note_compositor_edge(
-    state: &mut DeviceState,
-    source_mapping: u32,
-    output_mapping: u32,
-    width: u32,
-    height: u32,
-    pipeline_ref: u32,
-) -> bool {
-    if source_mapping == 0
-        || output_mapping == 0
-        || source_mapping == output_mapping
-        || width == 0
-        || height == 0
-    {
-        return false;
-    }
-    let source_matches = state
-        .mappings
-        .get(&source_mapping)
-        .map(|m| m.has_geom && m.width == width && m.height == height)
-        .unwrap_or(false);
-    let Some(output_generation) = state.mappings.get(&output_mapping).and_then(|m| {
-        (m.has_geom && m.width == width && m.height == height).then_some(m.content_generation)
-    }) else {
-        return false;
-    };
-    if !source_matches {
-        return false;
-    }
-
-    state.note_compositor_output(
-        source_mapping,
-        output_mapping,
-        width,
-        height,
-        output_generation,
-    );
-    // Per-present-per-source re-assertion of an already-discovered edge (~2.8k/
-    // 25s under a continuously-animating app — the single largest present-path
-    // flood). The always-on compositor-graph signal is the deduplicated
-    // `compositor_member_grant` (new member) + `compositor_member_refresh` (pin
-    // move); gate this per-present edge trace behind REIMS_VGPU_DRAW_LOG.
-    crate::observe::line(format!(
-        "compositor_edge source_mid={source_mapping} output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
-    ));
-    true
-}
-
-/// Record a successful same-geometry linear-texture → type-11 dependency.
-///
-/// Type-2/3 textures have no surface mapping id, so source `0` explicitly
-/// denotes the decoded linear-input class. Exact input/output geometry and a
-/// mapped output are required; content occupancy is never inspected.
-pub fn note_linear_compositor_output(
-    state: &mut DeviceState,
-    output_mapping: u32,
-    width: u32,
-    height: u32,
-    pipeline_ref: u32,
-) -> bool {
-    if output_mapping == 0 || width == 0 || height == 0 {
-        return false;
-    }
-    let Some(output_generation) = state.mappings.get(&output_mapping).and_then(|m| {
-        (m.has_geom && m.width == width && m.height == height).then_some(m.content_generation)
-    }) else {
-        return false;
-    };
-
-    state.present.compositor_output_mapping = output_mapping;
-    state.present.compositor_output_source = 0;
-    state.present.compositor_output_generation = output_generation;
-    state.present.compositor_output_width = width;
-    state.present.compositor_output_height = height;
-    state.present.compositor_output_members.insert(
-        output_mapping,
-        crate::model::CompositorOutputMember {
-            width,
-            height,
-            source: 0,
-        },
-    );
-    // Per-present linear-source edge re-assertion; gate behind REIMS_VGPU_DRAW_LOG
-    // (see the `note_compositor_output` site — member_grant/refresh carry the
-    // always-on graph signal).
-    crate::observe::line(format!(
-        "compositor_edge source=linear output_mid={output_mapping} {width}x{height} output_gen={output_generation} pipe={pipeline_ref}"
-    ));
-    true
-}
-
 /// After a successful type-11 color writeback: maybe latch front mapping / paint.
 ///
 /// Contract:
@@ -1637,58 +1049,12 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             && width == state.present.width
             && height == state.present.height
         {
-            // Track latest Composite full-FB writeback for ClearOnly bootstrap
-            // (when +0x188 empty) and pre-boundary early feed. Post-retain peer
-            // selection is sticky on frame_mapping — early_front must not drive
-            // hop (serial-223416 follow oscillation). Always update here so
-            // retain writebacks can refresh gen when early_front==retain.
+            // Track the latest Composite full-FB writeback. Pre-boundary this
+            // feeds `early_scanout_target`; post-boundary it is the peer named
+            // on the `front_wb` / `present_order_hold` lines. Always update
+            // here so a later writeback into the same mid refreshes the gen.
             state.present.early_front_mapping = mapping_id;
             state.present.early_front_generation = gen;
-            // Proven compositor-output member: move the graph output pin to the
-            // buffer the guest just finished writing. Steady-state WindowServer
-            // composite passes are damage passes (partial quads) that never
-            // re-fire the full-coverage edge, so without this the pin freezes on
-            // whichever buffer got the last boot-time full paint and ClearOnly
-            // presents show only half the double-buffered frames (lag + captures
-            // of a buffer mid-redraw). Membership itself is only granted by a
-            // decoded full-coverage/sampled edge — unproven writers still cannot
-            // steal the pin (serial-223416 follow oscillation stays fixed).
-            if let Some(prev) =
-                state.refresh_compositor_output_member(mapping_id, width, height, gen)
-            {
-                // Always-on a/b-follow rail: fires only when the pin MOVES to a
-                // different proven member (the graph followed the guest's buffer
-                // swap), not on every store — the load-bearing signal for the a/b
-                // divergence class the user tracks. Locked always-on by
-                // `composite_writeback_on_member_refollows_graph_output`.
-                crate::observe::off(format!(
-                    "compositor_member_refresh output_mid={mapping_id} prev_mid={prev} {width}x{height} gen={gen} (Composite store on proven member; graph follows guest buffer alternation)"
-                ));
-            }
-            // Present↔store FIFO pairing: queue this finished member so the
-            // next ClearOnly present pairs with it in ring order (the guest
-            // pipelines store B, store A, present, present — capturing only
-            // the newest member drops B's frame every cycle).
-            if state.note_member_store(mapping_id, width, height, gen) {
-                crate::observe::line(format!(
-                    "present_store_enqueue mid={mapping_id} {width}x{height} gen={gen} depth={}",
-                    state.present_store_fifo.len()
-                ));
-            }
-        }
-        // Offline: only log when writeback mid ≠ present (dual-mid gap class).
-        if mapping_id != state.present.present_mapping
-            && mapping_id != state.present.host_mapping
-            && mapping_id != state.present.frame_mapping
-            && width >= 1280
-            && height >= 720
-        {
-            crate::observe::line(format!(
-                "front_wb SKIP post_boundary mid={mapping_id} {width}x{height} present_mapping={} frame_mapping={} early_peer={} (content mid ≠ present mid — ClearOnly present may capture peer)",
-                state.present.present_mapping,
-                state.present.frame_mapping,
-                state.present.early_front_mapping
-            ));
         }
         return;
     }
@@ -1953,172 +1319,6 @@ mod tests {
                 assert!(!v.contains(' '), "{}: {v}", d.slug());
             }
         }
-    }
-
-    /// The Store-readback capture fast path is byte-exact and tightly guarded:
-    /// it consumes the readback only when id + geometry + live map_generation
-    /// match and the mapping is BGRA8; every mismatch falls back to the guest
-    /// read and always clears the readback (freshness — never carried forward).
-    #[test]
-    fn compositor_edge_proxy_records_only_non_self_matching_geometry() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        for mapping_id in [5u32, 6u32] {
-            assert!(state.map_surface(mapping_id));
-            let m = state.mappings.get_mut(&mapping_id).unwrap();
-            m.mapped = true;
-            m.has_geom = true;
-            m.width = 64;
-            m.height = 48;
-            m.content_generation = mapping_id;
-        }
-        let pipeline_ref = std::process::id();
-        assert!(note_compositor_edge(&mut state, 5, 6, 64, 48, pipeline_ref));
-        assert_eq!(state.present.compositor_output_source, 5);
-        assert_eq!(state.present.compositor_output_mapping, 6);
-        assert_eq!(state.present.compositor_output_generation, 6);
-        assert_eq!(state.present.compositor_output_width, 64);
-        assert_eq!(state.present.compositor_output_height, 48);
-        // The per-present `compositor_edge` line is REIMS_VGPU_DRAW_LOG-gated diagnostic
-        // (2026-07-19); the always-on graph signal is `compositor_member_grant`/
-        // `compositor_member_refresh` (asserted in `member_refresh_...`). This
-        // test owns the graph-state recording + geometry gating below.
-
-        assert!(!note_compositor_edge(
-            &mut state,
-            6,
-            6,
-            64,
-            48,
-            pipeline_ref
-        ));
-        assert!(!note_compositor_edge(
-            &mut state,
-            5,
-            6,
-            63,
-            48,
-            pipeline_ref
-        ));
-        assert!(state.unmap_surface(5));
-        assert_eq!(state.present.compositor_output_mapping, 0);
-        assert_eq!(state.present.compositor_output_source, 0);
-    }
-
-    #[test]
-    fn linear_compositor_proxy_records_only_matching_output_geometry() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        assert!(state.map_surface(6));
-        let m = state.mappings.get_mut(&6).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 64;
-        m.height = 48;
-        m.content_generation = 9;
-
-        let pipeline_ref = std::process::id();
-        assert!(note_linear_compositor_output(
-            &mut state,
-            6,
-            64,
-            48,
-            pipeline_ref
-        ));
-        assert_eq!(state.present.compositor_output_source, 0);
-        assert_eq!(state.present.compositor_output_mapping, 6);
-        assert_eq!(state.present.compositor_output_generation, 9);
-        // `compositor_edge` is REIMS_VGPU_DRAW_LOG-gated diagnostic (2026-07-19); this
-        // test owns the linear-source graph-state recording + geometry gating.
-        assert!(!note_linear_compositor_output(
-            &mut state,
-            6,
-            63,
-            48,
-            pipeline_ref
-        ));
-    }
-
-    /// Steady-state WindowServer composite passes are damage passes that never
-    /// re-fire the full-coverage edge. A Composite writeback into a *proven*
-    /// compositor-output member must re-pin the graph output to that member
-    /// (guest double-buffer alternation); unproven writers must not move it.
-    #[test]
-    fn composite_writeback_on_member_refollows_graph_output() {
-        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut host = FakeHost::new();
-        let (w, h) = (64u32, 48u32);
-        for mid in [1u32, 5u32, 7u32] {
-            assert!(state.map_surface(mid));
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.has_geom = true;
-            m.width = w;
-            m.height = h;
-            m.format = MTL_FORMAT_BGRA8_UNORM;
-            m.page_entries =
-                vec![((mid as u64) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID as u64) as u32];
-            m.content_generation = 1;
-        }
-        state.present.valid = true;
-        state.present.width = w;
-        state.present.height = h;
-        state.present.frame_flush_seen = true;
-
-        // Prove both double-buffer halves as compositor outputs: mid 1 by a
-        // full-coverage draw edge, mid 5 by a full-frame publish (ok_runs
-        // store) — snapshot boots may never fire a coverage edge for one half.
-        assert!(note_linear_compositor_output(&mut state, 1, w, h, 11));
-        assert_eq!(state.present.compositor_output_mapping, 1);
-        state.note_compositor_member_published(5, w, h);
-        assert!(state.is_compositor_output_member(5));
-        assert_eq!(
-            state.present.compositor_output_mapping, 1,
-            "publish grants membership but must not move the pin by itself"
-        );
-        // First Composite writeback on published member 5 takes the pin.
-        state.note_surface_composite(5);
-        state.mappings.get_mut(&5).unwrap().content_generation = 2;
-        note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 5);
-
-        // Damage-pass Composite writeback on member 1 → pin follows to 1.
-        state.note_surface_composite(1);
-        state.mappings.get_mut(&1).unwrap().content_generation = 2;
-        note_front_buffer_writeback(&mut state, &mut host, 1, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 1);
-        assert_eq!(state.present.compositor_output_generation, 2);
-
-        // Alternate back to member 5.
-        state.note_surface_composite(5);
-        state.mappings.get_mut(&5).unwrap().content_generation = 3;
-        note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 5);
-
-        // Unproven Composite writer 7 must not steal the pin (early_front only).
-        state.note_surface_composite(7);
-        state.mappings.get_mut(&7).unwrap().content_generation = 4;
-        note_front_buffer_writeback(&mut state, &mut host, 7, w, h, 0);
-        assert_eq!(state.present.compositor_output_mapping, 5);
-        assert_eq!(state.present.early_front_mapping, 7);
-
-        // Unmap drops membership and the pin.
-        assert!(state.unmap_surface(5));
-        assert!(!state.is_compositor_output_member(5));
-        assert_eq!(state.present.compositor_output_mapping, 0);
-
-        let body = std::fs::read_to_string(crate::observe::fail_log_path())
-            .expect("reims-vgpu-fail.log readable");
-        assert!(
-            body.lines().any(|line| line
-                .starts_with("OFF compositor_member_refresh output_mid=1 prev_mid=5 64x48 gen=2")),
-            "member refresh pin move must be always-on visible"
-        );
-        assert!(
-            body.lines().any(|line| line
-                .starts_with("OFF compositor_member_grant mid=5 64x48 reason=full_frame_publish")),
-            "publish membership grant must be always-on visible"
-        );
     }
 
     #[test]
@@ -2393,61 +1593,6 @@ mod tests {
         );
     }
 
-    /// The console paint reuses the stats `capture_present_frame` already scanned
-    /// instead of re-scanning the 8 MiB frame twice under the device lock. Lock
-    /// that the stashed `frame_stats` are byte-exact with a fresh fused scan of
-    /// `frame_bgra` and keyed to the current mapping+generation — so the reused
-    /// diagnostic can never silently diverge from what a rescan would report.
-    #[test]
-    fn capture_stashes_frame_stats_byte_exact_with_rescan() {
-        use crate::runtime::mapping_write::write_bgra8;
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut host = FakeHost::new();
-        let mid = 4u32;
-        let pfn = 0x70u32;
-        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(gpa, 0x4000, 0);
-        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![entry];
-        }
-        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-        // Mixed content so byte-nz != rgb-nz (black + alpha-only + colored).
-        let frame = [
-            0x00u8, 0x00, 0x00, 0xFF, // rgb-empty, byte-nonzero (alpha)
-            0x10, 0x20, 0x30, 0xFF, // colored
-            0x00, 0x00, 0x00, 0x00, // fully black
-            0xFF, 0x80, 0x40, 0xFF, // colored
-        ];
-        assert!(write_bgra8(&mut state, &mut host, mid, &frame, 8, 2, 2));
-        let gen = state.mappings.get(&mid).unwrap().content_generation;
-        state.present.frame_flush_seen = true;
-        state.present.width = 2;
-        state.present.height = 2;
-
-        assert!(capture_present_frame(&mut state, mid, 2, 2, gen));
-        let fs = state.present.frame_stats;
-        assert_eq!(fs.mapping, mid, "stats keyed to captured mapping");
-        assert_eq!(fs.generation, gen, "stats keyed to captured generation");
-        let (nz, maxb, rgb_nz, max_rgb, px0) =
-            crate::observe::bgra_present_stats(&state.present.frame_bgra);
-        assert_eq!(
-            (fs.byte_nz, fs.byte_max, fs.rgb_nz, fs.max_rgb, fs.px0),
-            (nz, maxb, rgb_nz, max_rgb, px0),
-            "stashed stats must be byte-exact with a fresh rescan of frame_bgra"
-        );
-        // Sanity: the mixed content really exercises the byte-nz vs rgb-nz split.
-        assert!(
-            fs.byte_nz != fs.rgb_nz,
-            "test frame must separate the two scans"
-        );
-    }
-
     /// The capture buffer is a recycled warm double-buffer, not a fresh 8 MiB
     /// alloc per present. Lock that (a) a successful capture recycles the prior
     /// retain into `capture_scratch` so the next capture reuses that allocation,
@@ -2655,9 +1800,15 @@ mod tests {
     ///
     /// - dmabuf carrying → NO readback, ever, however long since the last one.
     ///   The proxies are fed by the GPU reduction instead, so there is no
-    ///   sampling floor forcing a copy any more. The prior `frame_bgra` is left
-    ///   untouched (the window ignores it under dmabuf) while the present
-    ///   metadata advances so `publish_window_frame` exports the fresh resident.
+    ///   sampling floor forcing a copy any more. `frame_bgra` is dropped rather
+    ///   than left holding the previous readback, while the present metadata
+    ///   advances so `publish_window_frame` exports the fresh resident.
+    ///
+    ///   The buffer still holding the earlier frame used to be this test's
+    ///   evidence that no copy ran, and it was the wrong evidence: that same
+    ///   buffer is what the content verdict and the console blit read as the
+    ///   CURRENT frame. `full_captures` counts readbacks directly, so it answers
+    ///   the question the assertion was actually asking.
     /// - dmabuf NOT carrying → the window blits `frame_bgra`, so the readback
     ///   runs. This is what keeps the display off any env gate.
     #[test]
@@ -2694,20 +1845,19 @@ mod tests {
         assert_eq!(state.present.light_captures, 0);
 
         // dmabuf carrying: there must be no readback.
-        state.present.dmabuf_active = true;
+        state.present.display_from_resident = true;
         let frame_b = [0x44u8, 0x55, 0x66, 0xFF].repeat(4);
         assert!(write_bgra8(&mut state, &mut host, mid, &frame_b, 8, 2, 2));
         let gen_b = state.mappings.get(&mid).unwrap().content_generation;
         assert_ne!(gen_a, gen_b);
         assert!(capture_present_frame(&mut state, mid, 2, 2, gen_b));
         assert_eq!(
-            &state.present.frame_bgra[..16],
-            &frame_a[..],
+            state.present.full_captures, 1,
             "no sampling floor may force a copy once the GPU oracle feeds proxies"
         );
-        assert_eq!(
-            state.present.full_captures, 1,
-            "a dmabuf-carried present must never take a full capture"
+        assert!(
+            state.present.frame_bgra.is_empty(),
+            "the readback did not run, so no frame belongs to this present"
         );
         assert_eq!(state.present.light_captures, 1);
         // Present metadata still advances so the fresh resident gets exported.
@@ -2975,188 +2125,6 @@ mod tests {
         assert_eq!(state.present.height, 1080);
     }
 
-    /// BUG A gate (dense-retention seed): a LOAD draw into a compositor-output
-    /// member that lags a same-geometry peer by at least `margin` full frames
-    /// (`dense_frame_seq`) seeds from that DENSE peer. The MARGIN is the crux:
-    /// healthy a/b alternation (both buffers full-framed each present → ~1-lag)
-    /// must NOT seed, else the seed floods every flip (the dock-tooltip / cursor-
-    /// sweep residue + churn regression a live boot exposed). The seed is a
-    /// relaxed one-shot: it re-arms only when the lag re-widens past `margin` on a
-    /// strictly-newer full frame. The freshest member, a sub-margin lag, a
-    /// non-member, and wrong geometry never seed. Structural only — never content.
-    #[test]
-    fn peer_front_seed_gate_is_structural_and_once_per_lifetime() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (64u32, 48u32);
-        // Mirror the guard's margin so the seed fixes exactly what it flags.
-        const M: u64 = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-
-        state.note_compositor_member_published(1, w, h); // seq[1]=1
-        state.note_compositor_member_published(4, w, h); // seq[4]=2
-        assert!(state.is_compositor_output_member(1));
-        assert!(state.is_compositor_output_member(4));
-
-        // MARGIN GATE: mid 1 lags the freshest mid 4 by exactly 1 (healthy a/b
-        // alternation — each buffer holds its own recent full frame). Must NOT
-        // seed: a 1-lag is not a retention gap and seeding it every flip floods.
-        assert_eq!(
-            state.peer_needs_front_seed(1, w, h, true, M),
-            None,
-            "healthy 1-lag alternation must NOT seed (margin gate)"
-        );
-
-        // mid 1 now keeps getting full frames while mid 4 falls behind by ≥margin
-        // (the ⌘Q-app-quit case: the guest only recomposites one buffer).
-        for _ in 0..M {
-            state.note_compositor_member_published(1, w, h); // seq[1] → 2+M
-        }
-
-        // Pre-convergence (boot logo/pill phase): never seed regardless.
-        assert_eq!(
-            state.peer_needs_front_seed(4, w, h, false, M),
-            None,
-            "must not seed before boot convergence (boot-pill strobe guard)"
-        );
-
-        // Lagging peer mid 4 (≥margin behind) → seed from the DENSE source mid 1.
-        assert_eq!(
-            state.peer_needs_front_seed(4, w, h, true, M),
-            Some(1),
-            "a member lagging a dense peer by ≥margin seeds from that dense peer"
-        );
-        // The seed advanced mid 4's dense seq to the source's → gap closed, no
-        // re-seed on the next flip.
-        assert_eq!(
-            state.peer_needs_front_seed(4, w, h, true, M),
-            None,
-            "gap closed after the seed → does not re-arm"
-        );
-
-        // The freshest member is never its own lagging peer.
-        assert_eq!(
-            state.peer_needs_front_seed(1, w, h, true, M),
-            None,
-            "the freshest dense member must not seed from itself"
-        );
-
-        // A non-member target never seeds; wrong geometry never seeds.
-        assert_eq!(
-            state.peer_needs_front_seed(9, w, h, true, M),
-            None,
-            "non-member target must not seed"
-        );
-        assert_eq!(
-            state.peer_needs_front_seed(4, w + 1, h, true, M),
-            None,
-            "geometry mismatch must not seed"
-        );
-
-        // A SUB-margin new frame on mid 1 does NOT re-seed (still healthy).
-        state.note_compositor_member_published(1, w, h); // gap(4)=1
-        assert_eq!(
-            state.peer_needs_front_seed(4, w, h, true, M),
-            None,
-            "a sub-margin lag does not re-arm the seed"
-        );
-        // The lag re-widening past margin DOES re-arm (relaxed one-shot) — safe
-        // because the source is always a full-display dense frame, never residue.
-        for _ in 0..M {
-            state.note_compositor_member_published(1, w, h);
-        }
-        assert_eq!(
-            state.peer_needs_front_seed(4, w, h, true, M),
-            Some(1),
-            "the lag re-widening past margin re-arms the seed"
-        );
-
-        // Re-map (unmap → forget) clears the dense seq + latch; a freshly
-        // re-published member is the freshest (never lags on grant).
-        state.unmap_surface(4);
-        for _ in 0..=M {
-            state.note_compositor_member_published(4, w, h); // seq[4] ≥ margin above seq[1]
-        }
-        assert_eq!(
-            state.peer_needs_front_seed(4, w, h, true, M),
-            None,
-            "a freshly re-published member is current, not lagging"
-        );
-        assert_eq!(
-            state.peer_needs_front_seed(1, w, h, true, M),
-            Some(4),
-            "mid 1 now lags the fresh mid 4 by ≥margin → seeds from it"
-        );
-    }
-
-    /// Protocol-structural a/b retention-gap tracking (`dense_frame_seq`):
-    /// a member's dense seq advances on a full-frame Store and is INHERITED when
-    /// the member is seeded from the front, so a member that missed BOTH reads as
-    /// lagging. `dense_retention_gap` reports the freshest same-geometry peer
-    /// only while the presented member genuinely lags; it is quiet after a seed
-    /// closes the gap and after a re-map prunes the seq. Structural only — no
-    /// content/nz input.
-    #[test]
-    fn dense_retention_gap_tracks_full_frame_and_seed_inheritance() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (64u32, 48u32);
-
-        state.note_compositor_member_published(1, w, h); // dense_seq[1]=1
-        state.note_compositor_member_published(4, w, h); // dense_seq[4]=2
-
-        // mid 4 is the freshest (seq 2); mid 1 lags by exactly 1 — healthy a/b
-        // alternation. The raw query reports any positive lag; the margin that
-        // separates "healthy 1-lag" from "retention gap" lives in present_proxy.
-        assert_eq!(state.dense_retention_gap(4, w, h), None);
-        assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 1, 2)));
-
-        // Mid 1 keeps receiving full frames; mid 4 never does → mid 4 lags widely.
-        for _ in 0..5 {
-            state.note_compositor_member_published(1, w, h);
-        }
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            Some((1, 2, 7)),
-            "mid 4 (last full frame seq 2) lags mid 1 (seq 7)"
-        );
-        // The freshest member never reports a gap.
-        assert_eq!(state.dense_retention_gap(1, w, h), None);
-
-        // Seeding mid 4 from the dense source (mid 1) inherits mid 1's seq → gap
-        // closes: the seed IS the inter-buffer retention the guest relies on.
-        assert_eq!(
-            state.peer_needs_front_seed(
-                4,
-                w,
-                h,
-                true,
-                crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN
-            ),
-            Some(1),
-            "lagging peer seeds from the freshest dense member"
-        );
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "a seeded peer inherits the front's dense seq → no retention gap"
-        );
-
-        // A re-map prunes the seq so a recycled id cannot inherit a stale seq,
-        // and a freshly re-published member is current (never lags on grant).
-        state.unmap_surface(4);
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "an unmapped mid is no longer a member"
-        );
-        state.note_compositor_member_published(4, w, h);
-        assert_eq!(
-            state.dense_retention_gap(4, w, h),
-            None,
-            "a freshly published member is current, not lagging"
-        );
-        // ...and now mid 1 (seq 7) is the one lagging the fresh mid 4 (seq 8).
-        assert_eq!(state.dense_retention_gap(1, w, h), Some((4, 7, 8)));
-    }
-
     /// Regression guard for `present_dims`, the scanout sizing lookup. The
     /// blit copies `width*height` from these dims, so their precedence is
     /// load-bearing: a present that reads the wrong dimensions blits with the
@@ -3320,10 +2288,9 @@ mod tests {
     /// a recycled mapping_id (a new, unrelated surface reusing the id after
     /// DeleteIOSurfaceBacking2) does not have its FIRST LOAD draw consume a stale
     /// flag and bleed the current retained front frame over its own resident —
-    /// the "background does not clear cleanly" residue class. Mirrors the
-    /// already-pruned sibling `peer_seeded_dense_seq`. Both teardown hooks
-    /// (`unmap_surface`, `condemn_surface_backing`) route through
-    /// `forget_compositor_mapping`; only the surviving flag is asserted here.
+    /// the "background does not clear cleanly" residue class. Both teardown
+    /// hooks (`unmap_surface`, `condemn_surface_backing`) route through
+    /// `forget_compositor_mapping`.
     #[test]
     fn present_boundary_seed_flag_is_pruned_on_teardown() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3351,174 +2318,117 @@ mod tests {
         );
     }
 
-    // --- Per-mid tile-generation damage-coverage tracking ----------------------
-
+    /// The display transaction names one surface, and that surface alone is the
+    /// capture source. A second compositor member of identical geometry holding
+    /// different content is not consulted, however fresh it is: the frame that
+    /// comes out is byte-for-byte the named mid's own pixels, and it is the same
+    /// frame the named mid produces when no such peer exists at all.
     #[test]
-    fn tile_gen_divergence_flags_stale_tile_a_peer_erased() {
+    fn capture_reads_only_the_named_surface_never_a_same_geometry_peer() {
+        use crate::runtime::mapping_write::write_bgra8;
+
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        // Two same-geometry compositor members (the a/b double buffer).
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-
-        // Epoch 1: both mids composite the full frame — no divergence.
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        state.bump_tile_gen(5, (0, 0, w, h), w, h);
-        assert_eq!(state.divergent_tile_count(1, 5).0, 0);
-
-        // Stuck-menu case: the peer (mid 5) keeps re-damaging the top menu strip
-        // while the presented mid (1) never re-touches it.
-        let menu = (0u32, 0u32, w, 30u32);
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, menu, w, h);
+        let mut host = FakeHost::new();
+        for (mid, pfn) in [(1u32, 0x40u32), (5u32, 0x41u32)] {
+            let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+            host.map_range(gpa, 0x4000, 0);
+            let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+            assert!(state.map_surface(mid));
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![entry];
+            assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
         }
-        let (count, bbox) = state.divergent_tile_count(1, 5);
-        assert!(count > 0, "peer erased the menu strip; presented is stale");
-        assert_eq!(bbox[1], 0, "divergence localizes to the top row");
-        assert!(bbox[3] <= 1, "localized to the menu strip, not whole-frame");
-        let (peer, c2, _) = state.tile_divergence_vs_peer(1, w, h).unwrap();
-        assert_eq!(peer, 5);
-        assert_eq!(c2, count);
-    }
 
-    #[cfg(feature = "backend-vulkan")]
-    #[test]
-    fn tile_divergence_is_not_physical_after_output_group_unification() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (0, 0, w, 30), w, h);
-        }
-        assert!(
-            physical_tile_divergence_vs_peer(&state, 1, w, h).is_some(),
-            "distinct Surface residents must expose the bootstrap divergence"
-        );
+        // The named mid holds grey; the same-geometry peer holds white and is
+        // the fresher of the two by every ordering the model tracks.
+        let grey = [0x55u8; 16];
+        let white = [0xFFu8; 16];
+        assert!(write_bgra8(&mut state, &mut host, 1, &grey, 8, 2, 2));
+        let gen1 = state.mappings.get(&1).unwrap().content_generation;
+        assert!(write_bgra8(&mut state, &mut host, 5, &white, 8, 2, 2));
 
-        state.note_presented_geom(1, w, h);
-        state.note_presented_geom(5, w, h);
-        assert!(
-            physical_tile_divergence_vs_peer(&state, 1, w, h).is_none(),
-            "members resolving to one OutputGroup cannot physically diverge"
-        );
-    }
+        // Capture the named mid with no peer published: the baseline frame.
+        assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
+        let alone = state.present.frame_bgra.clone();
+        assert_eq!(&alone[..], &grey[..]);
 
-    #[test]
-    fn tile_gen_no_divergence_when_both_mids_repaint_each_frame() {
-        // Video-like: both mids repaint the same rect every present. Their epochs
-        // stay within the retention margin → zero divergence → no thrash. This is
-        // the property (generation-compare, not pixel-compare) that keeps the
-        // steady-state/video path at today's single-blit cost.
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        let video = (100u32, 100u32, 900u32, 700u32);
-        for _ in 0..20 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(1, video, w, h);
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, video, w, h);
-        }
-        assert_eq!(state.divergent_tile_count(1, 5).0, 0);
-        assert_eq!(state.divergent_tile_count(5, 1).0, 0);
-    }
-
-    #[test]
-    fn tile_gen_never_composites_from_a_peer_that_never_drew_the_tile() {
-        // Bootstrap / black-regression guard: the peer only ever damage-drew a
-        // tiny corner; its undrawn tiles are epoch 0 and must NEVER be flagged
-        // divergent, or the later composite would pull black over the presented
-        // mid's good background (the exact failure that killed the prior fix).
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        // Presented mid 1 holds the ONLY full frame.
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        // Peer mid 5 only ever damage-draws one corner tile, many times.
-        for _ in 0..50 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (0, 0, 60, 60), w, h);
-        }
-        let (count, _) = state.divergent_tile_count(1, 5);
-        assert!(count <= 1, "only the corner tile may diverge, got {count}");
-    }
-
-    #[test]
-    fn tile_gen_collect_rects_coalesces_and_guards_undrawn_peer() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        // Presented mid 1 holds the full frame; peer 5 re-damages the whole top
-        // menu strip repeatedly (a full-width row-0 run).
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (0, 0, w, 30), w, h);
-        }
-        let mut rects = Vec::new();
-        let n = state.collect_divergent_tile_rects(1, 5, w, h, &mut rects);
-        assert!(n > 0);
-        // A full-width divergent row coalesces to ONE rect spanning x 0..w.
+        // Publish a full frame for the peer as well, then re-capture.
+        state.note_dense_frame_published(1, 2, 2);
+        state.note_dense_frame_published(5, 2, 2);
+        // The arrangement has to be one a peer-reading capture would act on, or
+        // the assertion below passes for the wrong reason: two surfaces of equal
+        // geometry, the peer holding different pixels, and the peer written more
+        // recently — mid 5's `write_bgra8` above runs after mid 1's, so it is the
+        // later write by program order. (The model tracks no cross-mapping write
+        // stamp to assert that with: the one it had existed only to feed a
+        // present-staleness census and went with it.)
+        let peer = state.mappings.get(&5).unwrap();
+        assert_eq!((peer.width, peer.height), (2, 2));
+        assert_ne!(&grey[..], &white[..]);
+        state.present.frame_bgra.clear();
+        state.present.frame_valid = false;
+        assert!(capture_present_frame(&mut state, 1, 2, 2, gen1));
         assert_eq!(
-            rects.len(),
-            1,
-            "full-width divergent row coalesces to one rect"
+            &state.present.frame_bgra[..],
+            &alone[..],
+            "a same-geometry peer must not change the named surface's frame"
         );
-        assert_eq!(rects[0].0, 0);
-        assert_eq!(rects[0].2, w);
-        // Presenting the FRESH mid instead finds nothing (no peer-fresher tiles).
+        assert_eq!(state.present.frame_mapping, 1);
+    }
+
+    /// A light capture must leave no frame behind, because everything
+    /// downstream reads "is there a frame for this present" off
+    /// `frame_bgra.is_empty()`.
+    ///
+    /// Skipping the readback only leaves the buffer empty if it was empty going
+    /// in, and on a real boot it is not: the first present runs the full path
+    /// before the guest has painted anything, capturing black, and direct
+    /// present then carries every frame after it. Boot 86 on the x86/Vulkan rail
+    /// judged that one frame `Black` on 481 of 481 presents — 0 `present_content`
+    /// and 0 `present_content_unsampled` — while the host window rendered
+    /// correctly from settle through an 11-minute idle.
+    #[test]
+    fn a_light_capture_leaves_no_stale_frame_behind() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (w, h) = (64u32, 64u32);
+        // The frame a full capture leaves: opaque, RGB black — the first present
+        // of a boot, before anything has been composited.
+        let stale: Vec<u8> = (0..(w * h) as usize).flat_map(|_| [0, 0, 0, 255]).collect();
+        state.present.frame_bgra = stale.clone();
+        state.present.frame_width = w;
+        state.present.frame_height = h;
+
+        // Direct present is carrying the display, so this capture takes the
+        // light path and reads back nothing.
+        state.present.display_from_resident = true;
+        let before = state.present.light_captures;
+        assert!(capture_present_frame(&mut state, 1, w, h, 1));
         assert_eq!(
-            state.collect_divergent_tile_rects(5, 1, w, h, &mut rects),
-            0
+            state.present.light_captures,
+            before.wrapping_add(1),
+            "the light path is the one under test"
         );
-        assert!(rects.is_empty());
-    }
-
-    #[test]
-    fn tile_gen_pruned_on_condemn() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        assert!(state.present.tile_gen.contains_key(&1));
-        state.condemn_surface_backing(1);
         assert!(
-            !state.present.tile_gen.contains_key(&1),
-            "tile_gen must be pruned on teardown (recycled id must not inherit epochs)"
+            state.present.frame_bgra.is_empty(),
+            "a light capture wrote no pixels, so it must not leave {} bytes of an \
+             earlier present for the content verdict and the console blit to read \
+             as this one",
+            state.present.frame_bgra.len()
         );
-    }
 
-    #[test]
-    fn tile_gen_scissor_and_ndc_map_to_the_same_tiles() {
-        // The bump takes pixel rects; confirm a mid-frame partial rect lands on
-        // the expected interior tiles and not the edges.
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (w, h) = (1920u32, 1080u32);
-        state.note_compositor_member_published(1, w, h);
-        state.note_compositor_member_published(5, w, h);
-        state.advance_tile_epoch();
-        state.bump_tile_gen(1, (0, 0, w, h), w, h);
-        // Peer re-damages a centered rect only.
-        for _ in 0..10 {
-            state.advance_tile_epoch();
-            state.bump_tile_gen(5, (w / 2 - 60, h / 2 - 60, w / 2 + 60, h / 2 + 60), w, h);
-        }
-        let (count, bbox) = state.divergent_tile_count(1, 5);
-        assert!(count > 0);
-        // Centered → interior tiles, never column 0 or the last column.
-        assert!(bbox[0] > 0 && bbox[2] < (crate::model::TILE_GEN_GRID_W as u32 - 1));
-        assert!(bbox[1] > 0 && bbox[3] < (crate::model::TILE_GEN_GRID_H as u32 - 1));
+        // And the verdict that reads it now says so, instead of reporting the
+        // stale frame's colour as this present's.
+        use crate::runtime::drain::present_content_verdict;
+        assert_eq!(
+            present_content_verdict(&state.present.frame_bgra, 0),
+            crate::runtime::drain::PresentContentVerdict::Unsampled
+        );
+        assert_eq!(
+            present_content_verdict(&stale, 0),
+            crate::runtime::drain::PresentContentVerdict::Black,
+            "the retained frame is what used to be judged"
+        );
     }
 }

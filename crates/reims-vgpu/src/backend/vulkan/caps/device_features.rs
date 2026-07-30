@@ -77,6 +77,13 @@ pub struct DeviceFeatures {
     /// spec-mandatory — only `R8G8B8A8_UNORM` is — so the BGRA composite path
     /// needs this *and* `storage_image_write_without_format`.
     pub bgra8_storage: bool,
+    /// `R32_SFLOAT` usable as a sampled image with **linear** filtering under
+    /// optimal tiling. Single-channel float32 color-management LUTs
+    /// (`UberCompositeFragment` display-profile pass) are sampled with linear
+    /// interpolation; unlike `R16_SFLOAT`, this feature is *not* spec-mandatory
+    /// and is absent on Apple GPUs, so the native float32 sampled rail is gated
+    /// on it and otherwise leaves the sample fail-visible.
+    pub sampled_r32f_linear_filter: bool,
     pub storage16: bool,
     pub storage8: bool,
     pub float16: bool,
@@ -186,6 +193,14 @@ pub unsafe fn query(
     .optimal_tiling_features
     .contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
 
+    // R32_SFLOAT linear filtering is optional (absent on Apple/MoltenVK); ask
+    // rather than assume, so the native float32 sampled LUT rail can decline
+    // where the host cannot filter it.
+    let sampled_r32f_linear_filter =
+        unsafe { instance.get_physical_device_format_properties(pd, vk::Format::R32_SFLOAT) }
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR);
+
     // Prefer the 1.2 core feature over the extension: it needs no extension
     // string and it is the spelling the baseline guarantees exists to ask about.
     let mirror_clamp_to_edge = if supported_vulkan12.sampler_mirror_clamp_to_edge == vk::TRUE {
@@ -205,6 +220,7 @@ pub unsafe fn query(
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
             == vk::TRUE,
         bgra8_storage,
+        sampled_r32f_linear_filter,
         storage16: supported_16.storage_buffer16_bit_access == vk::TRUE,
         storage8: supported_8.storage_buffer8_bit_access == vk::TRUE,
         float16: supported_f16i8.shader_float16 == vk::TRUE,
@@ -227,6 +243,7 @@ mod tests {
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
             bgra8_storage: true,
+            sampled_r32f_linear_filter: true,
             storage16: true,
             storage8: true,
             float16: true,

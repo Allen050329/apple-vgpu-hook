@@ -4,7 +4,6 @@
 
 use ash::vk;
 use std::collections::BTreeSet;
-use std::time::Instant;
 
 use super::caches::{
     AttrKey, BindingSig, LayoutKey, ObjectCaches, PassKey, PipelineKey, SecondaryAttachKey,
@@ -17,30 +16,23 @@ use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
 use super::types::{
-    BufferContent, DrawError, DrawOutput, DrawRequest, LoadOp, SampledSource, ScissorResource,
-    VertexStepFunction, ViewportResource,
+    BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, LoadOp, SampledSource,
+    ScissorResource, SeedOrder, VertexStepFunction, ViewportResource,
 };
 use super::vk_call::{VkCall, VkOp};
 
-/// One zero-copy buffer gather recorded into the draw's CB before the render
-/// pass: per-run byte copies from imported guest RAM into the pooled staging
-/// slot the vertex/storage bind then reads.
-struct BufferGather {
-    dst: vk::Buffer,
-    copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
-}
-
 /// Stage one draw-time buffer content into a pooled slot, deduplicating
 /// within the draw: several binds sharing one content (an `Arc`'d byte
-/// allocation, or the same gathered guest span) get ONE slot and, for
-/// `GuestRuns`, ONE gather. Returns a handle copy of the slot.
+/// allocation, or the same gathered guest span) get ONE slot and ONE gather.
+/// Returns a handle copy of the slot.
 ///
-/// `snapshot_volatile` — set for a deferred-submit (batched) draw: a
-/// `GuestRuns` gather recorded into a batched CB would read guest RAM at
-/// flush time, after ack-fast has let the guest repaint the pages; the
-/// snapshot copies the runs on the CPU *now* and stages plain bytes, so the
-/// deferred CB only ever reads stable pool memory (record-time freshness ==
-/// the CPU staging path's encode-time read).
+/// `snapshot_volatile` — set for a deferred-submit (batched) draw — no longer
+/// selects a mechanism. Every `GuestRuns` bind is now copied on the CPU at
+/// preparation time, which is what the snapshot always did and what the
+/// deferred CB needs: a gather recorded into a batched CB would have read guest
+/// RAM at flush time, after ack-fast let the guest repaint the pages. The flag
+/// survives because the counter it feeds distinguishes a batched bind from an
+/// immediate one, which is still a real difference in when the bytes were read.
 #[allow(
     clippy::too_many_arguments,
     reason = "buffer staging carries the Vulkan context, pools, binding, and lifetime sets"
@@ -53,7 +45,6 @@ unsafe fn stage_buffer_content(
     usage: vk::BufferUsageFlags,
     snapshot_volatile: bool,
     slots_by_content: &mut std::collections::HashMap<(usize, u64), BufferSlot>,
-    gathers: &mut Vec<BufferGather>,
 ) -> Result<BufferSlot, DrawError> {
     let key = match content {
         BufferContent::Bytes(b) => (std::sync::Arc::as_ptr(b) as usize, b.len() as u64),
@@ -63,7 +54,7 @@ unsafe fn stage_buffer_content(
         ),
     };
     if let Some(slot) = slots_by_content.get(&key) {
-        return Ok(slot.clone());
+        return Ok(*slot);
     }
     let slot = match content {
         BufferContent::Bytes(b) => {
@@ -71,61 +62,30 @@ unsafe fn stage_buffer_content(
             pools.write_staging(ctx, &slot, b)?;
             slot
         }
-        BufferContent::GuestRuns(src) if snapshot_volatile => {
-            let slot = pools.acquire_staging(ctx, src.total_len, usage, counters)?;
-            // Copy the guest runs straight into the mapped staging span — no
-            // intermediate `cpu_bytes()` heap Vec (the deferred-submit hot path,
-            // ~4.8 binds/draw under compositing).
-            pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
-            counters
-                .buffer_snapshot_binds
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            slot
-        }
+        // Guest runs are gathered by the CPU into the mapped staging span, with
+        // no intermediate `cpu_bytes()` heap Vec (this is the deferred-submit
+        // hot path, ~4.8 binds/draw under compositing).
+        //
+        // There used to be a second arm here that skipped this copy entirely:
+        // it resolved each run through a `VK_EXT_external_memory_host` import
+        // and had the command buffer read the guest pages directly. That is
+        // gone — an imported host pointer is one the GPU can *write*, and the
+        // runs point into guest RAM. `snapshot_volatile` therefore no longer
+        // selects between two mechanisms; it only records that the runtime
+        // asked for a stable snapshot, which is what this arm has always given
+        // it.
         BufferContent::GuestRuns(src) => {
-            let slot = pools.acquire_staging(
-                ctx,
-                src.total_len,
-                usage | vk::BufferUsageFlags::TRANSFER_DST,
-                counters,
-            )?;
-            // Runs were pre-checked by the runtime via ensure_host_import, so
-            // a missing region here is a genuine failure (the runtime gate
-            // falls back to the CPU staging path only at encode time).
-            let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-            let mut dst_offset = 0u64;
-            for run in src.runs.iter() {
-                let Some((buffer, src_offset)) =
-                    pools.host_import_resolve(ctx, run.host_ptr, run.len)
-                else {
-                    return Err(DrawError::DrawExecution(
-                        DrawExecutionDecline::BufferGuestRunImportMissing {
-                            host_ptr: run.host_ptr,
-                            len: run.len,
-                        },
-                    ));
-                };
-                let copy = vk::BufferCopy::default()
-                    .src_offset(src_offset)
-                    .dst_offset(dst_offset)
-                    .size(run.len);
-                match copies.last_mut() {
-                    Some((b, list)) if *b == buffer => list.push(copy),
-                    _ => copies.push((buffer, vec![copy])),
-                }
-                dst_offset = dst_offset.saturating_add(run.len);
+            let slot = pools.acquire_staging(ctx, src.total_len, usage, counters)?;
+            pools.write_staging_from_runs(ctx, &slot, &src.runs, src.total_len)?;
+            if snapshot_volatile {
+                counters
+                    .buffer_snapshot_binds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            counters
-                .buffer_zerocopy_binds
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            gathers.push(BufferGather {
-                dst: slot.buffer,
-                copies,
-            });
             slot
         }
     };
-    slots_by_content.insert(key, slot.clone());
+    slots_by_content.insert(key, slot);
     Ok(slot)
 }
 
@@ -137,17 +97,18 @@ enum PreparedSampled {
         volume: bool,
         layers: u32,
     },
-    /// Zero-copy guest gather: the CB copies the texel bytes from imported
-    /// guest RAM (per-run byte copies into a pooled scratch, then one
-    /// buffer→image copy). No CPU bytes exist, so the content cache is
-    /// bypassed and the slot is never retained.
+    /// Guest gather: the CPU packs the texel bytes out of the guest runs into a
+    /// pooled scratch, then one buffer→image copy uploads it. No owned CPU byte
+    /// buffer exists, so the content cache is bypassed and the slot is never
+    /// retained — that is what still separates this from [`Self::Upload`].
+    ///
+    /// The gather used to happen on the device, out of per-run host-pointer
+    /// imports of the guest pages, which is why the scratch carried
+    /// `TRANSFER_DST` and a per-source copy list. Both are gone with the import.
     GuestGather {
         binding: u32,
         image: SampledSlot,
         scratch: BufferSlot,
-        /// Byte copies grouped per imported source buffer.
-        copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)>,
-        total_len: u64,
         /// `bufferRowLength` for the buffer→image copy (0 = tight rows).
         row_length_texels: u32,
     },
@@ -416,7 +377,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        let element_end = attribute.offset.checked_add(format_size).ok_or_else(|| {
+        let element_end = attribute.offset.checked_add(format_size).ok_or({
             DrawError::DrawValidation(DrawValidationDecline::VertexOffsetOverflow {
                 location: attribute.location,
             })
@@ -439,13 +400,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     } else {
                         req.first_vertex as usize
                     };
-                    first_record
-                        .checked_add(last_record as usize)
-                        .ok_or_else(|| {
-                            DrawError::DrawValidation(DrawValidationDecline::VertexRangeOverflow {
-                                location: attribute.location,
-                            })
-                        })?
+                    first_record.checked_add(last_record as usize).ok_or({
+                        DrawError::DrawValidation(DrawValidationDecline::VertexRangeOverflow {
+                            location: attribute.location,
+                        })
+                    })?
                 }
                 VertexStepFunction::PerInstance => {
                     let instance_count = req.instance_count.unwrap_or(1);
@@ -454,15 +413,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                     } else {
                         (instance_count - 1) / attribute.step_rate
                     };
-                    req.base_instance
-                        .checked_add(relative_element)
-                        .ok_or_else(|| {
-                            DrawError::DrawValidation(
-                                DrawValidationDecline::InstanceRangeOverflow {
-                                    location: attribute.location,
-                                },
-                            )
-                        })? as usize
+                    req.base_instance.checked_add(relative_element).ok_or({
+                        DrawError::DrawValidation(DrawValidationDecline::InstanceRangeOverflow {
+                            location: attribute.location,
+                        })
+                    })? as usize
                 }
             }
         };
@@ -470,7 +425,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             .checked_mul(last_element)
             .and_then(|span| (attribute.offset as usize).checked_add(span))
             .and_then(|end| end.checked_add(format_size as usize))
-            .ok_or_else(|| {
+            .ok_or({
                 DrawError::DrawValidation(DrawValidationDecline::VertexByteRangeOverflow {
                     location: attribute.location,
                 })
@@ -531,6 +486,19 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
         if (image.arrayed as u8 + image.volume as u8 + image.cube as u8) > 1 {
+            return Err(DrawError::DrawValidation(
+                DrawValidationDecline::SampledShapeConflict {
+                    binding: image.binding,
+                    arrayed: image.arrayed,
+                    volume: image.volume,
+                    cube: image.cube,
+                },
+            ));
+        }
+        // A 1D image (`texture1d` / `texture1d_array`) is a single row: it may
+        // combine only with `arrayed` (the 1D-array case) and always has
+        // height 1. `volume`/`cube` are 2D/3D shapes and cannot co-occur.
+        if image.one_dim && (image.volume || image.cube || image.height != 1) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledShapeConflict {
                     binding: image.binding,
@@ -604,7 +572,14 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             }
             SampledSource::Bytes(_) => {}
             SampledSource::GuestRuns(src) => {
-                if image.arrayed || image.volume || image.cube || image.layers != 1 {
+                // The zero-copy gather uploads a single array layer into a
+                // single-depth image (`layer_count: 1`, `depth: 1` below), so
+                // it serves any shape that is one layer deep: plain 2D, a
+                // single-layer 2D array, and the 1D / single-layer 1D-array
+                // color-transfer LUTs. Volume and multi-layer shapes still
+                // decline by name — the gather would upload only their first
+                // slice.
+                if image.volume || image.cube || image.layers != 1 {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::GuestRunSampledNot2d {
                             binding: image.binding,
@@ -684,6 +659,98 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
     Ok(())
 }
 
+/// Stage a host-written buffer into a freshly created sampled image and leave it
+/// shader-readable.
+///
+/// Both sampled upload rails do exactly this: transition `UNDEFINED` →
+/// `TRANSFER_DST_OPTIMAL`, one `vkCmdCopyBufferToImage`, then
+/// `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL` against both shader
+/// stages. Keeping one copy means the barrier masks cannot drift apart between
+/// them, which is the failure this shape invites: a missing `SHADER_READ` on one
+/// rail is invisible on a driver that happens not to need it.
+///
+/// No HOST→TRANSFER barrier on either rail — writes the host made before
+/// `vkQueueSubmit` are automatically visible to the device, and every staging
+/// slot here is written before the submit. The guest-gather rail once opened with
+/// two barriers ordering a *device-side* gather against this copy; there is no
+/// device-side write to order any more.
+///
+/// `row_length_texels` is `VkBufferImageCopy::bufferRowLength`, where 0 means
+/// "rows are tightly packed" — the CPU-origin rail always packs tightly, the
+/// guest-gather rail may stride over guest row padding.
+#[allow(clippy::too_many_arguments)]
+unsafe fn upload_buffer_to_sampled_image(
+    ctx: &super::context::DeviceContext,
+    cb: vk::CommandBuffer,
+    src: vk::Buffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    array_layers: u32,
+    extent_depth: u32,
+    row_length_texels: u32,
+) {
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: array_layers,
+    };
+    let to_transfer = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .image(image)
+        .subresource_range(range)];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_transfer,
+    );
+    let copy = [vk::BufferImageCopy::default()
+        .buffer_row_length(row_length_texels)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: array_layers,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: extent_depth,
+        })];
+    ctx.device.cmd_copy_buffer_to_image(
+        cb,
+        src,
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &copy,
+    );
+    let to_shader = [vk::ImageMemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image(image)
+        .subresource_range(range)];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &to_shader,
+    );
+}
+
 fn draw_has_no_invocations(req: &DrawRequest) -> bool {
     let element_count = req
         .indexed
@@ -700,23 +767,16 @@ pub(crate) unsafe fn execute_draw_inner(
     counters: &EngineCounters,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
+    // Charges this draw's wall clock to one phase at a time; commits from
+    // `Drop`, so the `?` returns below keep their time.
+    let mut phase = super::draw_phase::DrawTimer::start();
     validate_v1(req)?;
     let force_loss = owner.force_device_lost;
     if force_loss {
         owner.force_device_lost = false;
     }
-    let context_started = Instant::now();
     let ctx = owner.ensure(counters)?;
-    counters.context_us.fetch_add(
-        context_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let pool_init_started = Instant::now();
     pools.ensure_init(ctx, counters)?;
-    counters.pool_init_us.fetch_add(
-        pool_init_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Draw batching (deferred submit): a draw that hands the CPU nothing
     // (skip_readback + resident target, no MRT) leaves its CB in recording
@@ -726,13 +786,25 @@ pub(crate) unsafe fn execute_draw_inner(
     // submit entirely. Every other draw claims a slot via begin_entry, which
     // flushes any open batch first (queue order = record order).
     let is_mrt = !req.secondary_targets.is_empty();
-    let output_bgra = req.output_bgra && req.target_identity.is_some();
+    // The resolved attachment decides its own channel order: a resident target
+    // takes the identity's (`TargetIdentity::is_bgra` — every type-11 surface is
+    // BGRA), and the pooled path stays RGBA. `req.output_bgra` remains an
+    // explicit opt-in for identities whose namespace does not imply an order.
+    //
+    // Derived here rather than at each runtime call site so that all the draws
+    // sharing one identity in a frame agree by construction. `registry_ensure`
+    // destroys and recreates the image on an order mismatch, so a per-path
+    // predicate that one path spells differently is a full reallocation per
+    // composite, not a wrong colour.
+    let output_bgra = req
+        .target_identity
+        .as_ref()
+        .is_some_and(|id| req.output_bgra || id.is_bgra());
     // A sampled zero-copy source reads guest RAM when the CB *executes*, and
     // ack-fast means the guest may repaint that buffer as soon as the command
     // is consumed — deferred submit stretches record→execute from ~0 to a
     // whole batch, so the GPU samples half-repainted a/b window buffers
-    // (rect_void 10x3-tile black bands under window drags, 2026-07-19 live
-    // A/B). Such draws take the immediate-submit path; buffer GuestRuns stay
+    // (large black bands under window drags, 2026-07-19 live A/B). Such draws take the immediate-submit path; buffer GuestRuns stay
     // batchable because `stage_buffer_content` snapshots them at record time.
     let has_zc_sampled = req
         .sampled_images
@@ -776,6 +848,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         pools.begin_entry(ctx, counters)?
     };
+    phase.enter(super::draw_phase::Phase::Pipeline);
 
     // Build layout key from storage / sampled / sampler bindings.
     let mut layout_bindings = Vec::new();
@@ -812,37 +885,23 @@ pub(crate) unsafe fn execute_draw_inner(
         bindings: layout_bindings,
     };
     // Resolve load action: explicit load_op > target_rgba8 > Clear.
-    let resolved_load: LoadOp = match &req.load_op {
-        Some(op) => match op {
-            LoadOp::Clear(c) => LoadOp::Clear(*c),
-            LoadOp::LoadFromTarget => LoadOp::LoadFromTarget,
-            LoadOp::LoadSeed(b) => LoadOp::LoadSeed(b.clone()),
-        },
-        None => match &req.target_rgba8 {
-            Some(b) => LoadOp::LoadSeed(b.clone()),
-            None => LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
-        },
-    };
-    let load_uses_gpu_content = matches!(resolved_load, LoadOp::LoadFromTarget);
+    let load_uses_gpu_content = matches!(req.load_op, Some(LoadOp::LoadFromTarget));
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
     // copy lands guest scanout order with no CPU swizzle.
-    let seed_bytes: Option<Vec<u8>> = match &resolved_load {
-        LoadOp::LoadSeed(bytes) => {
-            // LoadSeed is semantic RGBA8. Vulkan buffer→image copies do not
-            // perform format conversion, so a BGRA resident attachment needs
-            // physical B/G/R/A bytes. Otherwise partial draws preserve an
-            // exact R/B-exchanged seed outside their damaged geometry.
-            let mut native = bytes.clone();
-            if output_bgra {
-                for pixel in native.chunks_exact_mut(4) {
-                    pixel.swap(0, 2);
-                }
-            }
-            Some(native)
-        }
-        _ => None,
+    // The seed is borrowed from `req`, never copied to the heap. It is a whole
+    // frame, and `engine_delta` measures ~430 MB/s of seed uploads under a
+    // browser workload — so a `Vec` here is ~430 MB/s of memcpy plus ~240
+    // multi-MiB allocations a second on the drain worker that `drain_duty`
+    // shows pinned at duty 0.9+. The only thing that copy bought was a buffer
+    // the `output_bgra` arm could swizzle in place; that swizzle now happens
+    // during the single copy into the mapped staging span
+    // (`write_staging_rgba_as_bgra`), so the pixels are touched once either way.
+    let seed_bytes: Option<&[u8]> = match &req.load_op {
+        Some(LoadOp::LoadSeed(native)) => Some(native.as_slice()),
+        Some(_) => None,
+        None => req.target_rgba8.as_ref().map(|v| v.as_slice()),
     };
     let mut pass_key = PassKey::single(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),
@@ -893,7 +952,6 @@ pub(crate) unsafe fn execute_draw_inner(
         })
         .collect();
 
-    let cache_started = Instant::now();
     let (vert_digest, vert_module) =
         caches.get_or_create_shader(ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
@@ -918,6 +976,19 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             per_slot
         },
+        color_write_mask: {
+            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+            per_slot[0] = req.color_write_mask;
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot + 1] = target.color_write_mask;
+            }
+            per_slot
+        },
         pass: pass_key,
         flip_y: req.flip_viewport_y,
         cull_mode: req.cull_mode,
@@ -937,50 +1008,32 @@ pub(crate) unsafe fn execute_draw_inner(
             }),
         layout: layout_key.clone(),
     };
-    let pipeline = if let Some(pipeline) = caches.get_prepared(&pipeline_key) {
-        counters
-            .pipeline_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        pipeline
-    } else {
-        let pipe = caches.get_or_create_pipeline(
-            ctx,
-            &pipeline_key,
-            vert_module,
-            frag_module,
-            pipeline_layout,
-            render_pass,
-            counters,
-            pools,
-        )?;
-        caches.cache_prepared(pipeline_key.clone(), pipe);
-        pipe
-    };
-    counters.cache_us.fetch_add(
-        cache_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // One cache, consulted once. `get_or_create_pipeline` already counts the hit
+    // and already checks the negative entry for a key that failed to compile.
+    let pipeline = caches.get_or_create_pipeline(
+        ctx,
+        &pipeline_key,
+        vert_module,
+        frag_module,
+        pipeline_layout,
+        render_pass,
+        counters,
+        pools,
+    )?;
 
     // Samplers
-    let resource_started = Instant::now();
-    let sampler_prepare_started = Instant::now();
     let mut sampler_handles = Vec::new();
     for s in &req.samplers {
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
         sampler_handles.push((s.binding, h));
     }
-    counters.sampler_prepare_us.fetch_add(
-        sampler_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
+    phase.enter(super::draw_phase::Phase::Stage);
     // Vertex buffers (with Constant step shift), deduplicated by content:
     // several attributes on one interleaved stream share one staging slot.
-    let vertex_prepare_started = Instant::now();
     let no_vertex_fetch = draw_has_no_invocations(req);
     let mut slots_by_content: std::collections::HashMap<(usize, u64), BufferSlot> =
         std::collections::HashMap::new();
-    let mut buffer_gathers: Vec<BufferGather> = Vec::new();
     let mut vertex_bufs = Vec::new();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
@@ -998,7 +1051,7 @@ pub(crate) unsafe fn execute_draw_inner(
             };
             let prefix = (req.base_instance as usize)
                 .checked_mul(resource.stride as usize)
-                .ok_or_else(|| {
+                .ok_or({
                     DrawError::DrawExecution(
                         DrawExecutionDecline::ConstantVertexBaseInstanceOverflow {
                             base_instance: req.base_instance,
@@ -1031,18 +1084,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 batch_eligible,
                 &mut slots_by_content,
-                &mut buffer_gathers,
             )?
         };
         vertex_bufs.push((resource.binding, slot));
     }
-    counters.vertex_prepare_us.fetch_add(
-        vertex_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Index buffer
-    let index_prepare_started = Instant::now();
     let mut index_slot = None;
     if let Some(indexed) = &req.indexed {
         let slot = pools.acquire_staging(
@@ -1054,15 +1101,10 @@ pub(crate) unsafe fn execute_draw_inner(
         pools.write_staging(ctx, &slot, &indexed.indices)?;
         index_slot = Some(slot);
     }
-    counters.index_prepare_us.fetch_add(
-        index_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Storage buffers (deduplicated by content with the vertex streams: a
     // stage-in buffer doubling as a storage bind reuses the same slot —
     // staging slots always carry the full usage superset).
-    let storage_prepare_started = Instant::now();
     let mut storage_slots = Vec::new();
     for resource in &req.storage_buffers {
         let slot = stage_buffer_content(
@@ -1073,37 +1115,36 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::BufferUsageFlags::STORAGE_BUFFER,
             batch_eligible,
             &mut slots_by_content,
-            &mut buffer_gathers,
         )?;
         storage_slots.push((resource.binding, slot));
     }
-    counters.storage_prepare_us.fetch_add(
-        storage_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Target seed staging (CPU import only — not LoadFromTarget).
-    let seed_prepare_started = Instant::now();
-    let seed_slot = if let Some(rgba8) = &seed_bytes {
+    let seed_slot = if let Some(rgba8) = seed_bytes {
         let slot = pools.acquire_staging(
             ctx,
             rgba8.len() as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
             counters,
         )?;
-        pools.write_staging(ctx, &slot, rgba8)?;
+        // Vulkan buffer→image copies do not perform format conversion, so the
+        // staged bytes must already be in the attachment's physical order —
+        // otherwise partial draws preserve an exact R/B-exchanged seed outside
+        // their damaged geometry. The attachment is BGRA when `output_bgra`; the
+        // seed states its own order. Exchange exactly when they disagree, inside
+        // the copy that has to happen anyway.
+        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+            pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
+        } else {
+            pools.write_staging(ctx, &slot, rgba8)?;
+        }
         counters.note_seed_upload(rgba8.len() as u64);
         Some(slot)
     } else {
         None
     };
-    counters.seed_prepare_us.fetch_add(
-        seed_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Prefer identity-keyed resident target when provided; else geometry pool.
-    let target_prepare_started = Instant::now();
     let use_registry = req.target_identity.is_some();
     // A secondary MRT attachment is bound + rendered as attachment N of an
     // ad-hoc framebuffer built here. The primary slot 0 keeps its own single-RT
@@ -1118,6 +1159,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // with and without an input reference are NOT framebuffer-compatible),
     // and the fetch-carrying `render_pass` is used only for the ad-hoc
     // framebuffer + pipeline, exactly like MRT/depth.
+    phase.enter(super::draw_phase::Phase::StagePass);
     let primary_pass = if is_mrt || req.depth.is_some() || req.color_input {
         caches.get_or_create_pass(
             ctx,
@@ -1128,6 +1170,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         render_pass
     };
+    phase.enter(super::draw_phase::Phase::Acquire);
     // (identity, image, tracked-layout-before-this-draw) per secondary — used
     // to barrier prior sampled reads and to mark ready afterward.
     let mut mrt_secondaries: Vec<(super::types::TargetIdentity, vk::Image, vk::ImageLayout)> =
@@ -1313,14 +1356,9 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             None
         };
-    counters.target_prepare_us.fetch_add(
-        target_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     // Resolve sampled images only after ensuring the render target so registry
     // capacity eviction cannot destroy an image already selected for this draw.
-    let sampled_prepare_started = Instant::now();
     let mut sampled = Vec::new();
     for resource in &req.sampled_images {
         match &resource.source {
@@ -1332,6 +1370,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.volume,
                     resource.cube,
                     resource.arrayed,
+                    resource.one_dim,
                     resource.format,
                     resource.swizzle,
                     bytes,
@@ -1352,6 +1391,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.volume,
                     resource.cube,
                     resource.arrayed,
+                    resource.one_dim,
                     resource.format,
                     resource.swizzle,
                     counters,
@@ -1422,6 +1462,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         resource.volume,
                         resource.cube,
                         resource.arrayed,
+                        resource.one_dim,
                         super::super::translate::pixel::resident_color(source_bgra),
                         resource.swizzle,
                         counters,
@@ -1455,6 +1496,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     resource.volume,
                     resource.cube,
                     resource.arrayed,
+                    resource.one_dim,
                     resource.format,
                     resource.swizzle,
                     counters,
@@ -1462,71 +1504,42 @@ pub(crate) unsafe fn execute_draw_inner(
                 let scratch = pools.acquire_staging(
                     ctx,
                     src.total_len,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
                     counters,
                 )?;
-                // Runs were pre-checked by the runtime via ensure_host_import,
-                // so a missing region here is a genuine failure (the draw
-                // gate falls back to the CPU path on the reported error).
-                let mut copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
-                let mut dst_offset = 0u64;
-                for run in src.runs.iter() {
-                    let Some((buffer, src_offset)) =
-                        pools.host_import_resolve(ctx, run.host_ptr, run.len)
-                    else {
-                        return Err(DrawError::DrawExecution(
-                            DrawExecutionDecline::SampledGuestRunImportMissing {
-                                binding: resource.binding,
-                                host_ptr: run.host_ptr,
-                                len: run.len,
-                            },
-                        ));
-                    };
-                    let copy = vk::BufferCopy::default()
-                        .src_offset(src_offset)
-                        .dst_offset(dst_offset)
-                        .size(run.len);
-                    match copies.last_mut() {
-                        Some((b, list)) if *b == buffer => list.push(copy),
-                        _ => copies.push((buffer, vec![copy])),
-                    }
-                    dst_offset = dst_offset.saturating_add(run.len);
-                }
-                counters
-                    .sampled_zerocopy_binds
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The CPU gathers the texel bytes out of the guest runs into
+                // the mapped scratch; the command buffer then does one
+                // buffer→image copy over it.
+                //
+                // The command buffer used to do the gather itself, copying from
+                // per-run `VK_EXT_external_memory_host` imports of the guest
+                // pages. That is the mechanism this removal is about: an
+                // imported host pointer is one the GPU can write, and these
+                // runs are guest RAM. `TRANSFER_DST` came off the scratch usage
+                // with it — nothing on the device writes this buffer any more.
+                pools.write_staging_from_runs(ctx, &scratch, &src.runs, src.total_len)?;
                 sampled.push(PreparedSampled::GuestGather {
                     binding: resource.binding,
                     image: img,
                     scratch,
-                    copies,
-                    total_len: src.total_len,
                     row_length_texels: src.row_length_texels,
                 });
             }
         }
     }
-    counters.sampled_prepare_us.fetch_add(
-        sampled_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
-    let readback_prepare_started = Instant::now();
     let rb_size = (req.width as u64) * (req.height as u64) * 4;
     let do_readback = !req.skip_readback;
+    phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
         Some(pools.acquire_readback(ctx, rb_size, counters)?)
     } else {
         None
     };
-    counters.readback_prepare_us.fetch_add(
-        readback_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
     let _ = use_registry;
 
+    phase.enter(super::draw_phase::Phase::Descriptors);
     // Descriptor set
-    let descriptor_prepare_started = Instant::now();
     // Owning pool block travels alongside the set so the flush-time free routes
     // back to the block it was allocated from (arena may grow past block 0).
     let mut dset_pool: Option<vk::DescriptorPool> = None;
@@ -1601,20 +1614,12 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    counters.descriptor_prepare_us.fetch_add(
-        descriptor_prepare_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    counters.resource_us.fetch_add(
-        resource_started.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
+    phase.enter(super::draw_phase::Phase::Record);
     // The ring slot's CB retired at begin_entry and its fence is unsignaled —
     // no pre-record wait remains (pre_record_wait_us stays 0 on this path).
     // A batch joiner's CB is already recording (opened by the batch opener);
     // its commands append after the previous draw's end_render_pass.
-    let t_record = Instant::now();
     if !joins {
         ctx.device
             .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
@@ -1992,218 +1997,50 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
-        let array_layers = if *volume { 1 } else { *layers };
-        let extent_depth = if *volume { *layers } else { 1 };
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: array_layers,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-        let copy = [vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: array_layers,
-            })
-            .image_extent(vk::Extent3D {
-                width: img.width,
-                height: img.height,
-                depth: extent_depth,
-            })];
-        ctx.device.cmd_copy_buffer_to_image(
+        upload_buffer_to_sampled_image(
+            ctx,
             cb,
             st.buffer,
             img.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy,
-        );
-        let barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: array_layers,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
+            img.width,
+            img.height,
+            if *volume { 1 } else { *layers },
+            if *volume { *layers } else { 1 },
+            0,
         );
     }
 
-    // Zero-copy buffer gathers: pull vertex/storage bytes straight from
-    // imported guest RAM into the pooled staging slots the binds read.
-    // Same contract as the sampled gathers below: HOST→TRANSFER availability
-    // first (guest CPU writes are outside Vulkan's sync scope), per-run byte
-    // copies, then one visibility barrier to vertex-input + shader reads.
-    if !buffer_gathers.is_empty() {
-        let host_barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &host_barrier,
-            &[],
-            &[],
-        );
-        for gather in &buffer_gathers {
-            for (src_buffer, regions) in &gather.copies {
-                ctx.device
-                    .cmd_copy_buffer(cb, *src_buffer, gather.dst, regions);
-            }
-        }
-        let visible = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::VERTEX_ATTRIBUTE_READ | vk::AccessFlags::SHADER_READ,
-            )];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_INPUT
-                | vk::PipelineStageFlags::VERTEX_SHADER
-                | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &visible,
-            &[],
-            &[],
-        );
-    }
-
-    // Zero-copy guest gathers: pull the texel bytes straight from imported
-    // guest RAM inside this CB. Guest CPU writes happen outside Vulkan's
-    // sync scope, so the gather starts with a HOST→TRANSFER availability
-    // barrier; then per-run byte copies pack the fragmented runs into the
-    // scratch, and one buffer→image copy uploads it (`row_length_texels`
-    // strides over guest row padding; 0 = tight rows).
+    // Guest gathers: the scratch was packed by `write_staging_from_runs` during
+    // preparation, so this is the same host-staged upload the CPU-origin loop
+    // above performs, differing only in `row_length_texels` striding over guest
+    // row padding (0 = tight rows).
+    //
+    // No HOST→TRANSFER barrier, matching that loop: writes the host made before
+    // `vkQueueSubmit` are automatically visible to the device, and this scratch
+    // is written before the submit like every other staging slot. The two
+    // barriers that used to open this block ordered the *device-side* gather —
+    // per-run copies out of imported guest pages — against the image copy, and
+    // there is no device-side write to order any more.
     for image in &sampled {
         let PreparedSampled::GuestGather {
             image: img,
             scratch,
-            copies,
-            total_len,
             row_length_texels,
             ..
         } = image
         else {
             continue;
         };
-        let host_barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &host_barrier,
-            &[],
-            &[],
-        );
-        for (src_buffer, regions) in copies {
-            ctx.device
-                .cmd_copy_buffer(cb, *src_buffer, scratch.buffer, regions);
-        }
-        let scratch_barrier = [vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .buffer(scratch.buffer)
-            .offset(0)
-            .size(*total_len)];
-        let image_barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &scratch_barrier,
-            &image_barrier,
-        );
-        let copy = [vk::BufferImageCopy::default()
-            .buffer_row_length(*row_length_texels)
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .image_extent(vk::Extent3D {
-                width: img.width,
-                height: img.height,
-                depth: 1,
-            })];
-        ctx.device.cmd_copy_buffer_to_image(
+        upload_buffer_to_sampled_image(
+            ctx,
             cb,
             scratch.buffer,
             img.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy,
-        );
-        let to_shader = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(img.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &to_shader,
+            img.width,
+            img.height,
+            1,
+            1,
+            *row_length_texels,
         );
     }
 
@@ -2399,15 +2236,12 @@ pub(crate) unsafe fn execute_draw_inner(
     // in recording state for same-target successors and is submitted by
     // pools.batch_flush (next begin_entry / retire / explicit flush).
     let defer_submit = batch_eligible;
+    phase.enter(super::draw_phase::Phase::Submit);
     if !defer_submit {
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
     }
-    counters.record_us.fetch_add(
-        t_record.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
 
     if force_loss {
         // Recycle transient resources before reporting loss.
@@ -2421,7 +2255,6 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if !defer_submit {
-        let t_submit = Instant::now();
         let queue = ctx.queue();
         let cbs = [cb];
         let si = vk::SubmitInfo::default().command_buffers(&cbs);
@@ -2435,10 +2268,6 @@ pub(crate) unsafe fn execute_draw_inner(
             }
             Err(e) => return Err(DrawError::VkCall(VkCall::new(VkOp::ExecSubmit, e))),
         }
-        counters.submit_us.fetch_add(
-            t_submit.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
     }
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
@@ -2509,7 +2338,10 @@ pub(crate) unsafe fn execute_draw_inner(
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput { pixels: Vec::new() });
+        return Ok(DrawOutput {
+            pixels: Vec::new(),
+            pixels_bgra: output_bgra,
+        });
     }
 
     // Park the owed cleanup (descriptor set, transient pool slots, cache
@@ -2551,35 +2383,37 @@ pub(crate) unsafe fn execute_draw_inner(
         counters
             .render_post_wait_skips
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(DrawOutput { pixels: Vec::new() });
+        return Ok(DrawOutput {
+            pixels: Vec::new(),
+            pixels_bgra: output_bgra,
+        });
     };
 
-    let t_wait = Instant::now();
-    pools.retire_all(ctx, counters)?;
-    counters.wait_us.fetch_add(
-        t_wait.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // Wait ONLY this draw's fence, not the whole ring. The readback copy is the
+    // tail of this CB, and single-queue submission order already guarantees it
+    // observes every prior-submitted draw's writes (the same argument
+    // `read_target_inner` relies on) — so `retire_all` here would just serialize
+    // the guest-blocking readback behind an unrelated in-flight heavy draw (the
+    // `finish_us` tail). The cleanup is already parked with `finish_entry_async`
+    // above, so the slot stays pending and the ring retires it later with no
+    // extra wait (its fence is already signaled).
+    phase.enter(super::draw_phase::Phase::Wait);
+    pools.wait_entry_fence(ctx, counters, fence)?;
 
-    let t_rb = Instant::now();
-    let out = {
-        let ptr = ctx
-            .device
-            .map_memory(rb.memory, 0, rb_size, vk::MemoryMapFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecMapReadback, e)))?
-            as *const u8;
-        let mut pixels = vec![0u8; rb_size as usize];
-        std::ptr::copy_nonoverlapping(ptr, pixels.as_mut_ptr(), rb_size as usize);
-        ctx.device.unmap_memory(rb.memory);
-        counters.note_readback(rb_size);
-        pixels
-    };
-    counters.readback_us.fetch_add(
-        t_rb.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    phase.enter(super::draw_phase::Phase::Readback);
+    let out = super::pools::read_back_slot(
+        ctx,
+        rb,
+        rb_size,
+        VkOp::ExecMapReadback,
+        VkOp::ExecInvalidateReadback,
+    )?;
+    counters.note_readback(rb_size);
 
-    Ok(DrawOutput { pixels: out })
+    Ok(DrawOutput {
+        pixels: out,
+        pixels_bgra: output_bgra,
+    })
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
@@ -2644,6 +2478,7 @@ mod tests {
                 arrayed: false,
                 volume: false,
                 cube: false,
+                one_dim: false,
                 source: SampledSource::GuestRuns(GuestRunSource {
                     runs: std::sync::Arc::new(vec![GuestRun {
                         host_ptr: 0x1000,

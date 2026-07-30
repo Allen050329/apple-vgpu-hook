@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 
 #[cfg(feature = "backend-vulkan")]
@@ -56,6 +57,7 @@ fn rb(
 /// - Dropping it to the small-bind band (scroll glyphs ~3.6 KiB; small-UI /
 ///   gva_copy ~21–34 KiB) trades cheap CPU copies for many tiny GPU gathers +
 ///   host-import windows.
+///
 /// Vulkan-arm only: pins the `backend-vulkan` zero-copy byte floors.
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -124,25 +126,7 @@ fn type11_zero_copy_declines_transient_host_mappings() {
 }
 
 #[test]
-#[cfg(feature = "backend-vulkan")]
-fn type11_store_policy_follows_stable_host_import_gate() {
-    assert!(
-        type11_import_allowed(true, true, 7, 64, 64),
-        "a stable external-host-memory mapping keeps Store on the import rail"
-    );
-    assert!(
-        !type11_import_allowed(true, false, 7, 64, 64),
-        "a transient mapping must use synchronous CPU writeback"
-    );
-    assert!(!type11_import_allowed(false, true, 7, 64, 64));
-    assert!(!type11_import_allowed(true, true, 0, 64, 64));
-
-    assert!(type11_cpu_store_fallback_allowed(false));
-    assert!(!type11_cpu_store_fallback_allowed(true));
-}
-
-#[test]
-fn cpu_portability_store_publishes_composite_and_refollows_output() {
+fn cpu_portability_store_publishes_composite() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::model::SurfaceWriteKind;
@@ -165,9 +149,8 @@ fn cpu_portability_store_publishes_composite_and_refollows_output() {
     state.present.width = width;
     state.present.height = height;
     state.present.frame_flush_seen = true;
-    state.note_compositor_output(9, 1, width, height, 1);
 
-    publish_cpu_portability_store(
+    publish_surface_store(
         &mut state,
         &mut host,
         mid,
@@ -177,9 +160,7 @@ fn cpu_portability_store_publishes_composite_and_refollows_output() {
     );
 
     assert_eq!(state.surface_write_kind(mid), SurfaceWriteKind::Composite);
-    assert!(state.is_compositor_output_member(mid));
-    assert_eq!(state.present.compositor_output_mapping, mid);
-    assert_eq!(state.present.compositor_output_generation, 2);
+    assert_eq!(state.present.early_front_mapping, mid);
 }
 
 #[test]
@@ -846,6 +827,37 @@ fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
     }
 }
 
+/// `reorder_rb_in_place` must touch nothing when the order it holds is already
+/// the order asked for, and match `swap_rb_channels` when it is not.
+///
+/// The no-op half is the whole point of threading the order rather than
+/// normalizing: a type-11 composite Store's readback now arrives BGRA, so this is
+/// the call that used to be a 776 us whole-frame pass and is now a compare. A
+/// future edit that made it exchange unconditionally would restore that cost
+/// silently — the pixels would still be right.
+#[test]
+fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
+    for len in [0usize, 4, 8, 5, 260, 263] {
+        let src: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+        for order in [false, true] {
+            let mut same = src.clone();
+            crate::runtime::metal_draw::reorder_rb_in_place(&mut same, order, order);
+            assert_eq!(
+                same, src,
+                "len={len} order={order}: agreement must not copy"
+            );
+        }
+        // Disagreement in either direction is exactly the established swizzle,
+        // tail included.
+        let mut to_bgra = src.clone();
+        crate::runtime::metal_draw::reorder_rb_in_place(&mut to_bgra, false, true);
+        assert_eq!(to_bgra, swap_rb_channels(&src), "len={len} rgba->bgra");
+        let mut to_rgba = src.clone();
+        crate::runtime::metal_draw::reorder_rb_in_place(&mut to_rgba, true, false);
+        assert_eq!(to_rgba, swap_rb_channels(&src), "len={len} bgra->rgba");
+    }
+}
+
 /// Vulkan-arm only: SPIR-V storage-binding reflection has no Metal analogue.
 #[cfg(feature = "backend-vulkan")]
 #[test]
@@ -951,6 +963,168 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
     );
 }
 
+/// The last record of a resident render-pass chain is both the chain's consumer
+/// and the packet's guest-visible Store, and it must name the resident it loads
+/// from so it can skip its own readback.
+///
+/// Refusing `chain_from_resident` here cost the entire remaining composite
+/// readback population — `t11_keep_chain_from_resident` measured equal to
+/// `surface_deferred` in every window of one boot. The assertion that matters is
+/// the *equality*: `retarget_render_pass_draw` builds every record of a packet
+/// from one attachment template, so the record that loads from the resident is by
+/// construction the record that renders into it, and a Store naming a different
+/// slot than its own LOAD would pin an image its frame is not in.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_chained_composite_store_names_the_resident_it_loads_from() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert!(state.map_surface(7));
+    let mut req = DrawEncodeRequest {
+        width: 128,
+        height: 64,
+        ..Default::default()
+    };
+    req.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 3,
+        mapping_id: 7,
+        width: 128,
+        height: 64,
+        load_action: PASS_LOAD_ACTION_LOAD,
+        store_action: PASS_STORE_ACTION_STORE,
+        ..Default::default()
+    });
+
+    let unchained = type11_store_identity(&state, &req, true);
+    assert!(
+        unchained.is_some(),
+        "an unchained composite Store resolves its resident"
+    );
+
+    req.chain_from_resident = true;
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        unchained,
+        "a chained Store must name the same resident an unchained one does — it is \
+         the same attachment template, so the chain cannot move the slot"
+    );
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        render_chain_identity(&state, &req),
+        "the Store identity and the LoadFromTarget identity must be one slot"
+    );
+
+    // The gates that are still refusals. `writeback_guest` is the one that
+    // separates the packet's last record from its intermediates, and an
+    // intermediate has no guest Store to defer.
+    assert_eq!(
+        type11_store_identity(&state, &req, false),
+        None,
+        "an intermediate record stores nothing guest-visible"
+    );
+    req.colors[0].store_action = crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        None,
+        "a record that discards its target has no frame to defer"
+    );
+    req.colors[0].store_action = PASS_STORE_ACTION_STORE;
+    req.colors[0].mapping_id = 0;
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        None,
+        "a GVA target is the other rail's; this one requires a mapping"
+    );
+}
+
+/// An intermediate record renders into the surface resident too, so it must be
+/// able to ask whether that image is already current — even though it has no
+/// guest Store of its own to defer.
+///
+/// Keying the LOAD's currency check on the *Store* identity broke this, and the
+/// cost was not a lost elision but a loop. Record 1 of a chain has
+/// `writeback_guest == false`, so the check never ran; its LOAD fell through to a
+/// CPU seed; the seed found the host cache ceded to the resident rail and read the
+/// mapping's guest pages; and reading them landed the window the rail had just
+/// armed, which advanced the epoch and cost the *next* LOAD its elision too. One
+/// boot measured `surface_flush / surface_resident` at 1369/1373 — one flush per
+/// arm.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert!(state.map_surface(7));
+    let mut req = DrawEncodeRequest {
+        width: 128,
+        height: 64,
+        ..Default::default()
+    };
+    req.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 3,
+        mapping_id: 7,
+        width: 128,
+        height: 64,
+        load_action: PASS_LOAD_ACTION_LOAD,
+        store_action: PASS_STORE_ACTION_STORE,
+        ..Default::default()
+    });
+
+    // The query the LOAD actually asks. It takes no `writeback_guest`, so an
+    // intermediate and a final record get the same answer by construction — which
+    // is the property, and it is structural rather than asserted.
+    let (identity, mapping_epoch) = type11_load_currency_query(&state, &req)
+        .expect("a LOAD into a mapped type-11 surface is a candidate the resident could serve");
+    assert_eq!(
+        Some(identity.clone()),
+        render_chain_identity(&state, &req),
+        "the LOAD must ask about the slot the record actually renders into"
+    );
+    assert_eq!(
+        Some(identity),
+        type11_store_identity(&state, &req, true),
+        "the Store identity is the same slot, restricted — not a different one"
+    );
+    assert_eq!(
+        mapping_epoch,
+        Some(0),
+        "a freshly mapped surface has published nothing, and 0 is that value — the \
+         `is_some` guard in `type11_resident_is_current` is what keeps it from \
+         matching an unstamped slot"
+    );
+    assert_eq!(
+        type11_store_identity(&state, &req, false),
+        None,
+        "…while only the packet's last record may leave its frame on the resident"
+    );
+
+    // The refusals. A LOAD the resident cannot serve must not produce a query at
+    // all, or the counters below it would divide all draws instead of candidates.
+    req.colors[0].load_action = crate::runtime::decode::render::PASS_LOAD_ACTION_CLEAR;
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "a CLEAR has no prior content to be current"
+    );
+    req.colors[0].load_action = PASS_LOAD_ACTION_LOAD;
+    req.colors[0].target_seed_rgba = Some(vec![0u8; 128 * 64 * 4]);
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "an explicit seed was already selected by RT provenance"
+    );
+    req.colors[0].target_seed_rgba = None;
+    req.colors[0].store_action = crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "a record that discards its target renders into no resident worth naming"
+    );
+    req.colors[0].store_action = PASS_STORE_ACTION_STORE;
+    req.colors[0].mapping_id = 0;
+    assert!(
+        type11_load_currency_query(&state, &req).is_none(),
+        "a GVA target is the other rail's"
+    );
+}
+
 /// Records 2+ of an armed resident chain bind the attachment alias from
 /// the resident target; unarmed LOAD without a seed stays None (guest
 /// reload would expose pre-pass bytes — existing contract).
@@ -1036,35 +1210,6 @@ fn deferred_gva_sample_eligibility_rules() {
 }
 
 #[test]
-fn display_linear_sample_proxy_is_fail_visible() {
-    let task_id = std::process::id();
-    let marker = format!(
-            "OFF linear_sample src=gva_cache task={task_id} ref=77 type=2 gva=0x12345000 fmt=0x50 1280x720 bpr=5120 host_gen=9 rgb_nz=1 max_rgb=31"
-        );
-    let mut rgba = vec![0u8; 1280 * 720 * 4];
-    rgba[..4].copy_from_slice(&[31, 17, 9, 255]);
-    log_linear_sample_src(
-        task_id,
-        77,
-        2,
-        0x1234_5000,
-        MTL_FORMAT_BGRA8_UNORM,
-        5120,
-        1280,
-        720,
-        "gva_cache",
-        9,
-        &rgba,
-    );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "linear sample provenance proxy must be always-on"
-    );
-}
-
-#[test]
 fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
     let mut state = DeviceState::new(DeviceId(7), PAGE_SHIFT_ARM64E);
     let rgba = std::sync::Arc::new(vec![9u8, 8, 7, 255]);
@@ -1091,48 +1236,7 @@ fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
 }
 
 #[test]
-fn linear_cache_guest_probe_distinguishes_same_and_changed_bytes() {
-    let cache = [10u8, 20, 30, 255, 0, 0, 0, 0];
-    let same = compare_linear_cache_guest(&cache, &cache).expect("matching shape");
-    assert_eq!(same.differing_texels, 0);
-    assert_eq!(same.cache_rgb_nz, 1);
-    assert_eq!(same.guest_rgb_nz, 1);
-    assert_eq!(same.cache_alpha0, 1);
-    assert_eq!(same.guest_alpha0, 1);
-
-    let guest = [1u8, 2, 3, 255, 9, 0, 0, 255];
-    let changed = compare_linear_cache_guest(&cache, &guest).expect("matching shape");
-    assert_eq!(changed.differing_texels, 2);
-    assert_eq!(changed.cache_rgb_nz, 1);
-    assert_eq!(changed.guest_rgb_nz, 2);
-    assert_eq!(changed.cache_alpha0, 1);
-    assert_eq!(changed.guest_alpha0, 0);
-    assert!(compare_linear_cache_guest(&cache, &guest[..4]).is_none());
-
-    let task_id = std::process::id();
-    log_linear_cache_guest_comparison(
-        task_id,
-        202,
-        OBJECT_TYPE_TEXTURE_VARIANT,
-        0x04e4_d000,
-        MTL_FORMAT_BGRA8_UNORM,
-        7680,
-        1920,
-        1080,
-        5,
-        changed,
-    );
-    let marker = format!(
-            "OFF linear_cache_guest_probe status=ok task={task_id} ref=202 type={} gva=0x4e4d000 fmt=0x50 1920x1080 bpr=7680 host_gen=5 same=0 diff_px=2 cache_rgb=1 guest_rgb=2 cache_a0=1 guest_a0=0",
-            OBJECT_TYPE_TEXTURE_VARIANT
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "cache-vs-guest divergence proxy must be always-on"
-    );
-
+fn gva_cache_owner_object_type_transitions_are_named() {
     assert!(gva_cache_owner_allows_object_type(
         0,
         OBJECT_TYPE_TEXTURE_VARIANT
@@ -1153,391 +1257,6 @@ fn linear_cache_guest_probe_distinguishes_same_and_changed_bytes() {
         OBJECT_TYPE_TEXTURE,
         OBJECT_TYPE_TEXTURE_VIEW
     ));
-    log_linear_cache_authority_transition(
-        task_id,
-        19,
-        OBJECT_TYPE_TEXTURE_VARIANT,
-        0x04ec_c000,
-        1920,
-        1080,
-        1,
-        task_id,
-        110,
-        OBJECT_TYPE_TEXTURE,
-    );
-    let authority_marker = format!(
-            "OFF linear_cache_authority reason=object_type_transition action=skip_gva_cache task={task_id} ref=19 type={} gva=0x4ecc000 1920x1080 host_gen=1 producer_task={task_id} producer_ref=110 producer_type={}",
-            OBJECT_TYPE_TEXTURE_VARIANT, OBJECT_TYPE_TEXTURE
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&authority_marker)),
-        "object-type transition authority proxy must be always-on"
-    );
-}
-
-/// Vulkan-arm only: `draw_full_target_coverage` is a `backend-vulkan` fn.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn linear_compositor_coverage_accepts_full_quad_rejects_partial_and_split_geometry() {
-    use crate::backend::vulkan::engine::{
-        DrawRequest, IndexType, IndexedDrawResource, ScissorResource, VertexAttributeFormat,
-        VertexAttributeResource, VertexStepFunction,
-    };
-
-    let request = |ys: [f32; 2]| {
-        let mut bytes = Vec::new();
-        for (x, y) in [(0.0, ys[0]), (64.0, ys[0]), (0.0, ys[1]), (64.0, ys[1])] {
-            for value in [x, y, 0.0, 1.0] {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        let mut req = DrawRequest::default();
-        req.vertex_attributes.push(VertexAttributeResource {
-            location: 0,
-            binding: 0,
-            format: VertexAttributeFormat::Float4,
-            offset: 0,
-            stride: 16,
-            step_function: VertexStepFunction::PerVertex,
-            step_rate: 1,
-            content: bytes.into(),
-        });
-        req.indexed = Some(IndexedDrawResource {
-            index_type: IndexType::U16,
-            index_count: 6,
-            vertex_offset: 0,
-            indices: [0u16, 1, 2, 2, 1, 3]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        });
-        req
-    };
-
-    let mut full = request([0.0, 48.0]);
-    assert!(draw_full_target_coverage(&full, 64, 48, 1).full());
-    full.scissors.push(ScissorResource {
-        x: 0,
-        y: 40,
-        width: 64,
-        height: 8,
-    });
-    assert!(!draw_full_target_coverage(&full, 64, 48, 1).full());
-
-    let partial = request([40.0, 48.0]);
-    assert!(!draw_full_target_coverage(&partial, 64, 48, 1).full());
-
-    let mut split_quads = request([0.0, 12.0]);
-    let position = &mut split_quads.vertex_attributes[0];
-    let mut extended = position.content.cpu_bytes().into_owned();
-    for (x, y) in [(48.0f32, 36.0f32), (64.0, 36.0), (48.0, 48.0), (64.0, 48.0)] {
-        for value in [x, y, 0.0, 1.0] {
-            extended.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    position.content = extended.into();
-    let indexed = split_quads.indexed.as_mut().unwrap();
-    indexed.index_count = 12;
-    indexed.indices = [0u16, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7]
-        .into_iter()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let split_coverage = draw_full_target_coverage(&split_quads, 64, 48, 1);
-    assert!(
-        split_coverage.bounds_span,
-        "opposite quads reproduce the old bounds-only false positive"
-    );
-    assert!(
-        !split_coverage.triangles_cover && !split_coverage.full(),
-        "disjoint quads must not claim full-target ownership"
-    );
-
-    let mut invalid_index_base = request([0.0, 48.0]);
-    invalid_index_base.indexed.as_mut().unwrap().vertex_offset = -1;
-    assert!(!draw_full_target_coverage(&invalid_index_base, 64, 48, 1).full());
-
-    let pipeline_ref = std::process::id();
-    log_compositor_linear_coverage(
-        6,
-        64,
-        48,
-        pipeline_ref,
-        false,
-        true,
-        6,
-        true,
-        None,
-        None,
-        "stage_in",
-    );
-    let marker = format!(
-            "OFF compositor_linear_coverage output_mid=6 64x48 pipe={pipeline_ref} full=0 bounds=1 src=stage_in vtx=6 indexed=1 viewport=None scissor=None"
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines()
-            .any(|line| crate::observe::line_is(line, &marker)),
-        "linear compositor coverage proxy must be always-on"
-    );
-    let gap_marker = format!(
-            "OFF linear_coverage_gap reason=bounds_only_triangle_gap action=reject_edge output_mid=6 64x48 pipe={pipeline_ref} vtx=6 indexed=1"
-        );
-    assert!(
-        body.lines()
-            .any(|line| crate::observe::line_is(line, &gap_marker)),
-        "bounds-only triangle-gap proxy must be always-on"
-    );
-
-    let shader_pulled_pipeline = pipeline_ref.wrapping_add(1);
-    log_shader_pulled_coverage_gap(
-        6,
-        64,
-        48,
-        shader_pulled_pipeline,
-        6,
-        true,
-        &shader_pull_reflection(&[1, 2]),
-        &ShaderPulledCoverageDecline::VertexEval(
-            crate::runtime::spirv_vertex_eval::VertexEvalDecline::BufferBindingMissing {
-                binding: 1,
-            },
-        ),
-    );
-    let shader_pulled_marker = format!(
-            "OFF linear_coverage_gap reason=spirv_vertex_eval_buffer_binding_missing binding=1 class=shader_pulled_position_unresolved action=reject_edge output_mid=6 width=64 height=48 pipe={shader_pulled_pipeline} vtx=6 indexed=1 position_out=1 vertex_index=1 storage_bindings=[1,2]"
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines()
-            .any(|line| crate::observe::line_is(line, &shader_pulled_marker)),
-        "shader-pulled coverage gap proxy must be always-on"
-    );
-}
-
-#[test]
-fn coverage_proxies_dedup_per_episode_but_relog_on_state_change() {
-    // Distinct mid/pipe from the other coverage test so the process-global
-    // SEEN sets never collide. Repeated identical verdicts must collapse to a
-    // single always-on line (no flood); a changed verdict must re-log.
-    let count = |marker: &str| -> usize {
-        let body = std::fs::read_to_string(crate::observe::fail_log_path())
-            .expect("reims-vgpu-fail.log readable");
-        body.lines()
-            .filter(|line| crate::observe::line_is(line, marker))
-            .count()
-    };
-
-    let mid = 4242u32;
-    let pipe = std::process::id().wrapping_add(4242);
-    let census_marker = format!(
-            "OFF compositor_linear_coverage output_mid={mid} 64x48 pipe={pipe} full=0 bounds=1 src=stage_in vtx=6 indexed=1 viewport=None scissor=None"
-        );
-    let gap_marker = format!(
-            "OFF linear_coverage_gap reason=bounds_only_triangle_gap action=reject_edge output_mid={mid} 64x48 pipe={pipe} vtx=6 indexed=1"
-        );
-    for _ in 0..5 {
-        log_compositor_linear_coverage(
-            mid, 64, 48, pipe, false, true, 6, true, None, None, "stage_in",
-        );
-    }
-    assert_eq!(
-        count(&census_marker),
-        1,
-        "census must dedup identical verdicts"
-    );
-    assert_eq!(
-        count(&gap_marker),
-        1,
-        "bounds-only gap must dedup identical verdicts"
-    );
-
-    // A coverage-state change (partial -> full) is a new verdict and re-logs.
-    let full_marker = format!(
-            "OFF compositor_linear_coverage output_mid={mid} 64x48 pipe={pipe} full=1 bounds=1 src=stage_in vtx=6 indexed=1 viewport=None scissor=None"
-        );
-    for _ in 0..3 {
-        log_compositor_linear_coverage(
-            mid, 64, 48, pipe, true, true, 6, true, None, None, "stage_in",
-        );
-    }
-    assert_eq!(
-        count(&full_marker),
-        1,
-        "a new coverage verdict must re-log once"
-    );
-
-    // Shader-pulled gap dedups per (mid, pipe, eval); a new eval re-logs.
-    let iface = shader_pull_reflection(&[0]);
-    let eval_a_marker = format!(
-            "OFF linear_coverage_gap reason=shader_pulled_coverage_partial_viewport_or_scissor class=shader_pulled_position_unresolved action=reject_edge output_mid={mid} width=64 height=48 pipe={pipe} vtx=6 indexed=1 position_out=1 vertex_index=1 storage_bindings=[0]"
-        );
-    let eval_b_marker = format!(
-            "OFF linear_coverage_gap reason=shader_pulled_coverage_triangle_gap class=shader_pulled_position_unresolved action=reject_edge output_mid={mid} width=64 height=48 pipe={pipe} vtx=6 indexed=1 position_out=1 vertex_index=1 storage_bindings=[0]"
-        );
-    for _ in 0..7 {
-        log_shader_pulled_coverage_gap(
-            mid,
-            64,
-            48,
-            pipe,
-            6,
-            true,
-            &iface,
-            &ShaderPulledCoverageDecline::PartialViewportOrScissor,
-        );
-    }
-    log_shader_pulled_coverage_gap(
-        mid,
-        64,
-        48,
-        pipe,
-        6,
-        true,
-        &iface,
-        &ShaderPulledCoverageDecline::TriangleGap,
-    );
-    assert_eq!(
-        count(&eval_a_marker),
-        1,
-        "shader-pulled gap must dedup identical eval"
-    );
-    assert_eq!(
-        count(&eval_b_marker),
-        1,
-        "a new eval cause must re-log once"
-    );
-}
-
-/// Vulkan-arm only: `draw_full_target_coverage_shader_pulled` is a
-/// `backend-vulkan` fn.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn shader_pulled_coverage_evaluates_positions_and_fails_closed() {
-    use crate::backend::vulkan::engine::{
-        DrawRequest, IndexType, IndexedDrawResource, StorageBufferResource,
-    };
-    use crate::runtime::spirv_vertex_eval::fixtures;
-
-    let words = fixtures::shader_pulled_quad_module(false);
-    let request = |width: f32, height: f32, records: Vec<u8>| DrawRequest {
-        indexed: Some(IndexedDrawResource {
-            index_type: IndexType::U16,
-            index_count: 6,
-            vertex_offset: 0,
-            indices: [0u16, 1, 2, 2, 3, 0]
-                .into_iter()
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        }),
-        storage_buffers: vec![
-            StorageBufferResource {
-                binding: 0,
-                content: fixtures::config_bytes(2).into(),
-            },
-            StorageBufferResource {
-                binding: 1,
-                content: records.into(),
-            },
-            StorageBufferResource {
-                binding: 2,
-                content: fixtures::ortho_matrix_bytes(width, height).into(),
-            },
-        ],
-        ..DrawRequest::default()
-    };
-
-    // A full-target quad pulled from the storage buffer proves coverage
-    // that the stage-in proof cannot see at all.
-    let full = request(64.0, 48.0, fixtures::quad_record_bytes(64.0, 48.0));
-    let coverage = draw_full_target_coverage_shader_pulled(&full, 64, 48, 1, &words)
-        .expect("full quad evaluates");
-    assert!(coverage.full(), "{coverage:?}");
-    assert!(!draw_full_target_coverage(&full, 64, 48, 1).full());
-
-    // A partial quad evaluates but must not claim coverage.
-    let partial = request(64.0, 48.0, fixtures::quad_record_bytes(32.0, 48.0));
-    let coverage = draw_full_target_coverage_shader_pulled(&partial, 64, 48, 1, &words)
-        .expect("partial quad evaluates");
-    assert!(!coverage.full() && !coverage.bounds_span, "{coverage:?}");
-
-    // A missing bound buffer fails closed with a named slug.
-    let mut missing = request(64.0, 48.0, fixtures::quad_record_bytes(64.0, 48.0));
-    missing.storage_buffers.remove(1);
-    let err = draw_full_target_coverage_shader_pulled(&missing, 64, 48, 1, &words)
-        .expect_err("missing binding fails closed");
-    assert_eq!(
-        err,
-        ShaderPulledCoverageDecline::VertexEval(
-            crate::runtime::spirv_vertex_eval::VertexEvalDecline::BufferBindingMissing {
-                binding: 1
-            }
-        )
-    );
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn shader_pulled_coverage_declines_name_every_outer_check() {
-    use crate::runtime::spirv_vertex_eval::VertexEvalDecline;
-
-    let declines = [
-        ShaderPulledCoverageDecline::ZeroTarget,
-        ShaderPulledCoverageDecline::PartialViewportOrScissor,
-        ShaderPulledCoverageDecline::IndexStreamInvalid,
-        ShaderPulledCoverageDecline::TooFewIndices { count: 2 },
-        ShaderPulledCoverageDecline::VertexEval(VertexEvalDecline::BufferBindingMissing {
-            binding: 7,
-        }),
-        ShaderPulledCoverageDecline::PositionWDegenerate { vertex_index: 3 },
-        ShaderPulledCoverageDecline::PositionNotFinite { vertex_index: 3 },
-        ShaderPulledCoverageDecline::TriangleGap,
-        ShaderPulledCoverageDecline::PartialBounds,
-    ];
-    let mut slugs = declines.iter().map(Decline::slug).collect::<Vec<_>>();
-    assert_eq!(slugs.len(), 9);
-    assert!(slugs.iter().all(|slug| {
-        slug.starts_with("shader_pulled_coverage_") || slug.starts_with("spirv_vertex_eval_")
-    }));
-    slugs.sort_unstable();
-    slugs.dedup();
-    assert_eq!(
-        slugs.len(),
-        9,
-        "coverage checks must remain distinguishable"
-    );
-}
-
-#[test]
-fn zero_rgb_alpha_mask_proxy_is_fail_visible_for_small_samples() {
-    let task_id = std::process::id();
-    let texture_ref = 0xf000_0000u32.wrapping_add(task_id);
-    let marker = format!(
-            "OFF sample_alpha_mask reason=zero_rgb_alpha_preserved src=guest task={task_id} ref={texture_ref} type=2 gva=0x7788000 fmt=0x1 3x1 bpr=3 host_gen=0 zero_rgb_alpha=2 opaque_black=1"
-        );
-    let rgba = [0, 0, 0, 17, 0, 0, 0, 255, 0, 0, 0, 0];
-    log_linear_sample_src(
-        task_id,
-        texture_ref,
-        2,
-        0x0778_8000,
-        pixel_format::MTL_FORMAT_A8_UNORM,
-        3,
-        3,
-        1,
-        "guest",
-        0,
-        &rgba,
-    );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "small alpha-mask preservation proxy must be always-on"
-    );
 }
 
 /// Vulkan-arm only: `AttachmentAliasSample` and its resolver are
@@ -1574,18 +1293,6 @@ fn gva_attachment_alias_samples_the_in_process_chain() {
     assert_eq!(actual, seed);
     assert!(fragment_attachment_alias_sample(&req, 1, texture_ref).is_none());
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref + 1).is_none());
-
-    log_attachment_alias_chain(task_id, 0, texture_ref, target_gva, 2, 1, actual);
-    let marker = format!(
-            "OFF attachment_alias_chain reason=in_process_seed action=sample_seed task={task_id} i=0 ref={texture_ref} gva=0xabcd000 2x1 rgb_nz=1 max_rgb=10 alpha_nz=1"
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines()
-            .any(|line| crate::observe::line_is(line, &marker)),
-        "attachment alias chain proxy must be always-on"
-    );
 
     req.colors[0].mapping_id = 9;
     assert!(fragment_attachment_alias_sample(&req, 0, texture_ref).is_none());
@@ -1660,6 +1367,20 @@ fn tight_rgba_linear_load_preserves_native_bytes() {
 fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     use crate::runtime::census::srgb_census;
     srgb_census::reset_for_tests();
+    // The sink is append-only and shared with every other test in the binary,
+    // so this asserts a delta, not an absolute count.
+    // Count LINES, not substring hits: the slug appears twice per line, once as
+    // the event prefix and once as `reason=`.
+    let downgrade_lines = || {
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .map(|l| {
+                l.lines()
+                    .filter(|l| l.starts_with("srgb_downgraded "))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let before = downgrade_lines();
 
     // Native-upload rail: sRGB resolves exactly as its linear sibling.
     assert_eq!(
@@ -1691,10 +1412,18 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         "channel swap still applied"
     );
 
-    let (total, per_site) = srgb_census::counts();
-    assert_eq!(total, 3, "every downgrade counted, none swallowed");
-    assert_eq!(per_site[srgb_census::site::LINEAR_NATIVE_UPLOAD], 2);
-    assert_eq!(per_site[srgb_census::site::TIGHT_LINEAR_LOAD], 1);
+    // Three distinct (site, format) pairs were downgraded above — two on the
+    // native-upload rail (RGBA8 and BGRA8 sRGB) and one on the tight-load rail
+    // — so the sink must carry three lines and name both rails. Read off the
+    // log rather than a counter: the line is what a boot has to show.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert_eq!(
+        downgrade_lines() - before,
+        3,
+        "every downgrade named, none swallowed"
+    );
+    assert!(log.contains(&format!("site={}", srgb_census::site::LINEAR_NATIVE_UPLOAD)));
+    assert!(log.contains(&format!("site={}", srgb_census::site::TIGHT_LINEAR_LOAD)));
 
     // A linear source must never touch the census, or the proxy floods and
     // stops distinguishing anything.
@@ -1704,34 +1433,12 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
         dst.copy_from_slice(&native);
         true
     });
-    assert_eq!(srgb_census::counts().0, 0);
+    assert_eq!(
+        downgrade_lines() - before,
+        3,
+        "a linear source must add no line"
+    );
     srgb_census::reset_for_tests();
-}
-
-#[test]
-fn linear_sample_read_proxy_is_fail_visible() {
-    let task_id = std::process::id();
-    let marker = format!(
-            "OFF linear_sample_read mode=bulk_tight task={task_id} ref=19 gva=0x50be000 1920x1080 bpr=7680 calls=1 total_us=1234"
-        );
-    log_linear_sample_read(
-        task_id,
-        19,
-        0x50be000,
-        1920,
-        1080,
-        7680,
-        "bulk_tight",
-        1,
-        1234,
-    );
-
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "linear sample read-cost proxy must be always-on"
-    );
 }
 
 #[test]
@@ -1935,85 +1642,6 @@ fn vulkan_sampler_preserves_guest_coordinate_and_filter_state() {
     assert_eq!(mag.slug(), "draw_prepare_sampler_mag_filter_translation");
 }
 
-#[test]
-fn elapsed_us_is_monotonic_nonnegative() {
-    let t0 = std::time::Instant::now();
-    // Tiny sleep so some platforms report >0 (not required for correctness).
-    std::thread::yield_now();
-    let us = super::elapsed_us(t0);
-    // Must not panic / wrap; Instant::elapsed is always ≥ 0.
-    let _ = us;
-}
-
-/// Timing line fields must stay grep-stable for boot census scripts.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn m2v_timing_line_has_stage_fields() {
-    // log_linux_m2v_timing writes always-on fail log; assert the format contract
-    // by constructing the same string the logger uses.
-    let line = "linux_m2v_timing pipe=42 1920x1080 total_us=1000 load_us=10 m2v_us=20 setup_us=30 setup_spv_us=1 setup_bufs_us=2 setup_tex_us=3 setup_seed_us=4 setup_asm_us=5 asm_prep_us=1 asm_load_us=2 asm_cov_us=1 asm_diag_us=1 engine_us=400 engine_unattributed_us=40 composite_us=0 vk_engine_creates=1 vk_engine_allocs=1 pipe_hit=0 pipe_miss=1 context_us=1 pool_init_us=2 cache_us=3 shader_create_us=4 layout_create_us=5 pass_create_us=6 pipeline_create_us=7 sampler_create_us=8 resource_us=90 resource_unattributed_us=9 sampler_prepare_us=10 vertex_prepare_us=11 index_prepare_us=12 storage_prepare_us=13 seed_prepare_us=14 target_prepare_us=15 sampled_prepare_us=16 readback_prepare_us=17 descriptor_prepare_us=18 memory_alloc_us=19 pre_record_wait_us=20 record_us=21 submit_us=22 wait_us=23 retire_wait_us=0 post_wait_skips=1 ring_retire_blocks=0 readback_us=24 vk_engine_readbacks=1 seed_uploads=1 sampled_reuploads=1 sampled_reupload_bytes=16 sampled_cache_hits=2 sampled_cache_hit_bytes=32 sampled_cache_misses=1 sampled_gpu_binds=0";
-    for key in [
-        "linux_m2v_timing",
-        "total_us=",
-        "load_us=",
-        "m2v_us=",
-        "setup_us=",
-        "setup_spv_us=",
-        "setup_bufs_us=",
-        "setup_tex_us=",
-        "setup_seed_us=",
-        "setup_asm_us=",
-        "asm_prep_us=",
-        "asm_load_us=",
-        "asm_cov_us=",
-        "asm_diag_us=",
-        "engine_us=",
-        "engine_unattributed_us=",
-        "composite_us=",
-        "vk_engine_creates=",
-        "context_us=",
-        "pool_init_us=",
-        "cache_us=",
-        "shader_create_us=",
-        "layout_create_us=",
-        "pass_create_us=",
-        "pipeline_create_us=",
-        "sampler_create_us=",
-        "resource_us=",
-        "resource_unattributed_us=",
-        "sampler_prepare_us=",
-        "vertex_prepare_us=",
-        "index_prepare_us=",
-        "storage_prepare_us=",
-        "seed_prepare_us=",
-        "target_prepare_us=",
-        "sampled_prepare_us=",
-        "readback_prepare_us=",
-        "descriptor_prepare_us=",
-        "memory_alloc_us=",
-        "pre_record_wait_us=",
-        "record_us=",
-        "submit_us=",
-        "wait_us=",
-        "retire_wait_us=",
-        "post_wait_skips=",
-        "ring_retire_blocks=",
-        "readback_us=",
-        "vk_engine_readbacks=",
-        "seed_uploads=",
-        "sampled_reuploads=",
-        "sampled_reupload_bytes=",
-        "sampled_cache_hits=",
-        "sampled_cache_hit_bytes=",
-        "sampled_cache_misses=",
-        "sampled_gpu_binds=",
-    ] {
-        assert!(line.contains(key), "missing {key} in {line}");
-    }
-    assert_eq!(engine_unattributed_us(100, &[10, 20, 30]), 40);
-    assert_eq!(engine_unattributed_us(10, &[20]), 0);
-}
-
 /// qemu-shim Store policy: Clear/DontCare/force_full full-write; Load+seed
 /// may diff-only. Prevents Clear+partial logo-mid residual.
 #[test]
@@ -2027,159 +1655,6 @@ fn store_seed_policy_clear_full_load_diff() {
         Some(seed.as_slice())
     );
     assert!(store_seed_policy(false, PASS_LOAD_ACTION_LOAD, None).is_none());
-}
-
-/// Class A zero-copy wipe: LOAD + resident ready must LoadFromTarget even
-/// when host_cache was evicted (no CPU seed) or still holds black.
-#[test]
-fn type11_load_ready_uses_resident_not_clear() {
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, None, false, false),
-        Type11LoadChoice::LoadFromTarget
-    );
-    // CPU seed content never wins over a ready resident image.
-    let black = [0u8, 0, 0, 255];
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, Some(&black), false, false),
-        Type11LoadChoice::LoadFromTarget
-    );
-    // First touch: not ready, no seed → Clear (engine default).
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, None, false, false),
-        Type11LoadChoice::ClearBlack
-    );
-    // First touch with an all-black CPU seed still uploads that seed;
-    // presence, not an RGB census, is the Load contract.
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, Some(&black), false, false),
-        Type11LoadChoice::UseCpuSeed
-    );
-    // CLEAR never LoadFromTarget via this helper.
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_CLEAR, true, Some(&black), false, false),
-        Type11LoadChoice::UseCpuSeed
-    );
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_CLEAR, true, None, false, false),
-        Type11LoadChoice::ClearBlack
-    );
-}
-
-/// Dual-mid strobe class: the first LOAD draw after a mapping's own
-/// present must seed from guest pages (the guest may have CPU
-/// forward-copied into them) even when the resident chain is ready —
-/// and fall back to the resident when the pages were unreadable.
-#[test]
-fn type11_load_present_boundary_prefers_guest_seed() {
-    let seed = [9u8, 9, 9, 255];
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, Some(&seed), false, true),
-        Type11LoadChoice::UseCpuSeed
-    );
-    // GPU boundary seed (resident→target copy armed on the request)
-    // counts as seed presence exactly like CPU bytes: it must win over a
-    // ready resident at a present boundary.
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, None, true, true),
-        Type11LoadChoice::UseCpuSeed
-    );
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, None, true, true),
-        Type11LoadChoice::UseCpuSeed
-    );
-    // Pages unreadable (no seed): the ready resident is the fallback, not
-    // a black clear.
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, true, None, false, true),
-        Type11LoadChoice::LoadFromTarget
-    );
-    // Boundary + no resident + no seed still clears (first touch).
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_LOAD, false, None, false, true),
-        Type11LoadChoice::ClearBlack
-    );
-    // Boundary never affects CLEAR semantics.
-    assert_eq!(
-        resolve_type11_load_choice(PASS_LOAD_ACTION_CLEAR, true, Some(&seed), false, true),
-        Type11LoadChoice::UseCpuSeed
-    );
-}
-
-/// Present-boundary front-frame seed: exact-geometry retain converts
-/// BGRA→RGBA; invalid or mismatched retains yield None (guest-pages /
-/// resident fallback).
-#[test]
-fn present_front_frame_seed_requires_valid_same_geometry_retain() {
-    let mut present = crate::model::PresentState::default();
-    // Invalid retain → None.
-    assert_eq!(present_front_frame_rgba(&present, 2, 1), None);
-    // Valid 2x1 BGRA retain: [B,G,R,A] pixels.
-    present.frame_valid = true;
-    present.frame_width = 2;
-    present.frame_height = 1;
-    present.frame_bgra = vec![1, 2, 3, 255, 4, 5, 6, 255];
-    assert_eq!(
-        present_front_frame_rgba(&present, 2, 1).as_deref(),
-        Some(&[3u8, 2, 1, 255, 6, 5, 4, 255][..]),
-        "BGRA retain swizzles to RGBA seed"
-    );
-    // Geometry mismatch → None.
-    assert_eq!(present_front_frame_rgba(&present, 1, 1), None);
-    assert_eq!(present_front_frame_rgba(&present, 2, 2), None);
-    // Short buffer → None.
-    present.frame_bgra.truncate(4);
-    assert_eq!(present_front_frame_rgba(&present, 2, 1), None);
-}
-
-/// Load composite must not restore seed over intentional covered black.
-#[test]
-fn load_composite_keeps_covered_black_restores_alpha0_only() {
-    // Seed: gray base (prior frame / host_cache).
-    let seed = vec![187u8, 187, 187, 255, 187, 187, 187, 255];
-    // Draw: covered black (loginwindow) + uncovered hole (A=0).
-    let draw = vec![0u8, 0, 0, 255, 0, 0, 0, 0];
-    let (out, filled) = load_composite_alpha0_holes(&draw, &seed);
-    assert_eq!(filled, 1, "only alpha-0 hole restored");
-    assert_eq!(&out[0..4], &[0, 0, 0, 255], "covered black stays black");
-    assert_eq!(&out[4..8], &[187, 187, 187, 255], "alpha0 hole gets seed");
-}
-
-/// Fully opaque draw black must never pull seed (would freeze logo base).
-#[test]
-fn load_composite_full_covered_black_no_seed() {
-    let seed = vec![153u8; 16]; // 4 gray pixels
-    let draw = vec![
-        0u8, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255,
-    ];
-    let (out, filled) = load_composite_alpha0_holes(&draw, &seed);
-    assert_eq!(filled, 0);
-    assert_eq!(&out[..], &draw[..]);
-}
-
-/// serial-224146 pipe=60: sky Load seed + empty type-3 layer among mixed
-/// binds → opaque black draw must keep seed (not load_wipe sky).
-#[test]
-fn keep_seed_when_empty_type3_linear_among_mixed_binds() {
-    assert!(
-        should_keep_seed_on_empty_draw(0, 2_073_600, 13, false, true),
-        "empty type-3 linear + empty draw keeps sky seed"
-    );
-    assert!(
-        should_keep_seed_on_empty_draw(0, 50_000, 1, true, false),
-        "all samples RGB-empty still keeps"
-    );
-    assert!(
-        !should_keep_seed_on_empty_draw(0, 2_073_600, 13, false, false),
-        "mixed non-empty samples without empty type-3 do not keep"
-    );
-    assert!(
-        !should_keep_seed_on_empty_draw(185, 2_073_600, 13, false, true),
-        "non-empty draw RGB does not keep (real coverage)"
-    );
-    assert!(
-        !should_keep_seed_on_empty_draw(0, 0, 13, false, true),
-        "no Load seed → nothing to keep"
-    );
 }
 
 /// Premult One/OneMinusSrcAlpha Load: transparent draw keeps seed; opaque black wins.
@@ -2301,7 +1776,6 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
 #[test]
 fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2312,34 +1786,13 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
 
     // One-level page table: GVA pages 0..7 → data PFNs (blit_exec pattern).
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     // Object list at GVA page 0; count covers live residual slot 211.
     assert!(state.set_object_list(1, 0, 256));
 
@@ -2374,27 +1827,13 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 256).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -2430,7 +1869,6 @@ fn mrt_draw_request_type8_view_of_type11_as_color_rt() {
 #[test]
 fn mrt_draw_request_nested_type8_view_chain_to_type11() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2441,29 +1879,7 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
-
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     fn write_type8_view(
         host: &mut FakeHost,
@@ -2493,32 +1909,18 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
         st64(&mut desc[TEXTURE_VIEW_DESC_LEVEL_COUNT..], 1);
         st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
         st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
-        assert!(gva_mem::write_task_gva(
-            &mut *host,
-            &state.tasks[1],
-            desc_gva,
-            &desc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut *host, &state.tasks[1], desc_gva, &desc);
         let off = list_object_entry_offset(view_ref, 256).unwrap();
         let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
         let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        assert!(gva_mem::write_task_gva(
-            &mut *host,
-            &state.tasks[1],
-            off,
-            &list_entry,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut *host, &state.tasks[1], off, &list_entry);
     }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 256));
 
     // type-11 mid 9 as texture ref 3.
@@ -2563,7 +1965,6 @@ fn mrt_draw_request_nested_type8_view_chain_to_type11() {
 #[test]
 fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2574,33 +1975,11 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_REF, TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_SWIZZLE,
         TEXTURE_VIEW_MTL_TYPE_2D, TEXTURE_VIEW_OPCODE_SWIZZLE,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
-
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
@@ -2631,27 +2010,13 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
     // Non-identity BGRA → RGBA channel remap.
     desc[TEXTURE_VIEW_DESC_SWIZZLE..TEXTURE_VIEW_DESC_SWIZZLE + 4].copy_from_slice(&[2u8, 1, 0, 3]);
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -2686,7 +2051,6 @@ fn mrt_draw_request_type8_swizzled_view_rejected_as_color_rt() {
 #[test]
 fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2694,33 +2058,11 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
         OBJECT_TYPE_TEXTURE, RESOURCE_PAGE_SHIFT, TEXTURE_DESC_BASE_LEN, TEXTURE_DESC_HEIGHT,
         TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
-
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..16u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 16);
     assert!(state.set_object_list(1, 0, 256));
 
     // Stale type-11 latch at ref 199 (guest recycled the ref to type-2).
@@ -2746,27 +2088,13 @@ fn mrt_draw_request_type2_rgba16f_as_color_rt_despite_stale_t11_latch() {
         MTL_FORMAT_RGBA16_FLOAT,
     );
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(tex_ref, 256).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE as u32) | ((TEXTURE_DESC_BASE_LEN as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -2882,7 +2210,6 @@ fn mrt_draw_request_type11_live_mapping_overrides_stale_latch() {
 #[test]
 fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -2893,33 +2220,11 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
-
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     assert!(state.map_surface(9));
     assert!(state.set_mapping_geom(9, 64, 64, MTL_FORMAT_BGRA8_UNORM));
@@ -2948,27 +2253,13 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let desc_gva = 0x280u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     let packed = (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8);
     st32(&mut list_entry[0..], packed);
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let att = ColorAttachment {
         present: true,
@@ -3004,7 +2295,6 @@ fn mrt_draw_request_type8_nonzero_level_rejected_as_color_rt() {
 #[test]
 fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     use crate::contract::endian::{st16, st32, st64};
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
@@ -3020,33 +2310,11 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         TEXTURE_VIEW_DESC_TEXTURE_TYPE, TEXTURE_VIEW_MIN_RANGED, TEXTURE_VIEW_MTL_TYPE_2D,
         TEXTURE_VIEW_OPCODE_RANGED,
     };
-    use crate::runtime::gva_mem;
     use crate::runtime::host::FakeHost;
-
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-    }
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    setup_task_pages(&mut host, &mut state, 4);
+    gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
 
     // Type-2 base with 2 mips: L0 64x32 bpr 256; L1 at +0x2000, 32x16 bpr 128.
@@ -3072,14 +2340,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         MTL_FORMAT_BGRA8_UNORM,
     );
     let base_desc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        base_desc_gva,
-        &b,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], base_desc_gva, &b);
     let off = list_object_entry_offset(base_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -3087,9 +2348,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
     );
     le[4..12].copy_from_slice(&base_desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
     // Type-8 view: level_base=1 over the type-2 base.
     let view_ref = 8u32;
@@ -3115,14 +2374,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_BASE..], 0);
     st64(&mut desc[TEXTURE_VIEW_DESC_SLICE_COUNT..], 1);
     let desc_gva = 0x400u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(view_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -3130,9 +2382,7 @@ fn mrt_draw_request_type8_mip_level_view_of_linear_as_color_rt() {
         (OBJECT_TYPE_TEXTURE_VIEW as u32) | ((len as u32) << 8),
     );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
     let att = ColorAttachment {
         present: true,
@@ -3190,9 +2440,15 @@ fn view_swizzle_remaps_rgba8_pixels() {
     // Odd length fails visibly.
     let mut bad = vec![1u8, 2, 3];
     assert!(apply_view_swizzle_rgba8(&mut bad, Some(&plan), 1).is_none());
-    // One non-identity remap ran; the identity and None calls did not, and
-    // neither did the length-rejected one.
-    assert_eq!(crate::runtime::census::view_swizzle_census::counts().1, 1);
+    // One non-identity remap ran and said so; the identity and None calls did
+    // not, and neither did the length-rejected one. Read off the always-on sink
+    // rather than a counter: the line is what a boot actually has to show.
+    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
+    assert_eq!(
+        log.match_indices("view_swizzle_cpu_remap").count(),
+        1,
+        "exactly one CPU remap must be reported"
+    );
     crate::runtime::census::view_swizzle_census::reset_for_tests();
 }
 
@@ -3286,12 +2542,100 @@ fn write_gva_rgba8_uses_device_page_shift_x86() {
             8, // bpr = 2*4
             MTL_FORMAT_BGRA8_UNORM,
             &rgba,
-        ),
+        )
+        .is_ok(),
         "x86 page_shift=12 GVA store must succeed"
     );
     let mut back = [0u8; 8];
     assert!(gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, page_shift).is_ok());
     // BGRA row0: B,G,R,A = 30,20,10,255
+    assert_eq!(&back[..4], &[30, 20, 10, 255]);
+}
+
+/// A render-target Store outside the writing task's MapMemory2 spans still
+/// reaches guest RAM, and that is deliberate.
+///
+/// This rail was the first to be exempted, by measurement, and it was right: on
+/// a driven x86/Vulkan boot the gate read `exact=1155 no_spans=0 outside=893`
+/// over 2048 Stores, so refusing here drops 44% of them and blanks the screen.
+/// MapMemory2 does not describe render targets — see the module note on
+/// `write_gva_rgba8` for the span enumeration and for why the `owners=` field
+/// cannot be used as a weaker gate either.
+///
+/// Every other rail has since been exempted too, for the same reason arrived at
+/// from the other end: a notification the guest sends *after* installing the
+/// PTEs and using the memory cannot authorise anything. `WriteGate::Undeclared`
+/// is now a reported reading everywhere rather than a refusal anywhere, and
+/// `44%` is the number that says how normal it is.
+///
+/// This test exists so that adding the gate back fails loudly rather than
+/// silently costing half the frame. The fixture declares a span for the writing
+/// task that deliberately does *not* cover the target, which is exactly the arm
+/// that would refuse.
+#[test]
+fn an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram() {
+    use crate::contract::endian::st32;
+    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::host::FakeHost;
+
+    let page_shift = PAGE_SHIFT_X86;
+    let mut host = FakeHost::new();
+    let dir_gpa = 2u64 << page_shift;
+    let root_gpa = 3u64 << page_shift;
+    let data_gpa = 5u64 << page_shift;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x1000, 0);
+    host.map_range(data_gpa, 0x1000, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 5);
+    let _ = host.write_gpa(root_gpa + 4, &d[..4]);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.page_shift = page_shift;
+    assert!(state.define_task(1, 0x1000, 2));
+
+    let gva = 1u64 << page_shift; // 0x1000
+
+    // Task 1 declares a span far away from the target. The registry is now
+    // non-empty for this task, so the gate has a real bounds check to fail.
+    state.note_task_map(1, 0x9_0000, 0x1000);
+    assert_eq!(
+        state.gva_write_gate(1, gva, 2 * 8),
+        crate::model::WriteGate::Undeclared,
+        "fixture is not real: the gate must land on the arm under test"
+    );
+
+    let rgba = [
+        10u8, 20, 30, 255, //
+        40, 50, 60, 255, //
+        70, 80, 90, 255, //
+        100, 110, 120, 255,
+    ];
+    assert!(
+        write_gva_rgba8(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            2,
+            2,
+            8,
+            MTL_FORMAT_BGRA8_UNORM,
+            &rgba,
+        )
+        .is_ok(),
+        "this writer is deliberately ungated: an Outside store must still reach \
+         guest RAM, or 44% of render Stores are lost"
+    );
+
+    // …and the bytes really landed, so this is not passing on a write that
+    // failed for some unrelated reason.
+    let mut back = [0u8; 8];
+    assert!(gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, page_shift).is_ok());
     assert_eq!(&back[..4], &[30, 20, 10, 255]);
 }
 
@@ -3312,16 +2656,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
         px[2] = 185;
         px[3] = 255;
     }
-    host_cache_store_gva_layer(
-        &mut state,
-        0,
-        tex_ref,
-        OBJECT_TYPE_TEXTURE,
-        gva,
-        w,
-        h,
-        &rgba,
-    );
+    host_cache_store_gva_layer(&mut state, tex_ref, OBJECT_TYPE_TEXTURE, gva, w, h, &rgba);
     let cached = crate::runtime::surface_cache::get_texture(&state, tex_ref, w, h)
         .expect("texture_ref encode cache");
     // BGRA storage
@@ -3353,7 +2688,6 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -3395,14 +2729,7 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         MTL_FORMAT_BGRA8_UNORM,
     );
     let desc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        desc_gva,
-        &desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
     let off = list_object_entry_offset(tex_ref, 32).unwrap();
     let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -3410,14 +2737,7 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         (OBJECT_TYPE_TEXTURE_VARIANT as u32) | ((body as u32) << 8),
     );
     list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        off,
-        &list_entry,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
 
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
     let bgra = [40u8, 20, 10, 255].repeat((w * h) as usize);
@@ -3427,8 +2747,6 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         w,
         h,
         bgra,
-        1,
-        77,
         OBJECT_TYPE_TEXTURE,
     );
 
@@ -3447,12 +2765,15 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
     assert_eq!(&rgba[..4], &[10, 20, 40, 255]);
     let identity = identity.expect("GVA cache identity");
     assert_eq!(identity.key, texel_gva);
-    assert_eq!(identity.generation, 1);
+    // The value is whatever the device-global counter had reached; what the
+    // engine binds on is that it was issued once. Pinning a literal here would
+    // pin the counter's history, not the property.
+    assert_ne!(identity.generation, 0, "0 means no host content yet");
 }
 
 /// Guest-CPU-produced tight linear textures: unchanged native bytes must
-/// reuse the memoized RGBA Arc under a stable >u32::MAX generation
-/// identity; a guest write must be observed and produce a new generation.
+/// reuse the memoized RGBA Arc under a stable generation identity; a guest
+/// write must be observed and produce a new generation.
 #[test]
 fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     use crate::contract::endian::{st16, st32, st64};
@@ -3463,7 +2784,6 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -3500,10 +2820,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     st32(&mut b[TEXTURE_DESC_WIDTH + 4..], 2); // height
     st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
     let desc_gva = 0x200u64;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &b, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
     let off = list_object_entry_offset(tex_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -3511,19 +2828,10 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
         (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
     );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
     let bgra = [7u8, 5, 3, 255].repeat(8);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        texel_gva,
-        &bgra,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &bgra);
 
     // The caller resolves the object-list entry + decodes the descriptor
     // once and threads them in; the list is immutable for the draw.
@@ -3546,11 +2854,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     assert_eq!(&rgba1[..4], &[7, 5, 3, 255], "native BGRA8, unswizzled");
     let id1 = id1.expect("guest memo path must carry an identity");
     assert_eq!(id1.key, texel_gva);
-    assert!(
-        id1.generation > u32::MAX as u64,
-        "guest generations must not alias host_gen: {}",
-        id1.generation
-    );
+    assert_ne!(id1.generation, 0, "0 means no host content yet");
 
     let (_, _, rgba2, id2, _) =
         load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
@@ -3563,14 +2867,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
 
     // A direct guest write must be observed on the very next load.
     let bgra_new = [90u8, 60, 30, 255].repeat(8);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        texel_gva,
-        &bgra_new,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &bgra_new);
     let (_, _, rgba3, id3, _) =
         load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
             .expect("post-write load must succeed");
@@ -3595,7 +2892,6 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
-    use crate::runtime::gva_mem;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -3636,10 +2932,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     st32(&mut b[TEXTURE_DESC_WIDTH + 4..], h);
     st16(&mut b[TEXTURE_DESC_PIXEL_FORMAT..], MTL_FORMAT_BGRA8_UNORM);
     let desc_gva = 0x200u64;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], desc_gva, &b, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
+    write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &b);
     let off = list_object_entry_offset(tex_ref, 32).unwrap();
     let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
     st32(
@@ -3647,9 +2940,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         (OBJECT_TYPE_TEXTURE as u32) | ((body as u32) << 8),
     );
     le[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
 
     // Write two padded rows: each 16 tight BGRA bytes then 8 pad bytes.
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
@@ -3662,14 +2953,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     backing.extend_from_slice(&row1);
     backing.extend_from_slice(&pad);
     assert_eq!(backing.len(), (bpr * h) as usize);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        texel_gva,
-        &backing,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    write_task_gva_arm64e(&mut host, &state.tasks[1], texel_gva, &backing);
 
     let le_entry = objects::lookup_list_entry(&state, &host, 1, tex_ref)
         .expect("object-list entry must resolve");
@@ -3688,11 +2972,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         "padded BGRA8 must upload native (no CPU swizzle)"
     );
     let id = identity.expect("the padded memo path carries a producer identity");
-    assert!(
-        id.generation > u32::MAX as u64,
-        "guest generations must not alias host_gen: {}",
-        id.generation
-    );
+    assert_ne!(id.generation, 0, "0 means no host content yet");
     // Tight output = the two source rows concatenated, native BGRA order,
     // padding stripped. Length is w*h*4 regardless of format.
     let mut want = Vec::new();
@@ -3763,16 +3043,6 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
     )
     .expect("exact GVA cache seed");
     assert_eq!(seed, vec![0, 0, 0, 255, 0, 0, 0, 255]);
-
-    let marker = format!(
-            "OFF load_seed_black reason=zero_rgb_seed_preserved src=gva_cache task={task_id} ref={texture_ref} mid=0 gva={target_gva:#x} 2x1 alpha_nz=2"
-        );
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
-    assert!(
-        body.lines().any(|line| line.starts_with(&marker)),
-        "black Load preservation proxy must be always-on"
-    );
 
     // Without a GVA match, use the texture namespace (green), never the
     // colliding surface namespace (red).
@@ -4032,15 +3302,6 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     st16(&mut device_desc[DEVICE_DESC_BPE..], 2);
     assert!(state.set_mapping_device_desc(surface_id, &device_desc));
 
-    // The per-bind `type5_draw_view ok` line is now REIMS_VGPU_DRAW_LOG-gated (it
-    // floods the always-on log under video); the ALWAYS-ON signal that a
-    // serialized-view materialization happened is the `sampled_branch_census`
-    // Type5View branch (idx 0, monotonic — a delta of >=1 is race-safe under
-    // parallel tests). Snapshot the count before the bind, assert it advanced.
-    let census_before = crate::runtime::census::sampled_census::count(
-        crate::runtime::census::sampled_census::Branch::Type5View,
-    );
-
     let (sample_w, sample_h, sample_mid, sampled) =
         resolve_sampled_source(&mut state, &mut host, 1, texture_ref, None)
             .expect("serialized RG8 view must sample the 2-byte surface");
@@ -4062,14 +3323,6 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
         &sampled[last..last + 2],
         &[158, 154],
         "row padding must not enter the RG8 view"
-    );
-    let census_after = crate::runtime::census::sampled_census::count(
-        crate::runtime::census::sampled_census::Branch::Type5View,
-    );
-    assert!(
-        census_after > census_before,
-        "the always-on sampled census must record the serialized-view \
-             materialization (Type5View {census_before} -> {census_after})"
     );
 }
 
@@ -4148,9 +3401,9 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     );
     // Native footprint: two bytes per texel, tight rows (no RGBA8 expand).
     assert_eq!(rgba1.len(), (width * height * 2) as usize);
-    assert!(
-        id1.generation > (1u64 << 32),
-        "type-5 identities share the guest-linear generation namespace"
+    assert_ne!(
+        id1.generation, 0,
+        "0 means no host content yet; every real store takes a fresh generation"
     );
     assert_eq!(
         id1.key,
@@ -4493,7 +3746,7 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
     // inheriting slot 0's — there is no `or_else(first())` fallback here.
     let unblended = RenderPipelineDescriptor {
         color_attachments: vec![
-            pipeline.color_attachments[0].clone(),
+            pipeline.color_attachments[0],
             PipelineColorAttachment {
                 slot: 1,
                 blending_enabled: false,

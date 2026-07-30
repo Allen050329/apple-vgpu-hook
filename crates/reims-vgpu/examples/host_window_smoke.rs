@@ -39,7 +39,6 @@ fn main() {
     });
 
     let stop = Arc::new(AtomicBool::new(false));
-    let import_capable = Arc::new(AtomicBool::new(false));
     let handle = spawn(
         WindowConfig {
             title: "reims_vgpu host-window smoke".to_string(),
@@ -49,7 +48,6 @@ fn main() {
         on_input,
         frames,
         stop,
-        import_capable,
     );
     match handle.join() {
         Ok(Ok(())) => println!("window closed"),
@@ -78,7 +76,6 @@ fn gradient(w: u32, h: u32, t: u32) -> Frame {
         width: w,
         height: h,
         bgra,
-        dmabuf: None,
         resident: None,
     }
 }

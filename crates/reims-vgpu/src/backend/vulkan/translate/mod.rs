@@ -46,7 +46,8 @@
 //!   [`super::caps`]'s job and it has its own rules.
 
 pub mod blend;
-pub mod coverage;
+#[cfg(test)]
+mod coverage;
 #[cfg(test)]
 mod gate;
 pub mod pixel;

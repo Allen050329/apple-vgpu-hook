@@ -50,11 +50,23 @@ pub struct ReimsVgpuHostOps {
     /// thread. Distinct from `schedule_bh` (drain-worker wake): prompt actions
     /// (IRQ pulses, cursor moves) must be deliverable mid-drain.
     pub notify_actions: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
-    /// 1 when `map_pages` returns a stable guest-RAM alias whose address is
-    /// never unmapped or recycled during the device lifetime (x86 PCI: a
-    /// direct RAMBlock pointer; arm MMIO: a direct HVA or retained packed
-    /// `mach_vm_remap` view). `unmap_pages` is a no-op. Only a stable alias may
-    /// be retained in a cached host-pointer import — see `map_pages_stable`.
+    /// 1 when `map_pages` owes no release: the pointer is guest RAM itself and
+    /// stays valid for the device lifetime, so a caller may hold it
+    /// indefinitely and `unmap_pages` has nothing to free.
+    ///
+    /// The two shims answer differently and the difference is real. x86 PCI
+    /// answers **1**: it never allocates, refusing any list that is not a
+    /// packed host-contiguous run and otherwise returning
+    /// `memory_region_get_ram_ptr() + xlat`. arm MMIO answers **0**: a
+    /// contiguous run gets the same direct HVA, but a fragmented one gets a
+    /// packed `mach_vm_remap` view, and a bare pointer cannot say which it is.
+    ///
+    /// This used to also license retaining the pointer inside a cached
+    /// `VK_EXT_external_memory_host` import, which is where the stronger
+    /// promise came from — MMIO could claim 1 only because it never released a
+    /// view at all, so every fragmented map leaked a VA reservation until
+    /// teardown. Nothing imports guest pages now, `unmap_pages` on that shim
+    /// really deallocates, and the flag is back to the narrow claim above.
     pub map_pages_stable: c_int,
 }
 
@@ -163,7 +175,8 @@ pub enum ReimsVgpuHostActionKind {
     CursorUpdate = 4,
     Trace = 5,
     CursorGlyph = 6,
-    ScanoutGl = 7,
+    // 7 is retired (the removed GL/dmabuf scanout action); the values below are
+    // spelled out so its removal did not renumber the wire.
     InputKey = 8,
     InputPointerMove = 9,
     InputPointerButton = 10,
@@ -524,12 +537,6 @@ impl HostOps for NullHost {
     fn schedule_bh(&mut self) {}
 }
 
-/// Map an internal action kind for C layout checks.
-#[allow(dead_code)]
-pub fn action_kind_wire(kind: HostActionKind) -> u32 {
-    kind as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,7 +663,7 @@ mod tests {
             Err(MemError::QemuWriteGpaCallbackMissing)
         );
         assert_eq!(
-            host.read_kva(0xfffffe00_1000, &mut [0; 1]),
+            host.read_kva(0xffff_fe00_1000, &mut [0; 1]),
             Err(MemError::QemuReadKvaCallbackMissing)
         );
         assert_eq!(
@@ -683,7 +690,7 @@ mod tests {
             Err(MemError::QemuWriteGpaCallbackFailed(-8))
         );
         assert_eq!(
-            host.read_kva(0xfffffe00_1000, &mut [0; 1]),
+            host.read_kva(0xffff_fe00_1000, &mut [0; 1]),
             Err(MemError::NoCpu),
             "-2 is the no-current-vCPU state, not an unmapped KVA"
         );
@@ -740,11 +747,7 @@ mod tests {
             "qemu_map_pages_null_pointer",
             "qemu_unmap_pages_callback_missing",
         ];
-        let row = crate::observe::REGISTRY
-            .iter()
-            .find(|class| class.type_name == "QemuHostDecline")
-            .expect("QemuHostDecline registry row");
-        assert_eq!(row.slugs, expected);
+        assert_eq!(declines.len(), expected.len());
         for (decline, expected_slug) in declines.iter().zip(expected) {
             assert_eq!(decline.slug(), expected_slug);
             assert!(expected_slug
@@ -764,12 +767,10 @@ mod tests {
         let mut actions = VecDeque::new();
         let mut host = QemuHost::new(&ops, &mut actions);
         assert_eq!(host.map_pages(&[0x4000], 0x4000), None);
-        drop(host);
 
         ops.map_pages = Some(fail_map_pages);
         let mut host = QemuHost::new(&ops, &mut actions);
         assert_eq!(host.map_pages(&[0x8000], 0x4000), None);
-        drop(host);
 
         ops.map_pages = Some(null_map_pages);
         let mut host = QemuHost::new(&ops, &mut actions);
@@ -791,7 +792,9 @@ mod tests {
             (K::CursorUpdate, ReimsVgpuHostActionKind::CursorUpdate, 4),
             (K::Trace, ReimsVgpuHostActionKind::Trace, 5),
             (K::CursorGlyph, ReimsVgpuHostActionKind::CursorGlyph, 6),
-            (K::ScanoutGl, ReimsVgpuHostActionKind::ScanoutGl, 7),
+            // 7 is a retired wire value (the removed GL/dmabuf scanout action).
+            // The jump from 6 to 8 is deliberate: the input kinds keep the
+            // values the C shim already dispatches on.
             (K::InputKey, ReimsVgpuHostActionKind::InputKey, 8),
             (
                 K::InputPointerMove,
@@ -806,7 +809,7 @@ mod tests {
             (K::WindowClosed, ReimsVgpuHostActionKind::WindowClosed, 11),
         ];
         for (k, ak, wire) in pairs {
-            assert_eq!(action_kind_wire(k), wire);
+            assert_eq!(k as u32, wire);
             assert_eq!(ak as u32, wire);
         }
     }

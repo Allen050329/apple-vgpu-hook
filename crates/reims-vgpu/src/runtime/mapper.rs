@@ -8,10 +8,10 @@
 use crate::contract::iosurface_pages::{
     self, build_table_plan, decode_device_surface, decode_mapper_request_entry, guest_kernel_va,
     mapper_request_published_entry_offset, read_internal_desc_ptr, read_mapper_identity,
-    read_mapper_internal, sample_window, sample_window_prefer_device, validate_mapper_internal,
-    MapperInternalFields, PagesMemory, DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE,
-    MAPPER_CAPTURE_REG_MAPPING_INTERNAL, MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN,
-    MAPPER_REQUEST_MAP, MAPPER_REQUEST_UNMAP,
+    read_mapper_internal, sample_window_prefer_device, validate_mapper_internal, PagesMemory,
+    DEVICE_DESC_LEN, MAPPER_CAPTURE_REG_MAPPER_DEVICE, MAPPER_CAPTURE_REG_MAPPING_INTERNAL,
+    MAPPER_CAPTURE_REG_REQUEST_TYPE, MAPPER_REQUEST_ENTRY_LEN, MAPPER_REQUEST_MAP,
+    MAPPER_REQUEST_UNMAP,
 };
 use crate::model::{DeviceState, MapperCapture, MAX_MAPPINGS};
 use crate::runtime::host::{HostMemory, HostOps, MemError};
@@ -328,13 +328,14 @@ pub fn capture_at_producer<H: HostMemory + HostOps>(
 
 /// Apply a capture to the mapping named by the just-drained ring entry.
 pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u32) -> bool {
+    // Neither branch below releases a deferred writeback window. A type-11
+    // render Store writes guest pages on its own path, so an UNMAP (or a MAP
+    // that re-backs the slot with a different MappingInternal, orphaning the
+    // old identity) leaves no mapping-keyed render obligation behind. Compute
+    // storage windows are the surviving mapping-keyed rail and they are torn
+    // down by `storage_flush::drop_windows` from the lifecycle sites that know
+    // whether the pages can still be written.
     if cap.request_type == MAPPER_REQUEST_UNMAP {
-        // The surface is gone: eagerly release any deferred present-store window
-        // pinning its resident, so the registry LRU can reclaim it. Without this
-        // the pin lingers for the guest lifetime (nothing triggers the lazy
-        // `map_generation_drift` drop) and the registry soft-exceeds its cap.
-        #[cfg(feature = "backend-vulkan")]
-        crate::runtime::import_present::drop_render_deferred_windows(state, mapping_id);
         return state.unmap_surface(mapping_id);
     }
     if cap.request_type != MAPPER_REQUEST_MAP {
@@ -342,22 +343,6 @@ pub fn apply_capture(state: &mut DeviceState, cap: &MapperCapture, mapping_id: u
     }
     if cap.mapper_device_kva != 0 {
         state.mapper_device_kva = cap.mapper_device_kva;
-    }
-    // A MAP that re-backs the slot with a *different* MappingInternal is a new
-    // surface (attach_mapping_internal bumps the generation and drops the old
-    // geometry). Its old deferred windows now name a stale identity that no
-    // access will ever flush — release their pins here too. A re-statement of
-    // the same internal keeps its windows (attach early-returns unchanged).
-    #[cfg(feature = "backend-vulkan")]
-    {
-        let internal_changed = state
-            .mappings
-            .get(&mapping_id)
-            .map(|m| m.mapping_internal != cap.mapping_internal)
-            .unwrap_or(true);
-        if internal_changed {
-            crate::runtime::import_present::drop_render_deferred_windows(state, mapping_id);
-        }
     }
     state.attach_mapping_internal(mapping_id, cap.mapping_internal)
 }
@@ -492,8 +477,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                             sample_window_prefer_device(Some(&desc), None, format, width, height)
                         {
                             min_size = min_size.max(end).max(guest_page);
-                        } else if let Some((_, _, end)) = sample_window(0, format, width, height) {
-                            min_size = min_size.max(end).max(guest_page);
                         }
                     }
                 }
@@ -536,8 +519,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 sample_window_prefer_device(desc_slice, None, format, width, height)
             {
                 min_size = min_size.max(end).max(guest_page);
-            } else if let Some((_, _, end)) = sample_window(0, format, width, height) {
-                min_size = min_size.max(end).max(guest_page);
             }
         }
     }
@@ -574,6 +555,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     };
 
+    // Read before the `get_mut` below takes `state` mutably.
+    let page_shift = state.page_shift;
     let mut retired = None;
     let mut incarnation_changed = false;
     let mut reprieved = false;
@@ -585,6 +568,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // the resident and deferred windows stay live (black-band class). A
         // different plan is a genuine new incarnation.
         let condemned = m.condemned_entries.take();
+        let prev_pages = m.page_entries.len();
         (pages_changed, incarnation_changed, reprieved) =
             plan_adoption_decision(condemned.as_deref(), &m.page_entries, &plan.entries);
         // New page table ⇒ the contiguous view (and any Metal texture aliasing
@@ -595,7 +579,56 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             m.contig_len = 0;
         }
         if pages_changed {
-            DeviceState::bump_map_generation(mapping_id, m);
+            DeviceState::bump_map_generation(m);
+        }
+        // The guest-physical footprint this incarnation authorises us to write.
+        //
+        // A guest kernel panic names a *physical page* (`pmap_page_protect()
+        // ... pn=0x46b53b`), and nothing this device emitted could be compared
+        // against it — so "did we write there?" was unanswerable, and the
+        // random-victim panic class in AGENTS.md stayed a signature with no way
+        // to confirm or clear this device. Every mapping-rail write is bounded
+        // to the page list adopted here, so the union of these spans over a boot
+        // is exactly the set of pages those writes can reach. A `pn` inside it
+        // is evidence; a `pn` outside every one of them exonerates the rail.
+        //
+        // One line per surface incarnation, not per write: the key is
+        // (mapping, generation) and the generation only moves when the PFNs do,
+        // so this is bounded by how often the guest rewires a surface and is
+        // safe to leave on. min/max over the entries is O(pages) once per
+        // incarnation, against an O(pages) table build that just ran.
+        // Keyed on the ADOPTION, not on `pages_changed`. Two earlier cuts of
+        // this line were silent for entire boots, and both were the
+        // instrument-the-branch trap from AGENTS.md committed by a change that
+        // cites it. The first logged only when a span resolved, so it could not
+        // distinguish "no span" from "never ran". The second moved to
+        // `pages_changed` on the reasoning that `map_gen` climbing past 100
+        // proved that branch ran — but `bump_map_generation` has five other
+        // call sites, so the generation was never evidence about this one.
+        //
+        // `pages_changed` is genuinely false here even on a first population:
+        // the reprieve path (`condemned` holds the fingerprint, the plan
+        // matches it) repopulates an emptied `page_entries` with
+        // `pages_changed == false`. The adoption below is what every write is
+        // then bounded by, so that is what has to be reported.
+        //
+        // Dedup is `first_sight` on the span itself, which keeps it bounded by
+        // *distinct footprints* rather than by resolve rate — a mapping
+        // re-resolved every frame to the same pages logs once.
+        if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
+            let key = (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20);
+            if crate::observe::first_sight("mapping_gpa_span", key) {
+                crate::observe::off(format!(
+                    "mapping_gpa_span mid={mapping_id} gen={} pages={} prev_pages={prev_pages} \
+                     changed={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
+                    m.map_generation,
+                    plan.entries.len(),
+                    pages_changed as u8,
+                    hi + (1u64 << page_shift),
+                    lo >> page_shift,
+                    hi >> page_shift,
+                ));
+            }
         }
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
@@ -606,8 +639,6 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         }
     }
     if let Some(v) = retired {
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         state.retired_views.push(v);
     }
     if incarnation_changed {
@@ -621,15 +652,10 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // deferred window survived); plain reprieves are steady id-recycle
         // control flow.
         let windows = state
-            .render_deferred_flush
+            .compute_deferred_flush
             .keys()
             .filter(|k| k.mapping_id == mapping_id)
-            .count()
-            + state
-                .compute_deferred_flush
-                .keys()
-                .filter(|k| k.mapping_id == mapping_id)
-                .count();
+            .count();
         if windows > 0 {
             // Condemn dropped the raw-GVA alias index; the pages just
             // re-adopted are the same ones the windows defer-armed on.
@@ -785,6 +811,27 @@ fn fail_closed_surface_page_collision(
 /// carries different pages (drop the old windows); `reprieved` = the delete
 /// was stale — the plan matches the fingerprint, the same incarnation lives
 /// on (keep generation, resident, deferred windows).
+/// Lowest and highest page-aligned GPA a page-entry list resolves to.
+///
+/// Invalid entries are skipped rather than failing the span: the span is a
+/// *bound* on where writes through this list can land, and an entry that does
+/// not resolve is one that no write can reach. `None` when nothing resolves.
+///
+/// The bound is inclusive of `hi` — it names the first byte of the last page,
+/// not the end of it — so a caller reporting a range must add one page. The
+/// page list is not sorted and is not contiguous, so `[lo, hi]` is a hull and
+/// not a promise that every page inside it belongs to this surface.
+pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u64)> {
+    let (mut lo, mut hi) = (u64::MAX, 0u64);
+    for &e in entries {
+        if let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift) {
+            lo = lo.min(gpa);
+            hi = hi.max(gpa);
+        }
+    }
+    (lo != u64::MAX).then_some((lo, hi))
+}
+
 pub(crate) fn plan_adoption_decision(
     condemned: Option<&[u32]>,
     current: &[u32],
@@ -826,7 +873,7 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         // Match scanout/writeback default when format not latched.
         crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
     };
-    let span_end = if let Some((_, _, end, _)) = sample_window_prefer_device(
+    let Some((_, _, span_end, _)) = sample_window_prefer_device(
         if m.device_desc.len() >= DEVICE_DESC_LEN {
             Some(m.device_desc.as_slice())
         } else {
@@ -836,11 +883,7 @@ pub fn pages_cover_geom(state: &DeviceState, mapping_id: u32) -> bool {
         format,
         m.width,
         m.height,
-    ) {
-        end
-    } else if let Some((_, _, end)) = sample_window(0, format, m.width, m.height) {
-        end
-    } else {
+    ) else {
         return false;
     };
     let page_size = crate::contract::iosurface_pages::page_size_of(state.page_shift);
@@ -904,11 +947,31 @@ pub fn revalidate_mapping_pages<H: HostMemory + HostOps>(
 /// - `revalidate_gone` / `revalidate_unmapped` — the guest already dropped the
 ///   mapping (pageoff/unwire raced ahead of the flush trigger); nothing to write
 ///   back to, benign.
-/// - `revalidate_no_pages` — mapped but the page list is empty after resolve (a
-///   transient (re)wire gap); benign, stale-but-coherent guest bytes remain.
 /// - `revalidate_resolve_fail` — a live page table turned unreadable; the real
 ///   content-drop risk, and the only one that also emits the `st=invalidate`
 ///   line below.
+///
+/// The empty-page-list outcome is not one outcome. Four different states reach
+/// it, and they were all reported as `revalidate_no_pages` with a doc comment
+/// calling the class "a transient (re)wire gap" — one of the four, asserted for
+/// all of them. 106 render-flush losses across 73 boots carry that slug and none
+/// of them says which state produced it. Each check now owns its own:
+/// - `revalidate_condemned` — `DeleteIOSurfaceBacking2` moved the page list into
+///   `condemned_entries` and no resolve has re-adopted it. The guest deleted the
+///   backing; there is nothing safe to write through.
+/// - `revalidate_no_internal` — no `MappingInternal`, so **no resolve was ever
+///   attempted**, and the page list is empty for some other reason. Note that a
+///   zero `mapping_internal` is NOT itself a sign of missing backing: measured on
+///   the rail, 2280 render windows in one boot were armed on mappings with
+///   `mapping_internal == 0` and `page_entries.len() == 2040`, and all but two
+///   flushed normally, because a non-empty page list returns `None` above.
+/// - `revalidate_resolve_miss` — resolve ran and missed, with no live page table
+///   to condemn (so not `resolve_fail`).
+/// - `revalidate_empty_after_resolve` — resolve ran and *succeeded*, and the page
+///   list is still empty. The genuinely surprising one.
+/// - `revalidate_unmapped_late` / `revalidate_gone_late` — the mapping was
+///   mapped on entry and is unmapped or absent after resolve; teardown raced the
+///   revalidate, which the entry-side `revalidate_unmapped` cannot see.
 pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -923,10 +986,16 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     let has_internal = m.mapping_internal != 0;
     let had_live_table = m.page_table_kva != 0;
     let had_pages = !m.page_entries.is_empty();
+    // Whether the resolve below ran at all, and whether it reported success —
+    // the two facts that separate the empty-page-list outcomes from each other.
+    let mut resolve_ran = false;
+    let mut resolve_ok = false;
     if has_internal {
         let generation_before = m.map_generation;
         let started = std::time::Instant::now();
         let resolved = resolve_mapping_backing(state, host, mapping_id);
+        resolve_ran = true;
+        resolve_ok = resolved;
         let elapsed_us = started.elapsed().as_micros() as u64;
         let (pages_after, generation_after) = state
             .mappings
@@ -956,8 +1025,12 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     }
     match state.mappings.get(&mapping_id) {
         Some(m) if m.mapped && !m.page_entries.is_empty() => None,
-        Some(_) => Some("revalidate_no_pages"),
-        None => Some("revalidate_gone"),
+        Some(m) if !m.mapped => Some("revalidate_unmapped_late"),
+        Some(m) if m.condemned_entries.is_some() => Some("revalidate_condemned"),
+        Some(_) if !resolve_ran => Some("revalidate_no_internal"),
+        Some(_) if !resolve_ok => Some("revalidate_resolve_miss"),
+        Some(_) => Some("revalidate_empty_after_resolve"),
+        None => Some("revalidate_gone_late"),
     }
 }
 
@@ -968,9 +1041,9 @@ fn revalidate_timing_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= REVALIDATE_SLOW_US
 }
 
-/// Unmap contiguous views whose page tables changed (safe point: no GPU work
-/// in flight — execution is sync-per-packet and Metal objects were dropped by
-/// `type11_guest_texture_invalidate` when the view was retired).
+/// Unmap contiguous views whose page tables changed. No GPU object can hold one
+/// of these views: nothing on either backend aliases guest pages any more, so
+/// the only readers are CPU copies that finish inside their own call.
 pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);
@@ -990,7 +1063,7 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     host: &mut H,
     mapping_id: u32,
 ) -> Option<Vec<u64>> {
-    if !revalidate_mapping_pages(state, host, mapping_id) {
+    if !{ revalidate_mapping_pages(state, host, mapping_id) } {
         return None;
     }
     let m = state.mappings.get(&mapping_id)?;
@@ -1006,7 +1079,7 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
     if gpas.is_empty() || gpas.len() != m.page_entries.len() {
         return None;
     }
-    if let Some((gpa, owner)) = first_control_page_collision(state, &gpas) {
+    if let Some((gpa, owner)) = { first_control_page_collision(state, &gpas) } {
         crate::observe::fail(format!(
             "mapping_pages fail reason=control_page_collision mid={mapping_id} gpa={gpa:#x} owner={owner} pages={}",
             gpas.len()
@@ -1023,31 +1096,42 @@ pub fn mapping_page_gpas<H: HostMemory + HostOps>(
 fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u64, &'static str)> {
     let page = state.page_size();
     let page_base = |gpa: u64| gpa & !(page - 1);
-    // Live tasks can advertise one million object-list slots (4,096 x86
-    // pages each). A linear IOSurface scan for every control page turns one
-    // full-frame safety check into ~100 million comparisons. Preserve the
-    // exact collision contract with one page-base membership set.
-    let mapping_pages: std::collections::HashSet<u64> =
-        gpas.iter().map(|&gpa| page_base(gpa)).collect();
-    let contains = |gpa: u64| mapping_pages.contains(&page_base(gpa));
+    // Probe the SURFACE, not the control structures. A live task can advertise a
+    // million object-list slots — 4,096 x86 pages — and an object list is one
+    // contiguous span, so asking "does the surface hold this page?" once per
+    // control page enumerated the whole span page by page. Sorted, the same
+    // question is one range query per task.
+    //
+    // Measured on the x86/Vulkan rail before this shape: 414 µs per call, 71 024
+    // calls in a 120 s arm, 29.4 s of wall clock spent proving a full-screen
+    // IOSurface does not alias a FIFO ring.
+    let mut pages: Vec<u64> = gpas.iter().map(|&gpa| page_base(gpa)).collect();
+    pages.sort_unstable();
+    let holds = |gpa: u64| pages.binary_search(&page_base(gpa)).is_ok();
+    // The lowest surface page in `[start, end)`, if any. Both bounds and every
+    // entry are multiples of `page`, so a hit is exactly one of the pages the
+    // per-page form would have enumerated — same page, same reported gpa.
+    let holds_range = |start: u64, end: u64| -> Option<u64> {
+        let i = pages.partition_point(|&p| p < start);
+        pages.get(i).copied().filter(|&p| p < end)
+    };
 
-    if state.gfx.root_page != 0 && contains((state.gfx.root_page as u64) << state.page_shift) {
+    if state.gfx.root_page != 0 && holds((state.gfx.root_page as u64) << state.page_shift) {
         return Some(((state.gfx.root_page as u64) << state.page_shift, "gfx_root"));
     }
-    if state.gfx.fifo_base_page != 0
-        && contains((state.gfx.fifo_base_page as u64) << state.page_shift)
+    if state.gfx.fifo_base_page != 0 && holds((state.gfx.fifo_base_page as u64) << state.page_shift)
     {
         return Some((
             (state.gfx.fifo_base_page as u64) << state.page_shift,
             "root_fifo",
         ));
     }
-    if state.iosfc.ring_base != 0 && contains(state.iosfc.ring_base) {
+    if state.iosfc.ring_base != 0 && holds(state.iosfc.ring_base) {
         return Some((page_base(state.iosfc.ring_base), "iosfc_ring"));
     }
     for ring in &state.child_rings {
         for &gpa in &ring.page_gpas {
-            if contains(gpa) {
+            if holds(gpa) {
                 return Some((page_base(gpa), "child_fifo"));
             }
         }
@@ -1058,7 +1142,7 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
         }
         if task.directory_pfn != 0 {
             let gpa = (task.directory_pfn as u64) << state.page_shift;
-            if contains(gpa) {
+            if holds(gpa) {
                 return Some((gpa, "task_directory"));
             }
         }
@@ -1066,11 +1150,9 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             let first = (task.object_list_pfn as u64) << state.page_shift;
             let bytes = (task.object_list_count as u64).saturating_mul(16);
             let count = bytes.saturating_add(page - 1) / page;
-            for i in 0..count {
-                let gpa = first.saturating_add(i.saturating_mul(page));
-                if contains(gpa) {
-                    return Some((gpa, "task_object_list"));
-                }
+            let end = first.saturating_add(count.saturating_mul(page));
+            if let Some(gpa) = holds_range(first, end) {
+                return Some((gpa, "task_object_list"));
             }
         }
     }
@@ -1090,6 +1172,13 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
 /// On Linux, only a **packed** sequential host run succeeds. Fragmented
 /// IOSurface page lists must use [`write_mapping_bytes`] / [`read_mapping_bytes`]
 /// or multi-run import-present.
+/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
+/// whether the verdict was derived or served from `contig_fragmented_gen`.
+/// Reported as `served=` on every `contig_view_fragmented` line so the
+/// magnitude the old per-call line carried survives its deduplication.
+static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1106,9 +1195,39 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
         if m.contig_ptr != 0 {
             return Some((m.contig_ptr, m.contig_len));
         }
+        // The negative verdict caches on exactly the key that makes the
+        // positive one above safe. Re-deriving it per call collected the page
+        // GPAs and rescanned them every time, and said so in the always-on sink
+        // every time: 471 757 lines in one 2 900 s boot, the sole prefix ever to
+        // trip `log_flood_detected`, at up to 1 826 lines in a one-second window.
+        if m.contig_fragmented_gen == Some(m.map_generation) {
+            CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
     }
     let gpas = mapping_page_gpas(state, host, mapping_id)?;
     let page_sz = crate::contract::iosurface_pages::page_size_of(state.page_shift) as usize;
+    // A fragmented page list can never map as one packed view, and asking
+    // anyway turns documented control flow ("use write_mapping_bytes /
+    // read_mapping_bytes / multi-run import-present") into a logged
+    // `qemu_map_pages_callback_failed`.
+    let runs = crate::runtime::gva_view::contig_run_count(&gpas, page_sz as u64);
+    if runs != 1 {
+        let served = CONTIG_FRAGMENTED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let m = state.mappings.get_mut(&mapping_id)?;
+        m.contig_fragmented_gen = Some(m.map_generation);
+        let generation = m.map_generation;
+        // One line per (mapping, page list) rather than per call. The count the
+        // per-call line used to carry moves to `served`, a device-wide
+        // cumulative total of fragmented answers, so a census still reads
+        // magnitude off the newest line while the line count now measures
+        // distinct fragmented page lists — which is what the slug claims.
+        crate::observe::off(format!(
+            "contig_view_fragmented mid={mapping_id} pages={} runs={runs} generation={generation} served={served}",
+            gpas.len(),
+        ));
+        return None;
+    }
     let ptr = host.map_pages(&gpas, page_sz)?;
     let len = gpas.len() * page_sz;
     let m = state.mappings.get_mut(&mapping_id)?;
@@ -1328,12 +1447,6 @@ fn mapping_run_import_is_slow(elapsed_us: u64) -> bool {
     elapsed_us >= MAPPING_RUN_IMPORT_SLOW_US
 }
 
-/// Fields helper for tests.
-#[allow(dead_code)]
-pub fn fields_ok(fields: &MapperInternalFields, mapping_id: u32) -> bool {
-    fields.mapping_id == mapping_id
-}
-
 #[cfg(test)]
 mod revalidate_tests {
     use super::*;
@@ -1371,13 +1484,34 @@ mod revalidate_tests {
             revalidate_mapping_reason(&mut state, &host, 7),
             Some("revalidate_gone")
         );
-        // Mapped but no MappingInternal and no page list → the benign
-        // (re)wire-gap window, NOT a live-table resolve failure. Must carry its
-        // own slug so a real content drop is never masked by this case.
+        // Mapped, no MappingInternal, no page list. The resolve never ran, so
+        // this says nothing about whether the pages exist — which is exactly
+        // what the old shared `revalidate_no_pages` slug hid behind a comment
+        // calling it a benign (re)wire gap.
         state.map_surface(2);
         assert_eq!(
             revalidate_mapping_reason(&mut state, &host, 2),
-            Some("revalidate_no_pages")
+            Some("revalidate_no_internal")
+        );
+        // Unmapped on entry is caught before the resolve and keeps its own slug.
+        state.map_surface(3);
+        state.mappings.get_mut(&3).unwrap().mapped = false;
+        assert_eq!(
+            revalidate_mapping_reason(&mut state, &host, 3),
+            Some("revalidate_unmapped")
+        );
+        // A condemned backing is empty for a REASON the guest gave us
+        // (DeleteIOSurfaceBacking2 stashed the page list), which is a different
+        // answer from "the page list happens to be empty" and must not share its
+        // slug — a deferred window flushing here has nothing safe to write
+        // through, rather than nothing resolved yet.
+        state.map_surface(5);
+        state.mappings.get_mut(&5).unwrap().page_entries =
+            vec![(0x200 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        assert!(state.condemn_surface_backing(5));
+        assert_eq!(
+            revalidate_mapping_reason(&mut state, &host, 5),
+            Some("revalidate_condemned")
         );
         // A resolvable static page list → success (None).
         state.map_surface(4);
@@ -1567,6 +1701,92 @@ mod revalidate_tests {
         assert_eq!(state.retired_views, vec![(0xdead, 4096)]);
     }
 
+    /// The "cannot pack" verdict is derived once per page list, not once per
+    /// call, and a new page list re-derives it.
+    ///
+    /// Before this cache every call on a fragmented mapping rebuilt the page-GPA
+    /// vector, rescanned it for runs, and emitted a line — 471 757 of them in
+    /// one 2 900 s boot, the only prefix ever to trip `log_flood_detected`. The
+    /// line count is therefore the assertion: repeated calls must add none, and
+    /// the magnitude the old line carried must still be readable as `served=`.
+    #[test]
+    fn fragmented_verdict_is_derived_once_per_page_list() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let entry =
+            |gpa: u64| ((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID;
+        // Non-adjacent guest pages — never one packed run.
+        let (gpa0, gpa1, gpa2) = (0x1000_0000u64, 0x2000_0000u64, 0x3000_0000u64);
+        for gpa in [gpa0, gpa1, gpa2] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mid = 9u32;
+        state.map_surface(mid);
+        state.mappings.get_mut(&mid).unwrap().page_entries = vec![entry(gpa0), entry(gpa1)];
+
+        let cap = crate::observe::FailCapture::start();
+        let lines = || -> Vec<String> {
+            cap.lines()
+                .into_iter()
+                .filter(|l| l.starts_with("OFF contig_view_fragmented"))
+                .collect()
+        };
+        for _ in 0..16 {
+            assert!(
+                ensure_contig_view(&mut state, &mut host, mid).is_none(),
+                "fragmented list must never pack"
+            );
+        }
+        let first = lines();
+        assert_eq!(
+            first.len(),
+            1,
+            "16 calls on one page list must derive (and say) the verdict once: {first:?}"
+        );
+        assert!(
+            first[0].contains(" pages=2 runs=2 "),
+            "the derived line keeps its shape: {}",
+            first[0]
+        );
+
+        // A different page list is a different verdict: the generation bump that
+        // retires `contig_ptr` must also retire this.
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = vec![entry(gpa0), entry(gpa1), entry(gpa2)];
+            DeviceState::bump_map_generation(m);
+        }
+        assert!(ensure_contig_view(&mut state, &mut host, mid).is_none());
+        let after = lines();
+        assert_eq!(
+            after.len(),
+            2,
+            "a new page list must re-derive and re-report: {after:?}"
+        );
+        assert!(
+            after[1].contains(" pages=3 runs=3 "),
+            "the second line describes the second list: {}",
+            after[1]
+        );
+
+        // Magnitude survives deduplication: `served` counts every fragmented
+        // answer, cached ones included, so it advanced by the 16 calls between
+        // the two derivations.
+        let served = |l: &str| -> u64 {
+            l.rsplit_once("served=")
+                .and_then(|(_, v)| v.split_whitespace().next())
+                .and_then(|v| v.parse().ok())
+                .expect("line carries served=")
+        };
+        assert_eq!(
+            served(&after[1]) - served(&after[0]),
+            16,
+            "served must count cached answers too: {after:?}"
+        );
+    }
+
     /// Product Linux: full page list is non-packed → ensure_contig_view fails;
     /// write_mapping_bytes still lands bytes via maximal packed runs.
     #[test]
@@ -1619,19 +1839,6 @@ mod revalidate_tests {
     }
 }
 
-/// Read ring entry at absolute producer index (for tests).
-pub fn read_request_at_producer<M: HostMemory>(
-    host: &M,
-    ring_base: u64,
-    producer: u32,
-) -> Result<(u32, u32), MemError> {
-    let entry_off = mapper_request_published_entry_offset(producer).ok_or(MemError::BadArgs)?;
-    let mut e = [0u8; MAPPER_REQUEST_ENTRY_LEN];
-    host.read_gpa(ring_base + entry_off, &mut e)?;
-    let req = decode_mapper_request_entry(&e).map_err(|_| MemError::BadArgs)?;
-    Ok((req.request_type, req.mapping_id))
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1641,6 +1848,36 @@ mod tests {
         MAPPING_INTERNAL_BACKPTR, MAPPING_INTERNAL_EXPECTED_SIZE, MAPPING_INTERNAL_ID,
         MAPPING_INTERNAL_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
     };
+
+    /// The span is a hull over the *resolvable* entries, in PFN order-independent
+    /// fashion, and it must not be fooled by an unsorted list or by an invalid
+    /// entry sitting at either end — those are exactly the shapes a real page
+    /// list has, and a span that tracked first/last instead of min/max would
+    /// name a range that does not contain the pages written.
+    #[test]
+    fn entry_gpa_span_is_a_hull_over_resolvable_entries() {
+        let valid = |pfn: u32| (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        // Unsorted, so first/last != min/max.
+        let entries = [valid(9), valid(3), valid(7)];
+        assert_eq!(
+            entry_gpa_span(&entries, 12),
+            Some((3u64 << 12, 9u64 << 12)),
+            "min/max, not first/last"
+        );
+        // An invalid entry is skipped, not treated as GPA 0 — a zero would drag
+        // `lo` to the bottom of RAM and make the span claim pages no write can
+        // reach, which is the wrong direction for a bound used as evidence.
+        let with_hole = [0u32, valid(3), valid(9), 0u32];
+        assert_eq!(
+            entry_gpa_span(&with_hole, 12),
+            Some((3u64 << 12, 9u64 << 12))
+        );
+        // Page shift is honoured rather than assumed to be 12 (arm64 is 14).
+        assert_eq!(entry_gpa_span(&entries, 14), Some((3u64 << 14, 9u64 << 14)));
+        // Nothing resolvable ⇒ no span at all, rather than (u64::MAX, 0).
+        assert_eq!(entry_gpa_span(&[0, 0], 12), None);
+        assert_eq!(entry_gpa_span(&[], 12), None);
+    }
 
     #[test]
     fn plan_adoption_decision_incarnation_semantics() {
@@ -1895,10 +2132,28 @@ mod tests {
 
         state.mapper_device_kva = mapper;
         assert!(state.attach_mapping_internal(3, internal));
+        // The adopted page list is what bounds every mapping-rail guest write,
+        // so a successful resolve must report its guest-physical footprint. An
+        // earlier cut of `mapping_gpa_span` keyed on `pages_changed` and was
+        // silent for whole live boots while page lists were plainly being
+        // adopted; asserting it here is what makes that failure loud in the
+        // suite instead of only in a log nobody diffed.
+        let cap = crate::observe::sink::FailCapture::start();
         assert!(resolve_mapping_backing(&mut state, &host, 3));
         let m = state.mappings.get(&3).unwrap();
         assert_eq!(m.page_entries.len(), 1);
         assert_eq!(m.page_entries[0], entry);
+        let span = cap.one("OFF");
+        assert!(
+            span.contains("mapping_gpa_span mid=3") && span.contains("pages=1"),
+            "resolve must report its adopted footprint, got {span:?}"
+        );
+        // The page number is what a guest panic prints (`pmap_page_protect()
+        // ... pn=0x...`), so it has to be readable without arithmetic.
+        assert!(
+            span.contains(&format!("pn_lo={pfn:#x}")),
+            "span must name the adopted PFN as a page number, got {span:?}"
+        );
     }
 
     struct FailingKvaHost {
@@ -2038,6 +2293,59 @@ mod tests {
         assert!(pages_cover_geom(&state, 3));
     }
 
+    /// A page table cannot make a window the guest's own allocation does not
+    /// contain, however many pages it holds.
+    ///
+    /// `sample_window_prefer_device` refuses when the invented packed span runs
+    /// past `device_desc.alloc_size` — that refusal is the only place the wire
+    /// allocation bounds the window. This case is the one where a caller could
+    /// answer it by calling `sample_window` directly and getting the rejected
+    /// span back: the descriptor says 1.5 MiB, the packed 1024² BGRA window is
+    /// 4 MiB, and the table is deliberately sized to cover the 4 MiB. Falling
+    /// back would report "covered" for a surface whose own descriptor says it is
+    /// a third of that size.
+    #[test]
+    fn a_generous_table_cannot_cover_a_window_past_the_wire_allocation() {
+        use crate::contract::endian::{st32, st64};
+        use crate::contract::iosurface_pages::{
+            DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_BPR, DEVICE_DESC_DIMS, DEVICE_DESC_LEN,
+            DEVICE_DESC_PLANE_COUNT,
+        };
+
+        let mut desc = vec![0u8; DEVICE_DESC_LEN];
+        // 1.5 MiB allocation, single plane, and a bpr too small for 1024 BGRA so
+        // the device-surface path refuses and the invent tail is what runs.
+        st32(&mut desc[DEVICE_DESC_ALLOC_SIZE..], 0x18_0000);
+        st64(
+            &mut desc[DEVICE_DESC_DIMS..],
+            (1024u64 << 8) | (1024u64 << 40),
+        );
+        st32(&mut desc[DEVICE_DESC_BPR..], 64);
+        desc[DEVICE_DESC_PLANE_COUNT] = 0;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        assert!(state.attach_mapping_internal(9, KVA));
+        assert!(state.set_mapping_device_desc(9, &desc));
+        assert!(state.set_mapping_geom(
+            9,
+            1024,
+            1024,
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM
+        ));
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.mapped = true;
+            // 256 × 16 KiB = 4 MiB, exactly the packed 1024² BGRA span, so a
+            // fallback to `sample_window` would compare 4 MiB against 4 MiB and
+            // pass.
+            m.page_entries = vec![0x33; 256];
+        }
+        assert!(
+            !pages_cover_geom(&state, 9),
+            "alloc_size 0x18_0000 cannot hold a 4 MiB window; the page count is not the bound"
+        );
+    }
+
     /// 249² Favourites-class tiles fit in 16×16KiB pages; short-table proxy is
     /// desktop dual-mid, not tile size alone.
     #[test]
@@ -2086,5 +2394,102 @@ mod tests {
             Some((0x551_000, "task_object_list"))
         );
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
+    }
+
+    /// The object-list probe is a RANGE query over the surface, and the three
+    /// things a range query can get wrong that a per-page enumeration cannot.
+    ///
+    /// The per-page form walked `first + i*page` for every slot page and returned
+    /// the first one the surface held, so it reported the LOWEST colliding page
+    /// and stopped exactly at `count`. A `partition_point` that is off by one
+    /// entry, or an end bound computed from slots rather than pages, reproduces
+    /// the same `Some(_)`/`None` on a single-page surface and diverges here.
+    #[test]
+    fn object_list_collision_reports_the_lowest_page_and_stops_at_the_span_end() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        assert!(state.define_task(1, 0x4000_0000, 0x440));
+        // 1024 slots x 16 bytes = 16 KiB = pages 0x550..0x554 at a 4 KiB shift.
+        assert!(state.set_object_list(1, 0x550, 1024));
+
+        // Several surface pages inside the span, listed out of order: the answer
+        // is the lowest, not whichever the surface happens to name first.
+        assert_eq!(
+            first_control_page_collision(&state, &[0x553_000, 0x551_000, 0x552_000]),
+            Some((0x551_000, "task_object_list"))
+        );
+        // Both ends of the span are inside it.
+        assert_eq!(
+            first_control_page_collision(&state, &[0x550_000]),
+            Some((0x550_000, "task_object_list"))
+        );
+        assert_eq!(
+            first_control_page_collision(&state, &[0x553_000]),
+            Some((0x553_000, "task_object_list"))
+        );
+        // The page immediately after the span is not part of it.
+        assert_eq!(first_control_page_collision(&state, &[0x554_000]), None);
+        // Nor is the page immediately before.
+        assert_eq!(first_control_page_collision(&state, &[0x54f_000]), None);
+        // A surface that straddles the span without landing in it stays clean —
+        // the query must not report the neighbour it binary-searched past.
+        assert_eq!(
+            first_control_page_collision(&state, &[0x100_000, 0x554_000]),
+            None
+        );
+    }
+
+    /// Priority order survives the rewrite: a surface colliding with several
+    /// control structures at once names the same one it always did. The walk is
+    /// per task and interleaved (task 1's object list before task 2's directory),
+    /// which a flat "collect every control page then sort" would silently lose.
+    #[test]
+    fn a_surface_colliding_with_several_control_structures_names_the_first() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        state.gfx.root_page = 0x120;
+        state.gfx.fifo_base_page = 0x220;
+        state.iosfc.ring_base = 0x300_000;
+        state.child_rings[2].page_gpas = vec![0x330_000];
+        assert!(state.define_task(1, 0x4000_0000, 0x440));
+        assert!(state.set_object_list(1, 0x550, 1024));
+        assert!(state.define_task(2, 0x4000_0000, 0x660));
+
+        let all = [
+            0x660_000, 0x551_000, 0x440_000, 0x330_000, 0x300_000, 0x220_000, 0x120_000,
+        ];
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x120_000, "gfx_root"))
+        );
+        state.gfx.root_page = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x220_000, "root_fifo"))
+        );
+        state.gfx.fifo_base_page = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x300_000, "iosfc_ring"))
+        );
+        state.iosfc.ring_base = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x330_000, "child_fifo"))
+        );
+        state.child_rings[2].page_gpas.clear();
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x440_000, "task_directory"))
+        );
+        // Task 1's object list outranks task 2's directory: the walk is per task.
+        state.tasks[1].directory_pfn = 0;
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x551_000, "task_object_list"))
+        );
+        assert!(state.set_object_list(1, 0, 0));
+        assert_eq!(
+            first_control_page_collision(&state, &all),
+            Some((0x660_000, "task_directory"))
+        );
     }
 }

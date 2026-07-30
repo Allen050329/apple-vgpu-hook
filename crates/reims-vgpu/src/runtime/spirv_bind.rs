@@ -149,6 +149,14 @@ pub enum ImageFormat {
     R8Unorm,
     Rg8Unorm,
     Rgba32Uint,
+    /// Single-channel 32-bit float (SPIR-V `R32f`, enum value 3). This is what
+    /// `metal2vulkan` declares for a generic `texture2d<float, access::write>`
+    /// (`storage_format_from_name`: a `<float` scalar lowers to `R32f`), so it
+    /// arrives on the wire constantly — a full-width float write target whose
+    /// real texel format is whatever guest surface gets bound. Like [`Self::R32ui`]
+    /// it is specialized against that surface before use; leaving it undecoded
+    /// made every such dispatch `Unsupported(3)` and dropped it.
+    R32Float,
     /// Single-channel 32-bit uint (SPIR-V `R32ui`). Not emitted by the
     /// translator (which declares `Rgba8ui` for a generic `texture2d<uint,
     /// write>`); the device *specializes* a storage image to this format when
@@ -173,6 +181,7 @@ impl ImageFormat {
             0 => Self::Unknown,
             1 => Self::Rgba32Float,
             2 => Self::Rgba16Float,
+            3 => Self::R32Float,
             4 => Self::Rgba8Unorm,
             7 => Self::Rg16Float,
             9 => Self::R16Float,
@@ -191,6 +200,7 @@ impl ImageFormat {
         match self {
             Self::Rgba32Float => 1,
             Self::Rgba16Float => 2,
+            Self::R32Float => 3,
             Self::Rgba8Unorm => 4,
             Self::Rg16Float => 7,
             Self::R16Float => 9,
@@ -1039,42 +1049,6 @@ pub fn image_access_from_reflection(
     })
 }
 
-/// The shader-pulled-vertex coverage gate, sourced from reflection instead of a
-/// SPIR-V walk: the vertex stage writes `Position`, reads `VertexIndex`, and binds
-/// at least one buffer to pull vertices from. The builtins come straight from
-/// `vertex_builtins` (the AIR roles that also drive the emit, so no walk can
-/// disagree); buffer presence from the reflected `Buffer` bindings. `false` when
-/// the reflection carries no vertex builtins (a non-vertex stage). This only
-/// GATES the coverage proof — `draw_full_target_coverage_shader_pulled` still
-/// evaluates the emitted SPIR-V against the bound buffers (genuine execution, not
-/// an interface walk).
-pub fn vertex_position_pull_gate(reflection: &ShaderReflection) -> bool {
-    let Some(vb) = reflection.vertex_builtins else {
-        return false;
-    };
-    vb.writes_position
-        && vb.uses_vertex_index
-        && reflection
-            .bindings
-            .iter()
-            .any(|b| matches!(b.kind, ResourceKind::Buffer))
-}
-
-/// The reflected buffer descriptor bindings a vertex stage pulls from (sorted,
-/// deduped) — the reflection twin of the walk's `storage_bindings`, for the
-/// shader-pull coverage-gap diagnostic.
-pub fn vertex_pull_buffer_bindings(reflection: &ShaderReflection) -> Vec<u32> {
-    let mut v: Vec<u32> = reflection
-        .bindings
-        .iter()
-        .filter(|b| matches!(b.kind, ResourceKind::Buffer))
-        .filter_map(|b| b.descriptor.map(|d| d.binding))
-        .collect();
-    v.sort_unstable();
-    v.dedup();
-    v
-}
-
 /// Validate that the translator's reflection is internally well-formed, once per
 /// translate (miss path). This is the always-on regression proxy that replaces
 /// the former reflection-vs-SPIR-V cross-check: the hot path now reads texture
@@ -1511,58 +1485,6 @@ mod tests {
     }
 
     #[test]
-    fn vertex_pull_gate_and_buffer_bindings_from_reflection() {
-        use metal2vulkan::reflect::{ResourceBinding, ResourceKind, VertexBuiltins};
-
-        let buffer_binding = |binding: u32| ResourceBinding {
-            kind: ResourceKind::Buffer,
-            metal_index: binding,
-            descriptor: Some(DescriptorLocation { set: 0, binding }),
-            param_index: None,
-            address_space: None,
-            declared_size: None,
-            type_layout: None,
-            type_name: None,
-            texture_shape: None,
-            embedded_source: None,
-            access: None,
-            static_sampler: None,
-        };
-
-        // Full shader-pull vertex stage: writes Position, reads VertexIndex, binds
-        // buffers 7 and 1 → gate true, buffer list sorted+deduped.
-        let mut r = empty_reflection(ShaderStage::Vertex);
-        r.vertex_builtins = Some(VertexBuiltins {
-            uses_vertex_index: true,
-            uses_instance_index: false,
-            writes_position: true,
-        });
-        r.bindings.push(buffer_binding(7));
-        r.bindings.push(buffer_binding(1));
-        assert!(vertex_position_pull_gate(&r));
-        assert_eq!(vertex_pull_buffer_bindings(&r), vec![1, 7]);
-
-        // Missing VertexIndex → gate false.
-        let mut no_vi = r.clone();
-        no_vi.vertex_builtins = Some(VertexBuiltins {
-            uses_vertex_index: false,
-            uses_instance_index: false,
-            writes_position: true,
-        });
-        assert!(!vertex_position_pull_gate(&no_vi));
-
-        // No buffer binding → gate false (nothing to pull from).
-        let mut no_buf = empty_reflection(ShaderStage::Vertex);
-        no_buf.vertex_builtins = r.vertex_builtins;
-        assert!(!vertex_position_pull_gate(&no_buf));
-
-        // Non-vertex stage (no builtins) → gate false.
-        assert!(!vertex_position_pull_gate(&empty_reflection(
-            ShaderStage::Fragment
-        )));
-    }
-
-    #[test]
     fn folded_function_constants_reported_only_when_present() {
         // FC-free shader: silent (returns 0), no analysis line.
         let none = empty_reflection(ShaderStage::Fragment);
@@ -1807,6 +1729,30 @@ mod tests {
             Ok(1)
         );
         assert_eq!(image_format(&words, 33), Some(ImageFormat::R32ui));
+    }
+
+    /// SPIR-V `R32f` is enum value 3 and is what `metal2vulkan` declares for a
+    /// generic `texture2d<float, access::write>`. Leaving 3 out of the decode
+    /// table turned every such storage image into `Unsupported(3)`, which the
+    /// device cannot specialize — the dispatch was dropped rather than run
+    /// against the bound guest surface.
+    #[test]
+    fn r32f_write_image_decodes_and_specializes() {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 6, 0];
+        // OpTypeImage %1 : float 2D depth=0 arrayed=0 ms=0 sampled=2 format=3.
+        words.extend([(9u32 << 16) | OP_TYPE_IMAGE as u32, 1, 99, 1, 0, 0, 0, 2, 3]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 1]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 33]);
+
+        assert_eq!(ImageFormat::from_raw(3), ImageFormat::R32Float);
+        assert_eq!(ImageFormat::R32Float.raw(), 3);
+        assert_eq!(image_format(&words, 33), Some(ImageFormat::R32Float));
+        assert_eq!(
+            specialize_image_formats(&mut words, &[(33, ImageFormat::Rgba32Float)]),
+            Ok(1)
+        );
+        assert_eq!(image_format(&words, 33), Some(ImageFormat::Rgba32Float));
     }
 
     fn storage_buffer_module(binding: u32) -> Vec<u32> {

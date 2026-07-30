@@ -14,11 +14,12 @@
 //! an axis of the support matrix. It described the hosts this project happens to
 //! own rather than anything the code does: nothing in the engine has ever used a
 //! 1.3 core feature, so the "1.3 row" only ever meant "a host that also happens
-//! to have dmabuf". Zero-copy capability is the property that actually varies
-//! (see [`super::zero_copy`]), and it is orthogonal to the API version — a 1.2
-//! driver can advertise `VK_EXT_external_memory_host` and a 1.3 driver can lack
-//! it. Classifying on the version invited exactly the coupling the matrix exists
-//! to prevent, so the version is now a floor check and nothing more.
+//! to have feature X". Device capability is the property that actually varies
+//! — whether the device can share memory with another device at all — and it is
+//! orthogonal to the API version: a 1.2 driver can advertise an extension and
+//! a 1.3 driver can lack it. Classifying on the version invited exactly the
+//! coupling that gating on capability exists to prevent, so the version is now a
+//! floor check and nothing more.
 //!
 //! A capability promoted into 1.3 core must therefore be reached through its
 //! `KHR`/`EXT` form, gated on runtime presence, with the 1.2 path still
@@ -43,6 +44,10 @@ pub const MIN_SUPPORTED_API: u32 = vk::API_VERSION_1_2;
 /// clamp, not a driver limitation, and it changes nothing about what the engine
 /// requires, which is [`MIN_SUPPORTED_API`].
 pub const MAX_USEFUL_API: u32 = vk::API_VERSION_1_3;
+
+/// Inverting the pair would decline every device on earth with a confusing
+/// reason. Both are literals, so the check belongs at compile time.
+const _: () = assert!(MAX_USEFUL_API >= MIN_SUPPORTED_API);
 
 /// Whether a device's `apiVersion` clears the baseline every pathway needs.
 ///
@@ -119,11 +124,10 @@ mod tests {
         );
     }
 
-    /// The ceiling is never below the floor — inverting them would decline
-    /// every device on earth with a confusing reason.
+    /// The ceiling itself clears the floor, so clamping to it never produces an
+    /// instance version that would then be declined.
     #[test]
     fn ceiling_is_at_or_above_the_floor() {
-        assert!(MAX_USEFUL_API >= MIN_SUPPORTED_API);
         assert!(meets_floor(instance_api_version(MAX_USEFUL_API)));
     }
 

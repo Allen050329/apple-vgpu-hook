@@ -168,24 +168,6 @@ build_reims_vgpu_efi() {
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
 }
 
-build_reims_vgpu_standalone() {
-  local backend="$1"
-  case "$backend" in
-    metal)
-      echo "boot-x86.sh: building reims-vgpu crate (backend-metal) ..."
-      (cd "" && cargo build --release -p reims-vgpu --features backend-metal) \
-        || die "reims-vgpu build failed"
-      ;;
-    vulkan)
-      echo "boot-x86.sh: building reims-vgpu crate (backend-vulkan,host-window) ..."
-      (cd "" && cargo build --release -p reims-vgpu \
-        --no-default-features --features backend-vulkan,host-window) \
-        || die "reims-vgpu build failed"
-      ;;
-    *) die "unknown REIMS_VGPU_BACKEND: $backend (metal | vulkan)" ;;
-  esac
-}
-
 require_shader_toolchain
 ensure_rust_tools
 build_reims_vgpu_efi
@@ -197,8 +179,19 @@ if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
   "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend "$REIMS_VGPU_BACKEND" \
     || die "qemu-build failed"
 else
+  # An overridden QEMU_BIN is a binary that already exists, and the reims-vgpu
+  # crate is a *staticlib* linked into it (`ldd` on it names no reims object),
+  # so rebuilding the crate here cannot change a single byte of what this boot
+  # runs. This branch used to do that build anyway, via `(cd "" && cargo
+  # build ...)` — a null `cd` that failed outright, which is why pinning
+  # QEMU_BIN could never boot at all.
+  #
+  # Pinning is what makes it safe to edit the tree while a multi-boot harness
+  # runs: the default branch above rebuilds QEMU every boot and would pick up a
+  # half-finished edit mid-run (AGENTS.md records one run discarded for exactly
+  # that). Keep this branch free of the tree.
   REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
-  build_reims_vgpu_standalone "$REIMS_VGPU_BACKEND"
+  echo "boot-x86.sh: QEMU_BIN pinned ($QEMU_BIN) — not building; the staticlib is already linked in"
 fi
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
 [ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
@@ -387,7 +380,16 @@ discard_clone() {
   if [ "${IS_CLONE:-1}" -eq 1 ]; then
     rm -f "$DISK" "$OPENCORE" "$OVMF_VARS"
   fi
-  rm -f "$QMP_SOCK" "$RUN_DIR/qmp.sock"
+  rm -f "$QMP_SOCK"
+  # `qmp.sock` is the shared name every driver script resolves, and it is
+  # re-pointed by whichever boot started last. A boot shutting down must only
+  # remove it while it still names ITS socket: killing one VM and starting the
+  # next immediately otherwise has the dying instance delete the live
+  # instance's symlink, and the driver then fails with a bare ENOENT partway
+  # through a run — which reads as a guest defect, not as a missing socket.
+  if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
+    rm -f "$RUN_DIR/qmp.sock"
+  fi
 }
 
 promote_to_snapshot() {

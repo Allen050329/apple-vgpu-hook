@@ -2,19 +2,20 @@
 //! own `VkSurfaceKHR`/swapchain that presents the guest frame, replacing QEMU's
 //! UI ([[host-window]]).
 //!
-//! v1 scope (this file): open the window, build a swapchain, and drive an
-//! acquire → clear/blit → present loop; translate window input via
-//! [`super::input_map`] and hand each [`HostAction`] to the [`InputSink`] (the
-//! device wires that to the prompt action queue). The frame source is a
-//! CPU-BGRA [`FrameSlot`] the device fills from its present capture — a working
-//! window first; sharing the engine's `VkDevice` to present its resident image
-//! with zero copy is the direct-present increment (see the plan).
+//! This file opens the window, builds a swapchain, and drives an acquire →
+//! clear/blit → present loop; it translates window input via
+//! [`super::input_map`] and hands each [`HostAction`] to the [`InputSink`] (the
+//! device wires that to the prompt action queue).
+//!
+//! The frame source is a CPU-BGRA [`FrameSlot`] the device fills from its
+//! present capture, so a frame crosses host memory once on its way to the
+//! window. Presenting the engine's resident image directly on a shared
+//! `VkDevice` would remove that copy and is not implemented.
 //!
 //! Linux owns the event loop on a dedicated thread. macOS requires AppKit work
 //! on the process main thread, so QEMU creates it through
 //! [`start_main_thread`] during device realize and then makes
 //! [`run_main_thread`] its process-main UI loop.
-#![allow(dead_code)]
 // ash-heavy module: inner unsafe blocks add noise per ash call (matches the
 // engine modules' convention).
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -22,7 +23,7 @@
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -35,17 +36,15 @@ use winit::window::{Window, WindowId};
 
 use super::input_map;
 use crate::backend::vulkan::caps;
-use crate::backend::vulkan::engine::dmabuf_export::{ImportedDmabufImage, SCANOUT_EXPORT_RING};
-use crate::backend::vulkan::engine::DrawError;
 use crate::runtime::host::HostAction;
 
-/// Consecutive CPU-staging presents (after direct present was established) that
-/// trip the silent-revert alarm. ~240 presents is a couple seconds even at
-/// 120 Hz — far longer than the zero-to-one staging frame a geometry change can
-/// cause (verified: staging stays frozen across fullscreen/video transitions),
-/// so a trip means a real regression, not a transient.
-const REVERT_ALARM_RUN: u32 = 240;
-#[cfg(target_os = "macos")]
+// How often the window looks for a new guest frame.
+///
+/// 2 ms (500 Hz) is well above any guest refresh, so the poll adds at most one
+/// tick of latency to a frame the guest has already published, and a tick that
+/// finds no new seq costs a mutex lock and an integer compare. It is not a
+/// present rate: [`needs_engine_present`] decides that, and on a still screen
+/// nothing is presented at all.
 const ENGINE_WINDOW_REDRAW_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
@@ -78,37 +77,15 @@ impl Default for WindowConfig {
 /// lock.
 pub type InputSink = Arc<dyn Fn(HostAction) + Send + Sync>;
 
-/// A finished frame's zero-copy dmabuf source (direct-present route B). The
-/// engine exported one of its ring slots into this dmabuf; the window imports it
-/// once per `ring_idx` and re-blits the cached import while the engine writes
-/// fresh content into that slot's shared memory. `fd=None` means the window has
-/// already acknowledged importing this slot for the current geometry. When an fd
-/// is present, the window `take`s it on first sight of this frame (importing
-/// transfers fd ownership to Vulkan), and `Drop` closes it if the frame is
-/// superseded before the window ever reads it.
-pub struct FrameDmabuf {
-    /// Exported dmabuf fd for this frame's ring slot; `None` once consumed or
-    /// when the slot was already imported for this geometry.
-    pub fd: Mutex<Option<std::os::fd::OwnedFd>>,
-    /// LINEAR row pitch of the exported image (currently informational — the
-    /// import re-derives its own subresource layout).
-    pub pitch: u64,
-    /// Which engine ring slot this fd backs, so the window caches one import per
-    /// slot and re-blits the right one.
-    pub ring_idx: usize,
-    /// Shared import-success latch for this host window.
-    pub import_ack: Arc<DirectPresentImportAck>,
-}
-
 /// The latest guest frame to present (BGRA8, tightly packed `width*height*4`).
 /// `None` until the first present capture; the window clears to a flat color
-/// until then. Not `Clone`: it may own a single-consume dmabuf fd, and it is
-/// shared via `Arc` (never deep-cloned).
+/// until then. Shared via `Arc`, so the window's per-vblank read is a refcount
+/// bump rather than a deep copy.
 pub struct Frame {
     /// Monotonic publish sequence (assigned by the device when it writes a new
     /// frame). A static desktop publishes a new frame only when content changes.
-    /// Linux re-blits its prepared dmabuf/staging source each vblank but prepares
-    /// it only when `seq` advances. macOS submits the engine resident only when
+    /// Linux re-blits its prepared staging source each vblank but prepares it only
+    /// when `seq` advances. macOS submits the engine resident only when
     /// `seq` advances or the window resizes, so an unchanged desktop does not
     /// contend with guest render work for the engine queue.
     /// Wrap-around is harmless: a collision at most skips one prepare (the source
@@ -117,10 +94,6 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
-    /// Zero-copy source, when the engine exported this frame's resident target.
-    /// The window prefers it (no CPU upload) and falls back to `bgra` when absent
-    /// or when its device cannot import dmabufs.
-    pub dmabuf: Option<FrameDmabuf>,
     /// Engine-resident source for same-device MoltenVK presentation.
     pub resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
 }
@@ -129,6 +102,22 @@ pub struct Frame {
 /// is `Arc`-wrapped so the window's per-vblank read is a refcount bump, not an
 /// 8 MiB deep copy of an unchanged frame.
 pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
+
+/// Offer a published frame's CPU bytes to the engine presenter.
+///
+/// The presenter prefers the resident and only reads these when none carries the
+/// display — the firmware framebuffer, and any mapping the compositor has not
+/// rendered into. `bgra` is empty on presents the device elided the readback
+/// for, and the presenter rejects a short buffer rather than blitting a torn
+/// frame.
+fn window_cpu_frame(frame: &Frame) -> crate::backend::vulkan::engine::WindowCpuFrame<'_> {
+    crate::backend::vulkan::engine::WindowCpuFrame {
+        bgra: &frame.bgra,
+        width: frame.width,
+        height: frame.height,
+        seq: frame.seq,
+    }
+}
 
 /// Whether a present must upload `incoming`'s frame into the staging image.
 /// True unless the staging image already holds that exact `seq` — the seq-gated
@@ -139,7 +128,13 @@ fn needs_staging_upload(staged: Option<u64>, incoming: u64) -> bool {
     staged != Some(incoming)
 }
 
-#[cfg(target_os = "macos")]
+/// Whether the window must present at all.
+///
+/// A present is an acquire, a full-frame blit into the swapchain image, a submit
+/// and a `queue_present`. None of that produces a different picture when the
+/// guest has not produced a different frame, so the only reasons to pay it are a
+/// new frame seq or a drawable that must be rebuilt (first frame, resize,
+/// suboptimal swapchain).
 fn needs_engine_present(
     presented: Option<u64>,
     redraw_required: bool,
@@ -177,18 +172,10 @@ fn direct_present_degrade_line(reason: &'static str, detail: String) -> String {
     format!("direct_present_degrade reason={reason} {detail}")
 }
 
-fn direct_present_source_line(
-    presents: u64,
-    uploads: u64,
-    dmabuf_blits: u64,
-    staging_blits: u64,
-    fresh_imports: u64,
-    redundant_fds: u64,
-) -> String {
+fn direct_present_source_line(presents: u64, uploads: u64, staging_blits: u64) -> String {
     format!(
-        "direct_present_source presents={presents} uploads={uploads} dmabuf_blits={dmabuf_blits} \
-         staging_blits={staging_blits} fresh_imports={fresh_imports} \
-         redundant_fds={redundant_fds}"
+        "direct_present_source presents={presents} uploads={uploads} \
+         staging_blits={staging_blits}"
     )
 }
 
@@ -198,37 +185,7 @@ enum BlitSource {
     /// No usable frame yet — clear to the slate color.
     Slate,
     /// Blit the CPU staging image (the guest frame was uploaded into it).
-    Staging { dmabuf_fallback: bool },
-    /// Blit the imported engine dmabuf at this ring slot (zero-copy path).
-    Imported(usize),
-}
-
-fn counts_direct_present_revert_alarm(
-    dmabuf_blits: u64,
-    revert_logged: bool,
-    src: BlitSource,
-) -> bool {
-    dmabuf_blits > 0
-        && !revert_logged
-        && matches!(
-            src,
-            BlitSource::Staging {
-                dmabuf_fallback: true
-            }
-        )
-}
-
-fn next_direct_present_revert_run(
-    staging_run: u32,
-    dmabuf_blits: u64,
-    revert_logged: bool,
-    src: BlitSource,
-) -> u32 {
-    if counts_direct_present_revert_alarm(dmabuf_blits, revert_logged, src) {
-        staging_run.saturating_add(1)
-    } else {
-        0
-    }
+    Staging,
 }
 
 /// Shared flag the device sets to ask the window to close (VM teardown). The
@@ -237,56 +194,9 @@ fn next_direct_present_revert_run(
 /// Vulkan objects tear down before the join returns.
 pub type StopFlag = Arc<AtomicBool>;
 
-/// Set by the window thread once its Vulkan device is up, to `true` iff that
-/// device enabled the dmabuf-import extensions. The device reads it to decide
-/// whether the zero-copy resident export is worth doing: on a window whose
-/// device cannot import (e.g. an iGPU lacking the exts), exporting would be a
-/// wasted GPU blit per present, so the device skips it and publishes only the
-/// CPU frame. Starts `false` (unknown → CPU path) and latches once at startup.
-pub type ImportCapableFlag = Arc<AtomicBool>;
-
 /// Set after the native window and all of its Vulkan objects have torn down.
 /// QEMU's backend teardown waits for this before destroying shared GPU state.
 pub type ExitedFlag = Arc<AtomicBool>;
-
-/// Window-side acknowledgement that a direct-present dmabuf ring slot was
-/// successfully imported for a specific guest geometry.
-///
-/// The producer uses this only to skip duplicating an fd for a slot that the
-/// window has already imported. A false negative is harmless (one redundant fd);
-/// a true value is published only after `import_bgra_dmabuf_image` succeeds.
-#[derive(Debug, Default)]
-pub struct DirectPresentImportAck {
-    geom: AtomicU64,
-    slots: AtomicU64,
-}
-
-impl DirectPresentImportAck {
-    fn pack_geom(width: u32, height: u32) -> u64 {
-        ((width as u64) << 32) | height as u64
-    }
-
-    pub fn is_imported(&self, width: u32, height: u32, ring_idx: usize) -> bool {
-        if ring_idx >= 64 {
-            return false;
-        }
-        let geom = Self::pack_geom(width, height);
-        self.geom.load(Ordering::Acquire) == geom
-            && (self.slots.load(Ordering::Acquire) & (1u64 << ring_idx)) != 0
-    }
-
-    pub fn mark_imported(&self, width: u32, height: u32, ring_idx: usize) {
-        if ring_idx >= 64 {
-            return;
-        }
-        let geom = Self::pack_geom(width, height);
-        if self.geom.load(Ordering::Acquire) != geom {
-            self.slots.store(0, Ordering::Release);
-            self.geom.store(geom, Ordering::Release);
-        }
-        self.slots.fetch_or(1u64 << ring_idx, Ordering::AcqRel);
-    }
-}
 
 /// Errors from bringing up or running the window.
 ///
@@ -384,12 +294,6 @@ pub enum WindowError {
     StagingBindMemory(vk::Result),
     /// CPU fallback: mapping staging-image memory failed.
     StagingMapMemory { bytes: u64, result: vk::Result },
-    /// Direct present: the window device did not enable dmabuf import.
-    DmabufImportExtensionsMissing,
-    /// Direct present: the producer named a slot outside the fixed import ring.
-    DmabufRingIndexOutOfRange { ring_idx: usize, ring_len: usize },
-    /// Direct present: the engine's typed dmabuf import declined.
-    DmabufImport(DrawError),
 }
 
 impl WindowError {
@@ -436,10 +340,7 @@ impl WindowError {
             | Self::StagingMemoryTypeUnavailable { .. }
             | Self::StagingAllocateMemory { .. }
             | Self::StagingBindMemory(_)
-            | Self::StagingMapMemory { .. }
-            | Self::DmabufImportExtensionsMissing
-            | Self::DmabufRingIndexOutOfRange { .. }
-            | Self::DmabufImport(_) => None,
+            | Self::StagingMapMemory { .. } => None,
         }
     }
 }
@@ -492,9 +393,6 @@ impl crate::observe::Decline for WindowError {
             Self::StagingAllocateMemory { .. } => "window_staging_allocate_memory",
             Self::StagingBindMemory(_) => "window_staging_bind_memory",
             Self::StagingMapMemory { .. } => "window_staging_map_memory",
-            Self::DmabufImportExtensionsMissing => "window_dmabuf_import_extensions_missing",
-            Self::DmabufRingIndexOutOfRange { .. } => "window_dmabuf_ring_index_out_of_range",
-            Self::DmabufImport(reason) => reason.slug(),
         }
     }
 
@@ -525,11 +423,6 @@ impl crate::observe::Decline for WindowError {
                 ("bytes", bytes.to_string()),
                 ("vk_result", result.as_raw().to_string()),
             ],
-            Self::DmabufRingIndexOutOfRange { ring_idx, ring_len } => vec![
-                ("ring_idx", ring_idx.to_string()),
-                ("ring_len", ring_len.to_string()),
-            ],
-            Self::DmabufImport(reason) => reason.fields(),
             other => match other.detail() {
                 Some(d) => vec![("detail", detail_field(d))],
                 None => Vec::new(),
@@ -557,11 +450,10 @@ pub fn spawn(
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
-    import_capable: ImportCapableFlag,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, import_capable))
+        .spawn(move || run(config, on_input, frames, stop))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -573,7 +465,6 @@ pub fn run(
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
-    import_capable: ImportCapableFlag,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     let mut app = App {
@@ -581,22 +472,16 @@ pub fn run(
         on_input,
         frames,
         stop,
-        import_capable,
         closed_sent: false,
         window: None,
         vk: None,
         cursor: (0, 0),
-        #[cfg(target_os = "macos")]
+        engine_attached: false,
         first_engine_present_logged: false,
-        #[cfg(target_os = "macos")]
         first_engine_guest_logged: false,
-        #[cfg(target_os = "macos")]
         engine_error_logged: false,
-        #[cfg(target_os = "macos")]
         next_engine_redraw: std::time::Instant::now(),
-        #[cfg(target_os = "macos")]
         last_engine_seq: None,
-        #[cfg(target_os = "macos")]
         engine_redraw_required: true,
         #[cfg(target_os = "macos")]
         guest_extent: None,
@@ -635,7 +520,6 @@ pub fn start_main_thread(
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
-    import_capable: ImportCapableFlag,
     exited: ExitedFlag,
 ) -> Result<(), WindowError> {
     MAIN_THREAD_WINDOW.with(|cell| {
@@ -653,11 +537,11 @@ pub fn start_main_thread(
             on_input,
             frames,
             stop,
-            import_capable,
             closed_sent: false,
             window: None,
             vk: None,
             cursor: (0, 0),
+            engine_attached: false,
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
             engine_error_logged: false,
@@ -729,9 +613,6 @@ struct App {
     frames: FrameSlot,
     /// Set by the device to request teardown; polled in `about_to_wait`.
     stop: StopFlag,
-    /// Latched `true` once the Vulkan device is up iff it can import dmabufs, so
-    /// the device only exports resident frames a window that can consume them.
-    import_capable: ImportCapableFlag,
     /// True once a `WindowClosed` action has been emitted (UI close), so the
     /// shutdown request is sent exactly once.
     closed_sent: bool,
@@ -745,17 +626,23 @@ struct App {
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
-    #[cfg(target_os = "macos")]
+    /// The window presents from the engine's own `VkDevice`. False means the
+    /// engine presenter refused this surface and [`VkState`] is driving the
+    /// swapchain from a second device instead.
+    engine_attached: bool,
     first_engine_present_logged: bool,
-    #[cfg(target_os = "macos")]
     first_engine_guest_logged: bool,
-    #[cfg(target_os = "macos")]
     engine_error_logged: bool,
-    #[cfg(target_os = "macos")]
+    /// When the event loop should next look for a new guest frame. The loop
+    /// sleeps until then rather than re-requesting a redraw immediately, which
+    /// is what made the window present continuously while the guest sat at a
+    /// handful of frames per second.
     next_engine_redraw: std::time::Instant,
-    #[cfg(target_os = "macos")]
+    /// Frame seq the drawable currently holds, or `None` before the first
+    /// present.
     last_engine_seq: Option<u64>,
-    #[cfg(target_os = "macos")]
+    /// Force the next present regardless of seq: first frame, resize, or a
+    /// swapchain that reported suboptimal.
     engine_redraw_required: bool,
     /// Last guest DisplaySwap geometry the window observed. Drives the
     /// once-per-mode-change native resize request and the pointer-to-guest
@@ -793,48 +680,68 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        #[cfg(target_os = "macos")]
-        {
-            let attach = window
-                .display_handle()
-                .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))
-                .and_then(|display| {
-                    window
-                        .window_handle()
-                        .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))
-                        .map(|handle| (display.as_raw(), handle.as_raw()))
-                })
-                .and_then(|(display, handle)| {
-                    let size = window.inner_size();
-                    crate::backend::vulkan::engine::window_present_attach(
-                        display,
-                        handle,
-                        size.width.max(1),
-                        size.height.max(1),
-                    )
-                    .map_err(|error| WindowError::AttachEngine(error.to_string()))
-                });
-            match attach {
-                Ok(()) => {
-                    self.import_capable.store(true, Ordering::Release);
-                    window.request_redraw();
-                    self.window = Some(window);
-                }
-                Err(error) => {
+        // Prefer the engine's own device. Presenting the compositor resident
+        // from the device that rendered it is what removes the three full-frame
+        // host copies every presented layer otherwise pays: the drain's
+        // `read_target`, the publish copy, and the window's staging upload.
+        let attach = window
+            .display_handle()
+            .map_err(|error| WindowError::AttachDisplayHandle(error.to_string()))
+            .and_then(|display| {
+                window
+                    .window_handle()
+                    .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))
+                    .map(|handle| (display.as_raw(), handle.as_raw()))
+            })
+            .and_then(|(display, handle)| {
+                let size = window.inner_size();
+                crate::backend::vulkan::engine::window_present_attach(
+                    display,
+                    handle,
+                    size.width.max(1),
+                    size.height.max(1),
+                )
+                .map_err(|error| WindowError::AttachEngine(error.to_string()))
+            });
+        match attach {
+            Ok(()) => {
+                self.engine_attached = true;
+                crate::backend::vulkan::engine::note_window_present_attached(true);
+                window.request_redraw();
+                self.window = Some(window);
+                return;
+            }
+            Err(error) => {
+                // macOS has no second rail: MoltenVK surface creation failing
+                // is fatal for the window either way, and opening a second
+                // `VkInstance` against the same `CAMetalLayer` would not fix
+                // it. Elsewhere the presenter's typed capability refusals
+                // (`SwapchainUnavailable`, `QueueCannotPresent`) name a host
+                // whose engine device cannot drive this surface — a hybrid
+                // laptop where the engine picked the discrete GPU, or a build
+                // without the swapchain extension — and the window falls back
+                // to its own device and CPU pixels.
+                #[cfg(target_os = "macos")]
+                {
                     crate::observe::Emit::decline("host_window_init", &error).fail();
                     eprintln!("reims-vgpu-window: engine swapchain init failed: {error}");
                     self.request_shutdown();
                     event_loop.exit();
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    crate::observe::Emit::decline("host_window_engine_attach", &error).fail();
+                    eprintln!(
+                        "reims-vgpu-window: engine present unavailable ({error}); \
+                         falling back to the window's own device"
+                    );
                 }
             }
         }
         #[cfg(not(target_os = "macos"))]
         match unsafe { VkState::new(&window) } {
             Ok(vk) => {
-                // Tell the device whether this window can consume exported
-                // dmabufs, so it only pays the export blit when we'll use it.
-                self.import_capable
-                    .store(vk.import_fd_loader.is_some(), Ordering::Relaxed);
                 self.vk = Some(vk);
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
@@ -861,17 +768,21 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                #[cfg(target_os = "macos")]
-                {
-                    let applied = (size.width.max(1), size.height.max(1));
+                let applied = (size.width.max(1), size.height.max(1));
+                if self.engine_attached {
                     crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
-                    self.engine_redraw_required = true;
+                    #[cfg(target_os = "macos")]
                     self.note_guest_resize_applied(applied);
+                } else {
+                    #[cfg(not(target_os = "macos"))]
+                    if let Some(vk) = self.vk.as_mut() {
+                        unsafe { vk.recreate_swapchain(applied.0, applied.1) };
+                    }
                 }
-                #[cfg(not(target_os = "macos"))]
-                if let Some(vk) = self.vk.as_mut() {
-                    unsafe { vk.recreate_swapchain(size.width.max(1), size.height.max(1)) };
-                }
+                // Fresh swapchain images hold nothing; the seq gate would
+                // otherwise skip until the guest happened to produce a new
+                // frame, leaving the resized window blank.
+                self.engine_redraw_required = true;
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -899,10 +810,6 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
-                #[cfg(not(target_os = "macos"))]
-                if let Some(w) = self.window.as_ref() {
-                    w.request_redraw();
-                }
             }
             _ => {}
         }
@@ -915,8 +822,11 @@ impl ApplicationHandler for App {
         // first makes the driver marshal to a freed wl_proxy and crash. winit
         // calls this before the loop ends, so the ordering is explicit here
         // rather than relying on struct field order alone.
-        #[cfg(target_os = "macos")]
-        crate::backend::vulkan::engine::window_present_detach();
+        if self.engine_attached {
+            crate::backend::vulkan::engine::window_present_detach();
+            crate::backend::vulkan::engine::note_window_present_attached(false);
+            self.engine_attached = false;
+        }
         #[cfg(not(target_os = "macos"))]
         {
             self.vk = None;
@@ -925,14 +835,31 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // The device sets `stop` on VM teardown. The window redraws every frame
-        // (throttled by the FIFO swapchain to vblank), so this runs ~per frame
-        // and picks the request up within one frame — then the loop exits and
-        // `VkState::drop` tears the window's Vulkan objects down on this thread
-        // before the device's join returns.
+        // The device sets `stop` on VM teardown. The loop wakes at least once
+        // per [`ENGINE_WINDOW_REDRAW_POLL`], so the request is picked up within
+        // one poll — then the loop exits and `VkState::drop` tears the window's
+        // Vulkan objects down on this thread before the device's join returns.
         if self.stop.load(Ordering::Relaxed) {
             event_loop.exit();
-            return;
+        }
+        // Same pacing on both window rails: wake on a fixed poll, ask for a
+        // redraw, and let `draw`'s seq gate decide whether anything is actually
+        // presented. Linux used to re-request a redraw from inside
+        // `RedrawRequested`, which is a spin: measured on x86/Vulkan it held
+        // **510 presents/s** — a full-frame swapchain blit and submit each —
+        // while the guest was producing 4.5-8 frames/s. FIFO does not throttle
+        // it, and every one of those presents produced the picture already on
+        // screen.
+        #[cfg(not(target_os = "macos"))]
+        if let Some(window) = self.window.as_ref() {
+            let now = std::time::Instant::now();
+            if now >= self.next_engine_redraw {
+                window.request_redraw();
+                self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                self.next_engine_redraw,
+            ));
         }
         #[cfg(target_os = "macos")]
         if let Some(window) = self.window.as_ref() {
@@ -971,10 +898,13 @@ impl App {
     }
 
     fn surface_dims(&self) -> (u32, u32) {
-        #[cfg(target_os = "macos")]
-        if let Some(window) = self.window.as_ref() {
-            let size = window.inner_size();
-            return (size.width.max(1), size.height.max(1));
+        // The engine presenter owns the swapchain, so the native window is the
+        // only thing that knows the drawable size on that rail.
+        if self.engine_attached {
+            if let Some(window) = self.window.as_ref() {
+                let size = window.inner_size();
+                return (size.width.max(1), size.height.max(1));
+            }
         }
         self.vk
             .as_ref()
@@ -1007,27 +937,48 @@ impl App {
     }
 
     fn draw(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
+        if self.engine_attached {
             self.draw_engine_window();
+            return;
         }
         #[cfg(not(target_os = "macos"))]
         let Some(vk) = self.vk.as_mut() else {
             return;
         };
         #[cfg(not(target_os = "macos"))]
-        let frame = self.frames.lock().ok().and_then(|g| g.clone());
-        #[cfg(not(target_os = "macos"))]
-        if let Err(e) = unsafe { vk.present(frame.as_deref()) } {
-            crate::observe::Emit::decline("host_window_present", &e).fail_once(0);
-            eprintln!("reims-vgpu-window: present failed: {e}");
+        {
+            let frame = self.frames.lock().ok().and_then(|g| g.clone());
+            let incoming_seq = frame.as_ref().map(|frame| frame.seq);
+            if !needs_engine_present(
+                self.last_engine_seq,
+                self.engine_redraw_required,
+                incoming_seq,
+            ) {
+                return;
+            }
+            match unsafe { vk.present(frame.as_deref()) } {
+                Ok(()) => {
+                    self.last_engine_seq = incoming_seq;
+                    self.engine_redraw_required = false;
+                }
+                Err(e) => {
+                    // The drawable is in an unknown state — an acquire that
+                    // failed, a swapchain that was recreated mid-present. Hold
+                    // the force flag so the next tick presents rather than
+                    // waiting for a guest frame that may be seconds away.
+                    self.engine_redraw_required = true;
+                    crate::observe::Emit::decline("host_window_present", &e).fail_once(0);
+                    eprintln!("reims-vgpu-window: present failed: {e}");
+                }
+            }
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn draw_engine_window(&mut self) {
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
+        #[cfg(target_os = "macos")]
         self.request_guest_geometry(frame.as_deref());
+        #[cfg(target_os = "macos")]
         if self.pending_guest_resize.is_some() {
             // A guest mode change is being applied to the native window
             // (normally single-digit milliseconds; bounded by the 1 s alarm).
@@ -1047,6 +998,7 @@ impl App {
         }
         let result = crate::backend::vulkan::engine::window_present_frame(
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
+            frame.as_deref().map(window_cpu_frame),
         );
         match result {
             Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Busy) => {}
@@ -1063,7 +1015,6 @@ impl App {
                 // promptly so the corrected drawable replaces this one even if
                 // no new guest frame arrives for seconds.
                 self.engine_redraw_required = suboptimal;
-                self.import_capable.store(true, Ordering::Release);
                 if !self.first_engine_present_logged {
                     eprintln!(
                         "reims-vgpu-window: first frame presented \
@@ -1083,7 +1034,6 @@ impl App {
                 }
             }
             Err(error) => {
-                self.import_capable.store(false, Ordering::Release);
                 if !self.engine_error_logged {
                     // The engine present rail's `DrawError` names its own reason
                     // — a `VkCall`'s `vk_window_*` slug, a `DrawReason` refusal,
@@ -1169,7 +1119,6 @@ struct VkState {
     pd: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
-    qfamily: u32,
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,
@@ -1187,11 +1136,6 @@ struct VkState {
     /// the pre-frame slate). Distinguishes "window is up" from "guest content is
     /// flowing end to end" in the boot log — diagnostic only.
     first_guest_frame_logged: bool,
-    /// Latches after the first present that blitted the zero-copy engine dmabuf
-    /// (route B). The `first guest frame` line above latches on whatever the
-    /// FIRST frame used (often CPU staging during warmup before the resident is
-    /// ready), so it cannot confirm steady-state direct present; this line does.
-    first_dmabuf_logged: bool,
     /// Latched direct-present degradation reasons. These are always-on fail-log
     /// lines, not per-frame stderr, because a broken import with an intentionally
     /// elided CPU buffer otherwise looks like a frozen/blank window with no
@@ -1222,83 +1166,10 @@ struct VkState {
     presents: u64,
     uploads: u64,
     /// Present-source census (always-on, folded into the throttled skip-ratio
-    /// line). `dmabuf_blits` counts presents served by the zero-copy engine
-    /// import (route B); `staging_blits` counts presents served by the CPU
-    /// staging path. On an import-capable window a healthy direct-present boot is
-    /// dmabuf≫staging in steady state; a `staging_blits` that keeps climbing
-    /// after warmup means the export silently reverted to CPU (e.g. the member-
-    /// resident fallback regressed) — a regression this line NAMES without a
-    /// human watching the window.
-    dmabuf_blits: u64,
+    /// line): presents served by the CPU staging path, which is every present the
+    /// window makes. Kept beside `presents`/`uploads` so the line states its own
+    /// denominator rather than leaving it implied.
     staging_blits: u64,
-    /// Direct-present import churn proxy. `fresh_imports` counts the one-time
-    /// Vulkan imports that populate the ring cache; `redundant_fds` counts fresh
-    /// fds the producer still supplied for ring slots the window had already
-    /// imported. A healthy route-B window can blit from the cached slots, so a
-    /// growing `redundant_fds` value names the remaining fd-dup/close overhead.
-    fresh_imports: u64,
-    redundant_fds: u64,
-    /// Silent-revert guard. Once direct present is established (`dmabuf_blits`
-    /// has been nonzero), a sustained run of CPU-staging presents means the
-    /// engine export regressed (e.g. the member-resident fallback broke). Count
-    /// CONSECUTIVE staging presents after establishment; a run past
-    /// `REVERT_ALARM_RUN` emits ONE always-on fail line — a single transient
-    /// staging frame across a geometry change never trips it. `revert_logged`
-    /// latches the one-shot.
-    staging_run: u32,
-    revert_logged: bool,
-    /// `VK_KHR_external_memory_fd` loader when the window device enables the
-    /// dmabuf-import extensions (route B direct-present) — `None` on a device
-    /// that lacks them, in which case the window stays on the CPU staging path.
-    import_fd_loader: Option<ash::khr::external_memory_fd::Device>,
-    /// One imported dmabuf per engine ring slot (direct-present route B). The
-    /// engine hands a different ring slot each present and re-writes each slot's
-    /// shared memory in place, so the window imports each slot's fd ONCE and
-    /// re-blits the cached import — a steady-state present neither uploads nor
-    /// re-imports, just scale-blits. Sized [`SCANOUT_EXPORT_RING`]; all `None`
-    /// until the first dmabuf frame.
-    import_ring: Vec<Option<ImportedDmabufImage>>,
-    /// Geometry the `import_ring` entries are valid for; on a geometry change
-    /// every import is dropped and re-imported at the new size.
-    import_geom: (u32, u32),
-    /// The ring slot to blit this present (and subsequent same-`seq` presents),
-    /// or `None` when the CPU staging path is active. Set when a new dmabuf frame
-    /// is prepared; `staged_seq` gates re-preparing.
-    active_import: Option<usize>,
-    /// OPTIMAL-tiled device-local scratch the imported LINEAR dmabuf is copied
-    /// into before the scaling blit to the swapchain (route B). A scaling
-    /// `vkCmdBlitImage` with `VK_FILTER_LINEAR` requires the source to support
-    /// `SAMPLED_IMAGE_FILTER_LINEAR` (and `BLIT_SRC`) for its tiling — LINEAR
-    /// tiling guarantees neither, so a LINEAR imported dmabuf is not a portable
-    /// scaling-blit source (the 4K→window downscale resamples; the ≈1:1 1080p
-    /// case does not). A raw `vkCmdCopyImage` LINEAR→OPTIMAL preserves the exact
-    /// bytes and the scaling blit then reads a well-defined OPTIMAL source. Sized
-    /// to the current import geometry; recreated on a geometry change.
-    ///
-    /// NOTE: this scratch does NOT affect channel order — a whole-desktop R/B
-    /// swap once attributed to a "LINEAR-source scaling blit" was root-caused to
-    /// the compute BGRA storage-image composite instead (fixed there via a
-    /// format-less B8G8R8A8_UNORM storage view); window-side blit changes were
-    /// proven byte-identical. Kept purely for the scaling-blit portability above.
-    blit_scratch: Option<ScratchImage>,
-}
-
-/// An OPTIMAL-tiled device-local BGRA8 image the imported LINEAR dmabuf is copied
-/// into (raw, same size) so the scaling swapchain blit reads a portable source.
-struct ScratchImage {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    width: u32,
-    height: u32,
-    /// `false` until the first copy transitions it out of `UNDEFINED`.
-    initialized: bool,
-}
-
-impl ScratchImage {
-    unsafe fn destroy(self, device: &ash::Device) {
-        device.destroy_image(self.image, None);
-        device.free_memory(self.memory, None);
-    }
 }
 
 /// A host-visible LINEAR BGRA8 image the guest frame is uploaded into (mapped,
@@ -1427,15 +1298,6 @@ impl VkState {
         let qci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qfamily)
             .queue_priorities(&prio)];
-        // Enable the dmabuf-import extensions (route B direct-present) only when
-        // the device advertises all three — on a host that lacks them the window
-        // stays on the CPU staging path (import_fd_loader stays None). Same
-        // portability discipline as the engine device (AGENTS.md).
-        let want_import = [
-            vk::KHR_EXTERNAL_MEMORY_NAME,
-            vk::KHR_EXTERNAL_MEMORY_FD_NAME,
-            vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME,
-        ];
         let device_extensions = instance
             .enumerate_device_extension_properties(pd)
             .map_err(|e| WindowError::VkEnumerateDeviceExts(e.to_string()))?;
@@ -1444,11 +1306,6 @@ impl VkState {
                 .iter()
                 .any(|property| std::ffi::CStr::from_ptr(property.extension_name.as_ptr()) == want)
         };
-        let have_import = want_import.iter().all(|want| {
-            device_extensions
-                .iter()
-                .any(|property| std::ffi::CStr::from_ptr(property.extension_name.as_ptr()) == *want)
-        });
         // VK_KHR_swapchain was pushed unconditionally, so a device that does
         // not advertise it failed at create_device with a bare
         // ERROR_EXTENSION_NOT_PRESENT and no reason. A window without a
@@ -1461,9 +1318,6 @@ impl VkState {
         if has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME) {
             dev_exts.push(vk::KHR_PORTABILITY_SUBSET_NAME.as_ptr());
         }
-        if have_import {
-            dev_exts.extend(want_import.iter().map(|n| n.as_ptr()));
-        }
         let dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dev_exts);
@@ -1472,8 +1326,6 @@ impl VkState {
             .map_err(|e| WindowError::VkCreateDevice(e.to_string()))?;
         let queue = device.get_device_queue(qfamily, 0);
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
-        let import_fd_loader =
-            have_import.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
 
         let cmd_pool = device
             .create_command_pool(
@@ -1509,17 +1361,6 @@ impl VkState {
         let device_props = instance.get_physical_device_properties(pd);
         let window_caps = caps::HostGpuCaps {
             memory: caps::memory_topology::classify_memory(&mem_props),
-            // The window's zero-copy story is the import side of the display
-            // rail: it never exports a dmabuf and never imports guest pages
-            // (both memory rails belong to the engine device), so the only
-            // mechanism that means anything here is dmabuf import.
-            zero_copy: caps::ZeroCopyProfile::display_only(have_import),
-            // Always a swapchain — reaching here proved VK_KHR_swapchain is
-            // advertised. Never an export: this device consumes frames.
-            handoff: caps::HandoffLadder::resolve(&caps::frame_interop::HandoffInputs {
-                dmabuf_export: false,
-                engine_swapchain: true,
-            }),
             quirks: caps::DriverQuirk::for_portability_subset(has_device_extension(
                 vk::KHR_PORTABILITY_SUBSET_NAME,
             )),
@@ -1541,7 +1382,6 @@ impl VkState {
             pd,
             device,
             queue,
-            qfamily,
             swapchain_loader,
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
@@ -1557,7 +1397,6 @@ impl VkState {
             in_flight,
             first_present_logged: false,
             first_guest_frame_logged: false,
-            first_dmabuf_logged: false,
             direct_degrade_logged: HashSet::new(),
             mem_props,
             caps: window_caps,
@@ -1566,17 +1405,7 @@ impl VkState {
             staged_seq: None,
             presents: 0,
             uploads: 0,
-            dmabuf_blits: 0,
             staging_blits: 0,
-            fresh_imports: 0,
-            redundant_fds: 0,
-            staging_run: 0,
-            revert_logged: false,
-            import_fd_loader,
-            import_ring: (0..SCANOUT_EXPORT_RING).map(|_| None).collect(),
-            import_geom: (0, 0),
-            active_import: None,
-            blit_scratch: None,
         };
         let size = window.inner_size();
         s.recreate_swapchain(size.width.max(1), size.height.max(1));
@@ -1685,7 +1514,7 @@ impl VkState {
         let fences = [self.in_flight];
         let _ = self.device.wait_for_fences(&fences, true, u64::MAX);
 
-        // Prepare this frame's blit source (dmabuf import or CPU staging upload),
+        // Prepare this frame's blit source (the CPU staging upload),
         // seq-gated so an unchanged frame is neither re-uploaded nor re-imported.
         let src = self.prepare_frame(frame);
 
@@ -1736,31 +1565,8 @@ impl VkState {
         match src {
             // Scale-blit the guest frame into the swapchain image (LINEAR filter
             // covers guest-res != window-res).
-            BlitSource::Imported(idx) => {
-                self.dmabuf_blits = self.dmabuf_blits.wrapping_add(1);
-                self.staging_run = 0;
-                self.blit_ring_slot(image, idx)
-            }
-            BlitSource::Staging { .. } => {
+            BlitSource::Staging => {
                 self.staging_blits = self.staging_blits.wrapping_add(1);
-                // Only meaningful when a dmabuf-carried frame fell through to
-                // staging after direct present was established. Plain CPU frames
-                // with no dmabuf source are counted in the source census, but
-                // are not a window import regression.
-                self.staging_run = next_direct_present_revert_run(
-                    self.staging_run,
-                    self.dmabuf_blits,
-                    self.revert_logged,
-                    src,
-                );
-                if self.staging_run >= REVERT_ALARM_RUN {
-                    self.revert_logged = true;
-                    crate::observe::off(format!(
-                        "direct_present_reverted_to_staging run={} dmabuf_blits={} \
-                             staging_blits={} (engine export regressed — window fell back to CPU)",
-                        self.staging_run, self.dmabuf_blits, self.staging_blits
-                    ));
-                }
                 self.blit_staging(image)
             }
             BlitSource::Slate => {
@@ -1779,25 +1585,12 @@ impl VkState {
         }
         if !matches!(src, BlitSource::Slate) && !self.first_guest_frame_logged {
             if let Some(f) = frame {
-                let via = if matches!(src, BlitSource::Imported(_)) {
-                    "dmabuf"
-                } else if matches!(src, BlitSource::Staging { .. }) {
-                    "staging"
-                } else {
-                    "slate"
-                };
                 eprintln!(
-                    "reims-vgpu-window: first guest frame presented ({}x{}, via {via})",
+                    "reims-vgpu-window: first guest frame presented ({}x{}, via staging)",
                     f.width, f.height
                 );
             }
             self.first_guest_frame_logged = true;
-        }
-        if matches!(src, BlitSource::Imported(_)) && !self.first_dmabuf_logged {
-            eprintln!(
-                "reims-vgpu-window: direct present live — first frame blitted via dmabuf (route B)"
-            );
-            self.first_dmabuf_logged = true;
         }
         self.barrier(
             image,
@@ -1850,23 +1643,16 @@ impl VkState {
                 if self.presents.is_multiple_of(1024) {
                     eprintln!(
                         "reims-vgpu-window: present skip-ratio uploads={} presents={} \
-                         (elided {} redundant full-frame uploads) source dmabuf={} staging={} \
-                         fresh_imports={} redundant_fds={}",
+                         (elided {} redundant full-frame uploads) staging_blits={}",
                         self.uploads,
                         self.presents,
                         self.presents.saturating_sub(self.uploads),
-                        self.dmabuf_blits,
                         self.staging_blits,
-                        self.fresh_imports,
-                        self.redundant_fds,
                     );
                     crate::observe::off(direct_present_source_line(
                         self.presents,
                         self.uploads,
-                        self.dmabuf_blits,
                         self.staging_blits,
-                        self.fresh_imports,
-                        self.redundant_fds,
                     ));
                 }
                 Ok(())
@@ -1890,18 +1676,14 @@ impl VkState {
         class: &'static str,
         decline: &WindowError,
         frame: &Frame,
-        ring_idx: Option<usize>,
     ) {
         use crate::observe::Decline as _;
         if self.direct_degrade_logged.insert(decline.slug()) {
-            let mut emit = crate::observe::Emit::decline("direct_present_degrade", decline)
+            let emit = crate::observe::Emit::decline("direct_present_degrade", decline)
                 .field("class", class)
                 .field("seq", frame.seq)
                 .field("width", frame.width)
                 .field("height", frame.height);
-            if let Some(ring_idx) = ring_idx {
-                emit = emit.field("ring", ring_idx);
-            }
             emit.off();
         }
     }
@@ -2102,11 +1884,7 @@ impl VkState {
     }
 
     /// Prepare the blit source for `frame`, seq-gated so an unchanged frame is
-    /// neither re-uploaded (CPU path) nor re-imported (dmabuf path). Prefers the
-    /// zero-copy dmabuf when the frame carries one and the window can import it,
-    /// falling back to the CPU staging upload otherwise — so a dmabuf miss (no
-    /// exts, import failure, absent handle) degrades to today's path, never to a
-    /// blank window.
+    /// not re-uploaded.
     unsafe fn prepare_frame(&mut self, frame: Option<&Frame>) -> BlitSource {
         let Some(f) = frame else {
             return BlitSource::Slate;
@@ -2114,74 +1892,15 @@ impl VkState {
         if f.width == 0 || f.height == 0 {
             return BlitSource::Slate;
         }
-
-        // NOTE: the CPU buffer's length is deliberately NOT checked here. It is a
-        // precondition of the STAGING path only, and is validated at that path
-        // below. A dmabuf-carried frame legitimately arrives with an EMPTY `bgra`
-        // — the device stopped copying the full frame into it once the proxies
-        // moved to a GPU reduction — and gating the whole function on its length
-        // would reject a perfectly good dmabuf frame and blank the window.
-
-        // Zero-copy dmabuf path.
-        let mut dmabuf_fallback = false;
-        if self.import_fd_loader.is_some() {
-            if let Some(dm) = f.dmabuf.as_ref() {
-                // Same frame already prepared as an import: re-blit the cached
-                // ring slot (the engine rewrote its shared memory in place).
-                if self.staged_seq == Some(f.seq) && self.active_import == Some(dm.ring_idx) {
-                    return BlitSource::Imported(dm.ring_idx);
-                }
-                // New frame: consume the fd once (import transfers ownership to
-                // Vulkan; a redundant dup for an already-cached slot is closed).
-                let fd = dm.fd.lock().ok().and_then(|mut g| g.take());
-                if let Some(fd) = fd {
-                    match self.import_ring_slot(fd, f.width, f.height, dm.ring_idx) {
-                        Ok(()) => {
-                            dm.import_ack.mark_imported(f.width, f.height, dm.ring_idx);
-                            self.staged_seq = Some(f.seq);
-                            self.active_import = Some(dm.ring_idx);
-                            return BlitSource::Imported(dm.ring_idx);
-                        }
-                        Err(e) => {
-                            self.log_direct_present_decline(
-                                "import_failed",
-                                &e,
-                                f,
-                                Some(dm.ring_idx),
-                            );
-                        }
-                    }
-                    dmabuf_fallback = true;
-                } else if self.cached_import_available(f.width, f.height, dm.ring_idx) {
-                    self.staged_seq = Some(f.seq);
-                    self.active_import = Some(dm.ring_idx);
-                    return BlitSource::Imported(dm.ring_idx);
-                } else {
-                    self.log_direct_present_degrade(
-                        "fd_missing",
-                        format!(
-                            "seq={} ring={} {}x{} active_import={:?}",
-                            f.seq, dm.ring_idx, f.width, f.height, self.active_import
-                        ),
-                    );
-                    dmabuf_fallback = true;
-                }
-                // fd already consumed or import failed → fall through to CPU.
-            }
-        }
-
-        // CPU staging path (also the fallback when the dmabuf path did not take).
-        // This is the one consumer of `bgra`, so its length is required HERE.
-        // A short/empty buffer with no usable dmabuf means we genuinely have
-        // nothing to show: hold a slate rather than blit uninitialised memory.
-        self.active_import = None;
+        // `bgra` is the only source, so its length is required here: a short or
+        // empty buffer means we genuinely have nothing to show, and holding a
+        // slate beats blitting uninitialised memory.
         if f.bgra.len() < (f.width as usize * f.height as usize * 4) {
             self.log_direct_present_degrade(
                 "no_source",
                 format!(
-                    "seq={} dmabuf={} bgra={} need={} {}x{}",
+                    "seq={} bgra={} need={} {}x{}",
                     f.seq,
-                    f.dmabuf.is_some(),
                     f.bgra.len(),
                     f.width as usize * f.height as usize * 4,
                     f.width,
@@ -2197,346 +1916,13 @@ impl VkState {
                     self.staged_seq = Some(f.seq);
                     self.uploads = self.uploads.wrapping_add(1);
                 }
-                BlitSource::Staging { dmabuf_fallback }
+                BlitSource::Staging
             }
             Err(e) => {
-                self.log_direct_present_decline("staging_failed", &e, f, None);
+                self.log_direct_present_decline("staging_failed", &e, f);
                 BlitSource::Slate
             }
         }
-    }
-
-    fn cached_import_available(&self, width: u32, height: u32, ring_idx: usize) -> bool {
-        self.import_geom == (width, height)
-            && self
-                .import_ring
-                .get(ring_idx)
-                .and_then(|slot| slot.as_ref())
-                .is_some()
-    }
-
-    /// Import the engine's exported dmabuf `fd` (an `OwnedFd`) into ring slot
-    /// `ring_idx` as a `TRANSFER_SRC` image (direct-present route B), caching it
-    /// so later presents on the same slot re-blit without re-importing (the
-    /// engine rewrites the slot's shared memory in place). A geometry change
-    /// drops every cached import first; on a slot already imported the incoming
-    /// fd is a redundant dup for the same underlying dmabuf and is closed.
-    ///
-    /// The fd is consumed exactly once here: transferred to Vulkan on a
-    /// successful import, else closed (Vulkan does not take it on failure, and a
-    /// redundant dup is dropped) — so no fd leaks and none double-closes. The
-    /// import barrier + blit are validated cross-device by
-    /// `cross_device_dmabuf_import_is_byte_identical`.
-    unsafe fn import_ring_slot(
-        &mut self,
-        fd: std::os::fd::OwnedFd,
-        width: u32,
-        height: u32,
-        ring_idx: usize,
-    ) -> Result<(), WindowError> {
-        use std::os::fd::{FromRawFd, IntoRawFd};
-        let Some(loader) = self.import_fd_loader.clone() else {
-            // Cannot import; closing `fd` (dropped at scope end) reclaims it.
-            return Err(WindowError::DmabufImportExtensionsMissing);
-        };
-        if ring_idx >= self.import_ring.len() {
-            return Err(WindowError::DmabufRingIndexOutOfRange {
-                ring_idx,
-                ring_len: self.import_ring.len(),
-            });
-        }
-        // Geometry change: drop every cached import (dmabuf refcounting keeps the
-        // engine-side buffers alive until the engine frees them too).
-        if self.import_geom != (width, height) {
-            let _ = self
-                .device
-                .wait_for_fences(&[self.in_flight], true, u64::MAX);
-            for slot in self.import_ring.iter_mut() {
-                if let Some(old) = slot.take() {
-                    old.destroy(&self.device);
-                }
-            }
-            self.import_geom = (width, height);
-        }
-        if self.import_ring[ring_idx].is_some() {
-            // Already imported this slot — `fd` is a redundant dup; drop closes it.
-            self.redundant_fds = self.redundant_fds.wrapping_add(1);
-            return Ok(());
-        }
-        // Fresh import for this slot; quiesce any in-flight present first.
-        let _ = self
-            .device
-            .wait_for_fences(&[self.in_flight], true, u64::MAX);
-        let raw = fd.into_raw_fd();
-        match crate::backend::vulkan::engine::dmabuf_export::import_bgra_dmabuf_image(
-            &self.device,
-            &loader,
-            &self.mem_props,
-            raw,
-            width,
-            height,
-        ) {
-            Ok(img) => {
-                self.import_ring[ring_idx] = Some(img);
-                self.fresh_imports = self.fresh_imports.wrapping_add(1);
-                Ok(())
-            }
-            Err(e) => {
-                // Vulkan did not take the fd on failure — reclaim + close it.
-                drop(std::os::fd::OwnedFd::from_raw_fd(raw));
-                Err(WindowError::DmabufImport(e))
-            }
-        }
-    }
-
-    /// Scale-blit the imported engine dmabuf at ring slot `idx` into `dst`
-    /// (already in `TRANSFER_DST_OPTIMAL`), the zero-copy present path. An
-    /// EXTERNAL→graphics acquire barrier from `GENERAL` (the producer's layout)
-    /// makes the engine's latest write visible AND preserves the imported content
-    /// — never `UNDEFINED` (which discards it). Kept in `GENERAL` across frames so
-    /// re-blitting sees each fresh engine write without a round-trip transition.
-    /// No-op if the slot is not imported.
-    /// Ensure the OPTIMAL blit scratch matches `width`x`height`, (re)creating it on
-    /// a geometry change. Returns `false` if creation failed (caller skips the
-    /// present; the window holds its last good frame). The scratch is device-local
-    /// OPTIMAL BGRA8 with TRANSFER_DST (copy target) + TRANSFER_SRC (blit source).
-    unsafe fn ensure_blit_scratch(&mut self, width: u32, height: u32) -> bool {
-        if let Some(s) = &self.blit_scratch {
-            if s.width == width && s.height == height {
-                return true;
-            }
-        }
-        // Geometry change: the old scratch may still be referenced by the last
-        // submitted present, so drain the device before destroying it. This runs
-        // INSIDE `present()` after `in_flight` was already reset (unsignaled), so a
-        // fence wait would deadlock — `device_wait_idle` drains regardless of fence
-        // state. Only taken when an old scratch actually exists (rare: resolution
-        // switch); the first creation has nothing to drain.
-        if let Some(old) = self.blit_scratch.take() {
-            let _ = self.device.device_wait_idle();
-            old.destroy(&self.device);
-        }
-        // Every failure below used to be a bare `return false`, which leaves the
-        // caller presenting a swapchain image it never wrote — a blank or
-        // garbage window with nothing in the fail log. Each one now names its
-        // stage; the reasons are latched so a persistent failure logs once.
-        let image = match self.device.create_image(
-            &vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT)
-                .extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
-                .initial_layout(vk::ImageLayout::UNDEFINED),
-            None,
-        ) {
-            Ok(image) => image,
-            Err(error) => {
-                self.log_direct_present_degrade(
-                    "blit_scratch_create",
-                    format!("{width}x{height} err={error}"),
-                );
-                return false;
-            }
-        };
-        let req = self.device.get_image_memory_requirements(image);
-        let Some(mt) = self.memory_type_for(
-            req.memory_type_bits,
-            caps::MemoryClass::DeviceLocalPreferred,
-        ) else {
-            self.log_direct_present_degrade(
-                "blit_scratch_no_memory_type",
-                format!("{width}x{height} type_bits={:#x}", req.memory_type_bits),
-            );
-            self.device.destroy_image(image, None);
-            return false;
-        };
-        let memory = match self.device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(req.size)
-                .memory_type_index(mt),
-            None,
-        ) {
-            Ok(memory) => memory,
-            Err(error) => {
-                self.log_direct_present_degrade(
-                    "blit_scratch_alloc",
-                    format!("{width}x{height} bytes={} err={error}", req.size),
-                );
-                self.device.destroy_image(image, None);
-                return false;
-            }
-        };
-        if let Err(error) = self.device.bind_image_memory(image, memory, 0) {
-            self.log_direct_present_degrade(
-                "blit_scratch_bind",
-                format!("{width}x{height} err={error}"),
-            );
-            self.device.free_memory(memory, None);
-            self.device.destroy_image(image, None);
-            return false;
-        }
-        self.blit_scratch = Some(ScratchImage {
-            image,
-            memory,
-            width,
-            height,
-            initialized: false,
-        });
-        true
-    }
-
-    unsafe fn blit_ring_slot(&mut self, dst: vk::Image, idx: usize) {
-        let (src_image, sw, sh) = match self.import_ring.get(idx).and_then(|s| s.as_ref()) {
-            Some(img) => (img.image, img.width, img.height),
-            None => {
-                // The ring slot was never imported; presenting now would show
-                // an unwritten swapchain image.
-                self.log_direct_present_degrade(
-                    "ring_slot_not_imported",
-                    format!("idx={idx} ring={}", self.import_ring.len()),
-                );
-                return;
-            }
-        };
-        let full = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-        // Acquire the imported dmabuf (queue-family EXTERNAL→graphics), GENERAL
-        // layout (preserves the engine write; never UNDEFINED which discards it).
-        let acquire = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-            .dst_queue_family_index(self.qfamily)
-            .image(src_image)
-            .subresource_range(full)
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        self.device.cmd_pipeline_barrier(
-            self.cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[acquire],
-        );
-        // Route the LINEAR import through an OPTIMAL scratch: a raw same-size
-        // `vkCmdCopyImage` preserves the exact BGRA bytes, then the scaling blit
-        // reads a portable OPTIMAL source (blit-scaling a LINEAR source with a
-        // linear filter is not portable). See `blit_scratch`.
-        if !self.ensure_blit_scratch(sw, sh) {
-            // ensure_blit_scratch already named its own failure stage.
-            return;
-        }
-        let scratch = self.blit_scratch.as_ref().expect("ensured above");
-        let (scratch_image, was_init) = (scratch.image, scratch.initialized);
-        let layers = vk::ImageSubresourceLayers::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .layer_count(1);
-        // Scratch → TRANSFER_DST (UNDEFINED first use, else prior TRANSFER_SRC).
-        let (old_layout, src_access) = if was_init {
-            (
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::AccessFlags::TRANSFER_READ,
-            )
-        } else {
-            (vk::ImageLayout::UNDEFINED, vk::AccessFlags::empty())
-        };
-        let to_dst = vk::ImageMemoryBarrier::default()
-            .old_layout(old_layout)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(scratch_image)
-            .subresource_range(full)
-            .src_access_mask(src_access)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-        self.device.cmd_pipeline_barrier(
-            self.cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[to_dst],
-        );
-        let copy = vk::ImageCopy::default()
-            .src_subresource(layers)
-            .dst_subresource(layers)
-            .extent(vk::Extent3D {
-                width: sw,
-                height: sh,
-                depth: 1,
-            });
-        self.device.cmd_copy_image(
-            self.cmd,
-            src_image,
-            vk::ImageLayout::GENERAL,
-            scratch_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[copy],
-        );
-        // Scratch → TRANSFER_SRC for the scaling blit into the swapchain.
-        let to_src = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(scratch_image)
-            .subresource_range(full)
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        self.device.cmd_pipeline_barrier(
-            self.cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[to_src],
-        );
-        let region = vk::ImageBlit::default()
-            .src_subresource(layers)
-            .src_offsets([
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D {
-                    x: sw as i32,
-                    y: sh as i32,
-                    z: 1,
-                },
-            ])
-            .dst_subresource(layers)
-            .dst_offsets([
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D {
-                    x: self.extent.width as i32,
-                    y: self.extent.height as i32,
-                    z: 1,
-                },
-            ]);
-        self.device.cmd_blit_image(
-            self.cmd,
-            scratch_image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            dst,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[region],
-            crate::backend::vulkan::translate::sampler::PRESENT_BLIT_FILTER,
-        );
-        self.blit_scratch
-            .as_mut()
-            .expect("ensured above")
-            .initialized = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2579,14 +1965,6 @@ impl Drop for VkState {
             if let Some(staging) = self.staging.take() {
                 staging.destroy(&self.device);
             }
-            for slot in self.import_ring.iter_mut() {
-                if let Some(imported) = slot.take() {
-                    imported.destroy(&self.device);
-                }
-            }
-            if let Some(scratch) = self.blit_scratch.take() {
-                scratch.destroy(&self.device);
-            }
             self.device.destroy_fence(self.in_flight, None);
             self.device.destroy_semaphore(self.image_available, None);
             self.device.destroy_semaphore(self.render_finished, None);
@@ -2605,6 +1983,63 @@ impl Drop for VkState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run of redraws over one unchanged guest frame presents exactly once.
+    ///
+    /// This is the spin the Linux rail shipped: `RedrawRequested` called
+    /// `request_redraw()` again unconditionally, so the loop re-entered
+    /// immediately and presented whatever was already on screen. Measured on
+    /// x86/Vulkan it ran at 510 presents/s — each a full-frame swapchain blit
+    /// and submit — against a guest producing 4.5-8 frames/s. FIFO does not
+    /// throttle it, so nothing else in the stack was going to.
+    ///
+    /// The property that stops it is this predicate, and it now guards both
+    /// rails. Driving it with the poll sequence rather than the truth table is
+    /// deliberate: the table version passes even if a caller ignores the answer.
+    #[test]
+    fn repeated_polls_of_one_frame_present_once() {
+        let mut presented: Option<u64> = None;
+        let mut redraw_required = true;
+        let mut presents = 0;
+        // 300 polls — a couple of seconds at the 2 ms poll — over three guest
+        // frames, the middle one held for most of them.
+        for tick in 0..300u64 {
+            let incoming = Some(match tick {
+                0..=9 => 1,
+                10..=289 => 2,
+                _ => 3,
+            });
+            if needs_engine_present(presented, redraw_required, incoming) {
+                presents += 1;
+                presented = incoming;
+                redraw_required = false;
+            }
+        }
+        assert_eq!(
+            presents, 3,
+            "one present per distinct guest frame, not one per poll"
+        );
+    }
+
+    /// The first poll presents even though no guest frame exists yet, and a
+    /// resize presents again into the fresh swapchain images without waiting
+    /// for the guest — both are `redraw_required`, and both are why the gate
+    /// cannot be a bare seq comparison.
+    #[test]
+    fn forced_redraw_presents_without_a_new_frame() {
+        assert!(
+            needs_engine_present(None, true, None),
+            "the first present has no frame and must still happen"
+        );
+        assert!(
+            !needs_engine_present(None, false, None),
+            "and must not repeat once the flag is cleared"
+        );
+        assert!(
+            needs_engine_present(Some(7), true, Some(7)),
+            "a resize must repaint the same frame into new swapchain images"
+        );
+    }
 
     /// Every window bring-up check names itself, its slug is namespaced to the
     /// window rail and distinct, and — the property no crate-wide gate can see —
@@ -2702,11 +2137,6 @@ mod tests {
                 bytes: 4096,
                 result: vk::Result::ERROR_MEMORY_MAP_FAILED,
             },
-            WindowError::DmabufImportExtensionsMissing,
-            WindowError::DmabufRingIndexOutOfRange {
-                ring_idx: 4,
-                ring_len: 3,
-            },
         ];
         let mut slugs = std::collections::HashSet::new();
         for decline in all {
@@ -2716,7 +2146,12 @@ mod tests {
                 assert!(!value.contains(char::is_whitespace));
             }
         }
-        assert_eq!(slugs.len(), 14);
+        // A floor, not a census. `slugs.insert` above already proves the table
+        // has no duplicates, so an exact count would only restate `all.len()` —
+        // and a hand-bumped total taxes every variant this file loses without
+        // being able to see a variant the table never listed. The floor is here
+        // so a table gutted to one entry cannot pass vacuously.
+        assert!(slugs.len() >= 10, "{} window declines listed", slugs.len());
     }
 
     #[test]
@@ -2795,83 +2230,14 @@ mod tests {
         assert!(line.contains("1920x1080"));
     }
 
+    /// The throttled census line has to state its own denominator: `presents`
+    /// against `uploads` is the elision ratio, and `staging_blits` says how many
+    /// of those presents actually blitted a guest frame.
     #[test]
-    fn direct_present_source_line_names_import_churn() {
-        let line = direct_present_source_line(2048, 12, 2000, 48, 3, 197);
+    fn direct_present_source_line_names_its_denominator() {
+        let line = direct_present_source_line(2048, 12, 2000);
         assert!(line.starts_with("direct_present_source presents=2048"));
         assert!(line.contains("uploads=12"));
-        assert!(line.contains("dmabuf_blits=2000"));
-        assert!(line.contains("staging_blits=48"));
-        assert!(line.contains("fresh_imports=3"));
-        assert!(line.contains("redundant_fds=197"));
-    }
-
-    #[test]
-    fn direct_present_import_ack_is_geometry_scoped() {
-        let ack = DirectPresentImportAck::default();
-        assert!(!ack.is_imported(1920, 1080, 1));
-
-        ack.mark_imported(1920, 1080, 1);
-        assert!(ack.is_imported(1920, 1080, 1));
-        assert!(!ack.is_imported(1920, 1080, 2));
-        assert!(!ack.is_imported(3840, 2160, 1));
-
-        ack.mark_imported(3840, 2160, 2);
-        assert!(ack.is_imported(3840, 2160, 2));
-        assert!(!ack.is_imported(1920, 1080, 1));
-    }
-
-    #[test]
-    fn direct_present_revert_alarm_requires_dmabuf_fallback() {
-        assert!(!counts_direct_present_revert_alarm(
-            10,
-            false,
-            BlitSource::Staging {
-                dmabuf_fallback: false
-            }
-        ));
-        assert!(counts_direct_present_revert_alarm(
-            10,
-            false,
-            BlitSource::Staging {
-                dmabuf_fallback: true
-            }
-        ));
-        assert!(!counts_direct_present_revert_alarm(
-            0,
-            false,
-            BlitSource::Staging {
-                dmabuf_fallback: true
-            }
-        ));
-        assert!(!counts_direct_present_revert_alarm(
-            10,
-            true,
-            BlitSource::Staging {
-                dmabuf_fallback: true
-            }
-        ));
-        assert_eq!(
-            next_direct_present_revert_run(
-                7,
-                10,
-                false,
-                BlitSource::Staging {
-                    dmabuf_fallback: true
-                }
-            ),
-            8
-        );
-        assert_eq!(
-            next_direct_present_revert_run(
-                7,
-                10,
-                false,
-                BlitSource::Staging {
-                    dmabuf_fallback: false
-                }
-            ),
-            0
-        );
+        assert!(line.contains("staging_blits=2000"));
     }
 }

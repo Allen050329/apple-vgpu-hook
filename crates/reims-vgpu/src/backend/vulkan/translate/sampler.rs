@@ -135,19 +135,6 @@ pub fn vk_border_color_with_clamp_to_zero(
 /// non-scaling present hits the 1:1 path and never consults this.
 pub const PRESENT_BLIT_FILTER: vk::Filter = vk::Filter::LINEAR;
 
-/// Filter for engine passes that must read exact texels rather than resample —
-/// the content-statistics reduction, which is counting pixels and would get
-/// wrong answers from any interpolation.
-pub const EXACT_TEXEL_FILTER: vk::Filter = vk::Filter::NEAREST;
-
-/// Mip mode for those same passes. They bind single-level images, so this only
-/// has to be the cheaper of the two.
-pub const EXACT_TEXEL_MIPMAP_MODE: vk::SamplerMipmapMode = vk::SamplerMipmapMode::NEAREST;
-
-/// Address mode for those same passes: they never sample outside the image, so
-/// clamping is the choice that cannot introduce a border colour by accident.
-pub const EXACT_TEXEL_ADDRESS_MODE: vk::SamplerAddressMode = vk::SamplerAddressMode::CLAMP_TO_EDGE;
-
 #[cfg(test)]
 mod tests {
     use super::*;

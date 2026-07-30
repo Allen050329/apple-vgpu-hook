@@ -8,10 +8,8 @@
 use crate::model::{
     DeviceState, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
-use crate::runtime::decode::event::{self, Command as EventCommand, Kind as EventCmdKind};
-use crate::runtime::plan::event_sync::{
-    self, Decision, Domain, EventKind, FenceAction, ValueSnapshot,
-};
+use crate::runtime::decode::event::{Command as EventCommand, Kind as EventCmdKind};
+use crate::runtime::plan::event_sync::{self, Decision, Domain, EventKind, FenceAction};
 
 /// Outcome of a product-path event or encoder fence operation.
 ///
@@ -93,7 +91,6 @@ pub fn execute_fence(
     domain: Domain,
     fence_ref: u32,
     action: FenceAction,
-    stages: u32,
 ) -> FenceStatus {
     if fence_ref == 0 {
         return FenceStatus::Missing;
@@ -119,12 +116,9 @@ pub fn execute_fence(
             },
         );
     }
-    let current = match state.fence_generation(task_id, tag, fence_ref) {
-        Some(v) => Some(ValueSnapshot::current(v)),
-        None => Some(ValueSnapshot::absent()),
-    };
-    let plan = event_sync::plan_fence(action, domain, fence_ref, stages, current);
-    if event_sync::plan_updates_state(&plan) {
+    let current = state.fence_generation(task_id, tag, fence_ref);
+    let plan = event_sync::plan_fence(action, domain, current);
+    if plan.updates_state {
         state.set_fence_generation(task_id, tag, fence_ref, plan.update_value);
     }
     match plan.decision {
@@ -136,7 +130,6 @@ pub fn execute_fence(
             |e| {
                 e.field("task", task_id)
                     .field("domain", format!("{domain:?}"))
-                    .field("stages", stages)
             },
         ),
         Decision::Invalid => refused(
@@ -146,7 +139,6 @@ pub fn execute_fence(
                 e.field("task", task_id)
                     .field("domain", format!("{domain:?}"))
                     .field("action", format!("{action:?}"))
-                    .field("stages", stages)
             },
         ),
     }
@@ -174,19 +166,9 @@ pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) 
         }
     };
     let tag = FENCE_DOMAIN_EVENT;
-    let current = match state.fence_generation(task_id, tag, cmd.event_ref) {
-        Some(v) => Some(ValueSnapshot::current(v)),
-        None => Some(ValueSnapshot::absent()),
-    };
-    let plan = event_sync::plan_event(
-        kind,
-        cmd.event_ref,
-        cmd.value,
-        cmd.has_timeout,
-        cmd.timeout,
-        current,
-    );
-    if event_sync::plan_updates_state(&plan) {
+    let current = state.fence_generation(task_id, tag, cmd.event_ref);
+    let plan = event_sync::plan_event(kind, cmd.value, cmd.has_timeout, current);
+    if plan.updates_state {
         state.set_fence_generation(task_id, tag, cmd.event_ref, plan.update_value);
     }
     match plan.decision {
@@ -206,35 +188,6 @@ pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) 
                     .field("has_timeout", cmd.has_timeout)
             },
         ),
-    }
-}
-
-/// Convenience: decode event command bytes then execute.
-pub fn execute_event_bytes(state: &mut DeviceState, task_id: u32, bytes: &[u8]) -> FenceStatus {
-    match event::decode(bytes) {
-        Ok(cmd) => execute_event(state, task_id, &cmd),
-        Err(status) => {
-            let status: event::DecodeStatus = status;
-            // Named here, at the failing site, latched so a guest re-polling a
-            // bad event cannot flood.
-            if let Some(e) = crate::observe::Emit::refusal("event_decode", &status) {
-                // Same latch as the render/compute decode sites: a guest polling
-                // a malformed event re-sends it every drain.
-                e.field("len", bytes.len()).fail_once(0);
-            }
-            // Forward the decode rail's own slug into the value rather than
-            // flattening it, so a caller that re-derives a reason from the status
-            // (the encoder remap in `blit_exec`) reports which decode check fired
-            // instead of a generic "event failed".
-            FenceStatus::Unsupported(match crate::observe::Refusal::refusal(&status) {
-                Some(slug) => slug,
-                // Unreachable while every `DecodeStatus` error variant refuses.
-                // Registered rather than `unreachable!()` so a future variant
-                // that forgets its slug shows up in the log as a named gap
-                // instead of killing the drain worker.
-                None => "event_decode_unclassified",
-            })
-        }
     }
 }
 
@@ -267,7 +220,7 @@ mod tests {
         st32(&mut bytes[0..4], opcode);
         st32(&mut bytes[4..8], (HEADER_LEN + payload.len()) as u32);
         bytes[HEADER_LEN..].copy_from_slice(&payload);
-        event::decode(&bytes).expect("build event cmd")
+        crate::runtime::decode::event::decode(&bytes).expect("build event cmd")
     }
 
     #[test]
@@ -275,29 +228,15 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         // Same ref id, three domains.
         assert_eq!(
-            execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update, 0),
+            execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update),
             FenceStatus::Ok
         );
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::ComputeFence,
-                5,
-                FenceAction::Update,
-                0
-            ),
+            execute_fence(&mut state, 1, Domain::ComputeFence, 5, FenceAction::Update,),
             FenceStatus::Ok
         );
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::RenderFence,
-                5,
-                FenceAction::Update,
-                0
-            ),
+            execute_fence(&mut state, 1, Domain::RenderFence, 5, FenceAction::Update,),
             FenceStatus::Ok
         );
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 5), Some(1));
@@ -306,13 +245,13 @@ mod tests {
         // Wait each domain satisfied independently.
         for d in [Domain::BlitFence, Domain::ComputeFence, Domain::RenderFence] {
             assert_eq!(
-                execute_fence(&mut state, 1, d, 5, FenceAction::Wait, 0),
+                execute_fence(&mut state, 1, d, 5, FenceAction::Wait),
                 FenceStatus::Ok
             );
         }
         // Wait on never-updated ref is pending.
         assert_eq!(
-            execute_fence(&mut state, 1, Domain::ComputeFence, 9, FenceAction::Wait, 0),
+            execute_fence(&mut state, 1, Domain::ComputeFence, 9, FenceAction::Wait),
             FenceStatus::Pending
         );
     }
@@ -321,14 +260,7 @@ mod tests {
     fn zero_ref_missing() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::RenderFence,
-                0,
-                FenceAction::Update,
-                0
-            ),
+            execute_fence(&mut state, 1, Domain::RenderFence, 0, FenceAction::Update,),
             FenceStatus::Missing
         );
         let cmd = event_cmd(OP_SIGNAL_EVENT, 0, 1, None);
@@ -376,7 +308,7 @@ mod tests {
 
         // Same ref on blit fence domain is independent.
         assert_eq!(
-            execute_fence(&mut state, 1, Domain::BlitFence, 3, FenceAction::Update, 0),
+            execute_fence(&mut state, 1, Domain::BlitFence, 3, FenceAction::Update),
             FenceStatus::Ok
         );
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 3), Some(1));
@@ -432,7 +364,6 @@ mod tests {
             Domain::Unknown,
             4,
             FenceAction::Update,
-            0,
         ));
         record(execute_fence(
             &mut state,
@@ -440,7 +371,6 @@ mod tests {
             Domain::Event,
             4,
             FenceAction::Update,
-            0,
         ));
         // Event path: unknown kind, wait-with-timeout.
         record(execute_event(
@@ -474,25 +404,17 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
         assert_eq!(
-            execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update, 0).refusal(),
+            execute_fence(&mut state, 1, Domain::BlitFence, 5, FenceAction::Update).refusal(),
             None,
             "a successful update is not a refusal"
         );
         assert_eq!(
-            execute_fence(&mut state, 1, Domain::ComputeFence, 9, FenceAction::Wait, 0).refusal(),
+            execute_fence(&mut state, 1, Domain::ComputeFence, 9, FenceAction::Wait).refusal(),
             None,
             "a soft-pending wait is re-polled every drain; logging it floods"
         );
         assert_eq!(
-            execute_fence(
-                &mut state,
-                1,
-                Domain::RenderFence,
-                0,
-                FenceAction::Update,
-                0
-            )
-            .refusal(),
+            execute_fence(&mut state, 1, Domain::RenderFence, 0, FenceAction::Update,).refusal(),
             None,
             "ref==0 is the genuinely-unbound case AGENTS.md carves out"
         );
@@ -505,7 +427,7 @@ mod tests {
     #[test]
     fn a_refusal_carries_its_reason_across_the_blit_remap() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let st = execute_fence(&mut state, 1, Domain::Unknown, 7, FenceAction::Update, 0);
+        let st = execute_fence(&mut state, 1, Domain::Unknown, 7, FenceAction::Update);
         assert_eq!(st, FenceStatus::Unsupported("fence_domain_unknown"));
 
         let remapped = crate::runtime::blit_exec::blit_status_from_fence(st);

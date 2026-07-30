@@ -1,47 +1,49 @@
-# `runtime/census/` — the always-on proxies
+# `runtime/census/` — declines that cannot be written where they happen
 
-Every bug class in this project earns a **log- or test-level proxy** before or alongside its fix: a
-signal that says "this class is happening" without anyone staring at a screenshot. Each module here
-is one such class. There are ten because there have been ten classes, and that is the discipline
-working, not sprawl.
-
-## Why they are a directory now
-
-Each proxy arrived as a new file next to `metal_draw.rs`, so `runtime/` came to read as though
-measurement modules were peers of the execution path. They are not: the execution path calls them,
-never the reverse. Grouping them makes that direction visible at a glance and leaves `runtime/`
-listing the things that actually execute guest work.
+Four modules, each naming a class of loss that is otherwise invisible. They are not a measurement
+tier: every one of them ends in an `observe::fail` or an `observe::Emit::decline(...).fail()`. What
+puts them in their own directory is that the *reason* needs state the raising site does not hold —
+a dedup set that spans draws, or a slug vocabulary shared by several call sites — so the line is
+written here rather than inline.
 
 ## What is deliberately *not* here
 
-`runtime/draw_log.rs` — the **sink**. `draw_log::fail` and `draw_log::off` are the always-on
-outputs that everything in this directory writes to, and the execution path calls them directly for
-its own declines. Filing the sink under `census/` would suggest that a dropped guest command is a
-measurement. It is not: a decline **must** be logged, a measurement **must not** change behaviour.
-That distinction is the whole point of the split.
+`crate::observe` — the **sink**. `observe::fail` and `observe::off` are the always-on outputs that
+everything here writes to, and the execution path calls them directly for its own declines. Filing
+the sink under `census/` would suggest that a dropped guest command is a measurement. It is not: a
+decline **must** be logged, a measurement **must not** change behaviour.
 
-`draw_log::line` is the third tier — gated behind `REIMS_VGPU_DRAW_LOG=1`, so a failure logged only through
-it is invisible on a normal boot and does not satisfy the fail-visible rule.
+`observe::line` is the third tier — gated behind `REIMS_VGPU_DRAW_LOG=1`, so a failure logged only
+through it is invisible on a normal boot and does not satisfy the fail-visible rule.
 
 ## The rule every module here obeys
 
-**Measuring is allowed; branching on the measurement is not.**
-
-These modules may count nonzero pixels, sparsity, format volume, cache churn and geometry, and write
-those counts to the always-on log. Nothing in the device or backend may read one back to decide what
-to present, decode or execute. A proxy that changes behaviour has stopped being a proxy and become a
-content heuristic, which the ground rules forbid outright.
+**Measuring is allowed; branching on the measurement is not.** Nothing in the device or backend may
+read one of these back to decide what to present, decode or execute. A proxy that changes behaviour
+has stopped being a proxy and become a content heuristic, which the ground rules forbid outright.
 
 ## Reading them
 
-They write to `/tmp/reims-vgpu-fail.log` (`OFF` and `THRASH` lines) and, for the present path,
-`/tmp/reims-vgpu-thrash.log`. Count-based fields (`misses`, `hits`, `hitches`, `readback_mb`) are always
-trustworthy. Wall-clock fields (`us_*`, `*_us_avg`) are SCHED_IDLE-contaminated whenever the host is
-busy, because the testing boot runs QEMU at SCHED_IDLE — trust them only on a quiet host.
+They write to `/tmp/reims-vgpu-fail.log`. Every line here is deduplicated on the identity of the
+thing that failed — `(reason, texture ref)`, `(site, format)`, `(reason, geometry)` — so the line
+count measures *distinct* losses and never the frame rate. Zero lines is the healthy reading for all
+four.
 
 ## Adding one
 
-A new proxy belongs here when it measures a **named** bug class. Give it the class name, a
-regression test that fires it on a synthetic case, and an entry in the table in `mod.rs`. Then verify
-on a healthy boot that it fires **zero** times before calling the work done — a proxy that floods is
-worse than none, because it trains the next reader to ignore the log.
+This directory has shrunk far more often than it has grown, and the test that shrank it is one
+question: *if this were deleted, would a dropped guest command become invisible?*
+
+- If the refusal already emits a typed decline at the point it refuses, what is left here only
+  tracked its **rate**. Delete it; the decline is the report.
+- A tally of **successful** work — binds that worked, frames that published, residents released,
+  microseconds per sub-step — never had a claim under the rule at all.
+- Cost hides behind "measure-only". Removed from this family: a GPU compute reduction per present, a
+  registry scan under the engine lock per present, guest-descriptor reads per compute dispatch, and
+  a second log file kept open for one event. Price a proxy at the rate it will actually run before
+  writing `// Measure-only` on it.
+
+And verify on a healthy boot that a new one fires **zero** times before calling the work done. A
+proxy that floods is worse than none, because it trains the next reader to ignore the log — two
+modules were deleted for emitting 15 310 lines across five boots, 99% of which said nothing had
+happened.

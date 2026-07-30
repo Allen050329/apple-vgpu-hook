@@ -1,6 +1,11 @@
 use super::*;
 use crate::contract::endian::{st16, st32, st64};
 use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+/// Page-entry bits for hand-mapping a draw target. Metal-arm only, same reason
+/// as the compute-pipeline block below.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
@@ -20,6 +25,16 @@ use crate::runtime::decode::resource::{
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::FakeHost;
+/// Readback, the draw encoder and the fixture directory. Every Metal-arm ICB
+/// test needs this same set; it was spelled inside 29 test bodies before.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::mapping_write;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::metal_draw::{
+    encode_icb_execute_and_writeback, BufferBind, DrawEncodeRequest, EncodeStatus,
+};
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// The ICB reason survives the hop onto the compute rail.
@@ -218,7 +233,6 @@ fn make_render_icb_desc_bytes_ex(
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
-    use std::path::PathBuf;
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let vtx = std::fs::read(base.join("oracle_draw_vtx.mtlb")).expect("oracle_draw_vtx.mtlb");
     let frag = std::fs::read(base.join("oracle_draw_frag.mtlb")).expect("oracle_draw_frag.mtlb");
@@ -227,7 +241,6 @@ fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
-    use std::path::PathBuf;
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let vtx = std::fs::read(base.join("render_stagein_vtx.mtlb")).expect("render_stagein_vtx.mtlb");
     let frag =
@@ -235,12 +248,48 @@ fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
     (vtx, frag)
 }
 
+/// Minimal compute pipeline type-7 descriptor: one first-TLV entry naming the
+/// kernel function ref. Eight call sites built these same seven lines. Gated
+/// like its constants and all eight callers, which are Metal-arm execute tests.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_compute_pipeline_desc(kernel_ref: u32) -> Vec<u8> {
+    let mut pdesc = vec![0u8; 32];
+    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut pdesc[4..], 32);
+    pdesc[TYPE7_FIRST_TLVS] = 1;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], kernel_ref);
+    pdesc
+}
+
+/// Minimal render pipeline type-7 descriptor: a first-TLV block carrying only
+/// the vertex and fragment function refs — no vertex-input and no colour
+/// attachment, unlike [`make_stagein_render_pipeline_desc`]. Six call sites
+/// built these same twelve lines. Gated like its constants and all six callers,
+/// which are Metal-arm execute tests.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn make_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
+    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
+    let blen = pdesc.len() as u32;
+    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
+    st32(&mut pdesc[4..], blen);
+    st32(&mut pdesc[8..], 6);
+    pdesc[TYPE7_FIRST_TLVS] = 2;
+    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], vert_ref);
+    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
+    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
+    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], frag_ref);
+    pdesc
+}
+
 /// Type-7 render pipeline with vertex-input block: Float4 attr0 @ buffer0 stride 16.
 ///
 /// Layout matches `parse_vertex_block` / color-attachment section (offset from
 /// header end via tag `0x08`).
 fn make_stagein_render_pipeline_desc(vert_ref: u32, frag_ref: u32) -> Vec<u8> {
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         COLOR_ATTACHMENT_TAG_PIXEL_FORMAT, PIPELINE_TAG_COLOR_ATTACH_OFFSET,
         VERTEX_ATTR_TAG_BUFFER_INDEX, VERTEX_ATTR_TAG_FORMAT, VERTEX_ATTR_TAG_LOCATION,
@@ -377,17 +426,207 @@ fn put_type1_buffer(
     bytes: &[u8],
 ) {
     let gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(host, &state.tasks[1], gva, bytes, PAGE_SHIFT_ARM64E).is_ok());
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], gva, bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], bytes.len() as u64);
     st64(&mut bdesc[8..], handle as u64);
     // Descriptors must sit past the object-list region (32×12 = 0x180).
     let bdesc_gva = 0x200u64 + (obj_ref as u64) * 0x20;
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], bdesc_gva, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
+    put_object(host, state, obj_ref, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
+}
+
+/// Write `bytes` at `gva` and publish it as object `ref_` in the task's object
+/// list — the pair every fixture here performs together.
+///
+/// The published length is `bytes.len()`. That is not a simplification: the
+/// declared length was carried as its own argument through all 173 of these
+/// call sites and asserted equal to the slice at every one of them across the
+/// whole suite. A test that needs the two to disagree — a short-descriptor
+/// refusal — calls [`put_list_entry`] directly, which still takes both.
+fn put_object(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    ref_: u32,
+    otype: u8,
+    gva: u64,
+    bytes: &[u8],
+) {
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], gva, bytes);
+    put_list_entry(host, state, ref_, otype, bytes.len() as u32, gva);
+}
+
+/// Map a 4x4 BGRA8 render target for a draw to land in, one guest page backed
+/// at `pfn`, and return its mapping id.
+///
+/// Every draw test in this file needs exactly this surface and differs only in
+/// which page it takes, so `pfn` is the one parameter — distinct per test so
+/// two fixtures never share a guest page. The mapping is marked internal and
+/// mapped by hand because `map_surface` alone leaves it without page entries,
+/// which is the state a real `MapMemory2` would have already left behind.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Read back [`map_draw_target`]'s 4x4 surface and assert every texel is the
+/// colour the ICB test shaders write: `float4(0.4, 0.267, 0.133, 1)`, which is
+/// BGRA 34, 68, 102, 255.
+///
+/// The tolerance is +/-2 per channel, for float-to-unorm rounding across
+/// different Metal devices. `what` names the command shape under test so a
+/// failure says which of the eighteen callers produced the wrong pixels.
+fn assert_target_is_shader_solid(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    what: &str,
+) {
+    assert_target_texels(state, host, mapping_id, [34, 68, 102, 255], 2, what);
+}
+
+/// Same readback for the stage-in shaders, whose blue channel carries the
+/// surface id so a test can tell which surface the stage-in attributes came
+/// from. Tolerance is +/-1 rather than +/-2 because these write exact byte
+/// values rather than a float4 that has to round.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn assert_stagein_solid(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    sid: u8,
+    what: &str,
+) {
+    assert_target_texels(
+        state,
+        host,
+        mapping_id,
+        [0x22, 0x44, 0x60 + sid, 0xff],
+        1,
+        what,
     );
-    put_list_entry(host, state, obj_ref, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+}
+
+/// Read back [`map_draw_target`]'s 4x4 surface and assert every texel is `want`
+/// within `tol` per channel. `what` names the command shape under test so a
+/// failure says which of the twenty-nine callers produced the wrong pixels.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn assert_target_texels(
+    state: &mut DeviceState,
+    host: &mut FakeHost,
+    mapping_id: u32,
+    want: [u8; 4],
+    tol: i32,
+    what: &str,
+) {
+    let mut back = vec![0u8; 4 * 4 * 4];
+    assert!(mapping_write::read_rect_raw(
+        state, host, mapping_id, 0, 0, 4, 4, &mut back, 16
+    ));
+    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= tol;
+    for (p, px) in back.chunks_exact(4).enumerate() {
+        assert!(
+            near(px[0], want[0])
+                && near(px[1], want[1])
+                && near(px[2], want[2])
+                && near(px[3], want[3]),
+            "pixel {p} = {px:02x?}; want ~{want:02x?} ({what})"
+        );
+    }
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// The one-triangle draw every ICB pixel test issues into [`map_draw_target`]'s
+/// surface: pipeline 6, three vertices, one instance, triangles, over a
+/// zero-filled 4x4 BGRA8 seed.
+///
+/// A test that needs a different shape spells its own literal; this is only the
+/// two dozen that wanted exactly this one.
+fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
+    DrawEncodeRequest {
+        task_id: 1,
+        pipeline_ref: 6,
+        mapping_id,
+        width: 4,
+        height: 4,
+        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        vertex_count: 3,
+        instance_count: 1,
+        primitive_type: 3,
+        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        ..Default::default()
+    }
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Publish an MTLB `blob` at `blob_page`'s GVA page and describe it as function
+/// object `ref_`, whose 32-byte descriptor lives at `desc_gva` and carries
+/// `(blob gva, blob len)`. Fifty-six test bodies spelled these six lines.
+///
+/// All four values are the caller's because they are fixture identities that
+/// must not collide inside one test: two functions in the same pipeline take
+/// different pages, different refs and different descriptor addresses.
+fn put_function_object(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    ref_: u32,
+    desc_gva: u64,
+    blob_page: u64,
+    blob: &[u8],
+) {
+    let blob_gva = blob_page << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], blob_gva, blob);
+    let mut fdesc = vec![0u8; 32];
+    st64(&mut fdesc[0..], blob_gva);
+    st32(&mut fdesc[8..], blob.len() as u32);
+    put_object(host, state, ref_, OBJECT_TYPE_FUNCTION, desc_gva, &fdesc);
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+/// Publish an encoded ICB command-memory `slot` at `cmd_handle`'s page, wrap it
+/// in buffer object 10, and associate that buffer with ICB object 9 through
+/// opcode 0x1d1 — the sequence `execute` performs before any fill, spelled in
+/// thirteen test bodies before this.
+///
+/// `cmd_handle` is the caller's because it is the slot's GVA page index and must
+/// not collide with the other fixtures a given test has already placed; refs 9
+/// and 10 and descriptor GVA 0x1a0 are this file's fixture identities and are
+/// the same at every one of those sites.
+fn associate_icb_command_memory(
+    host: &mut FakeHost,
+    state: &DeviceState,
+    cmd_handle: u32,
+    slot: &[u8],
+) {
+    let cmd_gva = u64::from(cmd_handle) << RESOURCE_PAGE_SHIFT;
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], cmd_gva, slot);
+    let mut cmd_bdesc = vec![0u8; 16];
+    st64(&mut cmd_bdesc[0..], slot.len() as u64);
+    st64(&mut cmd_bdesc[8..], u64::from(cmd_handle));
+    put_object(host, state, 10, OBJECT_TYPE_BUFFER, 0x1a0, &cmd_bdesc);
+    // `&*host`, not `host`: this takes `&M` while `put_object` above needs
+    // `&mut FakeHost`, and the reborrow is what lets one binding serve both.
+    apply_icb_host_resource_info(
+        state,
+        &*host,
+        1,
+        &IcbHostResourceInfo {
+            icb_ref: 9,
+            buffer_ref: 10,
+            gpu_address: 0,
+        },
+    )
+    .expect("0x1d1 associate ICB command memory");
+}
+
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn map_draw_target(host: &mut FakeHost, state: &mut DeviceState, pfn: u32) -> u32 {
+    let mapping_id = 9u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+    state.map_surface(mapping_id);
+    {
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    mapping_id
 }
 
 fn put_list_entry(
@@ -403,7 +642,7 @@ fn put_list_entry(
     let packed = (otype as u32) | (len << 8);
     st32(&mut le[0..], packed);
     le[4..12].copy_from_slice(&gva.to_le_bytes());
-    assert!(gva_mem::write_task_gva(host, &state.tasks[1], off, &le, PAGE_SHIFT_ARM64E).is_ok());
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], off, &le);
 }
 
 #[test]
@@ -415,17 +654,7 @@ fn load_icb_from_object_list() {
     setup_task(&mut host, &mut state);
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
     let icb = load_icb_descriptor(&state, &host, 1, 9).unwrap();
     assert_eq!(icb.max_command_count, 8);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
@@ -447,17 +676,7 @@ fn materialize_and_execute_empty_range() {
     setup_task(&mut host, &mut state);
     let desc = make_icb_desc_bytes(8, 4, true);
     let gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, gva, &desc);
     let (d, icb) = resolve_metal_icb(&state, &host, 1, 9).expect("materialize");
     assert_eq!(d.max_command_count, 8);
     assert_eq!(icb.size(), 8);
@@ -477,7 +696,6 @@ fn materialize_and_execute_empty_range() {
 fn fill_and_execute_mul3add1_writeback() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -495,89 +713,24 @@ fn fill_and_execute_mul3add1_writeback() {
     // ICB object ref 9: 1 command, maxKernel=1, no inherit (explicit fills).
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Function + pipeline + data buffer (mul3add1).
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    let fdesc_gva = 0x100u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fdesc_gva,
-        &fdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, fdesc_gva);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     let pdesc_gva = 0x140u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
     let bdesc_gva = 0x180u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     // Host fill of command slot 0 (no stream fill opcode yet).
     fill_compute_command(
@@ -915,14 +1068,7 @@ fn decode_encode_draw_patches_slot_roundtrip() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_patches_tessellation_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_PATCHES;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -939,81 +1085,15 @@ fn fill_render_draw_patches_tessellation_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     // Vertex-input Float4 @ buffer0 stride 16 (step defaults to PerPatchControlPoint).
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Full-screen clip-space triangle as 3 control points.
     let tri: [[f32; 4]; 3] = [
@@ -1075,55 +1155,21 @@ fn fill_render_draw_patches_tessellation_oracle() {
     )
     .expect("fill DrawPatches tessellation");
 
-    let mapping_id = 9u32;
-    let pfn = 0x38u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x38);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "DrawPatches tessellation ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    // float4(0.4, 0.267, 0.133, 1) → BGRA ≈ 34,68,102,255
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawPatches tessellation)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "DrawPatches tessellation",
+    );
 }
 
 /// Pixel-level ICB DrawIndexedPatches: dummy control point at index 0,
@@ -1131,14 +1177,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_indexed_patches_tessellation_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1155,80 +1194,14 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Control points: dummy at 0, real full-screen triangle at 1,2,3.
     let cps: [[f32; 4]; 4] = [
@@ -1293,54 +1266,21 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
     )
     .expect("fill DrawIndexedPatches tessellation");
 
-    let mapping_id = 9u32;
-    let pfn = 0x39u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x39);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "DrawIndexedPatches tessellation ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawIndexedPatches tessellation)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "DrawIndexedPatches tessellation",
+    );
 }
 
 /// Unknown wire command types still fail closed.
@@ -1566,14 +1506,7 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_mesh_threads_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1589,83 +1522,17 @@ fn fill_render_draw_mesh_threads_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Mesh function lives in the type-7 "vertex" function slot (no guest
     // mesh-pipeline descriptor yet — host-fill only path).
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     // No vertex attributes needed for mesh; reuse stage-in desc helper with empty attrs.
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -1692,69 +1559,23 @@ fn fill_render_draw_mesh_threads_oracle() {
     )
     .expect("fill DrawMeshThreads");
 
-    let mapping_id = 9u32;
-    let pfn = 0x3au32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x3a);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "DrawMeshThreads ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    // float4(0.4, 0.267, 0.133, 1) → BGRA ≈ 34,68,102,255
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawMeshThreads)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "DrawMeshThreads");
 }
 
 /// Pixel-level ICB drawMeshThreadgroups (same solid BGRA).
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_mesh_threadgroups_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1770,80 +1591,14 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -1870,54 +1625,16 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
     )
     .expect("fill DrawMeshThreadgroups");
 
-    let mapping_id = 9u32;
-    let pfn = 0x3bu32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x3b);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "DrawMeshThreadgroups ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (DrawMeshThreadgroups)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "DrawMeshThreadgroups");
 }
 
 /// Wire `baseVertex@0x28` is a signed value stored as u64 bits (two's complement).
@@ -2002,13 +1719,6 @@ fn decode_encode_signed_base_vertex() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_negative_base_vertex_stagein_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -2019,80 +1729,14 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Clip-space full-cover triangle at vertex indices 0,1,2.
     let tri: [[f32; 4]; 3] = [
@@ -2163,54 +1807,16 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
     )
     .expect("fill DrawIndexed baseVertex=-1");
 
-    let mapping_id = 9u32;
-    let pfn = 0x37u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x37);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "negative baseVertex stage_in DrawIndexed"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (baseVertex=-1)"
-        );
-    }
+    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "baseVertex=-1");
 }
 
 #[test]
@@ -2265,7 +1871,6 @@ fn decode_encode_command_slot_roundtrip() {
 fn buffer_backed_fill_execute_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -2283,88 +1888,23 @@ fn buffer_backed_fill_execute_mul3add1() {
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let layout = compute_only_icb_layout(1);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    let fdesc_gva = 0x100u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fdesc_gva,
-        &fdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, fdesc_gva);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
+    let pdesc = make_compute_pipeline_desc(5);
     let pdesc_gva = 0x140u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
     let bdesc_gva = 0x180u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     // Guest-style fill: command slot in a type-1 backing buffer (handle 4).
     let slot = encode_compute_command_slot(
@@ -2395,27 +1935,19 @@ fn buffer_backed_fill_execute_mul3add1() {
     .unwrap();
     let cmd_handle = 4u32;
     let cmd_mem_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_mem_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_mem_gva, &slot);
     let mut cmd_bdesc = vec![0u8; 16];
     st64(&mut cmd_bdesc[0..], slot.len() as u64);
     st64(&mut cmd_bdesc[8..], cmd_handle as u64);
     let cmd_bdesc_gva = 0x1c0u64;
-    assert!(gva_mem::write_task_gva(
+    put_object(
         &mut host,
-        &state.tasks[1],
+        &state,
+        10,
+        OBJECT_TYPE_BUFFER,
         cmd_bdesc_gva,
         &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, cmd_bdesc_gva);
+    );
 
     // Auto-bind via type-1 buffer_ref (sync path / 0x1d1 payload).
     let mem = associate_icb_backing_buffer_ref(&state, &host, 1, 9, 10).expect("associate");
@@ -2497,22 +2029,7 @@ fn apply_0x1d1_auto_binds_backing() {
     let layout = compute_only_icb_layout(1);
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     let slot = encode_compute_command_slot(
         &layout,
@@ -2535,27 +2052,12 @@ fn apply_0x1d1_auto_binds_backing() {
     .unwrap();
     let handle = 5u32;
     let cmd_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], cmd_gva, &slot);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], slot.len() as u64);
     st64(&mut bdesc[8..], handle as u64);
     let bdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        bdesc_gva,
-        &bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 11, OBJECT_TYPE_BUFFER, 16, bdesc_gva);
+    put_object(&mut host, &state, 11, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     let mem = apply_icb_host_resource_info(
         &state,
@@ -2577,13 +2079,6 @@ fn apply_0x1d1_auto_binds_backing() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_draw_indexed_execute_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -2595,94 +2090,18 @@ fn fill_render_draw_indexed_execute_oracle() {
     // ICB: DrawIndexed, maxFragment=1 for color constant at fragment buffer 0.
     let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Vertex function (ref 2) + fragment function (ref 3).
     // Descriptor GVAs stay past object-list region (32×12 = 0x180).
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vfdesc_gva,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        ffdesc_gva,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     // Index buffer (ref 12, handle 4): UInt16 [0,1,2].
     let indices: [u16; 3] = [0, 1, 2];
@@ -2697,19 +2116,7 @@ fn fill_render_draw_indexed_execute_oracle() {
     put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
 
     // Mapping for color writeback (4×4 BGRA).
-    let mapping_id = 9u32;
-    let pfn = 0x30u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x30);
 
     fill_render_command(
         &state,
@@ -2766,34 +2173,19 @@ fn fill_render_draw_indexed_execute_oracle() {
     );
 
     // BGRA writeback: B=0x22 G=0x44 R=0x67 A=0xff (oracle sid=7).
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (ICB DrawIndexed oracle)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "ICB DrawIndexed oracle",
+    );
 }
 
 /// Buffer-backed DrawIndexed: encode slot → 0x1d1 associate → execute re-fill.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn buffer_backed_render_draw_indexed_fill_execute() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -2807,91 +2199,15 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vfdesc_gva,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        ffdesc_gva,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -2934,55 +2250,9 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     )
     .unwrap();
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    let cmd_bdesc_gva = 0x1a0u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_bdesc_gva,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, cmd_bdesc_gva);
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
-
-    let mapping_id = 9u32;
-    let pfn = 0x31u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x31);
 
     // Execute path re-fills from command memory (DrawIndexed + fragment bind).
     let req = DrawEncodeRequest {
@@ -3005,21 +2275,13 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (buffer-backed DrawIndexed)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "buffer-backed DrawIndexed",
+    );
 }
 
 /// Wire-backed E2E: DrawPatches tessellation.
@@ -3030,16 +2292,9 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_patches_tessellation_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_PATCHES,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3057,80 +2312,14 @@ fn wire_backed_draw_patches_tessellation_e2e() {
     let layout = render_draw_patches_icb_layout(1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -3187,93 +2376,22 @@ fn wire_backed_draw_patches_tessellation_e2e() {
     .expect("encode DrawPatches slot");
 
     // Command memory only — never call fill_render_command.
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1 associate command memory");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     // Explicit re-fill (what execute does) — proves decode+resolve path.
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory DrawPatches");
 
-    let mapping_id = 9u32;
-    let pfn = 0x3cu32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x3c);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed DrawPatches execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed DrawPatches)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed DrawPatches");
 }
 
 /// Dedicated wire-backed E2E: DrawIndexedPatches tessellation (not via
@@ -3281,17 +2399,10 @@ fn wire_backed_draw_patches_tessellation_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_indexed_patches_tessellation_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_indexed_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES,
         OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3309,80 +2420,14 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     let layout = render_draw_indexed_patches_icb_layout(1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Control points: dummy at 0, real triangle at 1,2,3.
     let cps: [[f32; 4]; 4] = [
@@ -3447,92 +2492,26 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     )
     .expect("encode DrawIndexedPatches slot");
 
-    let cmd_handle = 7u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1 associate command memory");
+    associate_icb_command_memory(&mut host, &state, 7, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory DrawIndexedPatches");
 
-    let mapping_id = 9u32;
-    let pfn = 0x48u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x48);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed DrawIndexedPatches execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed DrawIndexedPatches)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed DrawIndexedPatches",
+    );
 }
 
 /// Object+mesh host fill: dual-function metallib (object type 8 + mesh type 7)
@@ -3540,14 +2519,7 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_mesh_threadgroups_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3577,81 +2549,15 @@ fn fill_render_object_mesh_threadgroups_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -3680,54 +2586,16 @@ fn fill_render_object_mesh_threadgroups_oracle() {
     )
     .expect("fill object+mesh threadgroups");
 
-    let mapping_id = 9u32;
-    let pfn = 0x3eu32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x3e);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "object+mesh ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (object+mesh)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object+mesh");
 }
 
 /// Dedicated wire-backed E2E: dual-export object+mesh metallib in classic
@@ -3736,17 +2604,10 @@ fn fill_render_object_mesh_threadgroups_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_dual_export_object_mesh_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
         MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -3764,67 +2625,12 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Dual-export object+mesh in classic "vertex" function slot only.
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     // Classic type-7 shape: tag 0x01/0x02 only (no mesh SPI 0x14).
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
@@ -3836,18 +2642,7 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     assert!(!decoded.has_color_attachment_offset || decoded.color_attachment_offset != 0);
     // Mesh SPI shape uses tag 0x14; classic stagein has tag 0x08.
     // object/mesh refs must stay zero so fill uses dual-export scan of vertex metallib.
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -3868,92 +2663,26 @@ fn wire_backed_dual_export_object_mesh_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode dual-export slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory dual-export object+mesh");
 
-    let mapping_id = 9u32;
-    let pfn = 0x4bu32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x4b);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed dual-export object+mesh execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed dual-export object+mesh)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed dual-export object+mesh",
+    );
 }
 
 /// Separate object + mesh + fragment function refs via mesh SPI type-7
@@ -3961,16 +2690,9 @@ fn wire_backed_dual_export_object_mesh_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_separate_object_mesh_func_refs_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4000,90 +2722,15 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
     // Object function ref 2, mesh ref 4, fragment ref 3 — three distinct objects.
-    let oblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        oblob_gva,
-        &obj_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ofdesc = vec![0u8; 32];
-    st64(&mut ofdesc[0..], oblob_gva);
-    st32(&mut ofdesc[8..], obj_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &ofdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &obj_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mblob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x260,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 32, 0x260);
+    put_function_object(&mut host, &state, 4, 0x260, 4, &mesh_mtlb);
 
     let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
     let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh pipeline decode");
@@ -4091,18 +2738,7 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
     assert_eq!(decoded.mesh_func_ref, 4);
     assert_eq!(decoded.fragment_func_ref, 3);
     assert_eq!(decoded.vertex_func_ref, 0);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x280, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x280,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
 
     fill_render_command(
         &state,
@@ -4129,54 +2765,21 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
     )
     .expect("fill separate object+mesh+frag refs");
 
-    let mapping_id = 9u32;
-    let pfn = 0x3fu32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x3f);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "separate object/mesh func-ref ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (separate object/mesh refs)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "separate object/mesh refs",
+    );
 }
 
 /// Dedicated wire-backed E2E: mesh SPI pipeline shape (tag 0x14 + object/
@@ -4185,17 +2788,10 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_spi_pipeline_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
         MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4215,89 +2811,14 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Three distinct function objects: object=2, frag=3, mesh=4.
-    let oblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        oblob_gva,
-        &obj_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ofdesc = vec![0u8; 32];
-    st64(&mut ofdesc[0..], oblob_gva);
-    st32(&mut ofdesc[8..], obj_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &ofdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &obj_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mblob_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x260,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 4, OBJECT_TYPE_FUNCTION, 32, 0x260);
+    put_function_object(&mut host, &state, 4, 0x260, 4, &mesh_mtlb);
 
     let pdesc = make_mesh_render_pipeline_desc(Some(2), 4, 3);
     let decoded = decode_render_pipeline_descriptor(&pdesc).expect("mesh SPI pipeline");
@@ -4306,18 +2827,7 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     assert_eq!(decoded.fragment_func_ref, 3);
     assert_eq!(decoded.vertex_func_ref, 0);
     assert!(decoded.has_color_attachment_offset); // tag 0x14 shape
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x280, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x280,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -4338,106 +2848,33 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh SPI slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory mesh SPI pipeline");
 
-    let mapping_id = 9u32;
-    let pfn = 0x47u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x47);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed mesh SPI pipeline execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed mesh SPI pipeline)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed mesh SPI pipeline",
+    );
 }
 
 /// Pixel: setMeshBuffer — mesh stage reads scale from buffer(0).
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_mesh_buffer_bind_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4456,80 +2893,14 @@ fn fill_render_mesh_buffer_bind_oracle() {
     let icb_desc =
         make_render_icb_desc_bytes_ex(1, 0, 0, 0, 1, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // scale = 1.0f LE (handle must be a setup_task-mapped page pfn).
     let scale_bytes = 1.0f32.to_le_bytes();
@@ -4569,68 +2940,23 @@ fn fill_render_mesh_buffer_bind_oracle() {
     )
     .expect("fill mesh buffer bind");
 
-    let mapping_id = 9u32;
-    let pfn = 0x40u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x40);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "mesh buffer bind ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (mesh buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "mesh buffer bind");
 }
 
 /// Pixel: setObjectBuffer — object stage reads scale from buffer(0) → payload.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_buffer_bind_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4649,80 +2975,14 @@ fn fill_render_object_buffer_bind_oracle() {
     let icb_desc =
         make_render_icb_desc_bytes_ex(1, 0, 0, 1, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
@@ -4761,54 +3021,16 @@ fn fill_render_object_buffer_bind_oracle() {
     )
     .expect("fill object buffer bind");
 
-    let mapping_id = 9u32;
-    let pfn = 0x41u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x41);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "object buffer bind ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (object buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object buffer bind");
 }
 
 /// Wire-backed E2E: encode mesh buffer bind + MeshThreads → command memory
@@ -4816,17 +3038,10 @@ fn fill_render_object_buffer_bind_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_buffer_bind_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threads_icb_layout_with_binds, ICB_DESC_LAYOUT,
         ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4847,80 +3062,14 @@ fn wire_backed_mesh_buffer_bind_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
@@ -4954,92 +3103,26 @@ fn wire_backed_mesh_buffer_bind_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh bind slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory mesh buffer bind");
 
-    let mapping_id = 9u32;
-    let pfn = 0x42u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x42);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed mesh buffer bind execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed mesh buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed mesh buffer bind",
+    );
 }
 
 /// Wire-backed E2E: encode object buffer bind + MeshThreadgroups → command
@@ -5047,17 +3130,10 @@ fn wire_backed_mesh_buffer_bind_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_object_buffer_bind_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
         ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5078,80 +3154,14 @@ fn wire_backed_object_buffer_bind_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
@@ -5185,92 +3195,26 @@ fn wire_backed_object_buffer_bind_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode object bind slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory object buffer bind");
 
-    let mapping_id = 9u32;
-    let pfn = 0x43u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x43);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed object buffer bind execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed object buffer bind)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed object buffer bind",
+    );
 }
 
 /// Wire encode↔decode of object TG memory lengths + MeshThreadgroups.
@@ -5334,7 +3278,6 @@ fn decode_encode_object_tg_memory_mesh_slot() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_tg_memory_bad_length_rejected() {
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5368,81 +3311,15 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let err = fill_render_command(
         &state,
@@ -5481,14 +3358,7 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_object_tg_memory_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5522,81 +3392,15 @@ fn fill_render_object_tg_memory_oracle() {
         b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
             .copy_from_slice(&encode_icb_command_layout(&layout));
         let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            icb_gva,
-            &b,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
-        put_list_entry(
-            &mut host,
-            &state,
-            9,
-            OBJECT_TYPE_TYPE7,
-            ICB_DESC_LEN as u32,
-            icb_gva,
-        );
+        put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &b);
     }
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     fill_render_command(
         &state,
@@ -5626,72 +3430,27 @@ fn fill_render_object_tg_memory_oracle() {
     )
     .expect("fill object TG memory");
 
-    let mapping_id = 9u32;
-    let pfn = 0x45u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x45);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "object TG memory ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (object TG memory)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "object TG memory");
 }
 
 /// Dedicated wire-backed E2E: object TG length 16 through command memory.
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_object_tg_memory_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
         ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
         OBJECT_TYPE_BUFFER,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5713,80 +3472,14 @@ fn wire_backed_object_tg_memory_e2e() {
     icb_desc[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &om_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], om_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &om_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let fill = IcbRenderFill {
         command_index: 0,
@@ -5810,92 +3503,21 @@ fn wire_backed_object_tg_memory_e2e() {
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode object TG slot");
 
-    let cmd_handle = 5u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 5, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory object TG");
 
-    let mapping_id = 9u32;
-    let pfn = 0x46u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x46);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed object TG execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed object TG)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed object TG");
 }
 
 /// Wire-backed E2E: drawMeshThreads.
@@ -5905,16 +3527,9 @@ fn wire_backed_object_tg_memory_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_threads_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_mesh_threads_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADS,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -5931,80 +3546,14 @@ fn wire_backed_mesh_threads_e2e() {
     let layout = render_draw_mesh_threads_icb_layout(0);
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let slot = encode_render_command_slot(
         &layout,
@@ -6028,92 +3577,21 @@ fn wire_backed_mesh_threads_e2e() {
     )
     .expect("encode MeshThreads slot");
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory MeshThreads");
 
-    let mapping_id = 9u32;
-    let pfn = 0x3du32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x3d);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed MeshThreads execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed MeshThreads)"
-        );
-    }
+    assert_target_is_shader_solid(&mut state, &mut host, mapping_id, "wire-backed MeshThreads");
 }
 
 /// Dedicated wire-backed E2E: drawMeshThreadgroups (no object buffer binds).
@@ -6123,16 +3601,9 @@ fn wire_backed_mesh_threads_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_mesh_threadgroups_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_draw_mesh_threadgroups_icb_layout, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -6149,80 +3620,14 @@ fn wire_backed_mesh_threadgroups_e2e() {
     let layout = render_draw_mesh_threadgroups_icb_layout();
     let icb_desc = make_render_icb_desc_bytes(1, 0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let mblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        mblob_gva,
-        &mesh_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut mfdesc = vec![0u8; 32];
-    st64(&mut mfdesc[0..], mblob_gva);
-    st32(&mut mfdesc[8..], mesh_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &mfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &mesh_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let slot = encode_render_command_slot(
         &layout,
@@ -6246,92 +3651,26 @@ fn wire_backed_mesh_threadgroups_e2e() {
     )
     .expect("encode MeshThreadgroups slot");
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory MeshThreadgroups");
 
-    let mapping_id = 9u32;
-    let pfn = 0x44u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x44);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed MeshThreadgroups execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [34u8, 68, 102, 255];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 2;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed MeshThreadgroups)"
-        );
-    }
+    assert_target_is_shader_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        "wire-backed MeshThreadgroups",
+    );
 }
 
 /// inheritBuffers=true: ICB slot records only draw+PSO; fragment color
@@ -6339,13 +3678,7 @@ fn wire_backed_mesh_threadgroups_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn inherit_buffers_encoder_fragment_color() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::render::Stage;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, BufferBind, DrawEncodeRequest, EncodeStatus,
-    };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -6364,91 +3697,15 @@ fn inherit_buffers_encoder_fragment_color() {
         ICB_FLAG_INHERIT_BUFFERS,
     );
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vfdesc_gva,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        ffdesc_gva,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -6486,19 +3743,7 @@ fn inherit_buffers_encoder_fragment_color() {
     )
     .expect("fill inherit draw");
 
-    let mapping_id = 9u32;
-    let pfn = 0x32u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x32);
 
     // Stream-style fragment bind on the encode request (parent encoder).
     let req = DrawEncodeRequest {
@@ -6529,21 +3774,13 @@ fn inherit_buffers_encoder_fragment_color() {
         "inheritBuffers encoder fragment path"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (inheritBuffers encoder)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "inheritBuffers encoder",
+    );
 }
 
 /// inheritPipelineState=true: ICB slot records only buffers+draw; PSO
@@ -6552,13 +3789,7 @@ fn inherit_buffers_encoder_fragment_color() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn inherit_pipeline_encoder_fragment_color() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -6577,91 +3808,15 @@ fn inherit_pipeline_encoder_fragment_color() {
         ICB_FLAG_INHERIT_PIPELINE_STATE,
     );
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vfdesc_gva,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        ffdesc_gva,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let index_bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -6708,19 +3863,7 @@ fn inherit_pipeline_encoder_fragment_color() {
     )
     .expect("fill inheritPipeline draw");
 
-    let mapping_id = 9u32;
-    let pfn = 0x34u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x34);
 
     // Stream-style pipeline on the encode request (parent encoder).
     let req = DrawEncodeRequest {
@@ -6745,21 +3888,13 @@ fn inherit_pipeline_encoder_fragment_color() {
         "inheritPipelineState encoder fragment path"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (inheritPipelineState encoder)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "inheritPipelineState encoder",
+    );
 }
 
 #[test]
@@ -6783,13 +3918,6 @@ fn stagein_pipeline_fixture_decodes_vertex_attrs() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_stagein_draw_execute_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -6801,87 +3929,15 @@ fn fill_render_stagein_draw_execute_oracle() {
     // Draw (not indexed): max_vertex=1 for position buffer bind.
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vfdesc_gva,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        ffdesc_gva,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        pdesc_gva,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     // Fullscreen triangle positions (clip space), stride 16 Float4.
     let tri: [[f32; 4]; 3] = [
@@ -6943,19 +3999,7 @@ fn fill_render_stagein_draw_execute_oracle() {
     )
     .expect("fill_render stage_in Draw");
 
-    let mapping_id = 9u32;
-    let pfn = 0x33u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x33);
 
     let req = DrawEncodeRequest {
         task_id: 1,
@@ -6978,21 +4022,7 @@ fn fill_render_stagein_draw_execute_oracle() {
         "stage_in ICB execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (ICB stage_in)"
-        );
-    }
+    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "ICB stage_in");
 }
 
 /// Dedicated wire-backed E2E: classic Draw (`0x1`) with stage_in vertex
@@ -7000,14 +4030,8 @@ fn fill_render_stagein_draw_execute_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_primitives_stagein_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
-    };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7021,80 +4045,14 @@ fn wire_backed_draw_primitives_stagein_e2e() {
     let layout = render_icb_layout(1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -7155,92 +4113,27 @@ fn wire_backed_draw_primitives_stagein_e2e() {
     )
     .expect("encode Draw primitives slot");
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory Draw primitives");
 
-    let mapping_id = 9u32;
-    let pfn = 0x49u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x49);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed Draw primitives execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed Draw stage_in)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "wire-backed Draw stage_in",
+    );
 }
 
 #[test]
@@ -7349,13 +4242,6 @@ fn decode_encode_attribute_stride_table() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_attribute_stride_stagein_execute() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -7366,80 +4252,14 @@ fn fill_render_attribute_stride_stagein_execute() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     // Tight Float4 positions (stride 16) — attributeStride matches layout stride.
     let tri: [[f32; 4]; 3] = [
@@ -7501,53 +4321,21 @@ fn fill_render_attribute_stride_stagein_execute() {
     )
     .expect("fill with attributeStride");
 
-    let mapping_id = 9u32;
-    let pfn = 0x36u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x36);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (attributeStride stage_in)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "attributeStride stage_in",
+    );
 }
 
 /// Dedicated wire-backed E2E: vertex attributeStride=16 through command
@@ -7556,14 +4344,8 @@ fn fill_render_attribute_stride_stagein_execute() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_attribute_stride_stagein_e2e() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::decode::resource::{
         render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
-    };
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7578,80 +4360,14 @@ fn wire_backed_attribute_stride_stagein_e2e() {
     assert!(icb_layout_attribute_stride_slot_count(&layout) >= 1);
     let icb_desc = make_render_icb_desc_bytes(1, 1, 1, MTL_INDIRECT_CMD_DRAW);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(
-        &mut host,
-        &state,
-        6,
-        OBJECT_TYPE_TYPE7,
-        pdesc.len() as u32,
-        0x240,
-    );
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let tri: [[f32; 4]; 3] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -7715,92 +4431,27 @@ fn wire_backed_attribute_stride_stagein_e2e() {
         "attribute stride table on wire"
     );
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
-
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
     fill_icb_from_command_memory(&state, &host, 1, 9, 0, 1)
         .expect("fill_icb_from_command_memory attributeStride");
 
-    let mapping_id = 9u32;
-    let pfn = 0x4au32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x4a);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
         "wire-backed attributeStride execute"
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire-backed attributeStride)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "wire-backed attributeStride",
+    );
 }
 
 #[test]
@@ -7856,7 +4507,6 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
     use crate::runtime::decode::resource::compute_icb_layout;
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -7873,73 +4523,21 @@ fn fill_compute_barrier_and_tg_memory_execute() {
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 1, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    let pdesc = make_compute_pipeline_desc(5);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     let layout = compute_icb_layout(1, 1);
     fill_compute_command(
@@ -8021,7 +4619,6 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeBufferBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -8039,73 +4636,21 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     // inheritBuffers; maxKernel still advertises encoder bind capacity.
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_BUFFERS);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    let pdesc = make_compute_pipeline_desc(5);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     // Fill: pipeline + dispatch only — no kernel buffer in the ICB slot.
     fill_compute_command(
@@ -8186,7 +4731,6 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
     use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -8203,73 +4747,21 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_PIPELINE_STATE);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    let pdesc = make_compute_pipeline_desc(5);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     // Fill: buffers + dispatch only — pipeline_ref 0 (inherited).
     fill_compute_command(
@@ -8373,24 +4865,12 @@ fn put_type2_texture(
     st16(&mut desc[TEXTURE_DESC_PIXEL_FORMAT..], pixel_format);
     // Descriptor GVAs stay below the first resource page (handle<<14).
     let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        host,
-        state,
-        obj_ref,
-        OBJECT_TYPE_TEXTURE,
-        TEXTURE_DESC_BASE_LEN as u32,
-        desc_gva,
-    );
+    put_object(host, state, obj_ref, OBJECT_TYPE_TEXTURE, desc_gva, &desc);
     let data_gva = (handle as u64) << RESOURCE_PAGE_SHIFT;
     let mut page = vec![0u8; size as usize];
     let n = seed.len().min(page.len());
     page[..n].copy_from_slice(&seed[..n]);
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], data_gva, &page, PAGE_SHIFT_ARM64E).is_ok()
-    );
+    gva_mem::write_task_gva_arm64e(host, &state.tasks[1], data_gva, &page);
 }
 
 /// Minimal type-7 sampler (36 B): clamp-to-edge, nearest, normalized coords.
@@ -8419,17 +4899,7 @@ fn put_type7_sampler(host: &mut FakeHost, state: &DeviceState, obj_ref: u32, nor
     st32(&mut desc[SAMPLER_DESC_WORD20..], 0f32.to_bits()); // lod min
     st32(&mut desc[SAMPLER_DESC_LOD_MAX..], f32::MAX.to_bits());
     let desc_gva = 0x300u64 + (obj_ref as u64) * 0x40;
-    assert!(
-        gva_mem::write_task_gva(host, &state.tasks[1], desc_gva, &desc, PAGE_SHIFT_ARM64E).is_ok()
-    );
-    put_list_entry(
-        host,
-        state,
-        obj_ref,
-        OBJECT_TYPE_TYPE7,
-        SAMPLER_DESC_LEN as u32,
-        desc_gva,
-    );
+    put_object(host, state, obj_ref, OBJECT_TYPE_TYPE7, desc_gva, &desc);
 }
 
 /// Textures/samplers always bind on the parent compute encoder at ICB
@@ -8449,7 +4919,6 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -8466,73 +4935,21 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    let pdesc = make_compute_pipeline_desc(5);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     let data = [1u32, 2, 3, 4];
     let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     let buf_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        buf_gva,
-        &data_bytes,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
+    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
     let mut bdesc = vec![0u8; 16];
     st64(&mut bdesc[0..], 16);
     st32(&mut bdesc[8..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x180, &bdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 16, 0x180);
+    put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     const W: u32 = 2;
     const H: u32 = 2;
@@ -8657,7 +5074,6 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -8674,53 +5090,12 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     // maxKernel=1 for the AB buffer slot; no inheritBuffers — AB recorded on ICB.
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    let pdesc = make_compute_pipeline_desc(5);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     const W: u32 = 4;
     const H: u32 = 4;
@@ -8813,7 +5188,6 @@ fn icb_argument_buffer_sample_and_write() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
-    use std::path::PathBuf;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -8829,53 +5203,12 @@ fn icb_argument_buffer_sample_and_write() {
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        blob_gva,
-        &mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x100, &fdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 5, OBJECT_TYPE_FUNCTION, 32, 0x100);
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
-    let mut pdesc = vec![0u8; 32];
-    st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
-    st32(&mut pdesc[4..], 32);
-    pdesc[TYPE7_FIRST_TLVS] = 1;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_KERNEL_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x140, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 32, 0x140);
+    let pdesc = make_compute_pipeline_desc(5);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x140, &pdesc);
 
     const W: u32 = 4;
     const H: u32 = 4;
@@ -9019,13 +5352,6 @@ fn resolve_bind_offset_from_wire_va() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_render_nonzero_bind_offset_oracle() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -9036,91 +5362,15 @@ fn fill_render_nonzero_bind_offset_oracle() {
 
     let icb_desc = make_render_icb_desc_bytes(1, 0, 1, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vfdesc_gva,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, vfdesc_gva);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        ffdesc_gva,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, ffdesc_gva);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
+    let pdesc = make_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        pdesc_gva,
-        &pdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, pdesc_gva);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, pdesc_gva, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     // Index buffer: 4 B pad + 6 B indices (offset 4).
@@ -9173,53 +5423,21 @@ fn fill_render_nonzero_bind_offset_oracle() {
     )
     .expect("fill with non-zero offsets");
 
-    let mapping_id = 9u32;
-    let pfn = 0x34u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x34);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (nonzero bind offset)"
-        );
-    }
+    assert_stagein_solid(
+        &mut state,
+        &mut host,
+        mapping_id,
+        sid,
+        "nonzero bind offset",
+    );
     let _ = (index_base, color_base);
 }
 
@@ -9227,13 +5445,6 @@ fn fill_render_nonzero_bind_offset_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn buffer_backed_nonzero_wire_va_offset() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write;
-    use crate::runtime::metal_draw::{
-        encode_icb_execute_and_writeback, DrawEncodeRequest, EncodeStatus,
-    };
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -9247,84 +5458,14 @@ fn buffer_backed_nonzero_wire_va_offset() {
     let layout = render_icb_layout(max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_desc = make_render_icb_desc_bytes(1, max_v, max_f, MTL_INDIRECT_CMD_DRAW_INDEXED);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        icb_gva,
-        &icb_desc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(
-        &mut host,
-        &state,
-        9,
-        OBJECT_TYPE_TYPE7,
-        ICB_DESC_LEN as u32,
-        icb_gva,
-    );
+    put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        vblob_gva,
-        &vert_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x200,
-        &vfdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 2, OBJECT_TYPE_FUNCTION, 32, 0x200);
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        fblob_gva,
-        &frag_mtlb,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x220,
-        &ffdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 3, OBJECT_TYPE_FUNCTION, 32, 0x220);
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
-    let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
-    let blen = pdesc.len() as u32;
-    st32(&mut pdesc[0..], TYPE7_OBJECT_RENDER_PIPELINE);
-    st32(&mut pdesc[4..], blen);
-    st32(&mut pdesc[8..], 6);
-    pdesc[TYPE7_FIRST_TLVS] = 2;
-    pdesc[TYPE7_FIRST_TLVS + 1] = PIPELINE_TAG_VERTEX_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 2] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 2);
-    pdesc[TYPE7_FIRST_TLVS + 7] = PIPELINE_TAG_FRAGMENT_FUNC;
-    pdesc[TYPE7_FIRST_TLVS + 8] = 4;
-    st32(&mut pdesc[TYPE7_FIRST_TLVS + 9..], 3);
-    assert!(
-        gva_mem::write_task_gva(&mut host, &state.tasks[1], 0x240, &pdesc, PAGE_SHIFT_ARM64E)
-            .is_ok()
-    );
-    put_list_entry(&mut host, &state, 6, OBJECT_TYPE_TYPE7, blen, 0x240);
+    let pdesc = make_render_pipeline_desc(2, 3);
+    put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
     let indices: [u16; 3] = [0, 1, 2];
     let mut index_bytes = vec![0u8; 8]; // pad 8
@@ -9393,86 +5534,15 @@ fn buffer_backed_nonzero_wire_va_offset() {
         _ => panic!("indexed"),
     }
 
-    let cmd_handle = 6u32;
-    let cmd_gva = (cmd_handle as u64) << RESOURCE_PAGE_SHIFT;
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        cmd_gva,
-        &slot,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let mut cmd_bdesc = vec![0u8; 16];
-    st64(&mut cmd_bdesc[0..], slot.len() as u64);
-    st64(&mut cmd_bdesc[8..], cmd_handle as u64);
-    assert!(gva_mem::write_task_gva(
-        &mut host,
-        &state.tasks[1],
-        0x1a0,
-        &cmd_bdesc,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    put_list_entry(&mut host, &state, 10, OBJECT_TYPE_BUFFER, 16, 0x1a0);
+    associate_icb_command_memory(&mut host, &state, 6, &slot);
 
-    apply_icb_host_resource_info(
-        &state,
-        &host,
-        1,
-        &IcbHostResourceInfo {
-            icb_ref: 9,
-            buffer_ref: 10,
-            gpu_address: 0,
-        },
-    )
-    .expect("0x1d1");
+    let mapping_id = map_draw_target(&mut host, &mut state, 0x35);
 
-    let mapping_id = 9u32;
-    let pfn = 0x35u32;
-    let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(gpa, 0x4000, 0);
-    let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-    state.map_surface(mapping_id);
-    {
-        let m = state.mappings.get_mut(&mapping_id).unwrap();
-        m.mapped = true;
-        m.mapping_internal = 1;
-        m.page_entries = vec![entry];
-    }
-    assert!(state.set_mapping_geom(mapping_id, 4, 4, MTL_FORMAT_BGRA8_UNORM));
-
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
     );
 
-    let mut back = vec![0u8; 4 * 4 * 4];
-    assert!(mapping_write::read_rect_raw(
-        &mut state, &mut host, mapping_id, 0, 0, 4, 4, &mut back, 16
-    ));
-    let want = [0x22u8, 0x44, 0x60 + sid, 0xff];
-    let near = |g: u8, w: u8| (g as i32 - w as i32).abs() <= 1;
-    for (p, px) in back.chunks_exact(4).enumerate() {
-        assert!(
-            near(px[0], want[0])
-                && near(px[1], want[1])
-                && near(px[2], want[2])
-                && near(px[3], want[3]),
-            "pixel {p} = {px:02x?}; want ~{want:02x?} (wire_va offset)"
-        );
-    }
+    assert_stagein_solid(&mut state, &mut host, mapping_id, sid, "wire_va offset");
 }

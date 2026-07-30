@@ -17,7 +17,22 @@
 use crate::contract::gva_resolve::{read_task_root, translate_root, Cache, ResolveStatus, Task};
 use crate::model::{DeviceState, GvaHostView, TaskEntry};
 use crate::runtime::gva_mem::geometry_for_page_shift;
-use crate::runtime::host::{HostMemory, HostOps};
+use crate::runtime::host::{HostMemory, HostOps, MemError};
+
+/// Dedup key for a fragmented-span decline: the span identity plus its shape.
+///
+/// A fragmented GVA span is refused every time the caller asks, and the
+/// compositor asks constantly — one measured boot logged 34 000
+/// `gva_view_fragmented` lines covering 2 449 distinct spans. The refusal is
+/// documented control flow (the caller takes its per-run multi-import
+/// fallback), so what the always-on sink owes the reader is that the *class* is
+/// happening and on which spans, not one line per ask.
+fn fragmented_span_key(task_id: u32, gva: u64, pages: usize, runs: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (task_id, gva, pages, runs).hash(&mut h);
+    h.finish()
+}
 
 /// True if half-open ranges `[a, a+la)` and `[b, b+lb)` overlap.
 #[inline]
@@ -30,10 +45,35 @@ pub fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
     a < b_end && b < a_end
 }
 
+/// How a registered view's task id relates to the wire id asking about it.
+///
+/// Split out from [`task_matches`] because the aliased arm is only *safe* at
+/// some of that predicate's call sites, and a bare `bool` cannot say which arm
+/// answered. Retiring or evicting an aliased view costs a re-walk; **looking
+/// one up** hands the caller a host pointer registered for a different task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskViewMatch {
+    /// The view was registered under exactly this wire id.
+    Exact,
+    /// The view was registered under `wire >> 1` or `wire << 1`.
+    Aliased,
+}
+
+/// Which arm matches `view_task` against wire `task_id`, or `None` for neither.
+pub(crate) fn task_match_kind(view_task: u32, wire_task: u32) -> Option<TaskViewMatch> {
+    if view_task == wire_task {
+        return Some(TaskViewMatch::Exact);
+    }
+    if view_task == (wire_task >> 1) || (view_task << 1) == wire_task {
+        return Some(TaskViewMatch::Aliased);
+    }
+    None
+}
+
 /// Task id used when the view was built matches wire `task_id` (or define-task raw id).
 #[inline]
 pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
-    view_task == wire_task || view_task == (wire_task >> 1) || (view_task << 1) == wire_task
+    task_match_kind(view_task, wire_task).is_some()
 }
 
 /// Retire every registered GVA view that overlaps `[gva, gva+length)` under `task_id`.
@@ -79,30 +119,6 @@ pub fn retire_gva_views_overlapping(
     n
 }
 
-/// Retire all GVA views for a task (delete_task / task redefine).
-pub fn retire_gva_views_for_task(state: &mut DeviceState, task_id: u32) -> u32 {
-    let mut n = 0u32;
-    let mut i = 0;
-    while i < state.gva_host_views.len() {
-        if task_matches(state.gva_host_views[i].task_id, task_id) {
-            let v = state.gva_host_views.swap_remove(i);
-            if v.ptr != 0 && v.ptr_len != 0 {
-                state.retired_views.push((v.ptr, v.ptr_len));
-            }
-            n = n.saturating_add(1);
-        } else {
-            i += 1;
-        }
-    }
-    state
-        .guest_run_memo
-        .retain(|e| !task_matches(e.task_id, task_id));
-    state
-        .flush_nohit_memo
-        .retain(|&(t, _, _), _| !task_matches(t, task_id));
-    n
-}
-
 /// Find a covering view for `task_id` + `[gva, gva+length)` if one is registered.
 pub fn find_covering_view(
     state: &DeviceState,
@@ -113,27 +129,121 @@ pub fn find_covering_view(
     if length == 0 {
         return None;
     }
+    // **Exact task id only.** This returns a host pointer the caller reads
+    // through, so accepting a view registered under `task_id >> 1` or
+    // `task_id << 1` would hand one task another task's mapped pages. The
+    // aliased arm was censused over two full boots (`view_alias_lookup`) and
+    // matched zero times, so removing it changes nothing that happened.
+    //
+    // It is also the safe direction independent of that reading: dropping an
+    // arm from a *lookup* can only turn a hit into a miss, and `ensure_gva_view`
+    // answers a miss by walking the guest page table and building a fresh view.
+    // The cost is one extra walk; the alternative was wrong bytes.
+    //
+    // The overlap-retire site keeps [`task_matches`] deliberately: widening is
+    // conservative there (dropping a view that did not need dropping costs one
+    // re-walk) and narrowing it could leave a stale view live to be read later.
     state.gva_host_views.iter().find(|v| {
-        task_matches(v.task_id, task_id)
+        v.task_id == task_id
             && v.gva <= gva
             && gva.saturating_add(length) <= v.gva.saturating_add(v.length)
             && v.ptr != 0
     })
 }
 
-/// Resolve which task slot to walk (wire id, then define-task `>> 1`).
+/// The wire task word names two live tasks at once, and only one can be meant.
+///
+/// `DefineTask2` (op `0x38`) registers a task under `raw_id >> 1`
+/// ([`crate::model::DEFINE_TASK_ID_SHIFT`]), while `DeleteTask` (`0x20`),
+/// `SetObjectList` (`0x33`), `MapMemory2` (`0x39`), `UnmapMemory` (`0x22`),
+/// `DeleteObject` (`0x25`) and `CursorGlyph` (`0x04`) read a task word at the
+/// same payload offset **unshifted**. Nothing decodes that word canonically.
+///
+/// Measured on the x86/Vulkan rail: the `DefineTask2` raw words are `0x1`, `0x2`,
+/// `0x4`, `0x6`, `0x8` for slots 0–4, so the wire form is `(slot << 1) | flag`
+/// and the low bit is a flag the crate discards rather than decodes. Every other
+/// opcode then names the slot directly. Slots run densely from 0 upward, so for
+/// almost any wire id `n`, slot `n >> 1` is **also live**.
+///
+/// That is what makes the collision structural rather than incidental, and it is
+/// why this is a census and not a refusal: the walk takes the wire id, which on a
+/// healthy boot is the right answer. What the reading rules out is the safety
+/// argument for ever preferring `n >> 1` — a fallback to it could not fail
+/// loudly, because it would always find a live slot to land on.
+///
+/// Ambiguity is a property of `tasks[]` at the instant of the walk, so it is read
+/// from the table rather than counted from events: a count of aliased *walks*
+/// would say how often a fallback ran, never whether the namespace collided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskWalkAmbiguity {
+    /// The wire id and `id >> 1` both name live tasks.
+    BothSlotsLive,
+}
+
+impl crate::observe::Decline for TaskWalkAmbiguity {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::BothSlotsLive => "task_walk_ambiguous",
+        }
+    }
+}
+
+/// Record that the wire word named two live slots, latched per `(named, other)`.
+///
+/// Latched rather than counted because the pair is the identity that matters and
+/// the first sighting is timestamped — a boot that drives several stages gets a
+/// set difference between them for free. The discriminant is built from the two
+/// ids alone: both are stable identities, not accumulators, so this cannot
+/// repeat the reverted witness whose discriminator read a counter that many
+/// events advanced.
+///
+/// The latch is taken *before* the line is built, not by `fail_once` after it.
+/// This sits inside the resolver every guest read and write goes through, and
+/// `Emit::field` renders eagerly — building and dropping two `String`s per walk
+/// would make the probe cost scale with the traffic it is measuring.
+fn note_task_walk_ambiguity(named: u32, other: u32) {
+    use crate::observe::Decline;
+    let amb = TaskWalkAmbiguity::BothSlotsLive;
+    let discriminant = (u64::from(named) << 32) | u64::from(other);
+    if !crate::observe::first_sight(amb.slug(), discriminant) {
+        return;
+    }
+    crate::observe::Emit::decline("task_walk", &amb)
+        .field("named", named)
+        .field("other", other)
+        .fail();
+}
+
+/// Resolve which task slot to walk. **The wire id, or nothing.**
+///
+/// This used to fall back to `task_id >> 1` when the named slot was not live.
+/// That arm was measured over a full x86/Vulkan boot (wiki, apple.com, a drag,
+/// 660 s idle) and **decided zero times**, while the ambiguity census fired for
+/// six distinct wire ids — so the premise the fallback rested on, that only one
+/// of the two slots is ever live, is false.
+///
+/// Both readings point the same way. Dead, it costs nothing to remove. Live, it
+/// could not have failed safely: slots run densely from 0, so `task_id >> 1` is
+/// almost always some *other* live task, and the fallback would have walked that
+/// task's page tables rather than refusing. On a read that returns another task's
+/// bytes; on a write it puts host bytes at a GPA the named task does not own.
+///
+/// Returning `None` instead is what makes that case visible: the callers turn it
+/// into a typed, always-on refusal (`MemError::NoSuchTask`) rather than a
+/// plausible wrong answer nothing can see.
 fn resolve_task_for_walk(tasks: &[TaskEntry], task_id: u32) -> Option<(u32, &TaskEntry)> {
+    let shifted = task_id >> 1;
+    let shifted_live = shifted != task_id
+        && (shifted as usize) < tasks.len()
+        && tasks[shifted as usize].active
+        && tasks[shifted as usize].directory_pfn != 0;
     if (task_id as usize) < tasks.len() {
         let t = &tasks[task_id as usize];
         if t.active && t.directory_pfn != 0 {
+            if shifted_live {
+                note_task_walk_ambiguity(task_id, shifted);
+            }
             return Some((task_id, t));
-        }
-    }
-    let shifted = task_id >> 1;
-    if shifted != task_id && (shifted as usize) < tasks.len() {
-        let t = &tasks[shifted as usize];
-        if t.active && t.directory_pfn != 0 {
-            return Some((shifted, t));
         }
     }
     None
@@ -141,18 +251,24 @@ fn resolve_task_for_walk(tasks: &[TaskEntry], task_id: u32) -> Option<(u32, &Tas
 
 /// Collect one GPA per guest page covering `[gva, gva+length)` under the task PT.
 ///
-/// Returns page-aligned GPAs in GVA order. Fails closed on any unmapped page.
+/// Returns page-aligned GPAs in GVA order. Fails closed on any unmapped page,
+/// carrying **which** check refused — the walk's own status when the walk is
+/// what said no. Callers that only need "yes or no" take `.ok()`; the guest-write
+/// path propagates the reason so the always-on line names it.
 fn collect_span_gpas<M: HostMemory>(
     host: &M,
     task: &TaskEntry,
     gva: u64,
     length: u64,
     page_shift: u32,
-) -> Option<Vec<u64>> {
-    if length == 0 || !task.active || task.directory_pfn == 0 {
-        return None;
+) -> Result<Vec<u64>, MemError> {
+    if length == 0 {
+        return Err(MemError::BadArgs);
     }
-    let geom = geometry_for_page_shift(page_shift)?;
+    if !task.active || task.directory_pfn == 0 {
+        return Err(MemError::NoTaskDirectory);
+    }
+    let geom = geometry_for_page_shift(page_shift).ok_or(MemError::UnsupportedPageShift)?;
     let page_size = geom.page_size as u64;
     struct HostPhys<'a, M: HostMemory>(&'a M);
     impl<M: HostMemory> crate::contract::gva_resolve::PhysReader for HostPhys<'_, M> {
@@ -165,7 +281,7 @@ fn collect_span_gpas<M: HostMemory>(
         active: true,
         directory_pfn: task.directory_pfn,
     };
-    let root = read_task_root(&reader, &gr_task, geom).ok()?;
+    let root = read_task_root(&reader, &gr_task, geom).map_err(|_| MemError::TaskRootRead)?;
     let mut cache = Cache::default();
     let end = gva.saturating_add(length);
     let mut page_gva = gva & !(page_size - 1);
@@ -180,7 +296,7 @@ fn collect_span_gpas<M: HostMemory>(
             Some(&mut cache),
         );
         if t.status != ResolveStatus::Ok {
-            return None;
+            return Err(MemError::Unresolved(t.status));
         }
         // HostOps map_pages expects page-aligned GPAs (page base, not +offset).
         let gpa_base = t.gpa & !(page_size - 1);
@@ -188,9 +304,9 @@ fn collect_span_gpas<M: HostMemory>(
         page_gva = page_gva.saturating_add(page_size);
     }
     if gpas.is_empty() {
-        return None;
+        return Err(MemError::BadArgs);
     }
-    Some(gpas)
+    Ok(gpas)
 }
 
 /// Maximal packed-contig runs in a page-GPA list (product Linux `map_pages`).
@@ -211,6 +327,23 @@ pub fn contig_page_runs(gpas: &[u64], page_size: u64) -> Vec<std::ops::Range<usi
     }
     runs.push(start..gpas.len());
     runs
+}
+
+/// How many runs [`contig_page_runs`] would return, without building them.
+///
+/// The packed-view pre-check and the lines that report a fragmented decline
+/// both want only the count, and on this rail the fragmented answer is the
+/// common one: a compositor mapping of 2040 pages in 511 runs is asked hundreds
+/// of times a second, and materializing a 511-element `Vec` to read its `len()`
+/// was the entire cost of the check. Counting the breaks is the same traversal
+/// with no allocation.
+pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
+    if gpas.is_empty() || page_size == 0 {
+        return 0;
+    }
+    1 + (1..gpas.len())
+        .filter(|&i| gpas[i] != gpas[i - 1].wrapping_add(page_size))
+        .count()
 }
 
 /// Build or reuse a contiguous host-VA view of guest pages for `[gva, gva+length)`.
@@ -270,7 +403,7 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     let page_shift = state.page_shift;
     let (resolved_tid, gpas) = {
         let (tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
-        let gpas = collect_span_gpas(host, task, gva, length, page_shift)?;
+        let gpas = collect_span_gpas(host, task, gva, length, page_shift).ok()?;
         (tid, gpas)
     };
     let page_sz = state.page_size() as usize;
@@ -278,7 +411,22 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
     }
-    // Full-span packed view only (single map_pages). Fragmented → None.
+    // Full-span packed view only (single map_pages). Fragmented → None, and
+    // asking `map_pages` for a view it cannot build is not a failure to log:
+    // `write_span` / `read_span` import the maximal runs instead.
+    let runs = contig_run_count(&gpas, state.page_size());
+    if runs != 1 {
+        if crate::observe::first_sight(
+            "gva_view_fragmented",
+            fragmented_span_key(resolved_tid, gva, gpas.len(), runs),
+        ) {
+            crate::observe::off(format!(
+                "gva_view_fragmented task={resolved_tid} gva={gva:#x} pages={} runs={runs}",
+                gpas.len(),
+            ));
+        }
+        return None;
+    }
     let ptr = host.map_pages(&gpas, page_sz)?;
     let page_sz = (1usize) << page_shift;
     let ptr_len = gpas.len().saturating_mul(page_sz);
@@ -314,14 +462,14 @@ fn view_gpas_current<H: HostMemory>(
     let page = 1u64 << page_shift;
     let first_page = v.gva & !(page - 1);
     match collect_span_gpas(host, task, first_page, 1, page_shift) {
-        Some(g) if g.first() == Some(&v.first_gpa) => {}
+        Ok(g) if g.first() == Some(&v.first_gpa) => {}
         _ => return false,
     }
     if v.last_gpa != 0 {
         let last_page = v.gva.saturating_add(v.length).saturating_sub(1) & !(page - 1);
         if last_page != first_page {
             match collect_span_gpas(host, task, last_page, 1, page_shift) {
-                Some(g) if g.first() == Some(&v.last_gpa) => {}
+                Ok(g) if g.first() == Some(&v.last_gpa) => {}
                 _ => return false,
             }
         }
@@ -397,9 +545,9 @@ pub fn write_span<H: HostMemory + HostOps>(
     task_id: u32,
     gva: u64,
     buf: &[u8],
-) -> bool {
+) -> Result<(), MemError> {
     if buf.is_empty() {
-        return true;
+        return Ok(());
     }
     write_span_multi(state, host, task_id, gva, buf)
 }
@@ -435,13 +583,34 @@ pub fn map_fresh_span<H: HostMemory + HostOps>(
     let page_shift = state.page_shift;
     let gpas = {
         let (_tid, task) = resolve_task_for_walk(&state.tasks, task_id)?;
-        collect_span_gpas(host, task, gva, length, page_shift)?
+        collect_span_gpas(host, task, gva, length, page_shift).ok()?
     };
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
         return None;
     }
-    crate::runtime::mapper::flush_retired_views(state, host);
     let page_size = state.page_size();
+    // Fragmented span: `map_pages` can only alias page `i` at `base + i*page`
+    // inside one RAMBlock, so a gapped GPA list can never build a single packed
+    // view. Asking anyway spends an FFI call to be refused, and the refusal
+    // lands in the always-on failure log as `qemu_map_pages_callback_failed`.
+    // Decline here — quietly — so the caller takes its documented per-run
+    // multi-import fallback (the rgba8 store / `write_span`). A genuine
+    // `map_pages` refusal over a *packed* list below stays fail-visible. Mirrors
+    // the same pre-check `ensure_gva_view` already applies.
+    let runs = contig_run_count(&gpas, page_size);
+    if runs != 1 {
+        if crate::observe::first_sight(
+            "gva_view_fragmented_fresh",
+            fragmented_span_key(task_id, gva, gpas.len(), runs),
+        ) {
+            crate::observe::off(format!(
+                "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span)",
+                gpas.len(),
+            ));
+        }
+        return None;
+    }
+    crate::runtime::mapper::flush_retired_views(state, host);
     let page_sz = page_size as usize;
     let ptr_base = host.map_pages(&gpas, page_sz)?;
     let map_len = gpas.len().saturating_mul(page_sz);
@@ -491,32 +660,34 @@ pub fn read_span<H: HostMemory + HostOps>(
 ///
 /// Ephemeral per-run maps (do not register partial views — Darwin unmap needs
 /// the full map_pages base; product Linux alias is a no-op unmap).
+///
+/// Every refusal here names its own check. Fragmentation is **not** one of them:
+/// a gapped span is split into packed runs and mapped a run at a time, so a
+/// caller reporting "not contiguous" for a failure of this function is reporting
+/// a condition the function does not test.
 fn write_span_multi<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,
     gva: u64,
     buf: &[u8],
-) -> bool {
+) -> Result<(), MemError> {
     let length = buf.len() as u64;
     let page_shift = state.page_shift;
     let page_size = state.page_size();
     let page_sz = page_size as usize;
     let gpas = {
         let Some((_tid, task)) = resolve_task_for_walk(&state.tasks, task_id) else {
-            return false;
+            return Err(MemError::NoSuchTask);
         };
-        let Some(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
-            return false;
-        };
-        gpas
+        collect_span_gpas(host, task, gva, length, page_shift)?
     };
     if gpas.iter().any(|&g| !host.is_ram_gpa(g)) {
-        return false;
+        return Err(MemError::NotRam);
     }
     let runs = contig_page_runs(&gpas, page_size);
     if runs.is_empty() {
-        return false;
+        return Err(MemError::BadArgs);
     }
     crate::runtime::mapper::flush_retired_views(state, host);
     let span_page_base = gva & !(page_size - 1);
@@ -524,7 +695,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
     for run in &runs {
         let run_gpas = &gpas[run.clone()];
         let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            return false;
+            return Err(MemError::MapPagesRefused);
         };
         let total = run_gpas.len().saturating_mul(page_sz);
         let run_gva = span_page_base.saturating_add((run.start as u64).saturating_mul(page_size));
@@ -540,7 +711,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
         let n = (copy_hi - copy_lo) as usize;
         if host_off + n > total || buf_off + n > buf.len() {
             host.unmap_pages(ptr, total);
-            return false;
+            return Err(MemError::RunOutOfRange);
         }
         // SAFETY: map_pages packed `total` bytes; host_off+n in range.
         unsafe {
@@ -552,7 +723,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
         }
         host.unmap_pages(ptr, total);
     }
-    true
+    Ok(())
 }
 
 /// Multi-import read: map each packed GPA run, copy out, unmap.
@@ -571,7 +742,7 @@ fn read_span_multi<H: HostMemory + HostOps>(
         let Some((_tid, task)) = resolve_task_for_walk(&state.tasks, task_id) else {
             return false;
         };
-        let Some(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
+        let Ok(gpas) = collect_span_gpas(host, task, gva, length, page_shift) else {
             return false;
         };
         gpas
@@ -640,6 +811,144 @@ mod tests {
         assert_eq!(runs, vec![0..2, 2..4, 4..5]);
         assert_eq!(contig_page_runs(&[0x1000], page), vec![0..1]);
         assert!(contig_page_runs(&[], page).is_empty());
+    }
+
+    /// [`contig_run_count`] is what the packed-view pre-check and the
+    /// fragmented-decline lines now read, so it has to agree with the runs
+    /// [`contig_page_runs`] would have built — on every shape, including the two
+    /// that return no runs at all. A count that drifted high would turn a packed
+    /// mapping into a permanent multi-import fallback; one that drifted low
+    /// would hand `map_pages` a list it cannot view and put the refusal in the
+    /// failure log.
+    #[test]
+    fn contig_run_count_agrees_with_the_runs_it_does_not_build() {
+        let page = 0x1000u64;
+        let shapes: &[&[u64]] = &[
+            &[],
+            &[0x1000],
+            &[0x1000, 0x2000, 0x3000],
+            &[0x1000, 0x3000],
+            &[0x1000, 0x2000, 0x4000, 0x5000, 0x8000],
+            // Descending and repeated GPAs are breaks like any other.
+            &[0x3000, 0x2000, 0x1000],
+            &[0x1000, 0x1000],
+        ];
+        for shape in shapes {
+            assert_eq!(
+                contig_run_count(shape, page),
+                contig_page_runs(shape, page).len(),
+                "shape {shape:x?}"
+            );
+        }
+        let fragmented: Vec<u64> = (0..2040u64)
+            .map(|i| (i / 4) * 0x8000 + (i % 4) * page)
+            .collect();
+        assert_eq!(contig_run_count(&fragmented, page), 510);
+        assert_eq!(
+            contig_run_count(&fragmented, page),
+            contig_page_runs(&fragmented, page).len()
+        );
+        // `page_size == 0` is the no-runs guard, not a one-run answer.
+        assert_eq!(contig_run_count(&[0x1000, 0x2000], 0), 0);
+        assert_eq!(
+            contig_run_count(&[0x1000, 0x2000], 0),
+            contig_page_runs(&[0x1000, 0x2000], 0).len()
+        );
+    }
+
+    /// A fragmented span must not spend a `map_pages` call to be told no. The
+    /// C shim can only alias page `i` at `base + i * page`, so a gapped GPA list
+    /// always returns -1 — and that -1 reaches the always-on failure log as
+    /// `qemu_map_pages_callback_failed`, which is how one x86 boot logged 536
+    /// non-failures over documented fall-back-to-multi-run control flow.
+    #[test]
+    fn fragmented_gva_view_declines_without_asking_map_pages() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        // Wire PTE[1] → data1 (pfn 10) so the two-page span is gapped.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let before = host.map_pages_calls;
+        assert_eq!(
+            ensure_gva_view(&mut state, &mut host, 1, page - 4, 8),
+            None,
+            "a gapped span has no packed whole-span view"
+        );
+        assert_eq!(
+            host.map_pages_calls, before,
+            "the fragmented case must be answered in Rust, not by a failing FFI call"
+        );
+
+        // The packed case still goes to the host and still resolves.
+        let before = host.map_pages_calls;
+        assert!(ensure_gva_view(&mut state, &mut host, 1, 8, 4).is_some());
+        assert_eq!(host.map_pages_calls, before + 1);
+    }
+
+    /// The fragmented-span decline reports each distinct span once, not once per
+    /// ask.
+    ///
+    /// The refusal is documented control flow — the caller falls back to
+    /// per-run multi-import — so repeating it says nothing new, and the
+    /// compositor repeats it constantly: one measured boot logged 34 000
+    /// `gva_view_fragmented` lines over 2 449 distinct spans. Without the
+    /// first-sight guard this test sees sixteen lines for one span.
+    #[test]
+    fn a_fragmented_span_reports_once_and_a_different_span_reports_again() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        // A task id no other test in this module uses (`MAX_TASKS` is 256, so it
+        // must be in range): `first_sight` is process-global, so sharing an id
+        // would let another test's span consume this one's first sight.
+        let task = 200u32;
+        assert!(state.define_task(task, page, 2));
+
+        let cap = crate::observe::FailCapture::start();
+        let lines = || -> Vec<String> {
+            cap.lines()
+                .into_iter()
+                .filter(|l| l.starts_with("OFF gva_view_fragmented"))
+                .collect()
+        };
+
+        for _ in 0..16 {
+            assert_eq!(
+                ensure_gva_view(&mut state, &mut host, task, page - 4, 8),
+                None,
+                "a gapped span has no packed whole-span view"
+            );
+        }
+        let first = lines();
+        assert_eq!(
+            first.len(),
+            1,
+            "sixteen asks on one fragmented span must report once: {first:?}"
+        );
+        assert!(
+            first[0].contains(" pages=2 runs=2"),
+            "the line keeps its shape: {}",
+            first[0]
+        );
+
+        // A different span at the same shape is a different key and reports again.
+        assert_eq!(
+            ensure_gva_view(&mut state, &mut host, task, page - 8, 16),
+            None
+        );
+        let after = lines();
+        assert_eq!(
+            after.len(),
+            2,
+            "a span not seen before must still report: {after:?}"
+        );
     }
 
     #[test]
@@ -729,6 +1038,128 @@ mod tests {
         (host, root_gpa, data0, data1, page)
     }
 
+    /// Read the always-on log from `from` to the end.
+    fn log_tail(from: usize) -> String {
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        body[from.min(body.len())..].to_string()
+    }
+
+    /// Start capturing the always-on log; returns the offset to slice from.
+    fn log_mark() -> usize {
+        crate::observe::redirect_logs_for_tests();
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len()
+    }
+
+    /// `find_covering_view` returns a host pointer the caller reads through, so
+    /// it must match the task id exactly.
+    ///
+    /// Before this, a view registered by task 20 satisfied a lookup for wire id
+    /// 41 (`41 >> 1 == 20`) and handed task 41 task 20's mapped pages. The
+    /// aliased arm measured zero over two full boots, so removing it changes
+    /// nothing that happened — but a lookup is also the safe direction to
+    /// narrow, because a miss only costs a fresh page-table walk.
+    #[test]
+    fn a_view_registered_by_another_task_does_not_satisfy_this_tasks_lookup() {
+        assert_eq!(task_match_kind(20, 20), Some(TaskViewMatch::Exact));
+        assert_eq!(task_match_kind(20, 41), Some(TaskViewMatch::Aliased));
+        assert_eq!(task_match_kind(20, 43), None);
+
+        let mut state = state_x86();
+        state.gva_host_views.push(crate::model::GvaHostView {
+            task_id: 20,
+            gva: 0x1000,
+            length: 0x1000,
+            ptr: 0x4000,
+            ptr_len: 0x1000,
+            first_gpa: 0,
+            last_gpa: 0,
+        });
+
+        let before = log_mark();
+        assert!(find_covering_view(&state, 20, 0x1000, 0x10).is_some());
+        assert!(
+            !log_tail(before).contains("view_alias"),
+            "an exact match is not an alias and must not be reported as one"
+        );
+
+        // The deletion: wire id 41 aliases onto the view registered for task 20
+        // (41 >> 1 == 20), and the lookup must now refuse it rather than hand
+        // back another task's mapped pages. `ensure_gva_view` answers the miss
+        // by walking the guest page table and building a fresh view, so the
+        // cost of this refusal is one walk.
+        assert!(
+            find_covering_view(&state, 41, 0x1000, 0x10).is_none(),
+            "a view registered by task 20 must not satisfy a lookup for task 41"
+        );
+    }
+
+    /// A wire task word that names two live tasks at once is not resolvable
+    /// from the wire, and the walk silently prefers one of them.
+    ///
+    /// `DefineTask2` registers under `raw >> 1` while the opcodes that later
+    /// name the task read it unshifted, so slot `n` and slot `n >> 1` can both
+    /// be live. When they are, a write naming `n` translates through slot `n`'s
+    /// page tables — and a guest that meant `n >> 1` has its bytes written into
+    /// a different task's address space.
+    ///
+    /// Ids 9 and 4 rather than 2 and 1: the emission is latched per
+    /// `(slug, named, resolved)` for the life of the process, so a pair that
+    /// another test in this binary also walks would make this test pass or fail
+    /// on ordering.
+    #[test]
+    fn ambiguous_task_word_is_named_when_both_slots_are_live() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(4, page, 2));
+        assert!(state.define_task(9, page, 2));
+        let before = log_mark();
+        assert!(write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4]).is_ok());
+        let tail = log_tail(before);
+        let line = tail
+            .lines()
+            .find(|l| l.contains("task_walk "))
+            .expect("a walk whose wire word names two live tasks is always-on");
+        assert!(
+            line.contains("reason=task_walk_ambiguous"),
+            "both slots live must read as ambiguous, not as the ordinary \
+             fallback: {line}"
+        );
+        assert!(
+            line.contains("named=9") && line.contains("other=4"),
+            "the line must name the wire id and the slot that collided with it, \
+             since the walk always takes the wire id: {line}"
+        );
+    }
+
+    /// A write naming a slot that is not live must **refuse**, not silently walk
+    /// `task_id >> 1`'s page tables.
+    ///
+    /// Slot 9 is not defined here and slot 4 is. The deleted fallback would have
+    /// resolved this write through task 4 and landed guest bytes at GPAs task 9
+    /// does not own — and it would have looked like success. Slots run densely
+    /// from 0 on the real rail, so `>> 1` almost always finds *some* live task;
+    /// that is why the arm could never fail safely and why refusing is the whole
+    /// point of removing it.
+    #[test]
+    fn a_write_naming_a_dead_slot_refuses_instead_of_walking_its_neighbour() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(4, page, 2));
+        let before = log_mark();
+        let err = write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4])
+            .expect_err("slot 9 is not live, so this write has no address space");
+        assert_eq!(err, MemError::NoSuchTask);
+        let tail = log_tail(before);
+        assert!(
+            !tail.contains("task_walk_ambiguous"),
+            "one live slot is not an ambiguous wire word: {tail}"
+        );
+    }
+
     /// Guest writes must land where the PT points **now**, not where a
     /// registered view pointed when it was built (stale-view heap-corruption
     /// class — the guest recycles pages before the Unmap notify drains).
@@ -739,7 +1170,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         let gva = 8u64;
-        assert!(write_span(&mut state, &mut host, 1, gva, &[1, 2, 3, 4]));
+        assert!(write_span(&mut state, &mut host, 1, gva, &[1, 2, 3, 4]).is_ok());
         let mut back = [0u8; 4];
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4]);
@@ -752,11 +1183,145 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
 
-        assert!(write_span(&mut state, &mut host, 1, gva, &[5, 6, 7, 8]));
+        assert!(write_span(&mut state, &mut host, 1, gva, &[5, 6, 7, 8]).is_ok());
         host.read_gpa(data1 + gva, &mut back).unwrap();
         assert_eq!(back, [5, 6, 7, 8], "write must follow the live PT");
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4], "stale page must not be touched");
+    }
+
+    /// The product guest-write path must name the check that refused, not
+    /// assume contiguity. `write_span_multi` has six distinct refusals — no
+    /// task, an unresolved page, a non-RAM GPA, an empty run list, a `map_pages`
+    /// refusal and an out-of-range run window — and every one of them used to
+    /// reach the always-on log as `mem_not_contiguous`. That is the same "one
+    /// status for N checks" collapse that
+    /// `no_two_guest_memory_checks_answer_with_the_same_reason` ended for the
+    /// read paths, still standing on the write path.
+    ///
+    /// Here the span's second page has no PTE, so the walk refuses and
+    /// contiguity is never even in question.
+    #[test]
+    fn product_gva_write_reports_the_check_that_refused() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, _root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        crate::observe::redirect_logs_for_tests();
+        let before = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        // pt_fixture wires PTE[0] only, so page 1 of this two-page span is
+        // unresolved. `page - 4` straddles the boundary.
+        assert!(crate::runtime::gva_mem::write_task_gva_product(
+            &mut state,
+            &mut host,
+            1,
+            page - 4,
+            &[0u8; 8]
+        )
+        .is_err());
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let tail = &body[before.min(body.len())..];
+        let line = tail
+            .lines()
+            .find(|l| l.starts_with("gva_write "))
+            .expect("a refused product guest write is always-on");
+        assert!(
+            line.contains("reason=gva_zero_pfn"),
+            "the walk's own check must be the reason: {line}"
+        );
+    }
+
+    /// The three refusals `write_span_multi` owns must stay distinguishable
+    /// from each other and from the walk's. Asserted as "no two share a slug"
+    /// rather than by naming each, because the property that matters is the
+    /// absence of aliasing — the same shape
+    /// `no_two_guest_memory_checks_answer_with_the_same_reason` asserts crate-wide.
+    #[test]
+    fn write_span_refusals_do_not_share_a_reason() {
+        use crate::observe::Decline;
+        let mut slugs: Vec<&str> = [
+            MemError::NoSuchTask,
+            MemError::NotRam,
+            MemError::MapPagesRefused,
+            MemError::RunOutOfRange,
+            MemError::BadArgs,
+            MemError::Unresolved(ResolveStatus::ErrZeroPfn),
+        ]
+        .iter()
+        .map(|e| e.slug())
+        .collect();
+        let total = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(slugs.len(), total, "two write-span refusals share a slug");
+    }
+
+    /// A gapped span is the one thing the multi-import path is *for*, so it must
+    /// succeed — the reason it can no longer be reported as is now impossible to
+    /// name. Guards the direction the vocabulary change could have gone wrong in:
+    /// renaming the refusal without checking fragmentation still works.
+    #[test]
+    fn fragmented_write_succeeds_so_no_refusal_can_mean_fragmented() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, data0, data1, page) = pt_fixture(page_shift);
+        // PTE[1] → pfn 10, leaving a gap after PTE[0]'s pfn 4.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+        assert!(
+            write_span(
+                &mut state,
+                &mut host,
+                1,
+                page - 4,
+                &[1, 2, 3, 4, 5, 6, 7, 8]
+            )
+            .is_ok(),
+            "the multi-import path exists to write a gapped span"
+        );
+        let mut back = [0u8; 4];
+        host.read_gpa(data0 + page - 4, &mut back).unwrap();
+        assert_eq!(back, [1, 2, 3, 4]);
+        host.read_gpa(data1, &mut back).unwrap();
+        assert_eq!(back, [5, 6, 7, 8]);
+    }
+
+    /// A fragmented span handed to `map_fresh_span` must be declined in Rust,
+    /// exactly like `ensure_gva_view` — never a failing `map_pages` FFI call
+    /// whose -1 pollutes the always-on failure log as
+    /// `qemu_map_pages_callback_failed`. The caller's per-run multi-import
+    /// fallback (rgba8 store / `write_span`) still lands the content.
+    #[test]
+    fn fragmented_map_fresh_span_declines_without_asking_map_pages() {
+        let page_shift = PAGE_SHIFT_X86;
+        let (mut host, root_gpa, _data0, _data1, page) = pt_fixture(page_shift);
+        // Wire PTE[1] → data1 (pfn 10) so the two-page span is gapped.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 10);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let before = host.map_pages_calls;
+        assert!(
+            map_fresh_span(&mut state, &mut host, 1, page - 4, 8).is_none(),
+            "a gapped span has no packed whole-span view"
+        );
+        assert_eq!(
+            host.map_pages_calls, before,
+            "the fragmented case must be answered in Rust, not by a failing FFI call"
+        );
+
+        // The packed case still goes to the host and still resolves.
+        let before = host.map_pages_calls;
+        let s = map_fresh_span(&mut state, &mut host, 1, 8, 4).expect("packed span maps");
+        assert!(s.avail >= 4);
+        unmap_fresh_span(&mut host, s);
+        assert_eq!(host.map_pages_calls, before + 1);
     }
 
     /// map_fresh_span re-walks per call: after a PT rewire, writes through

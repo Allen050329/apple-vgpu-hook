@@ -54,16 +54,7 @@ impl crate::observe::Decline for MtlbDecline {
     }
 }
 
-impl std::fmt::Display for MtlbDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::observe::Decline as _;
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(MtlbDecline);
 
 impl std::error::Error for MtlbDecline {}
 

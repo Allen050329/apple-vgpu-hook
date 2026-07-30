@@ -24,8 +24,8 @@ use ash::vk;
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::StorageImageFormat;
 use crate::contract::pixel_format::{
-    self, SwizzlePlan, SwizzleSource, TexelLayout, COMPONENT_A, COMPONENT_B, COMPONENT_COUNT,
-    COMPONENT_G, COMPONENT_R,
+    self, SwizzlePlan, SwizzleSource, TexelLayout, COMPONENT_A, COMPONENT_B, COMPONENT_G,
+    COMPONENT_R,
 };
 
 /// Whether a format's stored values carry the sRGB electro-optical transfer
@@ -208,6 +208,15 @@ pub fn sampled_pixels(mtl: u16) -> Result<(TexelLayout, Option<TranslateReason>)
         vk::Format::B8G8R8A8_UNORM => TexelLayout::Bgra8,
         vk::Format::R8_UNORM => TexelLayout::R8,
         vk::Format::R8G8_UNORM => TexelLayout::Rg8,
+        // Single-channel float rides its own native rail (color-management
+        // LUTs). `R16_SFLOAT` is a spec-mandatory sampled+linear format, so it
+        // is unconditional. `R32_SFLOAT`'s linear-filter feature is optional
+        // (absent on Apple/MoltenVK): the layout is named here (a decode fact),
+        // but the rail that emits it must confirm the host can filter it — see
+        // `try_linear_sample_zero_copy`'s `supports_sampled_r32f_linear_filter`
+        // gate — or the sample stays fail-visible.
+        vk::Format::R16_SFLOAT => TexelLayout::R16Float,
+        vk::Format::R32_SFLOAT => TexelLayout::R32Float,
         _ => return Err(TranslateReason::NoSampledLayout(mtl)),
     };
     Ok((layout, srgb_decline(&f, mtl)))
@@ -225,6 +234,8 @@ pub fn vk_texel_layout(layout: TexelLayout) -> vk::Format {
         TexelLayout::Bgra8 => vk::Format::B8G8R8A8_UNORM,
         TexelLayout::R8 => vk::Format::R8_UNORM,
         TexelLayout::Rg8 => vk::Format::R8G8_UNORM,
+        TexelLayout::R16Float => vk::Format::R16_SFLOAT,
+        TexelLayout::R32Float => vk::Format::R32_SFLOAT,
     }
 }
 
@@ -338,7 +349,7 @@ pub fn storage_image(mtl: u16) -> Result<StorageImageFormat, TranslateReason> {
 /// The guest's scanout byte order, in Vulkan terms.
 ///
 /// The compositor's framebuffers are `MTLPixelFormatBGRA8Unorm`, so a resident
-/// target, an exported dmabuf and a swapchain image all use this format to keep
+/// target and a swapchain image both use this format to keep
 /// the present path free of a channel swap. Named once because it is one
 /// decision — spelled at each site it would drift, and a single wrong spelling
 /// shows up as red-and-blue-swapped output rather than a failure.
@@ -437,45 +448,14 @@ fn srgb_decline(f: &PixelFormat, mtl: u16) -> Option<TranslateReason> {
     f.is_srgb().then_some(TranslateReason::SrgbDowngraded(mtl))
 }
 
-/// The format to bind on a path that moves raw texels and therefore cannot
-/// apply the sRGB transfer function, paired with the decline to record.
-///
-/// `Some(reason)` means the caller just lost the sRGB qualifier and MUST emit
-/// it fail-visibly; `None` means the format was linear to begin with and
-/// nothing was lost. Returning the decline rather than logging here keeps the
-/// translation layer free of a log sink and lets each call site name its own
-/// context (pipeline ref, target geometry) on the line.
-pub fn linear_with_decline(
-    mtl: u16,
-) -> Result<(vk::Format, Option<TranslateReason>), TranslateReason> {
-    let f = translate(mtl)?;
-    let decline = f.is_srgb().then_some(TranslateReason::SrgbDowngraded(mtl));
-    Ok((f.linear_vk, decline))
-}
-
-/// Compose a decoded type-8 view swizzle with a format's own component plan.
-///
-/// The view selects from the channels **Metal** presents; the format plan says
-/// where those channels live on the Vulkan image. Composing once here means no
-/// call site has to know that, say, an `A8Unorm` texture's alpha is physically
-/// in red.
-pub fn compose_swizzle(format_plan: &SwizzlePlan, view: &SwizzlePlan) -> SwizzlePlan {
-    let mut source = [SwizzleSource::Zero; COMPONENT_COUNT];
-    for (out, selected) in source.iter_mut().zip(view.source) {
-        *out = match selected {
-            SwizzleSource::Zero => SwizzleSource::Zero,
-            SwizzleSource::One => SwizzleSource::One,
-            SwizzleSource::R => format_plan.source[COMPONENT_R],
-            SwizzleSource::G => format_plan.source[COMPONENT_G],
-            SwizzleSource::B => format_plan.source[COMPONENT_B],
-            SwizzleSource::A => format_plan.source[COMPONENT_A],
-        };
-    }
-    SwizzlePlan { source }
-}
-
 /// A decoded swizzle plan as the `VkImageView` component mapping that performs
 /// it in hardware.
+///
+/// The plan passed in is the decoded type-8 view swizzle and nothing else — a
+/// format's own channel remap is not composed into it. That is safe because
+/// [`sampled_pixels`] declines every format whose plan is not identity, which
+/// `every_format_the_sampled_rail_admits_needs_no_mapping_of_its_own` holds it
+/// to; `A8Unorm` is the only such format and it is refused, not reshaped.
 ///
 /// This is what makes a swizzled view cost nothing: Vulkan applies the mapping
 /// at sample time, so the texels never have to be rewritten on the CPU (which
@@ -500,14 +480,7 @@ pub fn vk_component_mapping(plan: &SwizzlePlan) -> vk::ComponentMapping {
     }
 }
 
-/// The component mapping an image view of `mtl` needs with no view swizzle
-/// applied — identity for nearly every format.
-pub fn format_component_mapping(mtl: u16) -> Result<vk::ComponentMapping, TranslateReason> {
-    Ok(vk_component_mapping(&translate(mtl)?.components))
-}
-
-/// Whether a Metal format's channels sit identically on the Vulkan format
-/// [`translate`] resolves it to, so a view needs no mapping of its own.
+/// Whether a Metal format's channels sit identically on its Vulkan format.
 ///
 /// The component plan is a property of the **Metal** format, not of the Vulkan
 /// one it resolves to: `A8Unorm` and `R8Unorm` both land on `R8_UNORM`, and
@@ -762,25 +735,6 @@ mod tests {
         assert_eq!(bgra.bytes_per_texel, 4);
     }
 
-    /// A linear format never produces a downgrade decline (that would flood the
-    /// fail log on every ordinary draw); an sRGB one always does.
-    #[test]
-    fn only_an_srgb_format_declines_when_taken_linear() {
-        let (fmt, decline) = linear_with_decline(p::MTL_FORMAT_BGRA8_UNORM).unwrap();
-        assert_eq!(fmt, vk::Format::B8G8R8A8_UNORM);
-        assert_eq!(decline, None);
-
-        let (fmt, decline) = linear_with_decline(p::MTL_FORMAT_BGRA8_UNORM_SRGB).unwrap();
-        assert_eq!(fmt, vk::Format::B8G8R8A8_UNORM);
-        assert_eq!(
-            decline,
-            Some(TranslateReason::SrgbDowngraded(
-                p::MTL_FORMAT_BGRA8_UNORM_SRGB
-            ))
-        );
-        assert_eq!(decline.unwrap().slug(), "srgb_downgraded");
-    }
-
     /// An undefined wire value declines by name instead of reaching a default.
     #[test]
     fn an_unknown_format_declines_by_name() {
@@ -788,69 +742,7 @@ mod tests {
         assert_eq!(err, TranslateReason::UnknownPixelFormat(0xffff));
         assert_eq!(err.slug(), "unknown_pixel_format");
         assert!(!is_srgb(0xffff));
-        assert!(linear_with_decline(0xffff).is_err());
-    }
-
-    /// `A8Unorm` is the one format whose Vulkan channel set differs from
-    /// Metal's, and the mapping restores Metal's `(0,0,0,a)`.
-    #[test]
-    fn a8_unorm_puts_its_byte_back_in_alpha() {
-        let m = format_component_mapping(p::MTL_FORMAT_A8_UNORM).unwrap();
-        assert_eq!(m.r, vk::ComponentSwizzle::ZERO);
-        assert_eq!(m.g, vk::ComponentSwizzle::ZERO);
-        assert_eq!(m.b, vk::ComponentSwizzle::ZERO);
-        assert_eq!(m.a, vk::ComponentSwizzle::R);
-        // And it agrees with what the CPU texel path produces for the format.
-        let rgba = pixel_format::texel_to_rgba8(p::MTL_FORMAT_A8_UNORM, &[0x7f]).unwrap();
-        assert_eq!(rgba, [0, 0, 0, 0x7f]);
-    }
-
-    /// Every other format maps its channels straight through.
-    #[test]
-    fn other_formats_map_their_channels_identically() {
-        for (mtl, _, _, _) in EXPECTED {
-            if *mtl == p::MTL_FORMAT_A8_UNORM {
-                continue;
-            }
-            let m = format_component_mapping(*mtl).unwrap();
-            assert_eq!(m.r, vk::ComponentSwizzle::R, "MTL {mtl:#x}");
-            assert_eq!(m.g, vk::ComponentSwizzle::G, "MTL {mtl:#x}");
-            assert_eq!(m.b, vk::ComponentSwizzle::B, "MTL {mtl:#x}");
-            assert_eq!(m.a, vk::ComponentSwizzle::A, "MTL {mtl:#x}");
-        }
-    }
-
-    /// A decoded view swizzle becomes the equivalent hardware mapping, and
-    /// composing with an identity format plan changes nothing.
-    #[test]
-    fn a_view_swizzle_becomes_a_component_mapping() {
-        // BGRA-order view of an RGBA texture, alpha forced opaque.
-        let view = pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap();
-        let composed = compose_swizzle(&IDENTITY, &view);
-        assert_eq!(composed, view);
-        let m = vk_component_mapping(&composed);
-        assert_eq!(m.r, vk::ComponentSwizzle::B);
-        assert_eq!(m.g, vk::ComponentSwizzle::G);
-        assert_eq!(m.b, vk::ComponentSwizzle::R);
-        assert_eq!(m.a, vk::ComponentSwizzle::ONE);
-    }
-
-    /// Composition is what lets a swizzled view of a channel-remapped format
-    /// work: selecting "alpha" from an `A8Unorm` view must reach the byte,
-    /// which physically lives in red.
-    #[test]
-    fn a_view_swizzle_composes_with_the_format_plan() {
-        // Broadcast alpha to every channel (`aaaa`).
-        let view = pixel_format::swizzle_plan(&[5, 5, 5, 5]).unwrap();
-        let a8 = translate(p::MTL_FORMAT_A8_UNORM).unwrap();
-        let m = vk_component_mapping(&compose_swizzle(&a8.components, &view));
-        for got in [m.r, m.g, m.b, m.a] {
-            assert_eq!(got, vk::ComponentSwizzle::R);
-        }
-        // Selecting a channel A8Unorm does not carry still reads zero.
-        let green = pixel_format::swizzle_plan(&[3, 3, 3, 3]).unwrap();
-        let m = vk_component_mapping(&compose_swizzle(&a8.components, &green));
-        assert_eq!(m.r, vk::ComponentSwizzle::ZERO);
+        assert!(sampled_pixels(0xffff).is_err());
     }
 
     /// The constant-fold shortcuts stay honest against the full translation —
@@ -882,9 +774,6 @@ mod tests {
             p::MTL_FORMAT_RGBA8_UNORM_SRGB,
             p::MTL_FORMAT_BGRA8_UNORM_SRGB,
         ] {
-            let (_, decline) = linear_with_decline(mtl).unwrap();
-            assert_eq!(decline, Some(TranslateReason::SrgbDowngraded(mtl)));
-
             let (_, decline) = sampled_pixels(mtl).unwrap();
             assert_eq!(
                 decline,
@@ -905,7 +794,6 @@ mod tests {
             if *transfer == TransferFunction::Srgb {
                 continue;
             }
-            assert_eq!(linear_with_decline(*mtl).unwrap().1, None, "MTL {mtl:#x}");
             if let Ok((_, decline)) = sampled_pixels(*mtl) {
                 assert_eq!(decline, None, "MTL {mtl:#x}");
             }
@@ -995,6 +883,31 @@ mod tests {
         );
     }
 
+    /// A single-channel `float16` texture samples natively as `R16_SFLOAT`
+    /// (its linear-filter feature is spec-mandatory, so it needs no capability
+    /// gate). The color-management LUTs of macOS WindowServer's
+    /// `UberCompositeFragment` display-profile pass arrive this way; before this
+    /// rail carried the layout the draw resolved to nothing and the whole
+    /// color-managed desktop composite failed with `draw_vk_nothing_stored`.
+    #[test]
+    fn single_channel_float_samples_natively_through_its_own_layout() {
+        use crate::contract::pixel_format::TexelLayout;
+        let (layout, decline) = sampled_pixels(p::MTL_FORMAT_R16_FLOAT).expect("R16F is sampled");
+        assert_eq!(layout, TexelLayout::R16Float);
+        assert!(decline.is_none(), "no sRGB transfer function to drop");
+        assert_eq!(layout.bytes_per_texel(), 2);
+        assert!(!layout.is_four_byte_color());
+        assert_eq!(vk_texel_layout(layout), vk::Format::R16_SFLOAT);
+        // R32F names its layout here (a decode fact); the *runtime* rail gates
+        // it on the optional linear-filter capability. Four bytes wide but not a
+        // colour order, so it must stay out of `is_four_byte_color`.
+        let (r32, _) = sampled_pixels(p::MTL_FORMAT_R32_FLOAT).expect("R32F is sampled");
+        assert_eq!(r32, TexelLayout::R32Float);
+        assert_eq!(r32.bytes_per_texel(), 4);
+        assert!(!r32.is_four_byte_color());
+        assert_eq!(vk_texel_layout(r32), vk::Format::R32_SFLOAT);
+    }
+
     /// Every rail's accepted set, spelled out. A format silently joining or
     /// leaving one of these changes which draws take the zero-copy path.
     #[test]
@@ -1011,7 +924,13 @@ mod tests {
                 // this rail cannot carry, and binding it as bare R8 would hand
                 // the shader the byte in red instead of alpha.
                 p::MTL_FORMAT_R8_UNORM,
+                // Single-channel float rides its own native rail (color LUTs).
+                // Both layouts are named here; the runtime gates R32F on the
+                // optional linear-filter capability, but the decode contract
+                // itself carries both.
+                p::MTL_FORMAT_R16_FLOAT,
                 p::MTL_FORMAT_RG8_UNORM,
+                p::MTL_FORMAT_R32_FLOAT,
                 p::MTL_FORMAT_RGBA8_UNORM,
                 p::MTL_FORMAT_RGBA8_UNORM_SRGB,
                 p::MTL_FORMAT_BGRA8_UNORM,

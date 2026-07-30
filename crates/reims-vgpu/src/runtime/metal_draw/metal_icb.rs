@@ -977,6 +977,7 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
                 c.format,
                 &pixels,
             )
+            .is_ok()
         } else if *mapping_id != 0 {
             let _ = mapper::ensure_resolved_for_scanout(state, host, *mapping_id);
             mapping_write::write_bgra8(state, host, *mapping_id, &pixels, stride, width, height)

@@ -1,12 +1,9 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{
-    LruBytesMemo, DEFAULT_OBJECT_LIST_COUNT, DEFAULT_OBJECT_LIST_PFN, GFX_MMIO_SIZE, MAX_CHANNELS,
-    MAX_MAPPINGS, MAX_TASKS,
-};
+use crate::model::{GFX_MMIO_SIZE, LruBytesMemo, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Opaque device instance id (QEMU handle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -367,6 +364,114 @@ pub struct TaskEntry {
     pub object_list_count: u32,
 }
 
+/// How the range a host→guest write targets stands against the `MapMemory2`
+/// spans the writing task has notified **so far**.
+///
+/// This is a reading of a notification log, and deliberately not an
+/// authorization. `MapMemory2` mutates nothing on our side — the guest has
+/// already installed the PTEs by the time the packet reaches us, which is what
+/// `drain`'s "Map notify: PTEs already live" comment records — and the FIFO
+/// carrying it is ordered against nothing that *uses* the memory. Measured on
+/// one x86/Vulkan boot: the guest allocates a 192 KiB texture backing at
+/// `0x1ada000`, uploads it with three `OP_COPY_BUFFER_TO_TEXTURE` commands, and
+/// notifies `0x1ada000 +0x30000` — the exact base, the exact length — **29 ms
+/// later**. Two of the five cases that boot notified within the same
+/// millisecond as the write.
+///
+/// So `Undeclared` is a statement about a race, not about bounds, and treating
+/// it as a refusal dropped whole textures. What a task may write is what its
+/// page table maps, which every writer here re-walks at write time and fails
+/// closed on (`gva_view::write_span`, `map_fresh_span`) — the same guarantee
+/// the hardware gives, and the only one the wire defines.
+///
+/// Returned rather than collapsed to a `bool` so the always-on line names the
+/// arm that decided instead of the caller's assumption about it: a reason the
+/// caller writes is not a reading, and that collapse regrows wherever a
+/// `-> bool` crosses a module boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteGate {
+    /// A span recorded for this exact task covers the whole range.
+    Exact,
+    /// This task has notified nothing at all. `delete_task` calls
+    /// `clear_task_map_spans`, so a write arriving after a teardown lands here.
+    NoSpans,
+    /// Spans exist for this task and none covers the range — the notification
+    /// for this allocation has not arrived yet, or never will. Reported, not
+    /// refused; see the type doc.
+    Undeclared,
+}
+
+impl crate::observe::Decline for WriteGate {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Exact => "write_gate_exact",
+            Self::NoSpans => "write_gate_no_spans",
+            Self::Undeclared => "write_gate_undeclared",
+        }
+    }
+}
+
+/// A range written while [`DeviceState::gva_write_gate`] said `Undeclared`,
+/// held until a later MapMemory2 covers it or the ring evicts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndeclaredWrite {
+    pub task_id: u32,
+    pub gva: u64,
+    pub len: u64,
+    /// `observe::elapsed_ms` at the write, so the report can carry how long the
+    /// notification took to arrive rather than only that it did.
+    pub at_ms: u64,
+    /// Which rail wrote it, for the eviction alarm — the write itself is
+    /// reported at the site, but the alarm fires far away and has to say where
+    /// its subject came from.
+    pub via: &'static str,
+}
+
+/// How many outstanding undeclared ranges [`DeviceState::undeclared_writes`]
+/// keeps.
+///
+/// Not a protocol value. On the boot this was measured on, every entry retired
+/// within 29 ms and at most a handful were ever outstanding, so a ring this
+/// size never evicts in healthy operation — which is what makes an eviction
+/// worth an alarm rather than a shrug.
+pub const UNDECLARED_WRITE_RING: usize = 32;
+
+/// Where a refused write sits relative to the spans its own task declared.
+///
+/// See [`DeviceState::task_span_readout`] for what each combination means. All
+/// four fields are readings of the span registry at the instant of the refusal;
+/// nothing branches on them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskSpanReadout {
+    /// Pages the refused range touches.
+    pub pages: u64,
+    /// Of those, how many the **union** of the task's own spans covers.
+    pub union: u64,
+    /// How many spans the task filed for itself.
+    pub own: u64,
+    /// Lowest GVA any of those spans starts at.
+    pub lo: u64,
+    /// Highest GVA any of them ends at.
+    pub hi: u64,
+    /// Bytes from the refused range to the nearest own span, `Some(0)` when one
+    /// overlaps without covering, `None` when the task filed nothing.
+    pub nearest_gap: Option<u64>,
+}
+
+impl TaskSpanReadout {
+    /// Whether `gva` falls within `[lo, hi)`, the extent of everything the task
+    /// declared.
+    ///
+    /// This is what tells a *hole* between two declarations apart from a range
+    /// in a region the task never declared anything in, and both come back
+    /// `union == 0`. `own == 0` is neither: a task that filed nothing has no
+    /// extent, and `lo == hi == 0` must not read as "everything is outside it"
+    /// by arithmetic accident.
+    pub fn gva_inside_extent(&self, gva: u64) -> bool {
+        self.own > 0 && gva >= self.lo && gva < self.hi
+    }
+}
+
 /// Guest-declared MapMemory2 span (notify-only; no host PTE invent).
 ///
 /// Used to fail-closed product GVA writes outside any recorded map when the
@@ -489,23 +594,30 @@ impl TaskMapSpan {
 }
 
 impl TaskEntry {
+    /// A task the guest has defined but not yet given an object list.
+    ///
+    /// `object_list_pfn` and `object_list_count` are **zero** because
+    /// `DefineTask2` does not carry them. `SetObjectList` (`0x33`) does, and
+    /// until it arrives the correct answer to "what object does ref N name" is
+    /// "the guest has not said".
+    ///
+    /// This used to invent `pfn = 1, count = 0x100000` — a page frame the guest
+    /// never named and a list of a million entries. Measured on the x86/Vulkan
+    /// rail: `lookup_list_entry` then computed entry addresses of `0x1000 + off`
+    /// for every task with no list, walked them, and failed with `gva_zero_pfn`
+    /// because nothing is mapped there — after which the guest-read fallback
+    /// walked the *neighbouring task's* page table at the same address and
+    /// decoded whatever it found as this task's object-list entry. Seven such
+    /// substitutions per boot, every boot, all from that one lookup.
     pub fn define(length: u64, directory_pfn: u32) -> Self {
         Self {
             active: true,
             length,
             directory_pfn,
-            object_list_pfn: DEFAULT_OBJECT_LIST_PFN,
-            object_list_count: DEFAULT_OBJECT_LIST_COUNT,
+            object_list_pfn: 0,
+            object_list_count: 0,
         }
     }
-}
-
-/// Object-list entry (type + descriptor GVA) keyed by (task, ref).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ObjectEntry {
-    pub object_type: u8,
-    pub desc_gva: u64,
-    pub desc_len: u32,
 }
 
 /// Directed mapper capture from guest xregs at iosfc producer write.
@@ -528,13 +640,28 @@ pub struct MappingEntry {
     pub height: u32,
     pub format: u16,
     pub content_generation: u32,
-    /// Global store-order stamp: `DeviceState::store_seq` value at this
-    /// mapping's most recent decoded guest write (`mark_mapping_written`).
-    /// Unlike per-mapping `content_generation`, this is comparable ACROSS
-    /// mappings — the compositor-output member with the highest stamp is the
-    /// buffer the guest most recently finished (structural write history,
-    /// never content).
-    pub last_store_seq: u64,
+    /// Epoch of this mapping's *surface content* in the sense a type-11 render
+    /// LOAD needs: it advances whenever the pixels that Load would seed from
+    /// could have changed, wherever they live.
+    ///
+    /// Strictly coarser than [`Self::content_generation`], and deliberately so.
+    /// `content_generation` counts writes to the mapping's *guest pages*, which
+    /// misses the one publisher that writes only the host shadow: the deferred
+    /// type-11 Store stores into `surface_cache` and arms a window instead of
+    /// scattering into guest pages. `surface_cache` holds exactly one entry per
+    /// mapping, so a sibling Store at a *different* geometry replaces the entry
+    /// an older geometry's resident is being compared against while
+    /// `content_generation` never moves — the same one-entry-per-mapping hazard
+    /// that cost the `deferred_flush_lost reason=cache_miss` class. Bumping here
+    /// on that publish makes the sibling case a mismatch, so the older geometry
+    /// falls back to the CPU seed rather than loading from a resident whose
+    /// currency nothing established.
+    ///
+    /// Compared against [`crate::backend::vulkan::engine::resident_content_epoch`]
+    /// to decide whether a type-11 LOAD may take `LoadOp::LoadFromTarget` and
+    /// skip its CPU seed entirely. Never read to decide *what* to present or
+    /// draw — only whether a known-equal upload can be elided.
+    pub surface_content_epoch: u32,
     /// Bumped whenever the guest page list / map lifetime changes (MAP, UNMAP,
     /// ReplacePhysical, MappingInternal reattach, page-table refresh that
     /// changes PFNs). Used as [`TargetIdentity`] generation for resident
@@ -559,14 +686,25 @@ pub struct MappingEntry {
     /// Used for biplanar plane selection by texture geometry; empty when unknown.
     pub device_desc: Vec<u8>,
     /// Contiguous host-VA view over `page_entries` (`HostOps::map_pages`,
-    /// mach_vm_remap of guest RAM). 0 = not built. This is the unified-memory
-    /// surface storage for the guest mapping: Metal
-    /// render targets and samples are created directly on this view, so GPU
-    /// Load/Store, guest CPU writes, and host page reads all see ONE copy —
-    /// no writeback mirrors, no seed/capture ranking. Retired (never freed in
-    /// place) whenever `page_entries` change; see `DeviceState::retired_views`.
+    /// mach_vm_remap of guest RAM). 0 = not built. This is the surface storage
+    /// for the guest mapping, and it is read and written by the **CPU only**:
+    /// Metal render targets used to be created directly on this view, which
+    /// gave the host GPU a handle on guest RAM, and that alias is deleted.
+    /// Guest CPU writes and host page reads still see one copy; a GPU Store
+    /// reaches it through the writeback. Retired (never freed in place)
+    /// whenever `page_entries` change; see `DeviceState::retired_views`.
     pub contig_ptr: usize,
     pub contig_len: usize,
+    /// `map_generation` whose page list was measured non-packed, so no
+    /// contiguous view can exist over it. `None` = not measured for the
+    /// current list.
+    ///
+    /// "Packed or not" is a pure function of `page_entries`, and
+    /// `map_generation` names that list — the same key that makes `contig_ptr`
+    /// above safe to cache. Without it every caller on a fragmented mapping
+    /// re-collected the whole page-GPA vector and re-scanned it only to reach
+    /// the answer it reached last time.
+    pub contig_fragmented_gen: Option<u32>,
     /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_type4_surface_ex` probes this task right after task 0 so a
@@ -670,40 +808,124 @@ impl ComputeStorageResidencyKey {
     }
 }
 
-/// Deferred render-Store window: guest pages of this type-11 view are STALE —
-/// the pinned engine resident render target (identity reconstructed as
-/// `TargetIdentity::Surface { id: mapping_id, width, height, generation:
-/// map_generation }`) is the authoritative content until a flush lands it.
+/// Why a present is not backed by guest work, as reported by
+/// [`DeviceState::note_present_backing`].
 ///
-/// Keyed like [`ComputeStorageResidencyKey`] so intersecting range scans share
-/// one shape; ordered by `(mapping_id, surface_offset, span_end)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RenderDeferredKey {
-    pub mapping_id: u32,
-    pub surface_offset: u64,
-    pub span_end: u64,
+/// Two distinct findings, and the callee names which so the caller cannot supply
+/// the word. Both are statements about **decoded Store bookkeeping only** —
+/// `dense_frame_seq`, advanced when a Store's pixels reached the mapping's guest
+/// pages. Neither says what the viewer sees, and that limit is the point: on the
+/// resident rail a Store renders into the registry without writing guest pages,
+/// so a mapping can be "unbacked" here while a perfectly good resident carries
+/// its present. What the viewer sees takes the carrier reading the emission site
+/// pairs with this (`resident_presentable`), never this value alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentBacking {
+    /// Presented again with no full-frame Store naming this mapping since its
+    /// own previous present. Carries the unchanged `dense_frame_seq`.
+    Restaled { seq: u64 },
+    /// First present since this mapping was created, and no full-frame Store has
+    /// ever named it.
+    NeverStored,
 }
 
-/// Everything a later flush needs to replay the deferred import-present Store.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RenderDeferredEntry {
-    pub width: u32,
-    pub height: u32,
-    /// Mapping lifetime at defer time — flush drops on drift (recycled pages).
-    pub map_generation: u64,
-    /// Bounds mode the original Store would have used.
-    pub full_quad_bounds: bool,
-    /// The deferred draw targeted the unified compositor-output group
-    /// resident (`TargetIdentity::OutputGroup`), not the per-mid Surface
-    /// identity. The flush rebuilds exactly the identity that was pinned;
-    /// `map_generation` still records the MEMBER's page lifetime so the
-    /// recycled-pages drop guard keeps working for grouped windows.
-    pub grouped: bool,
-    /// Arm order for oldest-first flush when the render-deferred window cap is
-    /// hit — mirrors [`GvaDeferredEntry::armed_seq`]. Bounds the pinned resident
-    /// population so a compositing burst (YouTube page-load) cannot balloon the
-    /// registry far past its slot cap.
-    pub armed_seq: u64,
+impl crate::observe::Decline for PresentBacking {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::Restaled { .. } => "present_backing_restaled",
+            Self::NeverStored => "present_backing_never_stored",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            // The seq the witness did NOT advance past, which is what makes a
+            // restale readable: two presents quoting the same number are the
+            // same guest frame shown twice.
+            Self::Restaled { seq } => vec![("since_seq", seq.to_string())],
+            Self::NeverStored => Vec::new(),
+        }
+    }
+}
+
+/// Which rail holds the authoritative pixels of a mapping-keyed deferred
+/// window, and therefore how a flush must read them.
+///
+/// Both kinds live in one map — [`DeviceState::compute_deferred_flush`] — and
+/// that is the point. The dangerous half of any deferred rail is the set of
+/// guest-page readers that must drain it first; a reader that misses one window
+/// makes the guest read stale pixels with nothing logged. Sharing the key type
+/// means both kinds share the range scan
+/// ([`DeviceState::take_deferred_flush_windows`]), the raw-GVA alias index
+/// ([`DeviceState::deferred_alias_pages`]), the teardown drop and every
+/// existing trigger, so a rail cannot be covered for one kind and missed for
+/// the other. A second map keyed the same way would have had to re-derive
+/// "does any window still name this mapping" in
+/// [`DeviceState::prune_alias_index`], and getting that wrong drops the alias
+/// index out from under a live window.
+///
+/// What genuinely differs is only where the pixels are. Everything else the
+/// flush needs — mapping id, geometry, format, guest byte range — is already in
+/// the key, which is why neither variant carries geometry of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeferredOwner {
+    /// Compute rail: a *storage* resident keyed by this same
+    /// `ComputeStorageResidencyKey`, read with
+    /// `engine::read_resident_storage(key, generation)`. The generation is the
+    /// resident's **content** generation, unrelated to `key.map_generation`.
+    Storage { generation: u32 },
+    /// Type-11 render Store rail: the window **owns the frame it deferred**,
+    /// tight BGRA8 at `key.width x key.height`, shared with the
+    /// [`crate::runtime::surface_cache`] entry that was stored from the same
+    /// readback.
+    ///
+    /// Owning it is what makes the obligation landable. The flush used to source
+    /// its pixels from `surface_cache::get(mapping_id, key.width, key.height)`,
+    /// and that cache holds exactly **one** entry per mapping: a later Store at a
+    /// different geometry replaces it, and every window still armed at the old
+    /// geometry then misses and reports `deferred_flush_lost reason=cache_miss`.
+    /// One boot lost 15 whole layers that way — a 1920x1080 desktop surface, a
+    /// 1920x24 menu bar, several window-sized rects — which is a compositing
+    /// layer rendering solid black with the loss reported only after the fact.
+    /// An `Arc` clone costs nothing at arm time and cannot be orphaned.
+    ///
+    /// `source` is the one thing that varies, and it varies for a reason the
+    /// paragraph above states in the other direction: owning the bytes is free
+    /// *when the Store already read them back*. A Store that skips its readback
+    /// has no bytes to own, and the whole point of skipping it is that ~98 % of
+    /// these windows are never flushed at all — so that rail names the resident
+    /// and pays the readback only if someone asks. Everything else about the
+    /// window is identical, which is why this is a field and not a variant:
+    /// `matches!(owner, Render { .. })` still selects the rail for the population
+    /// cap, the alias index, the teardown drop and `owner_slug`, and only the
+    /// pixel read dispatches.
+    Render {
+        armed_seq: u64,
+        source: RenderWindowSource,
+    },
+}
+
+/// Where a [`DeferredOwner::Render`] window's frame lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderWindowSource {
+    /// The window owns the frame, tight BGRA8 at `key.width x key.height`,
+    /// shared with the [`crate::runtime::surface_cache`] entry stored from the
+    /// same readback. Cannot be orphaned; see the variant's own note.
+    Owned(std::sync::Arc<Vec<u8>>),
+    /// The engine's `TargetIdentity::Surface` resident holds the frame and the
+    /// window holds a pin on it. `epoch` is the
+    /// [`MappingEntry::surface_content_epoch`] this window's pixels were
+    /// published at; the flush compares it against the resident's stamp
+    /// (`engine::resident_content_epoch`) and declines rather than writing a
+    /// frame it cannot vouch for.
+    ///
+    /// The identity is **reconstructed** at flush time from the key rather than
+    /// stored, exactly as `flush_gva_one` does: `key` already carries the mapping
+    /// id, the geometry and the `map_generation` that `surface_identity` keys on,
+    /// and the flush refuses on generation drift before it reads anything. Storing
+    /// it would put a backend type in the model and give the two spellings a way
+    /// to disagree.
+    Resident { epoch: u32 },
 }
 
 /// Everything a later flush needs to land a deferred **GVA render Store**
@@ -771,13 +993,23 @@ pub struct HostSurface {
     pub width: u32,
     pub height: u32,
     /// Tight BGRA8, stride = width * 4.
-    pub bgra: Vec<u8>,
-    /// Monotonic host store generation (independent of guest content_generation).
-    pub host_gen: u32,
-    /// Producer identity for GVA-keyed type-2/3 encodes. Zero for surface/ref
-    /// caches and for legacy/compute stores that did not record an owner.
-    pub producer_task_id: u32,
-    pub producer_texture_ref: u32,
+    ///
+    /// Shared rather than owned so a [`DeferredOwner::Render`] window can hold
+    /// the exact frame it deferred without copying it: the window and this entry
+    /// point at one allocation, and replacing the entry leaves the window's
+    /// pixels intact instead of orphaning them.
+    pub bgra: std::sync::Arc<Vec<u8>>,
+    /// Generation of the store that produced these bytes, issued by
+    /// [`DeviceState::next_sampled_content_generation`] (independent of guest
+    /// `content_generation`).
+    ///
+    /// Device-global rather than per-entry, because this value is half of the
+    /// sampled-content identity the engine binds on. A per-entry counter is
+    /// only unique while the entry lives, and this map's entries are removed
+    /// and re-created on the routine deferred-Store arm path.
+    pub host_gen: u64,
+    /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
+    /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
 }
 
@@ -802,16 +1034,6 @@ pub struct HostLinearTexture {
     pub resident_gen: u32,
 }
 
-/// Geometry/source proven for a compositor-output mapping (see
-/// [`PresentState::compositor_output_members`]).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CompositorOutputMember {
-    pub width: u32,
-    pub height: u32,
-    /// Sampled type-11 source mapping, or `0` for the linear-input class.
-    pub source: u32,
-}
-
 /// Which sub-path `paint_mapping` used to fill the present frame.
 ///
 /// Measure-only provenance for the per-present `paint_us` cost: a deferred-Store
@@ -829,50 +1051,15 @@ pub enum PaintSrc {
     /// into the guest pages during this capture's own `flush_intersecting`.
     ReuseStore,
     /// Read straight out of the GPU resident (`read_resident_bgra`) with **no**
-    /// guest-page scatter — the oracle frame source. The guest-page writeback
-    /// stays deferred on the `render_deferred_flush` rail for a real guest read.
+    /// guest-page scatter — the oracle frame source. Nothing is owed to the
+    /// guest pages by this read: a type-11 Store writes them on its own path
+    /// (`mapping_write::write_rgba8_image_changed`).
     Resident,
     /// Contiguous HostOps view read (packed mapping — one host span).
     GuestPagesContig,
     /// Multi-import fragmented guest-page read (the cold ~12 ms/present path).
     GuestPagesFragmented,
 }
-
-/// Occupancy stats of the retained `frame_bgra` snapshot, computed **once** by
-/// [`crate::runtime::scanout::capture_present_frame`]'s fused scan.
-///
-/// The console paint ([`crate::runtime::scanout::copy_to_bgra8`]) runs under the
-/// device lock on the QEMU display thread and previously re-scanned the same
-/// 8 MiB `frame_bgra` twice (a byte-nz pass + an rgb-nz pass) purely to fill its
-/// diagnostic `present_paint` lines — contending with the worker/VBL for the
-/// lock. Since `frame_bgra` is frozen at capture time (only writer is
-/// `capture_present_frame`), those stats are already known; the paint reuses
-/// them, guarded by `mapping`/`generation` so a mismatch falls back to a scan.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameStats {
-    /// The `frame_mapping` these stats were computed for.
-    pub mapping: u32,
-    /// The `frame_generation` these stats were computed for.
-    pub generation: u32,
-    /// Nonzero **bytes** across all four channels (`nonzero_stats`).
-    pub byte_nz: usize,
-    /// Max byte value across all four channels.
-    pub byte_max: u8,
-    /// Pixels with `max(B,G,R) > 0` (`bgra_rgb_stats`).
-    pub rgb_nz: usize,
-    /// Max of B/G/R across the frame.
-    pub max_rgb: u8,
-    /// First pixel BGRA.
-    pub px0: [u8; 4],
-}
-
-/// Coarse tile grid for the per-mid damage-epoch map ([`PresentState::tile_gen`]).
-/// Deliberately the SAME pitch as the `present_proxy` DAMAGE_GRID (32×18) so one
-/// grid definition governs both damage measurement and cross-mid divergence — a
-/// 1920×1080 target tiles at 60×60 px. Resolution-independent (proportional).
-pub(crate) const TILE_GEN_GRID_W: usize = 32;
-pub(crate) const TILE_GEN_GRID_H: usize = 18;
-pub(crate) const TILE_GEN_TILES: usize = TILE_GEN_GRID_W * TILE_GEN_GRID_H;
 
 /// Present / scanout model state.
 #[derive(Clone, Debug, Default)]
@@ -902,96 +1089,61 @@ pub struct PresentState {
     /// Latest type-11 **Composite** writeback mid (logo/desktop content).
     /// Pre-boundary: sticky early feed for gfx_update when present_mapping is a
     /// ClearOnly flip buffer (dual-mid buffer-setup thrash class).
-    /// Post-boundary: dual-mid *peer* tracker — x86 present often names ClearOnly
-    /// mid 2/3 while Stores land on Composite mid 1/4/5; ClearOnly present
-    /// captures this peer into +0x188 (not the black clear mid).
+    /// Post-boundary: dual-mid *peer* tracker, read only by the failure/census
+    /// lines (`front_wb`, `present_order_hold`) — x86 present often names
+    /// ClearOnly mid 2/3 while Stores land on Composite mid 1/4/5, and naming
+    /// the peer there is what makes that split visible in a boot log.
     pub early_front_mapping: u32,
     pub early_front_generation: u32,
-    /// Latest successful full-geometry compositor edge `source -> output`.
-    ///
-    /// A non-self type-11 sample, or a same-geometry type-2/3 linear sample,
-    /// establishes that `compositor_output_mapping` is downstream of a decoded
-    /// texture input.  `compositor_output_source == 0` names the linear-input
-    /// case (linear textures do not have a surface mapping id).  ClearOnly
-    /// DisplaySwap uses this protocol/resource relationship to distinguish a
-    /// completed compositor output from unrelated full-frame writers; pixel
-    /// occupancy is never consulted.
-    pub compositor_output_mapping: u32,
-    pub compositor_output_source: u32,
-    pub compositor_output_generation: u32,
-    pub compositor_output_width: u32,
-    pub compositor_output_height: u32,
-    /// Mappings proven compositor outputs by a decoded edge (full-coverage
-    /// linear sample or non-self type-11 sample), keyed by mapping id with the
-    /// geometry/source recorded at proof time.  Steady-state WindowServer
-    /// composite passes are damage passes (partial quads) that never re-prove
-    /// full coverage, so membership is sticky: a later Composite-class
-    /// writeback into a member at the proven geometry refreshes
-    /// `compositor_output_mapping` to that member, following the guest's
-    /// double-buffer alternation.  Removed on unmap.
-    pub compositor_output_members: BTreeMap<u32, CompositorOutputMember>,
     /// Present/scanout evidence: mapping → latest geometry it was displayed
-    /// at (a `capture_present_frame` action or a retained-frame re-show).
-    /// OutputGroup unification requires this — the copy-swap contract is a
-    /// *presented* double-buffer property.
-    /// Sampled sub-surfaces (WebKit content tiles, scrollbars) publish full
-    /// frames every paint but are never presented; without this gate any two
-    /// same-geometry publishers unified and distinct surfaces chained one
-    /// resident (the Safari-scroll black-band class).
-    /// Removed on unmap with membership.
-    pub presented_geoms: BTreeMap<u32, (u32, u32)>,
-    /// Per compositor-output-member peer: the `dense_frame_seq` of the dense
-    /// source it was last seeded from. A LOAD draw into a member-peer that lags
-    /// a same-geometry peer holding a fresher full frame seeds from that dense
-    /// peer (inter-buffer framebuffer retention — the boot-27 present model: the
-    /// guest damage-draws each swapchain buffer against a CURRENT full front,
-    /// performing no CPU forward-copy of its own). Storing the source seq makes
-    /// the seed a *relaxed* one-shot: it re-arms only when a strictly-newer full
-    /// frame exists than the one already propagated here, so steady-state damage
-    /// draws (frozen seqs) never re-seed while a genuinely new full frame always
-    /// re-propagates. Because `dense_frame_seq` advances only on a full-display
-    /// Store (never a transient overlay), a re-seed can only copy a legitimate
-    /// full frame — it cannot cause the dock-tooltip / cursor-sweep residue
-    /// class. Cleared with membership on unmap. Purely structural — never gated
-    /// on measured content.
-    pub peer_seeded_dense_seq: BTreeMap<u32, u64>,
+    /// at (a `capture_present_frame` action or a retained-frame re-show). The
+    /// decoded display transaction naming this surface as plane 0 is the only
+    /// thing that writes it, so it separates a scanout buffer from a sampled
+    /// sub-surface (a WebKit content tile publishes full frames every paint and
+    /// is never presented).
     /// Protocol-structural dense-frame tracking (measure-only, never gates a
-    /// present/seed decision): per compositor-output member, the monotonic
-    /// sequence number of the last FULL FRAME it actually holds — advanced when
-    /// the member receives a full-frame (whole-`w`×`h`) Store (the completeness
-    /// proof in [`Self::note_compositor_member_published`]) AND inherited from the
-    /// dense source's seq when the member is seeded from that source in
-    /// [`Self::peer_needs_front_seed`]. So a member that fell behind on BOTH a
-    /// full-frame Store and the inter-buffer seed has a stale seq: it is
-    /// presenting content it never received. A presented member whose seq lags a
-    /// same-geometry peer by a margin is the a/b inter-buffer retention gap
-    /// — the `dense_retention_gap` guard. Cleared with
-    /// membership on unmap.
+    /// present decision): per mapping id, the value of
+    /// [`Self::dense_frame_counter`] at the last full-frame (whole-`w`×`h`)
+    /// Store **naming that mapping id** — the completeness proof in
+    /// [`DeviceState::note_dense_frame_published`], which is the only site that
+    /// advances it. Read only by [`DeviceState::note_present_backing`], the
+    /// `present_unbacked` gate. Cleared on unmap.
+    ///
+    /// **What this is keyed on, and what that means it cannot see.** The advance
+    /// is a function of the mapping id the Store named and nothing else; it
+    /// consults no resident handle. So a full frame the guest sent for a
+    /// surface, whose draws were routed to a *different* resident than the one
+    /// that surface's present will read, still advances the seq — the gate below
+    /// is structurally blind to that. It is also keyed per mapping
+    /// id while unified surfaces share ONE resident, so a full frame stored
+    /// through one of them does not mark its siblings backed even though they
+    /// hold the same pixels.
     pub dense_frame_seq: BTreeMap<u32, u64>,
+    /// Per mapping id: the [`Self::dense_frame_seq`] value that mapping held
+    /// the last time it was PRESENTED.
+    ///
+    /// A surface whose seq is unchanged across two of its own presents received
+    /// no full-frame Store naming it in between. That is the always-on
+    /// `present_unbacked` gate — the loss itself, reported on the mid the guest
+    /// named, rather than a rate at which we papered over it. Keyed per mapping
+    /// id (not globally) so healthy a/b alternation, where each buffer
+    /// legitimately advances on its own turn, stays quiet. Cleared on unmap.
+    ///
+    /// The "or an inter-buffer seed" half of this condition is gone: `62587b1`
+    /// deleted the a/b peer front seed, because unified members share one
+    /// resident and a seed between them is a copy onto itself. Nothing else
+    /// advances [`Self::dense_frame_counter`].
+    pub presented_dense_seq: BTreeMap<u32, u64>,
     /// Monotonic source for [`Self::dense_frame_seq`] (one bump per full-frame
     /// Store). Never reset except on device reset.
     pub dense_frame_counter: u64,
-    /// Coarse per-mid per-tile damage-epoch grid.
-    /// `TILE_GEN_GRID_W × TILE_GEN_GRID_H` tiles; each cell holds the
-    /// [`Self::tile_epoch`] at which THIS mid last drew into that tile. Absent
-    /// map entry / cell value 0 = never drawn. Cross-mid comparable because
-    /// every cell is stamped from the single monotonic `tile_epoch` (never the
-    /// per-mid, non-comparable `content_generation`). This is the SPATIAL
-    /// refinement of the whole-frame [`Self::dense_frame_seq`]: a tile the guest
-    /// erased in a peer has a higher epoch there than in a presented mid still
-    /// showing the stale content (the a/b damage-coverage residue). Pruned on
-    /// unmap in [`Self::forget_compositor_mapping`]. Feeds the `tile_divergence`
-    /// proxy and the route-B cross-mid correction rects; the correction result is
-    /// separately classified by the always-on `tile_composite` proxy.
-    pub tile_gen: BTreeMap<u32, Box<[u64; TILE_GEN_TILES]>>,
-    /// Monotonic frame clock for [`Self::tile_gen`], advanced ONCE PER PRESENT
-    /// cycle (never per draw — a per-draw clock makes an actively-repainted
-    /// video tile look perpetually divergent from a peer 1 draw behind, the
-    /// thrash the reverted pixel-scan prototype hit). So two mids both
-    /// repainting a tile every frame stamp it within ~1 epoch of each other
-    /// (below [`crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN`]), while a
-    /// genuinely stale tile lags many epochs. Never reset except on device reset.
-    pub tile_epoch: u64,
+    /// Monotonic present counter, advanced exactly once per present cycle at the
+    /// present boundary ([`DeviceState::advance_present_epoch`]). Its only
+    /// consumer is the macOS window-publish dedup key, which includes it so that
+    /// every present republishes the frame even when the mapping id and resource
+    /// generation repeat (an in-place update of the same resident). Never reset
+    /// except on device reset.
+    pub present_epoch: u64,
     /// Latest presentFrame retain (PGDisplay +0x188) — most recent DisplaySwap.
     /// Tight packed BGRA8, stride = `frame_width * 4`.
     pub frame_bgra: Vec<u8>,
@@ -1018,9 +1170,6 @@ pub struct PresentState {
     pub backpressure_hold_count: u64,
     /// Sub-path the most recent `paint_mapping` used (measure-only provenance).
     pub last_paint_src: PaintSrc,
-    /// Occupancy stats of the current `frame_bgra`, computed once at capture so
-    /// the console paint does not re-scan the 8 MiB frame under the device lock.
-    pub frame_stats: FrameStats,
     /// Recycled scratch for the present-capture frame buffer.
     ///
     /// `capture_present_frame` previously did `vec![0u8; need]` on **every**
@@ -1034,49 +1183,21 @@ pub struct PresentState {
     /// untouched (keep-prior contract). Serialized with the console paint by the
     /// device lock; never read as content.
     pub capture_scratch: Vec<u8>,
-    /// True when the previous present's window publish exported the frame as a
-    /// zero-copy dmabuf (direct present, route B) rather than falling back to the
-    /// CPU staging upload. Set by `publish_window_frame` each present (same drain
-    /// worker, one present after the capture reads it — dmabuf state is stable
-    /// across steady-state presents). When true, the display is carried by the
-    /// GPU resident and does NOT consume the CPU `frame_bgra`, so
-    /// `capture_present_frame` skips the expensive guest-page readback. The GPU
-    /// stats oracle feeds the proxies without a framebuffer copy. Always false
-    /// on non-host-window / non-import-capable builds, so those keep the
-    /// per-present readback unchanged.
-    pub dmabuf_active: bool,
-    /// Always-on census: full (readback ran) vs light (dmabuf-carried, readback
+    /// True when the previous present's window publish handed the window a GPU
+    /// resident rather than CPU pixels — the macOS engine-swapchain handoff, which
+    /// presents the compositor's resident through the engine's own MoltenVK
+    /// swapchain and never reads `frame_bgra`. Set by `publish_window_frame` each
+    /// present (same drain worker, one present after the capture reads it; the
+    /// handoff is stable across steady-state presents). When true,
+    /// `capture_present_frame` skips the expensive guest-page readback.
+    ///
+    /// Always false where the window owns its own swapchain and uploads CPU pixels
+    /// — every non-macOS host — so those keep the per-present readback unchanged.
+    pub display_from_resident: bool,
+    /// Always-on census: full (readback ran) vs light (resident-carried, readback
     /// skipped) captures, so the readback-elision ratio is visible.
     pub full_captures: u64,
     pub light_captures: u64,
-    /// The GPU stats reduction armed by the previous present, awaiting consume.
-    ///
-    /// The zero-copy oracle is asynchronous: a present arms a reduction and a
-    /// later present collects it, so nothing ever blocks on the GPU. This
-    /// carries the key needed to rebuild the exact identity that was armed.
-    pub pending_stats: Option<PendingStats>,
-    /// Monotonic arm counter for [`PendingStats::seq`]; never 0 once armed.
-    pub stats_seq: u64,
-}
-
-/// Key for an in-flight GPU stats reduction (the zero-copy present oracle).
-///
-/// Carries everything needed to rebuild the resident identity that was armed,
-/// **without re-resolving it** — same rule as `render_deferred_identity`: a
-/// compositor-membership change between arm and consume must not make us look
-/// up a different image than the one the dispatch actually read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingStats {
-    pub mapping_id: u32,
-    pub width: u32,
-    pub height: u32,
-    /// Protocol content generation, for proxy attribution.
-    pub generation: u32,
-    /// Identity generation (0 for a unified `OutputGroup`).
-    pub map_generation: u64,
-    /// True when the armed identity was the unified compositor `OutputGroup`.
-    pub grouped: bool,
-    pub seq: u64,
 }
 
 /// Hardware cursor model.
@@ -1104,6 +1225,23 @@ pub struct DisplayHandshake {
     pub online_tries: u32,
     /// Cadence counter for ONLINE re-drive (archive display_poll_ctr).
     pub poll_ctr: u32,
+    /// Samples already logged per observed display-transaction wire shape,
+    /// keyed by `(opcode, payload_len, pipe_index, task_field_is_set)`.
+    ///
+    /// Backs the `display_txn_payload` measurement. A live x86 session showed the
+    /// payload is trailer-only and its length never varies, so keying on length
+    /// alone spent the whole budget inside the first 400ms of display activity
+    /// and stayed silent afterwards. The remaining trailer words are what still
+    /// carry news: `pipe_index` changes when a second display pipe appears, and
+    /// the task field is zero through early bring-up, so its first non-zero value
+    /// re-arms the probe exactly once at the transition into steady-state
+    /// compositing.
+    ///
+    /// The plane-0 surface id is deliberately *not* part of the key: it is
+    /// expected to change every frame, so keying on it would make the probe
+    /// unbounded. Whether the task field is likewise per-frame is answered by
+    /// comparing the samples within its bucket.
+    pub txn_payload_samples: BTreeMap<(u16, usize, u32, bool), u32>,
 }
 
 /// Last **command-class** write to a surface mid (not pixel occupancy).
@@ -1149,7 +1287,7 @@ pub const LINEAR_SAMPLED_MEMO_BYTE_CAP: usize = 128 << 20;
 #[derive(Clone, Debug)]
 pub struct LinearSampledMemo {
     pub gva: u64,
-    pub host_gen: u32,
+    pub host_gen: u64,
     pub width: u32,
     pub height: u32,
     pub rgba: std::sync::Arc<Vec<u8>>,
@@ -1178,201 +1316,24 @@ pub struct GuestLinearMemo {
 /// stalls) and blocks QEMU's main loop (delayed host display refresh). The
 /// opaque `drain_tranche_us` outlier is attributed here so a hitch can be read as
 /// compile/convert/wait/readback-bound without fragile per-draw log correlation.
-/// Accumulated per draw at the `log_linux_m2v_timing` site; `take`n every tranche
-/// in `device_drain`, which emits the breakdown only on the >25 ms outlier line.
+/// Counters for the two content memos whose only observable effect is a
+/// skipped re-read: the guest-run signature memo (`run_memo_*`) and the
+/// zero-copy flush signature memo (`zc_flush_*`).
+///
+/// These name product behavior, not cost: a memo that stops hitting silently
+/// doubles the work per bind, and `stale` is the memo serving bytes the guest
+/// has since rewritten. The tests for both paths assert on these.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TrancheStats {
-    pub draws: u64,
-    pub draw_total_us: u64,
-    pub load_us: u64,
-    pub m2v_us: u64,
-    pub setup_us: u64,
-    pub setup_bufs_us: u64,
-    pub setup_tex_us: u64,
-    pub setup_seed_us: u64,
-    pub setup_asm_us: u64,
-    pub engine_us: u64,
-    /// Engine per-draw cost split (subset of `engine_us`), so the dominant
-    /// per-draw engine cost is attributable off-main-core without the per-draw
-    /// `linux_m2v_timing` line (which needs `REIMS_VGPU_DRAW_LOG` and inflates timing).
-    /// `engine_resource_us` = the whole resource-prep phase (samplers, staging /
-    /// target resources, descriptor set) — measured ~65 µs/draw, the dominant
-    /// engine cost; `engine_descriptor_us` = the descriptor subset
-    /// (`vkAllocateDescriptorSets` + `vkUpdateDescriptorSets` + free) — measured
-    /// ~0.1 µs/draw, NOT a lever; `engine_record_us` = command-buffer recording
-    /// (barriers + staging copies + the draw); `engine_submit_us` = queue submit.
-    pub engine_resource_us: u64,
-    pub engine_descriptor_us: u64,
-    pub engine_record_us: u64,
-    pub engine_submit_us: u64,
-    /// Resource-prep decomposition (subset of `engine_resource_us`), to locate
-    /// the dominant sub-phase of the ~65 µs/draw resource cost off-main-core.
-    /// `engine_target_us` = render-target image acquire/manage; `engine_sampled_us`
-    /// = sampled-texture load/import; `engine_bufprep_us` = the
-    /// vertex/index/storage/seed/sampler staging-prep loops. The remainder
-    /// (`engine_resource_us` minus these three, `engine_descriptor_us`, and
-    /// readback prep) is the resource-phase unattributed residual.
-    pub engine_target_us: u64,
-    pub engine_sampled_us: u64,
-    pub engine_bufprep_us: u64,
-    /// GPU-object churn proxy (scheduling-independent, unlike the `*_us` fields):
-    /// `engine_creates` = `vkCreateImage`/framebuffer/view creates this tranche,
-    /// `engine_allocs` = `vkAllocateMemory` calls. On a steady workload these
-    /// stay near zero (targets/samplers are reused). When they track `draws`,
-    /// GPU-backed resources are being recreated per draw — the render-target
-    /// recreate-per-generation path (`registry_ensure`) that makes Safari video
-    /// playback crawl (a full image alloc/free every frame). This is the always-on
-    /// proxy for that bug class; it must not flood (one line per tranche).
-    pub engine_creates: u64,
-    pub engine_allocs: u64,
-    /// Resident render-target images reused from the recycle pool this tranche
-    /// (`target_free` hits). The counterpart to `engine_allocs` for the
-    /// video-realloc fix: when a per-frame-generation target recurs, its image
-    /// is popped from the recycle pool instead of reallocated, so under video
-    /// `target_reuse` tracks `draws` while `engine_allocs` collapses to ~0. A
-    /// high `engine_allocs` with a low `target_reuse` means the recycle pool is
-    /// missing (geometry/format churn or the per-key cap).
-    pub target_reuse: u64,
-    /// Wall-clock spent inside `vkAllocateMemory` this tranche (the timed subset
-    /// of `engine_allocs`; a slice of `engine_resource_us`). Always-on so a
-    /// layout-reflow burst (a fullscreen transition recreates the whole layer
-    /// tree at new geometry: `engine_creates`≈150 `engine_allocs`≈85
-    /// `target_reuse`≈0, which no geometry-keyed recycle pool can absorb) shows
-    /// whether the hitch is *allocation*-bound — i.e. whether a suballocating
-    /// memory pool (one big `vkAllocateMemory`, many image binds) would help —
-    /// without needing the `REIMS_VGPU_DRAW_LOG` per-draw `linux_m2v_timing` line. Like
-    /// every `*_us` field it is SCHED_IDLE-contaminated under the agent harness;
-    /// read it as a fraction of `drain_tranche_us`, and trust the count
-    /// (`engine_allocs`) for the scheduling-independent burst size.
-    pub engine_memory_alloc_us: u64,
-    pub wait_us: u64,
-    pub retire_wait_us: u64,
-    pub readback_us: u64,
-    pub readbacks: u64,
-    pub reuploads: u64,
-    pub reupload_bytes: u64,
-    /// Zero-copy vertex/storage buffer binds (engine GPU-gathered the span
-    /// from imported guest RAM instead of a CPU staging read).
-    pub buf_zc: u64,
-    /// Guest-run buffer binds CPU-snapshotted at record time (deferred-submit
-    /// draw: the batched CB must not read volatile guest RAM at flush).
-    pub buf_snap: u64,
-    /// Compute dispatches (not render draws): `execute_dispatch_linux` total_us.
-    pub compute_n: u64,
-    pub compute_us: u64,
-    /// Store/flush GPU readback+guest-writeback: import-present present captures
-    /// (`import_present` map+dma+post) and deferred render/GVA flushes
-    /// (`storage_flush::render_deferred_flush`). Neither is a render draw.
-    pub store_n: u64,
-    pub store_us: u64,
-    /// Present/scanout capture lock hold: `capture_present_frame` (8 MiB alloc +
-    /// host-cache/guest-page paint + the fused occupancy scan). Runs on the
-    /// present drain, not on a render draw — previously invisible inside the
-    /// opaque `other_us` residual, so a capture-bound present hitch could not be
-    /// distinguished from FIFO-parse / mapper-walk time.
-    pub capture_n: u64,
-    pub capture_us: u64,
-    /// Draw-batching ceiling census (measure-only, never gates behavior):
-    /// `batch_same_target` = this draw's (identity, geometry, bgra) equals the
-    /// previous draw's in the same packet; `batch_joinable` = additionally the
-    /// load folds to LoadFromTarget with no seed, no readback, no MRT
-    /// secondaries, and the draw does not sample its own target — i.e. it
-    /// could have been recorded into the previous draw's render pass.
-    pub batch_same_target: u64,
-    pub batch_joinable: u64,
-    /// ACTUAL deferred-submit batching outcomes (engine-reported, vs the
-    /// census prediction above): `batch_opened` = draws that left their CB
-    /// recording for successors; `batch_joined` = draws appended to an open
-    /// CB, skipping slot claim + submit entirely.
-    pub batch_opened: u64,
-    pub batch_joined: u64,
-    /// Guest-run memo effectiveness (draw-time zero-copy binds): a hit skips
-    /// the per-bind task page-table walk entirely.
+pub struct MemoCounters {
     pub run_memo_hit: u64,
     pub run_memo_miss: u64,
-    /// Sampled memo-hit verifies (1-in-64) that found the fresh walk
-    /// disagreeing with the memoized runs — each one is a draw that would
-    /// have read stale guest pages. Zero on a healthy boot; nonzero means
-    /// the invalidation contract has a hole (fail-logged as `rmemo_stale`).
     pub run_memo_stale: u64,
-    /// Draw-time buffer-bind CPU cost split (subset of `setup_bufs_us`), so the
-    /// dominant per-bind cost is attributable off-main-core without a per-draw
-    /// log. Accumulated in **nanoseconds** (each bind is sub-microsecond; a
-    /// per-call `as_micros()` truncates every sample to 0), emitted as µs:
-    /// `buf_resolve` = object-list lookup + descriptor read/decode + backing
-    /// resolve (FFI PT walks); `buf_read` = the byte materialization (host
-    /// per-page FFI read; host-pointer memcpy on a future fast path).
-    pub buf_resolve_ns: u64,
-    pub buf_read_ns: u64,
-    /// Wall time of the two stream buffer-load loops (vertex + fragment
-    /// `load_buffer_content`) within `setup_bufs`, in nanoseconds. The
-    /// remainder `setup_bufs_us - bufs_load` is the stage-in attribute build +
-    /// fragment SPIR-V reloc + storage-binding classification.
-    pub bufs_load_ns: u64,
-    /// Draw-time zero-copy-attempt cost split (nanoseconds), for binds that ride
-    /// `try_buffer_zero_copy_resolved`. `zc_flush` = the intersecting-deferred
-    /// store flush (per-bind page walk when any deferred surface is live);
-    /// `zc_import` = the `ensure_host_import` engine-lock + window resolve loop.
-    /// `zc_fail_import` counts ZC attempts that fell back to the CPU read
-    /// because a run was not coverable by a host import window.
-    pub zc_flush_ns: u64,
-    pub zc_import_ns: u64,
-    pub zc_fail_import: u64,
-    /// Deferred-window flushes that actually fired (a buffer bind aliased a
-    /// live deferred-writeback window). Near-zero under pure compositing means
-    /// the per-bind flush walk is detection overhead, not real coherence work.
+    /// Deferred windows a flush-signature check found already landed.
     pub zc_flush_hits: u64,
-    /// Per-bind flush walks skipped via the no-intersection memo (the win). A
-    /// skip replaces a full per-page task-PT walk with a signature compare +
-    /// set lookup.
+    /// Binds the signature memo answered without walking the window map.
     pub zc_flush_skip: u64,
-    /// Sampled full walks (1-in-64 of memo skips) that found a real
-    /// intersection the memo had marked non-intersecting — a missed deferred
-    /// signature change. MUST stay 0 on a healthy boot; each one is
-    /// fail-logged `zc_flush_stale` and self-heals (memo entry dropped, window
-    /// flushed).
+    /// Memo answers invalidated by an intervening arm/disarm.
     pub zc_flush_stale: u64,
-    /// zc_flush sub-path census (subset accounting for `zc_flush_ns`), so the
-    /// dominant cost inside the per-bind flush is attributable off-main-core.
-    /// `zc_flush_walk` = full per-page task-PT walks actually run (the expensive
-    /// path — each per-page FFI translate dominates when the memo key
-    /// `(task,gva,span)` churns and never hits); `zc_flush_walk_ns` = wall time
-    /// inside those walks; `zc_flush_recheck` = cheap `deferred_pages_intersect`
-    /// rechecks (a memo entry whose deferred signature changed, re-validated
-    /// against cached pages with NO PT walk). A high `zc_flush_walk` relative to
-    /// `zc_flush_skip` means the memo is churning (widen the key), not that the
-    /// signature compare is slow.
-    pub zc_flush_walk: u64,
-    pub zc_flush_walk_ns: u64,
-    pub zc_flush_recheck: u64,
-    /// Wall time (ns) inside `deferred_flush_signature()` — the per-bind O(windows)
-    /// hash over every live deferred window, computed once per flush call
-    /// (~8×/draw). Prime suspect for the non-walk zc_flush residual when the memo
-    /// churns. `zc_flush_isect_ns` = wall time inside the cheap
-    /// `deferred_pages_intersect` rechecks (O(cached_pages × windows), no PT walk).
-    pub zc_flush_sig_ns: u64,
-    pub zc_flush_isect_ns: u64,
-    /// Number of `flush_intersecting_task_gva` invocations made from the
-    /// zero-copy-resolved buffer attempt (`try_buffer_zero_copy_resolved`), i.e.
-    /// the exact population whose wall time is `zc_flush_ns`. Divides
-    /// `zc_flush_ns` to a true per-call cost so the residual can be attributed
-    /// (the sub-timers below span all flush call sites, a different population).
-    pub zc_flush_calls: u64,
-    /// Zero-copy flush calls whose wall time exceeded 100 µs — a preemption /
-    /// off-CPU spike, not steady per-call work. If a few of these dominate
-    /// `zc_flush_ns` the residual is scheduler noise (irreducible); if
-    /// near-zero while the mean stays high the residual is a uniform per-call
-    /// memory stall (reducible by cutting flush-call count / working set).
-    pub zc_flush_slow: u64,
-    /// Largest single zero-copy flush call wall time (ns) seen in the tranche —
-    /// separates a bimodal spike distribution from a uniform-slow one.
-    pub zc_flush_max_ns: u64,
-    /// Wall time (ns) inside the exact-window fast path `flush_gva_exact` (a
-    /// buffer bind whose base GVA is itself a live deferred render window → a
-    /// synchronous engine `read_target` GPU readback). Isolates that stall from
-    /// the cheap detection sub-paths so a rare-but-expensive readback cannot hide
-    /// inside `zc_flush_ns`.
-    pub zc_flush_exact_ns: u64,
 }
 
 /// One host-VA run of a memoized guest span (model mirror of the engine's
@@ -1401,243 +1362,37 @@ pub struct GuestRunMemoEntry {
     pub runs: Arc<Vec<GuestRunSpan>>,
 }
 
-/// One ExecIndirect2 packet's summary counters, folded into [`ExecAggStats`].
-/// Mirror of the runtime `ExecResult` fields the old per-packet
-/// `exec_indirect2` line carried (model stays independent of runtime types).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ExecPacketSample {
-    pub streams: u64,
-    pub saw_draw: bool,
-    pub clears: u64,
-    pub draws_ok: u64,
-    pub draws_fail: u64,
-    pub rt_resolves: u64,
-    pub guest_stores: u64,
-    pub icb_ok: u64,
-    pub icb_fail: u64,
-    pub compute_ctrl_fail: u64,
-    pub compute_icb_fail: u64,
-    pub load_us: u64,
-    pub render_us: u64,
-    pub blit_us: u64,
-    pub compute_us: u64,
-    pub event_us: u64,
-    pub info_us: u64,
-    pub finish_us: u64,
-    pub total_us: u64,
-}
+/// A map of deferred writeback windows whose page sets feed the union index
+/// [`DeviceState::deferred_page_refs`].
+///
+/// Read-only outside this module: [`Deref`](std::ops::Deref) exposes the whole
+/// `BTreeMap` read API, and there is deliberately **no** `DerefMut`, so the
+/// inner map can only be mutated where the paired refcount update lives. That
+/// is what makes the union index exact by construction — a site that armed or
+/// disarmed a window without touching the index would not compile, so nothing
+/// has to sample the index at runtime and repair it.
+#[derive(Debug)]
+pub struct DeferredWindows<K, V>(BTreeMap<K, V>);
 
-/// Aggregated ExecIndirect2 packet telemetry (diagnostic only — never gates
-/// behavior). The per-packet `exec_indirect2` line ran ~1k/s under Safari
-/// scroll (the dominant always-on flood after the per-draw telemetry was
-/// verbose-gated); healthy packets fold in here and one `exec_indirect2_agg`
-/// summary per ~1 s window keeps rate/shares/tail visible. Packets carrying
-/// failure counters still log per-packet on the always-on sink at the drain
-/// site, so failure visibility is unchanged.
-#[derive(Debug, Default)]
-pub struct ExecAggStats {
-    pub packets: u64,
-    pub saw_draw: u64,
-    pub streams: u64,
-    pub clears: u64,
-    pub draws_ok: u64,
-    pub draws_fail: u64,
-    pub rt_resolves: u64,
-    pub guest_stores: u64,
-    pub icb_ok: u64,
-    pub icb_fail: u64,
-    pub compute_ctrl_fail: u64,
-    pub compute_icb_fail: u64,
-    pub load_us: u64,
-    pub render_us: u64,
-    pub blit_us: u64,
-    pub compute_us: u64,
-    pub event_us: u64,
-    pub info_us: u64,
-    pub finish_us: u64,
-    pub finish_us_max: u64,
-    pub total_us: u64,
-    pub total_us_max: u64,
-    /// finish_us histogram: <1 ms, 1–4 ms, 4–16 ms, 16–64 ms, ≥64 ms.
-    pub finish_hist: [u64; 5],
-    window_start: Option<std::time::Instant>,
-}
-
-/// Aggregation window for the `exec_indirect2_agg` summary line.
-const EXEC_AGG_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
-
-impl ExecAggStats {
-    pub fn note(&mut self, s: &ExecPacketSample) {
-        if self.window_start.is_none() {
-            self.window_start = Some(std::time::Instant::now());
-        }
-        self.packets = self.packets.saturating_add(1);
-        self.saw_draw = self.saw_draw.saturating_add(s.saw_draw as u64);
-        self.streams = self.streams.saturating_add(s.streams);
-        self.clears = self.clears.saturating_add(s.clears);
-        self.draws_ok = self.draws_ok.saturating_add(s.draws_ok);
-        self.draws_fail = self.draws_fail.saturating_add(s.draws_fail);
-        self.rt_resolves = self.rt_resolves.saturating_add(s.rt_resolves);
-        self.guest_stores = self.guest_stores.saturating_add(s.guest_stores);
-        self.icb_ok = self.icb_ok.saturating_add(s.icb_ok);
-        self.icb_fail = self.icb_fail.saturating_add(s.icb_fail);
-        self.compute_ctrl_fail = self.compute_ctrl_fail.saturating_add(s.compute_ctrl_fail);
-        self.compute_icb_fail = self.compute_icb_fail.saturating_add(s.compute_icb_fail);
-        self.load_us = self.load_us.saturating_add(s.load_us);
-        self.render_us = self.render_us.saturating_add(s.render_us);
-        self.blit_us = self.blit_us.saturating_add(s.blit_us);
-        self.compute_us = self.compute_us.saturating_add(s.compute_us);
-        self.event_us = self.event_us.saturating_add(s.event_us);
-        self.info_us = self.info_us.saturating_add(s.info_us);
-        self.finish_us = self.finish_us.saturating_add(s.finish_us);
-        self.finish_us_max = self.finish_us_max.max(s.finish_us);
-        self.total_us = self.total_us.saturating_add(s.total_us);
-        self.total_us_max = self.total_us_max.max(s.total_us);
-        let bucket = match s.finish_us {
-            0..=999 => 0,
-            1_000..=3_999 => 1,
-            4_000..=15_999 => 2,
-            16_000..=63_999 => 3,
-            _ => 4,
-        };
-        self.finish_hist[bucket] = self.finish_hist[bucket].saturating_add(1);
-    }
-
-    /// When the window has run ≥1 s, return the formatted summary line and
-    /// reset. Called after each note() — cadence is packet-driven, so an idle
-    /// device emits nothing.
-    pub fn flush_if_due(&mut self) -> Option<String> {
-        let started = self.window_start?;
-        let elapsed = started.elapsed();
-        if elapsed < EXEC_AGG_WINDOW {
-            return None;
-        }
-        let line = format!(
-            "exec_indirect2_agg n={} window_ms={} saw_draw={} streams={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} load_us={} render_us={} blit_us={} compute_us={} event_us={} info_us={} finish_us={} finish_us_max={} total_us={} total_us_max={} finish_ms_hist={}/{}/{}/{}/{}",
-            self.packets,
-            elapsed.as_millis(),
-            self.saw_draw,
-            self.streams,
-            self.clears,
-            self.draws_ok,
-            self.draws_fail,
-            self.rt_resolves,
-            self.guest_stores,
-            self.icb_ok,
-            self.icb_fail,
-            self.compute_ctrl_fail,
-            self.compute_icb_fail,
-            self.load_us,
-            self.render_us,
-            self.blit_us,
-            self.compute_us,
-            self.event_us,
-            self.info_us,
-            self.finish_us,
-            self.finish_us_max,
-            self.total_us,
-            self.total_us_max,
-            self.finish_hist[0],
-            self.finish_hist[1],
-            self.finish_hist[2],
-            self.finish_hist[3],
-            self.finish_hist[4],
-        );
-        *self = Self::default();
-        Some(line)
+impl<K, V> DeferredWindows<K, V> {
+    fn new() -> Self {
+        Self(BTreeMap::new())
     }
 }
 
-impl TrancheStats {
-    /// Fold a compute dispatch's lock hold in (not a render draw).
-    pub fn note_compute(&mut self, us: u64) {
-        self.compute_n = self.compute_n.saturating_add(1);
-        self.compute_us = self.compute_us.saturating_add(us);
+impl<K, V> std::ops::Deref for DeferredWindows<K, V> {
+    type Target = BTreeMap<K, V>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
+}
 
-    /// Fold a store/flush readback+writeback's lock hold in (not a render draw).
-    pub fn note_store(&mut self, us: u64) {
-        self.store_n = self.store_n.saturating_add(1);
-        self.store_us = self.store_us.saturating_add(us);
-    }
-
-    /// Fold a present/scanout capture's lock hold in (not a render draw).
-    pub fn note_capture(&mut self, us: u64) {
-        self.capture_n = self.capture_n.saturating_add(1);
-        self.capture_us = self.capture_us.saturating_add(us);
-    }
-
-    /// Fold one draw's timing delta in (saturating; all fields are cumulative).
-    pub fn add(&mut self, d: TrancheStats) {
-        self.draws = self.draws.saturating_add(d.draws);
-        self.draw_total_us = self.draw_total_us.saturating_add(d.draw_total_us);
-        self.load_us = self.load_us.saturating_add(d.load_us);
-        self.m2v_us = self.m2v_us.saturating_add(d.m2v_us);
-        self.setup_us = self.setup_us.saturating_add(d.setup_us);
-        self.setup_bufs_us = self.setup_bufs_us.saturating_add(d.setup_bufs_us);
-        self.setup_tex_us = self.setup_tex_us.saturating_add(d.setup_tex_us);
-        self.setup_seed_us = self.setup_seed_us.saturating_add(d.setup_seed_us);
-        self.setup_asm_us = self.setup_asm_us.saturating_add(d.setup_asm_us);
-        self.engine_us = self.engine_us.saturating_add(d.engine_us);
-        self.engine_resource_us = self.engine_resource_us.saturating_add(d.engine_resource_us);
-        self.engine_descriptor_us = self
-            .engine_descriptor_us
-            .saturating_add(d.engine_descriptor_us);
-        self.engine_record_us = self.engine_record_us.saturating_add(d.engine_record_us);
-        self.engine_submit_us = self.engine_submit_us.saturating_add(d.engine_submit_us);
-        self.engine_target_us = self.engine_target_us.saturating_add(d.engine_target_us);
-        self.engine_sampled_us = self.engine_sampled_us.saturating_add(d.engine_sampled_us);
-        self.engine_bufprep_us = self.engine_bufprep_us.saturating_add(d.engine_bufprep_us);
-        self.engine_creates = self.engine_creates.saturating_add(d.engine_creates);
-        self.engine_allocs = self.engine_allocs.saturating_add(d.engine_allocs);
-        self.target_reuse = self.target_reuse.saturating_add(d.target_reuse);
-        self.engine_memory_alloc_us = self
-            .engine_memory_alloc_us
-            .saturating_add(d.engine_memory_alloc_us);
-        self.wait_us = self.wait_us.saturating_add(d.wait_us);
-        self.retire_wait_us = self.retire_wait_us.saturating_add(d.retire_wait_us);
-        self.readback_us = self.readback_us.saturating_add(d.readback_us);
-        self.readbacks = self.readbacks.saturating_add(d.readbacks);
-        self.reuploads = self.reuploads.saturating_add(d.reuploads);
-        self.reupload_bytes = self.reupload_bytes.saturating_add(d.reupload_bytes);
-        self.buf_zc = self.buf_zc.saturating_add(d.buf_zc);
-        self.buf_snap = self.buf_snap.saturating_add(d.buf_snap);
-        self.compute_n = self.compute_n.saturating_add(d.compute_n);
-        self.compute_us = self.compute_us.saturating_add(d.compute_us);
-        self.store_n = self.store_n.saturating_add(d.store_n);
-        self.store_us = self.store_us.saturating_add(d.store_us);
-        self.capture_n = self.capture_n.saturating_add(d.capture_n);
-        self.capture_us = self.capture_us.saturating_add(d.capture_us);
-        self.batch_same_target = self.batch_same_target.saturating_add(d.batch_same_target);
-        self.batch_joinable = self.batch_joinable.saturating_add(d.batch_joinable);
-        self.batch_opened = self.batch_opened.saturating_add(d.batch_opened);
-        self.batch_joined = self.batch_joined.saturating_add(d.batch_joined);
-        self.run_memo_hit = self.run_memo_hit.saturating_add(d.run_memo_hit);
-        self.run_memo_miss = self.run_memo_miss.saturating_add(d.run_memo_miss);
-        self.run_memo_stale = self.run_memo_stale.saturating_add(d.run_memo_stale);
-        self.buf_resolve_ns = self.buf_resolve_ns.saturating_add(d.buf_resolve_ns);
-        self.buf_read_ns = self.buf_read_ns.saturating_add(d.buf_read_ns);
-        self.bufs_load_ns = self.bufs_load_ns.saturating_add(d.bufs_load_ns);
-        self.zc_flush_ns = self.zc_flush_ns.saturating_add(d.zc_flush_ns);
-        self.zc_import_ns = self.zc_import_ns.saturating_add(d.zc_import_ns);
-        self.zc_fail_import = self.zc_fail_import.saturating_add(d.zc_fail_import);
-        self.zc_flush_hits = self.zc_flush_hits.saturating_add(d.zc_flush_hits);
-        self.zc_flush_skip = self.zc_flush_skip.saturating_add(d.zc_flush_skip);
-        self.zc_flush_stale = self.zc_flush_stale.saturating_add(d.zc_flush_stale);
-        self.zc_flush_walk = self.zc_flush_walk.saturating_add(d.zc_flush_walk);
-        self.zc_flush_walk_ns = self.zc_flush_walk_ns.saturating_add(d.zc_flush_walk_ns);
-        self.zc_flush_recheck = self.zc_flush_recheck.saturating_add(d.zc_flush_recheck);
-        self.zc_flush_sig_ns = self.zc_flush_sig_ns.saturating_add(d.zc_flush_sig_ns);
-        self.zc_flush_isect_ns = self.zc_flush_isect_ns.saturating_add(d.zc_flush_isect_ns);
-        self.zc_flush_calls = self.zc_flush_calls.saturating_add(d.zc_flush_calls);
-        self.zc_flush_slow = self.zc_flush_slow.saturating_add(d.zc_flush_slow);
-        self.zc_flush_max_ns = self.zc_flush_max_ns.max(d.zc_flush_max_ns);
-        self.zc_flush_exact_ns = self.zc_flush_exact_ns.saturating_add(d.zc_flush_exact_ns);
-    }
-
-    /// Reset to empty, returning the accumulated tranche total.
-    pub fn take(&mut self) -> TrancheStats {
-        std::mem::take(self)
+/// `for (k, v) in &windows`, which auto-deref does not reach on its own.
+impl<'a, K, V> IntoIterator for &'a DeferredWindows<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 
@@ -1679,8 +1434,28 @@ pub struct DeviceState {
     /// Live MapMemory2 spans per task (wire notify ranges). Cleared on Unmap /
     /// delete_task / redefine. Product GVA writes check coverage when non-empty.
     pub task_map_spans: Vec<TaskMapSpan>,
-    /// Sparse object table: (task_id, ref) -> entry.
-    pub objects: BTreeMap<(u32, u32), ObjectEntry>,
+    /// Ranges written while undeclared, kept so a later MapMemory2 covering one
+    /// can confirm it.
+    ///
+    /// The write site cannot distinguish "the guest never declares this memory"
+    /// from "the guest declares it, and the write raced ahead of the
+    /// notification". An event count there cannot separate them either, because
+    /// the evidence for the second arrives *after* the event — the same shape as
+    /// "an event count is not a state", with the state living in the future
+    /// rather than the past. `write_gate_late_map` is the confirming half;
+    /// `write_gate_never_declared`, emitted on eviction, is the alarming one.
+    pub undeclared_writes: Vec<UndeclaredWrite>,
+    /// Live object refs per task, as `(task_id, ref)`.
+    ///
+    /// Membership only — deliberately carries no descriptor payload. Every
+    /// consumer that needs an object's type or descriptor reads the guest's own
+    /// list through `objects::lookup_list_entry`, which walks guest memory at
+    /// use time; a cached copy here would be a second source of truth for
+    /// something the guest can rewrite under us. What the set *is* load-bearing
+    /// for is [`Self::delete_object`], which gates the host-side resource
+    /// teardown (`host_texture_surfaces`, `host_linear_textures`,
+    /// `texture_to_mapping`) on whether the ref was live.
+    pub objects: std::collections::BTreeSet<(u32, u32)>,
     /// Type-11 texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
     pub mappings: BTreeMap<u32, MappingEntry>,
@@ -1717,10 +1492,24 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
     pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u16), GuestLinearMemo>,
-    /// Monotonic content-generation source for [`Self::guest_linear_memo`]
-    /// and [`Self::type5_view_memo`] (shared so a generation value never
-    /// repeats across the two producers).
-    pub guest_linear_gen: u64,
+    /// Monotonic source for every sampled-content generation this device
+    /// hands the engine. Read only through
+    /// [`DeviceState::next_sampled_content_generation`].
+    ///
+    /// The engine's sampled cache binds a retained image on `(key, generation)`
+    /// alone — no hash, no compare — so a generation that ever repeats over
+    /// different bytes binds the wrong picture, silently. One counter for all
+    /// producers is what makes that impossible: a value is issued once and
+    /// never again, so uniqueness does not depend on any producer's entry
+    /// lifetime, key space, or eviction policy.
+    ///
+    /// Each producer used to keep its own counter and the difference was
+    /// measured, not theorised. The guest-linear and type-5 memos shared this
+    /// one and were sound; the GVA host cache incremented a *per-entry* field
+    /// that restarted at 1 whenever the entry was re-created, and
+    /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
+    /// boot's audit caught `(0xa4c000, 1)` naming two different 64x64 icons.
+    pub sampled_content_gen: u64,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
@@ -1748,18 +1537,17 @@ pub struct DeviceState {
     /// storage-image writeback for an exact type-11 view. This does not select
     /// engine behavior; it measures safe residency opportunities.
     pub compute_storage_residency: BTreeMap<ComputeStorageResidencyKey, u32>,
-    /// Deferred compute writebacks: windows whose guest pages are STALE — the
-    /// pinned engine resident at this generation is the authoritative content.
-    /// Every host-side read or write of intersecting mapping bytes must flush
-    /// first (`runtime::storage_flush::flush_intersecting`). Value = the
-    /// engine resident generation to flush.
-    pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, u32>,
-    /// Deferred render Stores: type-11 windows whose guest pages are STALE —
-    /// the pinned engine resident render target is authoritative. Same
-    /// flush-on-access contract as [`Self::compute_deferred_flush`]
-    /// (`runtime::storage_flush::flush_intersecting`); lifetime boundaries
-    /// drop fail-visibly, never write.
-    pub render_deferred_flush: BTreeMap<RenderDeferredKey, RenderDeferredEntry>,
+    /// Deferred mapping-keyed writebacks: windows whose guest pages are STALE —
+    /// a pinned engine resident is the authoritative content. Every host-side
+    /// read or write of intersecting mapping bytes must flush first
+    /// (`runtime::storage_flush::flush_intersecting`). The value says which
+    /// rail owns the pixels; see [`DeferredOwner`].
+    pub compute_deferred_flush: BTreeMap<ComputeStorageResidencyKey, DeferredOwner>,
+    /// Arm order for [`DeferredOwner::Render`] windows, so the population cap
+    /// can evict oldest-first. Compute windows are bounded by the dispatches
+    /// that create them; render windows are armed once per composite Store and
+    /// each one pins a display-sized image, so they need their own bound.
+    pub surface_deferred_seq: u64,
     /// Physical page bases of each mapping with live deferred windows, for the
     /// raw task-GVA sampling guard (`storage_flush::flush_intersecting_task_gva`).
     /// Built at defer time from the just-resolved `page_entries`
@@ -1768,15 +1556,9 @@ pub struct DeviceState {
     /// the mapping's last deferred window is taken. A stale entry after a PFN
     /// change costs one spurious no-op flush call, never a wrong flush — the
     /// windows map stays the single flush authority.
-    pub deferred_alias_pages: BTreeMap<u32, std::collections::HashSet<u64>>,
+    pub deferred_alias_pages: DeferredWindows<u32, std::collections::HashSet<u64>>,
     /// Per-mid last write **command class** (ClearOnly vs Composite) — present path.
     pub surface_write_kind: BTreeMap<u32, SurfaceWriteKind>,
-    /// RGB-nonzero pixel count of each mapping's last full-frame Store import
-    /// (`import_present ok_runs` resident stats). Diagnostic memory for the
-    /// `fullquad_store_noop` proxy — a full-quad draw whose resident content
-    /// stats do not move names the incomplete-swap-base class. Never gates
-    /// behavior.
-    pub import_rgb_nz: BTreeMap<u32, usize>,
     pub present: PresentState,
     pub cursor: CursorState,
     pub display: DisplayHandshake,
@@ -1822,17 +1604,14 @@ pub struct DeviceState {
     /// (`storage_flush::flush_intersecting_task_gva`). Cache-only-shaped
     /// windows never enter — their sync path never wrote guest pages either.
     pub linear_deferred_flush:
-        BTreeMap<ComputeStorageResidencyKey, (u32, std::collections::HashSet<u64>)>,
+        DeferredWindows<ComputeStorageResidencyKey, (u32, std::collections::HashSet<u64>)>,
     /// Deferred GVA render-Store windows (type-2/3 color0, `target_gva != 0`)
     /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
     /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
     /// authoritative content until `storage_flush::flush_gva_one` lands it.
-    pub gva_deferred_flush: BTreeMap<u64, GvaDeferredEntry>,
+    pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
-    /// Monotonic arm counter for the [`Self::render_deferred_flush`]
-    /// oldest-first cap (bounds the pinned resident population).
-    pub render_deferred_seq: u64,
     /// GVAs rendered this guest lifetime as an **MRT secondary attachment**
     /// (e.g. the vibrancy RG16Float coverage mask) → its (width, height). The
     /// producer records the identity + geometry here; a later draw sampling a
@@ -1854,31 +1633,8 @@ pub struct DeviceState {
     /// chaining the resident (dual-mid strobe class). Consumed at the type-11
     /// Load seed decision (`metal_draw::resolve_type11_load_choice`).
     pub presented_needs_guest_seed: std::collections::BTreeSet<u32>,
-    /// Global monotonic decoded-write counter feeding
-    /// [`MappingEntry::last_store_seq`] — the cross-mapping store order the
-    /// ClearOnly dual-mid peer-select uses to find the latest-finished
-    /// compositor member.
-    pub store_seq: u64,
-    /// FIFO of proven compositor-output members that received a Composite
-    /// full-FB writeback and are not yet matched to a present. The guest
-    /// pipelines its double buffer in ring order (store B, store A, present,
-    /// present), so each ClearOnly present pairs with the OLDEST unconsumed
-    /// member store. Capturing the newest member for every present drops the
-    /// other member's frame each cycle and displays a member against the
-    /// wrong present slot (dual-mid residue class). Entries are
-    /// (mapping_id, content_generation at enqueue); bounded by
-    /// [`PRESENT_STORE_FIFO_CAP`] (oldest dropped).
-    pub present_store_fifo: std::collections::VecDeque<(u32, u32)>,
-    /// Per-tranche draw-timing breakdown (diagnostic). See [`TrancheStats`].
-    pub tranche: TrancheStats,
-    /// Aggregated ExecIndirect2 packet telemetry (diagnostic). See [`ExecAggStats`].
-    pub exec_agg: ExecAggStats,
-    /// Batch-ceiling census key of the previous engine draw in the current
-    /// packet: (hash of the engine target identity, width, height, bgra).
-    /// Measure-only — feeds TrancheStats batch_same_target/batch_joinable;
-    /// reset at every ExecIndirect2 packet start. The identity is stored as a
-    /// std-hash so the model stays independent of backend engine types.
-    pub last_draw_batch_key: Option<(u64, u32, u32, bool)>,
+    /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
+    pub tranche: MemoCounters,
     /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
     /// invalidation contract (mirrors `gva_host_views` exactly). A `VecDeque`
     /// so the FIFO cap evict is an O(1) `pop_front` rather than a `Vec`
@@ -1913,19 +1669,14 @@ pub struct DeviceState {
     /// into ONE map instead of the old O(bind_pages × num_windows) scan over
     /// every window's HashSet — the dominant `zc_flush` cost. Refcounts (not a
     /// plain set) because windows share physical pages; a page leaves the index
-    /// only when its last window disarms. All three deferred maps mutate through
-    /// the `*_deferred*`/`index_deferred_alias_pages`/`take_*` methods, which
-    /// keep this in sync; a 1-in-64 sampled self-check ([`flush_verify_ctr`])
-    /// rebuilds it from truth and fail-logs `deferred_ref_drift` if it ever
-    /// diverges (self-heal — a missed site degrades to a transient extra walk,
-    /// never a missed flush, since binds are disjoint from windows anyway).
-    pub deferred_page_refs: std::collections::HashMap<u64, u32>,
+    /// only when its last window disarms.
+    ///
+    /// Exactness is a property of the type, not of a repair pass: the three
+    /// source maps are [`DeferredWindows`], which hands out no mutable access
+    /// outside this module, so every arm and disarm necessarily runs through the
+    /// method that also moves the refcount here.
+    deferred_page_refs: std::collections::HashMap<u64, u32>,
 }
-
-/// Bound for [`DeviceState::present_store_fifo`]: the guest pipelines at most
-/// a few frames ahead (double/triple buffer); a deeper backlog means presents
-/// stopped consuming (present-style switch) and old entries are stale.
-pub const PRESENT_STORE_FIFO_CAP: usize = 8;
 
 /// Domain tag for ch-event segment events (matches event_sync::Domain::Event).
 pub const FENCE_DOMAIN_EVENT: u8 = 1;
@@ -1971,7 +1722,8 @@ impl DeviceState {
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
             task_map_spans: Vec::new(),
-            objects: BTreeMap::new(),
+            undeclared_writes: Vec::new(),
+            objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -1980,10 +1732,9 @@ impl DeviceState {
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
-            render_deferred_flush: BTreeMap::new(),
-            deferred_alias_pages: BTreeMap::new(),
+            surface_deferred_seq: 0,
+            deferred_alias_pages: DeferredWindows::new(),
             surface_write_kind: BTreeMap::new(),
-            import_rgb_nz: BTreeMap::new(),
             present: PresentState::default(),
             cursor: CursorState {
                 show: true,
@@ -1999,26 +1750,21 @@ impl DeviceState {
             draining_mask: 0,
             retired_views: Vec::new(),
             retired_linear_residents: Vec::new(),
-            linear_deferred_flush: BTreeMap::new(),
-            gva_deferred_flush: BTreeMap::new(),
+            linear_deferred_flush: DeferredWindows::new(),
+            gva_deferred_flush: DeferredWindows::new(),
             mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,
-            render_deferred_seq: 0,
             retired_gva_windows: Vec::new(),
             linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            guest_linear_gen: 0,
+            sampled_content_gen: 0,
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo_scratch: Vec::new(),
             presented_needs_guest_seed: std::collections::BTreeSet::new(),
-            store_seq: 0,
-            present_store_fifo: std::collections::VecDeque::new(),
             gva_host_views: Vec::new(),
-            tranche: TrancheStats::default(),
-            exec_agg: ExecAggStats::default(),
-            last_draw_batch_key: None,
+            tranche: MemoCounters::default(),
             guest_run_memo: std::collections::VecDeque::new(),
             view_verify_ctr: 0,
             view_stale_reads: 0,
@@ -2099,46 +1845,6 @@ impl DeviceState {
         }
     }
 
-    /// Rebuild [`deferred_page_refs`] from the three live deferred maps. Returns
-    /// the fresh index for the sampled self-check to compare against.
-    fn rebuild_deferred_refs(&self) -> std::collections::HashMap<u64, u32> {
-        let mut refs: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
-        for pages in self.deferred_alias_pages.values() {
-            for &p in pages {
-                *refs.entry(p).or_insert(0) += 1;
-            }
-        }
-        for (_, pages) in self.linear_deferred_flush.values() {
-            for &p in pages {
-                *refs.entry(p).or_insert(0) += 1;
-            }
-        }
-        for entry in self.gva_deferred_flush.values() {
-            for &p in &entry.pages {
-                *refs.entry(p).or_insert(0) += 1;
-            }
-        }
-        refs
-    }
-
-    /// Sampled (1-in-64) self-check: rebuild the index from truth and compare
-    /// its key set to the incrementally-maintained one. Returns true (drift) and
-    /// self-heals (adopts the fresh index) when they diverge, so a missed
-    /// arm/disarm site can never silently drop a live page from the fast reject.
-    pub fn verify_and_heal_deferred_refs(&mut self) -> bool {
-        let fresh = self.rebuild_deferred_refs();
-        // Key-set equality is what the fast reject depends on; refcount values
-        // only affect when a shared page is dropped.
-        let drift = fresh.len() != self.deferred_page_refs.len()
-            || fresh
-                .keys()
-                .any(|k| !self.deferred_page_refs.contains_key(k));
-        if drift {
-            self.deferred_page_refs = fresh;
-        }
-        drift
-    }
-
     /// Arm (or re-arm) a deferred GVA render-Store window, keeping the union
     /// index in sync (re-arm subtracts the superseded page set first).
     pub fn arm_gva_deferred_window(&mut self, gva: u64, entry: GvaDeferredEntry) {
@@ -2147,7 +1853,7 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&entry.pages);
-        self.gva_deferred_flush.insert(gva, entry);
+        self.gva_deferred_flush.0.insert(gva, entry);
     }
 
     /// Arm (or re-arm) a linear compute-storage deferred window, keeping the
@@ -2163,18 +1869,29 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&pages);
-        self.linear_deferred_flush.insert(key, (generation, pages));
+        self.linear_deferred_flush
+            .0
+            .insert(key, (generation, pages));
     }
 
     /// Disarm a linear compute-storage deferred window, keeping the union index
-    /// in sync. Returns whether an entry was present.
-    pub fn disarm_linear_deferred_window(&mut self, key: &ComputeStorageResidencyKey) -> bool {
-        if let Some((_, pages)) = self.linear_deferred_flush.remove(key) {
-            self.deferred_ref_sub_pages(&pages);
-            true
-        } else {
-            false
-        }
+    /// in sync.
+    ///
+    /// Returns the page set the window was armed against, so a caller about to
+    /// write those guest pages can check they still belong to this window (see
+    /// `runtime::storage_flush::deferred_pages_still_ours`). This used to return
+    /// a bare `bool` and drop the pages on the floor, which left the flush with
+    /// no way to tell that the guest had re-pointed the span since defer time —
+    /// the same hazard the GVA rail already guards. `Some` still means "an entry
+    /// was present", so the presence test is unchanged for callers that only
+    /// want that.
+    pub fn disarm_linear_deferred_window(
+        &mut self,
+        key: &ComputeStorageResidencyKey,
+    ) -> Option<std::collections::HashSet<u64>> {
+        let (_, pages) = self.linear_deferred_flush.0.remove(key)?;
+        self.deferred_ref_sub_pages(&pages);
+        Some(pages)
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
@@ -2246,556 +1963,109 @@ impl DeviceState {
             .insert(mapping_id, SurfaceWriteKind::Composite);
     }
 
-    /// Record the latest successful non-self full-geometry type-11 edge.
-    pub fn note_compositor_output(
-        &mut self,
-        source_mapping: u32,
-        output_mapping: u32,
-        width: u32,
-        height: u32,
-        generation: u32,
-    ) {
-        if source_mapping == 0
-            || output_mapping == 0
-            || source_mapping == output_mapping
-            || width == 0
-            || height == 0
-        {
-            return;
-        }
-        self.present.compositor_output_mapping = output_mapping;
-        self.present.compositor_output_source = source_mapping;
-        self.present.compositor_output_generation = generation;
-        self.present.compositor_output_width = width;
-        self.present.compositor_output_height = height;
-        self.present.compositor_output_members.insert(
-            output_mapping,
-            CompositorOutputMember {
-                width,
-                height,
-                source: source_mapping,
-            },
-        );
-    }
-
     /// A draw Store published a **complete** frame for `mapping_id` into guest
-    /// pages (full-frame resident writeback, `import_present ok_runs`): grant
-    /// compositor-output membership at that geometry. Unlike the one-shot
-    /// full-coverage draw edges, this fires on every steady-state composite
-    /// pass, so both halves of a guest double buffer qualify on any boot.
-    /// Does not move the output pin itself — only Composite writebacks on a
-    /// member do (see [`Self::refresh_compositor_output_member`]).
-    pub fn note_compositor_member_published(&mut self, mapping_id: u32, width: u32, height: u32) {
+    /// pages (full-frame resident writeback, `import_present ok_runs`).
+    ///
+    /// Protocol-structural dense marker: this mapping now holds a complete full
+    /// frame, so advance its [`PresentState::dense_frame_seq`] off the global
+    /// [`PresentState::dense_frame_counter`]. A surface presented twice with no
+    /// advance in between received no full frame of its own, which is the
+    /// `present_unbacked` gate in [`Self::note_present_backing`] — the only
+    /// reader. The counter is monotonic per full-frame Store across all
+    /// mappings, so the value is a witness of "something was published for this
+    /// mid", never a staleness measure on its own.
+    pub fn note_dense_frame_published(&mut self, mapping_id: u32, width: u32, height: u32) {
         if mapping_id == 0 || width == 0 || height == 0 {
             return;
         }
-        let member = self
-            .present
-            .compositor_output_members
-            .entry(mapping_id)
-            .or_insert_with(|| {
-                crate::observe::off(format!(
-                    "compositor_member_grant mid={mapping_id} {width}x{height} reason=full_frame_publish"
-                ));
-                CompositorOutputMember {
-                    width,
-                    height,
-                    source: 0,
-                }
-            });
-        // Geometry change (mode switch / re-geom): follow the newly published
-        // geometry; keep the proven source edge when unchanged.
-        if member.width != width || member.height != height {
-            member.width = width;
-            member.height = height;
-            member.source = 0;
-        }
-        // Protocol-structural dense marker: this member now holds a complete
-        // full-frame. Advance its `dense_frame_seq` so a peer that never got a
-        // full frame (nor a seed) shows up as lagging (measure-only; the
-        // `dense_retention_gap` guard). The counter is monotonic per full-frame
-        // Store across all members.
         self.present.dense_frame_counter = self.present.dense_frame_counter.saturating_add(1);
         let seq = self.present.dense_frame_counter;
         self.present.dense_frame_seq.insert(mapping_id, seq);
     }
 
-    /// Advance the per-present tile-epoch clock and return the new value. Call
-    /// EXACTLY ONCE per present cycle (see [`PresentState::tile_epoch`]); draws
-    /// between two presents stamp the value current at draw time.
-    pub fn advance_tile_epoch(&mut self) -> u64 {
-        self.present.tile_epoch = self.present.tile_epoch.saturating_add(1);
-        self.present.tile_epoch
+    /// Advance the per-present epoch counter and return the new value. Call
+    /// EXACTLY ONCE per present cycle (see [`PresentState::present_epoch`]).
+    pub fn advance_present_epoch(&mut self) -> u64 {
+        self.present.present_epoch = self.present.present_epoch.saturating_add(1);
+        self.present.present_epoch
     }
 
-    /// Stamp every tile a pixel-space damage rect covers on `mid` with the
-    /// current [`PresentState::tile_epoch`]. `rect` = `(x0,y0,x1,y1)` in target
-    /// pixels (half-open); clamped to the `w`×`h` target. No-op on a degenerate
-    /// rect or unknown geometry. Allocates the mid's tile array lazily. O(tiles
-    /// in rect) — a menu strip / tooltip covers a handful; a full-frame store
-    /// covers all [`TILE_GEN_TILES`].
-    pub fn bump_tile_gen(&mut self, mid: u32, rect: (u32, u32, u32, u32), w: u32, h: u32) {
-        if mid == 0 || w == 0 || h == 0 {
-            return;
-        }
-        let (x0, y0, x1, y1) = rect;
-        if x1 <= x0 || y1 <= y0 {
-            return;
-        }
-        let tw = w as usize;
-        let th = h as usize;
-        let x0 = (x0 as usize).min(tw.saturating_sub(1));
-        let y0 = (y0 as usize).min(th.saturating_sub(1));
-        // Half-open [x0,x1): the last covered pixel is x1-1.
-        let xe = (x1 as usize).min(tw).saturating_sub(1);
-        let ye = (y1 as usize).min(th).saturating_sub(1);
-        let gx0 = (x0 * TILE_GEN_GRID_W / tw).min(TILE_GEN_GRID_W - 1);
-        let gx1 = (xe * TILE_GEN_GRID_W / tw).min(TILE_GEN_GRID_W - 1);
-        let gy0 = (y0 * TILE_GEN_GRID_H / th).min(TILE_GEN_GRID_H - 1);
-        let gy1 = (ye * TILE_GEN_GRID_H / th).min(TILE_GEN_GRID_H - 1);
-        let epoch = self.present.tile_epoch;
-        let arr = self
-            .present
-            .tile_gen
-            .entry(mid)
-            .or_insert_with(|| Box::new([0u64; TILE_GEN_TILES]));
-        for gy in gy0..=gy1 {
-            let row = gy * TILE_GEN_GRID_W;
-            for gx in gx0..=gx1 {
-                arr[row + gx] = epoch;
-            }
-        }
-    }
-
-    /// Count the tiles where `peer_mid` is fresher than `presented_mid` by at
-    /// least [`crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN`] epochs — the
-    /// divergent (residue) tiles the guest erased in the peer but our presented
-    /// mid still shows stale. Pure generation compare over [`TILE_GEN_TILES`]
-    /// `u64`s (no pixel scan, no allocation). Returns 0 when either mid has no
-    /// tile map yet (steady-state / bootstrap). Never counts a peer tile the peer
-    /// never drew (epoch 0 ≤ presented) — that is the by-construction guard that a
-    /// damage-only peer can never override the presented mid's good background.
-    /// Returns `(count, [gx0, gy0, gx1, gy1])` — the divergent-tile count and the
-    /// inclusive tile-grid bounding box of the divergent region (all zero when
-    /// count is 0). The bbox lets a proxy confirm the divergence LOCALIZES to the
-    /// visible residue (e.g. the menu strip / a rubber-band trail) rather than
-    /// smearing whole-frame.
-    pub fn divergent_tile_count(&self, presented_mid: u32, peer_mid: u32) -> (u32, [u32; 4]) {
-        if presented_mid == peer_mid {
-            return (0, [0; 4]);
-        }
-        let (Some(pres), Some(peer)) = (
-            self.present.tile_gen.get(&presented_mid),
-            self.present.tile_gen.get(&peer_mid),
-        ) else {
-            return (0, [0; 4]);
-        };
-        let margin = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-        let mut n = 0u32;
-        let (mut gx0, mut gy0, mut gx1, mut gy1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        for i in 0..TILE_GEN_TILES {
-            if peer[i] >= pres[i].saturating_add(margin) {
-                n += 1;
-                let gx = (i % TILE_GEN_GRID_W) as u32;
-                let gy = (i / TILE_GEN_GRID_W) as u32;
-                gx0 = gx0.min(gx);
-                gy0 = gy0.min(gy);
-                gx1 = gx1.max(gx);
-                gy1 = gy1.max(gy);
-            }
-        }
-        if n == 0 {
-            (0, [0; 4])
-        } else {
-            (n, [gx0, gy0, gx1, gy1])
-        }
-    }
-
-    /// A Composite-class writeback landed on a proven compositor-output member
-    /// at its proven geometry: move the graph output pin to that member so
-    /// ClearOnly presents follow the guest's buffer alternation (damage passes
-    /// never re-prove full coverage). Returns `Some(previous_output_mapping)`
-    /// when the pin moved to a different mapping, `None` when only refreshed
-    /// in place or not a matching member.
-    pub fn refresh_compositor_output_member(
-        &mut self,
-        mapping_id: u32,
-        width: u32,
-        height: u32,
-        generation: u32,
-    ) -> Option<u32> {
-        if mapping_id == 0 || width == 0 || height == 0 {
+    /// Record that `mapping_id` is being presented and report whether the guest
+    /// ever sent a full-frame Store **naming it** for what is about to be shown.
+    ///
+    /// Structural only: decoded Store bookkeeping, never measured content, and
+    /// never the resident. Say what that leaves out, because the name reads
+    /// broader than the check: a `None` here means the guest sent a frame for
+    /// this mid, **not** that the resident this present will read holds it. See
+    /// [`PresentState::dense_frame_seq`].
+    ///
+    /// Records the witness on every call, so a member that stays unbacked
+    /// reports once per present rather than once per lifetime — except
+    /// [`PresentBacking::NeverStored`], which by construction can only be
+    /// reported on a mapping's first present since it was created.
+    pub fn note_present_backing(&mut self, mapping_id: u32) -> Option<PresentBacking> {
+        if mapping_id == 0 {
             return None;
         }
-        let member = *self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != width || member.height != height {
-            return None;
-        }
-        let prev = self.present.compositor_output_mapping;
-        self.present.compositor_output_mapping = mapping_id;
-        self.present.compositor_output_source = member.source;
-        self.present.compositor_output_generation = generation;
-        self.present.compositor_output_width = width;
-        self.present.compositor_output_height = height;
-        (prev != mapping_id).then_some(prev)
-    }
-
-    /// Whether `mapping_id` has been proven a compositor output (any geometry).
-    pub fn is_compositor_output_member(&self, mapping_id: u32) -> bool {
-        self.present
-            .compositor_output_members
-            .contains_key(&mapping_id)
-    }
-
-    /// Measure-only: if `mapping_id` (presented at `w`×`h`) is a compositor
-    /// member whose last full frame lags a same-geometry peer, return
-    /// `(peer_mid, presented_seq, peer_seq)` for the peer holding the freshest
-    /// full frame. A large lag is the a/b inter-buffer retention gap
-    ///: the presented buffer is showing content it never
-    /// received (no full-frame Store, no seed). NEVER gates present/seed — the
-    /// `dense_retention_gap` guard's margin + dedup live in `present_proxy`.
-    pub fn dense_retention_gap(&self, mapping_id: u32, w: u32, h: u32) -> Option<(u32, u64, u64)> {
-        if mapping_id == 0 || w == 0 || h == 0 {
-            return None;
-        }
-        let member = self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != w || member.height != h {
-            return None;
-        }
-        let presented_seq = self
+        let seq = self
             .present
             .dense_frame_seq
             .get(&mapping_id)
             .copied()
             .unwrap_or(0);
-        let (peer_mid, peer_seq) = self
-            .present
-            .compositor_output_members
-            .iter()
-            .filter(|(mid, m)| **mid != mapping_id && m.width == w && m.height == h)
-            .filter_map(|(mid, _)| self.present.dense_frame_seq.get(mid).map(|s| (*mid, *s)))
-            .max_by_key(|(_, s)| *s)?;
-        (peer_seq > presented_seq).then_some((peer_mid, presented_seq, peer_seq))
-    }
-
-    /// The same-geometry compositor-output peer of `mapping_id` holding the
-    /// freshest full frame (`dense_frame_seq`). Unlike [`Self::dense_retention_gap`]
-    /// this does NOT gate on a whole-frame seq lag — tile-level residue is exactly
-    /// the case where the whole-frame seqs match but individual tiles diverge, so
-    /// the tile-divergence path needs the peer regardless of whole-frame lag.
-    pub fn compositor_geometry_peer(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
-        if mapping_id == 0 || w == 0 || h == 0 {
-            return None;
+        let previous = self.present.presented_dense_seq.insert(mapping_id, seq);
+        match previous {
+            Some(prev) if prev == seq => Some(PresentBacking::Restaled { seq }),
+            // First present since this mapping was created. `dense_frame_seq` is
+            // pruned by `forget_compositor_mapping`, so a *re-created* surface
+            // arrives here with no witness and no seq — and this arm is the only
+            // thing that can see it.
+            //
+            // It matters because that is the worst version of this class rather
+            // than a corner of it: a surface nothing has ever Stored into is
+            // uninitialized, so presenting it shows a fully black screen, not a
+            // stale one. Measured on a live boot: the guest re-created its
+            // scanout surfaces (`gen` reset 82 → 0) and we presented mid 6 at
+            // `gen=0` with `px0=[0,0,0,0]` and `rgb_nz=4254` of 2 073 600 — a
+            // black screen — for the three presents that followed.
+            // `present_unbacked` fired **zero** times during that whole boot.
+            //
+            // The guest was awake for all of it. An earlier reading of this
+            // boot blamed display sleep and it does not survive the log: the
+            // 86 s the guest went quiet is bracketed by seven
+            // `sync_exec_lock_hold` events of 935-979 ms each, one guest exec
+            // packet apiece, on an otherwise idle device. The surface
+            // re-creation is downstream of the stall, not of a power
+            // transition. What causes the stall is a separate question and is
+            // measured by `draw_phase`.
+            //
+            // The old shape could not have caught it. It compared this present's
+            // seq against the previous present's, which is a check for a
+            // *repeat* — a transition — while "this surface has never been
+            // written" is a *state*. The state was sitting in `dense_frame_seq`
+            // the whole time as an absent key.
+            None if seq == 0 => Some(PresentBacking::NeverStored),
+            _ => None,
         }
-        let member = self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != w || member.height != h {
-            return None;
-        }
-        self.present
-            .compositor_output_members
-            .iter()
-            .filter(|(mid, m)| **mid != mapping_id && m.width == w && m.height == h)
-            .map(|(mid, _)| {
-                (
-                    *mid,
-                    self.present.dense_frame_seq.get(mid).copied().unwrap_or(0),
-                )
-            })
-            .max_by_key(|(_, s)| *s)
-            .map(|(mid, _)| mid)
-    }
-
-    /// Fill `out` (cleared first) with the pixel-space rects `(x0,y0,x1,y1)` of
-    /// the tiles where `peer_mid` is fresher than `presented_mid` by the retention
-    /// margin — the residue tiles to composite from the peer's resident. Adjacent
-    /// divergent tiles in a row are coalesced into one rect to cut the copy-region
-    /// count. Tiling matches the `present_proxy` DAMAGE_GRID. Returns the number
-    /// of divergent TILES (not rects). Reuses `out` so the present path allocates
-    /// only on growth. A peer tile the peer never drew (epoch 0 ≤ presented) is
-    /// never emitted — the by-construction guard against pulling black over the
-    /// presented mid's good background.
-    pub fn collect_divergent_tile_rects(
-        &self,
-        presented_mid: u32,
-        peer_mid: u32,
-        w: u32,
-        h: u32,
-        out: &mut Vec<(u32, u32, u32, u32)>,
-    ) -> u32 {
-        out.clear();
-        if presented_mid == peer_mid || w == 0 || h == 0 {
-            return 0;
-        }
-        let (Some(pres), Some(peer)) = (
-            self.present.tile_gen.get(&presented_mid),
-            self.present.tile_gen.get(&peer_mid),
-        ) else {
-            return 0;
-        };
-        let margin = crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-        let mut count = 0u32;
-        for gy in 0..TILE_GEN_GRID_H {
-            let y0 = (gy * h as usize / TILE_GEN_GRID_H) as u32;
-            let y1 = ((gy + 1) * h as usize / TILE_GEN_GRID_H) as u32;
-            let row = gy * TILE_GEN_GRID_W;
-            let mut run_start: Option<usize> = None;
-            for gx in 0..TILE_GEN_GRID_W {
-                let divergent = peer[row + gx] >= pres[row + gx].saturating_add(margin);
-                if divergent {
-                    count += 1;
-                    if run_start.is_none() {
-                        run_start = Some(gx);
-                    }
-                } else if let Some(start) = run_start.take() {
-                    let x0 = (start * w as usize / TILE_GEN_GRID_W) as u32;
-                    let x1 = (gx * w as usize / TILE_GEN_GRID_W) as u32;
-                    out.push((x0, y0, x1, y1));
-                }
-            }
-            if let Some(start) = run_start.take() {
-                let x0 = (start * w as usize / TILE_GEN_GRID_W) as u32;
-                out.push((x0, y0, w, y1));
-            }
-        }
-        count
-    }
-
-    /// For a presented `mapping_id`, find its freshest same-geometry peer and
-    /// count the tiles where that peer is fresher by the retention margin — the
-    /// per-tile damage-coverage residue. `Some((peer_mid,
-    /// divergent_count, tile_bbox))` when a peer exists; `None` when there is no
-    /// peer. Pure generation compare, allocation-free.
-    pub fn tile_divergence_vs_peer(
-        &self,
-        mapping_id: u32,
-        w: u32,
-        h: u32,
-    ) -> Option<(u32, u32, [u32; 4])> {
-        let peer = self.compositor_geometry_peer(mapping_id, w, h)?;
-        let (count, bbox) = self.divergent_tile_count(mapping_id, peer);
-        Some((peer, count, bbox))
-    }
-
-    /// Present/scanout evidence that `mapping_id` was displayed at `w`x`h`
-    /// (see [`Self::note_presented_geom`]).
-    pub fn presented_at(&self, mapping_id: u32, w: u32, h: u32) -> bool {
-        self.present.presented_geoms.get(&mapping_id) == Some(&(w, h))
-    }
-
-    /// Record a present/scanout action displaying `mapping_id` at `w`x`h`.
-    /// This is the only evidence class that can qualify a mapping for
-    /// OutputGroup unification.
-    pub fn note_presented_geom(&mut self, mapping_id: u32, w: u32, h: u32) {
-        if mapping_id == 0 || w == 0 || h == 0 {
-            return;
-        }
-        self.present.presented_geoms.insert(mapping_id, (w, h));
-    }
-
-    /// Group id when `mapping_id` is a proven compositor-output member at
-    /// `w`x`h`, has been **presented** at that geometry, AND at least one
-    /// OTHER presented member shares it — the members then act as alternating
-    /// storage for ONE logical framebuffer (guest copy-swap contract) and
-    /// every member resolves to the shared `TargetIdentity::OutputGroup`.
-    /// A single-member geometry stays per-mid (no pair, nothing to unify).
-    /// The presented gate keeps sampled sub-surfaces (WebKit content tiles,
-    /// scrollbars — full-frame publishers that are never displayed) out of
-    /// groups: unifying those chains DISTINCT surfaces onto one resident
-    /// (the Safari-scroll black-band class).
-    pub fn output_group_for(&self, mapping_id: u32, w: u32, h: u32) -> Option<u32> {
-        let member = self.present.compositor_output_members.get(&mapping_id)?;
-        if member.width != w || member.height != h {
-            return None;
-        }
-        if !self.presented_at(mapping_id, w, h) {
-            return None;
-        }
-        let peers = self
-            .present
-            .compositor_output_members
-            .iter()
-            .filter(|(&mid, m)| {
-                mid != mapping_id && m.width == w && m.height == h && self.presented_at(mid, w, h)
-            })
-            .count();
-        (peers >= 1).then_some(1)
-    }
-
-    /// Queue a proven member's Composite full-FB writeback for present↔store
-    /// FIFO pairing (see [`DeviceState::present_store_fifo`]). Consecutive
-    /// writebacks into the same member coalesce (multi-pass stores of one
-    /// frame must not shift the pairing); the queue drops its oldest entry
-    /// past [`PRESENT_STORE_FIFO_CAP`]. Returns false when `mapping_id` is
-    /// not a member at this geometry (nothing queued).
-    pub fn note_member_store(
-        &mut self,
-        mapping_id: u32,
-        width: u32,
-        height: u32,
-        generation: u32,
-    ) -> bool {
-        let Some(member) = self.present.compositor_output_members.get(&mapping_id) else {
-            return false;
-        };
-        if member.width != width || member.height != height {
-            return false;
-        }
-        if let Some(back) = self.present_store_fifo.back_mut() {
-            if back.0 == mapping_id {
-                back.1 = generation;
-                return true;
-            }
-        }
-        if self.present_store_fifo.len() >= PRESENT_STORE_FIFO_CAP {
-            self.present_store_fifo.pop_front();
-        }
-        self.present_store_fifo.push_back((mapping_id, generation));
-        true
-    }
-
-    /// Should a LOAD draw into `target_mid` at `w`x`h` seed from the retained
-    /// front frame because it is a compositor-output-member **peer** sitting
-    /// behind a denser-lifetime member front it has not yet inherited this
-    /// generation?
-    ///
-    /// This closes the dual-mid inter-buffer retention gap: the guest
-    /// composites the full frame into whichever swapchain buffer is the front,
-    /// then at the a/b flip damage-draws the peer buffer with `LoadAction=Load`
-    /// expecting the display's current front content to be retained under it.
-    /// Our per-mid residents do not share that history, so the peer's first
-    /// LOAD after the flip would `LoadFromTarget` its own stale resident and
-    /// keep an undamaged black region forever (BUG A / stale-peer strobe).
-    /// Seeding the peer **once** (a one-shot bootstrap per mapping lifetime)
-    /// from the member front — the same mechanism the same-mid
-    /// `presented_needs_guest_seed` path already uses — gives the peer its first
-    /// dense frame.
-    ///
-    /// It is ONE-SHOT on purpose. `frame_generation` bumps on every present, so
-    /// "once per front generation" was in practice "once per a/b flip" — a full
-    /// front→peer forward-copy every flip. That copy carries the front's
-    /// *transient* overlays (dock hover tooltips, the cursor) onto the peer,
-    /// where WindowServer's damage model never erases them (it does not know the
-    /// peer holds them), so they accumulate as permanent residue (the dock
-    /// tooltip / cursor-sweep smear class). A single bootstrap seed fixes BUG A
-    /// stale-black; thereafter each a/b buffer retains its own content and the
-    /// guest's damage draws keep both in sync. Genuine resident loss (eviction)
-    /// re-bootstraps through the independent `!resident_content_ready` LOAD-seed
-    /// path, not here.
-    ///
-    /// Gating is purely structural and never consults measured content:
-    /// - `target_mid` is a proven compositor-output member at this geometry,
-    /// - a *distinct* same-geometry member holds a `dense_frame_seq` at least
-    ///   `margin` full frames ahead (a run of full frames the target never
-    ///   received — NOT the ~1-lag of healthy full-frame a/b alternation),
-    /// - that dense source is strictly newer than the one this peer was last
-    ///   seeded from (the relaxed latch below).
-    ///
-    /// Returns `Some(source_mid)` — the mapping id of the dense peer to copy —
-    /// when a seed should be armed, and records the source seq so a steady-state
-    /// flip (frozen seq) does not re-seed. The source is the freshest dense peer
-    /// (`dense_retention_gap`), NEVER the possibly-sparse present front: after an
-    /// app-quit / mode churn the presented front is itself sparse and copying it
-    /// does not close the gap.
-    ///
-    /// The original one-shot-per-lifetime latch is RELAXED to a monotonic source
-    /// seq: a re-seed arms only on a strictly-newer full frame. Because
-    /// `dense_frame_seq` advances only on a full-display-geometry Store — never a
-    /// transient overlay (dock tooltip / cursor sweep) — a re-seed can only ever
-    /// copy a legitimate full frame, so it cannot cause the residue class the
-    /// one-shot originally guarded against.
-    ///
-    /// `converged` MUST be the boot-convergence latch
-    /// (`present_proxy::has_converged()`): the seed only applies to the
-    /// steady-state desktop damage-compositing regime *after* a dense frame has
-    /// been produced this boot. Before convergence the guest redraws full
-    /// logo/progress frames each present (no inter-buffer retention dependency),
-    /// so seeding there is both unnecessary and actively harmful — it copies a
-    /// stale full front onto the peer and makes the boot progress pill strobe
-    /// (opacity/fill oscillation). Gating on convergence also guarantees the
-    /// source we propagate was itself once dense, never a sparse boot frame.
-    pub fn peer_needs_front_seed(
-        &mut self,
-        target_mid: u32,
-        w: u32,
-        h: u32,
-        converged: bool,
-        margin: u64,
-    ) -> Option<u32> {
-        if !converged {
-            return None;
-        }
-        // The seed source is the freshest same-geometry dense peer the target
-        // lags. `dense_retention_gap` enforces membership + geometry + a strict
-        // lag, so a member that is itself the freshest never seeds.
-        let (source_mid, presented_seq, source_seq) = self.dense_retention_gap(target_mid, w, h)?;
-        // Margin gate — the crux that keeps healthy a/b alternation quiet. When
-        // BOTH buffers get full frames each present (the guest recompositing
-        // both halves), each is only ~1 full frame behind the other on any given
-        // flip; that 1-lag is NOT a retention gap (each buffer holds its own
-        // recent full frame) and seeding it every flip is wasteful churn — the
-        // every-flip residue regression this gate exists to prevent. Only a lag of
-        // `margin`+ full frames — the target missed BOTH a full-frame Store and the
-        // seed, repeatedly — is the real inter-buffer retention gap. Mirrors the
-        // `dense_retention_gap` proxy's own margin so the seed fixes exactly what
-        // that proxy flags. This gate (locked by the
-        // `peer_front_seed_gate_is_structural_and_once_per_lifetime` unit test) is
-        // the sole guard against the every-flip regression; there is no runtime
-        // seed-count alarm (legitimate multi-video seeding is thousands/boot).
-        if source_seq < presented_seq.saturating_add(margin) {
-            return None;
-        }
-        // Relaxed one-shot: re-seed only on a strictly-newer dense frame than
-        // the one already propagated here. Frozen/equal seqs (healthy steady
-        // state) never re-arm.
-        if let Some(&last_seq) = self.present.peer_seeded_dense_seq.get(&target_mid) {
-            if source_seq <= last_seq {
-                return None;
-            }
-        }
-        self.present
-            .peer_seeded_dense_seq
-            .insert(target_mid, source_seq);
-        // The peer inherits `source_mid`'s full frame via this seed, so it now
-        // holds a frame as fresh as the source — advance its dense seq to match
-        // so it no longer reads as lagging (the seed IS the inter-buffer
-        // retention). Measure-only bookkeeping for the `dense_retention_gap`
-        // guard.
-        self.present.dense_frame_seq.insert(target_mid, source_seq);
-        Some(source_mid)
     }
 
     fn forget_compositor_mapping(&mut self, mapping_id: u32) {
-        crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
-        self.present.compositor_output_members.remove(&mapping_id);
-        self.present.peer_seeded_dense_seq.remove(&mapping_id);
-        // Prune the dense-frame seq too (mirrors peer_seeded_dense_seq): a
-        // recycled mapping id must not inherit a stale predecessor's dense seq.
+        // Prune the dense-frame seq: a recycled mapping id must not inherit a
+        // stale predecessor's dense seq.
         self.present.dense_frame_seq.remove(&mapping_id);
-        // Prune the per-mid tile-epoch grid too (mirrors dense_frame_seq): a
-        // recycled mapping id must not inherit a predecessor's tile epochs, or a
-        // logically-unrelated surface would show phantom cross-mid divergence.
-        self.present.tile_gen.remove(&mapping_id);
-        self.present.presented_geoms.remove(&mapping_id);
-        // Prune the present-boundary seed flag too, mirroring
-        // `peer_seeded_dense_seq` above. Both mark "this mid was just presented,
-        // so its next LOAD re-seeds from the front" — a per-lifetime signal that
-        // MUST NOT survive a teardown. Left stale, a recycled mapping_id (a new,
-        // logically-unrelated surface reusing this id after DeleteIOSurfaceBacking2)
-        // would have its FIRST LOAD draw consume this flag, take the
-        // present-boundary seed path, and bleed the CURRENT retained front frame
-        // (a different surface's pixels at +0x188) over its own ready resident —
-        // the "background/window content doesn't clear cleanly" residue class.
-        // `peer_seeded_dense_seq` was already pruned here; this set was the gap.
+        // Same rule for the presented-seq witness: a recycled id must not
+        // compare its first present against a predecessor's seq.
+        self.present.presented_dense_seq.remove(&mapping_id);
+        // Prune the present-boundary seed flag too. It marks "this mid was just
+        // presented, so its next LOAD re-seeds from the front" — a per-lifetime
+        // signal that MUST NOT survive a teardown. Left stale, a recycled
+        // mapping_id (a new, logically-unrelated surface reusing this id after
+        // DeleteIOSurfaceBacking2) would have its FIRST LOAD draw consume this
+        // flag, take the present-boundary seed path, and bleed the CURRENT
+        // retained front frame (a different surface's pixels at +0x188) over its
+        // own ready resident — the "background/window content doesn't clear
+        // cleanly" residue class.
         self.presented_needs_guest_seed.remove(&mapping_id);
-        if self.present.compositor_output_mapping == mapping_id
-            || self.present.compositor_output_source == mapping_id
-        {
-            self.present.compositor_output_mapping = 0;
-            self.present.compositor_output_source = 0;
-            self.present.compositor_output_generation = 0;
-            self.present.compositor_output_width = 0;
-            self.present.compositor_output_height = 0;
-        }
     }
 
     /// Last write class for present keep-prior decisions.
@@ -2807,6 +2077,22 @@ impl DeviceState {
     }
 
     pub fn reset(&mut self) {
+        // A translation hold that is still standing here never resolved. The
+        // hold itself is control flow — the FIFO is parked until an AIR module
+        // finishes loading and the packet is retried, not consumed — so it is
+        // census. THIS is the failure: the device went away with guest packets
+        // still parked behind a load that never completed, and those packets are
+        // lost. Reading it at the lifetime boundary needs no age, depth or
+        // timeout; the guest's own teardown is the deadline.
+        if self.translation_order_hold_mask != 0 || self.translation_deferred_mask != 0 {
+            crate::observe::fail(format!(
+                "translation_hold_unreleased held_mask={:#x} producer_mask={:#x} episodes={} \
+                 (device reset with guest packets still parked behind an AIR load)",
+                self.translation_order_hold_mask,
+                self.translation_deferred_mask,
+                self.translation_order_holds
+            ));
+        }
         let id = self.id;
         let page_shift = self.page_shift;
         // Keep the interrupt-status Arcs wired to the registry slot: the
@@ -2883,7 +2169,7 @@ impl DeviceState {
             .map(|(&gva, _)| gva)
             .collect();
         for gva in doomed {
-            if let Some(entry) = self.gva_deferred_flush.remove(&gva) {
+            if let Some(entry) = self.gva_deferred_flush.0.remove(&gva) {
                 self.deferred_ref_sub_pages(&entry.pages);
                 self.retired_gva_windows.push((gva, entry));
             }
@@ -2892,7 +2178,7 @@ impl DeviceState {
 
     /// Take the deferred GVA window at exactly `gva`, if any.
     pub fn take_gva_deferred_window(&mut self, gva: u64) -> Option<GvaDeferredEntry> {
-        let entry = self.gva_deferred_flush.remove(&gva)?;
+        let entry = self.gva_deferred_flush.0.remove(&gva)?;
         self.deferred_ref_sub_pages(&entry.pages);
         Some(entry)
     }
@@ -2904,27 +2190,9 @@ impl DeviceState {
             .iter()
             .min_by_key(|(_, e)| e.armed_seq)
             .map(|(&gva, _)| gva)?;
-        let entry = self.gva_deferred_flush.remove(&gva)?;
+        let entry = self.gva_deferred_flush.0.remove(&gva)?;
         self.deferred_ref_sub_pages(&entry.pages);
         Some((gva, entry))
-    }
-
-    /// Remove the least-recently-armed render-deferred window, for the
-    /// oldest-first flush that bounds the window population (and thus the pinned
-    /// resident count) under a compositing burst. Mirrors
-    /// [`Self::take_oldest_gva_deferred_window`]; prunes the alias index for the
-    /// window's mapping so the incremental deferred-page refcount stays exact.
-    pub fn take_oldest_render_deferred_window(
-        &mut self,
-    ) -> Option<(RenderDeferredKey, RenderDeferredEntry)> {
-        let key = *self
-            .render_deferred_flush
-            .iter()
-            .min_by_key(|(_, e)| e.armed_seq)
-            .map(|(k, _)| k)?;
-        let entry = self.render_deferred_flush.remove(&key)?;
-        self.prune_alias_index(key.mapping_id);
-        Some((key, entry))
     }
 
     pub fn define_task(&mut self, task_id: u32, length: u64, directory_pfn: u32) -> bool {
@@ -2933,12 +2201,27 @@ impl DeviceState {
             return false;
         }
         // Drop objects for this task on redefine.
-        self.objects.retain(|&(t, _), _| t != task_id);
+        self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
         self.clear_task_map_spans(task_id);
         // New directory ⇒ old GVA HostOps views alias the wrong PT — retire.
+        self.retire_task_gva_views(task_id);
+        self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
+        true
+    }
+
+    /// Retire every GVA HostOps view registered under `task_id`, plus the two
+    /// memos that carry the same invalidation contract.
+    ///
+    /// Both entry points that end a task's page table — `define_task` on a
+    /// redefine and `delete_task` on teardown — owe exactly this: the views hold
+    /// host pointers into pages the guest is about to recycle, so leaving one
+    /// live is a read of memory that no longer belongs to the surface (the
+    /// WindowServer SIGSEGV class `write_span` documents). `retired_views` is
+    /// drained by `mapper::flush_retired_views` through `HostOps::unmap_pages`.
+    fn retire_task_gva_views(&mut self, task_id: u32) {
         let mut i = 0;
         while i < self.gva_host_views.len() {
             if self.gva_host_views[i].task_id == task_id {
@@ -2952,8 +2235,6 @@ impl DeviceState {
         }
         self.guest_run_memo.retain(|e| e.task_id != task_id);
         self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
-        self.tasks[task_id as usize] = TaskEntry::define(length, directory_pfn);
-        true
     }
 
     /// Record a MapMemory2 span (guest already installed PTEs; notify only).
@@ -2969,6 +2250,117 @@ impl DeviceState {
             gva,
             length,
         });
+        self.confirm_undeclared_writes(task_id, gva, length);
+    }
+
+    /// Say so when a MapMemory2 covers a range already written while undeclared.
+    ///
+    /// This is the confirming half of the permit. The write site cannot see a
+    /// notification that has not arrived, so "the guest does declare this and we
+    /// were merely early" is only sayable from the map side, and it is the
+    /// evidence that permitting was right rather than a hope.
+    fn confirm_undeclared_writes(&mut self, task_id: u32, gva: u64, length: u64) {
+        if self.undeclared_writes.is_empty() {
+            return;
+        }
+        let span = TaskMapSpan {
+            task_id,
+            gva,
+            length,
+        };
+        let now = crate::observe::elapsed_ms() as u64;
+        let mut landed: Vec<UndeclaredWrite> = Vec::new();
+        self.undeclared_writes.retain(|r| {
+            if r.task_id != task_id || !span.covers(r.gva, r.len) {
+                return true;
+            }
+            landed.push(*r);
+            false
+        });
+        for r in landed {
+            let late_ms = now.saturating_sub(r.at_ms);
+            crate::observe::off(format!(
+                "write_gate_late_map task={} gva={:#x} len={:#x} via={} \
+                 span_gva={gva:#x} span_len={length:#x} late_ms={late_ms}",
+                r.task_id, r.gva, r.len, r.via
+            ));
+        }
+    }
+
+    /// Hold a range written while undeclared, for
+    /// [`Self::confirm_undeclared_writes`]. Returns whether it was newly
+    /// recorded.
+    ///
+    /// The write proceeds — see [`WriteGate`] for why a notification cannot
+    /// authorise anything — but a host→guest write outside everything the guest
+    /// has told us about is the shape the open memory-corruption signature would
+    /// take, so it goes on the record with the rail that issued it. Callers emit
+    /// their own line and use the return value to do so **once per distinct
+    /// range**: a per-row writer touching the same bytes every frame would
+    /// otherwise flood the log and evict older, different findings out of the
+    /// ring, and the readouts worth printing alongside cost a page walk.
+    pub fn note_undeclared_write(
+        &mut self,
+        task_id: u32,
+        gva: u64,
+        len: u64,
+        via: &'static str,
+    ) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = gva.saturating_add(len);
+        // Coalesce rather than dedup on the exact range. Several rails write one
+        // region a row at a time — `copy_region` walks `dst_row_stride`, the
+        // linear fallback walks `row_stride` — so an exact-match dedup would
+        // record 135 entries for one 135-row texture, flood the log and evict
+        // every older finding. Overlapping or touching ranges are one region and
+        // one finding; merging them also makes the confirming MapMemory2 prove
+        // coverage of the whole region rather than of its first row.
+        for r in &mut self.undeclared_writes {
+            if r.task_id != task_id || r.via != via {
+                continue;
+            }
+            let r_end = r.gva.saturating_add(r.len);
+            if gva > r_end || end < r.gva {
+                continue;
+            }
+            let lo = r.gva.min(gva);
+            r.len = r_end.max(end).saturating_sub(lo);
+            r.gva = lo;
+            return false;
+        }
+        // Evicting an entry means no MapMemory2 ever covered it. That is the
+        // reading this whole pair exists to make legible, and it is the one that
+        // cannot be taken at the write site: it is knowable only by outliving
+        // the notification that should have arrived. Healthy operation retires
+        // every entry in tens of milliseconds and never gets here.
+        //
+        // Latched per (task, rail): a run that is genuinely writing memory the
+        // guest never declares would otherwise emit this at the rate it writes,
+        // and the second line adds nothing the first did not say.
+        if self.undeclared_writes.len() >= UNDECLARED_WRITE_RING {
+            let old = self.undeclared_writes.remove(0);
+            if crate::observe::first_sight(
+                "write_gate_never_declared",
+                (u64::from(old.task_id) << 32) ^ old.via.len() as u64 ^ old.via.as_ptr() as u64,
+            ) {
+                let age_ms = (crate::observe::elapsed_ms() as u64).saturating_sub(old.at_ms);
+                crate::observe::fail(format!(
+                    "write_gate_never_declared task={} gva={:#x} len={:#x} via={} age_ms={age_ms} \
+                     outstanding={UNDECLARED_WRITE_RING}",
+                    old.task_id, old.gva, old.len, old.via
+                ));
+            }
+        }
+        self.undeclared_writes.push(UndeclaredWrite {
+            task_id,
+            gva,
+            len,
+            at_ms: crate::observe::elapsed_ms() as u64,
+            via,
+        });
+        true
     }
 
     /// Drop MapMemory2 spans overlapping Unmap `[gva, gva+length)`.
@@ -2991,23 +2383,177 @@ impl DeviceState {
         self.task_map_spans.retain(|s| s.task_id != task_id);
     }
 
-    /// Product GVA write gate: if this task has any recorded MapMemory2 spans,
-    /// `[gva, gva+len)` must be fully covered by one span. Empty registry ⇒ allow
-    /// (unit fixtures and pre-Map paths).
-    pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
+    /// Classify `[gva, gva+len)` against the MapMemory2 spans this task has
+    /// notified so far. **A reading, not a permission** — see [`WriteGate`].
+    ///
+    /// Callers report `Undeclared` through
+    /// [`Self::note_undeclared_write`] and proceed. The check that actually
+    /// bounds a host→guest write is the page-table walk every writer performs
+    /// at write time, which fails closed on an unmapped page; this one says
+    /// whether the guest has got round to telling us about the allocation yet,
+    /// and the answer is routinely "not yet".
+    pub fn gva_write_gate(&self, task_id: u32, gva: u64, len: u64) -> WriteGate {
         if len == 0 {
-            return true;
+            return WriteGate::Exact;
         }
-        let has_any = self.task_map_spans.iter().any(|s| {
-            s.task_id == task_id || s.task_id == (task_id >> 1) || (s.task_id << 1) == task_id
-        });
-        if !has_any {
-            return true;
+        // Spans filed by `task_id` and nothing else. This used to also accept a
+        // span filed under `task_id >> 1`, which is the wire-word halving that
+        // `runtime::task_slot` already refuted and removed from the command
+        // resolvers: `MapMemory2` files spans under slot ids (`0x5`, `0x7`,
+        // `0x9`), which the `DefineTask2` wire space does not contain, so
+        // halving a slot id names a **different task**. The gate was therefore
+        // authorising a write with a different task's map — and the write that
+        // followed walked the *named* task's page tables, because
+        // `gva_view::resolve_task_for_walk` never halves. Authorisation and
+        // destination came from two different address spaces.
+        let mut saw_any = false;
+        for s in &self.task_map_spans {
+            if s.task_id != task_id {
+                continue;
+            }
+            saw_any = true;
+            if s.covers(gva, len) {
+                return WriteGate::Exact;
+            }
         }
-        self.task_map_spans.iter().any(|s| {
-            (s.task_id == task_id || s.task_id == (task_id >> 1) || (s.task_id << 1) == task_id)
-                && s.covers(gva, len)
-        })
+        if saw_any {
+            WriteGate::Undeclared
+        } else {
+            WriteGate::NoSpans
+        }
+    }
+
+    /// Every task id holding a span that covers `[gva, gva+len)`, ascending and
+    /// deduplicated. **Readout only** — [`Self::gva_write_gate`] does not call
+    /// this and nothing may branch on it.
+    ///
+    /// This exists because the gate cannot answer it. The gate considers spans
+    /// filed under the writing task and no other, which is the whole point of
+    /// it; what a refusal leaves unknown is whether some *other* task declared
+    /// this range, and the only way to see that is to look without the filter.
+    /// A refused write whose `owners` names one specific other task every time
+    /// is a decode question about which key space that opcode's word is in — it
+    /// is not licence to write through the named task's page tables anyway,
+    /// which is what the removed alias arm did.
+    ///
+    /// Ambiguity is a property of the registry at the instant of the write, so
+    /// it is read from the registry rather than counted from map/unmap events: a
+    /// count of registrations would say how many spans were filed, never which
+    /// of them authorise this particular range right now.
+    pub fn tasks_covering(&self, gva: u64, len: u64) -> Vec<u32> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut owners: Vec<u32> = self
+            .task_map_spans
+            .iter()
+            .filter(|s| s.covers(gva, len))
+            .map(|s| s.task_id)
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        owners
+    }
+
+    /// How many MapMemory2 spans the registry holds in total, across all tasks.
+    ///
+    /// Pairs with [`WriteGate::NoSpans`], whose name overstates what it saw: it
+    /// means "no span for this task or its one alias", which is not the same as
+    /// an empty registry, and only one of those two is "the gate did not run".
+    pub fn task_map_span_count(&self) -> usize {
+        self.task_map_spans.len()
+    }
+
+    /// How many spans `task_id` has filed of its own, ignoring every other task.
+    ///
+    /// Separates the two things [`WriteGate::Aliased`] currently collapses. If
+    /// the writing task has registered nothing, the honest reading is that its
+    /// bounds check did not run and a neighbour's span was found by the alias
+    /// search — an ordering fact. If it has spans and none covers, the range is
+    /// one the guest never mapped for it — a bounds fact. Neither is visible
+    /// from the arm alone, and they call for opposite fixes.
+    pub fn task_own_span_count(&self, task_id: u32) -> usize {
+        self.task_map_spans
+            .iter()
+            .filter(|s| s.task_id == task_id)
+            .count()
+    }
+
+    /// Where a refused range sits relative to the spans the writing task filed
+    /// **for itself**, at page granularity.
+    ///
+    /// The refusal already says the range is not covered by one span. That is
+    /// consistent with at least three different defects and the fix differs for
+    /// each, so the line has to say which:
+    ///
+    /// - `union == pages` — every page *is* declared, just not by a single
+    ///   span, and [`Self::gva_write_gate`]'s one-span rule is the whole bug.
+    /// - `union == 0` and the range sits outside `[lo, hi)` — the task uses an
+    ///   allocation regime it never declares, so `task_map_spans` is not an
+    ///   authorization set at all and no relaxation of the rule can help.
+    /// - `union == 0` inside `[lo, hi)` — a hole between declared spans, which
+    ///   points at [`Self::note_task_unmap`] dropping more than it should, or a
+    ///   map we never recorded.
+    ///
+    /// Counted per page rather than per byte because that is the granularity
+    /// the guest's own page tables and every walk in this crate work in, and a
+    /// partial page cannot be authorised separately from the page holding it.
+    pub fn task_span_readout(
+        &self,
+        task_id: u32,
+        gva: u64,
+        len: u64,
+        page_shift: u32,
+    ) -> TaskSpanReadout {
+        let mut out = TaskSpanReadout::default();
+        if len == 0 {
+            return out;
+        }
+        let page = 1u64 << page_shift;
+        let first = gva & !(page - 1);
+        let last = gva.saturating_add(len - 1) & !(page - 1);
+        out.pages = ((last - first) >> page_shift).saturating_add(1);
+        let end = gva.saturating_add(len);
+        for s in self.task_map_spans.iter().filter(|s| s.task_id == task_id) {
+            let s_end = s.gva.saturating_add(s.length);
+            out.lo = if out.own == 0 {
+                s.gva
+            } else {
+                out.lo.min(s.gva)
+            };
+            out.hi = out.hi.max(s_end);
+            out.own += 1;
+            // Distance to the nearest declared span, 0 when one overlaps at all.
+            // An overlapping-but-not-covering span is a different finding from a
+            // range that lands nowhere near anything the task declared, and the
+            // single-span rule renders both as `Outside`.
+            let gap = if s.gva < end && gva < s_end {
+                0
+            } else if s.gva >= end {
+                s.gva - end
+            } else {
+                gva - s_end
+            };
+            out.nearest_gap = Some(out.nearest_gap.map_or(gap, |g: u64| g.min(gap)));
+        }
+        // Second pass: page coverage by the union. Separate from the extent scan
+        // above because a page is covered by *any* span, so it cannot be decided
+        // while still walking them.
+        let mut cur = first;
+        loop {
+            let covered = self
+                .task_map_spans
+                .iter()
+                .any(|s| s.task_id == task_id && s.covers(cur, page));
+            if covered {
+                out.union += 1;
+            }
+            if cur == last {
+                break;
+            }
+            cur += page;
+        }
+        out
     }
 
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
@@ -3020,7 +2566,7 @@ impl DeviceState {
         if !self.tasks[task_id as usize].active {
             return false;
         }
-        self.objects.retain(|&(t, _), _| t != task_id);
+        self.objects.retain(|&(t, _)| t != task_id);
         self.retire_task_linear_residents(task_id);
         self.retire_task_gva_windows(task_id);
         self.host_linear_textures.retain(|&(t, _), _| t != task_id);
@@ -3041,19 +2587,7 @@ impl DeviceState {
         // Task teardown ≡ all GPU VA maps for this task go away — retire any
         // HostOps views we held (does not touch host_gva_surfaces encode).
         // Runtime flushes retired_views via HostOps::unmap_pages.
-        let mut i = 0;
-        while i < self.gva_host_views.len() {
-            if self.gva_host_views[i].task_id == task_id {
-                let v = self.gva_host_views.swap_remove(i);
-                if v.ptr != 0 && v.ptr_len != 0 {
-                    self.retired_views.push((v.ptr, v.ptr_len));
-                }
-            } else {
-                i += 1;
-            }
-        }
-        self.guest_run_memo.retain(|e| e.task_id != task_id);
-        self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
+        self.retire_task_gva_views(task_id);
         self.tasks[task_id as usize] = TaskEntry::default();
         true
     }
@@ -3072,7 +2606,7 @@ impl DeviceState {
         true
     }
 
-    pub fn insert_object(&mut self, task_id: u32, ref_: u32, entry: ObjectEntry) -> bool {
+    pub fn insert_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let discriminant = (u64::from(task_id) << 32) | u64::from(ref_);
         if task_id as usize >= MAX_TASKS {
             StateMutationDecline::InsertObjectTaskIdRange {
@@ -3090,12 +2624,12 @@ impl DeviceState {
             .emit(discriminant);
             return false;
         }
-        self.objects.insert((task_id, ref_), entry);
+        self.objects.insert((task_id, ref_));
         true
     }
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
-        let removed = self.objects.remove(&(task_id, ref_)).is_some();
+        let removed = self.objects.remove(&(task_id, ref_));
         if removed {
             self.host_texture_surfaces.remove(&ref_);
             if let Some(e) = self.host_linear_textures.remove(&(task_id, ref_)) {
@@ -3108,19 +2642,11 @@ impl DeviceState {
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
     ///
-    /// The bump orphans any generation-keyed resident for the mapping — for a
-    /// large surface that moment is load-bearing when diagnosing sample
-    /// fallback classes, so it traces under `REIMS_VGPU_DRAW_LOG=1`.
-    pub fn bump_map_generation(mapping_id: u32, e: &mut MappingEntry) {
+    /// The bump orphans any generation-keyed resident for the mapping.
+    pub fn bump_map_generation(e: &mut MappingEntry) {
         e.map_generation = e.map_generation.wrapping_add(1);
         if e.map_generation == 0 {
             e.map_generation = 1;
-        }
-        if crate::observe::enabled() && (e.width as u64) * (e.height as u64) >= 250_000 {
-            crate::observe::line(format!(
-                "map_gen_bump mid={mapping_id} {}x{} gen={}",
-                e.width, e.height, e.map_generation
-            ));
         }
     }
 
@@ -3135,6 +2661,24 @@ impl DeviceState {
         });
     }
 
+    /// Remove one deferred window by exact key, pruning the alias index with it.
+    ///
+    /// For supersede: a writer that fully covers a window's guest range drops
+    /// the obligation instead of landing it, and must not disturb the
+    /// intersecting siblings [`Self::take_deferred_flush_windows`] would also
+    /// take. Going through here rather than `compute_deferred_flush.remove`
+    /// keeps the raw-GVA alias index in step — a mapping whose last window
+    /// leaves must lose its page refs, or the union index keeps counting pages
+    /// nothing defers on.
+    pub fn take_deferred_flush_window_exact(
+        &mut self,
+        key: &ComputeStorageResidencyKey,
+    ) -> Option<DeferredOwner> {
+        let owner = self.compute_deferred_flush.remove(key)?;
+        self.prune_alias_index(key.mapping_id);
+        Some(owner)
+    }
+
     /// Remove and return every deferred-writeback window intersecting
     /// `[lo, hi)` on this mapping. The caller owns flushing each returned
     /// entry (or reporting the loss) — once taken, the map no longer names it.
@@ -3143,7 +2687,7 @@ impl DeviceState {
         mapping_id: u32,
         lo: u64,
         hi: u64,
-    ) -> Vec<(ComputeStorageResidencyKey, u32)> {
+    ) -> Vec<(ComputeStorageResidencyKey, DeferredOwner)> {
         let keys: Vec<ComputeStorageResidencyKey> = self
             .compute_deferred_flush
             .keys()
@@ -3152,43 +2696,12 @@ impl DeviceState {
             })
             .cloned()
             .collect();
-        let taken: Vec<(ComputeStorageResidencyKey, u32)> = keys
+        let taken: Vec<(ComputeStorageResidencyKey, DeferredOwner)> = keys
             .into_iter()
             .filter_map(|key| {
                 self.compute_deferred_flush
                     .remove(&key)
-                    .map(|gen| (key, gen))
-            })
-            .collect();
-        if !taken.is_empty() {
-            self.prune_alias_index(mapping_id);
-        }
-        taken
-    }
-
-    /// Remove and return every deferred render-Store window intersecting
-    /// `[lo, hi)` on this mapping. Same take-then-flush ownership contract as
-    /// [`Self::take_deferred_flush_windows`].
-    pub fn take_render_deferred_windows(
-        &mut self,
-        mapping_id: u32,
-        lo: u64,
-        hi: u64,
-    ) -> Vec<(RenderDeferredKey, RenderDeferredEntry)> {
-        let keys: Vec<RenderDeferredKey> = self
-            .render_deferred_flush
-            .keys()
-            .filter(|key| {
-                key.mapping_id == mapping_id && key.span_end > lo && key.surface_offset < hi
-            })
-            .cloned()
-            .collect();
-        let taken: Vec<(RenderDeferredKey, RenderDeferredEntry)> = keys
-            .into_iter()
-            .filter_map(|key| {
-                self.render_deferred_flush
-                    .remove(&key)
-                    .map(|entry| (key, entry))
+                    .map(|owner| (key, owner))
             })
             .collect();
         if !taken.is_empty() {
@@ -3219,26 +2732,22 @@ impl DeviceState {
             self.deferred_ref_sub_pages(&old);
         }
         if set.is_empty() {
-            self.deferred_alias_pages.remove(&mapping_id);
+            self.deferred_alias_pages.0.remove(&mapping_id);
         } else {
             self.deferred_ref_add_pages(&set);
-            self.deferred_alias_pages.insert(mapping_id, set);
+            self.deferred_alias_pages.0.insert(mapping_id, set);
         }
     }
 
-    /// Drop the alias-index entry once no deferred window (compute or render)
-    /// names this mapping anymore.
+    /// Drop the alias-index entry once no mapping-keyed deferred window names
+    /// this mapping anymore.
     fn prune_alias_index(&mut self, mapping_id: u32) {
         let live = self
             .compute_deferred_flush
             .keys()
-            .any(|k| k.mapping_id == mapping_id)
-            || self
-                .render_deferred_flush
-                .keys()
-                .any(|k| k.mapping_id == mapping_id);
+            .any(|k| k.mapping_id == mapping_id);
         if !live {
-            if let Some(old) = self.deferred_alias_pages.remove(&mapping_id) {
+            if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
                 self.deferred_ref_sub_pages(&old);
             }
         }
@@ -3257,13 +2766,11 @@ impl DeviceState {
         e.page_entries.clear();
         e.page_table_kva = 0;
         e.condemned_entries = None;
-        Self::bump_map_generation(mapping_id, e);
+        Self::bump_map_generation(e);
         let retired = Self::take_mapping_view(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         had
     }
 
@@ -3279,7 +2786,7 @@ impl DeviceState {
     pub fn condemn_surface_backing(&mut self, mapping_id: u32) -> bool {
         self.forget_compositor_mapping(mapping_id);
         self.host_surfaces.remove(&mapping_id);
-        if let Some(old) = self.deferred_alias_pages.remove(&mapping_id) {
+        if let Some(old) = self.deferred_alias_pages.0.remove(&mapping_id) {
             self.deferred_ref_sub_pages(&old);
         }
         let Some(e) = self.mappings.get_mut(&mapping_id) else {
@@ -3294,8 +2801,6 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         true
     }
 
@@ -3333,6 +2838,7 @@ impl DeviceState {
         e.page_table_kva = 0;
         e.device_desc.clear();
         e.content_generation = 0;
+        e.surface_content_epoch = 0;
         e.has_geom = false;
         e.width = 0;
         e.height = 0;
@@ -3341,15 +2847,15 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
-        // any present evidence — the slot may hold a NEW surface (a stale
-        // presented_geoms entry could wrongly qualify a recycled publish-only
-        // surface for OutputGroup unification).
+        // any present evidence — the slot may hold a NEW surface.
         self.host_surfaces.remove(&mapping_id);
-        self.present.presented_geoms.remove(&mapping_id);
-        crate::runtime::census::present_proxy::forget_display_store_sample(mapping_id);
+        // Present evidence is stamped with the incarnation and deliberately NOT
+        // dropped here. A fresh MAP does not yet know whether this is a new
+        // surface — that is what the fingerprint compare decides, bumping the
+        // generation when it is. Dropping it eagerly demoted a proven swapchain
+        // buffer to a private resident for every draw until its next present,
+        // which is the black-desktop class.
         true
     }
 
@@ -3366,7 +2872,7 @@ impl DeviceState {
             e.condemned_entries = None;
             e.mapping_internal = 0;
             e.device_desc.clear();
-            Self::bump_map_generation(mapping_id, e);
+            Self::bump_map_generation(e);
             e.has_geom = false;
             e.width = 0;
             e.height = 0;
@@ -3375,8 +2881,6 @@ impl DeviceState {
             if let Some(v) = retired {
                 self.retired_views.push(v);
             }
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
             self.host_surfaces.remove(&mapping_id);
             true
         } else {
@@ -3410,7 +2914,8 @@ impl DeviceState {
         e.condemned_entries = None;
         e.device_desc.clear();
         e.content_generation = 0;
-        Self::bump_map_generation(mapping_id, e);
+        e.surface_content_epoch = 0;
+        Self::bump_map_generation(e);
         // New MappingInternal ⇒ new surface; force device-desc re-resolve.
         e.has_geom = false;
         e.width = 0;
@@ -3420,11 +2925,10 @@ impl DeviceState {
         if let Some(v) = retired {
             self.retired_views.push(v);
         }
-        #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-        crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
-        // New MappingInternal ⇒ new surface: stale present evidence must not
-        // qualify the recycled slot for OutputGroup unification.
-        self.present.presented_geoms.remove(&mapping_id);
+        // New MappingInternal ⇒ new surface, and the `bump_map_generation`
+        // above is what retires the stale present evidence: it is stamped with
+        // the incarnation that recorded it, so the recycled slot cannot inherit
+        // a display-plane qualification it did not earn.
         true
     }
 
@@ -3475,12 +2979,10 @@ impl DeviceState {
         }
         let e = self.mappings.entry(mapping_id).or_default();
         // Geom change (mode switch / rematerialize) is a new surface identity:
-        // reset content_generation and drop the cached Metal texture object
-        // (its descriptor no longer matches; the guest pages stay authoritative).
+        // reset content_generation (the guest pages stay authoritative).
         if e.width != width || e.height != height {
             e.content_generation = 0;
-            #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-            crate::backend::metal::runtime::type11_guest_texture_invalidate(mapping_id);
+            e.surface_content_epoch = 0;
         }
         e.has_geom = true;
         e.width = width;
@@ -3489,19 +2991,61 @@ impl DeviceState {
         true
     }
 
+    /// Issue a sampled-content generation that has never been issued before.
+    ///
+    /// Every producer of a sampled-content identity must take its generation
+    /// from here and nowhere else. The value is what the engine's sampled
+    /// cache binds on without looking at a single byte, so "never issued
+    /// before" is the whole of the contract — see
+    /// [`Self::sampled_content_gen`]. Never returns 0, which readers use for
+    /// "no host content yet".
+    pub fn next_sampled_content_generation(&mut self) -> u64 {
+        self.sampled_content_gen = self.sampled_content_gen.wrapping_add(1);
+        if self.sampled_content_gen == 0 {
+            self.sampled_content_gen = 1;
+        }
+        self.sampled_content_gen
+    }
+
     /// Bump content generation after a write into the mapping (0 never skips).
+    ///
+    /// Also advances [`MappingEntry::surface_content_epoch`], so every one of
+    /// this crate's guest-page writers keeps that epoch closed for free — the
+    /// completeness property the type-11 `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
-        let seq = self.store_seq.wrapping_add(1);
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
-        self.store_seq = seq;
-        m.last_store_seq = seq;
         m.content_generation = m.content_generation.wrapping_add(1);
         if m.content_generation == 0 {
             m.content_generation = 1;
         }
+        m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
         m.content_generation
+    }
+
+    /// Advance [`MappingEntry::surface_content_epoch`] for a publish that
+    /// changed the mapping's pixels *without* writing its guest pages — the
+    /// deferred type-11 Store, which stores the frame into `surface_cache` and
+    /// arms a window. Returns the new epoch so the caller can stamp the
+    /// resident that holds those pixels in the same breath; the two must not be
+    /// separable, or the stamp records a currency that already moved.
+    pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
+        let Some(m) = self.mappings.get_mut(&mapping_id) else {
+            return 0;
+        };
+        m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        m.surface_content_epoch
+    }
+
+    /// Wrapping increment that never lands on 0, so 0 keeps meaning "no content
+    /// published since attach" and cannot be matched by a resident's own
+    /// unstamped default.
+    fn next_epoch(epoch: u32) -> u32 {
+        match epoch.wrapping_add(1) {
+            0 => 1,
+            n => n,
+        }
     }
 
     pub fn record_fail(&mut self, ev: FailEvent) {
@@ -3522,7 +3066,7 @@ impl DeviceState {
 #[cfg(test)]
 mod fail_vocabulary_tests {
     use super::*;
-    use crate::observe::{Decline, REGISTRY};
+    use crate::observe::Decline;
 
     /// Every `FailEvent` names a *specific* check. Written as one assertion per
     /// variant rather than a loop so the expected slug is visible next to the
@@ -3647,20 +3191,6 @@ mod fail_vocabulary_tests {
         let count = slugs.len();
         slugs.dedup();
         assert_eq!(slugs.len(), count, "two packet faults share a slug");
-
-        // And every one of them is registered, so the crate-wide uniqueness and
-        // log-safety gates actually cover them.
-        let row = REGISTRY
-            .iter()
-            .find(|c| c.type_name == "FailEvent")
-            .expect("FailEvent is registered");
-        for f in ALL {
-            assert!(
-                row.slugs.contains(&f.slug()),
-                "{} is not in the registry row",
-                f.slug()
-            );
-        }
     }
 
     #[test]
@@ -3696,20 +3226,15 @@ mod fail_vocabulary_tests {
                 height: crate::model::MAX_SCANOUT_DIM + 1,
             },
         ];
-        let row = REGISTRY
-            .iter()
-            .find(|class| class.type_name == "StateMutationDecline")
-            .expect("state mutation declines are registered");
         let mut slugs = std::collections::HashSet::new();
         for decline in declines {
             assert!(slugs.insert(decline.slug()), "duplicate {}", decline.slug());
-            assert!(
-                row.slugs.contains(&decline.slug()),
-                "{} is not registered",
-                decline.slug()
-            );
         }
-        assert_eq!(slugs.len(), row.slugs.len());
+        assert_eq!(
+            slugs.len(),
+            17,
+            "every state mutation check has its own slug"
+        );
         assert_eq!(
             crate::observe::Emit::decline(
                 "model_state_mutation",
@@ -3733,5 +3258,124 @@ mod fail_vocabulary_tests {
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
+    }
+
+    /// `Outside` is one word for at least three defects, and each wants a
+    /// different fix. The readout has to separate them or the refusal is a dead
+    /// end — which is where the live rail has been sitting.
+    #[test]
+    fn a_refused_range_is_placed_against_the_tasks_own_spans() {
+        const SH: u32 = crate::model::PAGE_SHIFT_X86;
+        let page = 1u64 << SH;
+        let mut state = DeviceState::new(DeviceId(1), SH);
+
+        // Two adjacent declarations and a write straddling the seam. Neither
+        // span covers it, so the gate refuses — and every page is declared.
+        state.note_task_map(1, 0x10000, 2 * page);
+        state.note_task_map(1, 0x12000, 2 * page);
+        assert_eq!(
+            state.gva_write_gate(1, 0x11000, 2 * page),
+            WriteGate::Undeclared
+        );
+        let seam = state.task_span_readout(1, 0x11000, 2 * page, SH);
+        assert_eq!(
+            (seam.pages, seam.union),
+            (2, 2),
+            "the union declares every page, so the one-span rule is the refusal"
+        );
+        assert_eq!(
+            seam.nearest_gap,
+            Some(0),
+            "a span overlaps without covering"
+        );
+
+        // Far outside anything the task declared: no relaxation of the covering
+        // rule reaches this, and the two must not render alike.
+        let away = state.task_span_readout(1, 0x900000, page, SH);
+        assert_eq!((away.pages, away.union), (1, 0));
+        assert_eq!((away.lo, away.hi), (0x10000, 0x14000));
+        assert_eq!(
+            away.nearest_gap,
+            Some(0x900000 - 0x14000),
+            "distance to the nearest declaration, not merely that there is none"
+        );
+        assert_ne!(seam.union, away.union);
+
+        // A hole *between* declarations, inside the extent: same `union == 0` as
+        // the far case, told apart by sitting within `[lo, hi)`.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        state.note_task_map(1, 0x10000, page);
+        state.note_task_map(1, 0x12000, page);
+        let hole = state.task_span_readout(1, 0x11000, page, SH);
+        assert_eq!((hole.pages, hole.union, hole.own), (1, 0, 2));
+        assert!(
+            hole.gva_inside_extent(0x11000),
+            "inside the declared extent is what separates a hole from a foreign range"
+        );
+
+        // A task that filed nothing has no nearest span — not a gap of zero,
+        // which is what an overlap reports.
+        let none = state.task_span_readout(9, 0x11000, page, SH);
+        assert_eq!((none.own, none.union), (0, 0));
+        assert_eq!(none.nearest_gap, None);
+    }
+
+    /// A refusal cannot see a declaration that has not arrived yet, so the two
+    /// halves have to be joined from the map side.
+    #[test]
+    fn a_later_map_covering_a_refused_range_retires_it() {
+        const SH: u32 = crate::model::PAGE_SHIFT_X86;
+        let page = 1u64 << SH;
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        state.note_undeclared_write(1, 0x20000, page, "test");
+
+        // A map that does not cover it, and one for another task, both leave the
+        // record standing — otherwise absence would stop meaning "never
+        // declared".
+        state.note_task_map(1, 0x30000, page);
+        state.note_task_map(2, 0x20000, page);
+        assert_eq!(state.undeclared_writes.len(), 1);
+
+        // Partial cover is not cover: the write needed all of it.
+        state.note_task_map(1, 0x20000, page / 2);
+        assert_eq!(state.undeclared_writes.len(), 1);
+
+        state.note_task_map(1, 0x1f000, 4 * page);
+        assert!(
+            state.undeclared_writes.is_empty(),
+            "a covering span retires the record, which is what emits the report"
+        );
+
+        // A per-row caller re-refusing the same bytes must not evict older,
+        // different findings out of the ring.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        for _ in 0..(UNDECLARED_WRITE_RING * 4) {
+            state.note_undeclared_write(1, 0x20000, page, "test");
+        }
+        assert_eq!(state.undeclared_writes.len(), 1);
+        // Adjacent ranges coalesce into one region rather than filling the ring
+        // — that is what keeps a row-at-a-time writer from evicting every other
+        // finding, and it is why the cap has to be exercised with gaps.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        for i in 0..(UNDECLARED_WRITE_RING as u64 * 2) {
+            state.note_undeclared_write(1, 0x40000 + i * page, page, "test");
+        }
+        assert_eq!(
+            state.undeclared_writes.len(),
+            1,
+            "one contiguous region, however many calls describe it"
+        );
+        assert_eq!(state.undeclared_writes[0].gva, 0x40000);
+        assert_eq!(
+            state.undeclared_writes[0].len,
+            page * UNDECLARED_WRITE_RING as u64 * 2
+        );
+
+        // Separated by a gap, they are distinct findings and the cap holds.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        for i in 0..(UNDECLARED_WRITE_RING as u64 * 2) {
+            state.note_undeclared_write(1, 0x100000 + i * 4 * page, page, "test");
+        }
+        assert_eq!(state.undeclared_writes.len(), UNDECLARED_WRITE_RING);
     }
 }

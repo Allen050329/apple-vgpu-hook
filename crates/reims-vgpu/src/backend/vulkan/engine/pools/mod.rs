@@ -2,9 +2,6 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-mod host_import;
-use host_import::{capped_import_window, vma_bounds, HOST_IMPORT_WINDOW_CAP};
-
 use ash::vk;
 use ash::vk::Handle;
 use std::collections::{HashMap, VecDeque};
@@ -12,18 +9,14 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::caches::{BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches};
 use super::compute_execution::ComputeExecutionDecline;
 use super::context::{DeviceContext, FENCE_TIMEOUT_NS};
 use super::counters::EngineCounters;
 use super::desc_arena::{DescriptorArena, DESC_BLOCK_MAX_SETS};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
-use super::host_import_decline::HostImportDecline;
-use super::host_scatter;
-use super::stats_reduce;
 use super::types::{DrawError, StorageImageFormat, TargetIdentity};
 use super::vk_call::{VkCall, VkOp};
-use crate::backend::vulkan::caps::MemoryClass;
+use crate::backend::vulkan::caps::{MappedMemoryKind, MemoryClass};
 use crate::backend::vulkan::translate;
 use crate::model::ComputeStorageResidencyKey;
 
@@ -34,11 +27,32 @@ pub(crate) struct TargetKey {
     pub with_transfer_dst: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct BufferSlot {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub size: u64,
+    /// Host address of `memory`, mapped for the slot's whole lifetime, or 0 when
+    /// the slot is not persistently mapped (the readback pools).
+    ///
+    /// A `usize` rather than a pointer so [`crate::backend::vulkan::engine`]'s
+    /// state stays `Send` — the same reason `GuestRun::host_ptr` is one.
+    ///
+    /// Staging memory is HOST_VISIBLE|HOST_COHERENT by construction
+    /// (`MemoryClass::Upload` requires both), so a persistent map needs no
+    /// flush — exactly as the map/write/unmap form it replaces needed none.
+    /// Vulkan permits a memory object to stay mapped for its lifetime, and
+    /// `vkFreeMemory` unmaps implicitly, so no teardown changes.
+    pub mapped: usize,
+    /// Whether `memory`'s type carries `HOST_COHERENT`.
+    ///
+    /// `MemoryClass::Readback` prefers `HOST_CACHED` over coherence, because a
+    /// cached read is an order of magnitude faster and several drivers (Intel
+    /// ANV among them) expose no type carrying both. A reader of a slot whose
+    /// memory is not coherent owes `vkInvalidateMappedMemoryRanges` before it
+    /// touches the mapping, so the slot states the property rather than leaving
+    /// each reader to re-derive it from the type index.
+    pub coherent: bool,
 }
 
 pub(crate) struct TargetSlot {
@@ -53,6 +67,15 @@ pub(crate) struct ResourcePools {
     staging_free: HashMap<u64, Vec<BufferSlot>>,
     /// In-use staging slots returned after submit/wait.
     staging_live: Vec<BufferSlot>,
+    /// Staging free-list hits / misses and the miss bucket histogram; see
+    /// `note_staging_miss`. Measure-only.
+    staging_hits: u64,
+    staging_misses: u64,
+    staging_miss_bins: [usize; STAGING_BUCKET_BINS],
+    staging_miss_us_bins: [u64; STAGING_BUCKET_BINS],
+    /// `staging_hits + staging_misses` at the previous fired idle pass; see
+    /// `note_drain_settled`.
+    settled_staging_mark: u64,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -147,19 +170,6 @@ pub(crate) struct ResourcePools {
     /// a per-key or the global cap was full (an all-new-geometry compute burst).
     storage_recycle_admits: u64,
     storage_recycle_cap_drops: u64,
-    /// VK_EXT_external_memory_host imports over guest-RAM host VAs (direct
-    /// RAMBlock aliases — stable for the VM lifetime, so entries are never
-    /// evicted; freed only at teardown). Each entry carries a TRANSFER_SRC
-    /// buffer bound over the whole import for zero-copy guest gathers.
-    host_imports: Vec<HostImportRegion>,
-    /// One-shot guards for fail-visible import-budget declines.
-    host_import_count_cap_logged: bool,
-    host_import_zero_len_logged: bool,
-    host_import_no_ext_logged: bool,
-    host_import_byte_cap_logged: bool,
-    /// GPU-side present-proxy stats reduction (the zero-copy oracle).
-    stats_reduce: stats_reduce::StatsReducePool,
-    host_scatter: host_scatter::HostScatterPool,
     /// Open draw batch: a ring slot whose CB is still recording deferred
     /// same-target draws (submit pending). While `Some`, that CB references
     /// live GPU objects exactly like an in-flight CB, so dispose/graveyard
@@ -197,162 +207,6 @@ pub(crate) struct OpenBatch {
         std::sync::Arc<Vec<u8>>,
         Option<crate::backend::vulkan::engine::SampledContentIdentity>,
     )>,
-}
-
-/// One cached VK_EXT_external_memory_host import over a guest-RAM host-VA
-/// range, with a TRANSFER_SRC buffer bound over the whole range. `base`/`len`
-/// are the aligned import bounds; any request fully inside them resolves to
-/// `(buffer, ptr - base)`.
-pub(crate) struct HostImportRegion {
-    base: usize,
-    len: u64,
-    memory: vk::DeviceMemory,
-    buffer: vk::Buffer,
-}
-
-/// Arm's retained `mach_vm_remap` views are separate small VM regions, so a
-/// desktop legitimately exceeds the old 32-entry Linux/RAMBlock assumption.
-/// Bound both object count and total registered bytes: the count limits Vulkan
-/// objects while the byte cap prevents many maximum-size windows from pinning
-/// the guest's whole RAM allocation.
-const HOST_IMPORT_REGION_CAP: usize = 512;
-const HOST_IMPORT_TOTAL_BYTE_CAP: u64 = HOST_IMPORT_WINDOW_CAP;
-
-fn host_import_budget(
-    region_count: usize,
-    imported_bytes: u64,
-    candidate_bytes: u64,
-) -> Result<(), HostImportDecline> {
-    if region_count >= HOST_IMPORT_REGION_CAP {
-        return Err(HostImportDecline::RegionCount);
-    }
-    if imported_bytes.saturating_add(candidate_bytes) > HOST_IMPORT_TOTAL_BYTE_CAP {
-        return Err(HostImportDecline::TotalBytes);
-    }
-    Ok(())
-}
-
-fn terminal_host_import_error(
-    last_error: Option<DrawError>,
-    host_ptr: usize,
-    len: u64,
-    alignment: u64,
-) -> DrawError {
-    last_error.unwrap_or_else(|| {
-        DrawError::HostImport(HostImportDecline::NoValidWindow {
-            host_ptr,
-            len,
-            alignment,
-        })
-    })
-}
-
-fn resolve_scatter_regions(
-    runs: &[host_scatter::ScatterRun],
-    spans: &[host_scatter::ScatterSpan],
-    buffers: &[(vk::Buffer, u64)],
-    width: u32,
-    height: u32,
-) -> Result<Vec<host_scatter::ScatterRegion>, super::reason::HostPresentDecline> {
-    let mut regions = Vec::with_capacity(spans.len());
-    for (span_index, span) in spans.iter().enumerate() {
-        let Some(run) = runs.get(span.run_index) else {
-            return Err(
-                super::reason::HostPresentDecline::RunsScatterRunIndexOutOfBounds {
-                    span_index,
-                    run_index: span.run_index,
-                    run_count: runs.len(),
-                },
-            );
-        };
-        let Some(&(buffer, window_offset)) = buffers.get(span.run_index) else {
-            return Err(
-                super::reason::HostPresentDecline::RunsScatterBufferIndexOutOfBounds {
-                    span_index,
-                    run_index: span.run_index,
-                    buffer_count: buffers.len(),
-                },
-            );
-        };
-        if span.texels == 0 {
-            return Err(super::reason::HostPresentDecline::RunsScatterZeroTexels { span_index });
-        }
-        let source_end = span.x.checked_add(span.texels);
-        if source_end.is_none_or(|end| end > width) || span.y >= height {
-            return Err(
-                super::reason::HostPresentDecline::RunsScatterSourceOutOfBounds {
-                    span_index,
-                    x: span.x,
-                    y: span.y,
-                    texels: span.texels,
-                    width,
-                    height,
-                },
-            );
-        }
-        let len = u64::from(span.texels) * 4;
-        let span_end = span.dst_offset.checked_add(len).ok_or(
-            super::reason::HostPresentDecline::RunsScatterSpanEndOverflow {
-                span_index,
-                dst_offset: span.dst_offset,
-                len,
-            },
-        )?;
-        if span_end > run.ptr_len {
-            return Err(super::reason::HostPresentDecline::RunsScatterOob {
-                dst_offset: span.dst_offset,
-                len,
-                cap: run.ptr_len,
-            });
-        }
-        let buffer_offset = window_offset.checked_add(span.dst_offset).ok_or(
-            super::reason::HostPresentDecline::RunsScatterBufferOffsetOverflow {
-                span_index,
-                window_offset,
-                dst_offset: span.dst_offset,
-            },
-        )?;
-        regions.push(host_scatter::ScatterRegion {
-            buffer,
-            buffer_offset,
-            x: span.x,
-            y: span.y,
-            texels: span.texels,
-        });
-    }
-    Ok(regions)
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PresentStatsSetup {
-    Shader,
-    Layout,
-    Pipeline,
-}
-
-impl PresentStatsSetup {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Shader => "shader",
-            Self::Layout => "layout",
-            Self::Pipeline => "pipeline",
-        }
-    }
-
-    fn discriminant(self) -> u64 {
-        match self {
-            Self::Shader => 1,
-            Self::Layout => 2,
-            Self::Pipeline => 3,
-        }
-    }
-}
-
-fn present_stats_setup_decline(
-    setup: PresentStatsSetup,
-    error: &DrawError,
-) -> crate::observe::Emit {
-    crate::observe::Emit::decline("stats_reduce", error).field("setup", setup.name())
 }
 
 /// One in-flight ring slot: a primary CB, its fence (created unsignaled;
@@ -493,6 +347,12 @@ pub(crate) struct SampledSlot {
     pub volume: bool,
     pub cube: bool,
     pub arrayed: bool,
+    /// The image was created as a Vulkan 1D (`TYPE_1D` / `TYPE_1D_ARRAY`) image
+    /// because the shader's sampled binding reflects a Metal `texture1d` /
+    /// `texture1d_array` (color-transfer LUTs). Part of the pool key: a 1D view
+    /// and a `height==1` 2D view are byte-identical images but incompatible
+    /// descriptor types, so a recycled slot must never cross that boundary.
+    pub one_dim: bool,
     pub format: ash::vk::Format,
     /// The view's component mapping, from the decoded type-8 swizzle. Part of
     /// the pool key because it is baked into the `VkImageView`: a recycled slot
@@ -510,6 +370,7 @@ struct SampledKey {
     volume: bool,
     cube: bool,
     arrayed: bool,
+    one_dim: bool,
     format: ash::vk::Format,
     swizzle: crate::contract::pixel_format::SwizzlePlan,
 }
@@ -523,6 +384,7 @@ impl SampledSlot {
             volume: self.volume,
             cube: self.cube,
             arrayed: self.arrayed,
+            one_dim: self.one_dim,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -539,6 +401,7 @@ impl SampledSlot {
             volume: self.volume,
             cube: self.cube,
             arrayed: self.arrayed,
+            one_dim: self.one_dim,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -620,6 +483,23 @@ struct ResidentStorageImageSlot {
 }
 
 /// Persistent GPU render-target slot (identity-keyed registry, workstream D).
+/// Whether a resident can be blitted to the host window exactly as it stands.
+///
+/// The window presenter does no format conversion and no scaling of the source
+/// rect, so all four conditions are hard: content landed, guest scanout byte
+/// order, and the exact geometry the present names.
+///
+/// It is a free function because two callers must ask the *same* question at
+/// two different moments. The presenter asks it to pick a source; the device's
+/// publish path asks it a frame earlier to decide whether to read the frame back
+/// into host memory at all. If publish's predicate were the looser one, it would
+/// elide the readback for a frame the presenter then refuses — a blank window
+/// with no CPU pixels behind it, and no single site able to see the
+/// disagreement.
+pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u32) -> bool {
+    slot.content_ready && slot.bgra && slot.width == width && slot.height == height
+}
+
 pub(crate) struct ResidentTargetSlot {
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
@@ -630,6 +510,17 @@ pub(crate) struct ResidentTargetSlot {
     pub height: u32,
     pub generation: u64,
     pub content_ready: bool,
+    /// The mapping-level `surface_content_epoch` this image's pixels were last
+    /// stamped with, or `None` when nothing has vouched for them.
+    ///
+    /// `None` is the fail-closed default and it is what every reset restores:
+    /// slot creation, image recycle, and both `registry_mark_ready*` arms — so
+    /// a draw that stores into this identity without going on to publish the
+    /// mapping's content leaves the slot unvouched, and the type-11 LOAD gate
+    /// falls back to its CPU seed. An `Option` rather than a sentinel because
+    /// epoch 0 ("nothing published since attach") is a legal *mapping* value
+    /// and a bare `0 == 0` would match an image that was never stamped at all.
+    pub content_epoch: Option<u32>,
     /// Last known layout (tracked for correct barriers).
     pub layout: vk::ImageLayout,
     /// Attachment format: true = B8G8R8A8_UNORM (guest scanout order), false =
@@ -642,7 +533,7 @@ pub(crate) struct ResidentTargetSlot {
     pub color_format: vk::Format,
     /// Deferred render-Store pin count: this target's content exists only on
     /// the GPU (guest pages stale). The registry LRU sweep skips slots with a
-    /// nonzero count. A count (not a bool) because a shared `OutputGroup`
+    /// nonzero count. A count (not a bool) because a surface with several
     /// identity is pinned independently by each member's deferred window —
     /// the first member's flush must not expose the image to eviction while
     /// a peer's window is still armed.
@@ -698,96 +589,25 @@ impl FreeTargetImage {
     }
 }
 
-/// Measure-only snapshot of what the target registry holds at one geometry,
-/// produced by [`ResourcePools::registry_geom_census`] to classify an
-/// `export_present_miss outcome=…` census event. Not a product-control input.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RegistryGeomCensus {
-    /// Total registry occupancy (all geometries).
-    pub total: usize,
-    /// `Some(content_ready)` if an `OutputGroup` resident exists at this geom.
-    pub group: Option<bool>,
-    /// Every `Surface` resident at this geom: `(id, generation, content_ready)`.
-    pub surfaces: Vec<(u32, u64, bool)>,
-    /// Count of `Gva` residents at this geom.
-    pub gva: usize,
-}
-
-/// One reading of the pool occupancy that feeds the always-on cap-pressure
-/// census ([`ResourcePools::cap_pressure_occupancy`]). `registry_pinned` is the
-/// count of resident targets held against LRU eviction by a deferred write
-/// window — when it approaches `registry_len`, the registry has soft-exceeded
-/// its slot cap (the LRU sweep cannot evict pinned slots) and the non-pinned
-/// tail thrashes.
-pub(crate) struct CapPressureOccupancy {
-    pub registry_len: usize,
-    pub registry_cap: usize,
-    pub registry_pinned: usize,
-    /// Live descriptor-arena pool blocks (1 = the pool never grew). A value > 1
-    /// means a draw/dispatch burst exhausted a block and the arena grew rather
-    /// than dropping the draw — the descriptor cap-pressure signal.
-    pub desc_blocks: usize,
-    pub sampled_len: usize,
-    pub sampled_cap: usize,
-    pub sampled_bytes: usize,
-    pub sampled_byte_cap: usize,
-    pub graveyard_len: usize,
-    /// Physical VkDeviceMemory the slab holds from the driver, and how much of it
-    /// is unbound — the direct VRAM footprint + fragmentation signal.
-    pub slab: crate::backend::vulkan::engine::slab::SlabOccupancy,
-    /// Images cached in the resident-target / sampled recycle pools (each pins a
-    /// live slab sub-allocation, so they keep blocks from emptying).
-    pub target_free_imgs: usize,
-    pub sampled_free_imgs: usize,
-    /// Transient compute-storage images cached in `storage_image_free`. Each is a
-    /// standalone (non-slab) VkDeviceMemory, so — unlike the two pools above — it
-    /// does NOT show up in the slab `resident_mb`/`live_subs` census; surfaced
-    /// separately (`stfree`) so a compute-storage recycle leak is visible.
-    pub storage_free_imgs: usize,
-    /// Cumulative compute-storage recycle admits / cap-drops (`st_admit`/`st_drop`
-    /// on the census). A rising `st_drop` under a flat `stfree` is a cap-bounded
-    /// leak — the workload keeps producing new-geometry storage images the cap
-    /// destroys rather than a genuinely reused working set.
-    pub storage_recycle_admits: u64,
-    pub storage_recycle_cap_drops: u64,
-    /// Live compute-storage RESIDENTS (`compute_storage_registry`) and how many are
-    /// pinned (deferred-writeback, only-copy-on-GPU). Bounded by
-    /// `COMPUTE_STORAGE_REGISTRY_CAP=64` with LRU eviction AND a render-registry-style
-    /// idle-age drain ([`ResourcePools::trim_aged_compute_storage`]) that returns
-    /// non-pinned residents `IDLE_TARGET_AGE_MS` after last use — each resident is a
-    /// standalone (non-slab) VkDeviceMemory invisible to the slab census, so without
-    /// the drain a settled compute-heavy session would pin up to 64 whole allocations
-    /// for the guest lifetime. Surfaced (`st_res`/`st_pin`) so the drain's effect (and
-    /// any pinned-resident leak it cannot reclaim) stays visible at idle.
-    pub storage_resident: usize,
-    pub storage_resident_pinned: usize,
-    /// HOST_VISIBLE staging/readback buffers cached for reuse. System RAM on a
-    /// discrete GPU, but shared-with-the-guest RAM on an iGPU (portability
-    /// target), so their bytes are the "least host memory" signal there. Bucketed
-    /// by size, so bounded by concurrency — measured to confirm no unbounded
-    /// growth under many large (4K-frame) uploads.
-    pub staging_free_bytes: u64,
-    pub readback_free_bytes: u64,
-}
-
 /// Cap on the **non-pinned** (LRU-evictable) resident-target population — the
 /// active render working set. Pinned slots (deferred-write windows, each holding
-/// content only on the GPU, bounded separately by
-/// `import_present::RENDER_DEFERRED_WINDOW_CAP`) are **excluded** from this count
+/// content only on the GPU, bounded separately by the arming rail's own window
+/// cap — `metal_draw::vulkan::GVA_DEFERRED_WINDOW_CAP` for the GVA Store rail)
+/// are **excluded** from this count
 /// (see the eviction loops): counting them would force the still-in-use active
 /// targets out whenever a compositing burst pins hundreds, thrashing exactly the
 /// targets a draw is about to reuse (measured `reg=512/512 evicts=168` under a
 /// YouTube page-load, ~320 pinned). Excluding them lets the active set keep its
 /// full cap regardless of the pinned burst, so a burst is *absorbed* (evicts≈0)
 /// instead of thrashing. Total registry is bounded by construction —
-/// `REGISTRY_CAP` non-pinned + `RENDER_DEFERRED_WINDOW_CAP` pinned. VRAM does not
-/// stay pinned at this ceiling: the idle drain
+/// `REGISTRY_CAP` non-pinned plus the pinned windows, which each arming rail caps
+/// itself. VRAM does not stay pinned at this ceiling: the idle drain
 /// ([`ResourcePools::advance_registry_touch_and_drain`]) reclaims a burst's stale
 /// leftovers ~2 s after last use, returning the resident set to the ~56 idle
 /// working set once the burst ends. So this is sized to absorb the burst's *live*
 /// working set (measured non-pinned peak ~260 during a YouTube page-load), not to
 /// hold it forever. Slots are cheap; the real VRAM guard is per-image bytes.
-const REGISTRY_CAP: usize = 320;
+pub(crate) const REGISTRY_CAP: usize = 320;
 /// Wall-clock milliseconds a non-pinned resident may go untouched before the
 /// idle drain reclaims it. An actively-drawn target is touched every frame (and
 /// the presented target is touched every poll) so it never ages out, while a
@@ -891,6 +711,34 @@ const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 /// pure waste. Minimising idle VRAM is the explicit goal.
 const IDLE_SLAB_KEEP_EMPTY: usize = 0;
 
+/// Pop one entry from the LARGEST non-empty bucket of a size-keyed recycle pool.
+///
+/// The buffer pools are keyed by power-of-two byte size, and the idle trim that
+/// drains them exists to return host memory. Taking an arbitrary bucket returns
+/// an arbitrary number of bytes per destroy, and `HashMap` order is effectively
+/// random, so a pass budgeted at N destroys can spend all of them on 64-byte
+/// slots and return nothing. That is not hypothetical: the staging census put
+/// **11 792 of 26 624** misses in the 64-byte bucket and 1 462 more at 128 bytes
+/// — over half the pool's re-allocations, each costing a ~1.4 ms
+/// `vkAllocateMemory` on the upload hot path, to reclaim 64 bytes.
+///
+/// Largest-first makes each destroy return the most it can, so the trim reaches
+/// its memory target in the fewest destroys and leaves the small, cheap-to-hold,
+/// constantly-reused slots alone.
+fn pop_largest_pool_entry<V>(pool: &mut HashMap<u64, Vec<V>>) -> Option<V> {
+    let key = *pool
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .max_by_key(|(k, _)| **k)
+        .map(|(k, _)| k)?;
+    let bucket = pool.get_mut(&key)?;
+    let item = bucket.pop();
+    if bucket.is_empty() {
+        pool.remove(&key);
+    }
+    item
+}
+
 /// Pop one entry from any non-empty bucket of a keyed recycle pool, removing the
 /// bucket when it empties so the pool does not accumulate empty `Vec`s. `None`
 /// when the whole pool is empty.
@@ -909,6 +757,11 @@ where
     }
     item
 }
+/// Bucket bins for the staging census: one per power of two up to 2^31.
+pub(crate) const STAGING_BUCKET_BINS: usize = 32;
+/// One `staging_pool` line per this many misses.
+const STAGING_MISS_EMIT_EVERY: u64 = 512;
+
 /// Graveyard size at which begin_entry force-quiesces the ring to destroy
 /// deferred handles (pure-async streak backstop).
 const GRAVEYARD_FORCE_DRAIN: usize = 256;
@@ -939,186 +792,156 @@ fn sampled_content_hash(bytes: &[u8]) -> u128 {
     ((hi.finish() as u128) << 64) | lo.finish() as u128
 }
 
+/// Which pool asked for a `vkAllocateMemory`.
+///
+/// A `vkAllocateMemory` per draw is the render-target-recreate bug class (Safari
+/// video playback crawls when every frame reallocates its target). The count is
+/// the proxy for it, and it needs the site: a staging bucket that misses its
+/// free list, a per-frame sampled image, and a transient depth attachment are
+/// three different defects that a single fused count cannot separate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocSite {
+    StorageImage,
+    ResidentColor,
+    TransientDepth,
+    Staging,
+    Readback,
+    ReadbackMulti,
+    SlabBlock,
+}
+
+const ALLOC_SITE_N: usize = 7;
+
+impl AllocSite {
+    const fn idx(self) -> usize {
+        match self {
+            AllocSite::StorageImage => 0,
+            AllocSite::ResidentColor => 1,
+            AllocSite::TransientDepth => 2,
+            AllocSite::Staging => 3,
+            AllocSite::Readback => 4,
+            AllocSite::ReadbackMulti => 5,
+            AllocSite::SlabBlock => 6,
+        }
+    }
+}
+
+const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
+    "storage_image",
+    "resident_color",
+    "transient_depth",
+    "staging",
+    "readback",
+    "readback_multi",
+    "slab_block",
+];
+
+static ALLOC_SITE_COUNT: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+static ALLOC_SITE_BYTES: [std::sync::atomic::AtomicU64; ALLOC_SITE_N] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ALLOC_SITE_N];
+/// Allocations since the last emit; one line per this many, so the rate is
+/// self-clocked and an idle boot stays silent.
+static ALLOC_WINDOW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const ALLOC_WINDOW_EMIT_COUNT: u64 = 64;
+
 pub(crate) unsafe fn allocate_memory_timed(
     ctx: &DeviceContext,
     info: &vk::MemoryAllocateInfo<'_>,
-    counters: &EngineCounters,
+    site: AllocSite,
 ) -> Result<vk::DeviceMemory, vk::Result> {
-    let started = Instant::now();
     let result = ctx.device.allocate_memory(info, None);
-    counters
-        .memory_alloc_us
-        .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let i = site.idx();
+    ALLOC_SITE_COUNT[i].fetch_add(1, Ordering::Relaxed);
+    ALLOC_SITE_BYTES[i].fetch_add(info.allocation_size, Ordering::Relaxed);
+    if ALLOC_WINDOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1 >= ALLOC_WINDOW_EMIT_COUNT {
+        ALLOC_WINDOW_COUNT.store(0, Ordering::Relaxed);
+        emit_alloc_site_census();
+    }
     result
+}
+
+/// Cumulative per-site allocation census: `count:mebibytes`.
+fn emit_alloc_site_census() {
+    use std::fmt::Write as _;
+    let mut line = String::from("vk_alloc_sites");
+    for (i, name) in ALLOC_SITE_NAMES.iter().enumerate() {
+        let _ = write!(
+            line,
+            " {name}={}:{}",
+            ALLOC_SITE_COUNT[i].load(Ordering::Relaxed),
+            ALLOC_SITE_BYTES[i].load(Ordering::Relaxed) >> 20,
+        );
+    }
+    crate::observe::off(line);
+}
+
+/// A single host→staging step that blocked long enough to cost frames.
+///
+/// `draw_phase` put ~950 ms idle stalls inside the staging span of a draw and
+/// could not say which of its four calls owned them — including for a 31x24
+/// cursor draw, where no plausible amount of copying explains a second. These
+/// are `memcpy`s into a mapped span and an allocate/map, so at this scale the
+/// cost is the *mapping*, not the bytes: a `HOST_VISIBLE|DEVICE_LOCAL` span
+/// whose first touch after an idle stretch wakes the device, or guest pages the
+/// host has to fault back in. Naming the call and its size separates those.
+///
+/// Watches from `Drop` so a `?` inside the watched call still reports. Bounded
+/// per boot rather than latched per key, for the same reason `draw_stall` is:
+/// the distribution is the signal, and a healthy boot produces none of these.
+pub(crate) struct SlowStagingWrite {
+    kind: &'static str,
+    bytes: u64,
+    runs: usize,
+    started: std::time::Instant,
+}
+
+/// Below this a staging step is ordinary work. A frame at 60 Hz is 16.7 ms; the
+/// staging-miss census already reports means in the 0.3-5 ms band, so this is
+/// well clear of the healthy population and still an order of magnitude under
+/// the stall being chased.
+const SLOW_STAGING_WRITE_US: u64 = 20_000;
+const SLOW_STAGING_LINE_CAP: u64 = 256;
+static SLOW_STAGING_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl SlowStagingWrite {
+    pub(crate) fn watch(kind: &'static str, bytes: u64, runs: usize) -> Self {
+        Self {
+            kind,
+            bytes,
+            runs,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlowStagingWrite {
+    fn drop(&mut self) {
+        let us = self.started.elapsed().as_micros() as u64;
+        if us < SLOW_STAGING_WRITE_US {
+            return;
+        }
+        let n = SLOW_STAGING_LINES.fetch_add(1, Ordering::Relaxed);
+        if n >= SLOW_STAGING_LINE_CAP {
+            return;
+        }
+        crate::observe::off(format!(
+            "staging_write_slow kind={} us={us} bytes={} runs={}{}",
+            self.kind,
+            self.bytes,
+            self.runs,
+            if n + 1 == SLOW_STAGING_LINE_CAP {
+                " (last: report cap reached)"
+            } else {
+                ""
+            }
+        ));
+    }
 }
 
 include!("submission_and_buffers.rs");
 include!("images_and_registry.rs");
-include!("host_import_and_teardown.rs");
-
-#[cfg(test)]
-mod host_import_budget_tests {
-    use super::{
-        host_import_budget, host_scatter, present_stats_setup_decline, resolve_scatter_regions,
-        terminal_host_import_error, DrawError, HostImportDecline, PresentStatsSetup, VkCall, VkOp,
-        HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP,
-    };
-    use crate::observe::Decline;
-    use ash::vk;
-
-    #[test]
-    fn scatter_region_resolution_refuses_every_invalid_span_before_recording() {
-        let runs = [host_scatter::ScatterRun {
-            host_ptr: 0x1000,
-            ptr_len: 16,
-        }];
-        let buffers = [(vk::Buffer::null(), 8)];
-        let base = host_scatter::ScatterSpan {
-            run_index: 0,
-            dst_offset: 0,
-            x: 0,
-            y: 0,
-            texels: 1,
-        };
-        let regions = resolve_scatter_regions(&runs, &[base], &buffers, 4, 1).unwrap();
-        assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].buffer_offset, 8);
-
-        let slug = |span, runs: &[host_scatter::ScatterRun], buffers: &[(vk::Buffer, u64)]| {
-            resolve_scatter_regions(runs, &[span], buffers, 4, 1)
-                .unwrap_err()
-                .slug()
-        };
-        assert_eq!(
-            slug(
-                host_scatter::ScatterSpan {
-                    run_index: 1,
-                    ..base
-                },
-                &runs,
-                &buffers
-            ),
-            "host_runs_scatter_run_index_oob"
-        );
-        assert_eq!(slug(base, &runs, &[]), "host_runs_scatter_buffer_index_oob");
-        assert_eq!(
-            slug(
-                host_scatter::ScatterSpan { texels: 0, ..base },
-                &runs,
-                &buffers
-            ),
-            "host_runs_scatter_zero_texels"
-        );
-        assert_eq!(
-            slug(host_scatter::ScatterSpan { x: 4, ..base }, &runs, &buffers),
-            "host_runs_scatter_source_oob"
-        );
-        assert_eq!(
-            slug(
-                host_scatter::ScatterSpan {
-                    dst_offset: u64::MAX,
-                    ..base
-                },
-                &runs,
-                &buffers
-            ),
-            "host_runs_scatter_span_end_overflow"
-        );
-        assert_eq!(
-            slug(
-                host_scatter::ScatterSpan {
-                    dst_offset: 13,
-                    ..base
-                },
-                &runs,
-                &buffers
-            ),
-            "host_runs_scatter_oob"
-        );
-        let large_run = [host_scatter::ScatterRun {
-            host_ptr: 0x1000,
-            ptr_len: u64::MAX,
-        }];
-        assert_eq!(
-            slug(
-                host_scatter::ScatterSpan {
-                    dst_offset: 4,
-                    ..base
-                },
-                &large_run,
-                &[(vk::Buffer::null(), u64::MAX)]
-            ),
-            "host_runs_scatter_buffer_offset_overflow"
-        );
-    }
-
-    /// Each cause owns its latch, so a second cause is never reported as a repeat
-    /// of the first. A single shared flag is what would have made the extension
-    /// and zero-length cases indistinguishable at the sink.
-    #[test]
-    fn each_host_import_cause_latches_separately() {
-        let all = [
-            HostImportDecline::RegionCount,
-            HostImportDecline::TotalBytes,
-            HostImportDecline::ZeroLength,
-            HostImportDecline::ExtensionAbsent,
-        ];
-        let slugs: std::collections::BTreeSet<&str> = all.iter().map(|d| d.slug()).collect();
-        assert_eq!(slugs.len(), all.len(), "each cause needs its own slug");
-    }
-
-    #[test]
-    fn count_and_total_caps_report_distinct_reasons() {
-        assert_eq!(
-            host_import_budget(HOST_IMPORT_REGION_CAP, 1, 1),
-            Err(HostImportDecline::RegionCount)
-        );
-        assert_eq!(
-            host_import_budget(1, HOST_IMPORT_TOTAL_BYTE_CAP, 1),
-            Err(HostImportDecline::TotalBytes)
-        );
-    }
-
-    #[test]
-    fn terminal_failure_preserves_the_last_attempted_import_cause() {
-        let attempted = DrawError::VkCall(VkCall::new(
-            VkOp::PoolsHostImportBindBuffer,
-            ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY,
-        ));
-        let error = terminal_host_import_error(Some(attempted.clone()), 0x1000, 4096, 4096);
-        assert_eq!(error, attempted);
-        assert_eq!(error.slug(), "vk_pools_host_import_bind_buffer");
-
-        let no_attempt = terminal_host_import_error(None, 0x1001, 4096, 4096);
-        assert_eq!(no_attempt.slug(), "host_import_no_valid_window");
-        assert_eq!(
-            no_attempt.fields(),
-            vec![
-                ("host_ptr", "0x1001".into()),
-                ("len", "4096".into()),
-                ("alignment", "4096".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn present_stats_setup_failures_preserve_leaf_and_setup_stage() {
-        let error = DrawError::VkCall(VkCall::new(
-            VkOp::CachesCreateComputePipelines,
-            ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
-        ));
-        for setup in [
-            PresentStatsSetup::Shader,
-            PresentStatsSetup::Layout,
-            PresentStatsSetup::Pipeline,
-        ] {
-            let line = present_stats_setup_decline(setup, &error).render();
-            assert!(line
-                .starts_with("stats_reduce reason=vk_caches_create_compute_pipelines vk_result="));
-            assert!(line.ends_with(&format!(" setup={}", setup.name())));
-        }
-    }
-}
+include!("teardown.rs");
 
 #[cfg(test)]
 mod content_hash_tests {
@@ -1171,5 +994,202 @@ mod content_hash_tests {
         let mut b = vec![0xa0u8; 1024];
         b[0] = 0xa1;
         assert_ne!(sampled_content_hash(&a), sampled_content_hash(&b));
+    }
+}
+
+#[cfg(test)]
+mod pool_trim_order_tests {
+    use super::{pop_any_pool_entry, pop_largest_pool_entry};
+    use std::collections::HashMap;
+
+    /// The buffer trim must return the most bytes it can per destroy.
+    ///
+    /// The pools are keyed by power-of-two byte size and the trim's budget is a
+    /// COUNT of destroys, so which bucket it takes from decides how much memory a
+    /// pass reclaims. `HashMap` iteration order is effectively random, so the
+    /// arbitrary-bucket form could spend a whole pass on 64-byte slots — measured
+    /// as 11 792 of 26 624 staging misses in that one bucket, each costing a
+    /// ~1.4 ms `vkAllocateMemory` to recreate, to reclaim 64 bytes.
+    ///
+    /// Asserting the descending ORDER rather than one pop is the point: a single
+    /// pop passes by luck with a random-order pool, which is exactly how the bug
+    /// stayed invisible.
+    #[test]
+    fn buffer_trim_drains_the_largest_buckets_first() {
+        let mut pool: HashMap<u64, Vec<u32>> = HashMap::new();
+        for (bucket, n) in [(64u64, 40), (4096, 3), (1 << 22, 2), (256, 7)] {
+            pool.insert(bucket, vec![bucket as u32; n]);
+        }
+        let mut order = Vec::new();
+        while let Some(v) = pop_largest_pool_entry(&mut pool) {
+            order.push(v as u64);
+        }
+        assert_eq!(order.len(), 52);
+        assert!(
+            order.windows(2).all(|w| w[0] >= w[1]),
+            "trim order is not descending by bucket: {order:?}"
+        );
+        assert_eq!(order[0], 1 << 22);
+        assert_eq!(order[order.len() - 1], 64);
+        assert!(pool.is_empty(), "emptied buckets must be removed");
+
+        // The arbitrary-bucket helper is still used by the image pools, whose
+        // budget is not about bytes; it must keep draining everything.
+        let mut pool: HashMap<u64, Vec<u32>> = HashMap::new();
+        pool.insert(64, vec![1, 2]);
+        pool.insert(4096, vec![3]);
+        let mut n = 0;
+        while pop_any_pool_entry(&mut pool).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert!(pool.is_empty());
+    }
+}
+
+/// Host write pointer for a staging slot's first `size` bytes.
+///
+/// Staging slots are mapped for their lifetime at allocation, so this is a field
+/// read. The fallback map exists for a slot that predates the persistent
+/// mapping or was built by a path that does not map — it is the same
+/// map-per-write the pools used to do everywhere, and it leaks nothing because
+/// `vkFreeMemory` unmaps implicitly.
+unsafe fn staging_write_ptr(
+    ctx: &DeviceContext,
+    slot: &BufferSlot,
+    size: u64,
+) -> Result<*mut u8, DrawError> {
+    if slot.mapped != 0 {
+        return Ok(slot.mapped as *mut u8);
+    }
+    Ok(ctx
+        .device
+        .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
+        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))? as *mut u8)
+}
+
+/// Copy the first `len` bytes out of a readback slot, invalidating first when the
+/// slot's memory is not coherent.
+///
+/// **Every reader of a `MemoryClass::Readback` slot goes through here.** That
+/// class ranks `HOST_CACHED` above `HOST_COHERENT` — a cached read is an order of
+/// magnitude faster and several drivers expose no type carrying both — so the
+/// mapping can hold cache lines predating the GPU's writes, and a reader that
+/// skips `vkInvalidateMappedMemoryRanges` does not fail: it silently returns
+/// whatever it last read through that pooled buffer.
+///
+/// Which is to say the failure mode is *the previous frame*, and it is not
+/// theoretical. Adding the invalidate at only the draw rail left three others —
+/// `read_target_inner`, the compute storage-buffer readback and the compute
+/// storage-image readback — and two GPU parity cases went red with the second of
+/// two renders reporting the first one's pixels (`a_view_swizzle_…` read the
+/// identity result out of the swizzled draw; `depth_test_honored_on_resident_…`
+/// scored `Less` and `Greater` as equal). One reader means the next rail added
+/// cannot reintroduce that.
+///
+/// `WHOLE_SIZE` needs no `nonCoherentAtomSize` rounding, and the copy allocates
+/// uninitialized: every one of `len` bytes is written before the length becomes
+/// visible, so pre-zeroing a full frame is pure waste on a guest-blocking path.
+///
+/// A slot that is already mapped is read through that mapping. `vkMapMemory` on
+/// an already-mapped memory object fails `VK_ERROR_MEMORY_MAP_FAILED`, and the
+/// compute rail reads *back* out of slots it acquired from the staging pool
+/// (`acquire_staging`, which maps for the slot's lifetime) — so the persistent
+/// staging mapping had made 8 of `vk_engine_compute`'s 14 cases fail with
+/// `reason=vk_compute_exec_map_storage_readback
+/// vk_result=Mapping_of_a_memory_object_has_failed`, i.e. every SSBO dispatch on
+/// this host. This mirrors `staging_write_ptr`'s rule for the write direction.
+///
+/// `map_op` and `invalidate_op` stay per-rail so an exhaustion or a driver
+/// refusal still names which readback failed.
+pub(super) unsafe fn read_back_slot(
+    ctx: &DeviceContext,
+    slot: &BufferSlot,
+    len: u64,
+    map_op: VkOp,
+    invalidate_op: VkOp,
+) -> Result<Vec<u8>, DrawError> {
+    let persistent = slot.mapped != 0;
+    let ptr = if persistent {
+        slot.mapped as *const u8
+    } else {
+        ctx.device
+            .map_memory(slot.memory, 0, len, vk::MemoryMapFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(map_op, e)))? as *const u8
+    };
+    // Unmapping is only ours to do when the mapping is ours; a persistent one
+    // belongs to the slot and outlives this read.
+    let release = |ctx: &DeviceContext| {
+        if !persistent {
+            ctx.device.unmap_memory(slot.memory);
+        }
+    };
+    if !slot.coherent {
+        let range = vk::MappedMemoryRange::default()
+            .memory(slot.memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        if let Err(e) = ctx.device.invalidate_mapped_memory_ranges(&[range]) {
+            release(ctx);
+            return Err(DrawError::VkCall(VkCall::new(invalidate_op, e)));
+        }
+    }
+    let out = super::exec_compute::copy_mapped_output(ptr, len as usize);
+    release(ctx);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod staging_mapping_tests {
+    use super::{DeviceContext, ResourcePools};
+    use crate::backend::vulkan::engine::counters::EngineCounters;
+    use ash::vk;
+
+    /// A staging slot carries its own host mapping, and keeps it across recycle.
+    ///
+    /// Every staging write used to bracket itself in
+    /// `vkMapMemory`/`vkUnmapMemory` — two driver round trips per buffer bind,
+    /// and the outlier tranches carry ~92 000 binds. The pool's premise is that
+    /// the allocation outlives the bind; so does its mapping.
+    ///
+    /// The recycle half is the part worth pinning: a slot that came back from the
+    /// free list with `mapped == 0` would silently fall back to map-per-write and
+    /// nothing else would notice.
+    #[test]
+    fn a_staging_slot_keeps_one_mapping_across_recycle() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP staging mapping: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+        let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
+
+        let first = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+            .expect("a 4 KiB staging slot must be available");
+        assert_ne!(first.mapped, 0, "a fresh staging slot must be mapped");
+
+        // Written through the persistent pointer, readable through it.
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        unsafe { pools.write_staging(&ctx, &first, &payload) }.expect("write must land");
+        let seen = unsafe { std::slice::from_raw_parts(first.mapped as *const u8, payload.len()) };
+        assert_eq!(seen, &payload[..], "the mapping does not observe the write");
+
+        pools.recycle_staging();
+        let again = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
+            .expect("the recycled slot must come back");
+        assert_eq!(again.buffer, first.buffer, "expected the recycled slot");
+        assert_eq!(
+            again.mapped, first.mapped,
+            "a recycled slot lost its mapping and would map per write again"
+        );
+
+        pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
     }
 }

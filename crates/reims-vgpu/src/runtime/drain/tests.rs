@@ -85,7 +85,7 @@ fn assert_coalesced_paint_action(host: &crate::runtime::host::FakeHost, ctx: &st
 }
 
 #[test]
-fn exec_summary_names_each_synchronous_timing_bucket() {
+fn exec_summary_names_the_packet_counters_and_lock_hold() {
     let result = crate::runtime::exec::ExecResult {
         task_id: 3,
         streams_loaded: 1,
@@ -94,28 +94,14 @@ fn exec_summary_names_each_synchronous_timing_bucket() {
         sampler_unbinds: 4,
         render_attachment_resolves: 1,
         render_guest_stores: 1,
-        load_us: 11,
-        render_us: 12,
-        blit_us: 13,
-        compute_us: 14,
-        event_us: 15,
-        info_us: 16,
-        finish_us: 17,
         total_us: 98,
         ..Default::default()
     };
     let line = exec_summary(1, &result, 52);
     for field in [
-        "load_us=11",
-        "render_us=12",
-        "blit_us=13",
-        "compute_us=14",
         "rt_resolves=1",
         "guest_stores=1",
         "render_unbinds=2/3/4",
-        "event_us=15",
-        "info_us=16",
-        "finish_us=17",
         "total_us=98",
     ] {
         assert!(line.contains(field), "missing {field}: {line}");
@@ -283,12 +269,18 @@ fn display_swap_paints_mapping_geom_not_console_fallback() {
     assert_coalesced_paint_action(&host, "mapping geom, not console fallback");
 }
 
-/// After bootstrap, ClearOnly must **not** hop to a different early_front
-/// Composite mid (serial-223416 / tip 145ee5ff: mode=follow oscillated
-/// peer=5↔peer=1 → mid_sw thrash). mode=keep re-shows frozen retain;
-/// mode=refresh recaptures only when early_front is the retain mid.
+/// A present whose named mid's last write was a CLEAR captures the surface the
+/// transaction names, even when a same-geometry Composite peer holds different
+/// pixels.
+///
+/// This exact state — a ClearOnly named mid alongside a Composite `early_front`
+/// peer — is what a six-way peer resolver used to answer with the peer, on the
+/// theory that a mid cleared rather than drawn held nothing worth showing. The
+/// transaction payload carries exactly one field, plane 0's surface id, so the
+/// named surface is the only correct capture source; substituting a peer shows a
+/// buffer the guest never asked for.
 #[test]
-fn clear_only_present_sticky_refresh_ignores_other_early_front() {
+fn clear_only_present_captures_the_surface_the_transaction_names() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::runtime::mapping_write::write_bgra8;
@@ -302,7 +294,7 @@ fn clear_only_present_sticky_refresh_ignores_other_early_front() {
     let page_shift = PAGE_SHIFT_X86;
     let page_size = 1u64 << page_shift;
     let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 2u32, 5u32] {
+    for mid in [1u32, 2u32] {
         let base_pfn = 0x100u32 + mid * 0x1000;
         let mut entries = Vec::with_capacity(pages);
         for i in 0..pages {
@@ -321,399 +313,70 @@ fn clear_only_present_sticky_refresh_ignores_other_early_front() {
         }
         assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
     }
-    // Bootstrap: mid 1 logo, ClearOnly present mid 2.
-    let logo = vec![0x11u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &logo, stride, w, h));
+    // Mid 1: the Composite peer the resolver used to hand the display.
+    let gray = vec![0xAAu8; need];
+    assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
     state.note_surface_composite(1);
     state.present.early_front_mapping = 1;
-    state.present.early_front_generation = 2;
+    state.present.early_front_generation = 3;
     state.present.valid = true;
     state.present.width = w;
     state.present.height = h;
+    assert!(!state.present.frame_flush_seen);
+    assert!(!state.present.frame_valid);
+
+    // Mid 2: the surface the guest names, cleared to opaque black.
     let mut clear = vec![0u8; need];
     for px in clear.chunks_exact_mut(4) {
         px[3] = 255;
     }
     assert!(write_bgra8(&mut state, &mut host, 2, &clear, stride, w, h));
     state.note_surface_clear(2);
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(state.present.frame_mapping, 1);
-    assert_eq!(state.present.frame_bgra[0], 0x11);
-    host.actions.clear();
-
-    // Mid 5 is latest early_front (other Composite). mode=keep must stay on 1
-    // frozen bootstrap pixels (no hop, no recapture of mid1 updates).
-    let gray = vec![0x99u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 5, &gray, stride, w, h));
-    state.note_surface_composite(5);
-    let logo2 = vec![0x22u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &logo2, stride, w, h));
-    state.note_surface_composite(1);
-    for _ in 0..3 {
-        state.present.early_front_mapping = 5;
-        state.present.early_front_generation += 1;
-        host.actions.clear();
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-        assert_eq!(
-            state.present.frame_mapping, 1,
-            "sticky retain must not follow early_front=5"
-        );
-        assert_eq!(
-            state.present.frame_bgra[0], 0x11,
-            "mode=keep re-shows frozen +0x188, does not recapture mid1"
-        );
-        assert_eq!(
-            presented_mapping(&state),
-            Some(1),
-            "window shows retain mid 1"
-        );
-        assert_coalesced_paint_action(&host, "sticky refresh");
-    }
-
-    // early_front returns to retain mid → mode=refresh recaptures logo2.
-    state.present.early_front_mapping = 1;
-    state.present.early_front_generation += 1;
-    host.actions.clear();
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(state.present.frame_mapping, 1);
-    assert_eq!(
-        state.present.frame_bgra[0], 0x22,
-        "mode=refresh recaptures retain mid when early_front matches"
-    );
-
-    // A decoded same-geometry linear texture dependency is categorically
-    // different from an unrelated writer: the full output was produced
-    // from a type-2/3 input, so the next ClearOnly present may hand
-    // ownership to the downstream RT.
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 5, w, h, 77
-    ));
-    state.present.early_front_mapping = 1;
-    host.actions.clear();
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(
-        state.present.frame_mapping, 5,
-        "full-geometry linear compositor edge must hand off to downstream output"
-    );
-    assert_eq!(state.present.frame_bgra[0], 0x99);
-    let body = std::fs::read_to_string(crate::observe::fail_log_path())
-        .expect("reims-vgpu-fail.log readable");
     assert!(
-        body.lines().any(|line| {
-            line.starts_with("OFF present_owner_graph source=linear output_mid=5 ")
-                && line.contains("retain_mid=1")
-                && line.contains("mode=graph_handoff cap=1")
-        }),
-        "linear graph ownership handoff proxy must be always-on"
+        matches!(
+            state.surface_write_kind(2),
+            crate::model::SurfaceWriteKind::ClearOnly
+        ),
+        "the named mid must be the ClearOnly case this test is about"
     );
 
-    // An old base writer becoming early_front again is not a reverse edge;
-    // keep the graph output instead of recreating mode=follow oscillation.
-    state.present.early_front_mapping = 1;
-    host.actions.clear();
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(state.present.frame_mapping, 5);
-    assert_eq!(state.present.frame_bgra[0], 0x99);
-}
+    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
+    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
+        .copy_from_slice(&2u32.to_le_bytes());
+    process_child_packet(
+        &mut state,
+        &mut host,
+        5,
+        &Packet {
+            opcode: CHILD_OP_PRESENT_X86,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
 
-/// Peer capture fail must keep prior Composite +0x188 — never fall through
-/// to capture the named ClearOnly mid (live mid_sw 1→3 alpha-only thrash).
-#[test]
-fn clear_only_peer_capture_fail_keeps_prior_not_clear_mid() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 3u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            let gpa = (pfn as u64) << page_shift;
-            host.map_range(gpa, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    let logo = vec![0x44u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &logo, stride, w, h));
-    state.note_surface_composite(1);
-    state.present.early_front_mapping = 1;
-    state.present.early_front_generation = 2;
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-    let mut clear = vec![0u8; need];
-    for px in clear.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
-    assert!(write_bgra8(&mut state, &mut host, 3, &clear, stride, w, h));
-    state.note_surface_clear(3);
-    // Bootstrap retain mid=1 via ClearOnly present mid=3.
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&3u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(state.present.frame_mapping, 1);
-    assert_eq!(state.present.frame_bgra[0], 0x44);
-    // Make retain mid unreadable (pages gone) so refresh would fail; ClearOnly
-    // mid 3 pages remain solid black — old code fallthrough would capture them.
-    {
-        let m = state.mappings.get_mut(&1).unwrap();
-        m.page_entries.clear();
-        m.mapped = false;
-    }
-    state.present.early_front_mapping = 1;
-    host.actions.clear();
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&3u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
+    assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
+    assert!(
+        state.present.frame_flush_seen,
+        "a non-init present leaves BAR1"
+    );
+    assert!(state.present.frame_valid);
     assert_eq!(
-        state.present.frame_mapping, 1,
-        "must not install ClearOnly mid=3 into +0x188 after peer fail"
+        state.present.frame_mapping, 2,
+        "+0x188 holds the named mid, not the Composite peer"
     );
     assert_eq!(
-        state.present.frame_bgra[0], 0x44,
-        "prior Composite retain pixels must survive peer capture fail"
+        state.present.frame_bgra[0], 0x00,
+        "captured the named surface's cleared pages, not the peer's 0xAA"
     );
     assert_eq!(
         presented_mapping(&state),
-        Some(1),
-        "window re-shows retain mid 1"
+        Some(2),
+        "window shows named mid 2, not peer mid 1"
     );
-    assert_coalesced_paint_action(&host, "peer capture fail");
-}
-
-/// Flipping early_front every ClearOnly present must keep established retain
-/// (serial-222258 mid_sw thrash class when follow had no hysteresis).
-#[test]
-fn clear_only_present_keeps_retain_while_early_front_bounces() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 2u32, 5u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            let gpa = (pfn as u64) << page_shift;
-            host.map_range(gpa, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    let logo = vec![0x11u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &logo, stride, w, h));
-    state.note_surface_composite(1);
-    state.present.early_front_mapping = 1;
-    state.present.early_front_generation = 2;
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-    let mut clear = vec![0u8; need];
-    for px in clear.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
-    assert!(write_bgra8(&mut state, &mut host, 2, &clear, stride, w, h));
-    state.note_surface_clear(2);
-    // Bootstrap retain mid=1.
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(state.present.frame_mapping, 1);
-    let gray = vec![0x99u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 5, &gray, stride, w, h));
-    state.note_surface_composite(5);
-
-    // Bounce early_front 5 → 1 → 5 across ClearOnly presents; retain stays 1.
-    for &ef in &[5u32, 1u32, 5u32, 1u32] {
-        state.present.early_front_mapping = ef;
-        state.present.early_front_generation += 1;
-        host.actions.clear();
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-        assert_eq!(
-            state.present.frame_mapping, 1,
-            "bounce early_front={ef} must keep retain mid=1"
-        );
-        assert_eq!(state.present.frame_bgra[0], 0x11);
-    }
+    assert_coalesced_paint_action(&host, "named surface, not composite peer");
 }
 
 /// CmdDeleteTask (root 0x20) must clear the task — not flood UnknownRootOpcode.
@@ -814,643 +477,18 @@ fn delete_iosurface_backing_condemns_then_second_delete_tears_down() {
     assert_eq!(m.mapping_internal, 0);
 }
 
-/// ClearOnly present with sticky Composite early_front bootstraps leave-BAR1
-/// from the peer mid (live x86 dual-mid: present 2/3 clear, content 1/4).
+/// Direct Composite-named present (no ClearOnly pairing): the transaction
+/// payload carries exactly one thing — plane 0's surface id — so the only
+/// correct capture source is the surface the guest named. No comparison
+/// between our own full-frame sequences may override it, however far the
+/// named member's sequence lags a same-geometry peer's. Substituting the
+/// "denser" peer is what shows a buffer one rotation step behind the one the
+/// guest asked for: residue when a window closed in between, a stale region
+/// when one moved, and visible thrash as the choice oscillates.
 #[test]
-fn clear_only_present_captures_early_front_composite_peer() {
+fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 2u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            let gpa = (pfn as u64) << page_shift;
-            host.map_range(gpa, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    // Mid 1: composite content (logo/desktop) — never presented by guest.
-    let gray = vec![0xAAu8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
-    state.note_surface_composite(1);
-    state.present.early_front_mapping = 1;
-    state.present.early_front_generation = 3;
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-    assert!(!state.present.frame_flush_seen);
-    assert!(!state.present.frame_valid);
-
-    // Mid 2: clear-only present (live present_op6 sid=2).
-    let mut clear = vec![0u8; need];
-    for px in clear.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
-    assert!(write_bgra8(&mut state, &mut host, 2, &clear, stride, w, h));
-    state.note_surface_clear(2);
-
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
-
-    assert_eq!(
-        state.present.present_mapping, 2,
-        "guest still names ClearOnly mid"
-    );
-    assert!(
-        state.present.frame_flush_seen,
-        "leave-BAR1 once Composite peer is capturable"
-    );
-    assert_eq!(state.present.frame_mapping, 1, "+0x188 from Composite peer");
-    assert!(state.present.frame_valid);
-    assert_eq!(state.present.frame_bgra[0], 0xAA);
-    assert_eq!(
-        presented_mapping(&state),
-        Some(1),
-        "window shows peer mid 1, not clear mid 2"
-    );
-    assert_coalesced_paint_action(&host, "composite peer");
-}
-
-/// A retained-frame re-show is still a present of that retained member.
-/// `capture_present_frame` records presented geometry on recapture, but
-/// mode=keep/keep_retain deliberately does not recapture. If that path does
-/// not refresh `presented_geoms`, direct-present export can ask for a stale
-/// per-surface identity even though the shared OutputGroup resident is the
-/// live logical framebuffer
-/// (`export_present_miss outcome=orphan want=surface group=ready`).
-/// Vulkan-arm only: asserts on `TargetIdentity`, which is the Vulkan
-/// engine's resident-identity type, and on `import_present`, a
-/// `backend-vulkan` module.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn clear_only_keep_retain_marks_retained_member_presented_for_group_identity() {
-    use crate::backend::vulkan::engine::TargetIdentity;
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    for mid in [1u32, 2u32, 5u32] {
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.has_geom = true;
-            m.width = w;
-            m.height = h;
-            m.format = MTL_FORMAT_BGRA8_UNORM;
-            m.page_entries = vec![
-                (((0x1000 + mid) as u64) << PAGE_ENTRY_PFN_SHIFT | PAGE_ENTRY_VALID as u64) as u32,
-            ];
-        }
-    }
-    // Both logical framebuffer members are known, but only peer mid 5 has
-    // prior present evidence. Mid 1 is a valid retained frame about to be
-    // re-shown through keep_retain, not recaptured.
-    state.note_compositor_member_published(1, w, h);
-    state.note_compositor_member_published(5, w, h);
-    state.note_presented_geom(5, w, h);
-    assert!(matches!(
-        crate::runtime::import_present::surface_identity(&state, 1, w, h),
-        TargetIdentity::Surface { id: 1, .. }
-    ));
-
-    state.note_surface_clear(2);
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-    state.present.frame_flush_seen = true;
-    state.present.frame_valid = true;
-    state.present.frame_mapping = 1;
-    state.present.frame_generation = 9;
-    state.present.frame_width = w;
-    state.present.frame_height = h;
-    state.present.frame_bgra = vec![0x66u8; need];
-
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
-
-    assert_eq!(
-        state.present.frame_mapping, 1,
-        "keep_retain re-shows the retained member"
-    );
-    assert!(
-        state.presented_at(1, w, h),
-        "the retained member was displayed and must refresh present evidence"
-    );
-    assert!(matches!(
-        crate::runtime::import_present::surface_identity(&state, 1, w, h),
-        TargetIdentity::OutputGroup { .. }
-    ));
-}
-
-/// A ClearOnly present whose page table is identical to a Composite
-/// mapping's names THAT frame (two views of one IOSurface). page_alias
-/// must beat the sticky retain — this is the guest's double-buffer
-/// alternation, not thrash.
-#[test]
-fn clear_only_present_follows_page_identical_composite_peer() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    let build = |host: &mut FakeHost, base_pfn: u32| -> Vec<u32> {
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            let gpa = (pfn as u64) << page_shift;
-            host.map_range(gpa, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        entries
-    };
-    let shared = build(&mut host, 0x10_000);
-    let retain_pages = build(&mut host, 0x80_000);
-    // Composite frame buffer (mapping namespace) on the shared pages.
-    for (mid, entries) in [(1u32, shared.clone()), (2u32, shared), (3u32, retain_pages)] {
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    // Mid 1 composited this frame's content into the shared IOSurface.
-    let gray = vec![0xAAu8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
-    state.note_surface_composite(1);
-    // Mid 3 is the previously retained Composite (sticky retain target).
-    let blue = vec![0x55u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 3, &blue, stride, w, h));
-    state.note_surface_composite(3);
-    state.present.frame_valid = true;
-    state.present.frame_mapping = 3;
-    state.present.frame_generation = 7;
-    state.present.frame_width = w;
-    state.present.frame_height = h;
-    state.present.frame_bgra = blue;
-    state.present.frame_flush_seen = true;
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-    // Guest presents the surface-id view (ClearOnly) of the shared pages.
-    state.note_surface_clear(2);
-
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
-
-    assert_eq!(state.present.present_mapping, 2, "guest names the sid view");
-    assert_eq!(
-        state.present.frame_mapping, 1,
-        "page_alias follows the page-identical Composite peer over the sticky retain"
-    );
-    assert!(state.present.frame_valid);
-    assert_eq!(
-        state.present.frame_bgra[0], 0xAA,
-        "captured the named frame"
-    );
-    assert_eq!(
-        presented_mapping(&state),
-        Some(1),
-        "window shows the aliased Composite mid"
-    );
-    assert_coalesced_paint_action(&host, "page-identical peer");
-}
-
-/// Live x86 census (2026-07-16 boot): WindowServer double-buffers full
-/// frames across mids 1↔5 with damage passes (partial quads, never a
-/// full-coverage edge after boot), while presents name disjoint ClearOnly
-/// sids. The graph pin froze on the last boot-time full paint and every
-/// present captured the same mid — half the frames never shown. Composite
-/// writebacks into *proven* compositor-output members must re-pin the
-/// graph so ClearOnly presents follow the alternation.
-#[test]
-fn clear_only_present_follows_member_store_alternation() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 2u32, 5u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            host.map_range((pfn as u64) << page_shift, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    // Boot-time full-coverage passes prove both double-buffer halves.
-    let gray = vec![0xAAu8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
-    state.note_surface_composite(1);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 1, w, h, 11
-    ));
-    let blue = vec![0x55u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 5, &blue, stride, w, h));
-    state.note_surface_composite(5);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 5, w, h, 12
-    ));
-    state.note_surface_clear(2);
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-
-    let present_sid2 = |state: &mut DeviceState, host: &mut FakeHost| {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    };
-
-    // First present pins on the last proven edge (mid 5).
-    present_sid2(&mut state, &mut host);
-    assert_eq!(state.present.frame_mapping, 5);
-    assert_eq!(state.present.frame_bgra[0], 0x55);
-
-    // Steady state: damage-pass Stores alternate the members; each present
-    // must capture the buffer the guest just finished writing.
-    for (mid, byte) in [(1u32, 0x11u8), (5u32, 0x22u8), (1u32, 0x33u8)] {
-        let fill = vec![byte; need];
-        assert!(write_bgra8(&mut state, &mut host, mid, &fill, stride, w, h));
-        state.note_surface_composite(mid);
-        crate::runtime::scanout::note_front_buffer_writeback(&mut state, &mut host, mid, w, h, 0);
-        host.actions.clear();
-        present_sid2(&mut state, &mut host);
-        assert_eq!(
-            state.present.frame_mapping, mid,
-            "present follows the member the guest last stored"
-        );
-        assert_eq!(
-            state.present.frame_bgra[0], byte,
-            "captured the fresh frame"
-        );
-        assert_eq!(
-            presented_mapping(&state),
-            Some(mid),
-            "window shows the alternated member"
-        );
-        assert_coalesced_paint_action(&host, "member alternation");
-    }
-}
-
-/// The guest pipelines its double buffer a frame ahead: ring order is
-/// store B, store A, present, present (live x86 drag census 2026-07-18,
-/// serial-20260718-105304: both member stores land before both ClearOnly
-/// presents every ~78 ms cycle). Pin/latest-following captured the newest
-/// member for BOTH presents — B's frame never displayed (halved display
-/// rate) and the on-screen frame paired with the wrong present slot
-/// (dual-mid residue class). The present↔store FIFO must pair present #1
-/// with B and present #2 with A.
-#[test]
-fn clear_only_present_pairs_with_store_fifo_order() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 2u32, 5u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            host.map_range((pfn as u64) << page_shift, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    // Boot-time full-coverage passes prove both double-buffer halves.
-    let gray = vec![0xAAu8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
-    state.note_surface_composite(1);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 1, w, h, 11
-    ));
-    let blue = vec![0x55u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 5, &blue, stride, w, h));
-    state.note_surface_composite(5);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 5, w, h, 12
-    ));
-    state.note_surface_clear(2);
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-
-    let present_sid2 = |state: &mut DeviceState, host: &mut FakeHost| {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            state,
-            host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    };
-
-    // Establish the retain (leave-BAR1) before the pipelined cycle.
-    present_sid2(&mut state, &mut host);
-    assert_eq!(state.present.frame_mapping, 5);
-
-    // Pipelined cycle: BOTH members store before EITHER present drains.
-    let fill5 = vec![0x44u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 5, &fill5, stride, w, h));
-    state.note_surface_composite(5);
-    crate::runtime::scanout::note_front_buffer_writeback(&mut state, &mut host, 5, w, h, 0);
-    let fill1 = vec![0x66u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &fill1, stride, w, h));
-    state.note_surface_composite(1);
-    crate::runtime::scanout::note_front_buffer_writeback(&mut state, &mut host, 1, w, h, 0);
-    assert_eq!(
-        state.present_store_fifo.len(),
-        2,
-        "both member stores queue for pairing"
-    );
-
-    present_sid2(&mut state, &mut host);
-    assert_eq!(
-        state.present.frame_mapping, 5,
-        "present #1 pairs with the OLDER store (mid 5), not the newest pin"
-    );
-    assert_eq!(
-        state.present.frame_bgra[0], 0x44,
-        "present #1 shows mid 5's frame"
-    );
-
-    present_sid2(&mut state, &mut host);
-    assert_eq!(
-        state.present.frame_mapping, 1,
-        "present #2 pairs with the newer store (mid 1)"
-    );
-    assert_eq!(
-        state.present.frame_bgra[0], 0x66,
-        "present #2 shows mid 1's frame"
-    );
-    assert!(
-        state.present_store_fifo.is_empty(),
-        "both entries consumed by their presents"
-    );
-
-    // Present without a new store (cursor-only frame): FIFO empty, the
-    // retain refresh fallback re-captures the current member — no panic,
-    // no stale pop.
-    present_sid2(&mut state, &mut host);
-    assert_eq!(state.present.frame_mapping, 1);
-}
-
-/// Fullscreen-transition torn-capture guard: a store_fifo entry pairs a
-/// present with a member that missed a RUN of full frames (its
-/// `dense_frame_seq` lags a same-geometry peer by >= RETENTION_GAP_MARGIN — a
-/// scaling snapshot enqueued on one early full-frame Store, then abandoned).
-/// Capturing it would show stale / partially-unwritten pages (the
-/// vertical-strip + checkerboard torn frame). The present drain must
-/// substitute the full-frame-freshest same-geometry peer as the capture
-/// source. Keyed on the decoded full-frame-Store sequence, not pixel content;
-/// the healthy-alternation case (both within 1 → no substitution) is locked by
-/// `clear_only_present_pairs_with_store_fifo_order`.
-#[test]
-fn clear_only_present_substitutes_fresh_peer_for_starved_fifo_member() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 5u32, 2u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            host.map_range((pfn as u64) << page_shift, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    // mid 1 = the fresh peer (0x11); mid 5 = the starved FIFO member (0x55).
-    let fresh = vec![0x11u8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &fresh, stride, w, h));
-    state.note_surface_composite(1);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 1, w, h, 11
-    ));
-    let starved = vec![0x55u8; need];
-    assert!(write_bgra8(
-        &mut state, &mut host, 5, &starved, stride, w, h
-    ));
-    state.note_surface_composite(5);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 5, w, h, 12
-    ));
-    // Build the dense gap: mid 5 gets ONE full-frame publish, then mid 1 gets
-    // a RUN, so mid 5 lags mid 1 by >= RETENTION_GAP_MARGIN.
-    state.note_compositor_member_published(5, w, h);
-    for _ in 0..(RETENTION_GAP_MARGIN + 2) {
-        state.note_compositor_member_published(1, w, h);
-    }
-    let (peer, mine_seq, peer_seq) = state
-        .dense_retention_gap(5, w, h)
-        .expect("mid 5 lags a fresher peer");
-    assert_eq!(peer, 1, "mid 1 is the full-frame-freshest peer");
-    assert!(
-        peer_seq >= mine_seq + RETENTION_GAP_MARGIN,
-        "the gap crosses the substitution margin"
-    );
-    // The FIFO pairs the next present with the STARVED member (mid 5).
-    assert!(state.note_member_store(5, w, h, 12));
-    state.note_surface_clear(2);
-    state.present.valid = true;
-    state.present.width = w;
-    state.present.height = h;
-
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    process_child_packet(
-        &mut state,
-        &mut host,
-        5,
-        &Packet {
-            opcode: CHILD_OP_PRESENT_X86,
-            stamp_count: 0,
-            total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-            completion_stamp: 0,
-            payload,
-            next_head: 0,
-        },
-    );
-
-    assert_eq!(
-        state.present.frame_mapping, 1,
-        "starved FIFO member (mid 5) substituted by the full-frame-freshest peer (mid 1)"
-    );
-    assert_eq!(
-        state.present.frame_bgra[0], 0x11,
-        "captured the fresh peer's content, not the starved member's stale pages"
-    );
-}
-
-/// Direct Composite-named present (no ClearOnly pairing): a named member
-/// whose full-frame Store sequence lags its same-geometry peer by a run
-/// (>= RETENTION_GAP_MARGIN) is substituted by that peer — the arm64 A/B
-/// stale-body ping-pong class (one double-buffer member missed its full
-/// redraws and received only damage-region updates since). A healthy 1-lag
-/// alternation stays below the margin and captures the named member.
-#[test]
-fn composite_named_present_substitutes_fresh_peer_for_stale_member() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::census::present_proxy::RETENTION_GAP_MARGIN;
     use crate::runtime::mapping_write::write_bgra8;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -1483,15 +521,11 @@ fn composite_named_present_substitutes_fresh_peer_for_stale_member() {
     let fresh = vec![0x11u8; need];
     assert!(write_bgra8(&mut state, &mut host, 1, &fresh, stride, w, h));
     state.note_surface_composite(1);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 1, w, h, 11
-    ));
     let stale = vec![0x55u8; need];
     assert!(write_bgra8(&mut state, &mut host, 5, &stale, stride, w, h));
     state.note_surface_composite(5);
-    assert!(crate::runtime::scanout::note_linear_compositor_output(
-        &mut state, 5, w, h, 12
-    ));
+    // Both members are genuine swapchain buffers that alternate as the presented
+    // front.
     state.present.valid = true;
     state.present.width = w;
     state.present.height = h;
@@ -1515,85 +549,40 @@ fn composite_named_present_substitutes_fresh_peer_for_stale_member() {
         );
     };
 
-    // Healthy 1-lag alternation: both members publish, gap below margin —
-    // the named member is captured, no substitution.
-    state.note_compositor_member_published(5, w, h);
-    state.note_compositor_member_published(1, w, h);
+    // Healthy alternation: both members publish, the named member is captured.
+    state.note_dense_frame_published(5, w, h);
+    state.note_dense_frame_published(1, w, h);
     present_named(&mut state, &mut host, 5);
     assert_eq!(
         state.present.frame_mapping, 5,
-        "healthy alternation captures the named member"
+        "alternation captures the named member"
     );
     assert_eq!(state.present.frame_bgra[0], 0x55);
 
-    // Build the stale run: mid 1 publishes RETENTION_GAP_MARGIN+2 full
-    // frames while mid 5 receives none. Naming mid 5 now substitutes mid 1.
-    for _ in 0..(RETENTION_GAP_MARGIN + 2) {
-        state.note_compositor_member_published(1, w, h);
+    // Drive the named member's full-frame sequence arbitrarily far behind its
+    // peer's: mid 1 publishes a long run while mid 5 receives none. The guest
+    // still names mid 5, so mid 5 is still what goes on screen.
+    let lag_runs = 34u64;
+    for _ in 0..lag_runs {
+        state.note_dense_frame_published(1, w, h);
     }
+    // Read the lag straight out of the per-mapping counters — the point of this
+    // test is that the lag exists and changes nothing about what is captured.
+    let named_seq = state.present.dense_frame_seq[&5];
+    let peer_seq = state.present.dense_frame_seq[&1];
+    assert!(
+        peer_seq - named_seq >= lag_runs,
+        "the lag this test needs is present: {peer_seq} - {named_seq}"
+    );
     present_named(&mut state, &mut host, 5);
     assert_eq!(
-        state.present.frame_mapping, 1,
-        "stale named member substituted by the full-frame-freshest peer"
+        state.present.frame_mapping, 5,
+        "the guest named mid 5; no sequence comparison may substitute a peer"
     );
     assert_eq!(
-        state.present.frame_bgra[0], 0x11,
-        "captured the fresh peer's content, not the stale member's pages"
+        state.present.frame_bgra[0], 0x55,
+        "captured the named member's content, not the peer's"
     );
-}
-
-/// ClearOnly buffer-init present must not leave BAR1 (post-kdp handoff).
-#[test]
-fn clear_only_init_present_defers_frame_flush_boundary() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    assert!(state.map_surface(2));
-    {
-        let m = state.mappings.get_mut(&2).unwrap();
-        m.mapped = true;
-        m.has_geom = true;
-        m.width = 1920;
-        m.height = 1080;
-        m.content_generation = 1;
-        m.page_entries = vec![1];
-    }
-    state.note_surface_clear(2);
-    assert!(!state.present.frame_valid);
-    assert!(!state.present.frame_flush_seen);
-
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN.max(12)];
-    payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-        .copy_from_slice(&2u32.to_le_bytes());
-    let pkt = Packet {
-        opcode: CHILD_OP_PRESENT_X86,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + payload.len() as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
-    process_child_packet(&mut state, &mut host, 5, &pkt);
-
-    // Guest present bookkeeping yes; leave-BAR1 boundary no.
-    assert_eq!(state.present.present_mapping, 2);
-    assert!(!state.present.frame_flush_seen);
-    assert!(!state.present.frame_valid);
-    // Was "must not enqueue a ScanoutUpdate over the early console". That
-    // assertion is vacuous now that nothing enqueues one, so it is re-pointed
-    // at the invariant it existed to protect: a ClearOnly init must not hand
-    // the display a frame at all, leaving the early console owning the screen.
-    assert_eq!(
-        presented_mapping(&state),
-        None,
-        "ClearOnly init must not hand the display a frame over the early console"
-    );
-    assert_coalesced_paint_action(&host, "clear-only init");
-    // host_console decision stays on early FB.
-    assert!(crate::host_console_uses_bar1(false, false));
-    assert!(crate::host_console_uses_bar1(
-        state.present.frame_flush_seen,
-        false
-    ));
 }
 
 /// A display transaction cannot overtake an EXEC packet held on another
@@ -2203,20 +1192,19 @@ fn set_mapping_geom_size_change_resets_content_generation() {
     );
 }
 
-/// Archive poll_tick / render_wait_surface helpers: no rings → no-op, no panic.
+/// Archive render_wait_surface helper: no rings → no-op, no panic.
 #[test]
-fn drain_other_and_stranded_are_safe_noop_without_rings() {
+fn drain_other_child_fifos_is_a_safe_noop_without_rings() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     state.active_child_mask = (1 << 1) | (1 << 4);
     state.pending.child_mask = 1 << 1;
     state.gfx.control_fifo = 1;
-    // No root_page / rings: drains return immediately.
+    // No root_page / rings: the drain returns immediately.
     drain_other_child_fifos(&mut state, &mut host, 4);
-    drain_stranded_fifos(&mut state, &mut host);
     assert_eq!(
         state.pending.child_mask, 0,
-        "stranded drain clears pending mask"
+        "the sibling drain consumes the pending mask"
     );
 }
 
@@ -2303,123 +1291,9 @@ fn wait_surface_surface_inflight_tracks_async_target_mapping() {
     assert_eq!(wait_surface_mapping(&mut state, &mut host, 42), 0);
 }
 
-/// Sample/Load path shares the same wait (archive one function).
-#[test]
-fn wait_surface_snapshot_once_matches_mapping_wait() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    state.draining_channel = 4;
-    state.draining_mask = 1 << 4;
-    wait_surface_snapshot_once(&mut state, &mut host, 3);
-    assert_eq!(state.draining_channel, 4);
-    assert_eq!(state.draining_mask, 1 << 4);
-}
-
 /// qemu-shim dual-mid: incomplete last_store on one mid (logo/partial)
 /// must fire thrash `nz_swing` when DisplaySwap alternates full vs sparse.
 /// Regression gate for P1 dual-mid flicker (measure before fix).
-#[test]
-/// Contig write_bgra8 + thrash proxy: full→sparse mid hop fires nz_swing.
-///
-/// DisplaySwap sticky dual-mid policy may retain one mid (mode=refresh) so
-/// this locks the thrash class via present_proxy samples after real
-/// type-11 contig Stores (not invent nz).
-fn contig_store_dual_mid_incomplete_fires_nz_swing_proxy() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::census::present_proxy::{self, counters, PresentCaptureSample};
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 400u32;
-    let h = 300u32;
-    let stride = w * 4;
-    let need = (stride * h) as usize;
-    let pfn_a = 0x50u32;
-    let pfn_b = 0x90u32; // 32 pages from 0x50 → 0x70; 0x90 is clear
-    let pages_needed = 32usize;
-    let page = 1usize << PAGE_SHIFT_ARM64E as usize;
-    for (mid, base_pfn) in [(3u32, pfn_a), (4u32, pfn_b)] {
-        let base_gpa = (base_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(
-            base_gpa,
-            pages_needed * page,
-            if mid == 3 { 0xEE } else { 0x00 },
-        );
-        let mut entries = Vec::new();
-        for i in 0..pages_needed {
-            let pfn = base_pfn + i as u32;
-            entries.push((pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    let full = vec![0xCCu8; need];
-    assert!(write_bgra8(&mut state, &mut host, 3, &full, stride, w, h));
-    let mut sparse = vec![0u8; need];
-    for b in sparse.iter_mut().take(need / 20) {
-        *b = 0x80;
-    }
-    assert!(write_bgra8(&mut state, &mut host, 4, &sparse, stride, w, h));
-
-    // Guest pages hold full vs sparse (contig alias); sample like capture.
-    let mut px0 = [0u8; 4];
-    assert!(host
-        .read_gpa((pfn_a as u64) << PAGE_SHIFT_ARM64E, &mut px0)
-        .is_ok());
-    assert_ne!(
-        px0,
-        [0, 0, 0, 0],
-        "contig write_bgra8 must land in guest RAM"
-    );
-
-    let _proxy = present_proxy::test_exclusive();
-    present_proxy::reset_for_test();
-    let full_rgb = (w as usize) * (h as usize); // every px non-zero
-    let sparse_rgb = need / 20 / 4; // approx non-zero pixels in sparse fill
-    present_proxy::note_capture_ok(PresentCaptureSample {
-        mapping_id: 3,
-        generation: 1,
-        width: w,
-        height: h,
-        nz: need,
-        rgb_nz: full_rgb,
-        max_byte: 0xCC,
-        max_rgb: 0xCC,
-        from_last_store: true,
-        edge_energy: 1000,
-        named_peer: false,
-    });
-    present_proxy::note_capture_ok(PresentCaptureSample {
-        mapping_id: 4,
-        generation: 1,
-        width: w,
-        height: h,
-        nz: need / 20,
-        rgb_nz: sparse_rgb.max(1),
-        max_byte: 0x80,
-        max_rgb: 0x80,
-        from_last_store: true,
-        edge_energy: 50,
-        named_peer: false,
-    });
-    let c = counters();
-    assert!(
-        c.nz_swings >= 1,
-        "full→sparse dual-mid must count nz_swing (got {c:?})"
-    );
-    assert!(c.mid_switches >= 1);
-}
-
-/// qemu-shim DisplaySwap retains surface at present (after wait_surface
-/// drains); HostAction paints the frozen snapshot (hostPresentCount).
 #[test]
 fn display_swap_encodes_at_present_after_wait_surface() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -2958,188 +1832,156 @@ fn display_lifecycle_events_are_always_logged() {
     );
 }
 
+/// The VBL census reports the delivered rate, and separates the two ways it can
+/// deliver nothing.
+///
+/// VBL paces the guest compositor, so the rate we deliver caps guest frame rate
+/// however fast the present path is — and nothing measured it: a driven boot
+/// emitted zero lines matching `vbl` anywhere in the always-on channel. The
+/// three properties that make the new line readable are asserted here, because
+/// each one is a way the reading could have been wrong:
+///
+/// - only deliveries report, so the line's cadence is the thing it measures;
+/// - the rate is over the window since the last report, not the process
+///   lifetime, so an early stall does not depress it forever;
+/// - `not_online` and `not_claimed` stay separate, because "the display never
+///   came up" and "the 8 ms limiter is working correctly at 125 Hz" are opposite
+///   conclusions from the same low delivered count.
+#[test]
+fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
+    use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_CLAIMED, VBL_NOT_ONLINE};
+    let c = VblCensus::default();
+
+    // The silent arms never report, however many times they are taken.
+    for i in 0..5000u64 {
+        assert!(c.note(VBL_NOT_ONLINE, i).is_none());
+        assert!(c.note(VBL_NOT_CLAIMED, i).is_none());
+    }
+
+    // 1024 deliveries at the 8 ms grid: one report, and the rate is the grid.
+    let mut lines = Vec::new();
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
+            lines.push(l);
+        }
+    }
+    assert_eq!(lines.len(), 1, "exactly one report per 1024 deliveries");
+    let line = &lines[0];
+    assert!(line.contains("delivered=1024"), "{line}");
+    assert!(
+        line.contains("window_hz=125.0"),
+        "1024 deliveries spanning 8192 ms is 125 Hz: {line}"
+    );
+    assert!(
+        line.contains("not_online=5000") && line.contains("not_claimed=5000"),
+        "the silent arms must stay separable and counted: {line}"
+    );
+
+    // A second window at half the rate must read half, not an average dragged
+    // toward the first window — this is the property that makes a live reading
+    // of a *current* stall possible at all.
+    let base = 1024 * 8;
+    let mut second = None;
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, base + i * 16) {
+            second = Some(l);
+        }
+    }
+    let second = second.expect("second window must report");
+    assert!(second.contains("delivered=2048"), "{second}");
+    assert!(
+        second.contains("window_hz=62.5"),
+        "the window rate must not be a lifetime average: {second}"
+    );
+}
+
+/// The drain-duty census answers "is the worker saturated, and by which phase",
+/// which requires three properties the return value can be asserted on:
+///
+/// - duty is busy time over *elapsed* time, so a worker holding the lock for
+///   most of the window reads near 1 and an idle one reads near 0 — the two
+///   readings that point at opposite halves of the ~2 Hz question;
+/// - the two phases stay separate, because "guest work is slow" and "our export
+///   is slow" are different fixes drawn from the same high duty;
+/// - each report resets the window, so a live reading tracks the current stall
+///   instead of a lifetime average.
+#[test]
+fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases() {
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase};
+    let c = DrainDutyCensus::default();
+
+    // The first call only arms the window: reporting here would divide the whole
+    // pre-drain idle stretch into one tranche and read an absurd duty. Its own
+    // work is still counted — it is real time the worker spent — so it lands in
+    // the window it opens.
+    assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
+
+    // A saturated second: ten 90 ms tranches, 60 ms of it our export.
+    let mut line = None;
+    for i in 1..=10u64 {
+        if let Some(l) = c.note(30_000, 60_000, 5_000 + i * 100) {
+            line = Some(l);
+        }
+    }
+    let line = line.expect("a full second must report");
+    assert!(
+        line.contains("tranches=11"),
+        "the arming call counts: {line}"
+    );
+    assert!(
+        line.contains("duty=0.900"),
+        "900 ms busy in a 1000 ms window is duty 0.9: {line}"
+    );
+    assert!(
+        line.contains("drain_us=300000") && line.contains("publish_us=600000"),
+        "the phases must stay separable — this is which half to attack: {line}"
+    );
+    assert!(line.contains("max_tranche_us=90000"), "{line}");
+
+    // Phases are attributions inside `drain_us`, not a partition of it, so they
+    // are reported with their own counts and are allowed to overlap each other.
+    // What must hold is that each lands in its own bucket — a fused figure would
+    // make "the draws are slow" and "the flushes are slow" the same reading.
+    for _ in 0..3 {
+        c.note_phase(DrainPhase::Draw, 20_000);
+    }
+    c.note_phase(DrainPhase::Compute, 7_000);
+    c.note_phase(DrainPhase::Flush, 11_000);
+
+    // An idle window must read near zero rather than inheriting the busy one,
+    // and `skipped` must survive as its own arm: a worker that keeps bailing
+    // before the lock looks identical to an idle one in the duty alone.
+    c.note_skipped();
+    c.note_skipped();
+    let mut idle = None;
+    for i in 1..=10u64 {
+        if let Some(l) = c.note(500, 0, 6_000 + i * 100) {
+            idle = Some(l);
+        }
+    }
+    let idle = idle.expect("second window must report");
+    assert!(
+        idle.contains("duty=0.005"),
+        "the window must not average in the previous busy one: {idle}"
+    );
+    assert!(idle.contains("skipped=2"), "{idle}");
+    assert!(
+        idle.contains("draw_us=60000")
+            && idle.contains("draws=3")
+            && idle.contains("compute_us=7000")
+            && idle.contains("computes=1")
+            && idle.contains("flush_us=11000")
+            && idle.contains("flushes=1"),
+        "each phase must land in its own bucket with its own count: {idle}"
+    );
+}
+
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated
 /// `post_converge_display_reinit` line — the smoking gun for the intermittent
 /// post-converge boot-progress overlay. Before
 /// convergence the same reinit must NOT emit the correlated line (a display
 /// re-register during normal boot bring-up is expected, not the overlay).
-#[test]
-fn post_converge_display_reinit_self_labels_only_after_converge() {
-    use crate::runtime::census::present_proxy::{self, PresentCaptureSample};
-    let _proxy = present_proxy::test_exclusive();
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let index = 0u32;
-    let pfn = 0x91u32;
-    let gpa = state.pfn_gpa(pfn);
-    host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
-
-    let mut payload = vec![0u8; CHILD_SHARED_STATE_LEN];
-    payload[CHILD_SHARED_STATE_INDEX..CHILD_SHARED_STATE_INDEX + 4]
-        .copy_from_slice(&index.to_le_bytes());
-    payload[CHILD_SHARED_STATE_PFN..CHILD_SHARED_STATE_PFN + 4].copy_from_slice(&pfn.to_le_bytes());
-    let setup = Packet {
-        opcode: CHILD_OP_SETUP_SHARED_STATE,
-        stamp_count: 0,
-        total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
-        completion_stamp: 0,
-        payload,
-        next_head: 0,
-    };
-
-    // Reinit BEFORE convergence: expected boot bring-up, no correlated line.
-    present_proxy::reset_for_test();
-    assert!(!present_proxy::has_converged());
-    state.display.online_acked = true;
-    process_child_packet(&mut state, &mut host, 4, &setup);
-    assert!(
-        !present_proxy::has_converged(),
-        "no dense present fed → must not be converged"
-    );
-
-    // Drive convergence: one dense full-size present (present_converge fires).
-    present_proxy::note_capture_ok(PresentCaptureSample {
-        mapping_id: 2,
-        generation: 1,
-        width: 1920,
-        height: 1080,
-        nz: 1920 * 1080 * 4,
-        rgb_nz: 1920 * 1080,
-        max_byte: 0xCC,
-        max_rgb: 0xCC,
-        from_last_store: true,
-        edge_energy: 1000,
-        named_peer: false,
-    });
-    assert!(
-        present_proxy::has_converged(),
-        "dense 1920x1080 present must converge the proxy"
-    );
-
-    // Reinit AFTER convergence: the smoking-gun correlated line must fire.
-    state.display.online_acked = true;
-    process_child_packet(&mut state, &mut host, 4, &setup);
-
-    let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
-    assert!(
-        log.contains(&format!(
-            "post_converge_display_reinit index={index} gpa={gpa:#x}"
-        )),
-        "post-converge reinit must self-label with the correlated proxy line"
-    );
-}
-
-/// Clear-only DisplaySwap of mid 2 must keep a finished composite retain on mid 1
-/// (command-class history — not rgb_nz). Live dual-mid black class.
-#[test]
-fn present_clear_only_keeps_prior_composite_retain() {
-    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::mapping_write::write_bgra8;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let w = 1920u32;
-    let h = 1080u32;
-    let stride = w * 4;
-    let need = (stride as usize) * (h as usize);
-    let page_shift = PAGE_SHIFT_X86;
-    let page_size = 1u64 << page_shift;
-    let pages = (need as u64).div_ceil(page_size) as usize;
-    for mid in [1u32, 2u32] {
-        let base_pfn = 0x100u32 + mid * 0x1000;
-        let mut entries = Vec::with_capacity(pages);
-        for i in 0..pages {
-            let pfn = base_pfn + i as u32;
-            let gpa = (pfn as u64) << page_shift;
-            host.map_range(gpa, page_size as usize, 0);
-            entries
-                .push((((pfn as u64) << PAGE_ENTRY_PFN_SHIFT) | (PAGE_ENTRY_VALID as u64)) as u32);
-        }
-        assert!(state.map_surface(mid));
-        {
-            let m = state.mappings.get_mut(&mid).unwrap();
-            m.mapped = true;
-            m.mapping_internal = mid as u64;
-            m.page_entries = entries;
-        }
-        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
-    }
-    // Mid 1: composite gray (Draw Store).
-    let gray = vec![0xCCu8; need];
-    assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
-    state.note_surface_composite(1);
-    // Present mid 1 → +0x188 holds gray.
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&1u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(state.present.frame_mapping, 1);
-    assert!(state.present.frame_valid);
-    let prior_px = state.present.frame_bgra[0];
-    assert_eq!(prior_px, 0xCC);
-    host.actions.clear();
-    // Mid 2: clear-only (no composite Store).
-    let black = vec![0u8; need];
-    // solid alpha-black clear
-    let mut clear = black;
-    for px in clear.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
-    assert!(write_bgra8(&mut state, &mut host, 2, &clear, stride, w, h));
-    state.note_surface_clear(2);
-    // Present mid 2 ClearOnly → keep mid 1 gray retain.
-    {
-        let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
-        payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
-            .copy_from_slice(&2u32.to_le_bytes());
-        process_child_packet(
-            &mut state,
-            &mut host,
-            5,
-            &Packet {
-                opcode: CHILD_OP_PRESENT_X86,
-                stamp_count: 0,
-                total_size: PACKET_HEADER_LEN + PRESENT_X86_MIN_LEN as u32,
-                completion_stamp: 0,
-                payload,
-                next_head: 0,
-            },
-        );
-    }
-    assert_eq!(
-        state.present.present_mapping, 2,
-        "guest DisplaySwap mid still named present"
-    );
-    assert_eq!(
-        state.present.frame_mapping, 1,
-        "+0x188 still prior composite mid"
-    );
-    assert_eq!(state.present.frame_bgra[0], 0xCC);
-    assert_eq!(
-        presented_mapping(&state),
-        Some(1),
-        "window must re-show prior composite mid 1"
-    );
-    assert_coalesced_paint_action(&host, "clear-only keeps composite retain");
-}
-
 #[test]
 fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3462,11 +2304,6 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
         [0, 0, 0, 0],
         "product MapMemory2 must stay notify-only for GVA (no auto flush)"
     );
-    // Helper path still works when called explicitly.
-    let fl = surface_cache::flush_gva_host_cache_on_map(&mut state, &mut host, 1, gva, 0x1000);
-    assert_eq!(fl.wrote, 1);
-    host.read_gpa(data_gpa, &mut probe).unwrap();
-    assert_eq!(&probe[..4], &[185, 126, 81, 255]);
 }
 
 /// Synchronize 0x35 is stamp + wait only — no host_cache→guest write (RE audit).
@@ -3527,11 +2364,6 @@ fn synchronize_resources_does_not_write_guest_pages() {
         [0, 0, 0, 0],
         "Synchronize must not write host_cache into guest pages"
     );
-    // Helper remains for explicit/unit use only.
-    assert!(matches!(
-        surface_cache::flush_surface_id_to_guest_pages(&mut state, &mut host, mid),
-        surface_cache::SyncFlushResult::WroteGuest { .. }
-    ));
 }
 
 /// set guestValid alone must not bump host content generation.
@@ -3567,4 +2399,545 @@ fn invalidate_without_clr_host_does_not_bump_generation() {
         },
     );
     assert_eq!(state.mappings[&0x2a].content_generation, 7);
+}
+
+/// `present_unbacked` gate: a member presented twice with no full-frame Store
+/// **naming it** in between is being shown content the guest never sent for it.
+/// `note_dense_frame_published` is the only site that advances
+/// `dense_frame_seq`, so an unchanged seq across a member's own two presents is
+/// the exact structural witness.
+///
+/// The gate used to be described as covering "a full-frame Store or an
+/// inter-buffer seed". `62587b1` deleted the peer front seed, so only the first
+/// half survives.
+///
+/// Healthy alternation must stay quiet: each buffer advances on its own turn.
+#[test]
+fn present_backing_gate_fires_only_when_a_member_gained_nothing() {
+    let w = 1920u32;
+    let h = 1080u32;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    for mid in [1u32, 5u32] {
+        state.map_surface(mid);
+        state.note_dense_frame_published(mid, w, h);
+    }
+
+    // First present of each member has no prior witness — never a report.
+    assert_eq!(state.note_present_backing(1), None);
+    assert_eq!(state.note_present_backing(5), None);
+
+    // Healthy a/b alternation: each member gets its own full frame before its
+    // next present, so the seq advances and the gate stays silent.
+    for _ in 0..4 {
+        state.note_dense_frame_published(1, w, h);
+        assert_eq!(state.note_present_backing(1), None);
+        state.note_dense_frame_published(5, w, h);
+        assert_eq!(state.note_present_backing(5), None);
+    }
+
+    // Mid 5 now goes dark: every full frame lands on mid 1, but the guest keeps
+    // naming mid 5 at present. Each of those presents shows content mid 5 never
+    // received, and each is reported (once per present, not once per lifetime).
+    for _ in 0..3 {
+        state.note_dense_frame_published(1, w, h);
+        assert_eq!(state.note_present_backing(1), None);
+        assert!(
+            state.note_present_backing(5).is_some(),
+            "no full-frame store named mid 5"
+        );
+    }
+
+    // Backing is the seq itself, whatever advanced it: a member that reaches the
+    // source's seq is quiet again on its next present.
+    state.present.dense_frame_seq.insert(
+        5,
+        state.present.dense_frame_seq.get(&1).copied().unwrap_or(0),
+    );
+    assert_eq!(state.note_present_backing(5), None);
+
+    // A recycled mapping id must not compare against its predecessor's witness.
+    state.unmap_surface(5);
+    state.map_surface(5);
+    state.note_dense_frame_published(5, w, h);
+    assert_eq!(state.note_present_backing(5), None);
+}
+
+/// The other half of the gate: a surface presented for the first time since it
+/// was created, with no full-frame Store ever naming it, is **uninitialized** —
+/// so the screen goes black, not stale.
+///
+/// The seq comparison above cannot see this. It checks for a *repeat* — this
+/// present's seq against the previous present's — while "never written" is a
+/// *state*, and `forget_compositor_mapping` prunes both witnesses on teardown so
+/// a re-created surface arrives with neither. Measured on a live boot: the guest
+/// re-created its scanout surfaces and presented mid 6 at `gen=0` with
+/// `px0=[0,0,0,0]`, and `present_unbacked` fired **zero** times for the whole
+/// boot. The guest was awake throughout — see `note_present_backing`.
+#[test]
+fn present_backing_gate_reports_a_surface_nothing_ever_stored() {
+    let w = 1920u32;
+    let h = 1080u32;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    state.map_surface(6);
+
+    // Never Stored, first present: the black-screen case.
+    assert_eq!(
+        state.note_present_backing(6),
+        Some(crate::model::PresentBacking::NeverStored),
+        "an uninitialized surface must not be presented silently"
+    );
+
+    // Reported once per lifetime, not once per present: the witness is recorded
+    // on every call, so the next present of the same unbacked surface is the
+    // `Restaled` case and carries that reason instead.
+    assert_eq!(
+        state.note_present_backing(6),
+        Some(crate::model::PresentBacking::Restaled { seq: 0 }),
+        "the second present of the same surface is a restale, and says so"
+    );
+
+    // A surface the guest did Store into is quiet on its first present — this is
+    // what keeps the new arm from firing on every healthy mapping.
+    state.map_surface(7);
+    state.note_dense_frame_published(7, w, h);
+    assert_eq!(state.note_present_backing(7), None);
+
+    // And re-creation re-arms it: the teardown prunes the witness, so the next
+    // incarnation is judged on its own Stores, not its predecessor's.
+    state.unmap_surface(7);
+    state.map_surface(7);
+    assert_eq!(
+        state.note_present_backing(7),
+        Some(crate::model::PresentBacking::NeverStored),
+        "a re-created surface is uninitialized again until something Stores it"
+    );
+}
+
+/// An unbacked present is only a *loss* when nothing carries it, and a build
+/// that cannot answer must keep the loud reading.
+///
+/// The structural gate above reads `dense_frame_seq`, which only
+/// `publish_surface_store` advances — i.e. only when a Store's pixels reached the
+/// mapping's guest pages. The resident rail renders into the registry and skips
+/// that write, so "unbacked" stopped implying "shows black": one 524 s boot
+/// emitted four `reason=…never_stored` lines each claiming the surface was
+/// uninitialized, against exactly one `host_window_slate*` line in the whole run
+/// (a `covered=1` boot run) with `presents == offered` and `direct_frac=1.00` in
+/// every cadence window bracketing them. A resident carried all four.
+///
+/// So the channel turns on the carrier, and the `None` arm is the whole content
+/// of the rule: `carried != Some(true)` and `carried == Some(false)` differ only
+/// where the build cannot tell, which is precisely where demoting a possible
+/// black frame to a census would go unnoticed.
+#[test]
+fn an_unbacked_present_fails_unless_a_resident_positively_carries_it() {
+    use super::{carrier_word, unbacked_present_is_a_loss};
+
+    assert!(
+        !unbacked_present_is_a_loss(Some(true)),
+        "a resident carried the frame, so no guest work was lost — census"
+    );
+    assert!(
+        unbacked_present_is_a_loss(Some(false)),
+        "nothing can carry this present, so it shows black — failure channel"
+    );
+    assert!(
+        unbacked_present_is_a_loss(None),
+        "a build that cannot answer must not downgrade a possible black frame"
+    );
+
+    // The field has to distinguish all three, or the log cannot tell "nothing
+    // carried it" from "we did not look" — the difference between a defect and
+    // an unmeasured build.
+    let words = [
+        carrier_word(Some(true)),
+        carrier_word(Some(false)),
+        carrier_word(None),
+    ];
+    assert_eq!(words, ["resident", "nothing", "unknown"]);
+    assert_eq!(
+        words.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3,
+        "each carrier state needs its own word"
+    );
+}
+
+/// The two arms of the gate must name themselves, and `Restaled` must carry the
+/// seq that did not move — two presents quoting the same number are the same
+/// guest frame shown twice, which is the whole diagnostic.
+#[test]
+fn present_backing_names_its_own_reason_and_restale_carries_its_seq() {
+    use crate::model::PresentBacking;
+    use crate::observe::Decline;
+
+    let restaled = PresentBacking::Restaled { seq: 41 };
+    let never = PresentBacking::NeverStored;
+    assert_ne!(
+        restaled.slug(),
+        never.slug(),
+        "two distinct findings must not share a slug"
+    );
+    assert_eq!(
+        restaled.fields(),
+        vec![("since_seq", "41".to_string())],
+        "a restale without its seq is half a diagnostic"
+    );
+    assert!(
+        never.fields().is_empty(),
+        "never-stored has no seq to report — there was never one"
+    );
+
+    // Rendered through the same builder the emission site uses, so the test pins
+    // the line a reader will grep rather than the accessor.
+    let line = crate::observe::Emit::decline("present_unbacked", &restaled)
+        .field("mid", 4u32)
+        .field("carried", super::carrier_word(Some(false)))
+        .render();
+    assert!(line.contains("reason=present_backing_restaled"), "{line}");
+    assert!(line.contains("since_seq=41"), "{line}");
+    assert!(line.contains("carried=nothing"), "{line}");
+}
+
+/// An AIR-load hold is control flow; a hold that outlives the device is the
+/// failure. The two must not share a channel.
+///
+/// `observe::off` prefixes `OFF `, `observe::fail` does not, and the failure
+/// channel is the one place a bad boot explains itself. `translation_order_hold`
+/// and `exec_translation_deferred` park a FIFO until an AIR module finishes
+/// loading — the packet is retried, not consumed — and both of their resolution
+/// lines (`translation_order_release`, `exec_translation_ready`) were already
+/// census. Logging only the wait half as a failure put one control-flow pair
+/// across both channels, and cost 126 of boot 87's 300 failure lines, 42 %.
+///
+/// The real loss needs no age, depth or timeout to detect: at reset, a mask still
+/// standing means guest packets are parked behind a load that never finished.
+#[test]
+fn a_translation_hold_is_census_and_only_an_unreleased_one_fails() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+    // The wait: census only, nothing on the failure channel.
+    {
+        let cap = crate::observe::FailCapture::start();
+        super::note_translation_order_hold(&mut state, 0b101);
+        let lines = cap.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("OFF translation_order_hold")),
+            "the hold must still be logged, on the census channel: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.starts_with("translation_order_hold")),
+            "a resolver saying `not ready yet` is not a failure: {lines:?}"
+        );
+    }
+
+    // Released while the device is still alive: nothing failed.
+    {
+        let cap = crate::observe::FailCapture::start();
+        super::release_translation_order_holds(&mut state);
+        assert_eq!(state.translation_order_hold_mask, 0);
+        state.reset();
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.starts_with("translation_hold_unreleased")),
+            "a hold that released before teardown is not a loss: {:?}",
+            cap.lines()
+        );
+    }
+
+    // A hold still standing at reset IS a loss, and it says so on the failure
+    // channel carrying the masks it read.
+    {
+        let mut stuck = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        super::note_translation_order_hold(&mut stuck, 0b110);
+        stuck.translation_deferred_mask = 0b10;
+        let cap = crate::observe::FailCapture::start();
+        stuck.reset();
+        let line = cap.one("translation_hold_unreleased");
+        assert!(
+            line.contains("held_mask=0x6") && line.contains("producer_mask=0x2"),
+            "the failure must carry what it read: {line}"
+        );
+        assert_eq!(stuck.translation_order_hold_mask, 0, "reset still resets");
+    }
+}
+
+/// The display-transaction probe must key on the payload *shape*, not fire per
+/// present.
+///
+/// A steady-state x86 boot pushes tens of thousands of opcode-6 packets. An
+/// unbounded `display_txn_payload` line would bury every other always-on record
+/// in the fail log, which is the one place a bad boot explains itself — the
+/// probe would destroy the evidence it exists to collect. A repeat of a shape we
+/// have already sampled carries no new information about where the plane list
+/// lives, so the budget is per
+/// `(opcode, payload_len, pipe_index, task_field_is_set)`.
+#[test]
+fn display_txn_payload_probe_is_bounded_per_wire_shape() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let packet = |opcode: u16, plen: usize| Packet {
+        opcode,
+        stamp_count: 0,
+        total_size: PACKET_HEADER_LEN + plen as u32,
+        completion_stamp: 0,
+        payload: vec![0u8; plen],
+        next_head: 0,
+    };
+
+    for _ in 0..(DISPLAY_TXN_PAYLOAD_SAMPLES * 8) {
+        note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 12));
+    }
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 0, false)),
+        Some(&DISPLAY_TXN_PAYLOAD_SAMPLES),
+        "a known shape must stop logging once its sample budget is spent"
+    );
+
+    // A *new* length is the whole point of the measurement: if the guest ever
+    // appends an inline plane list the payload grows, and that packet must be
+    // sampled even though the opcode is one we have already seen many times.
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_X86, 64));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 64, 0, false)),
+        Some(&1),
+        "a new payload length must get its own sample budget"
+    );
+
+    // Opcodes are budgeted independently: 6 and 7 are different commands with
+    // different trailers, and 8 is the arm64 pathway entirely.
+    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_PRESENT_GAMMA_X86, 0x24));
+    note_display_txn_payload(&mut state, 4, &packet(CHILD_OP_DISPLAY_SWAP, 12));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_GAMMA_X86, 0x24, 0, false)),
+        Some(&1)
+    );
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_DISPLAY_SWAP, 12, 0, false)),
+        Some(&1)
+    );
+}
+
+/// The plane-0 surface id changes every frame by design; the pipe index and the
+/// task field do not.
+///
+/// Keying the budget on length alone spent it inside the first 400ms of a live
+/// boot and left the probe silent for the rest of the session, because the
+/// length never varies. The trailer's other two words are what still carry news,
+/// so a second display pipe or the task field's first non-zero value must each
+/// re-arm the budget — while a fresh surface id every frame must not, or the
+/// probe becomes unbounded again.
+#[test]
+fn display_txn_payload_probe_rearms_on_trailer_change_but_not_on_surface_id() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let trailer = |pipe: u32, surface: u32, task: u32| {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&pipe.to_le_bytes());
+        payload.extend_from_slice(&surface.to_le_bytes());
+        payload.extend_from_slice(&task.to_le_bytes());
+        Packet {
+            opcode: CHILD_OP_PRESENT_X86,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    // Bring-up: pipe 0, task still zero, a different surface id every frame.
+    for surface in 0..(DISPLAY_TXN_PAYLOAD_SAMPLES * 8) {
+        note_display_txn_payload(&mut state, 5, &trailer(0, surface + 1, 0));
+    }
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 0, false)),
+        Some(&DISPLAY_TXN_PAYLOAD_SAMPLES),
+        "a per-frame surface id must not re-arm the budget"
+    );
+    assert_eq!(
+        state.display.txn_payload_samples.len(),
+        1,
+        "surface ids must not each open their own bucket"
+    );
+
+    // Steady state: the task field goes non-zero. That transition is the open
+    // question, so it gets a fresh budget exactly once.
+    note_display_txn_payload(&mut state, 5, &trailer(0, 0x2a, 7));
+    note_display_txn_payload(&mut state, 5, &trailer(0, 0x2b, 9));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 0, true)),
+        Some(&2),
+        "the task field's first non-zero value must re-arm the budget"
+    );
+
+    // A second display pipe is a different wire shape, not a repeat.
+    note_display_txn_payload(&mut state, 6, &trailer(1, 0x2a, 7));
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_X86, 12, 1, true)),
+        Some(&1),
+        "a new pipe index must get its own sample budget"
+    );
+}
+
+/// The gamma command swaps the surface id and the task field relative to the
+/// plain one.
+///
+/// Both words are u32s in adjacent slots, so reading them at the wrong offsets
+/// still yields plausible-looking values — the probe would key its budget on the
+/// surface id and re-arm every frame, and the emitted `task=` would be a surface
+/// id. Nothing downstream would report an error.
+#[test]
+fn display_txn_trailer_slots_follow_the_emitting_command() {
+    // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
+    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, 2));
+    // command 7: [pipe][task][surface][gamma…] — the two are swapped.
+    assert_eq!(
+        display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
+        (2, 1)
+    );
+    assert_eq!(display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP), (1, 2));
+
+    // The swap has to survive the budget key, not just the log line: a gamma
+    // packet whose *task* is zero and whose surface id is non-zero must land in
+    // the task-is-zero bucket.
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes()); // pipe
+    payload.extend_from_slice(&0u32.to_le_bytes()); // task
+    payload.extend_from_slice(&0x2au32.to_le_bytes()); // surface
+    payload.resize(0x24, 0);
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &Packet {
+            opcode: CHILD_OP_PRESENT_GAMMA_X86,
+            stamp_count: 0,
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        state
+            .display
+            .txn_payload_samples
+            .get(&(CHILD_OP_PRESENT_GAMMA_X86, 0x24, 0, false)),
+        Some(&1),
+        "gamma's task field is slot 1; reading slot 2 would mistake a surface id for it"
+    );
+}
+
+/// The trailer the guest appends after serializing the transaction's resource
+/// list is 0x24 bytes for the gamma command and 0x0c for the plain one.
+///
+/// The probe reports the trailer read from *both* ends of the payload, and the
+/// tail reading is only meaningful at the right width — get this wrong and a
+/// payload that does carry an inline plane list would still look trailer-only.
+#[test]
+fn display_txn_trailer_width_matches_the_emitting_command() {
+    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_X86), 0x0c);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_PRESENT_GAMMA_X86), 0x24);
+    assert_eq!(display_txn_trailer_len(CHILD_OP_DISPLAY_SWAP), 0x0c);
+}
+
+/// Head and tail readings coincide exactly when the payload is trailer-only.
+///
+/// That coincidence is the measurement's verdict: agreement means the plane list
+/// is not inline and a real decode has to reach it another way; divergence means
+/// the list precedes the trailer and our fixed offset-zero read has been parsing
+/// the list header all along.
+#[test]
+fn display_txn_probe_distinguishes_trailer_only_from_prefixed_payload() {
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+
+    // Trailer-only: [pipe=0][surface=0x2a][task=7].
+    let mut trailer_only = Vec::new();
+    trailer_only.extend_from_slice(&0u32.to_le_bytes());
+    trailer_only.extend_from_slice(&0x2au32.to_le_bytes());
+    trailer_only.extend_from_slice(&7u32.to_le_bytes());
+    assert_eq!(
+        trailer_only.len(),
+        display_txn_trailer_len(CHILD_OP_PRESENT_X86)
+    );
+
+    // Same trailer behind an 8-byte prefix: offset-zero now reads the prefix.
+    let mut prefixed = vec![0xEEu8; 8];
+    prefixed.extend_from_slice(&trailer_only);
+
+    for payload in [trailer_only, prefixed] {
+        let plen = payload.len();
+        note_display_txn_payload(
+            &mut state,
+            5,
+            &Packet {
+                opcode: CHILD_OP_PRESENT_X86,
+                stamp_count: 0,
+                total_size: PACKET_HEADER_LEN + plen as u32,
+                completion_stamp: 0,
+                payload,
+                next_head: 0,
+            },
+        );
+        assert_eq!(
+            state
+                .display
+                .txn_payload_samples
+                .get(&(CHILD_OP_PRESENT_X86, plen, 0, true)),
+            Some(&1),
+            "each distinct shape must be sampled once"
+        );
+    }
+}
+
+/// A present the dmabuf carried is not a black present.
+///
+/// Route B skips the full-frame GPU→CPU readback on purpose, so `frame_bgra` is
+/// empty by design and any `max_rgb == 0` test reports black on every present —
+/// a live boot logged 1338 `present_black_retain` records against 1312 presents.
+/// An always-on failure sink that fires on every healthy frame cannot surface the
+/// unhealthy one, so "no pixels" must be its own verdict rather than folded into
+/// "black".
+#[test]
+fn a_dmabuf_carried_present_is_unsampled_not_black() {
+    assert_eq!(
+        present_content_verdict(&[], 0),
+        PresentContentVerdict::Unsampled,
+        "no CPU pixels means no evidence, not evidence of black"
+    );
+    // A genuinely black sampled frame must still be caught — that is the record's
+    // whole purpose, and the fix must not trade one blind spot for another.
+    assert_eq!(
+        present_content_verdict(&[0, 0, 0, 255], 0),
+        PresentContentVerdict::Black,
+        "an opaque all-zero-RGB frame is still black"
+    );
+    assert_eq!(
+        present_content_verdict(&[0, 0, 0x40, 255], 0x40),
+        PresentContentVerdict::Content
+    );
 }

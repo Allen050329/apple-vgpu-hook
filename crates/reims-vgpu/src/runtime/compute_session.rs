@@ -57,16 +57,12 @@ pub struct ComputeSession {
     /// Nested dispatches encoded on this session; flushed after GPU completion.
     pub(crate) nested_jobs: Vec<compute_exec::NestedDispatchJob>,
     pub control_depth: i32,
-    pub saw_control: bool,
-    pub saw_icb: bool,
     ended: bool,
 }
 
 #[cfg(feature = "backend-vulkan")]
 pub struct ComputeSession {
     pub control_depth: i32,
-    pub saw_control: bool,
-    pub saw_icb: bool,
 }
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -117,8 +113,6 @@ impl ComputeSession {
                 retained_icbs: Vec::new(),
                 nested_jobs: Vec::new(),
                 control_depth: 0,
-                saw_control: false,
-                saw_icb: false,
                 ended: false,
             })
         }
@@ -143,8 +137,6 @@ impl ComputeSession {
                 encode_start_else, encode_start_if, encode_start_while,
             };
             use metal::MTLResourceOptions;
-
-            self.saw_control = true;
 
             let mut stage_cond = |this: &mut Self,
                                   buffer_ref: u32,
@@ -272,7 +264,6 @@ impl ComputeSession {
         cmd: &ComputeCommand,
         acc: &ComputeAccum,
     ) -> ComputeStatus {
-        self.saw_icb = true;
         if cmd.indirect_command_buffer_ref == 0 {
             return ComputeStatus::MissingBuffer("compute_icb_ref_zero");
         }
@@ -427,6 +418,23 @@ impl ComputeSession {
     }
 }
 
+/// The mutable state of one `SEGMENT_TYPE_COMPUTE` segment.
+///
+/// These three share a single lifetime: they come into existence when the
+/// segment opens, every record in the segment reads and mutates them together,
+/// and the session commits when the segment ends. Passing them as one value
+/// keeps that lifetime visible at each call site.
+#[derive(Default)]
+pub struct ComputeSegment {
+    /// Pipeline / bind state accumulated across the segment's records.
+    pub acc: ComputeAccum,
+    /// Multi-record encoder, opened on demand by the first control-flow or ICB
+    /// record and committed at segment end.
+    pub session: Option<ComputeSession>,
+    /// Latched sequencing failure; once set it refuses later dispatches.
+    pub block: Option<SequencingBlock>,
+}
+
 pub fn ensure_session(
     session: &mut Option<ComputeSession>,
     dispatch_type: u32,
@@ -442,11 +450,9 @@ pub fn apply_sequencing<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     cmd: &ComputeCommand,
-    acc: &mut ComputeAccum,
-    session: &mut Option<ComputeSession>,
-    block: &mut Option<SequencingBlock>,
+    seg: &mut ComputeSegment,
 ) -> ComputeStatus {
-    if block.is_some() {
+    if seg.block.is_some() {
         return ComputeStatus::Unsupported("sequencing_block_active");
     }
     match cmd.kind {
@@ -457,32 +463,32 @@ pub fn apply_sequencing<M: HostMemory + HostOps>(
         | Kind::ControlStartIf
         | Kind::ControlStartElse
         | Kind::ControlEndIf => {
-            let sess = match ensure_session(session, acc.dispatch_type) {
+            let sess = match ensure_session(&mut seg.session, seg.acc.dispatch_type) {
                 Ok(s) => s,
                 Err(e) => {
-                    *block = Some(SequencingBlock::ControlFlow);
+                    seg.block = Some(SequencingBlock::ControlFlow);
                     return e;
                 }
             };
             let st = sess.encode_control(state, host, task_id, cmd);
             if !matches!(st, ComputeStatus::Ok) {
-                *block = Some(SequencingBlock::ControlFlow);
+                seg.block = Some(SequencingBlock::ControlFlow);
             }
             st
         }
         Kind::ExecuteCommandsInBuffer | Kind::ExecuteCommandsInBufferIndirect => {
-            let sess = match ensure_session(session, acc.dispatch_type) {
+            let sess = match ensure_session(&mut seg.session, seg.acc.dispatch_type) {
                 Ok(s) => s,
                 Err(e) => {
-                    *block = Some(SequencingBlock::IndirectCommandBuffer);
+                    seg.block = Some(SequencingBlock::IndirectCommandBuffer);
                     return e;
                 }
             };
-            let st = sess.encode_icb(state, host, task_id, cmd, acc);
+            let st = sess.encode_icb(state, host, task_id, cmd, &seg.acc);
             // Latch only on failure so successful materialize+execute does not
             // block later dispatches in the segment.
             if !matches!(st, ComputeStatus::Ok) {
-                *block = Some(SequencingBlock::IndirectCommandBuffer);
+                seg.block = Some(SequencingBlock::IndirectCommandBuffer);
             }
             st
         }
@@ -1091,6 +1097,8 @@ mod tests {
     };
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::runtime::gva_mem;
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    use crate::runtime::gva_mem::write_task_gva_arm64e;
 
     use crate::runtime::host::FakeHost;
 
@@ -1117,72 +1125,30 @@ mod tests {
     }
 
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    fn setup_task_pages(host: &mut FakeHost, state: &mut DeviceState, data_base_pfn: u32) {
-        let dir_pfn = 2u32;
-        let root_pfn = 3u32;
-        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(dir_gpa, 0x20, 0);
-        host.map_range(root_gpa, 0x4000, 0);
-        let mut d = [0u8; 8];
-        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-        let _ = host.write_gpa(dir_gpa, &d);
-        for i in 0..8u32 {
-            let pfn = data_base_pfn + i;
-            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-            let mut pte = [0u8; 4];
-            st32(&mut pte, pfn);
-            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-        }
-        assert!(state.define_task(1, 0x1000, dir_pfn));
-        assert!(state.set_object_list(1, 0, 32));
-    }
-
     #[test]
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     fn control_if_else_spi_session_commits() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_task_pages(&mut host, &mut state, 4);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(1, 0, 32));
 
         // Condition buffer: u32 == 5 at offset 0.
         let cond = 5u32.to_le_bytes();
         let buf_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            buf_gva,
-            &cond,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &cond);
         let mut bdesc = vec![0u8; 16];
         st64(&mut bdesc[0..], 4);
         st32(&mut bdesc[8..], 5);
         let bdesc_gva = 0x180u64;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            bdesc_gva,
-            &bdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
         {
             let off = list_object_entry_offset(7, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
         let mut session = ComputeSession::open(0).expect("metal session");
@@ -1236,83 +1202,42 @@ mod tests {
 
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_task_pages(&mut host, &mut state, 4);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        assert!(state.set_object_list(1, 0, 32));
 
         // Condition == 1 at buffer ref 8.
         let cond = 1u32.to_le_bytes();
         let cond_gva = 4u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            cond_gva,
-            &cond,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], cond_gva, &cond);
         let mut cdesc = vec![0u8; 16];
         st64(&mut cdesc[0..], 4);
         st32(&mut cdesc[8..], 4);
         let cdesc_gva = 0x100u64;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            cdesc_gva,
-            &cdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], cdesc_gva, &cdesc);
         {
             let off = list_object_entry_offset(8, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&cdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
         // Kernel function + pipeline + data buffer (same shape as mul3add1 unit).
         let blob_gva = 5u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            blob_gva,
-            &mtlb,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &mtlb);
         let mut fdesc = vec![0u8; 32];
         st64(&mut fdesc[0..], blob_gva);
         st32(&mut fdesc[8..], mtlb.len() as u32);
         let fdesc_gva = 0x140u64;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            fdesc_gva,
-            &fdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], fdesc_gva, &fdesc);
         {
             let off = list_object_entry_offset(5, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_FUNCTION as u32) | (32u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&fdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
         let mut pdesc = vec![0u8; 32];
         st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -1322,66 +1247,31 @@ mod tests {
         pdesc[TYPE7_FIRST_TLVS + 2] = 4;
         st32(&mut pdesc[TYPE7_FIRST_TLVS + 3..], 5);
         let pdesc_gva = 0x180u64;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            pdesc_gva,
-            &pdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], pdesc_gva, &pdesc);
         {
             let off = list_object_entry_offset(6, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_TYPE7 as u32) | (32u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&pdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
         let data = [1u32, 2, 3, 4];
         let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buf_gva = 6u64 << RESOURCE_PAGE_SHIFT;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            buf_gva,
-            &data_bytes,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
         let mut bdesc = vec![0u8; 16];
         st64(&mut bdesc[0..], 16);
         st32(&mut bdesc[8..], 6);
         let bdesc_gva = 0x1c0u64;
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            bdesc_gva,
-            &bdesc,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], bdesc_gva, &bdesc);
         {
             let off = list_object_entry_offset(7, 32).unwrap();
             let mut le = [0u8; OBJECT_LIST_ENTRY_LEN];
             let packed = (OBJECT_TYPE_BUFFER as u32) | (16u32 << 8);
             st32(&mut le[0..], packed);
             le[4..12].copy_from_slice(&bdesc_gva.to_le_bytes());
-            assert!(gva_mem::write_task_gva(
-                &mut host,
-                &state.tasks[1],
-                off,
-                &le,
-                PAGE_SHIFT_ARM64E
-            )
-            .is_ok());
+            write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
         // Phase A: nested dispatch alone on a session (no control SPI).
@@ -1425,14 +1315,7 @@ mod tests {
         // Reset data for phase B (if-wrapped).
         let data = [1u32, 2, 3, 4];
         let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        assert!(gva_mem::write_task_gva(
-            &mut host,
-            &state.tasks[1],
-            buf_gva,
-            &data_bytes,
-            PAGE_SHIFT_ARM64E
-        )
-        .is_ok());
+        write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &data_bytes);
 
         // Phase B: if wraps nested dispatch. Concurrent encoder is the intended
         // SPI host for encodeStartIf. Wire comparison is the Reims VGPU encoder's enum
@@ -1491,23 +1374,13 @@ mod tests {
     fn icb_latches_sequencing_block() {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut acc = ComputeAccum::default();
-        let mut session = None;
-        let mut block = None;
+        let mut seg = ComputeSegment::default();
         let cmd = ComputeCommand {
             kind: Kind::ExecuteCommandsInBuffer,
             indirect_command_buffer_ref: 1,
             ..ComputeCommand::default()
         };
-        let st = apply_sequencing(
-            &mut state,
-            &mut host,
-            1,
-            &cmd,
-            &mut acc,
-            &mut session,
-            &mut block,
-        );
+        let st = apply_sequencing(&mut state, &mut host, 1, &cmd, &mut seg);
         // Missing list entry → MissingBuffer; latches sequencing block.
         // Non-Apple metal stubs may short-circuit to NoMetal (Linux product).
         assert!(
@@ -1519,8 +1392,8 @@ mod tests {
             ),
             "unexpected {st:?}"
         );
-        assert_eq!(block, Some(SequencingBlock::IndirectCommandBuffer));
-        if let Some(s) = session.take() {
+        assert_eq!(seg.block, Some(SequencingBlock::IndirectCommandBuffer));
+        if let Some(s) = seg.session.take() {
             let _ = s.finish(&mut host, &mut state, 1);
         }
     }

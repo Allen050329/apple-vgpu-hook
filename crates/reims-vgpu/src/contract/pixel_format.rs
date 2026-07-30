@@ -1,7 +1,7 @@
 //! Metal pixel-format helpers (port of `host/utils/reims-vgpu-pixel-format`).
 
+use crate::contract::checked_mul_u64;
 use crate::contract::endian::{ld16, st16};
-use crate::contract::{align_up_u64, checked_mul_u64};
 
 pub const COMPONENT_COUNT: usize = 4;
 pub const COMPONENT_R: usize = 0;
@@ -14,6 +14,7 @@ pub const RG8_BPP: u32 = 2;
 pub const RGBA8_BPP: u32 = 4;
 pub const BGRA8_BPP: u32 = RGBA8_BPP;
 pub const R16F_BPP: u32 = 2;
+pub const R32F_BPP: u32 = 4;
 pub const RG16F_BPP: u32 = 4;
 pub const RGBA16_BPP: u32 = 8;
 pub const RGBA16F_BPP: u32 = RGBA16_BPP;
@@ -109,6 +110,21 @@ pub enum TexelLayout {
     R8,
     /// 2 bytes/texel — a biplanar video chroma plane, likewise native.
     Rg8,
+    /// 2 bytes/texel — a single-channel `float16` texture, sampled natively as
+    /// `R16_SFLOAT` (the shader reads `.x`, the other lanes expand to `0,0,1`).
+    /// Color-management 1D LUTs (macOS WindowServer's `UberCompositeFragment`
+    /// display-profile pass) are stored this way; converting them to unorm8
+    /// would quantize the transfer curve, and the CPU `texel_to_rgba8` loader
+    /// has no float arm, so this native rail is the only correct path. Not a
+    /// four-byte color layout, so it never rides the RGBA8-shaped loaders.
+    R16Float,
+    /// 4 bytes/texel — a single-channel `float32` texture, sampled natively as
+    /// `R32_SFLOAT`. Same color-LUT role as [`Self::R16Float`], but its
+    /// linear-filter feature is optional (absent on Apple/MoltenVK), so the
+    /// rail that emits this layout must first confirm the host supports it.
+    /// Four bytes wide but **not** a colour order, so it stays out of the
+    /// RGBA8-shaped loaders and `is_four_byte_color`.
+    R32Float,
 }
 
 impl TexelLayout {
@@ -118,6 +134,8 @@ impl TexelLayout {
             Self::Rgba8 | Self::Bgra8 => RGBA8_BPP,
             Self::R8 => R8_BPP,
             Self::Rg8 => RG8_BPP,
+            Self::R16Float => R16F_BPP,
+            Self::R32Float => R32F_BPP,
         }
     }
 
@@ -148,17 +166,6 @@ pub enum RenderTargetClass {
     /// widgets). The GPU pass is 8-bit UNORM like every other target; the R/G
     /// channels round-trip through the f16 LUT at guest writeback/seed.
     Rg16Float = 6,
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SwizzleSelector {
-    Zero = 0,
-    One = 1,
-    Red = 2,
-    Green = 3,
-    Blue = 4,
-    Alpha = 5,
 }
 
 #[repr(u8)]
@@ -266,8 +273,6 @@ pub struct DepthStencilPacking {
     pub full_bpp: u32,
     /// Byte offset of the depth field within the texel (if present).
     pub depth_offset: u32,
-    /// Raw depth field size in the packed texel (before buffer expansion).
-    pub depth_raw_size: u32,
     /// Buffer-side depth plane size after Metal extraction.
     pub depth_plane_bpp: u32,
     /// Byte offset of the stencil field within the texel (if present).
@@ -297,7 +302,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_DEPTH32_FLOAT_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 8,
             depth_offset: 0,
-            depth_raw_size: 4,
             depth_plane_bpp: 4,
             stencil_offset: 4,
             stencil_plane_bpp: 1,
@@ -307,7 +311,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_DEPTH24_UNORM_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 4,
             depth_offset: 0,
-            depth_raw_size: 4,
             depth_plane_bpp: 4,
             stencil_offset: 0,
             stencil_plane_bpp: 1,
@@ -317,7 +320,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_X32_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 8,
             depth_offset: 0,
-            depth_raw_size: 0,
             depth_plane_bpp: 0,
             stencil_offset: 4,
             stencil_plane_bpp: 1,
@@ -327,7 +329,6 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
         MTL_FORMAT_X24_STENCIL8 => Some(DepthStencilPacking {
             full_bpp: 4,
             depth_offset: 0,
-            depth_raw_size: 0,
             depth_plane_bpp: 0,
             stencil_offset: 0,
             stencil_plane_bpp: 1,
@@ -631,25 +632,6 @@ pub fn tight_row_bytes(width: u32, format: u16) -> Option<u32> {
     width.checked_mul(bpp)
 }
 
-pub fn row_bytes_aligned(width: u32, format: u16, alignment: u32) -> Option<u32> {
-    if width == 0 || alignment == 0 {
-        return None;
-    }
-    let bpp = bytes_per_pixel(format)?;
-    let row = checked_mul_u64(width as u64, bpp as u64)?;
-    let rem = row % alignment as u64;
-    let row = if rem != 0 {
-        row.checked_add(alignment as u64 - rem)?
-    } else {
-        row
-    };
-    if row > u32::MAX as u64 {
-        None
-    } else {
-        Some(row as u32)
-    }
-}
-
 pub fn iosurface_row_bytes(width: u32, format: u16) -> Option<u32> {
     if width == 0 {
         return None;
@@ -667,16 +649,6 @@ pub fn iosurface_row_bytes(width: u32, format: u16) -> Option<u32> {
     } else {
         Some(row as u32)
     }
-}
-
-pub fn tight_image_size(width: u32, height: u32, format: u16) -> Option<usize> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let bpp = bytes_per_pixel(format)?;
-    let pixels = checked_mul_u64(width as u64, height as u64)?;
-    let bytes = checked_mul_u64(pixels, bpp as u64)?;
-    usize::try_from(bytes).ok()
 }
 
 pub fn swizzle_identity() -> SwizzlePlan {
@@ -718,13 +690,6 @@ pub fn swizzle_is_identity(plan: &SwizzlePlan) -> bool {
             SwizzleSource::B,
             SwizzleSource::A,
         ]
-}
-
-pub fn swizzle_word(raw: &[u8; COMPONENT_COUNT]) -> u32 {
-    u32::from(raw[0])
-        | (u32::from(raw[1]) << 8)
-        | (u32::from(raw[2]) << 16)
-        | (u32::from(raw[3]) << 24)
 }
 
 pub fn apply_swizzle_rgba8(plan: &SwizzlePlan, in_rgba: [u8; 4]) -> [u8; 4] {
@@ -799,10 +764,6 @@ fn f16_to_unorm8_lut() -> &'static [u8; 65536] {
     LUT.get_or_init(build_f16_to_unorm8_lut)
 }
 
-pub fn f16_to_unorm8(half_bits: u16) -> u8 {
-    f16_to_unorm8_lut()[half_bits as usize]
-}
-
 fn unorm8_to_f16_slow(value: u8) -> u16 {
     let f = f32::from(value) / f32::from(UNORM8_MAX);
     let x = f.to_bits();
@@ -846,10 +807,6 @@ fn unorm8_to_f16_lut() -> &'static [u16; 256] {
         }
         lut
     })
-}
-
-pub fn unorm8_to_f16(value: u8) -> u16 {
-    unorm8_to_f16_lut()[value as usize]
 }
 
 pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
@@ -900,11 +857,6 @@ pub fn texel_to_rgba8(format: u16, src: &[u8]) -> Option<[u8; 4]> {
     Some(rgba)
 }
 
-pub fn texel_to_rgba8_swizzled(format: u16, src: &[u8], swizzle: &SwizzlePlan) -> Option<[u8; 4]> {
-    let rgba = texel_to_rgba8(format, src)?;
-    Some(apply_swizzle_rgba8(swizzle, rgba))
-}
-
 pub fn rgba8_to_texel(format: u16, rgba: [u8; 4], dst: &mut [u8]) -> bool {
     let Some(bpp) = bytes_per_pixel(format) else {
         return false;
@@ -947,36 +899,22 @@ fn row_walk_backward(
     dst_len: usize,
     dst_stride: usize,
     same_base: bool,
-) -> Option<bool> {
+) -> bool {
     // Non-overlapping or zero lengths: forward.
     if src_len == 0 || dst_len == 0 {
-        return Some(false);
+        return false;
     }
     // We cannot detect true pointer overlap without raw pointers; for Rust
     // slice APIs we only allow in-place when same_base is true (caller asserts
     // src and dst alias the same allocation).
     if !same_base {
-        return Some(false);
+        return false;
     }
-    Some(dst_stride > src_stride)
+    dst_stride > src_stride
 }
 
 pub fn convert_row_to_rgba8(format: u16, src: &[u8], pixels: u32, dst_rgba: &mut [u8]) -> bool {
     convert_row_to_rgba8_ex(format, src, pixels, dst_rgba, false)
-}
-
-pub fn convert_row_to_rgba8_inplace(format: u16, buf: &mut [u8], pixels: u32, bpp: u32) -> bool {
-    // In-place expand: process backward if bpp < 4.
-    let src_len = (pixels as usize).checked_mul(bpp as usize).unwrap_or(0);
-    let dst_len = (pixels as usize)
-        .checked_mul(RGBA8_BPP as usize)
-        .unwrap_or(0);
-    if buf.len() < dst_len.max(src_len) {
-        return false;
-    }
-    // Copy src first into temporary when expanding in place.
-    let src_owned = buf[..src_len].to_vec();
-    convert_row_to_rgba8(format, &src_owned, pixels, &mut buf[..dst_len])
 }
 
 fn convert_row_to_rgba8_ex(
@@ -1003,15 +941,13 @@ fn convert_row_to_rgba8_ex(
     if src.len() < src_len || dst_rgba.len() < dst_len {
         return false;
     }
-    let Some(backward) = row_walk_backward(
+    let backward = row_walk_backward(
         src_len,
         bpp as usize,
         dst_len,
         RGBA8_BPP as usize,
         same_base,
-    ) else {
-        return false;
-    };
+    );
 
     if format == MTL_FORMAT_RGBA16_FLOAT {
         let lut = f16_to_unorm8_lut();
@@ -1040,41 +976,6 @@ fn convert_row_to_rgba8_ex(
         let sp = (i as usize) * bpp as usize;
         let dp = (i as usize) * RGBA8_BPP as usize;
         let Some(rgba) = texel_to_rgba8(format, &src[sp..sp + bpp as usize]) else {
-            return false;
-        };
-        dst_rgba[dp..dp + 4].copy_from_slice(&rgba);
-    }
-    true
-}
-
-pub fn convert_row_to_rgba8_swizzled(
-    format: u16,
-    src: &[u8],
-    pixels: u32,
-    swizzle: &SwizzlePlan,
-    dst_rgba: &mut [u8],
-) -> bool {
-    if pixels == 0 {
-        return true;
-    }
-    let Some(bpp) = bytes_per_pixel(format) else {
-        return false;
-    };
-    let src_len = match (pixels as u64).checked_mul(bpp as u64) {
-        Some(v) => v as usize,
-        None => return false,
-    };
-    let dst_len = match (pixels as u64).checked_mul(RGBA8_BPP as u64) {
-        Some(v) => v as usize,
-        None => return false,
-    };
-    if src.len() < src_len || dst_rgba.len() < dst_len {
-        return false;
-    }
-    for i in 0..pixels {
-        let sp = (i as usize) * bpp as usize;
-        let dp = (i as usize) * RGBA8_BPP as usize;
-        let Some(rgba) = texel_to_rgba8_swizzled(format, &src[sp..], swizzle) else {
             return false;
         };
         dst_rgba[dp..dp + 4].copy_from_slice(&rgba);
@@ -1136,12 +1037,6 @@ pub fn convert_rgba8_to_row(format: u16, src_rgba: &[u8], pixels: u32, dst: &mut
         }
     }
     true
-}
-
-// silence unused for now
-#[allow(dead_code)]
-fn _align_up_used() {
-    let _ = align_up_u64(1, 128);
 }
 
 #[cfg(test)]
@@ -1407,30 +1302,18 @@ mod tests {
         // Same 4 Bpp packing as BGRA8 → same 128 B aligned row for w=200.
         assert_eq!(iosurface_row_bytes(200, MTL_FORMAT_RGBA8_UNORM), Some(896));
         assert_eq!(tight_row_bytes(200, MTL_FORMAT_BGRA8_UNORM), Some(800));
-        assert_eq!(row_bytes_aligned(3, MTL_FORMAT_RGBA32_FLOAT, 64), Some(64));
-        assert_eq!(tight_image_size(4, 3, MTL_FORMAT_RGBA8_UNORM), Some(48));
-        assert_eq!(
-            tight_image_size(u32::MAX, u32::MAX, MTL_FORMAT_RGBA32_FLOAT),
-            None
-        );
     }
 
     #[test]
     fn swizzle_and_texels() {
         let plan = swizzle_plan(&[2, 3, 4, 5]).unwrap();
         assert!(swizzle_is_identity(&plan));
-        assert_eq!(swizzle_word(&[2, 3, 4, 5]), 0x05040302);
         let bgra = [10u8, 20, 30, 40];
         let rgba = texel_to_rgba8(MTL_FORMAT_BGRA8_UNORM, &bgra).unwrap();
         assert_eq!(rgba, [30, 20, 10, 40]);
         let mut out = [0u8; 4];
         assert!(rgba8_to_texel(MTL_FORMAT_BGRA8_UNORM, rgba, &mut out));
         assert_eq!(out, bgra);
-
-        // f16 round-trip identity for unorm8 extremes
-        assert_eq!(f16_to_unorm8(unorm8_to_f16(0)), 0);
-        assert_eq!(f16_to_unorm8(unorm8_to_f16(255)), 255);
-        assert_eq!(f16_to_unorm8(unorm8_to_f16(128)), 128);
 
         let row = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let mut rgba_row = [0u8; 8];
@@ -1450,11 +1333,14 @@ mod tests {
         ));
         assert_eq!(back, row);
 
-        // property: random unorm8 -> f16 -> unorm8 stable for all bytes
+        // Property: the two lookup tables the conversion paths index are
+        // exact inverses over every byte. Asserted against the tables
+        // themselves, which is what those paths read.
+        let to_f16 = unorm8_to_f16_lut();
+        let to_u8 = f16_to_unorm8_lut();
         for v in 0u8..=255 {
-            assert_eq!(f16_to_unorm8(unorm8_to_f16(v)), v);
+            assert_eq!(to_u8[to_f16[v as usize] as usize], v);
         }
-        let _ = convert_row_to_rgba8_inplace;
         let _ = f64_to_unorm8(0.5);
         let _ = f16_to_f32(0x3c00); // 1.0
     }

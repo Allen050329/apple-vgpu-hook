@@ -45,13 +45,19 @@
 //! It changes no behaviour. It is an inventory, and its value is that the
 //! inventory is *checked* — the gaps it records are the input to closing them,
 //! not a substitute for it.
+//!
+//! Because it is only ever read by its own tests, it is declared
+//! `#[cfg(test)]` alongside `translate::gate` and `caps::gate`, the other two
+//! modules here that assert about the source rather than run in it. Nothing
+//! outside names `coverage::`; if a product path ever needs a disposition at
+//! runtime, that is the signal to un-gate it deliberately rather than by
+//! accident.
 
 /// What happens to one decoded Metal command/descriptor field on the Vulkan
 /// pathway.
 ///
-/// The plan that produced this module sketched three states and typed the
-/// declining one as a `TranslateReason`. Writing it out found that wrong twice
-/// over. The fail-visible declines on this path are `observe` slugs, not
+/// Three states, with the declining one typed as a `TranslateReason`, is the
+/// obvious shape and it is wrong twice over. The fail-visible declines on this path are `observe` slugs, not
 /// translation failures — the field translated fine, the *rail* cannot carry
 /// it — and, more importantly, there turned out to be a fourth state the sketch
 /// had no room for: decoded, dropped, and **silent**. Forcing those into
@@ -259,15 +265,14 @@ const RENDER_PIPELINE: &[FieldCoverage] = &[
         "PipelineColorAttachment.op_alpha",
         "backend/vulkan/engine/caches.rs:blend_att",
     ),
-    // The lapse this manifest exists for. `caches.rs` pins
-    // `color_write_mask(RGBA)` on every attachment, so a guest pipeline that
-    // masks alpha writes gets all four channels and nothing says so.
-    absent(
+    // The lapse this manifest exists for, now closed. The tag was read off a
+    // live guest by `note_color_entry_fields` rather than guessed: it is
+    // `0x09`, the ninth property in `MTLRenderPipeline.h`, following the eight
+    // above it in header order.
+    honored(
         "colorAttachments[n].writeMask",
-        "MTLColorWriteMask is not decoded: `PipelineColorAttachment` has no \
-         field for it and `parse_color_attachments` reads none. The builder \
-         pins ColorComponentFlags::RGBA unconditionally. Where it sits in the \
-         type-7 colour-attachment block is unknown — an RE task, not a guess.",
+        "PipelineColorAttachment.write_mask",
+        "backend/vulkan/engine/caches.rs:blend_att",
     ),
     absent(
         "rasterSampleCount",
@@ -1101,7 +1106,11 @@ const BUFFER_TEXTURE: &[FieldCoverage] = decoded_fields! {
 pub const MANIFEST: &[DescriptorFamily] = &[
     DescriptorFamily {
         descriptor: "MTLRenderPipelineDescriptor",
-        decode_structs: &["RenderPipelineDescriptor", "PipelineColorAttachment"],
+        decode_structs: &[
+            "RenderPipelineDescriptor",
+            "PipelineColorAttachment",
+            "ColorWriteMask",
+        ],
         fields: RENDER_PIPELINE,
     },
     DescriptorFamily {
@@ -1217,10 +1226,8 @@ pub const MANIFEST: &[DescriptorFamily] = &[
 /// Whole decode structs that are transport envelopes rather than guest GPU
 /// state.
 ///
-/// The Phase-6 audit found 43 public structs and 21 public enums under
-/// `runtime/decode/` (the plan's earlier “63 structs” shorthand combined the
-/// two categories and predates `DisplayTimingEntry`). Every struct not named
-/// here is field-exhaustive in [`MANIFEST`].
+/// `runtime/decode/` holds 43 public structs and 21 public enums. Every struct
+/// not named here is field-exhaustive in [`MANIFEST`].
 pub const DECODE_STRUCT_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "stream::Segment",
@@ -1237,10 +1244,6 @@ pub const DECODE_STRUCT_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "resource::CompactTlv",
         "compact TLV framing retained by the resource decoder; its tag and offsets locate descriptor fields rather than becoming GPU state",
-    ),
-    (
-        "resource::Tlv",
-        "full TLV framing retained by the resource decoder; its tag, length, and value offset locate descriptor fields rather than becoming GPU state",
     ),
     (
         "resource::ListObjectEntry",
@@ -1745,16 +1748,14 @@ mod tests {
     /// it overrides.
     #[test]
     fn a_pinned_builder_value_is_never_claimed_honored() {
-        const PINNED: &[(&str, &str)] = &[
-            (
-                ".color_write_mask(vk::ColorComponentFlags::RGBA)",
-                "colorAttachments[n].writeMask",
-            ),
-            (
-                ".rasterization_samples(vk::SampleCountFlags::TYPE_1)",
-                "rasterSampleCount",
-            ),
-        ];
+        // `.color_write_mask(vk::ColorComponentFlags::RGBA)` used to head this
+        // list and is gone: the builder now derives the mask from the guest's
+        // decoded `writeMask`, so the field is `Honored` and there is nothing
+        // left to pin it against.
+        const PINNED: &[(&str, &str)] = &[(
+            ".rasterization_samples(vk::SampleCountFlags::TYPE_1)",
+            "rasterSampleCount",
+        )];
         let builder = read("backend/vulkan/engine/caches.rs");
         for (call, field) in PINNED {
             assert!(
@@ -1887,7 +1888,10 @@ mod tests {
         }
         assert_eq!(
             (honored, declined, dropped, absent),
-            (250, 60, 23, 25),
+            // Moved 2026-07-30: `colorAttachments[n].writeMask` went
+            // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
+            // rose by one. It is on the wire after all, as tag 0x09.
+            (251, 60, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

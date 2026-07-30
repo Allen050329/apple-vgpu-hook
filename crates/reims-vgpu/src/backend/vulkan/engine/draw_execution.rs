@@ -1,9 +1,15 @@
 //! Typed failures while materializing a validated Vulkan draw request.
 //!
 //! Request-shape checks belong to `DrawValidationDecline`. These reasons are
-//! later failures: imported guest spans disappeared, resident state disagreed
-//! with the validated request, or a tracked image layout could not be used as
-//! a transfer source.
+//! later failures: resident state disagreed with the validated request, a
+//! constant-step vertex bind could not be shifted, or a tracked image layout
+//! could not be used as a transfer source.
+//!
+//! Two variants used to head this list — `BufferGuestRunImportMissing` and
+//! `SampledGuestRunImportMissing`, both meaning "an imported guest span
+//! disappeared between the runtime's pre-check and the bind". Neither can
+//! happen now: guest runs are gathered by the CPU out of the mapped span, so
+//! there is no import to lose.
 
 use ash::vk;
 
@@ -13,10 +19,6 @@ use crate::observe::Decline;
 /// A specific failure while preparing or executing a validated draw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DrawExecutionDecline {
-    BufferGuestRunImportMissing {
-        host_ptr: usize,
-        len: u64,
-    },
     ConstantVertexRequiresCpuBytes {
         location: u32,
     },
@@ -65,11 +67,6 @@ pub enum DrawExecutionDecline {
         resource_width: u32,
         resource_height: u32,
     },
-    SampledGuestRunImportMissing {
-        binding: u32,
-        host_ptr: usize,
-        len: u64,
-    },
     UnsupportedTrackedLayout {
         layout: vk::ImageLayout,
     },
@@ -78,9 +75,6 @@ pub enum DrawExecutionDecline {
 impl Decline for DrawExecutionDecline {
     fn slug(&self) -> &'static str {
         match self {
-            Self::BufferGuestRunImportMissing { .. } => {
-                "vk_draw_exec_buffer_guest_run_import_missing"
-            }
             Self::ConstantVertexRequiresCpuBytes { .. } => {
                 "vk_draw_exec_constant_vertex_requires_cpu_bytes"
             }
@@ -100,19 +94,12 @@ impl Decline for DrawExecutionDecline {
             Self::SampledResidentGeometryMismatch { .. } => {
                 "vk_draw_exec_sampled_resident_geometry_mismatch"
             }
-            Self::SampledGuestRunImportMissing { .. } => {
-                "vk_draw_exec_sampled_guest_run_import_missing"
-            }
             Self::UnsupportedTrackedLayout { .. } => "vk_draw_exec_unsupported_tracked_layout",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::BufferGuestRunImportMissing { host_ptr, len } => vec![
-                ("host_ptr", format!("{host_ptr:#x}")),
-                ("len", len.to_string()),
-            ],
             Self::ConstantVertexRequiresCpuBytes { location } => {
                 vec![("location", location.to_string())]
             }
@@ -182,15 +169,6 @@ impl Decline for DrawExecutionDecline {
                 ]);
                 fields
             }
-            Self::SampledGuestRunImportMissing {
-                binding,
-                host_ptr,
-                len,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("host_ptr", format!("{host_ptr:#x}")),
-                ("len", len.to_string()),
-            ],
             Self::UnsupportedTrackedLayout { layout } => {
                 vec![("layout", format!("{layout:?}"))]
             }
@@ -240,30 +218,10 @@ pub(super) fn identity_fields(identity: &TargetIdentity) -> Vec<(&'static str, S
             ("identity_kind", "anonymous".into()),
             ("identity_slot", slot.to_string()),
         ],
-        TargetIdentity::OutputGroup {
-            id,
-            width,
-            height,
-            generation,
-        } => vec![
-            ("identity_kind", "output_group".into()),
-            ("identity_id", id.to_string()),
-            ("identity_width", width.to_string()),
-            ("identity_height", height.to_string()),
-            ("identity_generation", generation.to_string()),
-        ],
     }
 }
 
-impl std::fmt::Display for DrawExecutionDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(DrawExecutionDecline);
 
 #[cfg(test)]
 mod tests {
@@ -280,10 +238,6 @@ mod tests {
 
     fn all() -> Vec<DrawExecutionDecline> {
         vec![
-            DrawExecutionDecline::BufferGuestRunImportMissing {
-                host_ptr: 0x1000,
-                len: 0x2000,
-            },
             DrawExecutionDecline::ConstantVertexRequiresCpuBytes { location: 2 },
             DrawExecutionDecline::ConstantVertexBaseInstanceOverflow {
                 base_instance: u32::MAX,
@@ -330,11 +284,6 @@ mod tests {
                 resource_width: 64,
                 resource_height: 32,
             },
-            DrawExecutionDecline::SampledGuestRunImportMissing {
-                binding: 32,
-                host_ptr: 0x1000,
-                len: 0x2000,
-            },
             DrawExecutionDecline::UnsupportedTrackedLayout {
                 layout: vk::ImageLayout::UNDEFINED,
             },
@@ -355,7 +304,12 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 14, "the draw executor's reason census moved");
+        // Down from 14: the two `*_guest_run_import_missing` checks went with
+        // the host-pointer import. Both meant "an imported guest span vanished
+        // between the runtime's pre-check and the bind", and guest runs are now
+        // gathered by the CPU out of the mapped span, so there is no import to
+        // lose and no refusal to make.
+        assert_eq!(before, 12, "the draw executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate draw-execution slug");
     }
 
@@ -411,16 +365,6 @@ mod tests {
                 TargetIdentity::Anonymous { slot: 9 },
                 "anonymous",
                 ("identity_slot", "9"),
-            ),
-            (
-                TargetIdentity::OutputGroup {
-                    id: 10,
-                    width: 80,
-                    height: 60,
-                    generation: 11,
-                },
-                "output_group",
-                ("identity_id", "10"),
             ),
         ];
 

@@ -429,64 +429,69 @@ impl crate::observe::Decline for ComputeSpirvDecline {
     }
 }
 
-impl std::fmt::Display for ComputeSpirvDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::observe::Decline as _;
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(ComputeSpirvDecline);
 
 impl std::error::Error for ComputeSpirvDecline {}
 
 /// Apply one decoded compute command to accum, or run a dispatch / sequencing op.
 ///
-/// `session` / `block` are the per-segment multi-record encoder and latched
-/// sequencing failure (ICB / control encode error). Pass `None` from unit tests
-/// that only exercise binds / one-shot dispatch.
+/// `seg` carries the whole segment's mutable state: the accum this record
+/// updates, the multi-record encoder a dispatch encodes onto when one is open,
+/// and the latched sequencing failure (ICB / control encode error) that refuses
+/// later dispatches.
 pub fn apply_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     cmd: &ComputeCommand,
-    acc: &mut ComputeAccum,
-    session: &mut Option<crate::runtime::compute_session::ComputeSession>,
-    block: &mut Option<crate::runtime::compute_session::SequencingBlock>,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
+) -> Option<ComputeStatus> {
+    let started = std::time::Instant::now();
+    let out = apply_record_inner(state, host, task_id, cmd, seg);
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
+    out
+}
+
+fn apply_record_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &ComputeCommand,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
     match cmd.kind {
         Kind::Pipeline => {
-            acc.set_pipeline(cmd.pipeline_ref);
+            seg.acc.set_pipeline(cmd.pipeline_ref);
             None
         }
         Kind::BufferBind | Kind::BufferBindAttributeStride => {
-            acc.bind_buffers(cmd.first, &cmd.buffers);
+            seg.acc.bind_buffers(cmd.first, &cmd.buffers);
             None
         }
         Kind::BufferOffset => {
-            acc.set_buffer_offset(cmd.first, cmd.buffer_offset, None);
+            seg.acc
+                .set_buffer_offset(cmd.first, cmd.buffer_offset, None);
             None
         }
         Kind::BufferOffsetAttributeStride => {
-            acc.set_buffer_offset(cmd.first, cmd.buffer_offset, Some(cmd.attribute_stride));
+            seg.acc
+                .set_buffer_offset(cmd.first, cmd.buffer_offset, Some(cmd.attribute_stride));
             None
         }
         Kind::TextureBind => {
-            acc.bind_textures(cmd.first, &cmd.textures);
+            seg.acc.bind_textures(cmd.first, &cmd.textures);
             None
         }
         Kind::SamplerBind | Kind::SamplerLod => {
-            acc.bind_samplers(cmd.first, &cmd.samplers);
+            seg.acc.bind_samplers(cmd.first, &cmd.samplers);
             None
         }
         Kind::DispatchType => {
-            acc.dispatch_type = cmd.dispatch_type;
+            seg.acc.dispatch_type = cmd.dispatch_type;
             None
         }
         Kind::StageInRegion => {
-            acc.set_stage_in_region(StageInRegion {
+            seg.acc.set_stage_in_region(StageInRegion {
                 origin_x: cmd.stage_in_region.origin.x,
                 origin_y: cmd.stage_in_region.origin.y,
                 origin_z: cmd.stage_in_region.origin.z,
@@ -497,34 +502,38 @@ pub fn apply_record<M: HostMemory + HostOps>(
             None
         }
         Kind::StageInRegionIndirect => {
-            acc.set_stage_in_region_indirect(
+            seg.acc.set_stage_in_region_indirect(
                 cmd.stage_in_indirect_buffer_ref,
                 cmd.stage_in_indirect_buffer_offset,
             );
             None
         }
         Kind::ThreadgroupMemory => {
-            acc.set_threadgroup_memory(cmd.threadgroup_memory_index, cmd.threadgroup_memory_length);
+            seg.acc.set_threadgroup_memory(
+                cmd.threadgroup_memory_index,
+                cmd.threadgroup_memory_length,
+            );
             None
         }
         Kind::ImageblockDimensions => {
-            acc.set_imageblock(cmd.imageblock_width, cmd.imageblock_height);
+            seg.acc
+                .set_imageblock(cmd.imageblock_width, cmd.imageblock_height);
             None
         }
         Kind::DispatchThreadgroups
         | Kind::DispatchThreads
         | Kind::DispatchThreadgroupsIndirect
         | Kind::DispatchThreadsIndirect => {
-            if block.is_some() {
+            if seg.block.is_some() {
                 return Some(ComputeStatus::Unsupported("dispatch_in_sequencing_block"));
             }
             // Open multi-record session (control-flow SPI): encode on that encoder.
-            if let Some(sess) = session.as_mut() {
+            if let Some(sess) = seg.session.as_mut() {
                 return Some(execute_dispatch_nested(
-                    state, host, task_id, acc, cmd, sess,
+                    state, host, task_id, &seg.acc, cmd, sess,
                 ));
             }
-            Some(execute_dispatch(state, host, task_id, acc, cmd))
+            Some(execute_dispatch(state, host, task_id, &seg.acc, cmd))
         }
         Kind::UpdateFence | Kind::WaitFence => None,
         // Ordered no-ops at the product one-dispatch boundary.
@@ -541,11 +550,9 @@ pub fn apply_record<M: HostMemory + HostOps>(
         | Kind::ControlStartElse
         | Kind::ControlEndIf
         | Kind::ExecuteCommandsInBuffer
-        | Kind::ExecuteCommandsInBufferIndirect => {
-            Some(crate::runtime::compute_session::apply_sequencing(
-                state, host, task_id, cmd, acc, session, block,
-            ))
-        }
+        | Kind::ExecuteCommandsInBufferIndirect => Some(
+            crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg),
+        ),
         Kind::Unknown => None,
     }
 }
@@ -594,7 +601,7 @@ pub(crate) fn load_mtlb<M: HostMemory + HostOps>(
         );
     };
     let mut mtlb = vec![0u8; len];
-    if gva_mem::read_task_gva_fallback(
+    if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -714,7 +721,7 @@ pub(crate) fn read_buffer_window<M: HostMemory + HostOps>(
         .checked_add(offset)
         .ok_or(ComputeStatus::MissingBuffer("compute_buf_win_gva_overflow"))?;
     let mut bytes = vec![0u8; len];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -801,7 +808,7 @@ pub(crate) fn stage_buffer<M: HostMemory + HostOps>(
         );
     };
     let mut bytes = vec![0u8; want];
-    if let Err(e) = gva_mem::read_task_gva_fallback(
+    if let Err(e) = gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -967,9 +974,10 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
     // same currency — not the mapping-level content generation — so disjoint
     // sibling-window writebacks (ping-pong canvases) cannot desync the pair.
     let generation = next_mapping_content_generation(candidate.seed_generation);
-    // Drop intersecting windows (normally already gone via the writeback's
-    // exact-window invalidation — kept here as defense in depth); keep
-    // disjoint siblings (ping-pong canvases) but bound the count.
+    // Drop intersecting windows (normally already gone, because the writeback
+    // wrote guest pages and every guest-page writer calls the same overlap
+    // invalidation — kept here as defense in depth); keep disjoint siblings
+    // (ping-pong canvases) but bound the count.
     let mapping_id = candidate.key.mapping_id;
     state.invalidate_storage_residency_window(
         mapping_id,
@@ -1000,77 +1008,6 @@ fn next_mapping_content_generation(current: u32) -> u32 {
     } else {
         next
     }
-}
-
-/// Measure the full-screen compute-result boundary before guest writeback.
-///
-/// This is diagnosis only: it never changes dispatch, writeback, or present
-/// behavior. Pair a nonzero `output_tex` destination with later
-/// `empty_sample kind=display` lines to localize loss after shader execution.
-/// `fused_stats` = `(rgb_nz, rgb_max)` already gathered during the engine's
-/// readback copy (identical pixel semantics to `rgba_rgb_stats`).
-fn log_compute_output_texture(pipe: u32, tex: &StagedTexture, fused_stats: Option<(usize, u8)>) {
-    let Some(row_bytes) =
-        pixel_format::bytes_per_pixel(tex.pixel_format).and_then(|bpp| tex.width.checked_mul(bpp))
-    else {
-        return;
-    };
-    // Reinterpreted views may be narrower in texels while covering the same
-    // physical row (for example 320 RGBA32Uint texels == 1280 BGRA8 pixels).
-    if row_bytes < 1280 * pixel_format::RGBA8_BPP || tex.height < 720 {
-        return;
-    }
-    // Prefer the census the engine fused into the readback copy; a second
-    // full scan of a display-sized image costs 2–3 ms on the stamp path.
-    let (nz, max_rgb) = fused_stats.unwrap_or_else(|| {
-        let (nz, max_rgb, _) = crate::observe::rgba_rgb_stats(&tex.bytes);
-        (nz, max_rgb)
-    });
-    let destination = match &tex.writeback {
-        TextureWriteback::None => "none".to_string(),
-        TextureWriteback::Linear { gva, .. } => format!("linear gva={gva:#x}"),
-        TextureWriteback::Type11 { mapping_id, .. } => format!("type11 mid={mapping_id}"),
-    };
-    crate::observe::off(format!(
-        "compute_linux output_tex pipe={pipe} bind={} simg={} fmt={:#x} dst={destination} {}x{} rgb_nz={nz} max_rgb={max_rgb}",
-        tex.binding,
-        tex.storage_selector
-            .map(|selector| selector.to_string())
-            .unwrap_or_else(|| "none".into()),
-        tex.pixel_format,
-        tex.width,
-        tex.height
-    ));
-}
-
-/// Census marker for a storage image the engine wrote back GPU-direct:
-/// content stats are not measured (nothing crossed the device→host
-/// boundary). Same display-size gating as [`log_compute_output_texture`].
-#[cfg(feature = "backend-vulkan")]
-fn log_compute_output_texture_direct(pipe: u32, tex: &StagedTexture) {
-    let Some(row_bytes) =
-        pixel_format::bytes_per_pixel(tex.pixel_format).and_then(|bpp| tex.width.checked_mul(bpp))
-    else {
-        return;
-    };
-    if row_bytes < 1280 * pixel_format::RGBA8_BPP || tex.height < 720 {
-        return;
-    }
-    let destination = match &tex.writeback {
-        TextureWriteback::None => "none".to_string(),
-        TextureWriteback::Linear { gva, .. } => format!("linear gva={gva:#x}"),
-        TextureWriteback::Type11 { mapping_id, .. } => format!("type11 mid={mapping_id}"),
-    };
-    crate::observe::off(format!(
-        "compute_linux output_tex pipe={pipe} bind={} simg={} fmt={:#x} dst={destination} {}x{} census=direct",
-        tex.binding,
-        tex.storage_selector
-            .map(|selector| selector.to_string())
-            .unwrap_or_else(|| "none".into()),
-        tex.pixel_format,
-        tex.width,
-        tex.height
-    ));
 }
 
 /// Measure storage-image seed traffic by structurally reflected content access.
@@ -1111,6 +1048,35 @@ pub(crate) fn m2v_handoff_dir() -> std::path::PathBuf {
         std::env::var_os("REIMS_VGPU_M2V_FAIL_DIR"),
         std::env::var_os("REIMS_VGPU_REPO_ROOT"),
     )
+}
+
+/// Which pipelines a `REIMS_VGPU_M2V_DUMP_*_PIPES` probe knob selects: a
+/// comma-separated list of pipeline refs, or `all`. Shared by the draw and
+/// compute handoff dumps so the two knobs cannot drift apart.
+///
+/// Probe tooling only — never alters device behavior. An unset variable parses
+/// to "none", so a normal boot pays one atomic load per encode.
+pub(crate) struct HandoffPipeSelection(Option<(bool, Vec<u32>)>);
+
+impl HandoffPipeSelection {
+    pub(crate) fn from_raw(raw: Option<String>) -> Self {
+        Self(raw.map(|raw| {
+            let all = raw.trim().eq_ignore_ascii_case("all");
+            let list = raw
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            (all, list)
+        }))
+    }
+
+    pub(crate) fn from_env(var: &str) -> Self {
+        Self::from_raw(std::env::var(var).ok())
+    }
+
+    pub(crate) fn wants(&self, pipe: u32) -> bool {
+        matches!(&self.0, Some((all, list)) if *all || list.contains(&pipe))
+    }
 }
 
 /// Persist the exact inputs of a compute kernel that failed downstream, for
@@ -1176,6 +1142,44 @@ fn dump_kernel_handoff(
         dir.display(),
         air.len()
     ));
+}
+
+/// How much of a bound buffer the handoff dump writes.
+///
+/// Metal's `setBytes:length:atIndex:` is specified for blocks of at most 4 KiB,
+/// so anything a kernel receives as inline constants — dimensions, weights, a
+/// colour conversion matrix — is inside that bound by construction. A vertex or
+/// image buffer bound at the same index can be megabytes, and writing those
+/// would turn a per-pipe probe into a per-boot disk hazard.
+const HANDOFF_BUFFER_PREVIEW_LEN: usize = 4096;
+
+fn handoff_buffer_preview(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(HANDOFF_BUFFER_PREVIEW_LEN)]
+}
+
+/// Write the constant-block prefix of each buffer bound to a dumped kernel.
+///
+/// The SPIR-V says which bindings a kernel reads and the AIR says what it does
+/// with them, but neither says what was *in* them. A kernel that takes its
+/// parameters from a buffer — which is how a conversion matrix normally
+/// arrives — is otherwise opaque off-VM.
+///
+/// Files land beside the kernel as `pipe<N>.<reason>.buf<index>.bin`, truncated
+/// to [`HANDOFF_BUFFER_PREVIEW_LEN`]; the sidecar `.txt` records each buffer's
+/// full length next to how much was written, so a truncation cannot be misread
+/// as a short buffer. Guest-owned bytes: the directory is gitignored, and the
+/// dump is off unless a pipe is explicitly listed.
+fn dump_kernel_buffers(pipe: u32, reason: &str, bufs: &[StagedBuffer]) {
+    let dir = m2v_handoff_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for s in bufs {
+        let _ = std::fs::write(
+            dir.join(format!("pipe{pipe}.{reason}.buf{}.bin", s.bind.index)),
+            handoff_buffer_preview(&s.bytes),
+        );
+    }
 }
 
 pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
@@ -1588,79 +1592,32 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             } else {
                 (m.width, m.height, m.format)
             }
-        } else if let Some(entry) = objects::lookup_list_entry(state, host, task_id, stage_ref) {
-            if let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) {
-                if let Ok(ResourceDescriptor::IOSurfaceTexture {
-                    width,
-                    height,
-                    pixel_format,
-                    ..
-                }) = crate::runtime::decode::resource::decode_iosurface_texture_descriptor(
-                    &desc_bytes,
-                ) {
-                    let format = if pixel_format != 0 {
-                        pixel_format
-                    } else {
-                        pixel_format::MTL_FORMAT_BGRA8_UNORM
-                    };
-                    (width, height, format)
-                } else {
-                    let m =
-                        state
-                            .mappings
-                            .get(&mapping_id)
-                            .ok_or(ComputeStatus::MissingTexture(
-                                "compute_stage_tex_mapping_gone",
-                            ))?;
-                    if !m.has_geom || m.width == 0 || m.height == 0 {
-                        return Err(ComputeStatus::MissingTexture(
-                            "compute_stage_tex_mapping_no_geom",
-                        ));
-                    }
-                    let format = if m.format != 0 {
-                        m.format
-                    } else {
-                        pixel_format::MTL_FORMAT_BGRA8_UNORM
-                    };
-                    (m.width, m.height, format)
-                }
-            } else {
-                let m = state
-                    .mappings
-                    .get(&mapping_id)
-                    .ok_or(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_mapping_gone",
-                    ))?;
-                if !m.has_geom || m.width == 0 || m.height == 0 {
-                    return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_mapping_no_geom",
-                    ));
-                }
-                let format = if m.format != 0 {
-                    m.format
-                } else {
-                    pixel_format::MTL_FORMAT_BGRA8_UNORM
-                };
-                (m.width, m.height, format)
-            }
         } else {
-            let m = state
-                .mappings
-                .get(&mapping_id)
-                .ok_or(ComputeStatus::MissingTexture(
-                    "compute_stage_tex_mapping_gone",
-                ))?;
-            if !m.has_geom || m.width == 0 || m.height == 0 {
-                return Err(ComputeStatus::MissingTexture(
-                    "compute_stage_tex_mapping_no_geom",
-                ));
+            // Three ways the surface's own IOSurface descriptor can fail to
+            // answer — no list entry, no descriptor bytes, or bytes that do not
+            // decode as an IOSurfaceTexture — and all three fall back to the
+            // mapping's latched geometry. Kept sequential rather than chained so
+            // the `&mut state` the lookups need does not overlap the `&state` the
+            // fallback reads.
+            let mut from_descriptor = None;
+            if let Some(entry) = objects::lookup_list_entry(state, host, task_id, stage_ref) {
+                if let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) {
+                    if let Ok(ResourceDescriptor::IOSurfaceTexture {
+                        width,
+                        height,
+                        pixel_format,
+                        ..
+                    }) = crate::runtime::decode::resource::decode_iosurface_texture_descriptor(
+                        &desc_bytes,
+                    ) {
+                        from_descriptor = Some((width, height, or_bgra8(pixel_format)));
+                    }
+                }
             }
-            let format = if m.format != 0 {
-                m.format
-            } else {
-                pixel_format::MTL_FORMAT_BGRA8_UNORM
-            };
-            (m.width, m.height, format)
+            match from_descriptor {
+                Some(geom) => geom,
+                None => mapping_geom_format(state, mapping_id)?,
+            }
         };
         if width == 0 || height == 0 {
             return Err(ComputeStatus::MissingTexture("compute_stage_tex_zero_geom"));
@@ -1713,9 +1670,34 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         let wire_len = crate::contract::iosurface_pages::decode_device_surface(&m.device_desc)
             .map(|s| s.alloc_size as u64)
             .unwrap_or(0);
-        let (surface_offset, surface_bpr, span_end) = match mapping_write::type11_sample_window(
-            m, width, height, stage_fmt,
-        ) {
+        // A type-5 record names its IOSurface plane on the wire (record `+0x20`,
+        // the `newTextureWithDescriptor:iosurface:plane:` argument), so the
+        // plane is decided, not inferred. Type-11 carries no such field and must
+        // still match a plane record by geometry — which is ambiguous whenever
+        // two planes share dims and bytes-per-element (v0a8 Y and alpha), and
+        // resolves to the invented packed window over plane 0 or to nothing at
+        // all. The draw path already binds type-5 views by index; this is the
+        // same resolution on the staging path.
+        let window = match type5_record {
+            Some(rec) => {
+                mapping_write::type5_sample_window(m, rec.plane_index, width, height, stage_fmt)
+                    .map(|(offset, bpr, end, from_device)| {
+                        // Invent always produces a packed window at offset 0 —
+                        // plane 0's bytes. Reaching it after the wire named a
+                        // different plane is a guaranteed wrong bind, so it
+                        // cannot stay quiet just because it returned a window.
+                        if !from_device && rec.plane_index != 0 {
+                            crate::observe::fail(format!(
+                                "compute_stage_tex plane_invent mapping={mapping_id} plane={} {width}x{height} fmt={stage_fmt:#x} offset={offset} bpr={bpr}",
+                                rec.plane_index
+                            ));
+                        }
+                        (offset, bpr, end)
+                    })
+            }
+            None => mapping_write::type11_sample_window(m, mapping_id, width, height, stage_fmt),
+        };
+        let (surface_offset, surface_bpr, span_end) = match window {
             Some(w) => w,
             None => {
                 // Measure type4_len_vs_plane: which window path rejected (device bpr vs invent span).
@@ -1777,15 +1759,17 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         };
         // Chained-dispatch restage skip: when guest pages still hold exactly
         // our own last writeback for THIS WINDOW (mirror entry survives only
-        // while no intersecting guest write lands — exact-window invalidation
-        // in mapping_write/mapper) AND the engine still holds the resident
-        // image at the mirror's generation, reading ~15 MB from guest pages
-        // reproduces what the GPU already has. The mapping-level content
+        // while no intersecting guest write lands — `DeviceState::
+        // invalidate_storage_residency_window`, called from mapping_write and
+        // mapper, drops every mirror entry whose byte window overlaps the
+        // write and keeps the disjoint siblings) AND the engine still holds the
+        // resident image at the mirror's generation, reading ~15 MB from guest
+        // pages reproduces what the GPU already has. The mapping-level content
         // generation may have advanced via disjoint sibling windows
         // (ping-pong canvases), so the gate pairs mirror↔engine directly.
         // The zero placeholder is never seeded — the engine fails visibly
-        // (`compute_resident_seed_lost`) if the resident vanishes by acquire
-        // time and the caller restages.
+        // with `vk_compute_exec_resident_seed_generation_lost` if the resident
+        // vanishes by acquire time.
         let mut seed_skipped = false;
         #[cfg(feature = "backend-vulkan")]
         if is_storage {
@@ -1902,6 +1886,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 "compute_stage_tex type11_fail reason=read mapping={mapping_id} {width}x{height} off={surface_offset} bpr={surface_bpr} span_end={span_end} pages={pages_n}"
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_read"));
+        }
+        if crate::observe::content_probe_enabled() && !seed_skipped && sample_resident.is_none() {
+            crate::observe::off(format!(
+                "compute_content stage=stage_read mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} storage={} gen={seed_generation} {}",
+                is_storage as u8,
+                crate::observe::content_summary(&bytes, bpp, width, height),
+            ));
         }
         let writeback = if is_storage {
             TextureWriteback::Type11 {
@@ -2204,7 +2195,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                         ComputeStatus::GuestIo("compute_stage_tex_linear_row_offset"),
                     )?)
                     .ok_or(ComputeStatus::GuestIo("compute_stage_tex_linear_row_gva"))?;
-                if let Err(e) = gva_mem::read_task_gva_fallback(
+                if let Err(e) = gva_mem::read_task_gva_by_id(
                     host,
                     &state.tasks,
                     task_id,
@@ -2374,9 +2365,17 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     else {
         return false;
     };
-    if !state.gva_write_allowed(task_id, gva, span_len) {
-        return false;
-    }
+    // Reported, not refused: a MapMemory2 span is a notification the guest sends
+    // after installing the PTEs and using the memory, so it cannot authorise
+    // anything. The fresh walk below is the check that bounds this write.
+    crate::runtime::gva_mem::report_undeclared_write(
+        state,
+        host,
+        task_id,
+        gva,
+        span_len,
+        "write_linear_guest",
+    );
     // Fresh PT walk at write time — never a cached view (stale-view class).
     let Some(span_map) =
         crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span_len)
@@ -2460,7 +2459,10 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 *height,
                 &tex.bytes,
             );
-            let Some(span) = row_stride.checked_mul(*height as u64) else {
+            // Kept although the span is no longer needed here: the overflow is
+            // a real refusal with a name, and `write_linear_guest` would only
+            // return a bare `false` for it.
+            let Some(_span) = row_stride.checked_mul(*height as u64) else {
                 crate::observe::fail(format!(
                     "compute_writeback_tex fail reason=linear_span_overflow task={task_id} ref={texture_ref} bind={} gva={gva:#x} dims={}x{} row_stride={row_stride}",
                     tex.binding, width, height
@@ -2469,14 +2471,14 @@ fn writeback_texture<M: HostMemory + HostOps>(
                     "compute_wb_tex_linear_span_overflow",
                 ));
             };
-            if !state.gva_write_allowed(task_id, *gva, span) {
-                crate::observe::fail(format!(
-                    "compute_writeback_tex cache_only reason=linear_unmapped task={task_id} ref={texture_ref} bind={} gva={gva:#x} span={span:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={row_stride}",
-                    tex.binding, width, height, bpp
-                ));
-                return Ok(());
-            }
-            if write_linear_guest(
+            // This used to return early on `reason=linear_unmapped` whenever the
+            // range fell outside the task's notified spans, which on a live boot
+            // discarded six glyph-atlas writebacks a boot (79x52, 90x20, 8x8 …)
+            // whose pages were mapped the whole time — only the notification had
+            // not arrived. The graceful degradation it provided is real and is
+            // kept; what changed is that it is now keyed on the condition itself
+            // rather than on a proxy that also catches healthy writes.
+            match write_linear_guest(
                 state,
                 host,
                 task_id,
@@ -2487,9 +2489,21 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 &tex.bytes,
                 &format!("bind={}", tex.binding),
             ) {
-                Ok(())
-            } else {
-                Err(ComputeStatus::GuestIo("compute_wb_tex_linear_guest_write"))
+                LinearWrite::Written => Ok(()),
+                // Nothing resolves under this task, so there is nowhere to put
+                // the result. The host cache keeps the authoritative bytes and
+                // sampling still serves them, so failing the whole dispatch
+                // would cost more than it protects.
+                LinearWrite::Unmapped => {
+                    crate::observe::fail(format!(
+                        "compute_writeback_tex cache_only reason=linear_unmapped task={task_id} ref={texture_ref} bind={} gva={gva:#x} fmt={pixel_format:#x} dims={}x{} bpp={} row_stride={row_stride}",
+                        tex.binding, width, height, bpp
+                    ));
+                    Ok(())
+                }
+                LinearWrite::Failed => {
+                    Err(ComputeStatus::GuestIo("compute_wb_tex_linear_guest_write"))
+                }
             }
         }
         TextureWriteback::Type11 {
@@ -2502,6 +2516,14 @@ fn writeback_texture<M: HostMemory + HostOps>(
             bpp,
         } => {
             let tight = width.saturating_mul(*bpp);
+            if crate::observe::content_probe_enabled() {
+                crate::observe::off(format!(
+                    "compute_content stage=write_out mapping={mapping_id} {width}x{height} fmt={:#x} bind={} {}",
+                    tex.pixel_format,
+                    tex.binding,
+                    crate::observe::content_summary(&tex.bytes, *bpp, *width, *height),
+                ));
+            }
             if !mapping_write::write_full_rect_raw_at(
                 state,
                 host,
@@ -2532,9 +2554,28 @@ fn writeback_texture<M: HostMemory + HostOps>(
     }
 }
 
+/// What a linear guest writeback did, for callers that must tell "there is
+/// nowhere to put this" apart from "putting it there went wrong".
+///
+/// A bare `bool` collapsed those, and the collapse was load-bearing: the only
+/// caller able to degrade gracefully was doing so off a *different* condition
+/// (the range being outside the task's notified spans) that also caught healthy
+/// writes. `-> bool` crossing a module boundary is exactly where that regrows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinearWrite {
+    /// Every row landed in guest memory.
+    Written,
+    /// The task's page tables resolve nothing at this GVA, so no write was
+    /// possible. Callers keep the host cache and carry on.
+    Unmapped,
+    /// A write was attempted and did not complete — bad layout, an arithmetic
+    /// overflow, or a per-row refusal. Already fail-logged with its own reason.
+    Failed,
+}
+
 /// Write tight-row `bytes` into a strided linear guest window through fresh
 /// task page-table walks (bulk view when packable, per-row fallback). Fail
-/// lines carry `ctx` for the call site. Returns `false` on any failed write.
+/// lines carry `ctx` for the call site.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2546,9 +2587,23 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
     height: u32,
     bytes: &[u8],
     ctx: &str,
-) -> bool {
+) -> LinearWrite {
     if write_linear_texture_bulk(state, host, task_id, gva, row_stride, tight, height, bytes) {
-        return true;
+        return LinearWrite::Written;
+    }
+    // The bulk path declines for several reasons and the per-row fallback below
+    // covers all but one of them. The exception is "nothing is mapped here",
+    // which no amount of retrying per row can fix, so it is answered once here
+    // rather than discovered `height` times.
+    if !crate::runtime::gva_mem::any_task_gva_page_resolves(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        1,
+        state.page_shift,
+    ) {
+        return LinearWrite::Unmapped;
     }
     let mut row = vec![0u8; row_stride as usize];
     for y in 0..height {
@@ -2559,13 +2614,13 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_row_offset_overflow {ctx} gva={gva:#x} y={y} row_stride={row_stride}"
             ));
-            return false;
+            return LinearWrite::Failed;
         };
         let Some(row_gva) = gva.checked_add(row_offset) else {
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_gva_overflow {ctx} gva={gva:#x} y={y} row_offset={row_offset:#x}"
             ));
-            return false;
+            return LinearWrite::Failed;
         };
         if let Err(e) = gva_mem::write_task_gva_product(
             state,
@@ -2577,10 +2632,10 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_gva_write task={task_id} {ctx} gva={row_gva:#x} y={y} row_stride={row_stride} height={height} err={e:?}"
             ));
-            return false;
+            return LinearWrite::Failed;
         }
     }
-    true
+    LinearWrite::Written
 }
 
 fn writeback_buffer<M: HostMemory + HostOps>(
@@ -2609,215 +2664,45 @@ fn writeback_buffer<M: HostMemory + HostOps>(
     Ok(())
 }
 
+/// An absent IOSurface pixel format means BGRA8: a type-11 surface the guest
+/// mapped without a format word is scanout-ordered by the display contract, and
+/// this is the one place that default is written down.
+fn or_bgra8(pixel_format: u16) -> u16 {
+    if pixel_format != 0 {
+        pixel_format
+    } else {
+        pixel_format::MTL_FORMAT_BGRA8_UNORM
+    }
+}
+
+/// Latched geometry and pixel format of a type-11 mapping, for a surface whose
+/// own IOSurface descriptor could not be read.
+///
+/// Three separate descriptor failures share this fallback, and spelling it out at
+/// each of them made one block of nineteen lines appear three times in a row.
+fn mapping_geom_format(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> Result<(u32, u32, u16), ComputeStatus> {
+    let m = state
+        .mappings
+        .get(&mapping_id)
+        .ok_or(ComputeStatus::MissingTexture(
+            "compute_stage_tex_mapping_gone",
+        ))?;
+    if !m.has_geom || m.width == 0 || m.height == 0 {
+        return Err(ComputeStatus::MissingTexture(
+            "compute_stage_tex_mapping_no_geom",
+        ));
+    }
+    Ok((m.width, m.height, or_bgra8(m.format)))
+}
+
 fn u32_dim(v: u64) -> Result<u32, ComputeStatus> {
     if v == 0 || v > u32::MAX as u64 {
         Err(ComputeStatus::BadGrid("compute_grid_dim_range"))
     } else {
         Ok(v as u32)
-    }
-}
-
-/// Archive `REIMS_VGPU_COMPUTE_PLAN_DEFERRED_GRID_Y_SENTINEL` / `try_recover_sentinel_grid`.
-///
-/// Live Core Image wallpaper shape (journal 2026-07-06):
-///   grid = [ceil(ow/tg), UINT64_MAX, 1], tg = [32, 0, 1]
-/// Recover tg.y = tg.x (square tile) and both grid axes from the largest
-/// write-capable bound texture. Without this every wallpaper VTMTS/CI dispatch
-/// hits [`ComputeStatus::BadGrid`] and the desktop stays black.
-const DEFERRED_GRID_Y_SENTINEL: u64 = u64::MAX;
-const GRID_DIM_MAX: u64 = 0x1_0000;
-const THREADGROUP_DIM_MAX: u64 = 1024;
-
-fn ceil_div_u64(n: u64, d: u64) -> u64 {
-    if d == 0 {
-        return 0;
-    }
-    n.div_ceil(d)
-}
-
-/// Largest bound texture (type-11 or type-2/3) by pixel area — archive picks the
-/// full-screen write target over small inputs.
-fn largest_bound_texture_dims<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    acc: &ComputeAccum,
-) -> Option<(u32, u32)> {
-    let mut best: Option<(u32, u32, u64)> = None;
-    for t in &acc.textures {
-        if t.texture_ref == 0 {
-            continue;
-        }
-        // Prefer type-11 mapping geom.
-        if let Some(mid) = objects::resolve_type11_ref(state, host, task_id, t.texture_ref) {
-            let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
-            if let Some(m) = state.mappings.get(&mid) {
-                if m.has_geom && m.width > 0 && m.height > 0 {
-                    let area = (m.width as u64).saturating_mul(m.height as u64);
-                    if best.map(|(_, _, a)| area > a).unwrap_or(true) {
-                        best = Some((m.width, m.height, area));
-                    }
-                    continue;
-                }
-            }
-        }
-        // type-2/3 linear.
-        let Some(entry) = objects::lookup_list_entry(state, host, task_id, t.texture_ref) else {
-            continue;
-        };
-        if entry.object_type != OBJECT_TYPE_TEXTURE
-            && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-        {
-            continue;
-        }
-        let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) else {
-            continue;
-        };
-        let Ok(tex) = decode_texture_descriptor(&desc) else {
-            continue;
-        };
-        if !tex.has_width || !tex.has_height || tex.width == 0 || tex.height == 0 {
-            continue;
-        }
-        let area = (tex.width as u64).saturating_mul(tex.height as u64);
-        if best.map(|(_, _, a)| area > a).unwrap_or(true) {
-            best = Some((tex.width, tex.height, area));
-        }
-    }
-    best.map(|(w, h, _)| (w, h))
-}
-
-/// Recover CI sentinel grid/threadgroup (archive `try_recover_sentinel_grid`).
-/// Returns `Some((gx,gy,gz,tx,ty,tz))` when the wire matches the sentinel shape
-/// and a bound texture supplies coverage; otherwise `None`.
-fn try_recover_sentinel_grid<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    acc: &ComputeAccum,
-    cmd: &ComputeCommand,
-) -> Option<(u32, u32, u32, u32, u32, u32)> {
-    if cmd.kind != Kind::DispatchThreadgroups {
-        return None;
-    }
-    let g0 = cmd.grid.x;
-    let g1 = cmd.grid.y;
-    let g2 = cmd.grid.z;
-    let t0 = cmd.threads_per_threadgroup.x;
-    let t1 = cmd.threads_per_threadgroup.y;
-    let t2 = cmd.threads_per_threadgroup.z;
-    if !((1..=GRID_DIM_MAX).contains(&g0)
-        && g1 == DEFERRED_GRID_Y_SENTINEL
-        && g2 == 1
-        && (1..=THREADGROUP_DIM_MAX).contains(&t0)
-        && t1 == 0
-        && t2 == 1)
-    {
-        return None;
-    }
-    let (tw, th) = largest_bound_texture_dims(state, host, task_id, acc)?;
-    let ty = t0;
-    let mut gx = ceil_div_u64(tw as u64, t0).max(1);
-    let mut gy = ceil_div_u64(th as u64, ty).max(1);
-    if gx > GRID_DIM_MAX {
-        gx = GRID_DIM_MAX;
-    }
-    if gy > GRID_DIM_MAX {
-        gy = GRID_DIM_MAX;
-    }
-    crate::observe::line(format!(
-        "compute_sentinel_recover grid=[{gx},{gy},1] tg=[{t0},{ty},1] tex={tw}x{th} wire_g0={g0}"
-    ));
-    Some((gx as u32, gy as u32, 1, t0 as u32, ty as u32, 1))
-}
-
-/// Measure-only census for a compute dispatch (always-on fail log on Linux).
-///
-/// Live x86 wallpaper class (serial-213122): type-3 multi-bind samples stay
-/// mapped zeros while MapMemory2/ReplacePhysical cycle; Core Image fills are
-/// `SEGMENT_TYPE_COMPUTE` dispatches. On non-Apple hosts
-/// [`execute_dispatch`] returns [`ComputeStatus::NoMetal`] and previously
-/// left **no** fail-log line — CI wallpaper drops were invisible next to
-/// m2v_empty_layer. Proxy: `compute_dispatch st=NoMetal …`.
-fn log_compute_dispatch_census<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    acc: &ComputeAccum,
-    cmd: &ComputeCommand,
-    st: ComputeStatus,
-    nested: bool,
-) {
-    let kind = match cmd.kind {
-        Kind::DispatchThreadgroups => "tg",
-        Kind::DispatchThreads => "threads",
-        Kind::DispatchThreadgroupsIndirect => "tg_ind",
-        Kind::DispatchThreadsIndirect => "thr_ind",
-        _ => "other",
-    };
-    let mut tex_parts: Vec<String> = Vec::new();
-    for t in acc.textures.iter().take(8) {
-        if t.texture_ref == 0 {
-            continue;
-        }
-        // Compact geom for wallpaper vs tile discrimination (no content gate).
-        let geom = if let Some(mid) =
-            objects::resolve_type11_ref(state, host, task_id, t.texture_ref)
-        {
-            state
-                .mappings
-                .get(&mid)
-                .filter(|m| m.has_geom)
-                .map(|m| format!("{}x{}", m.width, m.height))
-                .unwrap_or_else(|| "t11".into())
-        } else if let Some(entry) = objects::lookup_list_entry(state, host, task_id, t.texture_ref)
-        {
-            if entry.object_type == OBJECT_TYPE_TEXTURE
-                || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
-            {
-                if let Some(desc) = objects::read_descriptor(state, host, task_id, &entry) {
-                    if let Ok(tex) = decode_texture_descriptor(&desc) {
-                        format!("{}x{}", tex.width, tex.height)
-                    } else {
-                        format!("ot{}", entry.object_type)
-                    }
-                } else {
-                    format!("ot{}", entry.object_type)
-                }
-            } else {
-                format!("ot{}", entry.object_type)
-            }
-        } else {
-            "?".into()
-        };
-        tex_parts.push(format!("i{}:r{}:{}", t.index, t.texture_ref, geom));
-    }
-    let largest = largest_bound_texture_dims(state, host, task_id, acc)
-        .map(|(w, h)| format!("{w}x{h}"))
-        .unwrap_or_else(|| "none".into());
-    let nest = if nested { " nested=1" } else { "" };
-    // Always-on either way (a wallpaper CI miss must not hide in the env-gated
-    // draw.log only), but a successful dispatch (`st=Ok`) is census — route it
-    // to the `off()` sink so it stays in the log but leaves the curated
-    // real-error view (`grep -v '^OFF '`) clean; a non-Ok dispatch is a genuine
-    // failed guest compute command and stays `fail()`-visible with its reason.
-    let line = format!(
-        "compute_dispatch st={st:?} pipe={} kind={kind} ntex={} nbuf={} largest={largest} grid=[{},{},{}] tg=[{},{},{}] tex=[{}]{nest}",
-        acc.pipeline_ref,
-        acc.textures.len(),
-        acc.buffers.len(),
-        cmd.grid.x,
-        cmd.grid.y,
-        cmd.grid.z,
-        cmd.threads_per_threadgroup.x,
-        cmd.threads_per_threadgroup.y,
-        cmd.threads_per_threadgroup.z,
-        tex_parts.join(","),
-    );
-    if matches!(st, ComputeStatus::Ok) {
-        crate::observe::off(line);
-    } else {
-        crate::observe::fail(line);
     }
 }
 
@@ -2831,29 +2716,11 @@ pub fn execute_dispatch<M: HostMemory + HostOps>(
 ) -> ComputeStatus {
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     {
-        let st = execute_dispatch_metal(state, host, task_id, acc, cmd, None);
-        log_compute_dispatch_census(state, host, task_id, acc, cmd, st, false);
-        st
+        execute_dispatch_metal(state, host, task_id, acc, cmd, None)
     }
     #[cfg(feature = "backend-vulkan")]
     {
-        let st = execute_dispatch_linux(state, host, task_id, acc, cmd);
-        log_compute_dispatch_census(state, host, task_id, acc, cmd, st, false);
-        st
-    }
-    #[cfg(all(not(feature = "backend-vulkan"), feature = "backend-vulkan"))]
-    {
-        // Metal stubs / no vulkan feature: fail-visible census only.
-        log_compute_dispatch_census(
-            state,
-            host,
-            task_id,
-            acc,
-            cmd,
-            ComputeStatus::NoMetal("compute_dispatch_no_backend"),
-            false,
-        );
-        ComputeStatus::NoMetal("compute_dispatch_no_backend")
+        execute_dispatch_linux(state, host, task_id, acc, cmd)
     }
 }
 
@@ -2868,23 +2735,14 @@ pub(crate) fn execute_dispatch_nested<M: HostMemory + HostOps>(
 ) -> ComputeStatus {
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     {
-        let st = execute_dispatch_metal(state, host, task_id, acc, cmd, Some(session));
-        log_compute_dispatch_census(state, host, task_id, acc, cmd, st, true);
-        st
+        execute_dispatch_metal(state, host, task_id, acc, cmd, Some(session))
     }
     #[cfg(feature = "backend-vulkan")]
     {
-        // Nested/control-flow SPI not yet on Linux compute — fail-visible.
-        let _ = session;
-        log_compute_dispatch_census(
-            state,
-            host,
-            task_id,
-            acc,
-            cmd,
-            ComputeStatus::NoMetal("compute_nested_no_vulkan_path"),
-            true,
-        );
+        // Nested/control-flow SPI has no Linux compute path. Fail-visible via
+        // the returned status: `exec.rs::note_compute_refusal` names the slug
+        // at the rail boundary for every non-`Ok` compute record.
+        let _ = (state, host, task_id, acc, cmd, session);
         ComputeStatus::NoMetal("compute_nested_no_vulkan_path")
     }
 }
@@ -2996,24 +2854,21 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    acc: &ComputeAccum,
     cmd: &ComputeCommand,
 ) -> Result<DispatchDims, ComputeStatus> {
     match cmd.kind {
-        Kind::DispatchThreadgroups => {
-            if let Some(dims) = try_recover_sentinel_grid(state, host, task_id, acc, cmd) {
-                return Ok((dims.0, dims.1, dims.2, dims.3, dims.4, dims.5, false));
-            }
-            Ok((
-                u32_dim(cmd.grid.x)?,
-                u32_dim(cmd.grid.y)?,
-                u32_dim(cmd.grid.z)?,
-                u32_dim(cmd.threads_per_threadgroup.x)?,
-                u32_dim(cmd.threads_per_threadgroup.y)?,
-                u32_dim(cmd.threads_per_threadgroup.z)?,
-                false,
-            ))
-        }
+        // Every dimension comes from the wire. `u32_dim` refuses `0` and
+        // anything past `u32::MAX` with `BadGrid("compute_grid_dim_range")`, so
+        // a malformed grid is a named refusal rather than a substitution.
+        Kind::DispatchThreadgroups => Ok((
+            u32_dim(cmd.grid.x)?,
+            u32_dim(cmd.grid.y)?,
+            u32_dim(cmd.grid.z)?,
+            u32_dim(cmd.threads_per_threadgroup.x)?,
+            u32_dim(cmd.threads_per_threadgroup.y)?,
+            u32_dim(cmd.threads_per_threadgroup.z)?,
+            false,
+        )),
         Kind::DispatchThreads => Ok((
             u32_dim(cmd.grid.x)?,
             u32_dim(cmd.grid.y)?,
@@ -3093,9 +2948,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
 
     const TEXTURE_BIND_BASE: u32 = 32;
 
-    let total_started = std::time::Instant::now();
-    let stage_started = std::time::Instant::now();
-
     if acc.pipeline_ref == 0 {
         return ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero");
     }
@@ -3113,7 +2965,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }
     // Dims first (cheap; proves sentinel recovery without m2v/vk).
     let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims(state, host, task_id, acc, cmd) {
+        match resolve_dispatch_dims(state, host, task_id, cmd) {
             Ok(v) => v,
             Err(e) => {
                 crate::observe::line(format!(
@@ -3160,7 +3012,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
     // MTLB → AIR → SPIR-V (LocalSize = threadgroup dims).
-    let translate_started = std::time::Instant::now();
     let Some(mtlb) = load_mtlb(state, host, task_id, pipeline.kernel_func_ref) else {
         return ComputeStatus::MissingMtlb("compute_vk_mtlb_load");
     };
@@ -3212,7 +3063,37 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_spirv_parse");
         }
     };
-    let translate_us = u64::try_from(translate_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+    // Compute analog of `REIMS_VGPU_M2V_DUMP_DRAW_PIPES`: the failure sites
+    // below dump only kernels that were refused, so a kernel that translates and
+    // runs — and produces wrong pixels — is invisible to off-VM inspection.
+    // Listing it here lands its AIR and translated SPIR-V once per boot.
+    {
+        use std::sync::OnceLock;
+        static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
+        let wanted = WANTED
+            .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES"));
+        if wanted.wants(acc.pipeline_ref) {
+            let mut meta = format!(
+                "grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] textures={} buffers={}",
+                acc.textures.len(),
+                staged_bufs.len()
+            );
+            for s in &staged_bufs {
+                let preview = handoff_buffer_preview(&s.bytes);
+                meta.push_str(&format!(
+                    "\nbuf index={} ref={} gva={:#x} len={} dumped={}",
+                    s.bind.index,
+                    s.bind.buffer_ref,
+                    s.gva,
+                    s.bytes.len(),
+                    preview.len()
+                ));
+            }
+            dump_kernel_handoff(acc.pipeline_ref, "probe", &mtlb, air, Some(&spirv), &meta);
+            dump_kernel_buffers(acc.pipeline_ref, "probe", &staged_bufs);
+        }
+    }
 
     let mut buffer_accesses = Vec::with_capacity(staged_bufs.len());
     let mut buffer_readonly_count = 0usize;
@@ -3368,8 +3249,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
-    let mut max_nz = 0usize;
-    let mut max_wh = (0u32, 0u32);
     let mut sampled_count = 0usize;
     let mut storage_count = 0usize;
     for t in &staged_tex {
@@ -3377,23 +3256,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             storage_count += 1;
         } else {
             sampled_count += 1;
-        }
-        let (nz, max_rgb, _) = crate::observe::rgba_rgb_stats(&t.bytes);
-        if nz > max_nz {
-            max_nz = nz;
-            max_wh = (t.width, t.height);
-        }
-        if t.width >= 1280 && t.height >= 720 {
-            crate::observe::off(format!(
-                "compute_linux stage_tex pipe={} bind={} access={} {}x{} rgb_nz={} max_rgb={}",
-                acc.pipeline_ref,
-                t.binding,
-                if t.is_storage { "storage" } else { "sampled" },
-                t.width,
-                t.height,
-                nz,
-                max_rgb
-            ));
         }
     }
     let (residency_eligible, residency_hits, residency_eligible_bytes, residency_hit_bytes) =
@@ -3405,9 +3267,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         residency_eligible_bytes,
         residency_hit_bytes,
     );
-    let stage_us = u64::try_from(stage_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    crate::observe::off(format!(
-        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] max_tex={}x{} max_nz={max_nz} stage_us={} encode=engine",
+    // A dispatch that staged its resources is expected control flow; the
+    // refusals on this path each emit their own typed decline.
+    crate::observe::line(format!(
+        "compute_linux stage_ok pipe={} nbuf={} bro={} brw={} bunused={} ntex={} sampled={} storage={} swo={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] encode=engine",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
@@ -3417,11 +3280,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         sampled_count,
         storage_count,
         storage_writeonly_count,
-        max_wh.0,
-        max_wh.1,
-        stage_us,
     ));
-    let prep_started = std::time::Instant::now();
 
     // Workgroup counts: DispatchThreadgroups already is groups; DispatchThreads
     // is total threads → ceil-div by LocalSize.
@@ -3526,9 +3385,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }) {
         crate::runtime::spirv_bind::ensure_storage_write_without_format_capability(&mut spirv);
     }
-    // GPU-direct writeback support is a per-device constant; `None` disables
-    // planning for this dispatch (extension absent or engine init failed).
-    let direct_align = vk_engine::compute_host_writeback_alignment();
     // Compute-side analog of the render resident gates: a deferred storage
     // writeback leaves guest-visible bytes GPU-resident-only until a flush
     // choke point lands them, so it requires the device's
@@ -3618,15 +3474,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                         .unwrap_or(0)
                 ));
             }
-            if shader_fmt != guest_fmt && t.width >= 1280 && t.height >= 720 {
-                crate::observe::off(format!(
-                    "compute_linux storage_format_view pipe={} bind={} spirv={specialized:?} engine={shader_fmt:?} guest={guest_fmt:?} simg={} bpp={}",
-                    acc.pipeline_ref,
-                    t.binding,
-                    selector,
-                    shader_fmt.bytes_per_texel()
-                ));
-            }
             // Deferred writeback: a resident type-11 output skips the engine
             // readback and the CPU guest writeback entirely — the pinned
             // resident is authoritative and every host access of the window
@@ -3642,11 +3489,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     TextureWriteback::Type11 { .. } | TextureWriteback::Linear { .. }
                 ),
             );
-            let host_writeback = if defer_readback {
-                None
-            } else {
-                plan_direct_writeback(state, host, t, direct_align)
-            };
             storage_images.push(ComputeStorageImageResource {
                 binding: t.binding,
                 format: shader_fmt,
@@ -3667,7 +3509,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     }
                 }),
                 seed_skipped: t.seed_skipped,
-                host_writeback,
                 defer_readback,
             });
         } else {
@@ -3732,7 +3573,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         }
     }
 
-    let mut req = ComputeRequest {
+    let req = ComputeRequest {
         spirv,
         entry: "main".into(),
         grid: [wg_x, wg_y, wg_z],
@@ -3741,9 +3582,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         samplers,
         storage_images,
     };
-    let prep_us = u64::try_from(prep_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let engine_before = vk_engine::counter_snapshot();
-    let engine_started = std::time::Instant::now();
     let run_engine = |req: &ComputeRequest| {
         let engine_done = spawn_compute_engine_stall_watchdog(
             acc.pipeline_ref,
@@ -3754,20 +3592,7 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
         engine_done.store(true, std::sync::atomic::Ordering::Release);
         out
     };
-    let mut out_result = run_engine(&req);
-    if let Err(e) = &out_result {
-        let s = e.to_string();
-        if s.contains("compute_resident_seed_lost") || s.contains("compute_resident_sample_lost") {
-            // A resident vanished between the stage-time generation check and
-            // engine acquire (same-request registry eviction). Re-read every
-            // skipped seed and sampled resident window from guest pages and
-            // retry once.
-            if let Err(status) = restage_lost_residents(state, host, &mut req, acc.pipeline_ref) {
-                return status;
-            }
-            out_result = run_engine(&req);
-        }
-    }
+    let out_result = run_engine(&req);
     let out = match out_result {
         Ok(o) => o,
         Err(e) => {
@@ -3781,24 +3606,16 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_engine_run");
         }
     };
-    let engine_us = u64::try_from(engine_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let engine_after = vk_engine::counter_snapshot();
-    let engine_delta = engine_after.delta_since(&engine_before);
-    let engine_phase_fields = compute_engine_phase_fields(engine_us, &engine_delta);
-
     if out.buffers.len() != buffer_writable_count
         || out.images.len() != storage_count
-        || out.images_direct.len() != storage_count
         || out.images_deferred.len() != storage_count
     {
         crate::observe::fail(format!(
-            "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{} direct={}/{} deferred={}/{}",
+            "compute_linux readback count mismatch pipe={} buf={}/{} img={}/{} deferred={}/{}",
             acc.pipeline_ref,
             out.buffers.len(),
             buffer_writable_count,
             out.images.len(),
-            storage_count,
-            out.images_direct.len(),
             storage_count,
             out.images_deferred.len(),
             storage_count
@@ -3808,12 +3625,8 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let vk_engine::ComputeOutput {
         buffers: output_buffers,
         images: output_images,
-        image_stats: output_image_stats,
-        images_direct: output_images_direct,
         images_deferred: output_images_deferred,
     } = out;
-
-    let writeback_started = std::time::Instant::now();
     for buffer in output_buffers {
         let Some(s) = staged_bufs
             .iter_mut()
@@ -3839,12 +3652,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return e;
         }
     }
-    for ((((t, bytes), fused_stats), direct), deferred) in staged_tex
+    for ((t, bytes), deferred) in staged_tex
         .iter_mut()
         .filter(|texture| texture.is_storage)
         .zip(output_images)
-        .zip(output_image_stats)
-        .zip(output_images_direct)
         .zip(output_images_deferred)
     {
         if deferred {
@@ -3890,31 +3701,40 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 let key = candidate.key;
                 state.disarm_linear_deferred_window(&key);
                 let span = key.span_end;
-                let guest_flush = state.gva_write_allowed(task_id, *gva, span);
-                let mut indexed = 0usize;
-                if guest_flush {
-                    let mut pages = std::collections::HashSet::new();
-                    crate::runtime::gva_mem::visit_task_gva_page_gpas(
-                        host,
-                        &state.tasks,
-                        task_id,
-                        *gva,
-                        span,
-                        state.page_shift,
-                        1,
-                        &mut |gpa_page| {
-                            pages.insert(gpa_page);
-                            true
-                        },
-                    );
-                    indexed = pages.len();
-                    state.arm_linear_deferred_window(key, generation, pages);
-                }
+                // The window is armed whatever the notification log says. Gating
+                // it on span coverage meant a compute result the guest had not
+                // yet notified an allocation for never got a flush obligation at
+                // all, so its writeback simply never happened. `pages` is the
+                // reading that matters here and it comes from the page tables:
+                // an empty index is a window over memory nothing resolves.
+                crate::runtime::gva_mem::report_undeclared_write(
+                    state,
+                    host,
+                    task_id,
+                    *gva,
+                    span,
+                    "compute_writeback_deferred",
+                );
+                let mut pages = std::collections::HashSet::new();
+                crate::runtime::gva_mem::visit_task_gva_page_gpas(
+                    host,
+                    &state.tasks,
+                    task_id,
+                    *gva,
+                    span,
+                    state.page_shift,
+                    1,
+                    &mut |gpa_page| {
+                        pages.insert(gpa_page);
+                        true
+                    },
+                );
+                let indexed = pages.len();
+                state.arm_linear_deferred_window(key, generation, pages);
                 crate::observe::off(format!(
-                    "compute_writeback_deferred kind=linear pipe={} bind={} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} fmt={pixel_format:#x} gen={generation} guest_flush={} pages={indexed}",
+                    "compute_writeback_deferred kind=linear pipe={} bind={} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} fmt={pixel_format:#x} gen={generation} pages={indexed}",
                     acc.pipeline_ref,
                     t.binding,
-                    guest_flush as u32
                 ));
                 continue;
             }
@@ -3936,19 +3756,34 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             let generation = next_mapping_content_generation(candidate.seed_generation);
             // Superseded stale windows intersecting this one are dead content:
             // drop them (never flush over the newer output) and release their
-            // pins — except our own identity, which the engine re-pinned.
-            for (victim, victim_generation) in
+            // pins — except our own *storage* identity, which the engine
+            // re-pinned.
+            //
+            // The `victim != key` exemption is about that re-pin, so it applies
+            // only to a compute window. A render window can sit at the very same
+            // key — same mapping, geometry, format and plane window — while its
+            // pixels are in a target resident the engine has not touched, so
+            // skipping it there would leak a display-sized pin for the boot.
+            // `release_window_pin` picks the registry from the owner.
+            for (victim, victim_owner) in
                 state.take_deferred_flush_windows(*mapping_id, key.surface_offset, key.span_end)
             {
-                if victim != key {
+                let ours = victim == key
+                    && matches!(victim_owner, crate::model::DeferredOwner::Storage { .. });
+                if !ours {
                     crate::observe::off(format!(
-                        "compute_writeback_deferred supersede mapping={mapping_id} victim={}x{} fmt={:#x} gen={victim_generation}",
-                        victim.width, victim.height, victim.pixel_format
+                        "compute_writeback_deferred supersede mapping={mapping_id} victim={}x{} fmt={:#x} owner={}",
+                        victim.width,
+                        victim.height,
+                        victim.pixel_format,
+                        crate::runtime::storage_flush::owner_slug(&victim_owner)
                     ));
-                    crate::backend::vulkan::engine::unpin_resident_storage(&victim);
+                    crate::runtime::storage_flush::release_window_pin(&victim, &victim_owner);
                 }
             }
-            state.compute_deferred_flush.insert(key, generation);
+            state
+                .compute_deferred_flush
+                .insert(key, crate::model::DeferredOwner::Storage { generation });
             state.index_deferred_alias_pages(*mapping_id);
             let _ = state.mark_mapping_written(*mapping_id);
             note_storage_residency_writeback(state, t);
@@ -3958,372 +3793,32 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             ));
             continue;
         }
-        if direct {
-            // The engine DMA'd the dispatch output straight into the guest
-            // window; keep the protocol bookkeeping the CPU write would do
-            // (exact-window residency invalidation + generation bump).
-            let TextureWriteback::Type11 {
-                mapping_id,
-                surface_offset,
-                span_end,
-                ..
-            } = &t.writeback
-            else {
-                crate::observe::fail(format!(
-                    "compute_direct_writeback fail reason=non_type11_direct pipe={} bind={}",
-                    acc.pipeline_ref, t.binding
-                ));
-                return ComputeStatus::MetalFailed("compute_vk_direct_non_type11");
-            };
-            state.invalidate_storage_residency_window(*mapping_id, *surface_offset, *span_end);
-            let _ = state.mark_mapping_written(*mapping_id);
-            note_storage_residency_writeback(state, t);
-            log_compute_output_texture_direct(acc.pipeline_ref, t);
-            continue;
-        }
         t.bytes = bytes;
-        let stats_started = std::time::Instant::now();
-        log_compute_output_texture(
-            acc.pipeline_ref,
-            t,
-            fused_stats.map(|s| (s.rgb_nz, s.rgb_max)),
-        );
-        let stats_us = stats_started.elapsed().as_micros() as u64;
-        let write_started = std::time::Instant::now();
         if let Err(e) = writeback_texture(state, host, task_id, t) {
             return e;
         }
-        let write_us = write_started.elapsed().as_micros() as u64;
         note_storage_residency_writeback(state, t);
-        // Measure-only: split the writeback stall into the content-stats scan
-        // vs the guest write.
-        if stats_us + write_us > 1500 {
-            crate::observe::off(format!(
-                "compute_writeback_slow pipe={} bind={} {}x{} stats_us={stats_us} write_us={write_us}",
-                acc.pipeline_ref, t.binding, t.width, t.height
-            ));
-        }
     }
-    let writeback_us = u64::try_from(writeback_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let total_us = u64::try_from(total_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
-    let snap = engine_after;
-    crate::observe::off(format!(
-        "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={} stage_us={stage_us} translate_us={translate_us} prep_us={prep_us} engine_us={engine_us} {engine_phase_fields} writeback_us={writeback_us} total_us={total_us} vk_engine_dispatches={} creates={} allocs={}",
+    // A dispatch that completed is expected control flow; every refusal on this
+    // path emits its own typed decline. The fields are this dispatch's own
+    // shape — process-cumulative engine totals belong to the parity tests that
+    // take a snapshot around a known workload, not to a per-dispatch line that
+    // would pay a global engine lock to print them.
+    crate::observe::line(format!(
+        "compute_linux ok pipe={} wg=[{wg_x},{wg_y},{wg_z}] nbuf={} bro={} brw={} bunused={} ntex={}",
         acc.pipeline_ref,
         staged_bufs.len(),
         buffer_readonly_count,
         buffer_writable_count,
         buffer_unused_count,
         staged_tex.len(),
-        snap.dispatches,
-        snap.creates,
-        snap.allocs
     ));
-    // Per-tranche attribution: compute dispatches are not render draws, so their
-    // lock hold otherwise lands in the opaque `other_us` bucket.
-    state.tranche.note_compute(total_us);
     ComputeStatus::Ok
 }
 
 #[cfg(feature = "backend-vulkan")]
-fn compute_engine_phase_fields(
-    engine_us: u64,
-    delta: &crate::backend::vulkan::engine::CounterSnapshot,
-) -> String {
-    let resource_measured_us = delta
-        .sampler_prepare_us
-        .saturating_add(delta.storage_prepare_us)
-        .saturating_add(delta.sampled_prepare_us)
-        .saturating_add(delta.storage_image_prepare_us)
-        .saturating_add(delta.descriptor_prepare_us);
-    let resource_unattributed_us = delta.resource_us.saturating_sub(resource_measured_us);
-    let measured_us = delta
-        .lock_wait_us
-        .saturating_add(delta.context_us)
-        .saturating_add(delta.pool_init_us)
-        .saturating_add(delta.cache_us)
-        .saturating_add(delta.resource_us)
-        .saturating_add(delta.pre_record_wait_us)
-        .saturating_add(delta.record_us)
-        .saturating_add(delta.submit_us)
-        .saturating_add(delta.wait_us)
-        .saturating_add(delta.retire_wait_us)
-        .saturating_add(delta.readback_us)
-        .saturating_add(delta.cleanup_us);
-    let unattributed_us = engine_us.saturating_sub(measured_us);
-    format!(
-        "engine_lock_wait_us={} engine_context_us={} engine_pool_init_us={} engine_cache_us={} engine_shader_create_us={} engine_layout_create_us={} engine_pipeline_create_us={} engine_sampler_create_us={} engine_resource_us={} engine_resource_unattributed_us={} engine_sampler_prepare_us={} engine_storage_buffer_prepare_us={} engine_sampled_image_prepare_us={} engine_storage_image_prepare_us={} engine_descriptor_prepare_us={} engine_memory_alloc_us={} engine_pre_record_wait_us={} engine_record_us={} engine_submit_us={} engine_wait_us={} engine_retire_wait_us={} engine_post_wait_skips={} engine_ring_retire_blocks={} engine_readback_us={} engine_cleanup_us={} engine_unattributed_us={} engine_readbacks={} engine_readback_bytes={} engine_sampled_uploads={} engine_sampled_upload_bytes={} engine_sampled_resident_copies={} engine_sampled_resident_copy_bytes={} engine_sampled_reinterpret_copies={} engine_sampled_reinterpret_copy_bytes={} engine_storage_seed_uploads={} engine_storage_seed_upload_bytes={} engine_direct_writebacks={} engine_direct_writeback_bytes={} engine_direct_writeback_fallbacks={} engine_creates={} engine_allocs={}",
-        delta.lock_wait_us,
-        delta.context_us,
-        delta.pool_init_us,
-        delta.cache_us,
-        delta.shader_create_us,
-        delta.layout_create_us,
-        delta.pipeline_create_us,
-        delta.sampler_create_us,
-        delta.resource_us,
-        resource_unattributed_us,
-        delta.sampler_prepare_us,
-        delta.storage_prepare_us,
-        delta.sampled_prepare_us,
-        delta.storage_image_prepare_us,
-        delta.descriptor_prepare_us,
-        delta.memory_alloc_us,
-        delta.pre_record_wait_us,
-        delta.record_us,
-        delta.submit_us,
-        delta.wait_us,
-        delta.retire_wait_us,
-        delta.compute_post_wait_skips,
-        delta.ring_retire_blocks,
-        delta.readback_us,
-        delta.cleanup_us,
-        unattributed_us,
-        delta.readbacks,
-        delta.readback_bytes,
-        delta.compute_sampled_uploads,
-        delta.compute_sampled_upload_bytes,
-        delta.compute_sampled_resident_copies,
-        delta.compute_sampled_resident_copy_bytes,
-        delta.compute_sampled_reinterpret_copies,
-        delta.compute_sampled_reinterpret_copy_bytes,
-        delta.compute_storage_seed_uploads,
-        delta.compute_storage_seed_upload_bytes,
-        delta.compute_direct_writebacks,
-        delta.compute_direct_writeback_bytes,
-        delta.compute_direct_writeback_fallbacks,
-        delta.creates,
-        delta.allocs
-    )
-}
-
-#[cfg(feature = "backend-vulkan")]
 const COMPUTE_ENGINE_STALL_PROXY_MS: u64 = 2_000;
-
-/// Resolve a GPU-direct writeback window for a staged type-11 storage image:
-/// the contig host view of the destination mapping plus the surface window,
-/// for the engine to import (VK_EXT_external_memory_host) and copy into
-/// instead of the host-visible readback buffer. `None` keeps the CPU
-/// writeback path — correct, just slower. Texel-size/stride checks live
-/// engine-side (it knows the view format); the host-pointer conditions are
-/// checked here where the mapping is nameable.
-#[cfg(feature = "backend-vulkan")]
-fn plan_direct_writeback<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    tex: &StagedTexture,
-    align: Option<u64>,
-) -> Option<crate::backend::vulkan::engine::ComputeHostWriteback> {
-    let align = align?;
-    let TextureWriteback::Type11 {
-        mapping_id,
-        surface_offset,
-        surface_bpr,
-        span_end,
-        ..
-    } = &tex.writeback
-    else {
-        return None;
-    };
-    let (mapping_id, surface_offset, surface_bpr, span_end) =
-        (*mapping_id, *surface_offset, *surface_bpr, *span_end);
-    let Some((ptr, len)) = mapping_write::contig_ptr_for_span(state, host, mapping_id, span_end)
-    else {
-        // Fragmented mapping: the CPU multi-import writeback stays in charge.
-        crate::observe::off(format!(
-            "compute_direct_writeback skip reason=no_contig mid={mapping_id} span_end={span_end}"
-        ));
-        return None;
-    };
-    if !(ptr as u64).is_multiple_of(align) {
-        crate::observe::off(format!(
-            "compute_direct_writeback skip reason=ptr_align mid={mapping_id} ptr={ptr:#x} align={align}"
-        ));
-        return None;
-    }
-    Some(crate::backend::vulkan::engine::ComputeHostWriteback {
-        ptr,
-        len,
-        buffer_offset: surface_offset,
-        row_bytes: surface_bpr,
-    })
-}
-
-/// Re-read every seed-skipped storage image from guest pages after the engine
-/// reported `compute_resident_seed_lost` (the resident vanished between the
-/// stage-time generation check and acquire — same-request registry eviction).
-/// Guest pages still hold the last writeback for that generation, so the
-/// re-read reconstructs exactly the seed the skip elided. Clears the skip
-/// flags so the retry seeds normally. Fail-visible on every exit: seed loss is
-/// rare, and a flood of restage lines means the stage-time gate and the engine
-/// registry disagree.
-#[cfg(feature = "backend-vulkan")]
-fn restage_lost_residents<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    req: &mut crate::backend::vulkan::engine::ComputeRequest,
-    pipeline_ref: u32,
-) -> Result<(), ComputeStatus> {
-    // bytes was allocated as exactly tight*height at stage time, so the
-    // identity key recovers the read geometry for both resource kinds.
-    let read_window = |state: &mut DeviceState,
-                       host: &mut M,
-                       key: &crate::model::ComputeStorageResidencyKey,
-                       bytes: &mut Vec<u8>| {
-        let rows = key.height.max(1) as u64;
-        let tight = (bytes.len() as u64 / rows) as u32;
-        let bpp = tight / key.width.max(1);
-        bpp != 0
-            && mapping_write::read_rect_raw_at(
-                state,
-                host,
-                key.mapping_id,
-                key.surface_offset,
-                key.surface_bpr,
-                key.span_end,
-                0,
-                0,
-                key.width,
-                key.height,
-                bpp,
-                bytes,
-                tight,
-            )
-    };
-    let mut restaged_storage = 0u32;
-    for resource in req.storage_images.iter_mut().filter(|r| r.seed_skipped) {
-        let Some(residency) = resource.residency else {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=skip_without_identity pipe={pipeline_ref} bind={}",
-                resource.binding
-            ));
-            return Err(ComputeStatus::MetalFailed(
-                "compute_restage_skip_without_identity",
-            ));
-        };
-        let key = residency.identity;
-        // A linear window's deferred content lives only in the lost resident —
-        // there is no mapping to re-read (guest pages hold the pre-chain
-        // seed and may be unmapped). Terminal, named.
-        if key.is_linear() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=linear_resident_lost pipe={pipeline_ref} bind={} task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.surface_offset,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed("compute_restage_linear_lost"));
-        }
-        // Heap textures have no guest-memory backing. Their contents exist
-        // only in the engine resident created for the heap allocation.
-        if key.is_heap() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=heap_resident_lost pipe={pipeline_ref} bind={} task={} ref={} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed("compute_restage_heap_lost"));
-        }
-        // The resident is gone; if its window was writeback-deferred the guest
-        // pages hold PRE-chain bytes — the deferred content is lost with it.
-        // Name the loss and fall back to the coherent stale seed.
-        if let Some(generation) = state.compute_deferred_flush.remove(&key) {
-            crate::observe::fail(format!(
-                "deferred_flush_lost mapping={} reason=restage gen={generation} {}x{} fmt={:#x}",
-                key.mapping_id, key.width, key.height, key.pixel_format
-            ));
-        }
-        if !read_window(state, host, &key, &mut resource.bytes) {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=read pipe={pipeline_ref} bind={} mapping={} {}x{} off={} bpr={} span_end={}",
-                resource.binding,
-                key.mapping_id,
-                key.width,
-                key.height,
-                key.surface_offset,
-                key.surface_bpr,
-                key.span_end
-            ));
-            return Err(ComputeStatus::GuestIo("compute_restage_read"));
-        }
-        resource.seed_skipped = false;
-        restaged_storage += 1;
-    }
-    let mut restaged_sampled = 0u32;
-    for resource in req.sampled_images.iter_mut() {
-        let Some(bind) = resource.resident_bind else {
-            continue;
-        };
-        let key = bind.identity;
-        if key.is_linear() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=linear_resident_lost pipe={pipeline_ref} bind={} task={} ref={} gva={:#x} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.surface_offset,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed(
-                "compute_restage_sampled_linear_lost",
-            ));
-        }
-        if key.is_heap() {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=heap_resident_lost pipe={pipeline_ref} bind={} task={} ref={} {}x{} fmt={:#x}",
-                resource.binding,
-                key.map_generation,
-                key.texture_ref,
-                key.width,
-                key.height,
-                key.pixel_format
-            ));
-            return Err(ComputeStatus::MetalFailed(
-                "compute_restage_sampled_heap_lost",
-            ));
-        }
-        if !read_window(state, host, &key, &mut resource.bytes) {
-            crate::observe::fail(format!(
-                "compute_restage fail reason=sampled_read pipe={pipeline_ref} bind={} mapping={} {}x{} off={} bpr={} span_end={}",
-                resource.binding,
-                key.mapping_id,
-                key.width,
-                key.height,
-                key.surface_offset,
-                key.surface_bpr,
-                key.span_end
-            ));
-            return Err(ComputeStatus::GuestIo("compute_restage_sampled_read"));
-        }
-        resource.resident_bind = None;
-        restaged_sampled += 1;
-    }
-    if restaged_storage == 0 && restaged_sampled == 0 {
-        // The engine claimed a lost resident but no resource was skipped —
-        // contract breach between stage and acquire; do not retry blind.
-        crate::observe::fail(format!(
-            "compute_restage fail reason=no_skipped_resource pipe={pipeline_ref}"
-        ));
-        return Err(ComputeStatus::MetalFailed(
-            "compute_restage_no_skipped_resource",
-        ));
-    }
-    crate::observe::fail(format!(
-        "compute_resident_seed_restage pipe={pipeline_ref} n={restaged_storage} sampled={restaged_sampled}"
-    ));
-    Ok(())
-}
 
 /// Measurement-only watchdog for backend calls that cannot be bounded by a
 /// Vulkan fence timeout (notably pipeline creation and some driver submits).
@@ -4441,6 +3936,7 @@ fn spirv_image_format_to_engine_storage(
         S::R8Unorm => V::R8Unorm,
         S::Rg8Unorm => V::Rg8Unorm,
         S::Rgba32Uint => V::Rgba32Uint,
+        S::R32Float => V::R32Float,
         S::R32ui => V::R32Uint,
         // Format-less (`Unknown`) storage images carry no engine texel format —
         // their view format comes from the guest surface, resolved by the caller.
@@ -4449,6 +3945,30 @@ fn spirv_image_format_to_engine_storage(
 }
 
 #[cfg(feature = "backend-vulkan")]
+/// Numeric class of a guest storage format: 0 normalized/float, 1 unsigned
+/// integer, 2 signed integer.
+///
+/// Kept apart from the specialization table below because that table also
+/// refuses formats whose storage path is unproven, and the class of a format is
+/// a fact about it that holds whether or not we are willing to target it.
+fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat) -> u8 {
+    use crate::backend::vulkan::engine::StorageImageFormat as V;
+    match guest {
+        V::Rgba32Float
+        | V::Rgba16Float
+        | V::R16Float
+        | V::Rgba8Unorm
+        | V::Bgra8Unorm
+        | V::Rg16Float
+        | V::R8Unorm
+        | V::Rg8Unorm
+        | V::R32Float
+        | V::Rgb9e5Ufloat => 0,
+        V::Rgba16Uint | V::Rgba8Uint | V::Rgba32Uint | V::R32Uint => 1,
+        V::Rgba8Sint | V::R32Sint => 2,
+    }
+}
+
 fn specialized_storage_image_format(
     guest: crate::backend::vulkan::engine::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
@@ -4481,6 +4001,7 @@ fn specialized_storage_image_format(
                 | S::Rgba32Float
                 | S::Rgba16Float
                 | S::R16Float
+                | S::R32Float
                 | S::Rg16Float
                 | S::R8Unorm
                 | S::Rg8Unorm
@@ -4493,18 +4014,11 @@ fn specialized_storage_image_format(
             });
         }
     }
-    if guest.bytes_per_texel() == shader_engine.bytes_per_texel() && !matches!(guest, V::R32Uint) {
-        // Equal-size mismatches are intentional raw views (for example Metal
-        // BGRA8Unorm bound to a uint texture and translated as Rgba8Uint).
-        //
-        // R32Uint is the ONE equal-bytes case that is NOT a valid raw view: the
-        // translator declares a 4x8-bit `Rgba8ui` storage image for a generic
-        // `texture2d<uint, write>`, but the guest surface is a single 32-bit
-        // uint channel. Reinterpreting it as Rgba8ui would store only the low
-        // byte of each written lane (correct only for values < 256). It falls
-        // through to the class-matched specialization below, which re-targets
-        // the SPIR-V storage image to `R32ui` (VK_FORMAT_R32_UINT) so a written
-        // `uint4`'s `.x` lane is stored as the full u32.
+    // Nothing to specialize when the translator already named the guest's own
+    // format. Stated before the class rules below so a guest surface whose
+    // storage path is otherwise unproven (`R32Float`, `R32Sint`) is not refused
+    // for a shader that declares exactly it.
+    if shader_engine == guest {
         return Ok(shader);
     }
 
@@ -4512,6 +4026,7 @@ fn specialized_storage_image_format(
         S::Rgba32Float
         | S::Rgba16Float
         | S::R16Float
+        | S::R32Float
         | S::Rgba8Unorm
         | S::Rg16Float
         | S::R8Unorm
@@ -4523,6 +4038,33 @@ fn specialized_storage_image_format(
         // deliberately for the BGRA path, which returns above.
         S::Unknown | S::Unsupported(_) => return Err("spirv_storage_format_unsupported"),
     };
+    // An integer-class shader over a normalized/float-class guest surface of the
+    // same texel width is a deliberate raw byte view — Metal `BGRA8Unorm` bound
+    // to a `texture2d<uint, write>` and translated as `Rgba8Uint` writes bytes,
+    // not colours, and re-targeting it would convert values that were never meant
+    // to be converted. The reverse (a float shader over an integer surface) has
+    // never been captured and is refused below rather than guessed at.
+    //
+    // Within one class equal width means nothing, and the store is a value store:
+    // `R32Float` and `Rg16Float` are both four float bytes and mean different
+    // things. A `float4` written through the former stores lane `.x` as one f32,
+    // which the guest then reads as two halves — so a two-channel write loses its
+    // second channel outright and corrupts its first. That is measured, not
+    // hypothetical: the guest's decode-time HEIC downsample writes chroma with
+    // `OpVectorShuffle … 1 2 1 2` into an `Rg16Float` surface the translator
+    // declared `R32f`, and the picture speckles.
+    //
+    // The `R32Uint` guest case used to be carved out of a bare width test by name
+    // for the same reason (`Rgba8Uint` declared over one 32-bit uint channel,
+    // storing only the low byte of each lane). It needs no exception now: uint
+    // over uint is one class, so it reaches the class-matched table below.
+    if guest.bytes_per_texel() == shader_engine.bytes_per_texel()
+        && shader_class != 0
+        && guest_numeric_class(guest) == 0
+    {
+        return Ok(shader);
+    }
+
     let (guest_class, specialized) = match guest {
         // R32-single-channel: R32Uint is supported as a storage image by
         // re-targeting the SPIR-V to `R32ui` (its class must still match the
@@ -4652,7 +4194,7 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     };
 
     let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims(state, host, task_id, acc, cmd) {
+        match resolve_dispatch_dims(state, host, task_id, cmd) {
             Ok(v) => v,
             Err(e) => {
                 crate::observe::line(format!(

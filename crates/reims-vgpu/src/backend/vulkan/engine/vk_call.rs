@@ -40,44 +40,6 @@ use crate::observe::Decline;
 /// stays distinguishable in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VkOp {
-    // ---- stats_reduce.rs — the present-proxy GPU stats-reduction pool ----
-    /// `vkCreateDescriptorPool` for the private stats descriptor pool.
-    StatsDescPool,
-    /// `vkCreateSampler` for the point sampler `texelFetch` binds.
-    StatsSampler,
-    /// `vkCreateBuffer` for a slot's 32-byte readback buffer.
-    StatsCreateBuffer,
-    /// `vkAllocateMemory` for that buffer.
-    StatsAlloc,
-    /// `vkBindBufferMemory` for that buffer.
-    StatsBind,
-    /// `vkMapMemory` for that buffer's persistent host-coherent map.
-    StatsMap,
-    /// `vkAllocateCommandBuffers` for a slot's command buffer.
-    StatsAllocCb,
-    /// `vkCreateFence` for a slot's completion fence.
-    StatsCreateFence,
-    /// `vkGetFenceStatus` while reclaiming a saturated slot.
-    StatsFenceStatusReclaim,
-    /// `vkAllocateDescriptorSets` for a stats slot.
-    StatsAllocDescriptorSet,
-    /// `vkResetFences` before one stats dispatch.
-    StatsResetFence,
-    /// `vkResetCommandBuffer` before one stats dispatch.
-    StatsResetCommandBuffer,
-    /// `vkBeginCommandBuffer` for one stats dispatch.
-    StatsBeginCommandBuffer,
-    /// `vkEndCommandBuffer` after one stats dispatch.
-    StatsEndCommandBuffer,
-    /// `vkQueueSubmit` of one stats dispatch.
-    StatsQueueSubmit,
-    /// `vkGetFenceStatus` while non-blockingly consuming a stats block.
-    StatsFenceStatusConsume,
-    /// `vkWaitForFences` for the synchronous Store stats consumer.
-    StatsWaitFenceBlocking,
-    /// Bounded `vkWaitForFences` before destroying an in-flight stats slot.
-    StatsWaitFenceDestroy,
-
     // ---- mod.rs `read_target_inner` — the full-frame CPU readback rail ----
     /// `vkResetCommandBuffer` before recording the readback copy.
     ReadbackResetCb,
@@ -89,17 +51,8 @@ pub enum VkOp {
     ReadbackSubmit,
     /// `vkMapMemory` of the readback buffer to copy the pixels out.
     ReadbackMap,
-
-    // ---- mod.rs `present_into_host_ptr_strided` — the packed-contig host
-    //      present rail (guest page imported, GPU DMA straight into it) ----
-    /// `vkResetCommandBuffer` before recording the host-ptr present copy.
-    HostPresentResetCb,
-    /// `vkBeginCommandBuffer` for the host-ptr present copy.
-    HostPresentBeginCb,
-    /// `vkEndCommandBuffer` closing the host-ptr present copy.
-    HostPresentEndCb,
-    /// `vkQueueSubmit` of the host-ptr present copy.
-    HostPresentSubmit,
+    /// `vkInvalidateMappedMemoryRanges` of the readback buffer.
+    ReadbackInvalidate,
 
     // ---- mod.rs `read_resident_storage` — the pinned deferred-writeback
     //      storage-image flush rail (GPU→host tight copy, then unpin) ----
@@ -113,55 +66,8 @@ pub enum VkOp {
     StorageReadSubmit,
     /// `vkMapMemory` of the storage readback buffer to copy the bytes out.
     StorageReadMap,
-
-    // ---- mod.rs `export_scanout_from_bgra` — the CPU-capture → dmabuf export
-    //      scanout rail (staging copy of `frame_bgra`, then blit + export) ----
-    /// `vkMapMemory` of the staging buffer to upload the captured BGRA.
-    ExportScanoutMapStaging,
-    /// `vkResetCommandBuffer` before recording the scanout export blit.
-    ExportScanoutResetCb,
-    /// `vkBeginCommandBuffer` for the scanout export blit.
-    ExportScanoutBeginCb,
-    /// `vkEndCommandBuffer` closing the scanout export blit.
-    ExportScanoutEndCb,
-    /// `vkQueueSubmit` of the scanout export blit.
-    ExportScanoutSubmit,
-
-    // ---- mod.rs `export_present_from_resident_composited_fd_policy` — the
-    //      zero-copy resident → dmabuf present export rail ----
-    /// `vkResetCommandBuffer` before recording the present export blit.
-    ExportPresentResetCb,
-    /// `vkBeginCommandBuffer` for the present export blit.
-    ExportPresentBeginCb,
-    /// `vkEndCommandBuffer` closing the present export blit.
-    ExportPresentEndCb,
-    /// `vkQueueSubmit` of the present export blit.
-    ExportPresentSubmit,
-
-    // ---- dmabuf_export.rs `export_bgra_scanout_dmabuf` — the low-level dmabuf
-    //      scanout image export (the exportable VkImage the two mod.rs export
-    //      rails above are built on), create + alloc + bind + get_fd ----
-    /// `vkCreateImage` for the exportable LINEAR scanout image.
-    DmabufExportCreateImage,
-    /// `vkAllocateMemory` for that image (device-local preferred, exportable).
-    DmabufExportAlloc,
-    /// `vkBindImageMemory` binding that memory to the image.
-    DmabufExportBind,
-    /// `vkGetMemoryFdKHR` exporting the dmabuf fd for that memory.
-    DmabufExportGetFd,
-
-    // ---- dmabuf_export.rs `import_bgra_dmabuf_image` — the consumer half: the
-    //      host window imports the engine's exported dmabuf fd as a sampleable
-    //      `VkImage` for its zero-copy present blit, create + fd-props + alloc +
-    //      bind. Sibling of the export ops above, on the other device. ----
-    /// `vkCreateImage` for the LINEAR image backing the imported dmabuf.
-    DmabufImportCreateImage,
-    /// `vkGetMemoryFdPropertiesKHR` for the imported fd's allowed memory types.
-    DmabufImportFdProps,
-    /// `vkAllocateMemory` importing the dmabuf fd as dedicated device memory.
-    DmabufImportAlloc,
-    /// `vkBindImageMemory` binding the imported memory to the image.
-    DmabufImportBind,
+    /// `vkInvalidateMappedMemoryRanges` of the storage readback buffer.
+    StorageReadInvalidate,
 
     // ---- caches.rs `ObjectCaches` — the L2–L7 immutable-object create caches.
     //      Each op is cached negatively as a `VkCall`, so the cheap re-attempt
@@ -181,12 +87,6 @@ pub enum VkOp {
     /// `vkCreateComputePipelines` for a dispatch pipeline.
     CachesCreateComputePipelines,
 
-    // ---- context.rs — the guest host-pointer import rail (VK_EXT_external_
-    //      memory_host: address the guest RAM window in place) ----
-    /// `vkGetMemoryHostPointerPropertiesEXT` for an imported host pointer.
-    ContextHostPtrProps,
-    /// `vkAllocateMemory` importing that host pointer as device memory.
-    ContextImportHostPtrAlloc,
     /// `vkGetPipelineCacheData` before persisting a grown pipeline cache.
     ContextPipelineCacheGetData,
 
@@ -211,6 +111,10 @@ pub enum VkOp {
     ExecSubmit,
     /// `vkMapMemory` of the draw readback buffer.
     ExecMapReadback,
+    /// `vkInvalidateMappedMemoryRanges` of the draw readback buffer, needed
+    /// whenever `MemoryClass::Readback` landed on a host-cached type that is
+    /// not also coherent.
+    ExecInvalidateReadback,
 
     // ---- exec_compute.rs — the compute command-buffer record/submit/readback
     //      rail (a distinct queue submission from the draw rail above) ----
@@ -224,30 +128,12 @@ pub enum VkOp {
     ComputeExecSubmit,
     /// `vkMapMemory` of the storage-buffer readback after the dispatch.
     ComputeExecMapStorageReadback,
+    /// `vkInvalidateMappedMemoryRanges` of the storage-buffer readback.
+    ComputeExecInvalidateStorageReadback,
     /// `vkMapMemory` of the storage-image readback after the dispatch.
     ComputeExecMapImageReadback,
-    /// `vkCreateBuffer` over imported guest memory for direct compute writeback.
-    ComputeDirectWritebackCreateBuffer,
-    /// `vkBindBufferMemory` over imported guest memory for direct compute writeback.
-    ComputeDirectWritebackBindBuffer,
-
-    // ---- host_scatter.rs — the GPU-direct resident → guest-page Store rail ----
-    /// `vkAllocateCommandBuffers` for the private scatter command buffer.
-    HostScatterAllocCommandBuffer,
-    /// `vkCreateFence` for synchronous scatter completion.
-    HostScatterCreateFence,
-    /// `vkResetFences` before one scatter submission.
-    HostScatterResetFence,
-    /// `vkResetCommandBuffer` before recording one scatter.
-    HostScatterResetCommandBuffer,
-    /// `vkBeginCommandBuffer` for one scatter.
-    HostScatterBeginCommandBuffer,
-    /// `vkEndCommandBuffer` after recording one scatter.
-    HostScatterEndCommandBuffer,
-    /// `vkQueueSubmit` of one scatter.
-    HostScatterQueueSubmit,
-    /// `vkWaitForFences` that makes the guest-page write synchronous.
-    HostScatterWaitFence,
+    /// `vkInvalidateMappedMemoryRanges` of the storage-image readback.
+    ComputeExecInvalidateImageReadback,
 
     // ---- mod.rs guest reset — quiesce before dropping guest-owned state ----
     /// `vkDeviceWaitIdle` before a guest reset destroys device-derived objects.
@@ -279,10 +165,6 @@ pub enum VkOp {
     PoolsEndCbBatch,
     /// `vkQueueSubmit` of a submit batch.
     PoolsSubmitBatch,
-    /// `vkCreateBuffer` over a cached host-import window.
-    PoolsHostImportCreateBuffer,
-    /// `vkBindBufferMemory` over a cached host-import window.
-    PoolsHostImportBindBuffer,
     /// `vkCreateBuffer` for a staging slot.
     PoolsCreateStaging,
     /// `vkAllocateMemory` for a staging slot.
@@ -405,6 +287,14 @@ pub enum VkOp {
     WindowQueuePresent,
     /// `vkQueueWaitIdle` before destroying the window presenter.
     WindowDestroyQueueWaitIdle,
+    /// `vkCreateImage` for the presenter's host-visible LINEAR staging image.
+    WindowCreateStagingImage,
+    /// `vkAllocateMemory` for the presenter's staging image.
+    WindowAllocateStagingMemory,
+    /// `vkBindImageMemory` binding the presenter's staging image.
+    WindowBindStagingMemory,
+    /// `vkMapMemory` persistently mapping the presenter's staging image.
+    WindowMapStagingMemory,
 }
 
 /// A failed Vulkan call: which operation refused, and the driver's `vk::Result`.
@@ -430,62 +320,19 @@ impl Decline for VkCall {
     /// this type's own `Decline` impl.
     fn slug(&self) -> &'static str {
         match self.op {
-            VkOp::StatsDescPool => "vk_stats_desc_pool",
-            VkOp::StatsSampler => "vk_stats_sampler",
-            VkOp::StatsCreateBuffer => "vk_stats_create_buffer",
-            VkOp::StatsAlloc => "vk_stats_alloc",
-            VkOp::StatsBind => "vk_stats_bind",
-            VkOp::StatsMap => "vk_stats_map",
-            VkOp::StatsAllocCb => "vk_stats_alloc_cb",
-            VkOp::StatsCreateFence => "vk_stats_create_fence",
-            VkOp::StatsFenceStatusReclaim => "vk_stats_fence_status_reclaim",
-            VkOp::StatsAllocDescriptorSet => "vk_stats_alloc_descriptor_set",
-            VkOp::StatsResetFence => "vk_stats_reset_fence",
-            VkOp::StatsResetCommandBuffer => "vk_stats_reset_command_buffer",
-            VkOp::StatsBeginCommandBuffer => "vk_stats_begin_command_buffer",
-            VkOp::StatsEndCommandBuffer => "vk_stats_end_command_buffer",
-            VkOp::StatsQueueSubmit => "vk_stats_queue_submit",
-            VkOp::StatsFenceStatusConsume => "vk_stats_fence_status_consume",
-            VkOp::StatsWaitFenceBlocking => "vk_stats_wait_fence_blocking",
-            VkOp::StatsWaitFenceDestroy => "vk_stats_wait_fence_destroy",
-
             VkOp::ReadbackResetCb => "vk_readback_reset_cb",
             VkOp::ReadbackBeginCb => "vk_readback_begin_cb",
             VkOp::ReadbackEndCb => "vk_readback_end_cb",
             VkOp::ReadbackSubmit => "vk_readback_submit",
             VkOp::ReadbackMap => "vk_readback_map",
-
-            VkOp::HostPresentResetCb => "vk_host_present_reset_cb",
-            VkOp::HostPresentBeginCb => "vk_host_present_begin_cb",
-            VkOp::HostPresentEndCb => "vk_host_present_end_cb",
-            VkOp::HostPresentSubmit => "vk_host_present_submit",
+            VkOp::ReadbackInvalidate => "vk_readback_invalidate",
 
             VkOp::StorageReadResetCb => "vk_storage_read_reset_cb",
             VkOp::StorageReadBeginCb => "vk_storage_read_begin_cb",
             VkOp::StorageReadEndCb => "vk_storage_read_end_cb",
             VkOp::StorageReadSubmit => "vk_storage_read_submit",
             VkOp::StorageReadMap => "vk_storage_read_map",
-
-            VkOp::ExportScanoutMapStaging => "vk_export_scanout_map_staging",
-            VkOp::ExportScanoutResetCb => "vk_export_scanout_reset_cb",
-            VkOp::ExportScanoutBeginCb => "vk_export_scanout_begin_cb",
-            VkOp::ExportScanoutEndCb => "vk_export_scanout_end_cb",
-            VkOp::ExportScanoutSubmit => "vk_export_scanout_submit",
-
-            VkOp::ExportPresentResetCb => "vk_export_present_reset_cb",
-            VkOp::ExportPresentBeginCb => "vk_export_present_begin_cb",
-            VkOp::ExportPresentEndCb => "vk_export_present_end_cb",
-            VkOp::ExportPresentSubmit => "vk_export_present_submit",
-
-            VkOp::DmabufExportCreateImage => "vk_dmabuf_export_create_image",
-            VkOp::DmabufExportAlloc => "vk_dmabuf_export_alloc",
-            VkOp::DmabufExportBind => "vk_dmabuf_export_bind",
-            VkOp::DmabufExportGetFd => "vk_dmabuf_export_get_fd",
-
-            VkOp::DmabufImportCreateImage => "vk_dmabuf_import_create_image",
-            VkOp::DmabufImportFdProps => "vk_dmabuf_import_fd_props",
-            VkOp::DmabufImportAlloc => "vk_dmabuf_import_alloc",
-            VkOp::DmabufImportBind => "vk_dmabuf_import_bind",
+            VkOp::StorageReadInvalidate => "vk_storage_read_invalidate",
 
             VkOp::CachesCreateShaderModule => "vk_caches_create_shader_module",
             VkOp::CachesCreateDescriptorSetLayout => "vk_caches_create_descriptor_set_layout",
@@ -495,8 +342,6 @@ impl Decline for VkCall {
             VkOp::CachesCreateGraphicsPipelines => "vk_caches_create_graphics_pipelines",
             VkOp::CachesCreateComputePipelines => "vk_caches_create_compute_pipelines",
 
-            VkOp::ContextHostPtrProps => "vk_context_host_ptr_props",
-            VkOp::ContextImportHostPtrAlloc => "vk_context_import_host_ptr_alloc",
             VkOp::ContextPipelineCacheGetData => "vk_context_pipeline_cache_get_data",
 
             VkOp::DescArenaCreatePool => "vk_desc_arena_create_pool",
@@ -509,24 +354,18 @@ impl Decline for VkCall {
             VkOp::ExecEndCb => "vk_exec_end_cb",
             VkOp::ExecSubmit => "vk_exec_submit",
             VkOp::ExecMapReadback => "vk_exec_map_readback",
+            VkOp::ExecInvalidateReadback => "vk_exec_invalidate_readback",
 
             VkOp::ComputeExecResetCb => "vk_compute_exec_reset_cb",
             VkOp::ComputeExecBeginCb => "vk_compute_exec_begin_cb",
             VkOp::ComputeExecEndCb => "vk_compute_exec_end_cb",
             VkOp::ComputeExecSubmit => "vk_compute_exec_submit",
             VkOp::ComputeExecMapStorageReadback => "vk_compute_exec_map_storage_readback",
+            VkOp::ComputeExecInvalidateStorageReadback => {
+                "vk_compute_exec_invalidate_storage_readback"
+            }
             VkOp::ComputeExecMapImageReadback => "vk_compute_exec_map_image_readback",
-            VkOp::ComputeDirectWritebackCreateBuffer => "vk_compute_direct_writeback_create_buffer",
-            VkOp::ComputeDirectWritebackBindBuffer => "vk_compute_direct_writeback_bind_buffer",
-
-            VkOp::HostScatterAllocCommandBuffer => "vk_host_scatter_alloc_command_buffer",
-            VkOp::HostScatterCreateFence => "vk_host_scatter_create_fence",
-            VkOp::HostScatterResetFence => "vk_host_scatter_reset_fence",
-            VkOp::HostScatterResetCommandBuffer => "vk_host_scatter_reset_command_buffer",
-            VkOp::HostScatterBeginCommandBuffer => "vk_host_scatter_begin_command_buffer",
-            VkOp::HostScatterEndCommandBuffer => "vk_host_scatter_end_command_buffer",
-            VkOp::HostScatterQueueSubmit => "vk_host_scatter_queue_submit",
-            VkOp::HostScatterWaitFence => "vk_host_scatter_wait_fence",
+            VkOp::ComputeExecInvalidateImageReadback => "vk_compute_exec_invalidate_image_readback",
 
             VkOp::GuestResetDeviceWaitIdle => "vk_guest_reset_device_wait_idle",
 
@@ -542,8 +381,6 @@ impl Decline for VkCall {
             VkOp::PoolsResetFencesRetire => "vk_pools_reset_fences_retire",
             VkOp::PoolsEndCbBatch => "vk_pools_end_cb_batch",
             VkOp::PoolsSubmitBatch => "vk_pools_submit_batch",
-            VkOp::PoolsHostImportCreateBuffer => "vk_pools_host_import_create_buffer",
-            VkOp::PoolsHostImportBindBuffer => "vk_pools_host_import_bind_buffer",
             VkOp::PoolsCreateStaging => "vk_pools_create_staging",
             VkOp::PoolsAllocStaging => "vk_pools_alloc_staging",
             VkOp::PoolsBindStaging => "vk_pools_bind_staging",
@@ -601,6 +438,10 @@ impl Decline for VkCall {
             VkOp::WindowSubmitPresent => "vk_window_submit_present",
             VkOp::WindowQueuePresent => "vk_window_queue_present",
             VkOp::WindowDestroyQueueWaitIdle => "vk_window_destroy_queue_wait_idle",
+            VkOp::WindowCreateStagingImage => "vk_window_create_staging_image",
+            VkOp::WindowAllocateStagingMemory => "vk_window_allocate_staging_memory",
+            VkOp::WindowBindStagingMemory => "vk_window_bind_staging_memory",
+            VkOp::WindowMapStagingMemory => "vk_window_map_staging_memory",
         }
     }
 
@@ -641,55 +482,18 @@ mod tests {
     use super::*;
 
     const ALL: &[VkOp] = &[
-        VkOp::StatsDescPool,
-        VkOp::StatsSampler,
-        VkOp::StatsCreateBuffer,
-        VkOp::StatsAlloc,
-        VkOp::StatsBind,
-        VkOp::StatsMap,
-        VkOp::StatsAllocCb,
-        VkOp::StatsCreateFence,
-        VkOp::StatsFenceStatusReclaim,
-        VkOp::StatsAllocDescriptorSet,
-        VkOp::StatsResetFence,
-        VkOp::StatsResetCommandBuffer,
-        VkOp::StatsBeginCommandBuffer,
-        VkOp::StatsEndCommandBuffer,
-        VkOp::StatsQueueSubmit,
-        VkOp::StatsFenceStatusConsume,
-        VkOp::StatsWaitFenceBlocking,
-        VkOp::StatsWaitFenceDestroy,
         VkOp::ReadbackResetCb,
         VkOp::ReadbackBeginCb,
         VkOp::ReadbackEndCb,
         VkOp::ReadbackSubmit,
         VkOp::ReadbackMap,
-        VkOp::HostPresentResetCb,
-        VkOp::HostPresentBeginCb,
-        VkOp::HostPresentEndCb,
-        VkOp::HostPresentSubmit,
+        VkOp::ReadbackInvalidate,
         VkOp::StorageReadResetCb,
         VkOp::StorageReadBeginCb,
         VkOp::StorageReadEndCb,
         VkOp::StorageReadSubmit,
         VkOp::StorageReadMap,
-        VkOp::ExportScanoutMapStaging,
-        VkOp::ExportScanoutResetCb,
-        VkOp::ExportScanoutBeginCb,
-        VkOp::ExportScanoutEndCb,
-        VkOp::ExportScanoutSubmit,
-        VkOp::ExportPresentResetCb,
-        VkOp::ExportPresentBeginCb,
-        VkOp::ExportPresentEndCb,
-        VkOp::ExportPresentSubmit,
-        VkOp::DmabufExportCreateImage,
-        VkOp::DmabufExportAlloc,
-        VkOp::DmabufExportBind,
-        VkOp::DmabufExportGetFd,
-        VkOp::DmabufImportCreateImage,
-        VkOp::DmabufImportFdProps,
-        VkOp::DmabufImportAlloc,
-        VkOp::DmabufImportBind,
+        VkOp::StorageReadInvalidate,
         VkOp::CachesCreateShaderModule,
         VkOp::CachesCreateDescriptorSetLayout,
         VkOp::CachesCreatePipelineLayout,
@@ -697,8 +501,6 @@ mod tests {
         VkOp::CachesCreateSampler,
         VkOp::CachesCreateGraphicsPipelines,
         VkOp::CachesCreateComputePipelines,
-        VkOp::ContextHostPtrProps,
-        VkOp::ContextImportHostPtrAlloc,
         VkOp::ContextPipelineCacheGetData,
         VkOp::DescArenaCreatePool,
         VkOp::DescArenaAllocSets,
@@ -709,22 +511,15 @@ mod tests {
         VkOp::ExecEndCb,
         VkOp::ExecSubmit,
         VkOp::ExecMapReadback,
+        VkOp::ExecInvalidateReadback,
         VkOp::ComputeExecResetCb,
         VkOp::ComputeExecBeginCb,
         VkOp::ComputeExecEndCb,
         VkOp::ComputeExecSubmit,
         VkOp::ComputeExecMapStorageReadback,
+        VkOp::ComputeExecInvalidateStorageReadback,
         VkOp::ComputeExecMapImageReadback,
-        VkOp::ComputeDirectWritebackCreateBuffer,
-        VkOp::ComputeDirectWritebackBindBuffer,
-        VkOp::HostScatterAllocCommandBuffer,
-        VkOp::HostScatterCreateFence,
-        VkOp::HostScatterResetFence,
-        VkOp::HostScatterResetCommandBuffer,
-        VkOp::HostScatterBeginCommandBuffer,
-        VkOp::HostScatterEndCommandBuffer,
-        VkOp::HostScatterQueueSubmit,
-        VkOp::HostScatterWaitFence,
+        VkOp::ComputeExecInvalidateImageReadback,
         VkOp::GuestResetDeviceWaitIdle,
         VkOp::SlabAllocateMemory,
         VkOp::PoolsCreateCommandPool,
@@ -737,8 +532,6 @@ mod tests {
         VkOp::PoolsResetFencesRetire,
         VkOp::PoolsEndCbBatch,
         VkOp::PoolsSubmitBatch,
-        VkOp::PoolsHostImportCreateBuffer,
-        VkOp::PoolsHostImportBindBuffer,
         VkOp::PoolsCreateStaging,
         VkOp::PoolsAllocStaging,
         VkOp::PoolsBindStaging,
@@ -829,12 +622,12 @@ mod tests {
     #[test]
     fn the_line_carries_the_driver_result_code() {
         let c = VkCall::new(
-            VkOp::StatsCreateBuffer,
+            VkOp::PoolsCreateFence,
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
         );
-        let line = crate::observe::Emit::decline("stats_reduce", &c).render();
+        let line = crate::observe::Emit::decline("vk_pools", &c).render();
         assert!(
-            line.starts_with("stats_reduce reason=vk_stats_create_buffer vk_result="),
+            line.starts_with("vk_pools reason=vk_pools_create_fence vk_result="),
             "{line}"
         );
         assert!(

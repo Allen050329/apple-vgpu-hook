@@ -73,17 +73,6 @@ pub struct Command {
     pub raw_payload_length: usize,
 }
 
-pub fn opcode_accepted_by_deserializer(opcode: u32) -> bool {
-    matches!(
-        opcode,
-        OP_WAIT_EVENT | OP_SIGNAL_EVENT | OP_WAIT_EVENT_TIMEOUT
-    )
-}
-
-pub fn opcode_emitted_by_serializer(_opcode: u32) -> bool {
-    false
-}
-
 pub fn opcode_rejected_by_deserializer(opcode: u32) -> bool {
     matches!(
         opcode,
@@ -92,23 +81,6 @@ pub fn opcode_rejected_by_deserializer(opcode: u32) -> bool {
             | REJECTED_BEFORE_WINDOW
             | REJECTED_AFTER_WINDOW
     )
-}
-
-pub fn opcode_name(opcode: u32) -> &'static str {
-    match opcode {
-        OP_WAIT_EVENT => "decodeWaitForEvent",
-        OP_SIGNAL_EVENT => "decodeSignalEvent",
-        OP_WAIT_EVENT_TIMEOUT => "decodeWaitForEventTimeout",
-        _ => "unknown",
-    }
-}
-
-pub fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::SignalEvent => "signalEvent",
-        Kind::WaitEvent => "waitEvent",
-        Kind::Unknown => "unknown",
-    }
 }
 
 /// Decode one event command. Transactional: returns Ok only with a full snapshot.
@@ -243,9 +215,6 @@ mod tests {
             decode(&build(0x999, &[])).unwrap_err(),
             DecodeStatus::ErrUnknownOpcode
         );
-        assert!(opcode_accepted_by_deserializer(OP_SIGNAL_EVENT));
-        assert!(!opcode_emitted_by_serializer(OP_SIGNAL_EVENT));
-        assert_eq!(opcode_name(OP_SIGNAL_EVENT), "decodeSignalEvent");
     }
 
     #[test]

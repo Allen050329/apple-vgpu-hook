@@ -1,18 +1,13 @@
-//! Process-global content-hash caches + diagnostics counters.
+//! Process-global content-hash caches.
 
 use crate::backend::metal::abi::{
-    ReimsVgpuComputeTextureUsage, ReimsVgpuDepthStencilState, ReimsVgpuMetalCacheStats,
-    ReimsVgpuSampler,
+    ReimsVgpuComputeTextureUsage, ReimsVgpuDepthStencilState, ReimsVgpuSampler,
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::hash::hash_u64;
+use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
-
-#[derive(Default)]
-pub struct CacheStatsInner {
-    pub stats: ReimsVgpuMetalCacheStats,
-}
 
 pub struct FnEntry {
     pub hash: u64,
@@ -55,6 +50,13 @@ pub struct RenderPsoKey {
     pub color_blend_src_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub color_blend_dst_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub color_blend_op_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+    /// Per-RT `MTLColorWriteMask`, in Metal's own bit order.
+    ///
+    /// Outside the `color_blend_*` group on purpose: the mask applies whether
+    /// or not the slot blends, so it is keyed and applied unconditionally
+    /// while the blend fields are only meaningful under
+    /// `color_blend_enable[i]`.
+    pub color_write_mask: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub depth_pixel_format: u32,
     pub stencil_pixel_format: u32,
 }
@@ -94,6 +96,9 @@ impl Default for RenderPsoKey {
             color_blend_src_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
             color_blend_dst_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
             color_blend_op_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+            // `MTLColorWriteMaskAll`. Zero here would mean a default-built key
+            // describes a pipeline that writes no channel at all.
+            color_write_mask: [MTL_COLOR_WRITE_MASK_ALL; REIMS_VGPU_METAL_MAX_COLOR_RTS],
             depth_pixel_format: 0,
             stencil_pixel_format: 0,
         }
@@ -131,6 +136,7 @@ impl RenderPsoKey {
                 || self.color_blend_src_alpha[i] != other.color_blend_src_alpha[i]
                 || self.color_blend_dst_alpha[i] != other.color_blend_dst_alpha[i]
                 || self.color_blend_op_alpha[i] != other.color_blend_op_alpha[i]
+                || self.color_write_mask[i] != other.color_write_mask[i]
             {
                 return false;
             }
@@ -238,7 +244,6 @@ pub struct ReflectEntry {
 }
 
 struct GlobalCaches {
-    stats: ReimsVgpuMetalCacheStats,
     fn_cache: Vec<Option<FnEntry>>,
     fn_clock: usize,
     render_pso: Vec<Option<RenderPsoEntry>>,
@@ -256,7 +261,6 @@ struct GlobalCaches {
 impl GlobalCaches {
     fn new() -> Self {
         Self {
-            stats: ReimsVgpuMetalCacheStats::default(),
             fn_cache: Vec::new(),
             fn_clock: 0,
             render_pso: Vec::new(),
@@ -280,23 +284,13 @@ fn with_caches<R>(f: impl FnOnce(&mut GlobalCaches) -> R) -> R {
     f(guard.get_or_insert_with(GlobalCaches::new))
 }
 
-pub fn cache_stats() -> ReimsVgpuMetalCacheStats {
-    with_caches(|c| c.stats)
-}
-
-pub fn cache_stats_reset() {
-    with_caches(|c| c.stats = ReimsVgpuMetalCacheStats::default());
-}
-
 pub fn fn_cache_lookup(hash: u64, len: usize) -> Option<Function> {
     with_caches(|c| {
         for e in c.fn_cache.iter().flatten() {
             if e.hash == hash && e.len == len {
-                c.stats.function_hits += 1;
                 return Some(e.function.clone());
             }
         }
-        c.stats.function_misses += 1;
         None
     })
 }
@@ -305,7 +299,6 @@ pub fn fn_cache_insert(hash: u64, len: usize, function: Function) -> Function {
     with_caches(|c| {
         for e in c.fn_cache.iter().flatten() {
             if e.hash == hash && e.len == len {
-                c.stats.function_hits += 1;
                 return e.function.clone();
             }
         }
@@ -341,11 +334,9 @@ pub fn compute_pso_lookup(
                 && e.has_stage_input == has_stage
                 && e.stage_hash == stage_hash
             {
-                c.stats.compute_pso_hits += 1;
                 return Some(e.pso.clone());
             }
         }
-        c.stats.compute_pso_misses += 1;
         None
     })
 }
@@ -364,7 +355,6 @@ pub fn compute_pso_insert(
                 && e.has_stage_input == has_stage
                 && e.stage_hash == stage_hash
             {
-                c.stats.compute_pso_hits += 1;
                 return e.pso.clone();
             }
         }
@@ -393,11 +383,9 @@ pub fn render_pso_lookup(key: &RenderPsoKey) -> Option<(RenderPipelineState, u32
     with_caches(|c| {
         for e in c.render_pso.iter().flatten() {
             if e.key.equal(key) {
-                c.stats.render_pso_hits += 1;
                 return Some((e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask));
             }
         }
-        c.stats.render_pso_misses += 1;
         None
     })
 }
@@ -411,7 +399,6 @@ pub fn render_pso_insert(
     with_caches(|c| {
         for e in c.render_pso.iter().flatten() {
             if e.key.equal(&key) {
-                c.stats.render_pso_hits += 1;
                 return (e.pso.clone(), e.vert_sampler_mask, e.frag_sampler_mask);
             }
         }
@@ -440,11 +427,9 @@ pub fn sampler_lookup(key: u64, s: &ReimsVgpuSampler) -> Option<SamplerState> {
     with_caches(|c| {
         for e in c.sampler.iter().flatten() {
             if e.key_hash == key && e.matches(s) {
-                c.stats.sampler_hits += 1;
                 return Some(e.state.clone());
             }
         }
-        c.stats.sampler_misses += 1;
         None
     })
 }
@@ -453,7 +438,6 @@ pub fn sampler_insert(key: u64, s: &ReimsVgpuSampler, state: SamplerState) -> Sa
     with_caches(|c| {
         for e in c.sampler.iter().flatten() {
             if e.key_hash == key && e.matches(s) {
-                c.stats.sampler_hits += 1;
                 return e.state.clone();
             }
         }
@@ -496,11 +480,9 @@ pub fn depth_stencil_lookup(
     with_caches(|c| {
         for e in c.depth_stencil.iter().flatten() {
             if e.key_hash == key && depth_stencil_eq(&e.desc, desc) {
-                c.stats.depth_stencil_hits += 1;
                 return Some(e.state.clone());
             }
         }
-        c.stats.depth_stencil_misses += 1;
         None
     })
 }
@@ -513,7 +495,6 @@ pub fn depth_stencil_insert(
     with_caches(|c| {
         for e in c.depth_stencil.iter().flatten() {
             if e.key_hash == key && depth_stencil_eq(&e.desc, &desc) {
-                c.stats.depth_stencil_hits += 1;
                 return e.state.clone();
             }
         }
@@ -548,11 +529,9 @@ pub fn reflect_lookup(
     with_caches(|c| {
         for e in c.reflect.iter().flatten() {
             if e.mtlb_hash == mtlb_hash && e.mtlb_len == mtlb_len {
-                c.stats.compute_reflect_hits += 1;
                 return Some(e.usages.clone());
             }
         }
-        c.stats.compute_reflect_misses += 1;
         None
     })
 }

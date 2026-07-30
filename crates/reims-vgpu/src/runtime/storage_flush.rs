@@ -34,24 +34,54 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
     lo: u64,
     hi: u64,
 ) -> bool {
-    if state.compute_deferred_flush.is_empty() && state.render_deferred_flush.is_empty() {
+    if state.compute_deferred_flush.is_empty() {
+        return true;
+    }
+    // A condemned backing is an UNDECIDED window, not a dead one.
+    // `condemn_surface_backing` deliberately keeps content state — including
+    // these deferred windows — because `DeleteIOSurfaceBacking2` may name a
+    // prior incarnation of a recycled id whose slot already carries a live
+    // surface with an unflushed paint; `mapper::resolve` settles which by
+    // comparing the stashed page fingerprint, and reprieves or drops.
+    //
+    // Taking the windows here defeats exactly that. The page list is stashed in
+    // `condemned_entries`, so the flush cannot write (and must not — the pages
+    // may be recycled, the boot-16 PTE-corruption class), and the window is
+    // consumed on the way to failing: `flush_intersecting` removes it before
+    // `flush_one` runs. The fingerprint decision then has nothing left to
+    // reprieve, and the loss is reported as `revalidate_condemned` as though the
+    // flush were at fault. Leave the obligation armed for the resolve instead.
+    // A second delete with no resolve between still tears down for real
+    // (`drop_windows`), and the window cap still bounds the population.
+    if state.mapping_backing_condemned(mapping_id) {
+        // Latched per mapping. Holding is the *expected* outcome for as long as
+        // the condemnation is undecided, and a reader hits this choke point on
+        // every access: one boot emitted this 15224 times, 13015 of them for a
+        // single mapping that stayed condemned for 121 s, which is 7:1 against
+        // every other line in the log put together. That drowns the channel this
+        // device is diagnosed through, and the rate was never the signal — which
+        // mapping is holding is. A real loss is still reported, by
+        // `deferred_flush_lost` if the resolve reprieves and the write then
+        // fails, or by `deferred_flush_dropped` if it tears down.
+        if crate::observe::first_sight("deferred_flush_held", u64::from(mapping_id)) {
+            crate::observe::off(format!(
+                "deferred_flush_held mapping={mapping_id} reason=backing_condemned lo={lo} hi={hi} (latched)"
+            ));
+        }
         return true;
     }
     // Fixpoint: a taken window may extend past [lo, hi) and drag further
-    // deferred siblings (compute or render) into the flush set.
+    // deferred compute siblings into the flush set.
     let mut pending = state.take_deferred_flush_windows(mapping_id, lo, hi);
-    let mut render_pending = state.take_render_deferred_windows(mapping_id, lo, hi);
     let (mut span_lo, mut span_hi) = (lo, hi);
     loop {
         let new_lo = pending
             .iter()
             .map(|(key, _)| key.surface_offset)
-            .chain(render_pending.iter().map(|(key, _)| key.surface_offset))
             .fold(span_lo, u64::min);
         let new_hi = pending
             .iter()
             .map(|(key, _)| key.span_end)
-            .chain(render_pending.iter().map(|(key, _)| key.span_end))
             .fold(span_hi, u64::max);
         if new_lo == span_lo && new_hi == span_hi {
             break;
@@ -59,14 +89,10 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
         span_lo = new_lo;
         span_hi = new_hi;
         pending.extend(state.take_deferred_flush_windows(mapping_id, span_lo, span_hi));
-        render_pending.extend(state.take_render_deferred_windows(mapping_id, span_lo, span_hi));
     }
     let mut ok = true;
-    for (key, generation) in pending {
-        ok &= flush_one(state, host, &key, generation);
-    }
-    for (key, entry) in render_pending {
-        ok &= render_flush_one(state, host, &key, &entry);
+    for (key, owner) in pending {
+        ok &= flush_one(state, host, &key, owner);
     }
     ok
 }
@@ -80,16 +106,17 @@ pub fn flush_intersecting<M: HostMemory + HostOps>(
 /// pre-Store bytes (boot-18 `m2v_empty_layer reason=linear_sample` poisoning).
 /// Resolve the span's pages, match them against each deferred window's mapping
 /// pages, and flush the mappings that hit before the caller reads.
-/// Spans up to this many pages probe every page; larger spans probe sparsely.
-const GVA_ALIAS_FULL_PROBE_PAGES: u64 = 64;
-/// Probe stride (pages) for large spans. Real aliases are same-surface (the
-/// sampled texture IS the deferred surface), so the first page hits; the
-/// stride bounds the miss window for partial overlaps to `stride` pages.
-const GVA_ALIAS_PROBE_STRIDE_PAGES: u64 = 16;
 /// Bound for the per-bind no-intersection memo (`DeviceState::flush_nohit_memo`).
-/// The memo clears on every deferred-signature change, so it only holds the
-/// distinct `(task,gva,span)` binds seen at one signature — dozens in practice.
-/// The cap is a runaway guard: overflow just re-walks (correct, slower).
+///
+/// An entry is *revalidated* on a deferred-signature change, not dropped: the
+/// cached pages are re-checked against the new windows and re-stamped with the
+/// new signature when they still miss. So an entry can outlive arbitrarily many
+/// signature changes, and the live set is every distinct `(task, gva, span)`
+/// bind that has ever missed, not the ones seen at one signature. The cap is a
+/// runaway guard on that set: overflow just re-walks (correct, slower).
+///
+/// The walk this memo skips visits every page of the span — a stride argument
+/// with a sparse mode for large spans used to sit here and is gone.
 const FLUSH_NOHIT_MEMO_CAP: usize = 4096;
 
 pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
@@ -107,16 +134,9 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         return;
     }
     // Fast exact-window path: a sample of the deferred GVA surface itself
-    // names the same base GVA — no page walk needed to detect it. The flush
-    // itself is a synchronous engine read_target (GPU readback) — time it so a
-    // rare-but-expensive stall cannot hide inside the caller's zc_flush_ns.
+    // names the same base GVA — no page walk needed to detect it.
     if state.gva_deferred_flush.contains_key(&gva) {
-        let t_exact = std::time::Instant::now();
         flush_gva_exact(state, host, gva, true, "gva_alias");
-        state.tranche.zc_flush_exact_ns = state
-            .tranche
-            .zc_flush_exact_ns
-            .saturating_add(t_exact.elapsed().as_nanos() as u64);
     }
     if state.deferred_alias_pages.is_empty()
         && state.linear_deferred_flush.is_empty()
@@ -125,20 +145,21 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         return;
     }
     // No-intersection memo. The per-page task-PT walk below only finds work when
-    // a bound buffer span aliases a live deferred window — measured
-    // `zc_flush_hits == 0` over ~59k draws of pure compositing, i.e. it is
-    // detection overhead. Cache each full-walked bind's resolved gpa pages; skip
+    // a bound buffer span aliases a live deferred window, which is rare but NOT
+    // dead: across five x86/Vulkan repro boots it hit once in 408k calls and
+    // 89k walks (boot 89; boots 86, 87, 88 and 90 hit zero), and the fail sink
+    // holds 11 `gva_alias_hit_page` lines lifetime. An earlier reading of
+    // `zc_flush_hits == 0` over ~59k draws is restated here as "hits about once
+    // per boot" rather than "detection overhead" — the walk cannot be removed,
+    // only made cheap. Cache each full-walked bind's resolved gpa pages; skip
     // the walk while the deferred signature is unchanged, and on a signature
     // change re-check the cached pages against the current windows WITHOUT a PT
     // walk (the per-page FFI translate is the expensive part). A 1-in-64 sampled
     // full walk (`flush_verify_ctr`) self-heals a missed task-PT remap
-    // (`zc_flush_stale`, must stay 0).
-    let t_sig = std::time::Instant::now();
+    // (`zc_flush_stale`, must stay 0) — the memo's pages are only as good as the
+    // guest telling us it remapped, which is the one invariant here that no local
+    // audit can close.
     let sig = state.deferred_flush_signature();
-    state.tranche.zc_flush_sig_ns = state
-        .tranche
-        .zc_flush_sig_ns
-        .saturating_add(t_sig.elapsed().as_nanos() as u64);
     let memo_key = (task_id, gva, span);
     let mut sampled_verify = false;
     // On the sampled-verify path, what the cheap page recheck concluded — the
@@ -150,16 +171,6 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         sampled_verify = state.flush_verify_ctr.is_multiple_of(64);
         if sampled_verify {
             let pages = pages.clone();
-            // Self-heal the incremental deferred-page-refs index against truth on
-            // the same 1-in-64 cadence: a missed arm/disarm site would otherwise
-            // let the fast reject skip a live window. Rebuild + fail-log on drift
-            // so a coverage hole is visible and corrected, never silent.
-            if state.verify_and_heal_deferred_refs() {
-                crate::observe::fail(format!(
-                    "deferred_ref_drift task={task_id} gva={gva:#x} span={span} healed_pages={}",
-                    state.deferred_page_refs.len()
-                ));
-            }
             verify_cheap_hit = state.deferred_pages_intersect(&pages);
             // fall through to the full PT walk (ground truth / self-heal)
         } else if vsig == sig {
@@ -170,13 +181,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             // Signature changed: re-check the cached pages against the current
             // windows without a PT walk.
             let pages = pages.clone();
-            state.tranche.zc_flush_recheck = state.tranche.zc_flush_recheck.saturating_add(1);
-            let t_isect = std::time::Instant::now();
             let isect = state.deferred_pages_intersect(&pages);
-            state.tranche.zc_flush_isect_ns = state
-                .tranche
-                .zc_flush_isect_ns
-                .saturating_add(t_isect.elapsed().as_nanos() as u64);
             if !isect {
                 state.flush_nohit_memo.insert(memo_key, (sig, pages));
                 state.tranche.zc_flush_skip = state.tranche.zc_flush_skip.saturating_add(1);
@@ -189,21 +194,16 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
     }
     let page = state.page_size();
     let n_pages = ((gva % page) + span).div_ceil(page);
-    let full_walked = n_pages <= GVA_ALIAS_FULL_PROBE_PAGES;
-    let stride = if full_walked {
-        1
-    } else {
-        GVA_ALIAS_PROBE_STRIDE_PAGES
-    };
     let mut hits: Vec<u32> = Vec::new();
     let mut linear_hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = Vec::new();
     let mut gva_hits: Vec<u64> = Vec::new();
-    // Resolved gpa pages visited by the walk. Complete only on a no-hit full
-    // walk (the visitor early-exits once every window is hit), which is exactly
-    // when it is cached.
+    // Resolved gpa pages visited by the walk. Complete only on a no-hit walk
+    // (the visitor early-exits once every window is hit), which is exactly when
+    // it is cached.
     let mut visited_pages: Vec<u64> = Vec::new();
-    state.tranche.zc_flush_walk = state.tranche.zc_flush_walk.saturating_add(1);
-    let t_walk = std::time::Instant::now();
+    // Which page produced the first hit. The walk is complete, so this is the
+    // true first overlapping page rather than the next sample point after it.
+    let mut first_hit_ordinal: Option<u64> = None;
     {
         let index = &state.deferred_alias_pages;
         let linear_index = &state.linear_deferred_flush;
@@ -216,7 +216,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
             gva,
             span,
             state.page_shift,
-            stride,
+            1,
             &mut |gpa_page| {
                 visited_pages.push(gpa_page);
                 for (&mid, pages) in index.iter() {
@@ -234,24 +234,27 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
                         gva_hits.push(window_gva);
                     }
                 }
+                if first_hit_ordinal.is_none()
+                    && hits.len() + linear_hits.len() + gva_hits.len() > 0
+                {
+                    // `visited_pages` was pushed at the top of this call, so the
+                    // ordinal of the page that just hit is len-1.
+                    first_hit_ordinal = Some(visited_pages.len().saturating_sub(1) as u64);
+                }
                 hits.len() + linear_hits.len() + gva_hits.len() < total
             },
         );
     }
-    state.tranche.zc_flush_walk_ns = state
-        .tranche
-        .zc_flush_walk_ns
-        .saturating_add(t_walk.elapsed().as_nanos() as u64);
     let hit_ct = (hits.len() + linear_hits.len() + gva_hits.len()) as u64;
     if hit_ct == 0 {
-        // Non-intersecting. Cache the resolved pages (full walks only — a strided
-        // page set is incomplete and unsafe to re-check later).
-        if full_walked && state.flush_nohit_memo.len() < FLUSH_NOHIT_MEMO_CAP {
+        // Non-intersecting. Cache the resolved pages for the cheap re-check on a
+        // later signature change. The walk visits every page, so the set is
+        // complete and safe to re-check; that completeness is the whole reason
+        // the memo is sound.
+        if state.flush_nohit_memo.len() < FLUSH_NOHIT_MEMO_CAP {
             state
                 .flush_nohit_memo
                 .insert(memo_key, (sig, visited_pages));
-        } else if !full_walked {
-            state.flush_nohit_memo.remove(&memo_key);
         }
         if sampled_verify {
             state.tranche.zc_flush_skip = state.tranche.zc_flush_skip.saturating_add(1);
@@ -271,6 +274,14 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         }
         state.flush_nohit_memo.remove(&memo_key);
     }
+    // Always-on: a hit-producing walk is rare (six in a whole repro boot; the
+    // measurement this path's memo was built on saw zero over ~59k compositing
+    // draws), so there is no flood risk and nothing to sample.
+    crate::observe::fail(format!(
+        "gva_alias_hit_page task={task_id} gva={gva:#x} span={span} first_hit_page={} \
+         n_pages={n_pages} hits={hit_ct}",
+        first_hit_ordinal.map_or(-1i64, |o| o as i64)
+    ));
     state.tranche.zc_flush_hits = state.tranche.zc_flush_hits.saturating_add(hit_ct);
     for mid in hits {
         crate::observe::off(format!(
@@ -300,10 +311,10 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
 /// the one host-visible choke point for guest CPU reads, which no device-side
 /// flush hook can see (boot-24/25 black-wallpaper class: the fade snapshot is
 /// guest-CPU-composited from device-rendered windows whose writebacks were
-/// deferred). Render + compute windows on the mapping flush via
-/// [`flush_intersecting`]; linear task-GVA windows never name a mapping, so
-/// they flush when their defer-time page index aliases the mapping's physical
-/// pages. Returns `(all_ok, windows_flushed)`.
+/// deferred). Mapping-keyed compute windows flush via [`flush_intersecting`];
+/// linear task-GVA windows never name a mapping, so they flush when their
+/// defer-time page index aliases the mapping's physical pages. Returns
+/// `(all_ok, windows_flushed)`.
 pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -313,12 +324,7 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
         .compute_deferred_flush
         .keys()
         .filter(|k| k.mapping_id == mapping_id)
-        .count()
-        + state
-            .render_deferred_flush
-            .keys()
-            .filter(|k| k.mapping_id == mapping_id)
-            .count();
+        .count();
     let mut ok = true;
     let mut flushed = keyed as u32;
     if keyed > 0 {
@@ -381,6 +387,118 @@ pub fn flush_gva_exact<M: HostMemory + HostOps>(
     flush_gva_one(state, host, gva, &entry, guest_write, trigger)
 }
 
+/// Does this window's GVA still resolve to the pages it was armed with?
+///
+/// `entry.pages` is the whole point of the page-alias trigger: a new guest write
+/// is matched against it to decide the window must land first, so that two
+/// writers to the same guest memory are ordered. It was recorded when the window
+/// was armed, and nothing re-checks it. If the guest has since re-pointed
+/// `[gva, gva+span)` at different pages, then the alias matched pages this window
+/// no longer owns *and* the write that follows lands in whatever owns `gva` now —
+/// the stale-view class, with our own bookkeeping as the stale part.
+///
+/// §8.53/§8.54 measured only the case where the guest zeroed the PTEs, which is
+/// caught by [`crate::runtime::host::MemError::is_guest_teardown`]. Whether a
+/// window's pages can move while still resolving was the open question this used
+/// to only report on, on the grounds that a guard for an unmeasured hazard is a
+/// guess.
+///
+/// **It is measured now, and it happens.** One x86/Vulkan boot driving Finder,
+/// Calendar and Safari produced fourteen of these, and in most of them *every*
+/// armed page had moved — `armed_pages=73 live_pages=73 moved=73` for a 196x381
+/// window, and the same total displacement at 5, 4 and 22 pages under the
+/// `clear_store`, `rearm` and `gva_alias` triggers. So the guard has its
+/// measurement and this decides.
+///
+/// It returns `true` when the window may still be written to guest RAM. Drift
+/// means our own bookkeeping is the stale part: the window was armed against one
+/// set of guest pages, the guest has since re-pointed `[gva, gva+span)`
+/// somewhere else, and [`crate::runtime::metal_draw::write_gva_rgba8`] walks
+/// fresh — so the write lands in whatever owns those pages *now*. On this rail
+/// that has been observed as guest heap corruption: WindowServer aborting inside
+/// `small_free_list_remove_ptr_no_clear`, and the guest kernel panicking with
+/// `element modified after free` on a freed allocation overwritten with white
+/// RGBA8 pixels.
+///
+/// Refusing costs stale bytes at a guest address the guest has already
+/// repurposed; permitting costs somebody else's heap. The caller keeps the
+/// content either way — `host_cache_store_gva_layer` runs unconditionally — so
+/// nothing renderable is lost by refusing.
+#[cfg(feature = "backend-vulkan")]
+fn window_pages_still_ours<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+    trigger: &str,
+) -> bool {
+    deferred_pages_still_ours(
+        state,
+        host,
+        entry.task_id,
+        gva,
+        entry.span(),
+        &entry.pages,
+        &format!("{}x{} trigger={trigger}", entry.width, entry.height),
+    )
+}
+
+/// The drift decision itself, over any deferred window's armed page set.
+///
+/// Both deferred rails arm against a page set resolved at defer time and then
+/// write guest RAM through a *fresh* walk at flush time, so both have the same
+/// hazard and the same answer. Keeping one implementation is what stops the
+/// second rail from drifting away from the first: the linear rail carried this
+/// hazard with no check at all while the GVA rail had one, purely because the
+/// check lived inside the GVA-shaped function.
+///
+/// Returns `true` when the window may still be written to guest RAM.
+#[cfg(feature = "backend-vulkan")]
+fn deferred_pages_still_ours<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    armed: &std::collections::HashSet<u64>,
+    what: &str,
+) -> bool {
+    if span == 0 || armed.is_empty() {
+        return true;
+    }
+    let mut live = std::collections::HashSet::new();
+    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            live.insert(gpa_page);
+            true
+        },
+    );
+    // An empty or short walk is the teardown case the writers name precisely;
+    // deciding it here too would take it away from the reason that fits it, and
+    // those paths already land cache-only.
+    if live.len() < armed.len() {
+        return true;
+    }
+    if live == *armed {
+        return true;
+    }
+    crate::observe::fail(format!(
+        "deferred_window_page_drift gva={gva:#x} task={task_id} {what} \
+         armed_pages={} live_pages={} moved={} guest=refused",
+        armed.len(),
+        live.len(),
+        armed.difference(&live).count()
+    ));
+    false
+}
+
 /// Land a taken deferred GVA render-Store window: engine resident target →
 /// guest pages (when `guest_write` and the span is still map-covered) +
 /// `host_gva_surfaces`/texture encode caches (always). Unpins the resident
@@ -403,8 +521,12 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         height: entry.height,
         generation: 0,
     };
+    // `into_rgba8` rather than the raw bytes: a GVA resident is RGBA today, so
+    // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
+    // semantic RGBA and the readback states its own order. Asserting the order
+    // here instead would be the caller writing a fact it did not read.
     let rgba = match crate::backend::vulkan::engine::read_target(&identity) {
-        Ok(px) => px,
+        Ok(rb) => rb.into_rgba8(),
         Err(e) => {
             crate::backend::vulkan::engine::unpin_resident_target(&identity);
             crate::observe::fail(format!(
@@ -416,8 +538,30 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     };
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
-    if guest_write && state.gva_write_allowed(entry.task_id, gva, entry.span()) {
-        guest = if crate::runtime::metal_draw::write_gva_rgba8(
+    if guest_write {
+        // Reported, not skipped. This used to be `skip_uncovered`, which dropped
+        // the whole deferred window — a full compositing layer — whenever the
+        // guest had not yet notified the allocation, and it fired on live boots
+        // for 240x135 and 320x512 surfaces. `MapMemory2` arrives after the guest
+        // has installed the PTEs and used the memory; see `WriteGate`.
+        crate::runtime::gva_mem::report_undeclared_write(
+            state,
+            host,
+            entry.task_id,
+            gva,
+            entry.span(),
+            "gva_deferred_flush",
+        );
+    }
+    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
+        // The window's pages moved under us. Cache-only: see
+        // `window_pages_still_ours` for why writing here lands in another
+        // owner's memory. This is the check that actually protects the write —
+        // it walks every page of the window against the pages it was armed on,
+        // which no scan of a notification log can substitute for.
+        guest = "skip_drift";
+    } else if guest_write {
+        guest = match crate::runtime::metal_draw::write_gva_rgba8(
             state,
             host,
             entry.task_id,
@@ -428,22 +572,33 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             entry.format,
             &rgba,
         ) {
-            "written"
-        } else {
-            // write_gva_rgba8 fail-logs uncontiguous rows; the caches below
-            // keep the authoritative bytes either way.
-            crate::observe::fail(format!(
-                "deferred_flush_lost kind=gva reason=guest_write gva={gva:#x} {}x{} bpr={} fmt={:#x} trigger={trigger}",
-                entry.width, entry.height, entry.row_stride, entry.format
-            ));
-            "write_fail"
+            Ok(()) => "written",
+            // The guest already tore this window down and its Unmap notify has
+            // not drained yet. That is the same state the Unmap/Map notify path
+            // lands cache-only for — "on Unmap the PTEs are already gone" — just
+            // reached through a different door, because a page-alias flush races
+            // ahead of the notify. The caches below hold the content, so the
+            // obligation is discharged and nothing is lost. Expected control
+            // flow: it does not belong in the failure log.
+            Err(err) if err.is_guest_teardown() => "unmapped",
+            // A write that refused while the target still existed. The caches
+            // below keep the authoritative bytes, so guest RAM is stale rather
+            // than wrong — but this one is a real loss of guest work.
+            Err(err) => {
+                crate::observe::Emit::decline("deferred_flush_lost", &err)
+                    .field("kind", "gva")
+                    .field("gva", format!("{gva:#x}"))
+                    .field("dims", format!("{}x{}", entry.width, entry.height))
+                    .field("bpr", entry.row_stride)
+                    .field("fmt", format!("{:#x}", entry.format))
+                    .field("trigger", trigger)
+                    .fail();
+                "write_fail"
+            }
         };
-    } else if guest_write {
-        guest = "skip_uncovered";
     }
     crate::runtime::metal_draw::host_cache_store_gva_layer(
         state,
-        entry.task_id,
         entry.texture_ref,
         entry.producer_object_type,
         gva,
@@ -451,7 +606,12 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
         entry.height,
         &rgba,
     );
-    crate::observe::off(format!(
+    // A flush that landed is expected control flow and stays quiet. The two
+    // outcomes that are not — a refused write, and a window whose span the guest
+    // had already torn down — each emit their own typed line above, so the
+    // always-on view keeps the losses and drops the running commentary.
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::observe::line(format!(
         "gva_deferred_flush gva={gva:#x} {}x{} fmt={:#x} guest={guest} trigger={trigger} bytes={} us={}",
         entry.width,
         entry.height,
@@ -506,7 +666,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
     generation: u32,
 ) -> bool {
-    state.disarm_linear_deferred_window(key);
+    let armed_pages = state.disarm_linear_deferred_window(key);
     let task_id = key.map_generation;
     let texture_ref = key.texture_ref;
     let started = std::time::Instant::now();
@@ -538,9 +698,52 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
         &bytes,
     );
     let tight = (key.width as usize).saturating_mul(texel as usize);
-    let mut guest = "skip_uncovered";
-    if state.gva_write_allowed(task_id, key.surface_offset, key.span_end) {
-        guest = if crate::runtime::compute_exec::write_linear_guest(
+
+    // Same hazard, same answer as the GVA rail: this window was armed against a
+    // page set at defer time and `write_linear_guest` walks fresh, so a span the
+    // guest has since re-pointed sends a compute-storage image into whatever
+    // owns those pages now. Observed on this rail as guest heap corruption — a
+    // `pmap_page_protect` kernel panic and userspace SIGSEGVs inside libmalloc's
+    // own page bookkeeping. The cache entry keeps the authoritative bytes
+    // (`materialize_linear_resident` ran above), so refusing loses nothing
+    // renderable.
+    let still_ours = match &armed_pages {
+        // `span_end` is a length (`row_stride * height`) for a linear key, not
+        // an end address — and the arm site walks `(surface_offset, span_end)`
+        // with exactly these two values, so this walk has to as well or the two
+        // page sets describe different ranges and every flush reads as drift.
+        Some(pages) => deferred_pages_still_ours(
+            state,
+            host,
+            task_id,
+            key.surface_offset,
+            key.span_end,
+            pages,
+            &format!(
+                "{}x{} trigger=linear_flush ref={texture_ref}",
+                key.width, key.height
+            ),
+        ),
+        None => true,
+    };
+    // Both arms assign, so this is the whole set of outcomes this rail can
+    // report — `skip_uncovered` was the third and is gone.
+    let guest = if !still_ours {
+        "skip_drift"
+    } else {
+        // `skip_uncovered` used to live on this branch and discarded the whole
+        // linear writeback — up to 1.3 MiB of texture — when the guest had not
+        // yet notified the allocation. Reported and written now; see
+        // `report_undeclared_write`.
+        crate::runtime::gva_mem::report_undeclared_write(
+            state,
+            host,
+            task_id,
+            key.surface_offset,
+            key.span_end,
+            "linear_deferred_flush",
+        );
+        match crate::runtime::compute_exec::write_linear_guest(
             state,
             host,
             task_id,
@@ -551,13 +754,17 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             &bytes,
             &format!("flush ref={texture_ref}"),
         ) {
-            "written"
-        } else {
-            // The per-row failure is already fail-logged; the cache entry
-            // keeps the coherent authoritative bytes.
-            "write_fail"
-        };
-    }
+            crate::runtime::compute_exec::LinearWrite::Written => "written",
+            // Nothing resolves at this GVA, so there is no guest memory to land
+            // in. Distinct from `write_fail`, which means a write was attempted:
+            // one is the guest having taken the pages away, the other is ours.
+            crate::runtime::compute_exec::LinearWrite::Unmapped => "skip_unmapped",
+            // The per-row failure is already fail-logged; the cache entry keeps
+            // the coherent authoritative bytes.
+            crate::runtime::compute_exec::LinearWrite::Failed => "write_fail",
+        }
+    };
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::off(format!(
         "linear_deferred_flush task={task_id} ref={texture_ref} {}x{} fmt={:#x} gen={generation} guest={guest} bytes={} us={}",
         key.width,
@@ -596,7 +803,7 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     for key in &retired {
         // Task teardown = the GPU VA maps are gone; never write guest pages
         // from here (boot-16 rule) — drop any pending guest-flush obligation.
-        if state.disarm_linear_deferred_window(key) {
+        if state.disarm_linear_deferred_window(key).is_some() {
             crate::observe::off(format!(
                 "linear_deferred_dropped reason=retired task={} ref={}",
                 key.map_generation, key.texture_ref
@@ -618,14 +825,258 @@ pub fn retire_linear_residents(state: &mut DeviceState) {
     }
 }
 
-#[cfg(feature = "backend-vulkan")]
+/// Land one taken mapping-keyed window, dispatching on which rail holds its
+/// pixels. The key names the guest side identically for both; only the read
+/// differs (see [`crate::model::DeferredOwner`]).
 fn flush_one<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+    owner: crate::model::DeferredOwner,
+) -> bool {
+    match owner {
+        crate::model::DeferredOwner::Storage { generation } => {
+            flush_storage_one(state, host, key, generation)
+        }
+        crate::model::DeferredOwner::Render { source, .. } => {
+            flush_render_one(state, host, key, &source)
+        }
+    }
+}
+
+/// Land a deferred **type-11 render Store**: perform the CPU writeback into the
+/// mapping's guest pages that the Store itself skipped.
+///
+/// The pixels come from `surface_cache`, not from the engine. The Store read
+/// its target back as it always did and refreshed the cache with that frame
+/// before arming; only the guest-page copy was deferred. That is deliberate and
+/// it is what keeps this rail small: the engine resident for a type-11 surface
+/// is not authoritative here, so nothing has to be pinned, no `content_ready`
+/// has to hold across frames, and the Load seed and present capture keep
+/// reading exactly what they read before.
+///
+/// Deferring is a win rather than a rescheduling because nothing on the
+/// host-window present path reads these guest pages — `capture_present_frame`
+/// takes the cache or the resident and states in situ that it "never touches
+/// guest memory" — so the writeback is owed only to a guest-side reader that
+/// may never come.
+/// The engine resident a [`crate::model::RenderWindowSource::Resident`] window
+/// pinned, rebuilt from the key.
+///
+/// Not stored on the window, for the same reason `flush_gva_one` rebuilds its
+/// own: the key already carries every term of the identity, and two spellings of
+/// one value are two things that can disagree. `key.map_generation` is the field
+/// `present_identity::surface_identity` keys on, and the flush refuses on
+/// generation drift before it reads anything, so the rebuild is always for the
+/// generation the arm pinned.
+#[cfg(feature = "backend-vulkan")]
+fn render_window_identity(
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Surface {
+        id: key.mapping_id,
+        width: key.width,
+        height: key.height,
+        generation: key.map_generation as u64,
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn flush_render_one<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+    source: &crate::model::RenderWindowSource,
+) -> bool {
+    let started = std::time::Instant::now();
+    // Counted on the same one-line-per-second census as the Store routes, so a
+    // boot reads `surface_deferred=N surface_flush=M` on one line.
+    //
+    // That ratio is the only thing that separates a deferral from a
+    // rescheduling, and nothing else can report it: a reader draining every
+    // window every frame arms and flushes at identical rates and is
+    // indistinguishable from a working rail by arm count alone. M << N is the
+    // win; M ≈ N means some guest-page reader is asking for these bytes anyway
+    // and the next question is which one.
+    crate::runtime::drain::note_store_route("surface_flush");
+    // Recycled-pages guard, identical in intent to the compute rail's below and
+    // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
+    // arm time (ReplacePhysical, unmap/remap) points at pages this window's
+    // pixels do not belong in, and writing them there lands a framebuffer in
+    // whatever owns that memory now. Drop rather than write.
+    let current = state
+        .mappings
+        .get(&key.mapping_id)
+        .map(|m| m.map_generation);
+    if current != Some(key.map_generation) {
+        // Release the pin first. This arm returns before touching the frame, and
+        // a `Resident` window holds a registry pin that nothing else will drop —
+        // `evict_registry_to_cap` and the idle drain both skip pinned slots by
+        // design, so a pin leaked here strands a whole framebuffer for the guest
+        // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and this
+        // drift is not rare: one in 85 s on a driven boot.
+        release_window_pin_for_key(key, source);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
+    // Where the frame comes from, in guest scanout order either way.
+    //
+    // `Owned` carries its own bytes and cannot miss. It used to read
+    // `surface_cache::get(mapping_id, key.width, key.height)`, and that is one
+    // entry per mapping: a later Store at a different geometry replaced it and
+    // every window still armed at the old geometry lost its pixels —
+    // `deferred_flush_lost reason=cache_miss`, 15 whole layers in one boot, which
+    // is a compositing layer going solid black. The bytes are shared with the
+    // cache entry the same readback stored, so owning them costs an `Arc` clone
+    // and no copy.
+    //
+    // `Resident` names the pinned engine image instead, and pays the readback here
+    // rather than at every Store. It is checked against the epoch it was published
+    // at before being believed: `registry_mark_ready` clears a slot's
+    // `content_epoch` on every draw into it, so a mismatch means something rendered
+    // over this surface after the Store that armed this window, and the resident no
+    // longer holds the frame this window promised the guest. Declining leaves the
+    // guest its pre-Store bytes — stale but coherent — where writing would land a
+    // different layer's pixels in this one's pages.
+    // Set when the frame below came *out of* a resident image, so the write can
+    // hand the currency witness back to it. See the re-stamp after the write.
+    let mut flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
+    let frame: std::borrow::Cow<'_, [u8]> = match source {
+        crate::model::RenderWindowSource::Owned(bytes) => {
+            std::borrow::Cow::Borrowed(bytes.as_slice())
+        }
+        crate::model::RenderWindowSource::Resident { epoch } => {
+            let identity = render_window_identity(key);
+            let live = crate::backend::vulkan::engine::resident_content_epoch(&identity);
+            if live != Some(*epoch) {
+                crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                crate::observe::fail(format!(
+                    "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
+                     reason=resident_epoch_drift want={epoch} live={live:?}",
+                    key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+                ));
+                return false;
+            }
+            match crate::backend::vulkan::engine::read_target(&identity) {
+                Ok(rb) => {
+                    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    flushed_from_resident = Some(identity);
+                    // `into_bgra8`, not the raw bytes: a `Surface` resident is BGRA
+                    // so this is a no-op, and the writer below is declared in
+                    // scanout order. Reading the reported order rather than
+                    // asserting one is what keeps a future format change from
+                    // landing R and B exchanged in guest memory.
+                    std::borrow::Cow::Owned(rb.into_bgra8())
+                }
+                Err(e) => {
+                    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                    crate::observe::fail(format!(
+                        "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
+                         reason=resident_read err={e}",
+                        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+                    ));
+                    return false;
+                }
+            }
+        }
+    };
+    let bgra: &[u8] = frame.as_ref();
+    let ok = crate::runtime::mapping_write::write_bgra8(
+        state,
+        host,
+        key.mapping_id,
+        bgra,
+        key.width.saturating_mul(4),
+        key.width,
+        key.height,
+    );
+    if !ok {
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=write_refused",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+    }
+    // Hand the currency witness back to the image the frame came out of.
+    //
+    // `write_bgra8` ends in `mark_mapping_written`, which advances
+    // `surface_content_epoch` — correctly, since the mapping's guest pages did
+    // change. But the *pixels* did not: they are the resident's, copied out of it
+    // one statement ago. Leaving the stamp behind therefore invalidates a resident
+    // that holds exactly the mapping's content, and on the composite rail that is
+    // not a residual — it is a loop. The stale stamp costs the next LOAD its
+    // elision, the CPU seed it falls back to finds the host cache ceded to this
+    // rail, so it reads the mapping's guest pages, and reading them flushes the
+    // window this Store just armed, which advances the epoch again. One boot
+    // measured it at `surface_flush / surface_resident` = 1369/1373 — one flush per
+    // arm, a rail that had become a rescheduling with a GPU round trip added.
+    //
+    // Only on the resident path: an `Owned` window's bytes came from an `Arc`, and
+    // nothing here establishes that the slot under this identity still holds them.
+    // The stamp is refused for a slot that is absent or not content_ready, and a
+    // failed write leaves `flushed_from_resident` unused, so both fall back to a
+    // seed rather than to a wrong frame.
+    if ok {
+        if let Some(identity) = flushed_from_resident {
+            if let Some(epoch) = state
+                .mappings
+                .get(&key.mapping_id)
+                .map(|m| m.surface_content_epoch)
+            {
+                crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
+            }
+        }
+    }
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::observe::line(format!(
+        "render_deferred_flush mapping={} {}x{} fmt={:#x} ok={} bytes={} us={}",
+        key.mapping_id,
+        key.width,
+        key.height,
+        key.pixel_format,
+        ok as u8,
+        bgra.len(),
+        started.elapsed().as_micros()
+    ));
+    ok
+}
+
+#[cfg(not(feature = "backend-vulkan"))]
+fn flush_render_one<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    _host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
+    _bgra: &[u8],
+) -> bool {
+    // No engine ⇒ nothing can have deferred; drop the obligation fail-visibly.
+    let _ = state;
+    crate::observe::fail(format!(
+        "deferred_flush_lost kind=render mapping={} reason=no_backend",
+        key.mapping_id
+    ));
+    false
+}
+
+#[cfg(feature = "backend-vulkan")]
+fn flush_storage_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
     generation: u32,
 ) -> bool {
     let started = std::time::Instant::now();
+    // Two unrelated `u32` generations are in scope here and they must not be
+    // confused in the log: `key.map_generation` is the mapping's lifetime, the
+    // quantity this guard compares, and `generation` is the pinned resident's
+    // *content* generation, which only `read_resident_storage` uses. The fail
+    // line below printed `content_gen` in a field named `gen` next to
+    // `reason=map_generation_drift`, so a live boot read out as a mapping
+    // lifetime that had gone backwards (3 -> 2) when the two numbers were
+    // simply not comparable. `gen=` is the compared value; the other one says
+    // so in its name.
+    //
     // Same recycled-pages guard as the render flush: a surface window whose
     // defer-time map_generation no longer matches must not write through the
     // rewired pages.
@@ -636,8 +1087,8 @@ fn flush_one<M: HostMemory + HostOps>(
     if current != Some(key.map_generation) {
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::observe::fail(format!(
-            "deferred_flush_lost mapping={} {}x{} fmt={:#x} gen={generation} reason=map_generation_drift current={current:?}",
-            key.mapping_id, key.width, key.height, key.pixel_format
+            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
     }
@@ -649,10 +1100,12 @@ fn flush_one<M: HostMemory + HostOps>(
                 // same-identity key change). The window keeps its coherent
                 // pre-dispatch bytes; name the loss.
                 crate::observe::Emit::decline("deferred_flush_lost", &e)
+                    .field("kind", "compute")
                     .field("mapping", key.mapping_id)
                     .field("geom", format!("{}x{}", key.width, key.height))
                     .field("fmt", format!("{:#x}", key.pixel_format))
-                    .field("gen", generation)
+                    .field("gen", key.map_generation)
+                    .field("content_gen", generation)
                     .fail();
                 return false;
             }
@@ -660,12 +1113,22 @@ fn flush_one<M: HostMemory + HostOps>(
     let expected_bpp = crate::contract::pixel_format::bytes_per_pixel(key.pixel_format);
     if expected_bpp != Some(texel) {
         crate::observe::fail(format!(
-            "deferred_flush_lost mapping={} reason=texel_mismatch engine={texel} guest={expected_bpp:?} fmt={:#x}",
+            "deferred_flush_lost kind=compute mapping={} reason=texel_mismatch engine={texel} guest={expected_bpp:?} fmt={:#x}",
             key.mapping_id, key.pixel_format
         ));
         return false;
     }
     let tight = key.width.saturating_mul(texel);
+    if crate::observe::content_probe_enabled() {
+        crate::observe::off(format!(
+            "compute_content stage=flush_out mapping={} {}x{} fmt={:#x} gen={generation} {}",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            crate::observe::content_summary(&bytes, texel, key.width, key.height),
+        ));
+    }
     if !crate::runtime::mapping_write::write_full_rect_raw_at(
         state,
         host,
@@ -680,7 +1143,7 @@ fn flush_one<M: HostMemory + HostOps>(
         tight,
     ) {
         crate::observe::fail(format!(
-            "deferred_flush_lost mapping={} reason=guest_write {}x{} off={} bpr={} span_end={}",
+            "deferred_flush_lost kind=compute mapping={} reason=guest_write {}x{} off={} bpr={} span_end={}",
             key.mapping_id,
             key.width,
             key.height,
@@ -694,6 +1157,7 @@ fn flush_one<M: HostMemory + HostOps>(
     // re-establish the mirror entry the write's own invalidation dropped so
     // chained seed skips stay live.
     state.compute_storage_residency.insert(*key, generation);
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
     crate::observe::off(format!(
         "compute_deferred_flush mapping={} {}x{} fmt={:#x} gen={generation} bytes={} us={}",
         key.mapping_id,
@@ -707,7 +1171,7 @@ fn flush_one<M: HostMemory + HostOps>(
 }
 
 #[cfg(not(feature = "backend-vulkan"))]
-fn flush_one<M: HostMemory + HostOps>(
+fn flush_storage_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     _host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
@@ -715,110 +1179,8 @@ fn flush_one<M: HostMemory + HostOps>(
 ) -> bool {
     let _ = state;
     crate::observe::fail(format!(
-        "deferred_flush_lost mapping={} reason=no_backend gen={generation}",
+        "deferred_flush_lost kind=compute mapping={} content_gen={generation} reason=no_backend",
         key.mapping_id
-    ));
-    false
-}
-
-/// Flush one deferred render-Store window by replaying the import-present
-/// Store it stood in for. The engine resident target (pinned at defer time)
-/// DMAs straight into guest pages; every failure is the exact fail line the
-/// synchronous Store would have emitted, plus a named `deferred_flush_lost`.
-#[cfg(feature = "backend-vulkan")]
-pub(crate) fn render_flush_one<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    key: &crate::model::RenderDeferredKey,
-    entry: &crate::model::RenderDeferredEntry,
-) -> bool {
-    let started = std::time::Instant::now();
-    let identity = crate::runtime::import_present::render_deferred_identity(key.mapping_id, entry);
-    // Recycled-pages drop guard for EVERY window: the mapping's page table at
-    // defer time must still be current or the flush would DMA old content
-    // into rewired pages (grouped windows carry the group identity with no
-    // member lifetime inside; ungrouped windows can outlive a lifecycle bump
-    // when a fresh MAP re-uses the id before the flush trigger fires).
-    {
-        let current = state
-            .mappings
-            .get(&key.mapping_id)
-            .map(|m| m.map_generation as u64);
-        if current != Some(entry.map_generation) {
-            crate::backend::vulkan::engine::unpin_resident_target(&identity);
-            crate::observe::fail(format!(
-                "deferred_flush_lost kind=render mapping={} {}x{} gen={} reason=map_generation_drift current={:?}",
-                key.mapping_id, entry.width, entry.height, entry.map_generation, current
-            ));
-            return false;
-        }
-    }
-    let result = crate::runtime::import_present::try_import_present_store(
-        state,
-        host,
-        &identity,
-        key.mapping_id,
-        entry.width,
-        entry.height,
-        entry.full_quad_bounds,
-    );
-    crate::backend::vulkan::engine::unpin_resident_target(&identity);
-    if !matches!(
-        result,
-        crate::runtime::import_present::ImportPresentResult::Ok
-    ) {
-        // A failure before the readback consume leaves the armed prefetch
-        // slot live — cancel it so the orphan can never be matched later
-        // (no-op when the seq was consumed or never armed).
-        // The window is gone from the map either way; guest pages keep their
-        // stale-but-coherent pre-Store bytes. Name the loss.
-        crate::observe::fail(format!(
-            "deferred_flush_lost kind=render mapping={} {}x{} gen={} reason={}",
-            key.mapping_id,
-            entry.width,
-            entry.height,
-            entry.map_generation,
-            result.reason()
-        ));
-        return false;
-    }
-    // Measure-only consume census: this deferred window was actually flushed
-    // into guest pages — a consumer (present capture, guest sample, or
-    // SynchronizeResources) read them, so the writeback was needed.
-    crate::runtime::census::writeback_census::note_flushed();
-    let flush_us = started.elapsed().as_micros() as u64;
-    // Per-flush success census with wall-clock `us=` — one line per deferred
-    // render flush (~1.8k/25s under a continuously-animating app) and
-    // SCHED_IDLE-contaminated timing. The failure path above stays fail-visible
-    // (`deferred_flush_lost reason=`); the store bytes are already attributed to
-    // the tranche `store_us`. Gate the success line behind REIMS_VGPU_DRAW_LOG.
-    crate::observe::line(format!(
-        "render_deferred_flush mapping={} {}x{} gen={} off={} span_end={} us={flush_us}",
-        key.mapping_id,
-        entry.width,
-        entry.height,
-        entry.map_generation,
-        key.surface_offset,
-        key.span_end,
-    ));
-    // Per-tranche `store_us` attribution is noted by the inner
-    // `try_import_present_store` above (the zero-copy GPU→guest DMA that is
-    // essentially all of `flush_us`); do NOT note again here or the flush's
-    // store bytes would be double-counted.
-    true
-}
-
-#[cfg(not(feature = "backend-vulkan"))]
-pub(crate) fn render_flush_one<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    _host: &mut M,
-    key: &crate::model::RenderDeferredKey,
-    entry: &crate::model::RenderDeferredEntry,
-) -> bool {
-    let _ = state;
-    crate::observe::fail(format!(
-        "deferred_flush_lost kind=render mapping={} reason=no_backend gen={}",
-        key.mapping_id, entry.map_generation
     ));
     false
 }
@@ -828,26 +1190,135 @@ pub(crate) fn render_flush_one<M: HostMemory + HostOps>(
 /// without host access). Each drop is fail-visible.
 pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
     let dropped = state.take_deferred_flush_windows(mapping_id, 0, u64::MAX);
-    for (key, generation) in dropped {
+    for (key, owner) in dropped {
         crate::observe::fail(format!(
-            "deferred_flush_dropped mapping={} reason={reason} {}x{} fmt={:#x} gen={generation}",
-            key.mapping_id, key.width, key.height, key.pixel_format
+            "deferred_flush_dropped mapping={} reason={reason} {}x{} fmt={:#x} owner={}",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            owner_slug(&owner)
         ));
+        // The two rails pin different registries, so the release has to follow
+        // the owner. Unpinning storage for a render window would leave the
+        // target resident pinned for the life of the boot — the "~260 stale
+        // residents (~516 MiB)" shape — while reporting a clean teardown.
         #[cfg(feature = "backend-vulkan")]
-        crate::backend::vulkan::engine::unpin_resident_storage(&key);
+        release_window_pin(&key, &owner);
     }
-    let render_dropped = state.take_render_deferred_windows(mapping_id, 0, u64::MAX);
-    for (key, entry) in render_dropped {
-        crate::observe::fail(format!(
-            "deferred_flush_dropped kind=render mapping={} reason={reason} {}x{} gen={}",
-            key.mapping_id, entry.width, entry.height, entry.map_generation
-        ));
-        #[cfg(feature = "backend-vulkan")]
-        {
-            crate::backend::vulkan::engine::unpin_resident_target(
-                &crate::runtime::import_present::render_deferred_identity(key.mapping_id, &entry),
-            );
+}
+
+/// Drop — do not land — every render window whose guest byte range this Store
+/// fully covers, releasing what each one held.
+///
+/// Lives here rather than at the arm site because the *release* lives here, and
+/// the arm site got it wrong for exactly that reason: it took each covered window
+/// with a bare `take_deferred_flush_window_exact` and discarded it, so a
+/// `Resident` window's counted registry pin was never dropped. That is one leaked
+/// pin per composite Store on a surface the compositor repaints — and because the
+/// re-Store carries the *same* key, it is the same slot's `pin_count` climbing
+/// without bound. `evict_registry_to_cap` rotates pinned slots instead of
+/// evicting and the idle drain requires `pin_count == 0`, so a slot that gets
+/// there can never be reclaimed again: the "~260 stale residents (~516 MiB)
+/// pinned for the guest lifetime" shape, arrived at one frame at a time.
+///
+/// Dropping rather than flushing is what makes the rail a deferral instead of a
+/// rescheduling — a compositor painting one surface re-Stores the identical range
+/// every frame, so the previous window always intersects, and landing it here
+/// would perform exactly the guest write the rail exists to skip. It is sound for
+/// the reason it is sound on the GVA rail: those bytes were never observable
+/// without a flush, since any reader would have taken the window first, and this
+/// Store's pixels cover every byte of the range.
+///
+/// Returns the identities whose pins were released, so a caller can log them and
+/// a test can read the decision. `None` for an `Owned` window is the answer, not
+/// a missing one: its pixels are an `Arc` and dropping it *is* the release.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn supersede_covered_render_windows(
+    state: &mut DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> Vec<(
+    crate::model::ComputeStorageResidencyKey,
+    Option<crate::backend::vulkan::engine::TargetIdentity>,
+)> {
+    // Matched on the guest byte range, not on geometry: a sibling Store at a
+    // different size over the same span writes the same pages, so its window is
+    // covered even though its key differs. `release_window_pin` therefore has to
+    // rebuild the identity from the *old* key, which is why it takes one.
+    let covered: Vec<crate::model::ComputeStorageResidencyKey> = state
+        .compute_deferred_flush
+        .iter()
+        .filter(|(k, o)| {
+            k.mapping_id == key.mapping_id
+                && k.surface_offset == key.surface_offset
+                && k.span_end == key.span_end
+                && matches!(o, crate::model::DeferredOwner::Render { .. })
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    let mut released = Vec::with_capacity(covered.len());
+    for old in covered {
+        if let Some(owner) = state.take_deferred_flush_window_exact(&old) {
+            released.push((old, release_window_pin(&old, &owner)));
         }
+    }
+    released
+}
+
+/// Release whatever a taken window held, according to its rail.
+///
+/// Every site that takes a window and does not flush it must go through this
+/// rather than calling `unpin_resident_storage` directly. A compute window owns
+/// a storage-registry pin; a render window owns nothing on the GPU — its pixels
+/// are a `surface_cache` entry, which is LRU-managed and shared with the Load
+/// seed, so it must not be evicted here. Unpinning storage for a render window
+/// would name a key the storage registry never held and succeed silently.
+///
+/// Returns the render identity it unpinned, if any. `unpin_resident_target` is a
+/// silent no-op for an absent slot and the engine keeps no log of it, so without
+/// this return value "the pin was released" is a claim no test and no boot can
+/// read — which is how the supersede site went several commits leaking one.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn release_window_pin(
+    key: &crate::model::ComputeStorageResidencyKey,
+    owner: &crate::model::DeferredOwner,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    match owner {
+        crate::model::DeferredOwner::Storage { .. } => {
+            crate::backend::vulkan::engine::unpin_resident_storage(key);
+            None
+        }
+        crate::model::DeferredOwner::Render { source, .. } => {
+            release_window_pin_for_key(key, source)
+        }
+    }
+}
+
+/// Release whatever GPU hold a render window's source carries.
+///
+/// An `Owned` window holds nothing — its pixels are an `Arc` and dropping it is
+/// the release, so `None` here is the answer and not a miss. A `Resident` window
+/// holds a counted registry pin, and **every** exit that abandons the window has
+/// to drop it: `evict_registry_to_cap` and the idle drain both skip pinned slots
+/// by design, so a leaked pin strands a whole framebuffer for the guest lifetime
+/// rather than merely delaying a reclaim.
+#[cfg(feature = "backend-vulkan")]
+fn release_window_pin_for_key(
+    key: &crate::model::ComputeStorageResidencyKey,
+    source: &crate::model::RenderWindowSource,
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    if !matches!(source, crate::model::RenderWindowSource::Resident { .. }) {
+        return None;
+    }
+    let identity = render_window_identity(key);
+    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+    Some(identity)
+}
+
+pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
+    match owner {
+        crate::model::DeferredOwner::Storage { .. } => "compute",
+        crate::model::DeferredOwner::Render { .. } => "render",
     }
 }
 
@@ -869,34 +1340,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn take_render_deferred_windows_is_exact_intersection() {
-        use crate::model::{RenderDeferredEntry, RenderDeferredKey};
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let entry = RenderDeferredEntry {
-            width: 4,
-            height: 4,
-            map_generation: 1,
-            full_quad_bounds: false,
-            grouped: false,
-            armed_seq: 0,
-        };
-        let rkey = |mapping_id: u32, lo: u64, hi: u64| RenderDeferredKey {
-            mapping_id,
-            surface_offset: lo,
-            span_end: hi,
-        };
-        state.render_deferred_flush.insert(rkey(7, 0, 256), entry);
-        state.render_deferred_flush.insert(rkey(7, 256, 512), entry);
-        state.render_deferred_flush.insert(rkey(8, 0, 256), entry);
-
-        assert!(state.take_render_deferred_windows(7, 512, 1024).is_empty());
-        assert_eq!(state.render_deferred_flush.len(), 3);
-
-        let taken = state.take_render_deferred_windows(7, 200, 257);
-        assert_eq!(taken.len(), 2, "both mapping-7 windows intersect [200,257)");
-        assert_eq!(state.render_deferred_flush.len(), 1);
-        assert!(state.render_deferred_flush.contains_key(&rkey(8, 0, 256)));
+    /// A render window carrying its own 4x4 BGRA frame — the geometry [`key`]
+    /// names, since the flush writes `key.width x key.height` from these bytes.
+    fn render_owner(armed_seq: u64) -> crate::model::DeferredOwner {
+        crate::model::DeferredOwner::Render {
+            armed_seq,
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                0u8;
+                4 * 4 * 4
+            ])),
+        }
     }
 
     #[test]
@@ -968,83 +1421,503 @@ mod tests {
         assert!(e.page_entries.is_empty());
     }
 
+    /// The compute flush's drift line must print the generation its guard
+    /// compared, not the other one in scope.
+    ///
+    /// `flush_one` holds two unrelated `u32`s: `key.map_generation` (the
+    /// mapping lifetime it compares) and the pinned resident's *content*
+    /// generation. The line printed the content generation in a field named
+    /// `gen`, adjacent to `reason=map_generation_drift current=…`, and a boot
+    /// was read as showing a mapping lifetime running backwards (`gen=3
+    /// current=Some(2)`) when the two numbers were never comparable.
     #[test]
-    fn render_flush_refuses_map_generation_drift() {
-        use crate::model::{RenderDeferredEntry, RenderDeferredKey};
+    fn the_compute_drift_line_names_the_generation_it_compared() {
         use crate::runtime::host::FakeHost;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        // Mapping exists but was re-wired since defer time (gen 3 vs window's
-        // gen 2): the flush must refuse (never DMA old content into rewired
-        // pages) and consume the window fail-visibly. This guards ALL render
-        // windows, not just grouped ones.
         let m = state.mappings.entry(9).or_default();
         m.mapped = true;
-        m.map_generation = 3;
-        state.render_deferred_flush.insert(
-            RenderDeferredKey {
-                mapping_id: 9,
-                surface_offset: 0,
-                span_end: 4096,
-            },
-            RenderDeferredEntry {
-                width: 32,
-                height: 32,
-                map_generation: 2,
-                full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
+        // Distinct on purpose: the window's map_generation is 1 (from `key`),
+        // the mapping is at 5, and the content generation is 3. Only one pair
+        // of those is what the guard compares.
+        m.map_generation = 5;
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        let cap = crate::observe::FailCapture::start();
+        assert!(!super::flush_intersecting(
+            &mut state,
+            &mut host,
+            9,
+            0,
+            u64::MAX
+        ));
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("reason=map_generation_drift"),
+            "wrong refusal: {line}"
+        );
+        assert!(
+            line.contains(" gen=1 ") && line.contains("current=Some(5)"),
+            "`gen=` must be the compared window generation: {line}"
+        );
+        assert!(
+            line.contains("content_gen=3"),
+            "the resident's content generation must say so in its name: {line}"
+        );
+        assert!(
+            line.contains("kind=compute"),
+            "every deferred_flush_lost names its path: {line}"
+        );
+    }
+
+    /// A type-11 render window is found and landed by the *same* mapping-keyed
+    /// trigger the compute rail uses, and is read as a render window.
+    ///
+    /// This is the property the whole deferred type-11 rail rests on. Its
+    /// pixels live in a target resident that `ComputeStorageResidencyKey`
+    /// cannot name, so the flush has to dispatch on the owner; if it did not,
+    /// `flush_intersecting` would hand a render window to the storage read and
+    /// report a compute loss for a window the compute rail never armed. Driving
+    /// it through `flush_intersecting` — rather than calling the flush directly
+    /// — is deliberate: that call is the choke point every guest-page reader
+    /// goes through, so this also pins the trigger wiring.
+    ///
+    /// The map-generation drift is the cheap way to make the flush take a
+    /// decisive branch with no engine present. It doubles as coverage of the
+    /// recycled-pages guard: a mapping rebound since arm time must never have a
+    /// stale framebuffer written through its new pages.
+    #[test]
+    fn a_render_window_flushes_through_the_shared_trigger_and_names_its_rail() {
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        // The window latched map_generation 1 (from `key`); the mapping has
+        // since moved to 5, so its pages are not the ones the Store rendered
+        // for.
+        m.map_generation = 5;
+        state
+            .compute_deferred_flush
+            .insert(key(9, 0, 256), render_owner(1));
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window that cannot be written must report the loss"
+        );
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("kind=render"),
+            "a render window must not be reported as a compute one: {line}"
+        );
+        assert!(
+            line.contains("reason=map_generation_drift") && line.contains("current=Some(5)"),
+            "the rebound mapping must be the stated refusal: {line}"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the trigger must consume the window it took"
+        );
+    }
+
+    /// A `Resident` window whose resident no longer vouches for the frame
+    /// declines, and leaves the guest's pages exactly as it found them.
+    ///
+    /// This is the whole safety argument for the `skip_readback` rail. An `Owned`
+    /// window carries its pixels and cannot be wrong about them; a `Resident`
+    /// window carries only a *claim* that a GPU image still holds them, and the
+    /// epoch is what tests the claim. `registry_mark_ready` clears a slot's
+    /// `content_epoch` on every draw into it, so a mismatch means another layer
+    /// rendered over this surface after the Store that armed the window — and
+    /// writing then lands that other layer's pixels in these pages, which is the
+    /// black/torn-layer class rather than a merely stale frame.
+    ///
+    /// No engine is initialized here, so `resident_content_epoch` answers `None`
+    /// for the reconstructed identity, which is the same reading an evicted slot
+    /// produces and the one this arm must fail closed on. The assertion that
+    /// matters is the *guest memory*: a decline that still wrote would pass a
+    /// log-only check.
+    #[test]
+    fn a_resident_window_that_cannot_be_vouched_for_declines_without_writing() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x4500_0000u64;
+        host.map_range(gpa, page as usize, 0);
+        // A recognizable pre-Store pattern, so "did not write" is checkable
+        // rather than indistinguishable from a zeroed page.
+        let pre = [0x5Cu8; 256];
+        host.write_gpa(gpa, &pre).unwrap();
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.mapped = true;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                source: crate::model::RenderWindowSource::Resident { epoch: 7 },
             },
         );
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window whose resident cannot be vouched for must report the loss"
+        );
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("kind=render")
+                && line.contains("reason=resident_epoch_drift")
+                && line.contains("want=7"),
+            "the epoch witness must be the stated refusal, with the value it wanted: {line}"
+        );
+        let mut after = [0u8; 256];
+        host.read_gpa(gpa, &mut after).unwrap();
+        assert_eq!(
+            &after[..],
+            &pre[..],
+            "a declined resident window must leave the guest's own bytes untouched"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the trigger must consume the window it took"
+        );
+    }
+
+    /// The identity a `Resident` window's flush rebuilds from its key is the one
+    /// the draw rendered into, pinned and stamped.
+    ///
+    /// Four separate places name this slot — the draw's `target_identity`, the
+    /// arm's `pin_resident_target`, the arm's `stamp_resident_content_epoch`, and
+    /// the flush's `read_target` — and all four resolve through
+    /// `present_identity::surface_identity` except the last, which has only the
+    /// key. If those two spellings ever disagree the pin protects one image while
+    /// the flush reads another: the frame is silently the wrong one, and no
+    /// assertion in the crate is watching for it because both lookups *succeed*.
+    #[test]
+    fn a_render_windows_key_rebuilds_the_identity_the_draw_rendered_into() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        for generation in [1u32, 5, u32::MAX] {
+            let m = state.mappings.entry(9).or_default();
+            m.map_generation = generation;
+            let mut k = key(9, 0, 256);
+            k.map_generation = generation;
+            assert_eq!(
+                super::render_window_identity(&k),
+                crate::runtime::present_identity::surface_identity(&state, 9, k.width, k.height),
+                "the flush's rebuilt identity must equal the one the draw and the pin used"
+            );
+        }
+    }
+
+    /// A render window lands its own pixels even when `surface_cache` has moved
+    /// on to another geometry for the same mapping.
+    ///
+    /// The flush used to source its bytes from
+    /// `surface_cache::get(mapping_id, key.width, key.height)`, and that cache
+    /// holds exactly one entry per mapping. A guest that re-Stores the surface at
+    /// a new size therefore orphaned every window still armed at the old one:
+    /// the flush missed, emitted `deferred_flush_lost reason=cache_miss` and the
+    /// guest kept its stale pixels. One boot lost 15 whole layers that way —
+    /// including a 1920x1080 desktop surface and a 1920x24 menu bar — which on
+    /// screen is a compositing layer rendering solid black.
+    #[test]
+    fn a_render_window_lands_its_own_pixels_after_the_cache_moved_geometry() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x4400_0000u64;
+        host.map_range(gpa, page as usize, 0);
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.mapped = true;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        // The window's own frame — every byte 0xA7.
+        let frame = vec![0xA7u8; 4 * 4 * 4];
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+            },
+        );
+        // A later Store re-Stored this mapping at 8x8, replacing the one cache
+        // entry it has. The 4x4 window above is now unreachable through it.
+        crate::runtime::surface_cache::store(&mut state, 9, 8, 8, vec![0x11u8; 8 * 8 * 4]);
+
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window carrying its own pixels is always landable"
+        );
+        assert!(
+            cap.lines()
+                .iter()
+                .all(|l| !l.contains("deferred_flush_lost")),
+            "nothing may be lost: {:?}",
+            cap.lines()
+        );
+        // The guest side is row-strided at the mapping's own bytes-per-row, so
+        // read it the way the writeback wrote it.
+        let (base_off, bpr, _) = {
+            let m = state.mappings.get(&9).unwrap();
+            crate::runtime::mapping_write::type11_sample_window(
+                m,
+                9,
+                4,
+                4,
+                crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            )
+            .expect("the mapping has a type-11 sample window")
+        };
+        for y in 0..4u64 {
+            let mut row = [0u8; 4 * 4];
+            host.read_gpa(gpa + base_off + y * bpr as u64, &mut row)
+                .unwrap();
+            assert_eq!(
+                &row[..],
+                &frame[(y as usize) * 16..(y as usize) * 16 + 16],
+                "row {y} of the guest pages must hold the window's frame, not the cache's"
+            );
+        }
+    }
+
+    /// A render window fully covered by a later writer is *dropped*, not
+    /// flushed, and dropping it takes its alias-index refs with it.
+    ///
+    /// This is the difference between a deferral and a rescheduling. A guest
+    /// compositing into one surface re-Stores the identical guest range every
+    /// frame, so the previous window always intersects the new one; landing it
+    /// there performs exactly the guest write the rail exists to skip, once per
+    /// Store, and `surface_flush` would track `surface_deferred` at a ratio of 1.
+    ///
+    /// The alias-index half is the part that is easy to get wrong: taking the
+    /// entry with a bare `remove` leaves `deferred_alias_pages` holding page
+    /// refs for a mapping with no windows left, and the raw-GVA sampling guard
+    /// then walks pages nothing defers on.
+    #[test]
+    fn a_superseded_render_window_is_dropped_and_releases_its_alias_pages() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let k = key(9, 0, 256);
+        state.compute_deferred_flush.insert(k, render_owner(1));
+        state.index_deferred_alias_pages(9);
+        assert!(
+            state.deferred_alias_pages.contains_key(&9),
+            "arming indexes the mapping's pages for the raw-GVA guard"
+        );
+
+        let released = super::supersede_covered_render_windows(&mut state, &k);
+        assert_eq!(
+            released.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![k],
+            "the exact key is the one taken"
+        );
+        assert!(state.compute_deferred_flush.is_empty());
+        assert!(
+            !state.deferred_alias_pages.contains_key(&9),
+            "the last window leaving must drop the mapping's alias-page refs"
+        );
+    }
+
+    /// The other half of dropping a superseded window: a `Resident` one holds a
+    /// counted registry pin, and the supersede is one of the exits
+    /// `release_window_pin` names.
+    ///
+    /// The arm site got this wrong. It took each covered window with a bare
+    /// `take_deferred_flush_window_exact` and discarded it, so every composite
+    /// Store on a repainted surface leaked one pin — and since the re-Store
+    /// carries the same key, it is the same slot's `pin_count` climbing without
+    /// bound until nothing can ever reclaim it. `unpin_resident_target` is a
+    /// silent no-op with no engine here, so the assertion is on the *identity*
+    /// the release named: it has to be rebuilt from the superseded window's own
+    /// key, since a covered sibling may carry a different geometry over the same
+    /// guest range.
+    #[test]
+    fn superseding_a_resident_window_releases_the_pin_it_held() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut k = key(9, 0, 256);
+        k.map_generation = 3;
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                source: crate::model::RenderWindowSource::Resident { epoch: 11 },
+            },
+        );
+
+        let released = super::supersede_covered_render_windows(&mut state, &k);
+        assert_eq!(
+            released,
+            vec![(
+                k,
+                Some(TargetIdentity::Surface {
+                    id: 9,
+                    width: k.width,
+                    height: k.height,
+                    generation: 3,
+                })
+            )],
+            "a resident window's pin must be released, under the identity its own key names"
+        );
+
+        // An `Owned` window holds nothing on the GPU, so `None` is the answer and
+        // not a missed release — unpinning for one would name a slot the arm never
+        // pinned and succeed silently.
+        state.compute_deferred_flush.insert(k, render_owner(2));
+        assert_eq!(
+            super::supersede_covered_render_windows(&mut state, &k),
+            vec![(k, None)],
+            "an owned window releases nothing"
+        );
+    }
+
+    /// Superseding one window must not disturb a sibling covering a different
+    /// guest range on the same mapping — that one holds bytes the new Store does
+    /// not write, and dropping it would lose them.
+    #[test]
+    fn superseding_one_window_leaves_a_disjoint_sibling_armed() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let covered = key(9, 0, 256);
+        let sibling = key(9, 256, 512);
+        state
+            .compute_deferred_flush
+            .insert(covered, render_owner(1));
+        state
+            .compute_deferred_flush
+            .insert(sibling, render_owner(2));
+
+        assert_eq!(
+            super::supersede_covered_render_windows(&mut state, &covered).len(),
+            1
+        );
+        assert!(
+            state.compute_deferred_flush.contains_key(&sibling),
+            "a different range is a different obligation"
+        );
+        assert_eq!(state.compute_deferred_flush.len(), 1);
+    }
+
+    /// Teardown must name the render rail, because the two rails pin different
+    /// registries and the drop is where the pin is released.
+    ///
+    /// Unpinning storage for a render window succeeds silently and leaves the
+    /// target resident pinned for the life of the boot — a display-sized image
+    /// per window, which is the "~260 stale residents (~516 MiB)" shape. The
+    /// slug on this line is the only always-on evidence that the right registry
+    /// was chosen.
+    #[test]
+    fn dropping_a_render_window_reports_the_render_rail() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state
+            .compute_deferred_flush
+            .insert(key(9, 0, 256), render_owner(7));
+        state.compute_deferred_flush.insert(
+            key(9, 256, 512),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        let cap = crate::observe::FailCapture::start();
+        super::drop_windows(&mut state, 9, "unit");
+        let lines: Vec<String> = cap
+            .lines()
+            .into_iter()
+            .filter(|l| l.split_whitespace().next() == Some("deferred_flush_dropped"))
+            .collect();
+        assert_eq!(lines.len(), 2, "both windows drop: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("owner=render")),
+            "the render window must say so: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("owner=compute")),
+            "the compute window must say so: {lines:?}"
+        );
+        assert!(state.compute_deferred_flush.is_empty());
+    }
+
+    /// `condemn_surface_backing` keeps a mapping's deferred windows on purpose:
+    /// `DeleteIOSurfaceBacking2` may name a prior incarnation of a recycled id,
+    /// and `mapper::resolve` settles it later by fingerprint compare. A flush
+    /// trigger arriving inside that undecided window must therefore leave the
+    /// obligation armed — consuming it destroys the very thing the fingerprint
+    /// decision exists to reprieve, and reports a loss the flush did not cause.
+    #[test]
+    fn flush_holds_windows_while_the_backing_is_condemned() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::FakeHost;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let k = key(9, 0, 4096);
+        state.map_surface(9);
+        {
+            let m = state.mappings.get_mut(&9).unwrap();
+            m.map_generation = 2;
+            m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        state
+            .compute_deferred_flush
+            .insert(k, crate::model::DeferredOwner::Storage { generation: 3 });
+        // The guest deletes the backing; the window is kept for the fingerprint
+        // decision and the page list moves to `condemned_entries`.
+        assert!(state.condemn_surface_backing(9));
+        assert!(state.mapping_backing_condemned(9));
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
-        assert!(!ok, "drifted window must report the loss");
-        assert!(state.render_deferred_flush.is_empty());
+        assert!(ok, "an undecided window is not a loss");
+        assert!(
+            state.compute_deferred_flush.contains_key(&k),
+            "the window must survive for mapper::resolve to reprieve or drop"
+        );
     }
 
     #[test]
-    fn flush_intersecting_takes_render_windows_and_reports_loss() {
-        use crate::model::{RenderDeferredEntry, RenderDeferredKey};
+    fn flush_intersecting_takes_windows_and_reports_loss() {
         use crate::runtime::host::FakeHost;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        // Window over an unmapped mapping: the flush replay must fail closed
+        // Window over an unmapped mapping: the flush must fail closed
         // (fail-visible loss), remove the window, and return false.
-        state.render_deferred_flush.insert(
-            RenderDeferredKey {
-                mapping_id: 9,
-                surface_offset: 0,
-                span_end: 4096,
-            },
-            RenderDeferredEntry {
-                width: 32,
-                height: 32,
-                map_generation: 1,
-                full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
-            },
+        state.compute_deferred_flush.insert(
+            key(9, 0, 4096),
+            crate::model::DeferredOwner::Storage { generation: 3 },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
-        assert!(!ok, "lost render window must report failure");
+        assert!(!ok, "lost window must report failure");
         assert!(
-            state.render_deferred_flush.is_empty(),
+            state.compute_deferred_flush.is_empty(),
             "taken windows never return to the map"
         );
         // Disjoint mapping id: untouched.
-        state.render_deferred_flush.insert(
-            RenderDeferredKey {
-                mapping_id: 10,
-                surface_offset: 0,
-                span_end: 4096,
-            },
-            RenderDeferredEntry {
-                width: 32,
-                height: 32,
-                map_generation: 1,
-                full_quad_bounds: false,
-                grouped: false,
-                armed_seq: 0,
-            },
+        state.compute_deferred_flush.insert(
+            key(10, 0, 4096),
+            crate::model::DeferredOwner::Storage { generation: 3 },
         );
         assert!(super::flush_intersecting(
             &mut state,
@@ -1053,7 +1926,7 @@ mod tests {
             0,
             u64::MAX
         ));
-        assert_eq!(state.render_deferred_flush.len(), 1);
+        assert_eq!(state.compute_deferred_flush.len(), 1);
     }
 
     /// A raw task-GVA span whose physical pages alias a deferred window's
@@ -1064,7 +1937,6 @@ mod tests {
     fn gva_alias_takes_only_aliased_windows() {
         use crate::contract::endian::st32;
         use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-        use crate::model::{RenderDeferredEntry, RenderDeferredKey};
         use crate::runtime::host::{FakeHost, HostMemory};
         let page_shift = PAGE_SHIFT_X86;
         let mut host = FakeHost::new();
@@ -1096,21 +1968,15 @@ mod tests {
             m.mapped = true;
             m.page_entries = vec![page_entry(pfn)];
         }
-        let entry = RenderDeferredEntry {
-            width: 32,
-            height: 32,
-            map_generation: 1,
-            full_quad_bounds: false,
-            grouped: false,
-            armed_seq: 0,
-        };
-        let rkey = |mapping_id: u32| RenderDeferredKey {
-            mapping_id,
-            surface_offset: 0,
-            span_end: 0x1000,
-        };
-        state.render_deferred_flush.insert(rkey(9), entry);
-        state.render_deferred_flush.insert(rkey(10), entry);
+        let ckey = |mapping_id: u32| key(mapping_id, 0, 0x1000);
+        state.compute_deferred_flush.insert(
+            ckey(9),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        state.compute_deferred_flush.insert(
+            ckey(10),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         // Product defer sites index pages at defer time.
         state.index_deferred_alias_pages(9);
         state.index_deferred_alias_pages(10);
@@ -1118,11 +1984,11 @@ mod tests {
 
         super::flush_intersecting_task_gva(&mut state, &mut host, 1, 0, 0x100);
         assert!(
-            !state.render_deferred_flush.contains_key(&rkey(9)),
+            !state.compute_deferred_flush.contains_key(&ckey(9)),
             "aliased window must be taken for flush"
         );
         assert!(
-            state.render_deferred_flush.contains_key(&rkey(10)),
+            state.compute_deferred_flush.contains_key(&ckey(10)),
             "non-aliased window must stay deferred"
         );
         assert!(
@@ -1137,13 +2003,12 @@ mod tests {
 
     /// SynchronizeResources choke point: the guest names a mapping it is
     /// about to CPU-read; every deferred window on it — mapping-keyed
-    /// (compute + render) and linear windows whose defer-time page index
-    /// aliases the mapping's physical pages — must be taken for flush.
+    /// (compute) and linear windows whose defer-time page index aliases the
+    /// mapping's physical pages — must be taken for flush.
     /// Windows on disjoint mappings/pages stay deferred. Locks the
     /// boot-25 black-wallpaper class (guest-CPU composite of stale pages).
     #[test]
     fn guest_read_flush_takes_keyed_and_linear_alias_windows() {
-        use crate::model::{RenderDeferredEntry, RenderDeferredKey};
         use crate::runtime::host::FakeHost;
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
@@ -1153,22 +2018,15 @@ mod tests {
             m.mapped = true;
             m.page_entries = vec![page_entry(pfn)];
         }
-        state.compute_deferred_flush.insert(key(9, 0, 256), 3);
-        let entry = RenderDeferredEntry {
-            width: 32,
-            height: 32,
-            map_generation: 1,
-            full_quad_bounds: false,
-            grouped: false,
-            armed_seq: 0,
-        };
-        let rkey = |mapping_id: u32| RenderDeferredKey {
-            mapping_id,
-            surface_offset: 0,
-            span_end: 0x1000,
-        };
-        state.render_deferred_flush.insert(rkey(9), entry);
-        state.render_deferred_flush.insert(rkey(10), entry);
+        state.compute_deferred_flush.insert(
+            key(9, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        let disjoint = key(10, 0, 0x1000);
+        state.compute_deferred_flush.insert(
+            disjoint,
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
         // Linear windows never name the mapping: one aliases mapping 9's
         // physical page, one sits on a disjoint page.
         let mut lin_aliased = key(0, 0, 0x1000);
@@ -1179,12 +2037,8 @@ mod tests {
             [(0x2000u64) << PAGE_SHIFT_X86].into_iter().collect();
         let disjoint_pages: std::collections::HashSet<u64> =
             [(0x3000u64) << PAGE_SHIFT_X86].into_iter().collect();
-        state
-            .linear_deferred_flush
-            .insert(lin_aliased, (1, aliased_pages));
-        state
-            .linear_deferred_flush
-            .insert(lin_disjoint, (1, disjoint_pages));
+        state.arm_linear_deferred_window(lin_aliased, 1, aliased_pages);
+        state.arm_linear_deferred_window(lin_disjoint, 1, disjoint_pages);
 
         // No windows on mapping 11: clean no-op.
         assert_eq!(
@@ -1197,12 +2051,11 @@ mod tests {
         // flush reports a fail-visible loss — but every aliased window must
         // still be taken (obligations never return to the maps).
         assert!(!ok, "losses must be reported");
-        assert_eq!(flushed, 3, "compute@9 + render@9 + linear alias");
-        assert!(state.compute_deferred_flush.is_empty());
-        assert!(!state.render_deferred_flush.contains_key(&rkey(9)));
+        assert_eq!(flushed, 2, "compute@9 + linear alias");
+        assert!(!state.compute_deferred_flush.contains_key(&key(9, 0, 256)));
         assert!(
-            state.render_deferred_flush.contains_key(&rkey(10)),
-            "disjoint mapping's render window must stay deferred"
+            state.compute_deferred_flush.contains_key(&disjoint),
+            "disjoint mapping's window must stay deferred"
         );
         assert!(
             !state.linear_deferred_flush.contains_key(&lin_aliased),
@@ -1228,16 +2081,50 @@ mod tests {
         }
     }
 
+    /// Independent restatement of what the union index owes its only caller:
+    /// `deferred_pages_intersect` answers true for exactly the pages some live
+    /// window still holds. Recomputed here from the three window maps, so the
+    /// assertion never consults the index it is checking. `ever_armed` bounds
+    /// the domain — every page the caller has armed at any point, so the check
+    /// covers pages that must have LEFT the index as well as pages still in it.
+    fn assert_index_matches_windows(state: &crate::model::DeviceState, ever_armed: &[u64]) {
+        let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for pages in state.deferred_alias_pages.values() {
+            live.extend(pages.iter().copied());
+        }
+        for (_, pages) in state.linear_deferred_flush.values() {
+            live.extend(pages.iter().copied());
+        }
+        for entry in state.gva_deferred_flush.values() {
+            live.extend(entry.pages.iter().copied());
+        }
+        for &page in ever_armed {
+            assert_eq!(
+                state.deferred_pages_intersect(&[page]),
+                live.contains(&page),
+                "page {page:#x}: fast reject disagrees with the live window sets"
+            );
+        }
+    }
+
     /// The refcounted deferred-page union index (`deferred_page_refs`, the fast
     /// reject behind `deferred_pages_intersect`) tracks exactly the live window
-    /// pages: shared pages are refcounted so a page survives until its LAST
-    /// window disarms, re-arm swaps page sets cleanly, and a fresh rebuild agrees
-    /// with the incrementally-maintained index.
+    /// pages across both window kinds that carry their own page sets: shared
+    /// pages are refcounted so a page survives until its LAST window disarms,
+    /// re-arm swaps page sets cleanly, and a page shared by a GVA window and a
+    /// linear window needs both to disarm before it leaves.
+    ///
+    /// This is the invariant the deleted 1-in-64 `deferred_ref_drift` self-heal
+    /// used to repair at runtime. `DeferredWindows` now denies mutable access to
+    /// the three source maps outside `model::state`, so a window can no longer
+    /// be armed or disarmed without the paired refcount move; what remains
+    /// testable is that the paired moves are themselves right.
     #[test]
     fn deferred_page_refs_track_arm_disarm_with_sharing() {
-        use crate::model::{DeviceState, PAGE_SHIFT_X86};
+        use crate::model::{ComputeStorageResidencyKey, DeviceState, PAGE_SHIFT_X86};
         let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let p = |pfn: u64| pfn << PAGE_SHIFT_X86;
+        let seen = [p(0xA), p(0xB), p(0xC), p(0xD), p(0xE), p(0xF)];
         // Two windows share page A; window 1 also owns B, window 2 also owns C.
         state.arm_gva_deferred_window(0x1000, gva_entry(1, 4, 4, &[p(0xA), p(0xB)]));
         state.arm_gva_deferred_window(0x2000, gva_entry(1, 4, 4, &[p(0xA), p(0xC)]));
@@ -1245,38 +2132,55 @@ mod tests {
         assert!(state.deferred_pages_intersect(&[p(0xB)]));
         assert!(state.deferred_pages_intersect(&[p(0xC)]));
         assert!(!state.deferred_pages_intersect(&[p(0xD)]));
-        // Disarm window 1: shared A stays (window 2 still holds it), B leaves.
+        assert_index_matches_windows(&state, &seen);
+        // A linear window joins on A too: the page is now held by three windows
+        // of two different kinds, and the refcount is the only thing that knows.
+        let lin = ComputeStorageResidencyKey::linear(1, 7, 0, 4, 4, 4, 2, 0x46);
+        state.arm_linear_deferred_window(lin, 1, [p(0xA), p(0xF)].into_iter().collect());
+        assert_index_matches_windows(&state, &seen);
+        // Disarm window 1: shared A stays, B leaves.
         assert!(state.take_gva_deferred_window(0x1000).is_some());
         assert!(
             state.deferred_pages_intersect(&[p(0xA)]),
-            "A shared by window 2"
+            "A shared by window 2 and the linear window"
         );
         assert!(
             !state.deferred_pages_intersect(&[p(0xB)]),
             "B was only window 1"
         );
         assert!(state.deferred_pages_intersect(&[p(0xC)]));
-        // Re-arm window 2 onto a different page set: C leaves, E joins, A stays
-        // present only if the new set keeps it — here it does not.
+        assert_index_matches_windows(&state, &seen);
+        // Re-arm window 2 onto a different page set: C leaves, E joins. A stays
+        // only because the linear window still holds it.
         state.arm_gva_deferred_window(0x2000, gva_entry(1, 4, 4, &[p(0xE)]));
-        assert!(
-            !state.deferred_pages_intersect(&[p(0xA)]),
-            "re-arm dropped A"
-        );
         assert!(
             !state.deferred_pages_intersect(&[p(0xC)]),
             "re-arm dropped C"
         );
-        assert!(state.deferred_pages_intersect(&[p(0xE)]));
-        // The incremental index must match a from-scratch rebuild (no drift).
         assert!(
-            !state.verify_and_heal_deferred_refs(),
-            "incremental index agrees with a fresh rebuild"
+            state.deferred_pages_intersect(&[p(0xA)]),
+            "the linear window still holds A"
         );
-        // Disarm the last window: index empties.
-        assert!(state.take_gva_deferred_window(0x2000).is_some());
-        assert!(!state.deferred_pages_intersect(&[p(0xE)]));
-        assert!(!state.verify_and_heal_deferred_refs());
+        assert!(state.deferred_pages_intersect(&[p(0xE)]));
+        assert_index_matches_windows(&state, &seen);
+        // Re-arm the linear window off A: now nothing holds it.
+        state.arm_linear_deferred_window(lin, 2, [p(0xF)].into_iter().collect());
+        assert!(
+            !state.deferred_pages_intersect(&[p(0xA)]),
+            "last holder of A re-armed away from it"
+        );
+        assert_index_matches_windows(&state, &seen);
+        // Disarm both remaining windows: index empties.
+        assert_eq!(
+            state.disarm_linear_deferred_window(&lin),
+            Some([p(0xF)].into_iter().collect()),
+            "disarm returns the pages the window was armed against"
+        );
+        assert!(state.take_oldest_gva_deferred_window().is_some());
+        for page in seen {
+            assert!(!state.deferred_pages_intersect(&[page]));
+        }
+        assert_index_matches_windows(&state, &seen);
     }
 
     /// A raw task-GVA span aliasing a deferred GVA render-Store window's
@@ -1407,6 +2311,104 @@ mod tests {
         );
     }
 
+    /// A large bind's alias must be found wherever it sits, not only where a
+    /// sample point happens to land.
+    ///
+    /// This walk used to sample every 16th page once a span passed 64 pages, on
+    /// the stated grounds that "real aliases are same-surface, so the first page
+    /// hits". Measured on the rail, no alias hit page 0 — the three observed
+    /// landed at 16, 32 and 48 of 127- and 256-page spans, i.e. partial overlaps
+    /// somewhere below each sample point. So the miss window was live, and this
+    /// is what falls through it: a 65-page bind overlapping a window on page 1
+    /// alone, which a stride of 16 steps straight over.
+    #[test]
+    fn a_large_bind_alias_is_found_off_the_sample_points() {
+        use crate::contract::endian::st32;
+        use crate::runtime::host::HostMemory;
+        let (mut host, mut state, root_gpa, page_shift) = memo_pt_fixture();
+        // 65 pages, so the old rule ran a strided walk. Page i -> pfn 0x4000+i.
+        const N: u64 = 65;
+        for i in 0..N {
+            let pfn = 0x4000 + i;
+            host.map_range(pfn << page_shift, 0x1000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn as u32);
+            host.write_gpa(root_gpa + 4 * i, &pte).unwrap();
+        }
+        // The deferred window covers page 1 and nothing else. A stride-16 walk
+        // visits 0, 16, 32, 48, 64 — never 1.
+        state.arm_gva_deferred_window(0x9100_0000, gva_entry(1, 4, 4, &[0x4001u64 << page_shift]));
+        super::flush_intersecting_task_gva(&mut state, &mut host, 1, 0, N << page_shift);
+        assert!(
+            !state.gva_deferred_flush.contains_key(&0x9100_0000),
+            "a window aliasing page 1 of a 65-page bind must be found and flushed"
+        );
+    }
+
+    /// `gva_alias_hit_page` reports which page of a bind first overlapped a live
+    /// deferred window, and the walk exists to find every such overlap — so the
+    /// line has to be able to tell a page-0 hit from a later one. A probe that
+    /// always said 0 would look healthy while measuring nothing, and reading this
+    /// number is what refuted the "real aliases hit on the first page" claim that
+    /// a 1-in-16 sampled walk used to rest on.
+    ///
+    /// Same fixture, same two-page span, same window geometry — only which page
+    /// the window sits on differs.
+    #[test]
+    fn alias_hit_page_probe_separates_a_first_page_hit_from_a_later_one() {
+        use crate::contract::endian::st32;
+        use crate::runtime::host::HostMemory;
+        let first_hit_page = |state: &mut DeviceState,
+                              host: &mut crate::runtime::host::FakeHost,
+                              window_page: u64|
+         -> String {
+            let page_shift = PAGE_SHIFT_X86;
+            state.arm_gva_deferred_window(
+                0x9100_0000,
+                gva_entry(1, 4, 4, &[window_page << page_shift]),
+            );
+            crate::observe::redirect_logs_for_tests();
+            let at = std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len();
+            // Two guest pages from gva 0, so page 0 resolves to 0x2000 and page 1
+            // to 0x3000 — the window sits on exactly one of them.
+            super::flush_intersecting_task_gva(state, host, 1, 0, 2 << page_shift);
+            let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+            body[at.min(body.len())..]
+                .lines()
+                .find(|l| l.starts_with("gva_alias_hit_page "))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .find(|f| f.starts_with("first_hit_page="))
+                })
+                .unwrap_or("<no line>")
+                .to_string()
+        };
+
+        let (mut host, mut state, root_gpa, page_shift) = memo_pt_fixture();
+        // Wire PTE[1] -> 0x3000 so the span's second page resolves too.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 0x3000);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        assert_eq!(
+            first_hit_page(&mut state, &mut host, 0x2000),
+            "first_hit_page=0",
+            "a window on the span's first page must report page 0"
+        );
+
+        let (mut host, mut state, root_gpa, _) = memo_pt_fixture();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 0x3000);
+        host.write_gpa(root_gpa + 4, &pte).unwrap();
+        assert_eq!(
+            first_hit_page(&mut state, &mut host, 0x3000),
+            "first_hit_page=1",
+            "a window on the span's second page must report page 1, not 0"
+        );
+        let _ = page_shift;
+    }
+
     /// A signature change that arms a window ON the cached bind's own page is
     /// caught by the cheap recheck (no PT walk needed) and flushed.
     #[test]
@@ -1512,6 +2514,189 @@ mod tests {
         assert!(state.gva_deferred_flush.contains_key(&0x9100_0000));
     }
 
+    /// Page drift must distinguish the cases it exists to separate, and now
+    /// **decide** them.
+    ///
+    /// A probe that reports nothing is indistinguishable from a probe that
+    /// cannot fire, and this codebase has already paid for three of those. So
+    /// drive both controls through the same fixture: a window whose GVA still
+    /// resolves to its armed pages must stay silent and stay writable, and one
+    /// whose pages moved under it must produce the line and be refused — same
+    /// task, same geometry, only the armed set differs.
+    ///
+    /// The decision is asserted alongside the line because they are two separate
+    /// claims. Logging drift while still writing is exactly what this used to
+    /// do, and the guest heap corruption that allowed — WindowServer aborting in
+    /// `small_free_list_remove_ptr_no_clear` — is why it decides now.
+    #[test]
+    fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let (dir_gpa, root_gpa, data0) = (2 * page, 3 * page, 4 * page);
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+
+        crate::observe::redirect_logs_for_tests();
+        let drift_lines = |from: usize| -> usize {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .get(from..)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("deferred_window_page_drift "))
+                .count()
+        };
+        let mark = || {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len()
+        };
+
+        // Negative control: armed on the page the GVA resolves to right now.
+        let at = mark();
+        assert!(
+            super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[data0]),
+                "gva_alias",
+            ),
+            "an unmoved window must stay writable — a guard that refuses every \
+             flush means the guest never sees a Store"
+        );
+        assert_eq!(
+            drift_lines(at),
+            0,
+            "a window that did not move must be quiet"
+        );
+
+        // Positive control: same window, armed on a page it no longer maps to.
+        let at = mark();
+        assert!(
+            !super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[9 * page]),
+                "gva_alias",
+            ),
+            "a window whose pages moved must be refused, not merely reported"
+        );
+        assert_eq!(drift_lines(at), 1, "a window whose pages moved must report");
+    }
+
+    /// The linear compute-storage rail gets the same drift decision as the GVA
+    /// rail, and takes its span the way the arm site does.
+    ///
+    /// `flush_linear_one` needs a live Vulkan engine to reach its guest write, so
+    /// this exercises the decision itself with a linear key's geometry. The span
+    /// argument is the subtle part and the positive control is what pins it: a
+    /// linear key's `span_end` is a *length* (`row_stride * height`), not an end
+    /// address, and the arm site walks `(surface_offset, span_end)` with exactly
+    /// those two values. Reading `span_end` as an end address here would make the
+    /// span `page - page == 0`, the walk would come back empty, the short-walk arm
+    /// would permit, and the positive control below would fail — which is the
+    /// point of siting it at a nonzero offset rather than at GVA 0, where both
+    /// readings coincide.
+    #[test]
+    fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length() {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let (dir_gpa, root_gpa, data0, data1) = (2 * page, 3 * page, 4 * page, 5 * page);
+        for gpa in [dir_gpa, root_gpa, data0, data1] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        // Two PTEs: GVA page 0 → data0, GVA page 1 → data1.
+        let mut ptes = [0u8; 8];
+        st32(&mut ptes[0..], 4);
+        st32(&mut ptes[4..], 5);
+        host.write_gpa(root_gpa, &ptes).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, 8 * page, 2));
+
+        crate::observe::redirect_logs_for_tests();
+        let drift_lines = |from: usize| -> usize {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .get(from..)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("deferred_window_page_drift "))
+                .count()
+        };
+        let mark = || {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len()
+        };
+        // One page long, sited at GVA `page` so a length/end confusion is visible.
+        let (offset, span) = (page, page);
+
+        // Negative control: armed on the page GVA `page` resolves to right now.
+        let at = mark();
+        assert!(
+            super::deferred_pages_still_ours(
+                &state,
+                &host,
+                1,
+                offset,
+                span,
+                &[data1].into_iter().collect(),
+                "8x8 trigger=linear_flush ref=5",
+            ),
+            "an unmoved linear window must stay writable — a guard that refuses \
+             every flush means the guest never sees a compute Store"
+        );
+        assert_eq!(
+            drift_lines(at),
+            0,
+            "a linear window that did not move must be quiet"
+        );
+
+        // Positive control: same window, armed on a page it no longer maps to.
+        // This is also the assertion that the span is read as a length.
+        let at = mark();
+        assert!(
+            !super::deferred_pages_still_ours(
+                &state,
+                &host,
+                1,
+                offset,
+                span,
+                &[9 * page].into_iter().collect(),
+                "8x8 trigger=linear_flush ref=5",
+            ),
+            "a linear window whose pages moved must be refused — and a zero-length \
+             walk from misreading span_end as an end address would permit it"
+        );
+        assert_eq!(
+            drift_lines(at),
+            1,
+            "a linear window whose pages moved must report"
+        );
+    }
+
     /// Task teardown moves the task's GVA windows to the retired list (model)
     /// and the runtime lands them cache-only — obligations never write guest
     /// pages from teardown and never linger.
@@ -1556,9 +2741,18 @@ mod tests {
     #[test]
     fn take_deferred_windows_is_exact_intersection() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        state.compute_deferred_flush.insert(key(7, 0, 256), 3);
-        state.compute_deferred_flush.insert(key(7, 256, 512), 4);
-        state.compute_deferred_flush.insert(key(8, 0, 256), 5);
+        state.compute_deferred_flush.insert(
+            key(7, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 3 },
+        );
+        state.compute_deferred_flush.insert(
+            key(7, 256, 512),
+            crate::model::DeferredOwner::Storage { generation: 4 },
+        );
+        state.compute_deferred_flush.insert(
+            key(8, 0, 256),
+            crate::model::DeferredOwner::Storage { generation: 5 },
+        );
 
         // Disjoint range takes nothing.
         assert!(state.take_deferred_flush_windows(7, 512, 1024).is_empty());

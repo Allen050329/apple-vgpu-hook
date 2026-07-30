@@ -45,8 +45,6 @@ pub const OP_MEMORY_BARRIER: u32 = 0x17;
 pub const OP_UPDATE_FENCE: u32 = 0x18;
 pub const OP_WAIT_FENCE: u32 = 0x19;
 pub const OP_RENDER_PASS: u32 = 0x1a;
-pub const OP_RENDER_PASS_SUBRECORD_FIRST: u32 = 0x1e;
-pub const OP_RENDER_PASS_SUBRECORD_LAST: u32 = 0x24;
 
 /// Live render-pass attachment layout (reims_vgpu_render_format.h).
 pub const PASS_DEPTH_ATTACH_OFF: usize = 0x00;
@@ -282,10 +280,6 @@ pub struct Command {
     pub icb_is_range: bool,
 }
 
-pub fn opcode_is_render_pass_subrecord(opcode: u32) -> bool {
-    (OP_RENDER_PASS_SUBRECORD_FIRST..=OP_RENDER_PASS_SUBRECORD_LAST).contains(&opcode)
-}
-
 pub fn opcode_is_apple_rejected(opcode: u32) -> bool {
     // Outside the known accepted encoder surface (C matrix uses explicit accepted list).
     // Unknown high opcodes fail closed as unsupported when listed rejected in C tests.
@@ -298,47 +292,6 @@ pub fn opcode_supported(opcode: u32) -> bool {
     }
     // Full accepted window from reims_vgpu_render_decode.h enum range.
     opcode <= OP_ACCEPTED_LAST
-}
-
-pub fn opcode_name(opcode: u32) -> &'static str {
-    match opcode {
-        OP_SET_PIPELINE => "setRenderPipelineState",
-        OP_SET_VERTEX_BUFFER => "setVertexBuffer",
-        OP_SET_FRAGMENT_BUFFER => "setFragmentBuffer",
-        OP_SET_VERTEX_BUFFER_OFFSET => "setVertexBufferOffset",
-        OP_SET_FRAGMENT_BUFFER_OFFSET => "setFragmentBufferOffset",
-        OP_DRAW => "drawPrimitives",
-        OP_DRAW_INST_COMPACT => "drawPrimitivesInstanced",
-        OP_DRAW_INDEXED_WIDE => "drawIndexedPrimitivesWide",
-        OP_DRAW_INDEXED => "drawIndexedPrimitives",
-        OP_SET_VIEWPORT => "setViewport",
-        OP_SET_SCISSOR => "setScissorRect",
-        OP_UPDATE_FENCE => "updateFence",
-        OP_WAIT_FENCE => "waitForFence",
-        OP_EXECUTE_COMMANDS_INDIRECT => "executeCommandsInBufferIndirect",
-        OP_EXECUTE_COMMANDS_RANGE => "executeCommandsInBuffer",
-        _ if opcode_is_apple_rejected(opcode) => "AppleException",
-        _ if opcode_supported(opcode) => "accepted",
-        _ => "unknown",
-    }
-}
-
-pub fn kind_name(k: Kind) -> &'static str {
-    match k {
-        Kind::SetPipeline => "setPipeline",
-        Kind::SetBuffer => "setBuffer",
-        Kind::SetBufferOffset => "setBufferOffset",
-        Kind::SetTexture => "setTexture",
-        Kind::SetSampler => "setSampler",
-        Kind::Draw => "draw",
-        Kind::SetViewport => "setViewport",
-        Kind::SetScissor => "setScissor",
-        Kind::Fence => "fence",
-        Kind::Barrier => "barrier",
-        Kind::RenderPass => "renderPass",
-        Kind::OtherAccepted => "other",
-        _ => "unknown",
-    }
 }
 
 /// Decode color attachment slot `index` from a render-pass payload.
@@ -813,12 +766,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
     }
 }
 
-// silence unused
-#[allow(dead_code)]
-fn _ld16(p: &[u8]) -> u16 {
-    ld16(p)
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1067,6 +1014,49 @@ mod tests {
             decode(&hdr(0x99, 16)).unwrap_err(),
             DecodeStatus::ErrUnsupportedOpcode
         );
+    }
+
+    /// Every bind opcode refuses `count == 0` and refuses more entries than the
+    /// slot table holds, so a decoded bind record ALWAYS carries at least one
+    /// entry.
+    ///
+    /// `exec::apply_record` relies on this: it walks `buffer_binds` / `ref_binds`
+    /// directly, with no single-entry wire form to fall back to. If a zero-count
+    /// record ever decoded successfully, those loops would silently bind nothing.
+    #[test]
+    fn a_bind_record_never_decodes_to_zero_entries() {
+        for (op, entry_size) in [
+            (OP_SET_VERTEX_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (OP_SET_FRAGMENT_BUFFER, BUFFER_BIND_ENTRY_SIZE),
+            (OP_SET_VERTEX_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (OP_SET_FRAGMENT_TEXTURE, REF_BIND_ENTRY_SIZE),
+            (OP_SET_VERTEX_SAMPLER, REF_BIND_ENTRY_SIZE),
+            (OP_SET_FRAGMENT_SAMPLER, REF_BIND_ENTRY_SIZE),
+        ] {
+            let hdr_len = 8;
+            let body = |count: u32, entries: usize| {
+                let mut v = hdr(op, hdr_len + BIND_ENTRIES + entries * entry_size);
+                st32(&mut v[hdr_len + BIND_FIRST..], 0);
+                st32(&mut v[hdr_len + BIND_COUNT..], count);
+                v
+            };
+            assert_eq!(
+                decode(&body(0, 0)).unwrap_err(),
+                DecodeStatus::ErrBadLength,
+                "op {op:#x} accepted count=0"
+            );
+            assert_eq!(
+                decode(&body(MAX_BIND_ENTRIES + 1, (MAX_BIND_ENTRIES + 1) as usize)).unwrap_err(),
+                DecodeStatus::ErrBadLength,
+                "op {op:#x} accepted count past MAX_BIND_ENTRIES"
+            );
+            let c = decode(&body(1, 1)).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+            assert_eq!(
+                c.buffer_binds.len() + c.ref_binds.len(),
+                1,
+                "op {op:#x} decoded one entry into neither list"
+            );
+        }
     }
 
     #[test]

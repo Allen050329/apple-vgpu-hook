@@ -69,7 +69,7 @@ impl ResourcePools {
         let req = ctx.device.get_image_memory_requirements(image);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, MemoryClass::DeviceLocal)
-            .ok_or_else(|| {
+            .ok_or({
                 DrawError::Unsupported(
                     super::reason::DrawReason::NoDeviceLocalMemoryForStorageImage {
                         memory_type_bits: req.memory_type_bits,
@@ -81,7 +81,7 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(req.size)
                 .memory_type_index(mt),
-            counters,
+            AllocSite::StorageImage,
         )
         .map_err(|e| {
             ctx.device.destroy_image(image, None);
@@ -217,7 +217,7 @@ impl ResourcePools {
         // Reuse the common allocator, then detach its bookkeeping copy from
         // the transient live list: the registry now owns this allocation.
         let slot = self.acquire_storage_image(ctx, key, counters)?;
-        let live = self.storage_image_live.pop().ok_or_else(|| {
+        let live = self.storage_image_live.pop().ok_or({
             DrawError::ComputeExecution(ComputeExecutionDecline::ResidentAllocatorLiveSlotMissing {
                 identity,
                 width: key.width,
@@ -328,76 +328,6 @@ impl ResourcePools {
 
     pub(crate) fn registry_get(&self, identity: &TargetIdentity) -> Option<&ResidentTargetSlot> {
         self.registry.get(identity)
-    }
-
-    /// Measure-only: the newest-generation registry Surface entry for this
-    /// mapping id + geometry, at ANY generation. Diagnoses generation-orphaned
-    /// residents (a map_generation bump strands the content under the old key).
-    pub(crate) fn registry_probe_surface_any_gen(
-        &self,
-        id: u32,
-        width: u32,
-        height: u32,
-    ) -> Option<(u64, bool)> {
-        self.registry
-            .iter()
-            .filter_map(|(k, s)| match k {
-                TargetIdentity::Surface {
-                    id: i,
-                    width: w,
-                    height: h,
-                    generation,
-                } if *i == id && *w == width && *h == height => {
-                    Some((*generation, s.content_ready))
-                }
-                _ => None,
-            })
-            .max_by_key(|(g, _)| *g)
-    }
-
-    /// Measure-only: classify what the registry holds at `width`x`height`. Used
-    /// to diagnose an `export_present_miss` event — it distinguishes a
-    /// resident that exists but under a DIFFERENT key (generation/identity
-    /// orphan: `OutputGroup` present while present asked for `Surface`, or a
-    /// stale-generation `Surface`) from a genuinely-absent one (no GPU render
-    /// pass produced this frame — the composited content lives only in guest
-    /// pages / the CPU surface cache, so there is nothing on the GPU to export).
-    /// That split decides whether the direct-present fix is "align the export
-    /// identity to the live resident" (cheap) or "keep the composite render
-    /// resident alive to present time" (architectural).
-    pub(crate) fn registry_geom_census(&self, width: u32, height: u32) -> RegistryGeomCensus {
-        let mut c = RegistryGeomCensus {
-            total: self.registry.len(),
-            ..Default::default()
-        };
-        for (k, s) in self.registry.iter() {
-            match k {
-                TargetIdentity::OutputGroup {
-                    width: w,
-                    height: h,
-                    ..
-                } if *w == width && *h == height => {
-                    c.group = Some(s.content_ready);
-                }
-                TargetIdentity::Surface {
-                    id,
-                    width: w,
-                    height: h,
-                    generation,
-                } if *w == width && *h == height => {
-                    c.surfaces.push((*id, *generation, s.content_ready));
-                }
-                TargetIdentity::Gva {
-                    width: w,
-                    height: h,
-                    ..
-                } if *w == width && *h == height => {
-                    c.gva += 1;
-                }
-                _ => {}
-            }
-        }
-        c
     }
 
     /// Ensure a resident target exists for `identity` with the given geometry + pass.
@@ -611,6 +541,7 @@ impl ResourcePools {
                 height,
                 generation,
                 content_ready: false,
+                content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
                 bgra,
                 color_format: format,
@@ -731,7 +662,7 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                counters,
+                AllocSite::ResidentColor,
             )
             .map_err(|e| {
                 ctx.device.destroy_image(image, None);
@@ -782,6 +713,7 @@ impl ResourcePools {
                 height,
                 generation,
                 content_ready: false,
+                content_epoch: None,
                 layout: vk::ImageLayout::UNDEFINED,
                 bgra: format == translate::pixel::SCANOUT_FORMAT,
                 color_format: format,
@@ -861,7 +793,7 @@ impl ResourcePools {
             &vk::MemoryAllocateInfo::default()
                 .allocation_size(ireq.size)
                 .memory_type_index(imt),
-            counters,
+            AllocSite::TransientDepth,
         )
         .map_err(|e| {
             ctx.device.destroy_image(image, None);
@@ -935,15 +867,15 @@ impl ResourcePools {
     ) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
+            slot.content_epoch = None;
             slot.layout = layout;
         }
     }
 
     /// Pin/unpin a resident render target against LRU eviction (deferred
-    /// render Stores). Pins are counted, not boolean: each deferred window
-    /// holds one count, and a shared `OutputGroup` identity carries one count
-    /// per member window — the slot stays protected until every holder
-    /// unpins. Returns false when the identity is absent or (for pinning) its
+    /// render Stores). Pins are counted, not boolean: a surface can have several
+    /// deferred windows armed at once and each holds one count, so the slot
+    /// stays protected until every holder unpins. Returns false when the identity is absent or (for pinning) its
     /// content is not ready — callers must fall back to the synchronous
     /// Store. Unpin saturates at zero (a spurious unpin never underflows).
     pub(crate) fn pin_resident_target(&mut self, identity: &TargetIdentity, pinned: bool) -> bool {
@@ -961,11 +893,38 @@ impl ResourcePools {
         false
     }
 
+    /// Mark a resident ready after a draw stored into it.
+    ///
+    /// Clears `content_epoch`: this image's pixels just changed, and until
+    /// something publishes them as the mapping's content and stamps the slot,
+    /// nothing may claim they match a mapping epoch. Every path that ends in a
+    /// resident holding new pixels comes through here or
+    /// [`Self::registry_mark_ready_at`], which is what keeps the reset total
+    /// rather than a list of the writers somebody remembered.
     pub(crate) fn registry_mark_ready(&mut self, identity: &TargetIdentity) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
+            slot.content_epoch = None;
             // Draw pass final_layout is TRANSFER_SRC_OPTIMAL.
             slot.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        }
+    }
+
+    /// Record that this resident's pixels are the mapping's content as of
+    /// `epoch`. Refuses (returns false) unless the slot exists and is
+    /// content_ready — stamping an image no draw has stored into would vouch
+    /// for undefined memory.
+    pub(crate) fn registry_stamp_content_epoch(
+        &mut self,
+        identity: &TargetIdentity,
+        epoch: u32,
+    ) -> bool {
+        match self.registry.get_mut(identity) {
+            Some(slot) if slot.content_ready => {
+                slot.content_epoch = Some(epoch);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -995,6 +954,7 @@ mod pin_count_tests {
             height: 16,
             generation: 1,
             content_ready,
+            content_epoch: None,
             layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             bgra: true,
             color_format: translate::pixel::SCANOUT_FORMAT,
@@ -1003,8 +963,8 @@ mod pin_count_tests {
         }
     }
 
-    fn group_identity() -> TargetIdentity {
-        TargetIdentity::OutputGroup {
+    fn pinned_identity() -> TargetIdentity {
+        TargetIdentity::Surface {
             id: 1,
             width: 16,
             height: 16,
@@ -1012,29 +972,119 @@ mod pin_count_tests {
         }
     }
 
-    /// Two members' deferred windows pin the SAME OutputGroup identity; the
-    /// first member's flush-unpin must NOT expose the shared image to the LRU
-    /// sweep while the peer's window is still armed. This is the eviction
-    /// window a boolean pin had.
+    /// The window presenter blits a resident with no format conversion and no
+    /// source scaling, so every one of these four conditions is load-bearing.
+    ///
+    /// It matters that this is ONE function: the device's publish path asks it
+    /// a frame ahead of the presenter to decide whether to read the frame back
+    /// into host memory. A looser predicate there elides the readback for a
+    /// frame the presenter then refuses, and the window goes blank with no CPU
+    /// pixels behind it — a disagreement neither call site can see on its own.
+    #[test]
+    fn only_a_ready_bgra_resident_at_the_exact_geometry_is_presentable() {
+        let ready = dummy_slot(true);
+        assert!(slot_presentable(&ready, 16, 16));
+
+        assert!(
+            !slot_presentable(&dummy_slot(false), 16, 16),
+            "content that has not landed would present the previous frame"
+        );
+
+        let mut rgba = dummy_slot(true);
+        rgba.bgra = false;
+        assert!(
+            !slot_presentable(&rgba, 16, 16),
+            "the blit does no channel swap; RGBA would present with red and blue exchanged"
+        );
+
+        assert!(
+            !slot_presentable(&ready, 32, 16),
+            "a wider present than the resident holds would blit a stretched frame"
+        );
+        assert!(
+            !slot_presentable(&ready, 16, 32),
+            "a taller present than the resident holds would blit a stretched frame"
+        );
+    }
+
+    /// A draw into this identity invalidates any stamp on it. The image's
+    /// pixels just changed, and until something publishes them as the mapping's
+    /// content the type-11 LOAD gate must not treat them as current — otherwise
+    /// an intermediate record's output is loaded as though it were the guest's
+    /// prior frame.
+    ///
+    /// Placed on `registry_mark_ready` rather than on the individual writers on
+    /// purpose: every path that leaves a resident holding new pixels goes
+    /// through here or `registry_mark_ready_at`, so the invalidation is total
+    /// rather than a list of the writers somebody remembered.
+    #[test]
+    fn a_draw_into_a_resident_clears_its_content_stamp() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+
+        assert!(pools.registry_stamp_content_epoch(&id, 9));
+        assert_eq!(pools.registry.get(&id).unwrap().content_epoch, Some(9));
+
+        pools.registry_mark_ready(&id);
+        assert_eq!(
+            pools.registry.get(&id).unwrap().content_epoch,
+            None,
+            "a draw stored new pixels; the old stamp cannot vouch for them"
+        );
+
+        assert!(pools.registry_stamp_content_epoch(&id, 10));
+        pools.registry_mark_ready_at(&id, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        assert_eq!(
+            pools.registry.get(&id).unwrap().content_epoch,
+            None,
+            "the MRT-secondary ready arm must invalidate identically"
+        );
+    }
+
+    /// Stamping an image no draw has stored into would vouch for undefined
+    /// memory, and an absent identity has no image at all. Both refuse, and the
+    /// caller reads the `false` as "the elision is off for this surface".
+    #[test]
+    fn a_stamp_refuses_an_image_no_draw_has_written() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+
+        assert!(
+            !pools.registry_stamp_content_epoch(&id, 1),
+            "an absent identity cannot be stamped"
+        );
+
+        pools.registry.insert(id.clone(), dummy_slot(false));
+        assert!(
+            !pools.registry_stamp_content_epoch(&id, 1),
+            "a resident that is not content_ready holds undefined pixels"
+        );
+        assert_eq!(pools.registry.get(&id).unwrap().content_epoch, None);
+    }
+
+    /// Two deferred windows on one surface pin the SAME identity; the first
+    /// window's flush-unpin must NOT expose the image to the LRU sweep while the
+    /// second is still armed. This is the eviction window a boolean pin had.
     #[test]
     fn shared_identity_pin_is_counted_not_boolean() {
         let mut pools = ResourcePools::new();
-        let id = group_identity();
+        let id = pinned_identity();
         pools.registry.insert(id.clone(), dummy_slot(true));
 
-        assert!(pools.pin_resident_target(&id, true), "member A pin");
-        assert!(pools.pin_resident_target(&id, true), "member B pin");
+        assert!(pools.pin_resident_target(&id, true), "window A pin");
+        assert!(pools.pin_resident_target(&id, true), "window B pin");
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 2);
 
-        // Member A flushes: one unpin — the slot must stay sweep-protected.
+        // Window A flushes: one unpin — the slot must stay sweep-protected.
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(
             pools.registry.get(&id).unwrap().pin_count,
             1,
-            "peer window still armed: slot must remain pinned"
+            "the second window is still armed: slot must remain pinned"
         );
 
-        // Member B flushes: fully released.
+        // Window B flushes: fully released.
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
     }
@@ -1044,7 +1094,7 @@ mod pin_count_tests {
     #[test]
     fn unpin_saturates_at_zero() {
         let mut pools = ResourcePools::new();
-        let id = group_identity();
+        let id = pinned_identity();
         pools.registry.insert(id.clone(), dummy_slot(true));
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.registry.get(&id).unwrap().pin_count, 0);
@@ -1057,7 +1107,7 @@ mod pin_count_tests {
     #[test]
     fn pin_refuses_not_ready_and_absent() {
         let mut pools = ResourcePools::new();
-        let id = group_identity();
+        let id = pinned_identity();
         assert!(!pools.pin_resident_target(&id, true), "absent identity");
         pools.registry.insert(id.clone(), dummy_slot(false));
         assert!(!pools.pin_resident_target(&id, true), "not-ready slot");
@@ -1147,6 +1197,46 @@ mod pin_count_tests {
         assert_eq!(victims.len(), IDLE_TARGET_DRAIN_MAX_PER_CALL);
     }
 
+    /// A pass with no registry victim but live staging traffic is NOT settled.
+    ///
+    /// This is the case the victim count alone cannot see and the one that
+    /// actually happens: a steady animation re-uses the same render targets, so
+    /// nothing ages out and every pass reads as quiet, while the upload path runs
+    /// flat out. Measured under testufo the trim fired about once a second
+    /// throughout the load and cost 607 re-allocations of the 8 MiB full-frame
+    /// staging bucket at 12.6 ms each.
+    #[test]
+    fn a_pass_with_no_victims_but_live_uploads_is_not_settled() {
+        let mut pools = ResourcePools::new();
+        // Quiet the gate first, so the assertion below is about uploads and not
+        // about the counter still warming up.
+        for _ in 0..SETTLED_PASSES_FOR_BUFFER_TRIM {
+            pools.note_drain_settled(0);
+        }
+        assert!(
+            pools.note_drain_settled(0),
+            "no victims, no uploads → settled"
+        );
+
+        // One staging acquire between passes — no victim, still not settled.
+        pools.staging_hits += 1;
+        assert!(
+            !pools.note_drain_settled(0),
+            "uploads ran between passes; the buffer pools must not be trimmed"
+        );
+        // …and the gate stays shut while uploads keep flowing, however many
+        // zero-victim passes go by.
+        for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM * 3) {
+            pools.staging_misses += 1;
+            assert!(!pools.note_drain_settled(0), "still uploading");
+        }
+        // Uploads stop: the gate reopens after the usual consecutive passes.
+        for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
+            assert!(!pools.note_drain_settled(0), "counter restarted from zero");
+        }
+        assert!(pools.note_drain_settled(0), "settled once uploads stopped");
+    }
+
     /// The HOST_VISIBLE buffer trim gate: only permitted after
     /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive zero-victim passes, and any
     /// pass that drains ≥1 victim (active churn) resets the counter — so a
@@ -1197,16 +1287,15 @@ mod pin_count_tests {
         );
     }
 
-    /// Route-B tile compositing may need the offscreen same-geometry peer even
-    /// when the displayed member is the only target being presented. Touching
-    /// that peer before export must refresh it against the idle-drain cutoff,
-    /// otherwise the later peer-copy lookup degrades to `tile_composite
-    /// reason=peer_missing` after a static desktop interval.
+    /// `registry_touch_at` refreshes a target against the idle-drain cutoff
+    /// without going through the draw path, so a target that is registered but
+    /// not being drawn survives a static desktop interval when a caller still
+    /// needs it.
     #[test]
-    fn registry_touch_at_keeps_offscreen_peer_alive() {
+    fn registry_touch_at_defers_the_idle_drain_for_an_untouched_target() {
         let mut pools = ResourcePools::new();
         admit(&mut pools, surf(1), 0, 0); // displayed target
-        admit(&mut pools, surf(4), 0, 0); // offscreen peer, otherwise aged
+        admit(&mut pools, surf(4), 0, 0); // registered but undrawn, otherwise aged
         let now = IDLE_TARGET_AGE_MS + 500;
 
         pools.registry_touch_at(&surf(4), now);
@@ -1216,77 +1305,12 @@ mod pin_count_tests {
         assert_eq!(
             victims,
             Vec::<TargetIdentity>::new(),
-            "display and touched peer both survive"
+            "the display target and the touched target both survive"
         );
         assert_eq!(
             pools.registry.get(&surf(4)).unwrap().last_touch_ms,
             now,
-            "peer stamped fresh for the export-time composite lookup"
+            "the touched target is stamped at the touch time"
         );
-    }
-
-    /// The geometry census classifies an export miss: it must surface a resident
-    /// that exists under a DIFFERENT key at the same geometry (the orphan case
-    /// direct-present must recover) and report an empty census when nothing
-    /// backs that geometry (the "content is only on the CPU/guest side" case).
-    #[test]
-    fn geom_census_reports_group_and_surfaces_at_geometry() {
-        let mut pools = ResourcePools::new();
-        // Empty registry: nothing at any geometry.
-        let empty = pools.registry_geom_census(16, 16);
-        assert_eq!(empty.total, 0);
-        assert!(empty.group.is_none());
-        assert!(empty.surfaces.is_empty());
-        assert_eq!(empty.gva, 0);
-
-        // A ready OutputGroup at 16x16 plus two Surface residents (one at a
-        // different generation, one not-ready) at the same geometry, and one
-        // resident at a DIFFERENT geometry that must not leak into the census.
-        pools.registry.insert(group_identity(), dummy_slot(true));
-        pools.registry.insert(
-            TargetIdentity::Surface {
-                id: 3,
-                width: 16,
-                height: 16,
-                generation: 7,
-            },
-            dummy_slot(true),
-        );
-        pools.registry.insert(
-            TargetIdentity::Surface {
-                id: 5,
-                width: 16,
-                height: 16,
-                generation: 2,
-            },
-            dummy_slot(false),
-        );
-        pools.registry.insert(
-            TargetIdentity::Surface {
-                id: 9,
-                width: 32,
-                height: 32,
-                generation: 1,
-            },
-            dummy_slot(true),
-        );
-
-        let c = pools.registry_geom_census(16, 16);
-        assert_eq!(c.total, 4, "counts all geometries");
-        assert_eq!(c.group, Some(true), "group resident present + ready");
-        assert_eq!(c.surfaces.len(), 2, "only the two 16x16 surfaces");
-        assert!(c.surfaces.contains(&(3, 7, true)));
-        assert!(c.surfaces.contains(&(5, 2, false)));
-        assert!(
-            !c.surfaces.iter().any(|&(id, ..)| id == 9),
-            "other-geometry resident excluded"
-        );
-        assert_eq!(c.gva, 0);
-
-        // A geometry with no resident: the miss classifier reads this as "no GPU
-        // content — CPU/guest-only", not an orphan.
-        let bare = pools.registry_geom_census(64, 64);
-        assert!(bare.group.is_none() && bare.surfaces.is_empty() && bare.gva == 0);
-        assert_eq!(bare.total, 4);
     }
 }

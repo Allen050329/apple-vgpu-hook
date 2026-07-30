@@ -5,7 +5,6 @@
 use ash::vk;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 // ash Handle trait not required here.
 
@@ -14,8 +13,8 @@ use super::counters::EngineCounters;
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, CullMode, DrawError, PrimitiveTopology, SamplerStateKey, VertexAttributeFormat,
-    VertexStepFunction,
+    BlendKey, ColorWriteMask, CullMode, DrawError, PrimitiveTopology, SamplerStateKey,
+    VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -152,6 +151,14 @@ pub(crate) struct PipelineKey {
     /// different pipelines, and before this they would have aliased onto
     /// whichever was created first.
     pub secondary_blend: [Option<BlendKey>; MAX_SECONDARY_ATTACH],
+    /// Per-slot `MTLColorWriteMask`, index 0 the primary attachment and index
+    /// `n` the secondary parallel to `pass.secondary[n - 1]`.
+    ///
+    /// In the key, not just the builder input: two draws sharing shaders, pass
+    /// shape and blend but masking different channels need different
+    /// pipelines. Vulkan's write mask is pipeline state with no dynamic
+    /// spelling below `VK_EXT_extended_dynamic_state3`.
+    pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
     pub pass: PassKey,
     pub flip_y: bool,
     /// Face culling. `None` (the 2D UI default) keeps the raster state at
@@ -323,11 +330,8 @@ pub(crate) struct ObjectCaches {
     passes: FifoCache<PassKey, vk::RenderPass>,
     pipelines: FifoCache<PipelineKey, vk::Pipeline>,
     samplers: FifoCache<SamplerStateKey, vk::Sampler>,
-    /// Pipeline key → pipeline shortcut for the warm path.
-    prepared: FifoCache<PipelineKey, vk::Pipeline>,
     /// Lc: compute pipelines (content digest + entry + layout).
     compute_pipelines: FifoCache<ComputePipelineKey, vk::Pipeline>,
-    prepared_dispatch: FifoCache<ComputePipelineKey, vk::Pipeline>,
 }
 
 impl ObjectCaches {
@@ -338,9 +342,7 @@ impl ObjectCaches {
             passes: FifoCache::new(64),
             pipelines: FifoCache::new(CAP_DEFAULT),
             samplers: FifoCache::new(CAP_DEFAULT),
-            prepared: FifoCache::new(CAP_DEFAULT),
             compute_pipelines: FifoCache::new(CAP_DEFAULT),
-            prepared_dispatch: FifoCache::new(CAP_DEFAULT),
         }
     }
 
@@ -351,8 +353,6 @@ impl ObjectCaches {
         for p in self.compute_pipelines.take_all() {
             device.destroy_pipeline(p, None);
         }
-        self.prepared.clear();
-        self.prepared_dispatch.clear();
         for (dsl, pl) in self.layouts.take_all() {
             device.destroy_pipeline_layout(pl, None);
             if dsl != vk::DescriptorSetLayout::null() {
@@ -376,9 +376,7 @@ impl ObjectCaches {
         self.passes.clear();
         self.pipelines.clear();
         self.samplers.clear();
-        self.prepared.clear();
         self.compute_pipelines.clear();
-        self.prepared_dispatch.clear();
     }
 
     pub(crate) unsafe fn get_or_create_shader(
@@ -398,14 +396,9 @@ impl ObjectCaches {
             return Ok((key, m));
         }
         counters.shader_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let created = ctx
             .device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None);
-        counters.shader_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         let module = created.map_err(|e| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateShaderModule, e));
             self.shaders.insert_negative(key, err.clone());
@@ -434,7 +427,6 @@ impl ObjectCaches {
             return Ok((dsl, pl));
         }
         counters.layout_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = key
             .bindings
             .iter()
@@ -483,10 +475,6 @@ impl ObjectCaches {
                 self.layouts.insert_negative(key.clone(), err.clone());
                 err
             })?;
-        counters.layout_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         counters.note_create();
         if let Some((old_dsl, old_pl)) = self.layouts.insert(key.clone(), (dsl, pl)) {
             pools.dispose(&ctx.device, DeferredHandle::PipelineLayout(old_pl));
@@ -513,7 +501,6 @@ impl ObjectCaches {
             return Ok(rp);
         }
         counters.pass_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let target_format = translate::pixel::resident_color(key.bgra);
         let (load_op, initial) = if key.load_seed {
             (
@@ -699,10 +686,6 @@ impl ObjectCaches {
             self.passes.insert_negative(key, err.clone());
             err
         })?;
-        counters.pass_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         counters.note_create();
         if let Some(old) = self.passes.insert(key, rp) {
             pools.dispose(&ctx.device, DeferredHandle::RenderPass(old));
@@ -726,7 +709,6 @@ impl ObjectCaches {
             return Ok(s);
         }
         counters.sampler_misses.fetch_add(1, Ordering::Relaxed);
-        let create_started = Instant::now();
         let not_mipmapped = key.mip_filter == super::types::SamplerMipFilter::NotMipmapped;
         let (min_lod, max_lod) = if key.unnormalized_coordinates || not_mipmapped {
             (0.0, 0.0)
@@ -804,10 +786,6 @@ impl ObjectCaches {
                 self.samplers.insert_negative(*key, err.clone());
                 err
             })?;
-        counters.sampler_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         counters.note_create();
         if let Some(old) = self.samplers.insert(*key, sampler) {
             pools.dispose(&ctx.device, DeferredHandle::Sampler(old));
@@ -1024,27 +1002,35 @@ impl ObjectCaches {
         // fields per slot. Only this key collapsed them, so a guest MRT
         // pipeline that asked to blend slot 1 silently got a raw store.
         //
-        // The colour write mask is still pinned to RGBA on every slot. That one
-        // is real: `MTLColorWriteMask` is genuinely not decoded, and the
-        // coverage manifest records it as `NotOnTheWire` rather than pretending
-        // otherwise.
-        let attachment_blend = |blend: Option<BlendKey>| match blend {
-            Some(b) => vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(true)
-                .src_color_blend_factor(b.src_color.vk())
-                .dst_color_blend_factor(b.dst_color.vk())
-                .color_blend_op(b.color_op.vk())
-                .src_alpha_blend_factor(b.src_alpha.vk())
-                .dst_alpha_blend_factor(b.dst_alpha.vk())
-                .alpha_blend_op(b.alpha_op.vk()),
-            None => vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(false),
+        // The colour write mask comes from the guest too, and it is applied on
+        // both arms because `MTLColorWriteMask` is independent of
+        // `blendingEnabled` — an unblended masked attachment still leaves its
+        // unwritten channels alone. Metal's bits are alpha-first and Vulkan's
+        // are red-first, so the exchange goes through `vk_color_write_mask`
+        // rather than a cast.
+        let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
+            let write = translate::blend::vk_color_write_mask(mask);
+            match blend {
+                Some(b) => vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(write)
+                    .blend_enable(true)
+                    .src_color_blend_factor(b.src_color.vk())
+                    .dst_color_blend_factor(b.dst_color.vk())
+                    .color_blend_op(b.color_op.vk())
+                    .src_alpha_blend_factor(b.src_alpha.vk())
+                    .dst_alpha_blend_factor(b.dst_alpha.vk())
+                    .alpha_blend_op(b.alpha_op.vk()),
+                None => vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(write)
+                    .blend_enable(false),
+            }
         };
-        let mut blend_att = vec![attachment_blend(key.blend)];
+        let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
         for slot in 0..key.pass.secondary_count as usize {
-            blend_att.push(attachment_blend(key.secondary_blend[slot]));
+            blend_att.push(attachment_blend(
+                key.secondary_blend[slot],
+                key.color_write_mask[slot + 1],
+            ));
         }
         let blend_constants = key
             .blend
@@ -1095,14 +1081,9 @@ impl ObjectCaches {
         if key.pass.depth.is_some() {
             gpci = gpci.depth_stencil_state(&depth_stencil);
         }
-        let create_started = Instant::now();
         let created = ctx
             .device
             .create_graphics_pipelines(ctx.pipeline_cache, &[gpci], None);
-        counters.pipeline_create_us.fetch_add(
-            create_started.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
         let pipe = created.map_err(|(_, e)| {
             let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreateGraphicsPipelines, e));
             self.pipelines.insert_negative(key.clone(), err.clone());
@@ -1170,26 +1151,6 @@ impl ObjectCaches {
             pools.dispose(&ctx.device, DeferredHandle::Pipeline(old));
         }
         Ok(pipe)
-    }
-
-    pub(crate) fn cache_prepared(&mut self, key: PipelineKey, pipeline: vk::Pipeline) {
-        let _ = self.prepared.insert(key, pipeline);
-    }
-
-    pub(crate) fn get_prepared(&self, key: &PipelineKey) -> Option<vk::Pipeline> {
-        self.prepared.get(key).copied()
-    }
-
-    pub(crate) fn cache_prepared_dispatch(
-        &mut self,
-        key: ComputePipelineKey,
-        pipeline: vk::Pipeline,
-    ) {
-        let _ = self.prepared_dispatch.insert(key, pipeline);
-    }
-
-    pub(crate) fn get_prepared_dispatch(&self, key: &ComputePipelineKey) -> Option<vk::Pipeline> {
-        self.prepared_dispatch.get(key).copied()
     }
 }
 

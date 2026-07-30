@@ -3,8 +3,6 @@
 
 #![allow(non_camel_case_types)]
 
-use std::os::raw::c_void;
-
 pub const REIMS_VGPU_OK: i32 = 0;
 pub const REIMS_VGPU_ERR_ARGS: i32 = 1;
 pub const REIMS_VGPU_ERR_TRANSLATE: i32 = 2;
@@ -386,28 +384,6 @@ pub struct ReimsVgpuVertexAttr {
     pub step_rate: u32,
 }
 
-/// Cache diagnostics (matches `reims_vgpu_backend_metal_cache.h`).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReimsVgpuMetalCacheStats {
-    pub function_hits: u64,
-    pub function_misses: u64,
-    pub render_pso_hits: u64,
-    pub render_pso_misses: u64,
-    pub compute_pso_hits: u64,
-    pub compute_pso_misses: u64,
-    pub sampler_hits: u64,
-    pub sampler_misses: u64,
-    pub depth_stencil_hits: u64,
-    pub depth_stencil_misses: u64,
-    pub compute_reflect_hits: u64,
-    pub compute_reflect_misses: u64,
-}
-
-// Silence unused for now (used by backend modules).
-const _: usize = std::mem::size_of::<ReimsVgpuBuffer>();
-const _: *const c_void = std::ptr::null();
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,16 +423,5 @@ mod tests {
         assert_eq!(offset_of!(ReimsVgpuStorageImage, data), 16);
         assert_eq!(size_of::<ReimsVgpuComputeSampledImage>(), 40);
         assert_eq!(offset_of!(ReimsVgpuComputeSampledImage, swizzle), 36);
-    }
-
-    #[test]
-    fn cache_stats_remain_a_dense_twelve_counter_c_abi() {
-        assert_eq!(align_of::<ReimsVgpuMetalCacheStats>(), align_of::<u64>());
-        assert_eq!(size_of::<ReimsVgpuMetalCacheStats>(), 12 * size_of::<u64>());
-        assert_eq!(offset_of!(ReimsVgpuMetalCacheStats, function_hits), 0);
-        assert_eq!(
-            offset_of!(ReimsVgpuMetalCacheStats, compute_reflect_misses),
-            11 * size_of::<u64>()
-        );
     }
 }

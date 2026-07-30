@@ -20,32 +20,58 @@ use crate::runtime::mapper;
 /// dims and bpe match the texture (`sample_window_prefer_device`). Falls back
 /// to packed invent `ALIGN_UP(w×bpp, 128)` when the descriptor is missing or
 /// rejects. Returns `(surface_offset, bytes_per_row, span_end)`.
+///
+/// # The invent fallback is reported
+///
+/// Type-11 is the case with **no wire plane index** — unlike
+/// [`type5_sample_window`], nothing on the wire names which plane the texture
+/// wants, so a multi-plane surface is resolved by matching width, height and
+/// bytes-per-element. That scan takes the plane only when **exactly one**
+/// matches; zero matches and two-or-more matches both fall through to the
+/// invented packed window, which is plane 0's bytes at offset 0. On a
+/// multi-plane surface that is a bind of the wrong plane, and it is the case the
+/// geometry scan cannot detect by construction.
+///
+/// So the fallback is not silent. `type11_window_invent` is emitted through the
+/// always-on channel, deduped per (mapping, geometry, format), carrying the
+/// surface's plane count so a reader can tell "no descriptor yet" (plane_count
+/// unknown) from "the scan could not pick a plane" (plane_count > 1). The three
+/// `mapper.rs` callers of `sample_window_prefer_device` legitimately ignore this
+/// — they want `span_end` only, as a floor on how many pages to map.
 pub fn type11_sample_window(
     m: &MappingEntry,
+    mapping_id: u32,
     width: u32,
     height: u32,
     format: u16,
 ) -> Option<(u64, u32, u64)> {
-    type11_sample_window_ex(m, width, height, format).map(|(o, b, e, _)| (o, b, e))
-}
-
-/// Like [`type11_sample_window`], plus `from_device` (true = guest device
-/// descriptor plane/surface window; false = invent packed fallback).
-///
-/// Measure/import paths log `invent=` from this flag — menu-strip residual when
-/// a 1920×24 job invents over a stale multiplanar mapping.
-pub fn type11_sample_window_ex(
-    m: &MappingEntry,
-    width: u32,
-    height: u32,
-    format: u16,
-) -> Option<(u64, u32, u64, bool)> {
     let desc = if m.device_desc.len() >= DEVICE_DESC_LEN {
         Some(m.device_desc.as_slice())
     } else {
         None
     };
-    sample_window_prefer_device(desc, None, format, width, height)
+    let (offset, bpr, end, from_device) =
+        sample_window_prefer_device(desc, None, format, width, height)?;
+    if !from_device
+        && crate::observe::first_sight(
+            "type11_window_invent",
+            u64::from(mapping_id) << 48
+                | u64::from(width) << 32
+                | u64::from(height) << 16
+                | u64::from(format),
+        )
+    {
+        let planes = desc
+            .and_then(crate::contract::iosurface_pages::decode_device_surface)
+            .map(|s| i64::from(s.plane_count))
+            .unwrap_or(-1);
+        crate::observe::off(format!(
+            "type11_window_invent mapping={mapping_id} {width}x{height} fmt={format:#x} \
+             planes={planes} offset={offset} bpr={bpr} span_end={end} (no wire plane index and \
+             the device descriptor did not resolve one; this window is plane 0 packed)"
+        ));
+    }
+    Some((offset, bpr, end))
 }
 
 /// Sample window for a type-5 serialized view, which — unlike type-11 —
@@ -67,18 +93,6 @@ pub fn type5_sample_window(
     sample_window_prefer_device(desc, Some(plane_index), format, width, height)
 }
 
-/// Public contig-view probe for GPU-direct writeback planning: the packed
-/// host view of the whole mapping (base pointer + available length) covering
-/// at least `span_end` bytes, or `None` when fragmented.
-pub fn contig_ptr_for_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping_id: u32,
-    span_end: u64,
-) -> Option<(usize, usize)> {
-    contig_for_span(state, host, mapping_id, span_end)
-}
-
 /// Revalidate + packed contig host view covering at least `span_end` bytes.
 ///
 /// Returns `None` when the mapping is fragmented on Linux (use
@@ -97,6 +111,36 @@ fn contig_for_span<H: HostMemory + HostOps>(
         return None;
     }
     Some((ptr, len))
+}
+
+/// One past the last mapping byte a rect transfer touches: the last texel of its
+/// last row, at `bpr` pitch, `x_off` bytes into the row.
+///
+/// Both the raw-pointer read and the raw-pointer write below must compare this
+/// against `span_end`, because `contig_for_span` guarantees the view covers
+/// `span_end` and nothing more — past it a read takes unrelated QEMU heap and a
+/// write smashes unrelated guest pages, both trace-lessly. Written once because
+/// duplicated arithmetic is the only reason the two sides could disagree, and
+/// they did: the write side was hardened for this bound and the read side
+/// shipped without it. Each caller still names its own slug — `read_overrun` and
+/// `writeback_overrun` are different losses.
+fn rect_extent_end(
+    base_off: u64,
+    origin_y: u32,
+    height: u32,
+    bpr: usize,
+    x_off: u64,
+    rb: usize,
+) -> u64 {
+    base_off
+        .saturating_add(
+            (origin_y as u64)
+                .saturating_add(height as u64)
+                .saturating_sub(1)
+                .saturating_mul(bpr as u64),
+        )
+        .saturating_add(x_off)
+        .saturating_add(rb as u64)
 }
 
 /// Write a tight BGRA8 image into the mapping's guest pages.
@@ -145,7 +189,8 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     if mw != width || mh != height {
         return false;
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
+    else {
         return false;
     };
     // Deferred-writeback flush-on-access: land pending resident content in
@@ -301,7 +346,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     if mw != width || mh != height {
         return false;
     }
-    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mw, mh, format) else {
+    let Some((base_off, bpr_u32, span_end)) = type11_sample_window(m, mapping_id, mw, mh, format)
+    else {
         return false;
     };
     let bpr = bpr_u32 as u64;
@@ -581,6 +627,7 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     clippy::too_many_arguments,
     reason = "the mapping API mirrors the decoded texture rectangle"
 )]
+#[cfg(test)]
 pub fn read_rect_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -603,7 +650,9 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, m.width, m.height, format) else {
+    let Some((base_off, bpr, span_end)) =
+        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    else {
         return false;
     };
     let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
@@ -643,6 +692,24 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     {
         return false;
     }
+    // Deferred-writeback flush-on-access, for the same reason
+    // `mapper::read_mapping_bytes` does it: this read must observe the deferred
+    // Store's pixels, not the stale pre-Store guest bytes.
+    //
+    // It has to be here rather than at the callers because only one of the two
+    // paths below was ever covered. The fragmented path ends in
+    // `read_mapping_bytes`, which flushes; the `contig_for_span` path is a raw
+    // `copy_nonoverlapping` out of the mapped span and flushes nothing — so
+    // whether a type-11 surface read observed the deferred Store depended on
+    // whether its guest pages happened to be contiguous. Three callers read
+    // guest pages through here with no flush of their own: the type-5 view
+    // loader, a blit reading a type-11 texture backing, and the compute sample
+    // stage.
+    //
+    // `flush_intersecting` returns immediately when nothing is armed, so this
+    // costs a map-empty check per read. It must also precede `contig_for_span`:
+    // the flush writes through the mapping and can retire the cached view.
+    crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
     let Some(m) = state.mappings.get(&mapping_id) else {
         return false;
     };
@@ -666,7 +733,18 @@ pub fn read_rect_raw_at<M: HostMemory + HostOps>(
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // SAFETY: contig covers span_end.
+        // The fragmented branch below goes through `mapper::read_mapping_bytes`,
+        // which is bounded already. A correctly-sized read satisfies this exactly
+        // (dense tight read: `read_end == span_end`), so it drops ONLY a genuine
+        // overrun.
+        let read_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
+        if read_end > span_end {
+            crate::observe::fail(format!(
+                "mapping_read fail reason=read_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} read_end={read_end} span_end={span_end}"
+            ));
+            return false;
+        }
+        // SAFETY: contig covers span_end, and read_end ≤ span_end (checked).
         let base = unsafe { (ptr as *const u8).add(base_off as usize) };
         if x_off == 0 && rb == bpr && dst_stride as usize == rb {
             // Dense rows: identical byte range as the loop, one copy.
@@ -772,7 +850,9 @@ pub fn write_rect_raw<M: HostMemory + HostOps>(
     } else {
         MTL_FORMAT_BGRA8_UNORM
     };
-    let Some((base_off, bpr, span_end)) = type11_sample_window(m, m.width, m.height, format) else {
+    let Some((base_off, bpr, span_end)) =
+        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    else {
         return false;
     };
     let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
@@ -907,26 +987,12 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
     if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
-        // `contig_for_span` only guarantees the view covers `span_end`, NOT the
-        // full write extent. Both branches below write up to the last texel of
-        // the last row — `base_off + (origin_y+height-1)*bpr + x_off + rb` — so
-        // if the source `height` (or `origin_y`) exceeds what the destination
-        // `span_end` allows, the copy runs past the view into adjacent guest
-        // pages: a trace-less heap smash. The
-        // fragmented full-plane branch below already rejects on the same bound
+        // The fragmented full-plane branch below already rejects on the same bound
         // (`frame_end > span_end`); enforce it here too so the contig fast paths
         // can never overrun. A correctly-sized writeback satisfies this exactly
-        // (dense tight write: write_end == span_end), so this drops ONLY a
-        // genuine overrun — named, never silent.
-        let write_end = base_off
-            .saturating_add(
-                (origin_y as u64)
-                    .saturating_add(height as u64)
-                    .saturating_sub(1)
-                    .saturating_mul(bpr as u64),
-            )
-            .saturating_add(x_off)
-            .saturating_add(rb as u64);
+        // (dense tight write: `write_end == span_end`), so it drops ONLY a genuine
+        // overrun — named, never silent.
+        let write_end = rect_extent_end(base_off, origin_y, height, bpr, x_off, rb);
         if write_end > span_end {
             crate::observe::fail(format!(
                 "mapping_write fail reason=writeback_overrun mid={mapping_id} base_off={base_off} origin_y={origin_y} height={height} bpr={surface_bpr} x_off={x_off} rb={rb} write_end={write_end} span_end={span_end}"
@@ -1131,9 +1197,12 @@ mod tests {
         assert!(write_full_rect_raw_at(
             &mut state, &mut host, mid, 0, 2048, 6160, 4, 4, 4, &src, 16,
         ));
-        // Two failed packed-view attempts plus one successful import per GPA run.
-        // The old row loop took nine attempts for these four rows and scaled with height.
-        assert_eq!(host.map_pages_calls, 4);
+        // One successful import per maximal GPA run, and nothing else: the
+        // fragmented page list fails `is_single_packed_run` in Rust, so the
+        // packed-view fast path never spends a call the host can only refuse.
+        // The old row loop took nine attempts for these four rows and scaled
+        // with height.
+        assert_eq!(host.map_pages_calls, 2);
         let calls_after_write = host.map_pages_calls;
 
         let mut row = [0u8; 16];
@@ -1141,7 +1210,7 @@ mod tests {
             &mut state, &mut host, mid, 4096, &mut row,
         ));
         assert_eq!(row, [0x2a; 16]);
-        assert_eq!(calls_after_write, 4);
+        assert_eq!(calls_after_write, 2);
     }
 
     /// Linux product: non-packed page list still lands BGRA via multi-import.
@@ -1227,6 +1296,59 @@ mod tests {
         assert_eq!(
             final_padding, [0xCC; 4],
             "padding after the final row must remain untouched"
+        );
+    }
+
+    /// The packed-contig BGRA write pokes rows straight into a raw host pointer,
+    /// so its only bound is the sample window `contig_for_span` validated. The
+    /// fragmented path's equivalent is checked by
+    /// `write_bgra8_fragmented_skips_final_row_padding`; this pins the same
+    /// contract on the pointer path, where an overrun is a write into whatever
+    /// guest allocation follows rather than a refused import.
+    ///
+    /// Asserted as "every byte outside the window is unchanged", not just the
+    /// final row's padding: inter-row padding belongs to the same class and a
+    /// stride bug hits it first.
+    #[test]
+    fn write_bgra8_contig_writes_only_inside_the_sample_window() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x7300_0000u64;
+        host.map_range(gpa, page as usize, 0xCC);
+        let pfn = (gpa >> PAGE_SHIFT_X86) as u32;
+        let mid = 21u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        // No device descriptor, so the invented window applies: tight = 2 × 4,
+        // bpr = ALIGN_UP(8, ROW_BYTES_ALIGN) = 128, two rows.
+        let tight = 8usize;
+        let bpr = 128usize;
+        let src: Vec<u8> = (0..16u8).map(|i| i.wrapping_mul(17)).collect();
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_some(),
+            "one packed page must take the contig path this test is about"
+        );
+        assert!(write_bgra8(&mut state, &mut host, mid, &src, 8, 2, 2));
+
+        let mut got = vec![0u8; page as usize];
+        assert!(host.read_gpa(gpa, &mut got).is_ok());
+        let mut want = vec![0xCCu8; page as usize];
+        want[..tight].copy_from_slice(&src[..tight]);
+        want[bpr..bpr + tight].copy_from_slice(&src[tight..]);
+        let first_diff = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+        assert_eq!(
+            first_diff, None,
+            "byte {first_diff:?} outside the sample window was modified"
         );
     }
 
@@ -1418,6 +1540,69 @@ mod tests {
         assert_eq!(state.mappings.get(&4).unwrap().content_generation, gen);
     }
 
+    /// The read side of the same bound. A rect read whose geometry exceeds what
+    /// `span_end` allows must be REJECTED, not run past the contig view.
+    ///
+    /// `contig_for_span` guarantees the view covers `span_end` and nothing more,
+    /// so an oversized `height` reads whatever is next in the QEMU process —
+    /// unrelated memory sampled into a texture, or a SIGSEGV that takes the VM
+    /// down with no guest-side trace. The write side has carried this guard for a
+    /// while; the read side did not, which is the asymmetry to watch for when a
+    /// raw-pointer fast path is added beside a checked slow path.
+    ///
+    /// A correctly-sized read (read_end == span_end) still succeeds.
+    #[test]
+    fn oversized_height_rect_read_is_rejected_not_overrun() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x23u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        // A full 16 KiB page, so `contig_for_span` succeeds and the guard — not
+        // the view length — is what has to stop the overrun.
+        host.map_range(gpa, 0x4000, 0xCC);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(11);
+        {
+            let m = state.mappings.get_mut(&11).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![entry];
+        }
+        // The source allows exactly 2 rows of bpr=8.
+        let bpr = 8u32;
+        let (width, bpp) = (2u32, 4u32); // row_bytes = 8 == bpr (dense path)
+        let span_end = 16u64;
+
+        // 100 rows: read_end = (100-1)*8 + 8 = 800 > 16.
+        let mut big = vec![0u8; 100 * bpr as usize];
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !read_rect_raw_at(
+                &mut state, &mut host, 11, 0, bpr, span_end, 0, 0, width, 100, bpp, &mut big, bpr,
+            ),
+            "an oversized-height read must be rejected"
+        );
+        assert!(
+            cap.one("mapping_read").contains("reason=read_overrun"),
+            "the refusal must name itself"
+        );
+        assert!(
+            big.iter().all(|&b| b == 0),
+            "a rejected read must not have copied anything into the caller's buffer"
+        );
+        drop(cap);
+
+        // A correctly-sized 2-row read (read_end == span_end) still succeeds.
+        let mut ok = vec![0u8; 2 * bpr as usize];
+        assert!(
+            read_rect_raw_at(
+                &mut state, &mut host, 11, 0, bpr, span_end, 0, 0, width, 2, bpp, &mut ok, bpr,
+            ),
+            "a read whose extent equals span_end must succeed"
+        );
+        assert_eq!(ok, vec![0xCC; 2 * bpr as usize], "and must read the page");
+    }
+
     /// A writeback whose source `height` exceeds what the destination `span_end`
     /// allows must be REJECTED, not run past the contig view into adjacent guest
     /// pages (the trace-less heap smash behind).
@@ -1589,5 +1774,89 @@ mod tests {
         assert!(!write_rect_raw(
             &mut state, &mut host, 5, 3, 0, 2, 1, &src, 8
         ));
+    }
+
+    /// A rect read through the **contiguous** path must observe a deferred
+    /// type-11 Store, not the stale guest bytes underneath it.
+    ///
+    /// `read_rect_raw_at` has two paths and only one of them was ever covered.
+    /// The fragmented path ends in `mapper::read_mapping_bytes`, which flushes;
+    /// the `contig_for_span` path is a raw `copy_nonoverlapping` out of the
+    /// mapped span and flushed nothing. So whether a type-11 surface read saw
+    /// the deferred Store depended on whether its guest pages happened to be
+    /// contiguous — and three callers read guest pages through here with no
+    /// flush of their own (the type-5 view loader, a blit reading a type-11
+    /// texture backing, and the compute sample stage). On screen that is a
+    /// sampled layer rendering its pre-Store contents.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_contiguous_rect_read_flushes_the_deferred_store_first() {
+        use crate::model::PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x9100_0000u64;
+        host.map_range(gpa, page as usize, 0);
+        // Stale guest bytes: what a reader saw before the Store landed.
+        host.write_gpa(gpa, &[0x22u8; 256]).unwrap();
+
+        let mid = 21u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.map_generation = 1;
+            m.has_geom = true;
+            m.width = 4;
+            m.height = 4;
+            m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (base_off, bpr, span_end) = {
+            let m = state.mappings.get(&mid).unwrap();
+            type11_sample_window(
+                m,
+                mid,
+                4,
+                4,
+                crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            )
+            .expect("the mapping has a type-11 sample window")
+        };
+        // The Store the guest issued, deferred rather than written.
+        let frame = vec![0xE3u8; 4 * 4 * 4];
+        state.compute_deferred_flush.insert(
+            crate::model::ComputeStorageResidencyKey {
+                mapping_id: mid,
+                map_generation: 1,
+                surface_offset: base_off,
+                surface_bpr: bpr,
+                span_end,
+                width: 4,
+                height: 4,
+                pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                texture_ref: 0,
+            },
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+            },
+        );
+
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        assert!(read_rect_raw_at(
+            &mut state, &mut host, mid, base_off, bpr, span_end, 0, 0, 4, 4, 4, &mut dst, 16,
+        ));
+        assert_eq!(
+            dst, frame,
+            "the read must observe the deferred Store, not the stale guest bytes"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the read is a flush trigger, so it must consume the window"
+        );
     }
 }

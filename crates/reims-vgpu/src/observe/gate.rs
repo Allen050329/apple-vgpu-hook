@@ -1,14 +1,29 @@
-//! Static gates over the decline vocabulary.
+//! Static gates over the decline vocabulary and the support-matrix boundary.
 //!
-//! These generalize three tests that already existed and each covered one
-//! island: `every_reason_has_its_own_slug` and `slugs_are_log_safe` in
-//! `translate/reason.rs` and `engine/reason.rs` (each checking only its own
-//! enum), and `declined_slugs_are_actually_emitted` in `translate/coverage.rs`
-//! (checking only render-descriptor fields). Written in the same style as
-//! `translate/gate.rs` and `caps/gate.rs`: read the source, assert a property,
-//! name the defect in the failure message.
+//! Each one reads the crate's own source, asserts a property, and names the
+//! defect in the failure message. Scanning source is crude, but it fails at
+//! `cargo test` time on the machine that made the change — which is the only
+//! place these fixes are cheap. The alternative for every property here is
+//! noticing at runtime, on a specific host, in a specific frame.
+//!
+//! # What used to be here, and why it is not
+//!
+//! Eleven of these tests checked a 2 700-line `#[cfg(test)]` `REGISTRY` in
+//! `super::decline` — a hand-maintained table restating, for each of 67 decline
+//! types, its defining file, its emission site and all 1 425 of its slugs. The
+//! table was a copy of the `slug()` arms, so it could only ever agree or
+//! disagree with them; agreeing added no invariant the arms did not already
+//! carry, and disagreeing was reported as "the registry drifted" rather than as
+//! a defect in the code. Meanwhile every deletion cost a second edit plus a
+//! hand-bumped `(types, slugs)` baseline carrying forty lines of changelog prose,
+//! which is what made shrinking this crate expensive.
+//!
+//! The one property that is genuinely crate-wide — **no two checks share a
+//! slug**, which no single impl can see — is now read straight off the
+//! `Decline`/`Refusal` impls by
+//! [`no_two_declines_share_a_slug`]. It is a scan of the code rather than of a
+//! copy of the code, so it cannot drift from it, and it needs no baseline.
 
-use super::decline::{Emission, REGISTRY};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -32,14 +47,25 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Byte offsets of `Result<Success, String>` spellings in Rust code.
+/// Repo-relative path with forward slashes, for stable messages.
+fn rel(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// `src` with every comment and every ordinary string/char literal replaced by
+/// spaces, byte-for-byte, so offsets and line numbers survive the mask.
 ///
-/// This is intentionally a small lexical scan rather than a same-line grep:
-/// rustfmt can wrap either generic argument, and nested generic `>` tokens must
-/// not be mistaken for the outer result. Comments and ordinary string/char
-/// literals are masked so the gate can explain the forbidden shape and test
-/// itself without creating a false source hit.
-fn result_string_error_offsets(src: &str) -> Vec<usize> {
+/// Shared by every source gate in this file, because a gate that greps raw
+/// source cannot tell code from prose: a doc comment quoting the shape it
+/// forbids, or a fail-log format string naming the very symbol under test, both
+/// read as source hits. Raw strings with any hash count, escaped string
+/// literals, `'x'`/`'\''` char literals and nested block comments are all
+/// handled here rather than in each caller — hand-rolling a second scrubber is
+/// how a sweep silently starts reporting live code as dead.
+fn mask_comments_and_literals(src: &str) -> Vec<u8> {
     #[derive(Clone, Copy)]
     enum State {
         Code,
@@ -196,7 +222,18 @@ fn result_string_error_offsets(src: &str) -> Vec<usize> {
             }
         };
     }
+    masked
+}
 
+/// Byte offsets of `Result<Success, String>` spellings in Rust code.
+///
+/// This is intentionally a small lexical scan rather than a same-line grep:
+/// rustfmt can wrap either generic argument, and nested generic `>` tokens must
+/// not be mistaken for the outer result. Comments and ordinary string/char
+/// literals are masked so the gate can explain the forbidden shape and test
+/// itself without creating a false source hit.
+fn result_string_error_offsets(src: &str) -> Vec<usize> {
+    let masked = mask_comments_and_literals(src);
     let mut hits = Vec::new();
     let mut from = 0usize;
     while let Some(rel) = masked[from..]
@@ -268,6 +305,129 @@ fn the_result_string_scanner_reads_wrapped_types_and_only_the_error_slot() {
     assert_eq!(hits.len(), 2, "wrapped/direct string errors: {hits:?}");
 }
 
+/// `VK_EXT_external_memory_host` must never be asked for.
+///
+/// Importing a host pointer over guest RAM gives the host GPU write access to
+/// the guest VM's memory. That is a property of the mechanism, not of how much
+/// of it is used, so the bound is "never requested" rather than any budget.
+///
+/// This is a **source** assertion and not a behavioural one, and it is here
+/// because the behavioural form cannot be built: what the flip changes is what
+/// `DeviceContext::create` asks the driver for, and every fixture that reads
+/// that answer needs `instance.create_device` to succeed — which on a driverless
+/// host degenerates into a skip, i.e. a green summary that is produced whether
+/// or not the code is right. A source gate has no such arm.
+///
+/// The needles are the whole API surface of the mechanism, not just the request.
+/// The name constant is how a device *asks* for it
+/// (`has_device_extension(…NAME)`, `enabled_device_extensions.push(…NAME…)`);
+/// the loader type, the two import structs, the properties entry point and the
+/// `HOST_ALLOCATION_EXT` handle type are how it would then be *used*. A
+/// reintroduction has to name at least one of them, and matching all six means
+/// the gate does not depend on which end someone starts from.
+///
+/// Earlier this gate matched only the two name constants, on the reasoning that
+/// the loader type and the `ext_external_memory_host` field should stay in the
+/// tree as hard-`None` decline sites. That subsystem is deleted now — the
+/// resolver, its window budget, the scatter pool and both present entry points
+/// went with it — so nothing legitimate names any of these, and the narrower
+/// gate would no longer notice a whole rail coming back.
+///
+/// Comments and string literals are masked, so the paragraph above is not a hit.
+/// Whitespace is folded so a rustfmt wrap inside a path cannot hide a request.
+#[test]
+fn the_host_pointer_import_extension_is_never_requested() {
+    let root = crate_src();
+    let mut hits = Vec::new();
+    for path in rust_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = mask_comments_and_literals(&src);
+        let folded: String = masked
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        for needle in [
+            "external_memory_host::NAME",
+            "EXT_EXTERNAL_MEMORY_HOST_NAME",
+            "ash::ext::external_memory_host",
+            "ImportMemoryHostPointerInfoEXT",
+            "get_memory_host_pointer_properties_ext",
+            "ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT",
+        ] {
+            if folded.contains(needle) {
+                hits.push(format!(
+                    "{} names {needle}",
+                    path.strip_prefix(&root).unwrap_or(&path).to_string_lossy()
+                ));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "VK_EXT_external_memory_host is requested; the GPU must not be able to \
+         write guest RAM:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// Metal has exactly one no-copy buffer constructor, and it takes host bytes.
+///
+/// `newBufferWithBytesNoCopy` is the Metal half of the same hazard the Vulkan
+/// gate above covers: it hands the GPU a pointer, and if that pointer is a
+/// `mach_vm_remap` view of the guest's pages then the host GPU can read and
+/// write guest RAM. It is not banned outright, because the crate legitimately
+/// aliases its **own** allocations with it — the CPU-staged vertex, fragment
+/// and compute byte vectors in `new_buffer_from_host`, which are `Vec<u8>`s
+/// this process owns.
+///
+/// So the invariant is not "never call it", it is "call it in exactly one
+/// place, whose argument is provably host-owned". A second call site is the
+/// thing to look at, whatever it claims to be aliasing. The one that used to
+/// exist took `MappingEntry::contig_ptr` and became a linear texture the guest
+/// surface was rendered into.
+///
+/// This is a **source** assertion for the same reason as the Vulkan gate, and
+/// one more: `backend-metal` is Apple-only and does not compile on a Linux
+/// host at all, so nothing else in this tree — not the compiler, not clippy,
+/// not the feature matrix — reads that code on the machine most of this work
+/// happens on. Comments and string literals are masked, so this paragraph is
+/// not a hit.
+#[test]
+fn metal_no_copy_buffers_alias_host_memory_and_nothing_else() {
+    const OWNER: &str = "backend/metal/runtime.rs";
+    let root = crate_src();
+    let mut sites = Vec::new();
+    for path in rust_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = mask_comments_and_literals(&src);
+        let folded: String = masked
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let count = folded.matches("new_buffer_with_bytes_no_copy").count();
+        if count > 0 {
+            sites.push((
+                path.strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                count,
+            ));
+        }
+    }
+    assert_eq!(
+        sites,
+        vec![(OWNER.to_string(), 1)],
+        "newBufferWithBytesNoCopy must appear exactly once, in {OWNER}'s \
+         new_buffer_from_host over host-owned bytes; a second site is a \
+         candidate guest-RAM alias"
+    );
+}
+
 /// Free-text `Result` errors cannot return. A typed decline may preserve an
 /// external driver's prose as a field, but the error carrier itself must remain
 /// exhaustively matchable and registered.
@@ -292,229 +452,6 @@ fn no_result_uses_string_as_its_error_type() {
     );
 }
 
-/// Two checks sharing a slug is the exact failure `AGENTS.md` names: you grep
-/// the fail log, see the slug fire, and still cannot tell which of the two
-/// refused. Uniqueness is now crate-wide, not per-enum — the old per-enum tests
-/// could not have caught `translate` and `engine` colliding.
-#[test]
-fn every_registered_slug_is_unique_crate_wide() {
-    let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
-    let mut clashes = Vec::new();
-    for class in REGISTRY {
-        for slug in class.slugs {
-            if let Some(prev) = owner.insert(slug, class.type_name) {
-                clashes.push(format!(
-                    "`{slug}` claimed by both {prev} and {}",
-                    class.type_name
-                ));
-            }
-        }
-    }
-    assert!(
-        clashes.is_empty(),
-        "decline slugs must be unique crate-wide:\n  {}",
-        clashes.join("\n  ")
-    );
-}
-
-/// Slugs are grepped out of a space-separated log line, so they may not carry
-/// whitespace or an `=`, and they stay snake_case for consistency with the
-/// existing `caps`, `translate` and census slugs.
-#[test]
-fn every_registered_slug_is_log_safe() {
-    for class in REGISTRY {
-        for slug in class.slugs {
-            assert!(!slug.is_empty(), "{}: empty slug", class.type_name);
-            assert!(
-                slug.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-                "{}: slug {slug:?} must be lowercase snake_case",
-                class.type_name
-            );
-        }
-    }
-}
-
-/// Every registered type must actually exist where the registry says it does.
-/// A row pointing at a moved or deleted file documents a vocabulary the crate
-/// no longer has.
-#[test]
-fn every_registered_type_is_defined_where_the_registry_says() {
-    for class in REGISTRY {
-        let path = crate_src().join(class.defined_in);
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{}: {}: {e}", class.type_name, class.defined_in));
-        assert!(
-            src.contains(class.type_name),
-            "{} is not defined in {}",
-            class.type_name,
-            class.defined_in
-        );
-    }
-}
-
-/// Does `src` open an `Emit::decline`/`Emit::refusal` whose first argument is the
-/// string `event`?
-///
-/// Textual, because the alternative is resolving types, and deliberately anchored
-/// on the *first* argument rather than "the event appears somewhere in the file":
-/// an event token also shows up in tests and in prose, and a row that passed on
-/// those would be back to claiming a file rather than a line. rustfmt breaks long
-/// calls after the open paren, so the argument may be on the following line —
-/// hence the skip over whitespace rather than a `contains` of the joined text.
-fn emits_event(src: &str, event: &str) -> bool {
-    let needle = format!("\"{event}\"");
-    for opener in ["Emit::decline(", "Emit::refusal("] {
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find(opener) {
-            let after = from + rel + opener.len();
-            if src[after..].trim_start().starts_with(&needle) {
-                return true;
-            }
-            from = after;
-        }
-    }
-    false
-}
-
-#[test]
-fn the_emission_check_reads_the_first_argument_not_the_whole_file() {
-    assert!(emits_event(
-        "crate::observe::Emit::refusal(\"stream_frame_fail\", &status)",
-        "stream_frame_fail"
-    ));
-    // rustfmt's wrapped form, as in `metal_draw.rs`.
-    assert!(emits_event(
-        "Emit::decline(\n    \"shader_state_degraded\",\n    &reason,\n)",
-        "shader_state_degraded"
-    ));
-    // The event named as a *field value* or in prose is not an emission. This is
-    // the case that makes the check a claim about a line: without it, a comment
-    // mentioning the slug would keep a deleted emission green.
-    assert!(!emits_event(
-        "// we used to Emit::decline here for blit_fail\ne.field(\"why\", \"blit_fail\")",
-        "blit_fail"
-    ));
-    // A different event in the same file must not satisfy this row.
-    assert!(!emits_event(
-        "Emit::refusal(\"blit_decode\", &status)",
-        "render_decode"
-    ));
-}
-
-/// **The gate that closes the unchecked handoff.**
-///
-/// `translate/` and `caps/` are pure: they return typed declines and log
-/// nothing, which is correct. But nothing checked that any *caller* logged
-/// them, and that is the mechanism by which a decline can be typed, returned,
-/// and still never reach `/tmp/reims-vgpu-fail.log`. A registered type must name a
-/// `(file, event)` pair where it meets an `observe::` emitter, and that call
-/// must really be there.
-#[test]
-fn every_registered_type_reaches_the_sink() {
-    let mut unlogged = Vec::new();
-    for class in REGISTRY {
-        let sites = match class.emission {
-            // An unreachable type is exempt from *emission*, not from scrutiny:
-            // the claim is checked below by
-            // `unreachable_declines_really_have_no_caller`.
-            Emission::Unreachable(why) => {
-                assert!(
-                    !why.is_empty(),
-                    "{}: Unreachable needs an argument",
-                    class.type_name
-                );
-                continue;
-            }
-            Emission::At(sites) => sites,
-        };
-        if sites.is_empty() {
-            unlogged.push(format!(
-                "{} names no emission site — a typed decline nobody logs is \
-                 still a silent failure",
-                class.type_name
-            ));
-            continue;
-        }
-        for (site, event) in sites {
-            let path = crate_src().join(site);
-            let Ok(src) = std::fs::read_to_string(&path) else {
-                unlogged.push(format!(
-                    "{}: emission site {site} does not exist",
-                    class.type_name
-                ));
-                continue;
-            };
-            // The row must name the *line*, not the file. Either builder:
-            // `decline` for an always-refusal type, `refusal` for a status enum
-            // whose `Ok` must not produce a line. Matching the event token means
-            // deleting the emission fails the gate, which naming only the file
-            // did not — `contains(type_name)` was satisfied by an unused import.
-            if !emits_event(&src, event) {
-                unlogged.push(format!(
-                    "{}: {site} has no Emit::decline/refusal(\"{event}\") — the \
-                     row names an emission that is not there",
-                    class.type_name
-                ));
-            }
-        }
-    }
-    assert!(
-        unlogged.is_empty(),
-        "these decline types never reach the always-on sink:\n  {}",
-        unlogged.join("\n  ")
-    );
-}
-
-/// `Emission::Unreachable` is a strong claim — "nothing can log this because
-/// nothing calls it" — and a wrong one would excuse a genuinely silent path.
-/// It is therefore checked, not trusted: if a caller appears, the exemption
-/// must be replaced by a real emission site.
-#[test]
-fn unreachable_declines_really_have_no_caller() {
-    for class in REGISTRY {
-        let Emission::Unreachable(_) = class.emission else {
-            continue;
-        };
-        let mut callers = Vec::new();
-        for path in rust_files(&crate_src()) {
-            let rel = path
-                .strip_prefix(crate_src())
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            // The defining file, the registry and the gates name the type
-            // without consuming it.
-            if rel == class.defined_in || rel.starts_with("observe/") {
-                continue;
-            }
-            let Ok(src) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // A consumer *handles* the error: matches a variant or propagates
-            // it. Merely implementing the trait that returns it does not count.
-            if src.contains(&format!("{}::", class.type_name))
-                && !src.contains(&format!("impl Backend for"))
-            {
-                callers.push(rel);
-            }
-        }
-        assert!(
-            callers.is_empty(),
-            "{} is registered Unreachable but is consumed in {callers:?} — \
-             give it a real emission site",
-            class.type_name
-        );
-    }
-}
-
-/// The source of the block `anchor` opens, delimited by its braces.
-///
-/// A source scan rather than a value-level enumeration because Rust cannot
-/// iterate an enum's variants: the exhaustive `match` inside `slug()` is the one
-/// place the compiler *does* force completeness, so scanning that match is how a
-/// new variant becomes visible to the gate. Add a variant and the compiler makes
-/// you write an arm; write an arm and this scan makes you register its slug.
 fn block_after(src: &str, anchor: &str) -> Option<String> {
     let start = src.find(anchor)?;
     let body = &src[start..];
@@ -556,12 +493,12 @@ fn block_after(src: &str, anchor: &str) -> Option<String> {
 fn slugs_returned_by(block: &str) -> Vec<String> {
     const RESULT_OF: &[&str] = &["=> \"", "=> Some(\"", "return \"", "return Some(\""];
     let mut out = Vec::new();
+    // Every literal in a result position, with no charset filter: anchoring on the
+    // `slug()`/`refusal()` body is what makes a literal here vocabulary, and a slug
+    // that is *not* log-safe is a defect `every_declared_slug_is_log_safe` must be
+    // able to see rather than one this extractor should quietly drop.
     let push_if_slug = |out: &mut Vec<String>, lit: &str| {
-        if !lit.is_empty()
-            && lit
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        {
+        if !lit.is_empty() {
             out.push(lit.to_string());
         }
     };
@@ -666,171 +603,119 @@ fn production_source(src: &str) -> String {
         .join("\n")
 }
 
-/// Every slug written as a literal at a *call* site: the first string literal
-/// inside the parentheses opened by each occurrence of `call`.
+/// Every `(slug, owning type)` pair the crate's `Decline`/`Refusal` impls write.
 ///
-/// This is the shape a vocabulary takes when the reason lives in the value or in
-/// a side channel rather than in a `match` — `FenceStatus::Unsupported(
-/// "fence_domain_unknown")`, or the blit rail's `br(BlitStatus::Bounds,
-/// "fill_out_of_range")`. Nobody writes a 178-arm `slug()`, so for those types
-/// the construction site *is* the vocabulary, and a census that could not read it
-/// there would have to exempt them — which is how a rail stays uncounted.
+/// Read off the impls themselves rather than off a table naming them, so a new
+/// variant becomes visible here the moment its `slug()` arm is written. Rust
+/// cannot iterate an enum's variants, but the exhaustive `match` inside `slug()`
+/// is the one place the compiler *does* force completeness: add a variant and
+/// the compiler makes you write an arm, write an arm and this scan reads it.
 ///
-/// A site with no literal is skipped rather than flagged: it is forwarding a slug
-/// it received (`br(BlitStatus::Unsupported, e.slug())`, `FenceStatus::
-/// Unsupported(why)`), and the delegate that owns that slug is registered on its
-/// own row. That is also why `fn br(status: BlitStatus, reason: &'static str)` —
-/// the definition — contributes nothing.
-fn slugs_passed_to(src: &str, call: &str) -> Vec<String> {
+/// Anchored on the trait impl and then on the `fn slug` / `fn refusal` body
+/// inside it, because `fields()` lives in the same impl and its keys are
+/// lowercase snake_case too — reading the whole impl would count field keys as
+/// vocabulary.
+fn declared_slugs() -> Vec<(String, String)> {
+    let root = crate_src();
     let mut out = Vec::new();
-    let mut rest = src;
-    while let Some(at) = rest.find(call) {
-        rest = &rest[at + call.len()..];
-        let bytes = rest.as_bytes();
-        let mut depth = 1i32;
-        let mut lit: Option<&str> = None;
-        let mut i = 0usize;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                b'"' if lit.is_none() => {
-                    let start = i + 1;
-                    let mut j = start;
-                    while j < bytes.len() && !(bytes[j] == b'"' && bytes[j - 1] != b'\\') {
-                        j += 1;
-                    }
-                    lit = Some(&rest[start..j.min(rest.len())]);
-                    i = j;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        if let Some(l) = lit {
-            if !l.is_empty()
-                && l.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            {
-                out.push(l.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// Every block the gate reads for one registered type: its own trait impl, plus
-/// any delegate the row names.
-fn vocabulary_blocks(class: &super::decline::DeclineClass) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for trait_name in ["Decline for ", "Refusal for "] {
-        out.push((
-            class.defined_in.to_string(),
-            format!("{trait_name}{}", class.type_name),
-        ));
-    }
-    for (file, anchor) in class.slug_blocks {
-        out.push((file.to_string(), anchor.to_string()));
-    }
-    out
-}
-
-/// **The gate that keeps the census honest.**
-///
-/// A registry row that lists a slug its type cannot produce documents a refusal
-/// the crate cannot make; a type that produces a slug no row lists is a refusal
-/// nobody can count. Both are the census lying, and both are cheap to catch by
-/// reading the one place the vocabulary is written down.
-#[test]
-fn every_row_lists_exactly_the_slugs_its_type_writes() {
-    let mut wrong = Vec::new();
-    for class in REGISTRY {
-        let mut found: Vec<String> = Vec::new();
-        // Types whose reason is carried in the value or side-channelled write
-        // their vocabulary at construction sites, not in a match arm.
-        for (rel, call) in class.slug_calls {
-            let path = crate_src().join(rel);
-            match std::fs::read_to_string(&path) {
-                Ok(src) => {
-                    let sites = slugs_passed_to(&production_source(&src), call);
-                    if sites.is_empty() {
-                        wrong.push(format!(
-                            "{}: no `{call}` site in {rel} passes a slug literal \
-                             — the row points at a vocabulary that is not there",
-                            class.type_name
-                        ));
-                    }
-                    found.extend(sites);
-                }
-                Err(e) => wrong.push(format!("{}: {rel}: {e}", class.type_name)),
-            }
-        }
-        for (rel, anchor) in vocabulary_blocks(class) {
-            let path = crate_src().join(&rel);
-            let Ok(src) = std::fs::read_to_string(&path) else {
-                wrong.push(format!("{}: {rel} does not exist", class.type_name));
-                continue;
-            };
-            let Some(block) = block_after(&src, &anchor) else {
-                continue;
-            };
-            // Only the vocabulary methods, not the whole impl: `fields()` sits
-            // in the same block and its arms return field *values*
-            // (`MmioWindow::Gfx => "gfx"`), which are not slugs. Reading the
-            // impl wholesale counted those, and this gate caught it on its own
-            // first registration — which is the argument for the gate.
-            let mut any = false;
-            for method in ["fn slug", "fn refusal"] {
-                if let Some(body) = block_after(&block, method) {
-                    found.extend(slugs_returned_by(&body));
-                    any = true;
-                }
-            }
-            if !any {
-                wrong.push(format!(
-                    "{}: block `{anchor}` in {rel} has neither `fn slug` nor \
-                     `fn refusal` — the gate cannot read its vocabulary",
-                    class.type_name
-                ));
-            }
-        }
-        if found.is_empty() {
-            wrong.push(format!(
-                "{}: no slug literals found — does it implement Decline or \
-                 Refusal in {}?",
-                class.type_name, class.defined_in
-            ));
+    for path in rust_files(&root) {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
+        };
+        // Comments are dropped so a doc comment demonstrating an impl cannot
+        // register vocabulary; `production_source` also hides `#[cfg(test)]`
+        // modules, whose fixture impls are not slugs the crate can write.
+        let src = production_source(&raw);
+        let rel = rel(&path, &root);
+        for trait_name in ["Decline for ", "Refusal for "] {
+            let mut from = 0usize;
+            while let Some(at) = src[from..].find(trait_name) {
+                let start = from + at;
+                let Some(block) = block_after(&src[start..], "{") else {
+                    from = start + trait_name.len();
+                    continue;
+                };
+                let ty = src[start + trait_name.len()..]
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                for anchor in ["fn slug", "fn refusal"] {
+                    if let Some(body) = block_after(&block, anchor) {
+                        for slug in slugs_returned_by(&body) {
+                            out.push((slug, format!("{rel}: {ty}")));
+                        }
+                    }
+                }
+                from = start + trait_name.len() + block.len();
+            }
         }
-        found.sort_unstable();
-        found.dedup();
-        let mut listed: Vec<String> = class.slugs.iter().map(|s| s.to_string()).collect();
-        listed.sort_unstable();
-        listed.dedup();
-        for slug in found.iter().filter(|s| !listed.contains(s)) {
-            wrong.push(format!(
-                "{}: writes `{slug}` but no registry row lists it — an \
-                 uncounted refusal",
-                class.type_name
-            ));
-        }
-        for slug in listed.iter().filter(|s| !found.contains(s)) {
-            wrong.push(format!(
-                "{}: registry lists `{slug}` but the type never writes it — a \
-                 refusal the crate cannot make",
-                class.type_name
-            ));
+    }
+    out
+}
+
+/// Two checks sharing a slug is the exact failure `AGENTS.md` names: you grep the
+/// fail log, watch the slug fire, and still cannot tell which of the two refused.
+///
+/// This is the property that needs a crate-wide scan. Uniqueness *within* an enum
+/// is visible in the `match` and gets caught by reading it; a `translate` slug
+/// colliding with an `engine` slug is visible from neither impl, and the
+/// per-enum tests this replaced could not have caught it.
+///
+/// **What this covers, exactly.** The slugs written as literals in a
+/// `slug()`/`refusal()` result position. It does *not* cover the vocabularies
+/// written at *construction* sites — `br(BlitStatus::Bounds, "fill_out_of_range")`
+/// and `FenceStatus::Unsupported("fence_domain_unknown")` — where the reason rides
+/// in the value rather than in a `match` arm. The registry this replaced listed
+/// those too, at the cost of a second hand-maintained table of `(file, call)` pairs
+/// per type; a collision inside one of those rails is not caught here. Stated so
+/// the number is not read as the crate's whole refusal surface.
+#[test]
+fn no_two_declines_share_a_slug() {
+    let declared = declared_slugs();
+    // The scan must actually reach the vocabulary, or the assertion below is
+    // vacuously green — the failure mode every sweep in this repo has had.
+    assert!(
+        declared.len() > 400,
+        "the slug scan found only {} slugs; it is not reading the impls",
+        declared.len()
+    );
+
+    let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut clashes = Vec::new();
+    for (slug, who) in &declared {
+        if let Some(prev) = owner.insert(slug, who) {
+            if prev != who {
+                clashes.push(format!("`{slug}` claimed by both {prev} and {who}"));
+            }
         }
     }
     assert!(
-        wrong.is_empty(),
-        "the decline registry does not match the vocabulary the code writes:\n  {}",
-        wrong.join("\n  ")
+        clashes.is_empty(),
+        "decline slugs must be unique crate-wide:\n  {}",
+        clashes.join("\n  ")
+    );
+}
+
+/// Slugs are grepped out of a space-separated log line, so they may not carry
+/// whitespace or an `=`, and they stay snake_case for consistency with the
+/// `caps`, `translate` and census slugs.
+#[test]
+fn every_declared_slug_is_log_safe() {
+    let mut bad = Vec::new();
+    for (slug, who) in declared_slugs() {
+        if slug.is_empty()
+            || !slug
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            bad.push(format!("{who}: {slug:?}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a slug must be lowercase snake_case to survive a grep of the log:\n  {}",
+        bad.join("\n  ")
     );
 }
 
@@ -910,117 +795,66 @@ fn the_slug_extractor_reads_arms_and_not_field_keys() {
     assert!(!a.contains("\"b\""), "block ran past its own impl: {a}");
 }
 
-/// The call-site extractor is the only thing standing between a carried-reason
-/// vocabulary and being exempt from the census, so it is checked against the
-/// exact shapes the crate writes — including the three it must *not* count.
+/// `production_source` is what keeps a doc comment's example and a test module's
+/// fixture out of the vocabulary. Both exclusions are load-bearing and neither is
+/// visible from a passing scan, so they are checked directly.
+///
+/// The `#[cfg(test)]` *helper* partway down is the trap: cutting at the first
+/// `#[cfg(test)]` rather than at the test module hid 2 450 of `blit_exec.rs`'s
+/// lines, and with them every slug the file writes.
 #[test]
-fn the_call_site_extractor_reads_constructed_reasons_and_skips_forwarded_ones() {
-    let src = r#"
-fn br(status: BlitStatus, reason: &'static str) -> BlitStatus { status }
-
-fn a() -> FenceStatus {
-    return FenceStatus::Unsupported("fence_domain_unknown");
-}
-fn b() -> FenceStatus {
-    refused(
-        FenceStatus::Unsupported("event_plan_invalid"),
-        r,
-        |e| e.field("task", t),
-    )
-}
-fn c(why: &'static str) -> FenceStatus { FenceStatus::Unsupported(why) }
-"#;
-    let got = slugs_passed_to(&production_source(src), "FenceStatus::Unsupported(");
-    assert_eq!(
-        got,
-        vec!["fence_domain_unknown", "event_plan_invalid"],
-        "a forwarded `why` is delegation, not vocabulary"
-    );
-
-    // The side-channel shape: the slug is the *second* argument, and the `fn br`
-    // signature above must contribute nothing despite matching `br(`.
-    let channel = r#"
-fn br(status: BlitStatus, reason: &'static str) -> BlitStatus { status }
-fn d() -> BlitStatus {
-    if x { return br(BlitStatus::Bounds, "fill_out_of_range"); }
-    y.ok_or_else(|| br(BlitStatus::Capacity, "copy_region_src_row_overflow"))?;
-    z.map_err(|e| br(BlitStatus::Unsupported, e.slug()))?
-}
-"#;
-    assert_eq!(
-        slugs_passed_to(&production_source(channel), "br("),
-        vec!["fill_out_of_range", "copy_region_src_row_overflow"],
-        "the definition and the delegating site must both contribute nothing"
-    );
-
-    // A doc comment demonstrating the call, and a test constructing a made-up
-    // reason, would each register a slug the crate never writes. The
-    // `#[cfg(test)]` *helper* partway down is the trap: cutting at the first
-    // `#[cfg(test)]` rather than at the test module hid 2450 of `blit_exec.rs`'s
-    // lines, and with them every slug the file writes.
+fn production_source_hides_prose_and_test_modules_but_not_what_follows_them() {
     let noise = r#"
-/// Refuse with br(BlitStatus::Bounds, "doc_example_only").
-fn e() -> BlitStatus { br(BlitStatus::Bounds, "real_reason") }
+/// Refuses with `Self::A => "doc_example_only"`.
+impl Decline for A {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::A => "real_reason",
+        }
+    }
+}
 
 #[cfg(test)]
 fn reset_dedup_for_test() {}
 
-fn g() -> BlitStatus { br(BlitStatus::Bounds, "reason_below_the_helper") }
+impl Decline for B {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::B => "reason_below_the_helper",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    fn f() -> BlitStatus { br(BlitStatus::Bounds, "test_only_reason") }
+    impl Decline for T {
+        fn slug(&self) -> &'static str {
+            match self {
+                Self::T => "test_only_reason",
+            }
+        }
+    }
 }
 
-fn h() -> BlitStatus { br(BlitStatus::Bounds, "reason_below_the_test_module") }
+impl Decline for C {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::C => "reason_below_the_test_module",
+        }
+    }
+}
 "#;
+    let kept = production_source(noise);
     assert_eq!(
-        slugs_passed_to(&production_source(noise), "br("),
+        slugs_returned_by(&kept),
         vec![
             "real_reason",
             "reason_below_the_helper",
             "reason_below_the_test_module"
         ],
-        "neither a cfg(test) helper nor a mid-file test module may hide \
-         later production vocabulary"
+        "neither a doc comment, a cfg(test) helper nor a mid-file test module may \
+         hide or contribute vocabulary"
     );
-}
-
-/// The census: how much of the crate's refusal surface is typed and registered.
-///
-/// This is a **baseline, not a target**. The audit that opened this phase
-/// counted 21 error/decline types of which 5 carried a `slug()`; the rest could
-/// not be grepped by name, counted, or exhaustively tested. Each phase that
-/// migrates a type moves this number up and updates it in the same commit, so
-/// the remaining silent surface stays a written figure rather than a vibe.
-#[test]
-fn the_registry_is_what_the_last_migration_recorded() {
-    let types = REGISTRY.len();
-    let slugs: usize = REGISTRY.iter().map(|c| c.slugs.len()).sum();
-    assert_eq!(
-        (types, slugs),
-        (68, 1734),
-        "the decline registry moved; update this baseline in the same commit \
-         that moves it, and say which way in the journal"
-    );
-}
-
-/// The staged list is the counted remainder of the migration. It may shrink,
-/// never grow: a new payload-free decline must be typed, not appended here.
-#[test]
-fn the_staged_decline_backlog_only_shrinks() {
-    assert!(
-        STAGED.is_empty(),
-        "STAGED grew to {} — a new decline type must name its reason, in the \
-         variant or at its call sites, rather than join the backlog",
-        STAGED.len()
-    );
-    for (file, name, why) in STAGED {
-        assert!(
-            !why.is_empty(),
-            "{file}: {name} must say how many checks its Unsupported hides"
-        );
-    }
 }
 
 /// Pin both halves of the typed draw-error surface: an unused compatibility
@@ -1051,53 +885,6 @@ fn draw_error_has_no_untyped_carrier_or_constructors() {
     }
 }
 
-/// A registry row that lists a slug the type cannot produce, or omits one it
-/// can, is a census that lies. Checked against the real `slug()` for every
-/// constructible variant.
-#[test]
-fn the_registry_lists_exactly_the_slugs_backend_error_produces() {
-    use crate::backend::{BackendError, BackendKind, BackendOp};
-    use crate::observe::Decline;
-
-    const OPS: &[BackendOp] = &[
-        BackendOp::WriteTexture,
-        BackendOp::ReadTexture,
-        BackendOp::SetPipelineLibrary,
-        BackendOp::ExecuteBlit,
-        BackendOp::ExecuteCompute,
-        BackendOp::ExecuteRender,
-        BackendOp::RenderDraw,
-        BackendOp::Present,
-        BackendOp::EncodeSimpleDraw,
-    ];
-    let mut produced: Vec<&'static str> = OPS
-        .iter()
-        .map(|op| BackendError::Unsupported(*op, BackendKind::Vulkan).slug())
-        .collect();
-    for e in [
-        BackendError::InvalidArgument,
-        BackendError::ResourceMissing,
-        BackendError::ShaderError,
-        BackendError::DeviceLost,
-        BackendError::Other("x"),
-    ] {
-        produced.push(e.slug());
-    }
-    produced.sort_unstable();
-
-    let row = REGISTRY
-        .iter()
-        .find(|c| c.type_name == "BackendError")
-        .expect("BackendError is registered");
-    let mut listed = row.slugs.to_vec();
-    listed.sort_unstable();
-
-    assert_eq!(
-        produced, listed,
-        "BackendError's registry row is out of date"
-    );
-}
-
 /// Not every payload-free `Unsupported` is a defect, and the difference is
 /// worth stating rather than assuming.
 ///
@@ -1120,42 +907,24 @@ const PERMANENT: &[(&str, &str, &str)] = &[
         "a capability rung: the device does not offer the feature. caps/gate \
          governs it, and the decline is named at the sampler binding site",
     ),
+    (
+        "runtime/blit_exec.rs",
+        "BlitStatus",
+        "the reason lives at the construction site, not in the variant: all 177 \
+         of this rail's refusals are written `br(BlitStatus::Unsupported, \
+         \"slug\")`, so a payload would only duplicate that channel",
+    ),
 ];
-
-/// Genuine declines whose `Unsupported` still collapses several checks.
-/// **This list may only shrink.** Each row names how many distinct checks it
-/// currently hides, which is the size of the diagnostic gap.
-///
-/// Empty: every genuine decline now names its check, either in the variant's
-/// payload or through a registered call-site vocabulary. Kept rather than deleted
-/// because `the_staged_decline_backlog_only_shrinks` pins it at zero, so the
-/// backlog cannot reopen without someone editing that pin.
-const STAGED: &[(&str, &str, &str)] = &[];
 
 /// A payload-free `Unsupported`-shaped variant is the defect the ground rules
 /// name by example. Catching it by scan rather than by memory is what stops it
 /// being reintroduced the next time an enum grows a catch-all.
 #[test]
 fn no_error_enum_carries_a_payload_free_unsupported() {
-    // A third exemption, and unlike the two lists above it is *derived* rather
-    // than asserted: a type whose registry row names `slug_calls` writes its
-    // reason at the construction sites, and `every_row_lists_exactly_the_slugs_
-    // its_type_writes` checks that the row and those sites agree. So the crate
-    // can already say which check refused — provably, for all 177 of
-    // `BlitStatus`'s — and a payload would only duplicate the channel.
-    //
-    // Deriving it matters: a hand-written exemption would also excuse a type that
-    // *stopped* naming its reasons, whereas this one evaporates the moment the
-    // row loses its `slug_calls`.
-    let names_its_reasons_at_call_sites = |name: &str| {
-        REGISTRY
-            .iter()
-            .any(|c| c.type_name == name && !c.slug_calls.is_empty())
-    };
     let allowed = |rel: &str, name: &str| {
-        PERMANENT.iter().any(|(f, e, _)| *f == rel && *e == name)
-            || STAGED.iter().any(|(f, e, _)| *f == rel && *e == name)
-            || names_its_reasons_at_call_sites(name)
+        PERMANENT
+            .iter()
+            .any(|(file, enum_name, _)| *file == rel && *enum_name == name)
     };
     let mut bare: Vec<String> = Vec::new();
     for path in rust_files(&crate_src()) {
@@ -1199,7 +968,7 @@ fn no_error_enum_carries_a_payload_free_unsupported() {
     assert!(
         bare.is_empty(),
         "a payload-free Unsupported cannot say which check refused — give it a \
-         reason type, as BackendError and DrawError have:\n  {}",
+         reason type, as DrawError does:\n  {}",
         bare.join("\n  ")
     );
 }
@@ -1223,6 +992,24 @@ fn the_scanner_walks_the_whole_crate() {
         assert!(
             files.iter().any(|p| p.ends_with(expect)),
             "scanner never reached {expect}"
+        );
+    }
+}
+
+/// A row exempting a type must name a file that exists and say why. An exemption
+/// pointing at a moved or deleted file excuses nothing and hides the next one.
+#[test]
+fn every_permanent_exemption_names_a_live_file_and_a_reason() {
+    for (file, enum_name, why) in PERMANENT {
+        assert!(
+            !why.is_empty(),
+            "{file}: {enum_name} must say why it is exempt"
+        );
+        let src = std::fs::read_to_string(crate_src().join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(
+            src.contains(enum_name),
+            "{file} no longer defines {enum_name}; drop the exemption"
         );
     }
 }

@@ -78,63 +78,6 @@ pub enum ComputeExecutionDecline {
         arrayed: bool,
         volume: bool,
     },
-    DirectWritebackCapabilityLost {
-        binding: u32,
-    },
-    DirectWritebackShapeMismatch {
-        binding: u32,
-        layers: u32,
-        one_dim: bool,
-        arrayed: bool,
-        volume: bool,
-    },
-    DirectWritebackRowBytesNotTexelAligned {
-        binding: u32,
-        row_bytes: u32,
-        texel_bytes: u64,
-    },
-    DirectWritebackRowBytesTooShort {
-        binding: u32,
-        row_bytes: u32,
-        minimum_row_bytes: u64,
-    },
-    DirectWritebackBufferOffsetNotTexelAligned {
-        binding: u32,
-        buffer_offset: u64,
-        texel_bytes: u64,
-    },
-    DirectWritebackBufferOffsetNotFourAligned {
-        binding: u32,
-        buffer_offset: u64,
-    },
-    DirectWritebackNullPointer {
-        binding: u32,
-    },
-    DirectWritebackPointerMisaligned {
-        binding: u32,
-        pointer: usize,
-        alignment: u64,
-    },
-    DirectWritebackRowStartOverflow {
-        binding: u32,
-        buffer_offset: u64,
-        last_row_offset: u64,
-    },
-    DirectWritebackRequiredSpanOverflow {
-        binding: u32,
-        last_row_start: u64,
-        row_bytes_required: u64,
-    },
-    DirectWritebackImportSizeOverflow {
-        binding: u32,
-        required_bytes: u64,
-        alignment: u64,
-    },
-    DirectWritebackWindowTooShort {
-        binding: u32,
-        window_bytes: usize,
-        import_bytes: u64,
-    },
 }
 
 impl Decline for ComputeExecutionDecline {
@@ -170,42 +113,6 @@ impl Decline for ComputeExecutionDecline {
             }
             Self::ResidentAllocatorLiveSlotMissing { .. } => {
                 "vk_compute_exec_resident_allocator_live_slot_missing"
-            }
-            Self::DirectWritebackCapabilityLost { .. } => {
-                "vk_compute_exec_direct_writeback_capability_lost"
-            }
-            Self::DirectWritebackShapeMismatch { .. } => {
-                "vk_compute_exec_direct_writeback_shape_mismatch"
-            }
-            Self::DirectWritebackRowBytesNotTexelAligned { .. } => {
-                "vk_compute_exec_direct_writeback_row_bytes_not_texel_aligned"
-            }
-            Self::DirectWritebackRowBytesTooShort { .. } => {
-                "vk_compute_exec_direct_writeback_row_bytes_too_short"
-            }
-            Self::DirectWritebackBufferOffsetNotTexelAligned { .. } => {
-                "vk_compute_exec_direct_writeback_buffer_offset_not_texel_aligned"
-            }
-            Self::DirectWritebackBufferOffsetNotFourAligned { .. } => {
-                "vk_compute_exec_direct_writeback_buffer_offset_not_four_aligned"
-            }
-            Self::DirectWritebackNullPointer { .. } => {
-                "vk_compute_exec_direct_writeback_null_pointer"
-            }
-            Self::DirectWritebackPointerMisaligned { .. } => {
-                "vk_compute_exec_direct_writeback_pointer_misaligned"
-            }
-            Self::DirectWritebackRowStartOverflow { .. } => {
-                "vk_compute_exec_direct_writeback_row_start_overflow"
-            }
-            Self::DirectWritebackRequiredSpanOverflow { .. } => {
-                "vk_compute_exec_direct_writeback_required_span_overflow"
-            }
-            Self::DirectWritebackImportSizeOverflow { .. } => {
-                "vk_compute_exec_direct_writeback_import_size_overflow"
-            }
-            Self::DirectWritebackWindowTooShort { .. } => {
-                "vk_compute_exec_direct_writeback_window_too_short"
             }
         }
     }
@@ -322,102 +229,6 @@ impl Decline for ComputeExecutionDecline {
                 ]);
                 fields
             }
-            Self::DirectWritebackCapabilityLost { binding }
-            | Self::DirectWritebackNullPointer { binding } => {
-                vec![("binding", binding.to_string())]
-            }
-            Self::DirectWritebackShapeMismatch {
-                binding,
-                layers,
-                one_dim,
-                arrayed,
-                volume,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("layers", layers.to_string()),
-                ("one_dim", one_dim.to_string()),
-                ("arrayed", arrayed.to_string()),
-                ("volume", volume.to_string()),
-            ],
-            Self::DirectWritebackRowBytesNotTexelAligned {
-                binding,
-                row_bytes,
-                texel_bytes,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("row_bytes", row_bytes.to_string()),
-                ("texel_bytes", texel_bytes.to_string()),
-            ],
-            Self::DirectWritebackRowBytesTooShort {
-                binding,
-                row_bytes,
-                minimum_row_bytes,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("row_bytes", row_bytes.to_string()),
-                ("minimum_row_bytes", minimum_row_bytes.to_string()),
-            ],
-            Self::DirectWritebackBufferOffsetNotTexelAligned {
-                binding,
-                buffer_offset,
-                texel_bytes,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("buffer_offset", buffer_offset.to_string()),
-                ("texel_bytes", texel_bytes.to_string()),
-            ],
-            Self::DirectWritebackBufferOffsetNotFourAligned {
-                binding,
-                buffer_offset,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("buffer_offset", buffer_offset.to_string()),
-            ],
-            Self::DirectWritebackPointerMisaligned {
-                binding,
-                pointer,
-                alignment,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("pointer", format!("{pointer:#x}")),
-                ("alignment", alignment.to_string()),
-            ],
-            Self::DirectWritebackRowStartOverflow {
-                binding,
-                buffer_offset,
-                last_row_offset,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("buffer_offset", buffer_offset.to_string()),
-                ("last_row_offset", last_row_offset.to_string()),
-            ],
-            Self::DirectWritebackRequiredSpanOverflow {
-                binding,
-                last_row_start,
-                row_bytes_required,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("last_row_start", last_row_start.to_string()),
-                ("row_bytes_required", row_bytes_required.to_string()),
-            ],
-            Self::DirectWritebackImportSizeOverflow {
-                binding,
-                required_bytes,
-                alignment,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("required_bytes", required_bytes.to_string()),
-                ("alignment", alignment.to_string()),
-            ],
-            Self::DirectWritebackWindowTooShort {
-                binding,
-                window_bytes,
-                import_bytes,
-            } => vec![
-                ("binding", binding.to_string()),
-                ("window_bytes", window_bytes.to_string()),
-                ("import_bytes", import_bytes.to_string()),
-            ],
         }
     }
 }
@@ -453,15 +264,7 @@ pub(super) fn residency_fields(
     ]
 }
 
-impl std::fmt::Display for ComputeExecutionDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(ComputeExecutionDecline);
 
 #[cfg(test)]
 mod tests {
@@ -549,59 +352,6 @@ mod tests {
                 arrayed: false,
                 volume: false,
             },
-            ComputeExecutionDecline::DirectWritebackCapabilityLost { binding: 34 },
-            ComputeExecutionDecline::DirectWritebackShapeMismatch {
-                binding: 34,
-                layers: 2,
-                one_dim: false,
-                arrayed: true,
-                volume: false,
-            },
-            ComputeExecutionDecline::DirectWritebackRowBytesNotTexelAligned {
-                binding: 34,
-                row_bytes: 257,
-                texel_bytes: 4,
-            },
-            ComputeExecutionDecline::DirectWritebackRowBytesTooShort {
-                binding: 34,
-                row_bytes: 128,
-                minimum_row_bytes: 256,
-            },
-            ComputeExecutionDecline::DirectWritebackBufferOffsetNotTexelAligned {
-                binding: 34,
-                buffer_offset: 3,
-                texel_bytes: 4,
-            },
-            ComputeExecutionDecline::DirectWritebackBufferOffsetNotFourAligned {
-                binding: 34,
-                buffer_offset: 2,
-            },
-            ComputeExecutionDecline::DirectWritebackNullPointer { binding: 34 },
-            ComputeExecutionDecline::DirectWritebackPointerMisaligned {
-                binding: 34,
-                pointer: 0x1001,
-                alignment: 4096,
-            },
-            ComputeExecutionDecline::DirectWritebackRowStartOverflow {
-                binding: 34,
-                buffer_offset: u64::MAX,
-                last_row_offset: 4,
-            },
-            ComputeExecutionDecline::DirectWritebackRequiredSpanOverflow {
-                binding: 34,
-                last_row_start: u64::MAX,
-                row_bytes_required: 4,
-            },
-            ComputeExecutionDecline::DirectWritebackImportSizeOverflow {
-                binding: 34,
-                required_bytes: u64::MAX - 3,
-                alignment: 8,
-            },
-            ComputeExecutionDecline::DirectWritebackWindowTooShort {
-                binding: 34,
-                window_bytes: 4095,
-                import_bytes: 4096,
-            },
         ]
     }
 
@@ -619,7 +369,13 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 23, "the compute executor's reason census moved");
+        // Down from 23: twelve `direct_writeback_*` checks went out with the
+        // GPU-direct compute writeback. Every one of them validated the shape
+        // of a caller-supplied guest window the dispatch would DMA into —
+        // alignment, row stride, offset, overflow, window length — and none of
+        // them has anything left to validate now that the copy always lands in
+        // a pooled readback the runtime owns.
+        assert_eq!(before, 11, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 
@@ -654,98 +410,5 @@ mod tests {
                 ("residency_texture_ref", "11".into()),
             ]
         );
-    }
-
-    #[test]
-    fn direct_writeback_declines_preserve_the_failed_contract_values() {
-        let cases = [
-            (
-                ComputeExecutionDecline::DirectWritebackShapeMismatch {
-                    binding: 34,
-                    layers: 2,
-                    one_dim: false,
-                    arrayed: true,
-                    volume: false,
-                },
-                vec!["binding=34", "layers=2", "arrayed=true"],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackRowBytesNotTexelAligned {
-                    binding: 35,
-                    row_bytes: 257,
-                    texel_bytes: 4,
-                },
-                vec!["binding=35", "row_bytes=257", "texel_bytes=4"],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackRowBytesTooShort {
-                    binding: 36,
-                    row_bytes: 128,
-                    minimum_row_bytes: 256,
-                },
-                vec!["binding=36", "row_bytes=128", "minimum_row_bytes=256"],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackPointerMisaligned {
-                    binding: 37,
-                    pointer: 0x1001,
-                    alignment: 4096,
-                },
-                vec!["binding=37", "pointer=0x1001", "alignment=4096"],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackRowStartOverflow {
-                    binding: 38,
-                    buffer_offset: u64::MAX,
-                    last_row_offset: 16,
-                },
-                vec![
-                    "binding=38",
-                    "buffer_offset=18446744073709551615",
-                    "last_row_offset=16",
-                ],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackRequiredSpanOverflow {
-                    binding: 39,
-                    last_row_start: u64::MAX,
-                    row_bytes_required: 16,
-                },
-                vec![
-                    "binding=39",
-                    "last_row_start=18446744073709551615",
-                    "row_bytes_required=16",
-                ],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackImportSizeOverflow {
-                    binding: 40,
-                    required_bytes: u64::MAX - 3,
-                    alignment: 8,
-                },
-                vec![
-                    "binding=40",
-                    "required_bytes=18446744073709551612",
-                    "alignment=8",
-                ],
-            ),
-            (
-                ComputeExecutionDecline::DirectWritebackWindowTooShort {
-                    binding: 41,
-                    window_bytes: 4095,
-                    import_bytes: 4096,
-                },
-                vec!["binding=41", "window_bytes=4095", "import_bytes=4096"],
-            ),
-        ];
-        for (decline, expected_fields) in cases {
-            let line = crate::observe::Emit::decline("compute_direct_writeback", &decline).render();
-            for field in expected_fields {
-                assert!(
-                    line.split_ascii_whitespace().any(|word| word == field),
-                    "{line}"
-                );
-            }
-        }
     }
 }

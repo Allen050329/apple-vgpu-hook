@@ -1,8 +1,9 @@
-//! Direct host-Metal backend: pure-Rust encode + `reims_vgpu_backend_*` C ABI.
+//! Direct host-Metal backend: pure-Rust Metal encode driven from `runtime/`.
 //!
-//! On Apple hosts this is the full MTL encode path. On non-Apple hosts
-//! (`host_stub`) the same types exist so `backend-metal` still builds and
-//! links; encode stays fail-closed until a real host Metal rail lands.
+//! macOS only. `backend-metal` on any other target is rejected by the
+//! `compile_error!` in `lib.rs`, so there is no non-Apple arm of this module
+//! and every `target_os = "macos"` gate below is a statement of that fact
+//! rather than a branch.
 
 pub mod abi;
 mod constants;
@@ -21,9 +22,6 @@ mod cache;
 pub(crate) mod compute;
 #[cfg(target_os = "macos")]
 mod device;
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-pub mod ffi;
 #[cfg(target_os = "macos")]
 pub(crate) mod format;
 #[cfg(target_os = "macos")]
@@ -45,36 +43,3 @@ pub(crate) mod util;
 
 #[cfg(target_os = "macos")]
 pub use device::{system_device_name, MetalBackend, MetalRuntime};
-
-/// C ABI declarations for tests / external callers (defs in [`ffi`]).
-#[cfg(target_os = "macos")]
-pub mod c_abi {
-    use super::abi::*;
-    use std::os::raw::c_char;
-
-    extern "C" {
-        pub fn reims_vgpu_backend_begin_native_color_format(pixel_format: u32);
-        pub fn reims_vgpu_backend_end_native_color_format();
-        pub fn reims_vgpu_backend_metal_cache_stats(out: *mut ReimsVgpuMetalCacheStats);
-        pub fn reims_vgpu_backend_metal_cache_stats_reset();
-        pub fn reims_vgpu_backend_dispatch_compute_mtlb(
-            mtlb: *const u8,
-            mtlb_len: usize,
-            buffers: *mut ReimsVgpuBuffer,
-            buffer_count: usize,
-            grid_x: u32,
-            err: *mut c_char,
-            err_cap: usize,
-        ) -> i32;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Non-Apple: host stub (same public names; encode unsupported)
-// ---------------------------------------------------------------------------
-
-#[cfg(not(target_os = "macos"))]
-mod host_stub;
-
-#[cfg(not(target_os = "macos"))]
-pub use host_stub::{c_abi, runtime, system_device_name, MetalBackend, MetalRuntime};

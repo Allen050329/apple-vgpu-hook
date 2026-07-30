@@ -20,13 +20,27 @@ use reims_vgpu::backend::vulkan::engine::{
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-fn engine_test_lock() -> &'static Mutex<()> {
+/// Acquire the process-global engine lock **and** reset the engine, in that
+/// order. Every engine-touching test must start from a fresh context:
+/// `device_loss_named_and_recreate_bounded` deliberately drives the
+/// device-recreate budget to its cap and leaves it there, which is the correct
+/// product behaviour — the cap is a permanent give-up, not a per-draw counter.
+/// A test that acquires the lock without resetting therefore inherits an engine
+/// that refuses every draw with `recreate_cap_exhausted`. Handing the guard out
+/// only from a function that has already reset makes that omission unwritable,
+/// rather than a rule about call order that the next test can forget.
+fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| {
-        // Never share the live product logs with a concurrent boot.
-        reims_vgpu::observe::redirect_logs_for_tests();
-        Mutex::new(())
-    })
+    let guard = LOCK
+        .get_or_init(|| {
+            // Never share the live product logs with a concurrent boot.
+            reims_vgpu::observe::redirect_logs_for_tests();
+            Mutex::new(())
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    engine::test_reset_engine();
+    guard
 }
 
 fn fixtures() -> PathBuf {
@@ -89,6 +103,27 @@ fn near(got: u8, want: u8) -> bool {
     (got as i32 - want as i32).abs() <= 1
 }
 
+/// A draw's pixels in semantic RGBA8, whatever physical order the attachment
+/// read back in.
+///
+/// The engine picks the attachment format from the resolved target — a
+/// `TargetIdentity::Surface` resident is `B8G8R8A8_UNORM` so a type-11 composite
+/// Store's readback lands in guest scanout order with no CPU pass — and reports
+/// which it used in `DrawOutput::pixels_bgra`. These cases assert *colour*, not
+/// byte layout, so they normalize here from the reported order rather than
+/// assuming one. The physical contract has its own case
+/// (`a_surface_resident_reads_back_in_guest_scanout_order`); assuming an order
+/// here would let this whole suite silently follow the engine.
+fn semantic_rgba(out: &engine::DrawOutput) -> Vec<u8> {
+    let mut px = out.pixels.clone();
+    if out.pixels_bgra {
+        for p in px.chunks_exact_mut(4) {
+            p.swap(0, 2);
+        }
+    }
+    px
+}
+
 fn assert_fullscreen_fragment_color(label: &str, px: &[u8], w: u32, h: u32) {
     assert_eq!(px.len(), (w * h * 4) as usize, "{label}: readback size");
     let i = ((h / 2) * w + w / 2) as usize * 4;
@@ -106,7 +141,7 @@ fn assert_fullscreen_fragment_color(label: &str, px: &[u8], w: u32, h: u32) {
 
 fn draw_or_skip(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
     match engine::execute_draw_request(req) {
-        Ok(o) => Some(o.pixels),
+        Ok(o) => Some(semantic_rgba(&o)),
         Err(e) => {
             let s = e.to_string();
             if skip_if_no_gpu(&s) {
@@ -121,8 +156,7 @@ fn draw_or_skip(label: &str, req: &DrawRequest) -> Option<Vec<u8>> {
 
 #[test]
 fn plain_triangle_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
     if let Some(px) = draw_or_skip("plain_triangle", &req) {
@@ -132,8 +166,7 @@ fn plain_triangle_known_color() {
 
 #[test]
 fn viewport_scissor_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 32, 32);
     req.viewports.push(ViewportResource {
@@ -169,8 +202,7 @@ fn triangle_covered(px: &[u8], w: u32, h: u32) -> bool {
 /// actually applied AND the front-facing winding selects the right face.
 #[test]
 fn cull_mode_honored_and_winding_correct() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
 
@@ -226,8 +258,7 @@ fn cull_mode_honored_and_winding_correct() {
 /// the wiring without depending on the exact depth compare operand order.
 #[test]
 fn depth_test_honored_compare_and_clear_wired() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
@@ -281,6 +312,7 @@ fn depth_test_honored_compare_and_clear_wired() {
             arrayed: false,
             volume: false,
             cube: false,
+            one_dim: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
@@ -343,8 +375,7 @@ fn depth_test_honored_compare_and_clear_wired() {
 /// green channel discriminator survives the R/B swap (index 1 unchanged).
 #[test]
 fn depth_test_honored_on_resident_target_path() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
@@ -407,6 +438,7 @@ fn depth_test_honored_on_resident_target_path() {
             arrayed: false,
             volume: false,
             cube: false,
+            one_dim: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
@@ -429,7 +461,9 @@ fn depth_test_honored_on_resident_target_path() {
             }
             Err(e) => panic!("resident depth draw: {e}"),
         }
-        let px = engine::read_target(&identity).expect("read resident depth target");
+        let px = engine::read_target(&identity)
+            .expect("read resident depth target")
+            .into_rgba8();
         Some(triangle_covered(&px, w, h))
     };
 
@@ -473,8 +507,7 @@ fn depth_test_honored_on_resident_target_path() {
 /// observe and are the documented follow-up gap.
 #[test]
 fn stencil_test_honored_compare_ref_and_clear_wired() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
@@ -538,6 +571,7 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
             arrayed: false,
             volume: false,
             cube: false,
+            one_dim: false,
             source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
@@ -592,12 +626,11 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
 
 #[test]
 fn load_seed_preserves_uncovered_and_draws() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     // Fullscreen triangle covers everything; seed is Load base then overdrawn.
-    req.target_rgba8 = Some([10, 20, 30, 255].repeat(8 * 8));
+    req.target_rgba8 = Some(std::sync::Arc::new([10, 20, 30, 255].repeat(8 * 8)));
     if let Some(px) = draw_or_skip("load_seed", &req) {
         assert_fullscreen_fragment_color("load_seed", &px, 8, 8);
     }
@@ -605,11 +638,10 @@ fn load_seed_preserves_uncovered_and_draws() {
 
 #[test]
 fn blend_src_alpha_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
-    req.target_rgba8 = Some([0, 0, 0, 255].repeat(8 * 8));
+    req.target_rgba8 = Some(std::sync::Arc::new([0, 0, 0, 255].repeat(8 * 8)));
     req.blend = Some(BlendStateResource {
         src_color: BlendFactor::SrcAlpha,
         dst_color: BlendFactor::OneMinusSrcAlpha,
@@ -627,8 +659,7 @@ fn blend_src_alpha_known_color() {
 
 #[test]
 fn indexed_u16_known_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 16, 16);
     req.indexed = Some(IndexedDrawResource {
@@ -650,8 +681,7 @@ fn indexed_u16_known_color() {
 
 #[test]
 fn storage_buffer_binding_still_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.storage_buffers.push(StorageBufferResource {
@@ -659,7 +689,7 @@ fn storage_buffer_binding_still_renders() {
         content: vec![0u8; 64].into(),
     });
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("storage", &o.pixels, 8, 8),
+        Ok(o) => assert_fullscreen_fragment_color("storage", &semantic_rgba(&o), 8, 8),
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP storage: {e}"),
         Err(e) => {
             // Unused binding may fail pipeline create on some SPIR-V/ICD combos — named only.
@@ -675,8 +705,7 @@ fn storage_buffer_binding_still_renders() {
 
 #[test]
 fn sampled_and_sampler_still_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -687,6 +716,7 @@ fn sampled_and_sampler_still_renders() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
@@ -697,7 +727,7 @@ fn sampled_and_sampler_still_renders() {
     req.samplers.push(SamplerResource::normalized_default(2));
     match engine::execute_draw_request(&req) {
         Ok(o) => {
-            assert_fullscreen_fragment_color("sampled", &o.pixels, 8, 8);
+            assert_fullscreen_fragment_color("sampled", &semantic_rgba(&o), 8, 8);
             let warm_before = engine::counter_snapshot();
             let warm = engine::execute_draw_request(&req).expect("exact sampled cache hit");
             assert_eq!(warm.pixels, o.pixels, "cache hit must preserve draw bytes");
@@ -763,13 +793,74 @@ fn sampled_and_sampler_still_renders() {
     }
 }
 
+/// An unchanging sampled texture uploads exactly once, no matter how many
+/// draws follow.
+///
+/// Cache admission is parked on a ring slot's deferred cleanup, so this is the
+/// gate on *when* that cleanup runs. Retiring only the slot about to be reused
+/// held every admission until the ring wrapped, which re-uploaded and
+/// re-allocated the same bytes for `RING_DEPTH - 1` draws. The two-draw tests
+/// above cannot see that: they pass as soon as one extra slot is reaped. This
+/// one drives more draws than the ring is deep, so it fails for any policy that
+/// does not reap the whole signaled run.
+#[test]
+fn sampled_upload_happens_once_across_more_draws_than_the_ring_is_deep() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let mut req = engine_req(&v, &f, 8, 8);
+    req.sampled_images.push(SampledImageResource {
+        binding: 1,
+        width: 2,
+        height: 2,
+        layers: 1,
+        arrayed: false,
+        volume: false,
+        cube: false,
+        one_dim: false,
+        source: SampledSource::Bytes(std::sync::Arc::new(vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ])),
+        format: ash::vk::Format::R8G8B8A8_UNORM,
+        identity: None,
+        swizzle: Default::default(),
+    });
+    req.samplers.push(SamplerResource::normalized_default(2));
+
+    // Comfortably past RING_DEPTH so the ring wraps several times.
+    const DRAWS: u32 = 24;
+    let before = engine::counter_snapshot();
+    match engine::execute_draw_request(&req) {
+        Ok(first) => {
+            for _ in 1..DRAWS {
+                let out = engine::execute_draw_request(&req).expect("repeat sampled draw");
+                assert_eq!(out.pixels, first.pixels, "every redraw is byte-identical");
+            }
+            let d = engine::counter_snapshot().delta_since(&before);
+            assert_eq!(
+                d.sampled_reuploads, 1,
+                "one upload for {DRAWS} identical draws: {d:?}"
+            );
+            assert_eq!(
+                d.sampled_cache_hits,
+                u64::from(DRAWS - 1),
+                "every draw after the first is served by the cache: {d:?}"
+            );
+            assert_eq!(
+                d.sampled_cache_misses, 1,
+                "only the cold draw misses: {d:?}"
+            );
+        }
+        Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP sampled ring reuse: {e}"),
+        Err(e) => panic!("unexpected sampled path error: {e}"),
+    }
+}
+
 /// A resident type-11 sample stays on the GPU: no source readback, staging
 /// upload, or temporary sampled image. The tracked layout must still permit a
 /// later LoadFromTarget draw on the source identity.
 #[test]
 fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let source = TargetIdentity::Surface {
         id: 0x51,
@@ -781,7 +872,9 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     let mut make_source = engine_req(&v, &f, 16, 16);
     make_source.target_identity = Some(source.clone());
     match engine::execute_draw_request(&make_source) {
-        Ok(o) => assert_fullscreen_fragment_color("resident_sample_source", &o.pixels, 16, 16),
+        Ok(o) => {
+            assert_fullscreen_fragment_color("resident_sample_source", &semantic_rgba(&o), 16, 16)
+        }
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP resident_sample_bind: {e}");
             return;
@@ -798,6 +891,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Target(source.clone()),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
@@ -806,7 +900,12 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
     let consumed = engine::execute_draw_request(&consume).expect("bind resident sample");
-    assert_fullscreen_fragment_color("resident_sample_consumer", &consumed.pixels, 16, 16);
+    assert_fullscreen_fragment_color(
+        "resident_sample_consumer",
+        &semantic_rgba(&consumed),
+        16,
+        16,
+    );
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(delta.sampled_gpu_binds, 1, "direct-bind proxy: {delta:?}");
     assert_eq!(delta.sampled_reuploads, 0, "no sampled reupload: {delta:?}");
@@ -819,15 +918,14 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
     load_again.target_identity = Some(source.clone());
     load_again.load_op = Some(LoadOp::LoadFromTarget);
     let loaded = engine::execute_draw_request(&load_again).expect("load after direct sample");
-    assert_fullscreen_fragment_color("resident_sample_reloaded", &loaded.pixels, 16, 16);
+    assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
 }
 
 /// Attachment feedback is represented as a GPU snapshot, matching Metal's
 /// prior-content sampling without binding one image for read and write at once.
 #[test]
 fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 0x52,
@@ -857,6 +955,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Target(identity),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
@@ -865,7 +964,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
     engine::reset_draw_counters();
     let before = engine::counter_snapshot();
     let out = engine::execute_draw_request(&alias).expect("resident alias GPU snapshot");
-    assert_fullscreen_fragment_color("resident_sample_alias", &out.pixels, 16, 16);
+    assert_fullscreen_fragment_color("resident_sample_alias", &semantic_rgba(&out), 16, 16);
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(delta.sampled_gpu_binds, 1, "GPU snapshot proxy: {delta:?}");
     assert_eq!(delta.sampled_reuploads, 0, "no host reupload: {delta:?}");
@@ -874,8 +973,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
 
 #[test]
 fn vertex_float2_attr_still_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.vertex_attributes.push(VertexAttributeResource {
@@ -889,7 +987,7 @@ fn vertex_float2_attr_still_renders() {
         content: vec![0u8; 24].into(),
     });
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("attr", &o.pixels, 8, 8),
+        Ok(o) => assert_fullscreen_fragment_color("attr", &semantic_rgba(&o), 8, 8),
         Err(e) if skip_if_no_gpu(&e.to_string()) => eprintln!("SKIP attr: {e}"),
         Err(e) => {
             let s = e.to_string();
@@ -907,8 +1005,7 @@ fn vertex_float2_attr_still_renders() {
 /// changed bytes falls back to the content-addressed path (miss + reupload).
 #[test]
 fn sampled_identity_fast_path_skips_content_compare() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 8, 8);
     req.sampled_images.push(SampledImageResource {
@@ -919,6 +1016,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Bytes(std::sync::Arc::new(vec![
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
         ])),
@@ -978,8 +1076,7 @@ fn sampled_identity_fast_path_skips_content_compare() {
 
 #[test]
 fn warm_identical_draw_zero_creates_and_allocs() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
     match engine::execute_draw_request(&req) {
@@ -1012,8 +1109,7 @@ fn warm_identical_draw_zero_creates_and_allocs() {
 
 #[test]
 fn warm_draw_byte_identical_hot_cache() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 16, 16);
     let first = match engine::execute_draw_request(&req) {
@@ -1036,8 +1132,7 @@ fn warm_draw_byte_identical_hot_cache() {
 /// Warm non-Store resident draw: zero readbacks, zero seed uploads, zero creates, zero allocs.
 #[test]
 fn warm_non_store_zero_readback_seed_create_alloc() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 42,
@@ -1051,7 +1146,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     cold.skip_readback = false;
     match engine::execute_draw_request(&cold) {
-        Ok(o) => assert_fullscreen_fragment_color("resident_cold", &o.pixels, 16, 16),
+        Ok(o) => assert_fullscreen_fragment_color("resident_cold", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP warm_non_store: {e}");
             return;
@@ -1086,88 +1181,10 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     );
     // Boundary materialization still works: read_target waits the shared
     // fence first, so it returns the exact content of the skipped-wait draw.
-    let px = engine::read_target(&identity).expect("read_target after warm");
+    let px = engine::read_target(&identity)
+        .expect("read_target after warm")
+        .into_rgba8();
     assert_fullscreen_fragment_color("read_target", &px, 16, 16);
-}
-
-/// Workstream E: present a resident target straight into imported host memory
-/// (VK_EXT_external_memory_host) — the GPU DMAs the frame into caller pages with
-/// no CPU readback copy. Off-VM stand-in for guest scanout pages: we supply our
-/// own page-aligned buffer and assert the GPU-written bytes appear through the
-/// raw pointer. Skips if the ICD lacks the extension.
-#[test]
-fn present_into_host_ptr_writes_frame_zero_copy() {
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
-    let (v, f) = triangle_spirv();
-    let w = 16u32;
-    let h = 16u32;
-    let identity = TargetIdentity::Surface {
-        id: 77,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    // Render the known triangle color into the resident target (readback so we
-    // know the GPU content is right before we test the import path).
-    let mut cold = engine_req(&v, &f, w, h);
-    cold.target_identity = Some(identity.clone());
-    cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
-    cold.skip_readback = false;
-    match engine::execute_draw_request(&cold) {
-        Ok(o) => assert_fullscreen_fragment_color("import_present_cold", &o.pixels, w, h),
-        Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP present_into_host_ptr: {e}");
-            return;
-        }
-        Err(e) => panic!("cold resident: {e}"),
-    }
-
-    // Page-aligned host buffer (guest scanout page stand-in). 64 KiB alignment
-    // dominates any driver min_imported_host_pointer_alignment (≤ page size).
-    let frame = (w * h * 4) as usize;
-    let align = 65536usize;
-    let cap = frame.div_ceil(align) * align;
-    let layout = Layout::from_size_align(cap, align).unwrap();
-    // SAFETY: non-zero layout; freed below with the same layout.
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "host alloc failed");
-
-    engine::reset_draw_counters();
-    let before = engine::counter_snapshot();
-    // SAFETY: ptr backs `cap` valid bytes, exclusive for this call.
-    let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0, false)
-    };
-    match res {
-        Ok(_) => {
-            let after = engine::counter_snapshot();
-            let d = after.delta_since(&before);
-            assert_eq!(d.import_presents, 1, "import_present counter: {d:?}");
-            assert_eq!(
-                d.readbacks, 0,
-                "import present must not do a CPU readback: {d:?}"
-            );
-            // Read the frame back through the raw host pointer — these bytes were
-            // written by the GPU with no CPU copy.
-            // SAFETY: ptr backs at least `frame` initialized bytes post-present.
-            let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
-            assert_fullscreen_fragment_color("import_present_host_ptr", seen, w, h);
-        }
-        Err(e)
-            if e.to_string().contains("external_memory_host") || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP present_into_host_ptr (unsupported): {e}");
-        }
-        Err(e) => {
-            // SAFETY: same ptr/layout from the alloc above.
-            unsafe { dealloc(ptr, layout) };
-            panic!("present_into_host_ptr: {e}");
-        }
-    }
-    // SAFETY: same ptr/layout from the alloc above.
-    unsafe { dealloc(ptr, layout) };
 }
 
 /// Deferred render Stores pin their resident target: the registry LRU sweep
@@ -1176,8 +1193,7 @@ fn present_into_host_ptr_writes_frame_zero_copy() {
 /// synchronous Store).
 #[test]
 fn pinned_resident_target_survives_registry_cap_sweep() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
 
     let absent = TargetIdentity::Surface {
@@ -1226,7 +1242,7 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     // 64 -> 320, so no eviction ever fired and the "unpinned was evicted" assert
     // below could not hold. `+16` clears the cap with margin so the oldest
     // non-pinned is definitely swept.
-    let cap = engine::cap_pressure_snapshot().registry_cap as u32;
+    let cap = engine::registry_cap() as u32;
     for i in 0..(cap + 16) {
         let mut filler = engine_req(&v, &f, 16, 16);
         filler.target_identity = Some(TargetIdentity::Surface {
@@ -1252,117 +1268,100 @@ fn pinned_resident_target_survives_registry_cap_sweep() {
     assert!(engine::resident_content_ready(&pinned));
 }
 
-/// Workstream E: a BGRA resident target lands guest scanout byte order directly
-/// (no CPU RGBA→BGRA swizzle), so import-present writes correct bytes. Same
-/// triangle as the RGBA test, but the center pixel bytes are the byte-swap:
-/// RGBA ~(64,128,191,255) stored as BGRA ~(191,128,64,255).
+/// A `output_bgra` + `skip_readback` resident draw leaves content that
+/// [`engine::read_target`] can read back twice with the same answer — the
+/// property the deleted dmabuf-export case used as its precondition, kept
+/// because nothing else in this suite reads the same resident twice.
+/// A `TargetIdentity::Surface` resident renders and reads back in guest scanout
+/// order **without the caller asking**, and says so; a pooled target does not.
+///
+/// This is the contract the type-11 composite Store rests on. That Store's
+/// consumers are all defined in BGRA — `mapping_write::write_bgra8`,
+/// `surface_cache`, the deferred window the flush reads — so when the attachment
+/// is BGRA the readback lands ready to use, and when it is not the runtime pays a
+/// whole-frame R/B exchange per Store. Measured at 776 us on a 1080p frame, 84 %
+/// of the drain worker's draw time that `draw_phase` could not attribute.
+///
+/// Both halves are asserted, and the second is the one that would rot quietly:
+/// `pixels_bgra` is what every consumer branches on, so a resident that came out
+/// BGRA while reporting `false` is a silent R/B exchange on every composite —
+/// the reported order has to be the order the bytes are actually in, not a
+/// constant that happens to agree today.
+///
+/// `output_bgra` is deliberately left unset. The point is that the *identity*
+/// carries the order, so that a composite Store, a chain intermediate and an MRT
+/// primary sharing one surface all agree without coordinating: `registry_ensure`
+/// destroys and recreates the image whenever a draw disagrees with the slot, so a
+/// per-path predicate one path spelled differently would cost a full
+/// reallocation per frame rather than a wrong colour.
 #[test]
-fn present_into_host_ptr_bgra_target_lands_guest_byte_order() {
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+fn a_surface_resident_reads_back_in_guest_scanout_order() {
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
-    let w = 16u32;
-    let h = 16u32;
-    let identity = TargetIdentity::Surface {
-        id: 78,
+    let (w, h) = (16u32, 16u32);
+    // The fragment writes semantic (64, 128, 191, 255) — asymmetric in R and B,
+    // so an omitted or doubled exchange shows rather than cancelling.
+    let i = ((h / 2) * w + w / 2) as usize * 4;
+
+    let mut resident = engine_req(&v, &f, w, h);
+    resident.target_identity = Some(TargetIdentity::Surface {
+        id: 4711,
         width: w,
         height: h,
         generation: 1,
-    };
-    // Resident BGRA target, no readback (content_ready set regardless).
-    let mut req = engine_req(&v, &f, w, h);
-    req.target_identity = Some(identity.clone());
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
-    req.output_bgra = true;
-    req.skip_readback = true;
-    match engine::execute_draw_request(&req) {
-        Ok(_) => {}
+    });
+    let out = match engine::execute_draw_request(&resident) {
+        Ok(o) => o,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP bgra import-present: {e}");
+            eprintln!("SKIP surface scanout order: {e}");
             return;
         }
-        Err(e) => panic!("bgra resident draw: {e}"),
-    }
-
-    let frame = (w * h * 4) as usize;
-    let align = 65536usize;
-    let cap = frame.div_ceil(align) * align;
-    let layout = Layout::from_size_align(cap, align).unwrap();
-    // SAFETY: non-zero layout; freed below with the same layout.
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null(), "host alloc failed");
-
-    // SAFETY: ptr backs `cap` valid bytes, exclusive for this call. measure_content
-    // exercises the GPU stats reduction the packed-contig store path uses — it
-    // must return content stats with NO full-frame CPU readback.
-    let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, 0, true)
+        Err(e) => panic!("surface resident draw: {e}"),
     };
-    match res {
-        Ok(stats) => {
-            // SAFETY: ptr backs at least `frame` initialized bytes post-present.
-            let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
-            let i = ((h / 2) * w + w / 2) as usize * 4;
-            let (b, g, r, a) = (seen[i], seen[i + 1], seen[i + 2], seen[i + 3]);
-            assert!(
-                near(b, 191) && near(g, 128) && near(r, 64) && near(a, 255),
-                "bgra import-present center BGRA=({b},{g},{r},{a}); expected ~(191,128,64,255)"
-            );
-            // GPU-computed content stats (no CPU readback): the whole 16x16
-            // resident is the fragment color, so every pixel is non-zero RGB and
-            // opaque alpha, with rgb_max at the red channel's ~191.
-            let stats = stats.expect("measure_content must return GPU stats for a bgra resident");
-            let px = (w * h) as usize;
-            assert_eq!(
-                stats.rgb_nz, px,
-                "GPU rgb_nz={} expected {px}",
-                stats.rgb_nz
-            );
-            assert_eq!(
-                stats.alpha_opaque, px,
-                "GPU alpha_opaque={} expected {px}",
-                stats.alpha_opaque
-            );
-            assert_eq!(
-                stats.alpha_nz, px,
-                "GPU alpha_nz={} expected {px}",
-                stats.alpha_nz
-            );
-            assert!(
-                near(stats.rgb_max, 191),
-                "GPU rgb_max={} expected ~191",
-                stats.rgb_max
-            );
-        }
-        Err(e)
-            if e.to_string().contains("external_memory_host") || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP bgra import-present (unsupported): {e}");
-        }
-        Err(e) => {
-            // SAFETY: same ptr/layout from the alloc above.
-            unsafe { dealloc(ptr, layout) };
-            panic!("bgra present_into_host_ptr: {e}");
-        }
-    }
-    // SAFETY: same ptr/layout from the alloc above.
-    unsafe { dealloc(ptr, layout) };
+    assert!(
+        out.pixels_bgra,
+        "a Surface resident must report the BGRA order it rendered in"
+    );
+    // `near`, not `assert_eq!`: green is `0.5 * 255 = 127.5`, an exact tie, and
+    // Vulkan does not pin which way a float→unorm8 tie goes. Intel ANV rounds it
+    // down and this assertion read 127 against a hardcoded 128 on every run since
+    // it was written. The tolerance costs the property nothing — an R/B exchange
+    // moves 191 against 64, which is 127 LSB, not one.
+    let px = [
+        out.pixels[i],
+        out.pixels[i + 1],
+        out.pixels[i + 2],
+        out.pixels[i + 3],
+    ];
+    assert!(
+        near(px[0], 191) && near(px[1], 128) && near(px[2], 64) && near(px[3], 255),
+        "a Surface resident's readback must already be in guest scanout order; got BGRA={px:?}"
+    );
+
+    // The pooled path is the control: no identity, so no namespace to take an
+    // order from, and the bytes stay semantic. Without it an engine that had
+    // simply been switched to BGRA everywhere would pass the arm above.
+    let pooled = engine_req(&v, &f, w, h);
+    let out = engine::execute_draw_request(&pooled).expect("pooled draw");
+    assert!(
+        !out.pixels_bgra,
+        "a pooled target has no identity to take an order from"
+    );
+    let px = [
+        out.pixels[i],
+        out.pixels[i + 1],
+        out.pixels[i + 2],
+        out.pixels[i + 3],
+    ];
+    assert!(
+        near(px[0], 64) && near(px[1], 128) && near(px[2], 191) && near(px[3], 255),
+        "a pooled target's readback stays semantic RGBA; got RGBA={px:?}"
+    );
 }
 
-/// Direct-present zero-copy export (host-window route B, B2): a content-ready
-/// BGRA resident exports straight to a dmabuf fd via a GPU→GPU blit — no CPU
-/// readback. Prove the end-to-end product path runs on a real resident: it
-/// returns a usable fd + correct geometry, and it leaves the resident intact and
-/// readable (the blit restored TRANSFER_SRC_OPTIMAL, so a later `read_target`
-/// still sees the same content). The byte-fidelity of the exported pixels is
-/// pinned separately by the in-crate `blit_present_into_export_is_byte_identical`
-/// (the test crate cannot reach the `pub(crate)` dmabuf import helper).
 #[test]
-fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
-    use std::os::fd::FromRawFd;
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+fn a_bgra_resident_draw_reads_back_identically_twice() {
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let w = 16u32;
     let h = 16u32;
@@ -1380,155 +1379,99 @@ fn export_present_from_resident_returns_usable_fd_and_preserves_resident() {
     match engine::execute_draw_request(&req) {
         Ok(_) => {}
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP export-present resident: {e}");
+            eprintln!("SKIP bgra resident readback: {e}");
             return;
         }
         Err(e) => panic!("bgra resident draw: {e}"),
     }
-
-    // Center color the fullscreen triangle wrote (BGRA), read BEFORE the export.
-    let before = engine::read_target(&identity).expect("read resident before export");
     let i = ((h / 2) * w + w / 2) as usize * 4;
-    let center_before = [before[i], before[i + 1], before[i + 2], before[i + 3]];
-
-    match unsafe {
-        engine::export_present_from_resident_composited_fd_policy(&identity, None, |_, _, _| true)
-    } {
-        Ok((fd, pitch, ew, eh, ring_idx)) => {
-            let fd = fd.expect("always-true fd policy must return an fd");
-            assert!(fd >= 0, "export returned an invalid fd");
-            assert_eq!((ew, eh), (w, h), "export geometry must match the resident");
-            assert!(
-                pitch >= (w as u64) * 4,
-                "LINEAR row pitch {pitch} < tight {}",
-                w * 4
-            );
-            assert!(ring_idx < 3, "ring index {ring_idx} out of range");
-            // Own + close the dmabuf fd so the test does not leak it.
-            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
-        }
-        Err(e)
-            if e.to_string().contains("extensions unavailable")
-                || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP export-present resident (no dmabuf export): {e}");
-            return;
-        }
-        Err(e) => panic!("export_present_from_resident_composited_fd_policy: {e}"),
-    }
-
-    // The export blit must not have corrupted the resident: the same content is
-    // still readable (and the tracked layout was restored so the readback's own
-    // barrier starts from the right place).
-    let after = engine::read_target(&identity).expect("read resident after export");
-    let center_after = [after[i], after[i + 1], after[i + 2], after[i + 3]];
+    let first = engine::read_target(&identity)
+        .expect("read resident")
+        .pixels;
+    let center_first = [first[i], first[i + 1], first[i + 2], first[i + 3]];
+    let second = engine::read_target(&identity)
+        .expect("re-read resident")
+        .pixels;
+    let center_second = [second[i], second[i + 1], second[i + 2], second[i + 3]];
     assert_eq!(
-        center_before, center_after,
-        "resident content changed across the export blit",
+        center_first, center_second,
+        "resident content changed across a second readback",
     );
     assert!(
-        near(center_after[0], 191)
-            && near(center_after[1], 128)
-            && near(center_after[2], 64)
-            && near(center_after[3], 255),
-        "resident center BGRA={center_after:?}; expected ~(191,128,64,255)"
+        near(center_second[0], 191)
+            && near(center_second[1], 128)
+            && near(center_second[2], 64)
+            && near(center_second[3], 255),
+        "resident center BGRA={center_second:?}; expected ~(191,128,64,255)"
     );
 }
 
-/// The arm Cocoa route consumes a host BGRA frame rather than a dmabuf. Its
-/// readback must apply the same cross-mid tile correction as direct export,
-/// entirely on the GPU and without changing either resident.
+/// A deferred composite Store moves its device→host copy; it does not delete
+/// it. `readbacks` pooled both populations, so it read the same whether the
+/// deferral worked or merely rescheduled the copy — which is how a boot came
+/// back with `readbacks / surface_deferred` at 1.39 and no way to say why.
+///
+/// The split is the measurement: a `skip_readback` draw must land in
+/// `render_post_wait_skips` and leave `readbacks` alone, and the `read_target`
+/// a consumer later asks for must land in `target_reads` and *still* leave
+/// `readbacks` alone.
 #[test]
-fn resident_readback_composites_peer_rects_without_mutating_residents() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
-    let (w, h) = (16u32, 16u32);
-    let base = TargetIdentity::Surface {
-        id: 101,
+    let w = 16u32;
+    let h = 16u32;
+    let identity = TargetIdentity::Surface {
+        id: 93,
         width: w,
         height: h,
         generation: 1,
     };
-    let peer = TargetIdentity::Surface {
-        id: 102,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    let make = |identity: TargetIdentity| {
-        let mut req = engine_req(&v, &f, w, h);
-        req.target_identity = Some(identity);
-        req.output_bgra = true;
-        req.skip_readback = true;
-        req
-    };
-    let base_req = make(base.clone());
-    let peer_req = make(peer.clone());
-    for (label, req) in [("composite base", &base_req), ("composite peer", &peer_req)] {
-        match engine::execute_draw_request(req) {
-            Ok(_) => {}
-            Err(e) if skip_if_no_gpu(&e.to_string()) => {
-                eprintln!("SKIP {label}: {e}");
-                return;
-            }
-            Err(e) => panic!("{label}: {e}"),
+    let mut req = engine_req(&v, &f, w, h);
+    req.target_identity = Some(identity.clone());
+    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
+    req.skip_readback = true;
+
+    let before_draw = engine::counter_snapshot();
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP readback split: {e}");
+            return;
         }
+        Err(e) => panic!("resident draw: {e}"),
     }
-    let mut peer_add = make(peer.clone());
-    peer_add.load_op = Some(LoadOp::LoadFromTarget);
-    peer_add.blend = Some(BlendStateResource {
-        src_color: BlendFactor::One,
-        dst_color: BlendFactor::One,
-        color_op: BlendOp::Add,
-        src_alpha: BlendFactor::One,
-        dst_alpha: BlendFactor::Zero,
-        alpha_op: BlendOp::Add,
-        constants: [0.0; 4],
-    });
-    engine::execute_draw_request(&peer_add).expect("make peer content distinct");
+    let draw = engine::counter_snapshot().delta_since(&before_draw);
+    assert_eq!(
+        draw.readbacks, 0,
+        "a skip_readback draw took a draw readback anyway"
+    );
+    assert_eq!(
+        draw.render_post_wait_skips, 1,
+        "a skip_readback draw did not record its skipped fence wait"
+    );
+    assert_eq!(
+        draw.target_reads, 0,
+        "a draw that reads nothing back recorded a resident read"
+    );
 
-    let base_before = engine::read_target(&base).expect("read base before composite");
-    let peer_before = engine::read_target(&peer).expect("read peer before composite");
-    let rects = [(0, h / 2, w, h)];
-    let composed = engine::read_resident_bgra_composited(
-        &base,
-        Some((&peer, rects.as_slice())),
-        (w * h * 4) as usize,
-    )
-    .expect("composited resident readback");
-
-    let pixel = |bytes: &[u8], x: u32, y: u32| {
-        let i = ((y * w + x) * 4) as usize;
-        [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]
-    };
-    let differing_pixel = |y0: u32, y1: u32| {
-        (y0..y1)
-            .flat_map(|y| (0..w).map(move |x| (x, y)))
-            .find(|&(x, y)| pixel(&base_before, x, y) != pixel(&peer_before, x, y))
-            .expect("base and peer clears differ in the selected half")
-    };
-    let outside = (0, 0);
-    let inside = differing_pixel(h / 2, h);
+    let before_read = engine::counter_snapshot();
+    let px = engine::read_target(&identity)
+        .expect("read resident")
+        .pixels;
+    let read = engine::counter_snapshot().delta_since(&before_read);
     assert_eq!(
-        pixel(&composed, outside.0, outside.1),
-        pixel(&base_before, outside.0, outside.1),
-        "outside the peer rect must retain the base resident"
+        read.target_reads, 1,
+        "read_target did not record a resident read"
     );
     assert_eq!(
-        pixel(&composed, inside.0, inside.1),
-        pixel(&peer_before, inside.0, inside.1),
-        "inside the peer rect must use the peer resident"
+        read.target_read_bytes,
+        px.len() as u64,
+        "resident read bytes disagree with the frame it returned"
     );
     assert_eq!(
-        engine::read_target(&base).expect("read base after composite"),
-        base_before,
-        "composited readback must not mutate the base resident"
-    );
-    assert_eq!(
-        engine::read_target(&peer).expect("read peer after composite"),
-        peer_before,
-        "composited readback must not mutate the peer resident"
+        read.readbacks, 0,
+        "read_target was pooled into the draw rail's readback count"
     );
 }
 
@@ -1537,8 +1480,7 @@ fn resident_readback_composites_peer_rects_without_mutating_residents() {
 /// of guest descriptors: shader-visible R/G/B must land as physical B/G/R.
 #[test]
 fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -1595,6 +1537,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
@@ -1610,7 +1553,9 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         }
         Err(e) => panic!("sampled RGBA to BGRA target: {e}"),
     }
-    let raw = engine::read_target(&identity).expect("read BGRA target");
+    let raw = engine::read_target(&identity)
+        .expect("read BGRA target")
+        .pixels;
     let center = ((h / 2) * w + w / 2) as usize * 4;
     assert_eq!(
         &raw[center..center + 4],
@@ -1626,7 +1571,9 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         warm_delta.sampled_reuploads, 0,
         "warm upload: {warm_delta:?}"
     );
-    let warm_raw = engine::read_target(&identity).expect("read warm BGRA target");
+    let warm_raw = engine::read_target(&identity)
+        .expect("read warm BGRA target")
+        .pixels;
     assert_eq!(
         &warm_raw[center..center + 4],
         &[rgba[2], rgba[1], rgba[0], rgba[3]],
@@ -1647,7 +1594,9 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
         changed_delta.sampled_reuploads, 1,
         "changed upload: {changed_delta:?}"
     );
-    let changed_raw = engine::read_target(&identity).expect("read changed BGRA target");
+    let changed_raw = engine::read_target(&identity)
+        .expect("read changed BGRA target")
+        .pixels;
     assert_eq!(
         &changed_raw[center..center + 4],
         &[
@@ -1669,8 +1618,7 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
 fn reflected_static_sampler_descriptor_samples_texture() {
     use metal2vulkan::reflect::ResourceKind;
 
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let tmp = std::env::temp_dir().join(format!(
         "paravirt_engine_{}_static_sampler",
@@ -1741,6 +1689,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Bytes(std::sync::Arc::new(rgba.repeat(4))),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
@@ -1773,8 +1722,7 @@ fn reflected_static_sampler_descriptor_samples_texture() {
 /// loader is switched to stop swizzling.
 #[test]
 fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -1839,6 +1787,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
             arrayed: false,
             volume: false,
             cube: false,
+            one_dim: false,
             source: SampledSource::Bytes(std::sync::Arc::new(bytes)),
             format,
             identity: None,
@@ -1846,7 +1795,11 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         match engine::execute_draw_request(&req) {
-            Ok(_) => Some(engine::read_target(&identity).expect("read BGRA target")),
+            Ok(_) => Some(
+                engine::read_target(&identity)
+                    .expect("read BGRA target")
+                    .pixels,
+            ),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP bgra8 bytes upload: {e}");
                 None
@@ -1895,8 +1848,7 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
 fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
     use reims_vgpu::contract::pixel_format;
 
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let vert = translate_words("textured_quad.air", Stage::Vertex);
     let frag = translate_words("textured_quad.air", Stage::Fragment);
     let w = 16u32;
@@ -1957,6 +1909,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
             arrayed: false,
             volume: false,
             cube: false,
+            one_dim: false,
             source: SampledSource::Bytes(std::sync::Arc::new(source.repeat(4))),
             format: ash::vk::Format::R8G8B8A8_UNORM,
             identity: None,
@@ -1964,7 +1917,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         });
         req.samplers.push(SamplerResource::normalized_default(64));
         match engine::execute_draw_request(&req) {
-            Ok(_) => Some(engine::read_target(&identity).expect("read target")),
+            Ok(_) => Some(engine::read_target(&identity).expect("read target").pixels),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP view swizzle: {e}");
                 None
@@ -2008,8 +1961,7 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
 /// fullscreen tests overwrite the bad upload and cannot catch this class.
 #[test]
 fn partial_draw_preserves_rgba_seed_on_bgra_target() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (vert, frag) = triangle_spirv();
     let (w, h) = (16u32, 16u32);
     let identity = TargetIdentity::Surface {
@@ -2039,7 +1991,9 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
         }
         Err(e) => panic!("BGRA partial seed: {e}"),
     }
-    let raw = engine::read_target(&identity).expect("read BGRA partial-seed target");
+    let raw = engine::read_target(&identity)
+        .expect("read BGRA partial-seed target")
+        .pixels;
     let outside = ((h / 2) * w + w / 2) as usize * 4;
     assert_eq!(
         &raw[outside..outside + 4],
@@ -2048,88 +2002,162 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     );
 }
 
-/// Strided import-present: guest IOSurface BPR > width*4 (live mids 1/5 class).
-/// GPU must honor buffer_row_length so row N starts at N*bpr, not N*tight.
+/// An alpha-only `MTLColorWriteMask` must leave the attachment's colour
+/// channels exactly as the Load seed left them.
+///
+/// This is the shape a compositor uses to punch coverage into a surface without
+/// touching its colour, and it is the one non-`all` mask a live x86/Vulkan guest
+/// was measured sending (tag `0x09`, value 1). Before the mask was decoded the
+/// builder pinned `ColorComponentFlags::RGBA` on every attachment, so this draw
+/// replaced the whole pixel: the assertion below fails with the shader's
+/// (64, 128, 191) in place of the seed.
+///
+/// Both halves are asserted. RGB must survive — that is the fix — and alpha must
+/// change, which is what separates "the mask worked" from "the draw never ran".
+/// A test that only checked RGB would pass against a pipeline that rendered
+/// nothing at all.
 #[test]
-fn present_into_host_ptr_strided_honors_guest_bpr() {
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
-    let (v, f) = triangle_spirv();
-    let w = 16u32;
-    let h = 8u32;
-    let tight = w * 4;
-    let bpr = tight + 16; // 16 bytes pad per row (matches padded scanout class)
-    let identity = TargetIdentity::Surface {
-        id: 79,
-        width: w,
-        height: h,
-        generation: 1,
-    };
-    let mut req = engine_req(&v, &f, w, h);
-    req.target_identity = Some(identity.clone());
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
-    req.output_bgra = true;
-    req.skip_readback = true;
-    match engine::execute_draw_request(&req) {
-        Ok(_) => {}
+fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
+    use reims_vgpu::backend::vulkan::engine::ColorWriteMask;
+    let _g = engine_test_session();
+    let (vert, frag) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // Distinct from the shader's (64, 128, 191, 255) in every channel, so an
+    // ignored mask is visible whichever channel is read.
+    let seed = [17u8, 91, 203, 7];
+
+    let mut req = engine_req(&vert, &frag, w, h);
+    req.load_op = Some(LoadOp::LoadSeed(seed.repeat((w * h) as usize)));
+    req.color_write_mask = ColorWriteMask::new(1).expect("MTLColorWriteMaskAlpha");
+    let masked = match engine::execute_draw_request(&req) {
+        Ok(out) => out.pixels,
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
-            eprintln!("SKIP strided import-present: {e}");
+            eprintln!("SKIP alpha-only write mask: {e}");
             return;
         }
-        Err(e) => panic!("strided resident draw: {e}"),
-    }
-
-    let frame = (bpr * h) as usize;
-    let align = 65536usize;
-    let cap = frame.div_ceil(align) * align;
-    let layout = Layout::from_size_align(cap, align).unwrap();
-    // SAFETY: non-zero layout; freed below.
-    let ptr = unsafe { alloc_zeroed(layout) };
-    assert!(!ptr.is_null());
-
-    // SAFETY: ptr backs `cap` exclusive bytes for the DMA.
-    let res = unsafe {
-        engine::present_into_host_ptr_strided(&identity, ptr as *mut _, cap as u64, bpr, false)
+        Err(e) => panic!("alpha-only write mask: {e}"),
     };
-    match res {
-        Ok(_) => {
-            // SAFETY: GPU wrote `frame` bytes into ptr.
-            let seen = unsafe { std::slice::from_raw_parts(ptr, frame) };
-            // Pad region at end of row 0 must stay zero (not spilled image bytes).
-            let pad0 = &seen[tight as usize..bpr as usize];
-            assert!(
-                pad0.iter().all(|&b| b == 0),
-                "row pad must stay zero under strided DMA; got {pad0:?}"
-            );
-            // Center of image (row h/2, col w/2) via guest BPR layout.
-            let row = (h / 2) as usize;
-            let col = (w / 2) as usize;
-            let i = row * (bpr as usize) + col * 4;
-            let (b, g, r, a) = (seen[i], seen[i + 1], seen[i + 2], seen[i + 3]);
-            assert!(
-                near(b, 191) && near(g, 128) && near(r, 64) && near(a, 255),
-                "strided center BGRA=({b},{g},{r},{a}); expected ~(191,128,64,255)"
-            );
+    let i = ((h / 2) * w + w / 2) as usize * 4;
+    assert_eq!(
+        &masked[i..i + 3],
+        &seed[..3],
+        "an alpha-only mask must not write colour; got the shader's output, so \
+         the mask was dropped"
+    );
+    assert!(
+        near(masked[i + 3], 255),
+        "alpha is the one channel the mask permits, and it must have changed \
+         from the seed's {} — otherwise nothing rendered and the RGB check \
+         above is vacuous",
+        seed[3]
+    );
+
+    // Control: the same draw with the default `all` mask writes every channel.
+    // Run in the same session so a difference cannot come from device state.
+    req.color_write_mask = ColorWriteMask::default();
+    let unmasked = engine::execute_draw_request(&req)
+        .expect("unmasked control draw")
+        .pixels;
+    assert_fullscreen_fragment_color("unmasked control", &unmasked, w, h);
+    assert_ne!(
+        &masked[i..i + 3],
+        &unmasked[i..i + 3],
+        "the two arms must differ, or the mask is not what produced the result"
+    );
+}
+
+/// A `SeedOrder::Bgra8` seed must land the same semantic pixels as the
+/// equivalent `SeedOrder::Rgba8` seed.
+///
+/// This is the type-11 composite Load. `surface_cache` holds guest scanout order
+/// while the pooled target is RGBA, so the runtime used to allocate, copy and
+/// swizzle a whole framebuffer per seeded draw purely to restate pixels it
+/// already had — at the 28-111 Stores/s `store_routes` measures. Naming the
+/// seed's own order lets the exchange ride the copy into the mapped staging
+/// span, which happens either way.
+///
+/// A partial draw is what makes it observable: the scissor leaves most of the
+/// seed untouched, and a fullscreen draw would overwrite a wrong upload and pass
+/// regardless. Both arms are run and compared rather than asserting a literal,
+/// so this cannot pass by both paths being broken the same way.
+#[test]
+fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
+    let _g = engine_test_session();
+    let (vert, frag) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // Deliberately asymmetric in R and B, so an omitted or doubled exchange is
+    // visible rather than cancelling.
+    let semantic_rgba = [17u8, 91, 203, 255];
+    let scanout_bgra = [
+        semantic_rgba[2],
+        semantic_rgba[1],
+        semantic_rgba[0],
+        semantic_rgba[3],
+    ];
+    let outside = ((h / 2) * w + w / 2) as usize * 4;
+
+    let read_back = |order: engine::SeedOrder, bytes: [u8; 4], id: u32| -> Option<Vec<u8>> {
+        let identity = TargetIdentity::Surface {
+            id,
+            width: w,
+            height: h,
+            generation: 1,
+        };
+        let mut req = engine_req(&vert, &frag, w, h);
+        req.target_identity = Some(identity.clone());
+        req.skip_readback = true;
+        req.target_rgba8 = Some(std::sync::Arc::new(bytes.repeat((w * h) as usize)));
+        req.target_seed_order = order;
+        req.scissors.push(ScissorResource {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+        match engine::execute_draw_request(&req) {
+            Ok(_) => {}
+            Err(e) if skip_if_no_gpu(&e.to_string()) => {
+                eprintln!("SKIP seed order: {e}");
+                return None;
+            }
+            Err(e) => panic!("seed order draw: {e}"),
         }
-        Err(e)
-            if e.to_string().contains("external_memory_host") || skip_if_no_gpu(&e.to_string()) =>
-        {
-            eprintln!("SKIP strided import-present (unsupported): {e}");
-        }
-        Err(e) => {
-            unsafe { dealloc(ptr, layout) };
-            panic!("strided present_into_host_ptr: {e}");
-        }
-    }
-    unsafe { dealloc(ptr, layout) };
+        // Normalized through the order the engine reports, so this case tests the
+        // seed exchange and not the attachment's format: a `Surface` resident is
+        // BGRA, and asserting a literal against raw bytes would make this case
+        // fail whenever that choice changed while the property it names still
+        // held.
+        Some(
+            engine::read_target(&identity)
+                .expect("read seed-order target")
+                .into_rgba8(),
+        )
+    };
+
+    let Some(rgba_arm) = read_back(engine::SeedOrder::Rgba8, semantic_rgba, 91) else {
+        return;
+    };
+    let Some(bgra_arm) = read_back(engine::SeedOrder::Bgra8, scanout_bgra, 92) else {
+        return;
+    };
+    assert_eq!(
+        &bgra_arm[outside..outside + 4],
+        &rgba_arm[outside..outside + 4],
+        "the same pixels described in two orders must land identically"
+    );
+    // And that they landed as the semantic colour, not as some agreed-upon wrong
+    // one: the scissor left this pixel untouched, so it still holds the seed.
+    assert_eq!(
+        &rgba_arm[outside..outside + 4],
+        &semantic_rgba[..],
+        "an unwritten pixel must still hold the seed's semantic colour"
+    );
 }
 
 /// Premult One/OMSA: GPU Load+blend matches the retired software composite oracle.
 #[test]
 fn premult_one_omsa_gpu_blend_matches_software_oracle() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // Seed: solid gray base (128,128,128,255)
     let w = 16u32;
@@ -2137,7 +2165,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
     let seed: Vec<u8> = (0..(w * h)).flat_map(|_| [128u8, 128, 128, 255]).collect();
     // GPU path: Load seed + One/OMSA blend (fullscreen frag writes opaque color).
     let mut gpu = engine_req(&v, &f, w, h);
-    gpu.target_rgba8 = Some(seed.clone());
+    gpu.target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
     gpu.blend = Some(BlendStateResource {
         src_color: BlendFactor::One,
         dst_color: BlendFactor::OneMinusSrcAlpha,
@@ -2180,8 +2208,7 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
 /// Product choice is also locked by `type11_load_ready_uses_resident_not_clear`.
 #[test]
 fn skip_readback_store_then_load_from_target_preserves_content() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 91,
@@ -2214,7 +2241,9 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     store2.skip_readback = true;
     store2.target_rgba8 = None;
     engine::execute_draw_request(&store2).expect("store2 LoadFromTarget");
-    let px = engine::read_target(&identity).expect("read_target after progressive Stores");
+    let px = engine::read_target(&identity)
+        .expect("read_target after progressive Stores")
+        .into_rgba8();
     assert_fullscreen_fragment_color("progressive_skip_readback", &px, 16, 16);
     // No seed_uploads on pass 2 (LoadFromTarget, not CPU seed).
     // Counters are process-global; just ensure content survived.
@@ -2225,8 +2254,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
 /// resident images even when the next guest reuses the same id/generation.
 #[test]
 fn guest_reset_evicts_resident_targets_without_destroying_context() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let identity = TargetIdentity::Surface {
         id: 91,
@@ -2256,13 +2284,12 @@ fn guest_reset_evicts_resident_targets_without_destroying_context() {
 /// Chain byte-parity: LoadFromTarget chain matches CPU-seed chain.
 #[test]
 fn chain_load_from_target_byte_parity_vs_cpu_seed() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // CPU-seed chain: draw1 clear → pixels → draw2 LoadSeed(pixels) → pixels2
     let d1 = engine_req(&v, &f, 16, 16);
     let p1 = match engine::execute_draw_request(&d1) {
-        Ok(o) => o.pixels,
+        Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP chain: {e}");
             return;
@@ -2270,10 +2297,8 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
         Err(e) => panic!("chain d1: {e}"),
     };
     let mut d2_cpu = engine_req(&v, &f, 16, 16);
-    d2_cpu.target_rgba8 = Some(p1.clone());
-    let p2_cpu = engine::execute_draw_request(&d2_cpu)
-        .expect("cpu seed chain")
-        .pixels;
+    d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
+    let p2_cpu = semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed chain"));
 
     // GPU-resident chain: same identity LoadFromTarget.
     engine::test_reset_engine();
@@ -2291,12 +2316,116 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     g2.target_identity = Some(identity.clone());
     g2.load_op = Some(LoadOp::LoadFromTarget);
     g2.skip_readback = false; // read back for compare
-    let p2_gpu = engine::execute_draw_request(&g2)
-        .expect("gpu chain d2")
-        .pixels;
+    let p2_gpu = semantic_rgba(&engine::execute_draw_request(&g2).expect("gpu chain d2"));
     assert_eq!(
         p2_gpu, p2_cpu,
         "LoadFromTarget chain must match CPU-seed chain"
+    );
+}
+
+/// The type-11 composite Store's shape: `LoadFromTarget` on a resident that the
+/// *previous* pass read back, rather than one it left GPU-only.
+///
+/// Every other `LoadFromTarget` case in this suite sets `skip_readback = true`
+/// on the producing pass, so the image goes attachment-write → attachment-load
+/// with nothing in between. A composite Store keeps its readback — that copy is
+/// what feeds `surface_cache`, the deferred window's owned frame and the guest
+/// writeback — so the image is additionally read as a transfer source between
+/// the two passes, and the next pass's load barrier has to source its scope from
+/// the tracked `TRANSFER_SRC_OPTIMAL` rather than from a color write.
+///
+/// Scored against the CPU-seed chain it replaces, byte for byte: eliding the
+/// seed upload is only sound if the resident holds exactly what the upload
+/// would have carried. A dropped or mis-scoped barrier shows up here as the
+/// prior frame, a torn frame, or a black one — the class the elision gate
+/// exists to avoid.
+///
+/// Both passes are **scissored to 1x1**, and that is what makes the test mean
+/// anything. The default triangle covers the whole attachment, so with a
+/// full-viewport draw `LoadFromTarget`, `LoadSeed` and even `Clear` all produce
+/// identical pixels and the assertion holds no matter what the load action did.
+/// Verified: substituting `Clear` for `LoadFromTarget` in the unscissored form
+/// still passed. Scissored, 255 of the 256 pixels carry only loaded content, so
+/// the load action is the only thing under test.
+#[test]
+fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // A prior frame the draw cannot manufacture, so a lost load reads as black
+    // rather than as a coincidentally-correct fragment colour.
+    let prior = [17u8, 91, 203, 255].repeat((w * h) as usize);
+    let dot = |x: u32, y: u32| ScissorResource {
+        x,
+        y,
+        width: 1,
+        height: 1,
+    };
+
+    // Arm A — the round trip this rail removes: seed from host bytes, draw a
+    // corner, read back, re-upload those pixels as the next pass's seed.
+    let mut d1 = engine_req(&v, &f, w, h);
+    d1.load_op = Some(LoadOp::LoadSeed(prior.clone()));
+    d1.scissors.push(dot(0, 0));
+    let p1 = match engine::execute_draw_request(&d1) {
+        Ok(o) => semantic_rgba(&o),
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP load_from_target_after_readback: {e}");
+            return;
+        }
+        Err(e) => panic!("readback chain d1: {e}"),
+    };
+    let mut d2_cpu = engine_req(&v, &f, w, h);
+    d2_cpu.load_op = Some(LoadOp::LoadSeed(p1.clone()));
+    d2_cpu.scissors.push(dot(8, 8));
+    let p2_cpu =
+        semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
+
+    // The two arms are only comparable if the seed actually survives the draw.
+    let untouched = ((h / 2) * w + 2) as usize * 4;
+    assert_eq!(
+        &p2_cpu[untouched..untouched + 4],
+        &prior[0..4],
+        "a scissored draw must leave the rest of the seed intact, or neither \
+         arm is testing the load action"
+    );
+
+    // Arm B — the elision: the same two passes, both still reading back, the
+    // second loading from the resident the first stored into.
+    engine::test_reset_engine();
+    let identity = TargetIdentity::Surface {
+        id: 311,
+        width: w,
+        height: h,
+        generation: 1,
+    };
+    let mut g1 = engine_req(&v, &f, w, h);
+    g1.target_identity = Some(identity.clone());
+    g1.load_op = Some(LoadOp::LoadSeed(prior));
+    g1.scissors.push(dot(0, 0));
+    g1.skip_readback = false;
+    let p1_resident =
+        semantic_rgba(&engine::execute_draw_request(&g1).expect("resident store with readback"));
+    assert_eq!(
+        p1_resident, p1,
+        "the resident pass must read back the same pixels as the pooled one, \
+         or the two arms are not comparing the same content"
+    );
+
+    let mut g2 = engine_req(&v, &f, w, h);
+    g2.target_identity = Some(identity.clone());
+    g2.load_op = Some(LoadOp::LoadFromTarget);
+    g2.target_rgba8 = None;
+    g2.scissors.push(dot(8, 8));
+    g2.skip_readback = false;
+    let p2_gpu = semantic_rgba(
+        &engine::execute_draw_request(&g2).expect("load from a target that was read back"),
+    );
+
+    assert_eq!(
+        p2_gpu, p2_cpu,
+        "a LOAD elided against a read-back resident must land the same frame \
+         the seed upload would have"
     );
 }
 
@@ -2307,8 +2436,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
 /// per record) it replaces.
 #[test]
 fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // CPU round-trip reference chain: every record reads back, next record
     // re-uploads the pixels as its seed (the legacy GVA chain rail).
@@ -2322,10 +2450,10 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
         Err(e) => panic!("gva_chain d1: {e}"),
     };
     let mut d2 = engine_req(&v, &f, 16, 16);
-    d2.target_rgba8 = Some(p1);
+    d2.target_rgba8 = Some(std::sync::Arc::new(p1));
     let p2 = engine::execute_draw_request(&d2).expect("cpu d2").pixels;
     let mut d3 = engine_req(&v, &f, 16, 16);
-    d3.target_rgba8 = Some(p2);
+    d3.target_rgba8 = Some(std::sync::Arc::new(p2));
     let p3_cpu = engine::execute_draw_request(&d3).expect("cpu d3").pixels;
 
     // Resident chain on a Gva identity: intermediates never touch the CPU.
@@ -2376,8 +2504,7 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
 /// byte-identical pixels to the synchronous readback Store it replaces.
 #[test]
 fn gva_deferred_store_flush_read_matches_sync_store() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     // Sync reference: the legacy Store readback.
     let d_sync = engine_req(&v, &f, 16, 16);
@@ -2414,9 +2541,22 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
 
     // Flush-on-access landing: one readback, byte parity with the sync Store.
     let before_flush = engine::counter_snapshot();
-    let p_flush = engine::read_target(&identity).expect("flush read_target");
+    let p_flush = engine::read_target(&identity)
+        .expect("flush read_target")
+        .into_rgba8();
     let df = engine::counter_snapshot().delta_since(&before_flush);
-    assert_eq!(df.readbacks, 1, "flush is the single readback: {df:?}");
+    // The flush's copy is a resident read, not a draw readback — the two are
+    // counted apart so that moving a copy from one rail to the other cannot look
+    // like removing it. Both halves are asserted: one read happened, and the
+    // draw rail stayed out of it.
+    assert_eq!(
+        df.target_reads, 1,
+        "flush is the single resident read: {df:?}"
+    );
+    assert_eq!(
+        df.readbacks, 0,
+        "flush must not take a draw readback: {df:?}"
+    );
     engine::unpin_resident_target(&identity);
     assert_eq!(
         p_flush, p_sync,
@@ -2426,8 +2566,7 @@ fn gva_deferred_store_flush_read_matches_sync_store() {
 
 #[test]
 fn device_loss_named_and_recreate_bounded() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let req = engine_req(&v, &f, 8, 8);
     match engine::execute_draw_request(&req) {
@@ -2474,6 +2613,25 @@ fn device_loss_named_and_recreate_bounded() {
         "device_lost counter must fire, got {}",
         snap.device_lost
     );
+
+    // The cap is a permanent give-up: the engine this test leaves behind refuses
+    // every draw. Suite independence therefore rests entirely on
+    // `test_reset_engine` clearing the budget, which is what
+    // [`engine_test_session`] does for every other case. Pin that here, at the
+    // one site that manufactures the exhausted state — if the reset ever stops
+    // clearing it, the whole suite goes order-dependent, and it fails as a
+    // single unrelated case rather than as anything named "reset".
+    engine::test_reset_engine();
+    assert_eq!(
+        engine::device_recreate_count(),
+        0,
+        "reset must clear the recreate budget"
+    );
+    match engine::execute_draw_request(&req) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {}
+        Err(e) => panic!("engine must draw again after a reset from an exhausted cap: {e}"),
+    }
 }
 
 /// In-flight ring lock (3-deep): consecutive no-readback resident draws land
@@ -2483,8 +2641,7 @@ fn device_loss_named_and_recreate_bounded() {
 /// If RING_DEPTH changes, the wrap arithmetic below must follow.
 #[test]
 fn ring_overlaps_in_flight_no_readback_draws() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let id_a = TargetIdentity::Surface {
         id: 91,
@@ -2504,7 +2661,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         cold.target_identity = Some((*identity).clone());
         cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         match engine::execute_draw_request(&cold) {
-            Ok(o) => assert_fullscreen_fragment_color(label, &o.pixels, 16, 16),
+            Ok(o) => assert_fullscreen_fragment_color(label, &semantic_rgba(&o), 16, 16),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
                 eprintln!("SKIP ring_overlaps: {e}");
                 return;
@@ -2549,9 +2706,13 @@ fn ring_overlaps_in_flight_no_readback_draws() {
         "each subsequent draw flushes its predecessor's batch: {d:?}"
     );
     // Boundary reads retire the in-flight work and see the final content.
-    let px = engine::read_target(&id_a).expect("ring boundary read a");
+    let px = engine::read_target(&id_a)
+        .expect("ring boundary read a")
+        .into_rgba8();
     assert_fullscreen_fragment_color("ring_read_a", &px, 16, 16);
-    let px = engine::read_target(&id_b).expect("ring boundary read b");
+    let px = engine::read_target(&id_b)
+        .expect("ring boundary read b")
+        .into_rgba8();
     assert_fullscreen_fragment_color("ring_read_b", &px, 16, 16);
 }
 
@@ -2561,8 +2722,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
 /// content byte-exactly.
 #[test]
 fn seed_from_target_gpu_copies_front_frame() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let front = TargetIdentity::Surface {
         id: 71,
@@ -2582,7 +2742,7 @@ fn seed_from_target_gpu_copies_front_frame() {
     cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     let front_pixels = match engine::execute_draw_request(&cold) {
         Ok(o) => {
-            assert_fullscreen_fragment_color("gpu_seed_front", &o.pixels, 16, 16);
+            assert_fullscreen_fragment_color("gpu_seed_front", &semantic_rgba(&o), 16, 16);
             o.pixels
         }
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2632,8 +2792,7 @@ fn seed_from_target_gpu_copies_front_frame() {
 /// vibrancy coverage mask) instead of silently discarding it.
 #[test]
 fn mrt_secondary_attachment_becomes_sampleable_resident() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let primary = TargetIdentity::Surface {
         id: 0x60,
@@ -2660,10 +2819,11 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
         blend: None,
+        color_write_mask: Default::default(),
     });
     match engine::execute_draw_request(&mrt) {
         // Slot 0 (primary) still receives the shader's location-0 output.
-        Ok(o) => assert_fullscreen_fragment_color("mrt_primary", &o.pixels, 16, 16),
+        Ok(o) => assert_fullscreen_fragment_color("mrt_primary", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP mrt_secondary: {e}");
             return;
@@ -2695,6 +2855,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         arrayed: false,
         volume: false,
         cube: false,
+        one_dim: false,
         source: SampledSource::Target(secondary.clone()),
         format: ash::vk::Format::R8G8B8A8_UNORM,
         identity: None,
@@ -2716,8 +2877,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
 /// image build and render without error, and the mask persists as a resident.
 #[test]
 fn mrt_rg16float_secondary_builds_and_renders() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let primary = TargetIdentity::Surface {
         id: 0x63,
@@ -2744,9 +2904,10 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         // raw store. Which is exactly why every secondary used to be forced
         // unblended — one real case generalized into a rule for all of them.
         blend: None,
+        color_write_mask: Default::default(),
     });
     match engine::execute_draw_request(&mrt) {
-        Ok(o) => assert_fullscreen_fragment_color("mrt_rg16f_primary", &o.pixels, 32, 32),
+        Ok(o) => assert_fullscreen_fragment_color("mrt_rg16f_primary", &semantic_rgba(&o), 32, 32),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP mrt_rg16float: {e}");
             return;
@@ -2763,8 +2924,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
 /// path untouched — same fragment color, zero MRT residents created.
 #[test]
 fn single_rt_draw_unaffected_by_mrt_path() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let target = TargetIdentity::Surface {
         id: 0x64,
@@ -2776,7 +2936,7 @@ fn single_rt_draw_unaffected_by_mrt_path() {
     req.target_identity = Some(target.clone());
     assert!(req.secondary_targets.is_empty());
     match engine::execute_draw_request(&req) {
-        Ok(o) => assert_fullscreen_fragment_color("single_rt_guard", &o.pixels, 16, 16),
+        Ok(o) => assert_fullscreen_fragment_color("single_rt_guard", &semantic_rgba(&o), 16, 16),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
             eprintln!("SKIP single_rt_guard: {e}");
             return;
@@ -2803,14 +2963,16 @@ fn single_rt_draw_unaffected_by_mrt_path() {
 /// unbound read was the arm64 MoltenVK GPU-address-fault class.
 #[test]
 fn framebuffer_fetch_reads_destination_via_input_attachment() {
-    let _g = engine_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = engine_test_session();
     let (v, _) = triangle_spirv();
     let f = translate_words("render_frag_fetch.air", Stage::Fragment);
     let (w, h) = (16u32, 16u32);
     let mut req = engine_req(&v, &f, w, h);
     req.color_input = true;
     // Seed (64, 128, 191, 255) → expect ~(191, 127, 64, 255).
-    req.target_rgba8 = Some([64, 128, 191, 255].repeat((w * h) as usize));
+    req.target_rgba8 = Some(std::sync::Arc::new(
+        [64, 128, 191, 255].repeat((w * h) as usize),
+    ));
     let Some(px) = draw_or_skip("framebuffer_fetch", &req) else {
         return;
     };
@@ -2822,4 +2984,93 @@ fn framebuffer_fetch_reads_destination_via_input_attachment() {
             "fetch: pixel {p} RGBA=({r},{g},{b},{a}); expected ~(191,127,64,255)"
         );
     }
+}
+
+/// An instrument, not a gate: how a draw's cost splits between a fixed
+/// submit-and-wait floor and the bytes it moves.
+///
+/// `#[ignore]` deliberately. It asserts nothing — a timing assertion in this
+/// suite would flake — and it must not occupy an executed slot, because the
+/// suite is serial and alphabetical and every engine-touching case it runs
+/// changes what the next one sees. Run it on purpose:
+///
+/// ```sh
+/// cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-window \
+///   --test vk_engine_parity -- --ignored --nocapture --exact \
+///   measure_draw_cost_against_pass_size
+/// ```
+///
+/// It exists because the boot-log evidence could not separate fixed submission
+/// latency from per-pass render cost: `draw_phase`'s `wait_us` was split by
+/// *readback* bytes, and a composite pass's render work is not proportional to
+/// those. Sweeping the geometry varies both together and the intercept falls out.
+///
+/// Measured on the x86 dev host (Intel ARL iGPU), 40 draws per point, all caches
+/// warmed first, no `target_rgba8` so no seed upload is included:
+///
+/// | geometry | MB | us/draw | us/MB |
+/// |---|---|---|---|
+/// | 16x16 | 0.001 | 278 | — |
+/// | 64x64 | 0.016 | 258 | — |
+/// | 256x256 | 0.262 | 299 | 1139 |
+/// | 960x540 | 2.074 | 894 | 431 |
+/// | 1920x1080 | 8.294 | 2386 | 288 |
+///
+/// A 256x range of pixel count at the small end moves the time by 8 %, so the
+/// floor is ~270 us and everything above ~256x256 is linear at ~270 us/MB. That
+/// model predicts the guest's measured 5.1 MB average readback at 1647 us against
+/// 1523 measured.
+///
+/// The consequence is what makes it worth keeping: the fixed floor is only
+/// ~45 ms per second at the guest's 167 readbacks/s, so **draw batching cannot be
+/// the frame-rate lever** — the cost is the bytes. Re-run this after any change
+/// that claims otherwise.
+#[test]
+#[ignore]
+fn measure_draw_cost_against_pass_size() {
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+    // Warm pipeline, pass, target and staging caches at every geometry first, so
+    // the timed runs measure steady state rather than first-sight allocation.
+    for (w, h) in [
+        (16u32, 16u32),
+        (64, 64),
+        (256, 256),
+        (960, 540),
+        (1920, 1080),
+    ] {
+        let req = engine_req(&v, &f, w, h);
+        if draw_or_skip("warm", &req).is_none() {
+            eprintln!("SKIP draw-cost measurement: no GPU");
+            return;
+        }
+    }
+    const RUNS: u32 = 40;
+    eprintln!(
+        "\n  {:>12} {:>10} {:>10} {:>10}",
+        "geometry", "MB/draw", "us/draw", "us/MB"
+    );
+    for (w, h) in [
+        (16u32, 16u32),
+        (64, 64),
+        (256, 256),
+        (960, 540),
+        (1920, 1080),
+    ] {
+        let req = engine_req(&v, &f, w, h);
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            engine::execute_draw_request(&req).expect("timed draw");
+        }
+        let us = start.elapsed().as_micros() as f64 / f64::from(RUNS);
+        let mb = f64::from(w) * f64::from(h) * 4.0 / 1e6;
+        eprintln!(
+            "  {:>12} {:>10.3} {:>10.0} {:>10.0}",
+            format!("{w}x{h}"),
+            mb,
+            us,
+            us / mb
+        );
+    }
+    eprintln!();
 }

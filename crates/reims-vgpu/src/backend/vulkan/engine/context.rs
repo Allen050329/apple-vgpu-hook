@@ -13,11 +13,9 @@ use super::types::DrawError;
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::caps::api_floor;
 use crate::backend::vulkan::caps::device_select::select_physical_device;
-use crate::backend::vulkan::caps::frame_interop::{HandoffInputs, HandoffLadder};
 use crate::backend::vulkan::caps::memory_topology::{
-    classify_memory, select_memory_type, MemoryClass, MemoryRequest,
+    classify_memory, select_memory_type, MappedMemoryKind, MemoryClass, MemoryRequest,
 };
-use crate::backend::vulkan::caps::zero_copy::{DmaMechanisms, ZeroCopyProfile};
 use crate::backend::vulkan::caps::{DriverQuirk, HostGpuCaps};
 
 /// Max device recreates per process after DEVICE_LOST (named constant).
@@ -225,6 +223,9 @@ pub(crate) struct DeviceContext {
     /// storage surface without an R/B swap (SPIR-V has no `Bgra8` storage
     /// format). Universally present on desktop NVIDIA / Mesa ANV / RADV.
     pub storage_image_write_without_format: bool,
+    /// `R32_SFLOAT` usable as a linearly-filtered sampled image; gates the
+    /// native float32 color-LUT sampled rail (see [`DeviceFeatures`]).
+    pub sampled_r32f_linear_filter: bool,
     pub pipeline_cache: vk::PipelineCache,
     pub vertex_divisor: VertexDivisorCapabilities,
     /// Which vertex attribute formats this device accepts in a vertex buffer,
@@ -239,18 +240,6 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::backend::vulkan::caps::device_features::DeviceFeatures,
-    /// VK_EXT_external_memory_host present-import capability (workstream E:
-    /// render the frame directly into imported guest pages, no CPU copy).
-    /// Loader present iff the extension was enabled at device create.
-    pub ext_external_memory_host: Option<ash::ext::external_memory_host::Device>,
-    /// dmabuf EXPORT loader (`vkGetMemoryFdKHR`), present iff
-    /// `VK_KHR_external_memory_fd` + `VK_EXT_external_memory_dma_buf` were both
-    /// enabled at device create. Backs the GL/dmabuf scanout export path
-    /// (`dmabuf_export`).
-    pub ext_external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
-    /// Required alignment (bytes) for an imported host pointer + allocation size;
-    /// 0 when the extension is unavailable.
-    pub min_imported_host_pointer_alignment: u64,
     /// Combined depth-stencil format supported for DEPTH_STENCIL_ATTACHMENT on
     /// this device (D32_SFLOAT_S8_UINT preferred, D24_UNORM_S8_UINT fallback).
     /// Used only by the stencil-test path; depth-only uses D32_SFLOAT.
@@ -261,8 +250,8 @@ pub(crate) struct DeviceContext {
     /// Byte length of the last persisted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
-    /// `VK_KHR_swapchain` was enabled for the macOS engine-owned host window.
-    #[cfg(all(feature = "host-window", target_os = "macos"))]
+    /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
+    #[cfg(feature = "host-window")]
     pub swapchain: bool,
 }
 
@@ -304,7 +293,21 @@ impl DeviceContext {
         if portability_enumeration {
             instance_extensions.push(vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr());
         }
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        // Surface extensions for the engine-owned host window.
+        //
+        // The window does not exist yet — the engine context is created on the
+        // first draw, long before winit has a handle — so which *platform*
+        // surface extension will be needed is not knowable here. Enabling every
+        // one the loader advertises is what makes the later
+        // `ash_window::create_surface` work for whichever handle arrives, and it
+        // costs nothing: an enabled instance extension with no surface created
+        // through it is inert.
+        //
+        // Enabling nothing unless `VK_KHR_surface` *and* at least one platform
+        // extension are both present keeps the failure at attach time, where it
+        // can be a typed decline and fall back to the CPU staging path, rather
+        // than failing instance creation for every headless run.
+        #[cfg(feature = "host-window")]
         {
             let advertised = entry
                 .enumerate_instance_extension_properties(None)
@@ -316,11 +319,29 @@ impl DeviceContext {
                     .iter()
                     .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
             };
-            if has_instance_extension(ash::khr::surface::NAME)
-                && has_instance_extension(ash::ext::metal_surface::NAME)
-            {
+            #[cfg(target_os = "macos")]
+            let platform: &[&CStr] = &[ash::ext::metal_surface::NAME];
+            // X11 and Wayland are both live on Linux desktops and the session
+            // type is a runtime property, so both are offered and each is taken
+            // only if advertised.
+            #[cfg(target_os = "linux")]
+            let platform: &[&CStr] = &[
+                ash::khr::xlib_surface::NAME,
+                ash::khr::xcb_surface::NAME,
+                ash::khr::wayland_surface::NAME,
+            ];
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let platform: &[&CStr] = &[];
+            let available: Vec<&CStr> = platform
+                .iter()
+                .copied()
+                .filter(|name| has_instance_extension(name))
+                .collect();
+            if has_instance_extension(ash::khr::surface::NAME) && !available.is_empty() {
                 instance_extensions.push(ash::khr::surface::NAME.as_ptr());
-                instance_extensions.push(ash::ext::metal_surface::NAME.as_ptr());
+                for name in available {
+                    instance_extensions.push(name.as_ptr());
+                }
             }
         }
         let mut ici = vk::InstanceCreateInfo::default()
@@ -401,6 +422,7 @@ impl DeviceContext {
         );
         let storage_image_write_without_format_bgra =
             features.storage_image_write_without_format_bgra();
+        let sampled_r32f_linear_filter = features.sampled_r32f_linear_filter;
         let has16 = features.storage16;
         let has8 = features.storage8;
         let has_float16 = features.float16;
@@ -417,16 +439,7 @@ impl DeviceContext {
         let enabled = features.enabled_features();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
-        let external_memory_host = has_device_extension(ash::ext::external_memory_host::NAME);
-        // dmabuf EXPORT capability (workstream: GL/dmabuf scanout export — hand
-        // the finished present image to QEMU as a dmabuf fd so the frame never
-        // leaves the GPU). Needs the fd export loader + the DMA_BUF handle-type
-        // enabler; VK_KHR_external_memory is core in 1.1 but enable it explicitly
-        // for portability. All three must be present or export is unavailable.
-        let external_memory_fd = has_device_extension(vk::KHR_EXTERNAL_MEMORY_FD_NAME);
-        let external_memory_dma_buf = has_device_extension(vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME);
-        let dmabuf_export = external_memory_fd && external_memory_dma_buf;
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        #[cfg(feature = "host-window")]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
         // spec guarantees at least ONE of D32_SFLOAT_S8_UINT / D24_UNORM_S8_UINT
@@ -451,15 +464,6 @@ impl DeviceContext {
             // silently guessing an unsupported format.
             vk::Format::D32_SFLOAT_S8_UINT
         };
-        // Query the min host-pointer alignment (properties2) when the extension
-        // is present — it bounds which guest surfaces we can import for present.
-        let mut min_imported_host_pointer_alignment = 0u64;
-        if external_memory_host {
-            let mut emh_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
-            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut emh_props);
-            instance.get_physical_device_properties2(pd, &mut properties);
-            min_imported_host_pointer_alignment = emh_props.min_imported_host_pointer_alignment;
-        }
         let mut divisor_features = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
         let mut divisor_properties =
             vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR::default();
@@ -486,15 +490,7 @@ impl DeviceContext {
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
         }
-        if external_memory_host {
-            enabled_device_extensions.push(ash::ext::external_memory_host::NAME.as_ptr());
-        }
-        if dmabuf_export {
-            enabled_device_extensions.push(vk::KHR_EXTERNAL_MEMORY_NAME.as_ptr());
-            enabled_device_extensions.push(vk::KHR_EXTERNAL_MEMORY_FD_NAME.as_ptr());
-            enabled_device_extensions.push(vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME.as_ptr());
-        }
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        #[cfg(feature = "host-window")]
         if swapchain {
             enabled_device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
         }
@@ -532,29 +528,10 @@ impl DeviceContext {
         let device = instance
             .create_device(pd, &dci, None)
             .map_err(|result| DrawError::Init(InitDecline::CreateDevice { result }))?;
-        let ext_external_memory_host = external_memory_host
-            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
-        let ext_external_memory_fd =
-            dmabuf_export.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
         let props = instance.get_physical_device_properties(pd);
         let memory_properties = instance.get_physical_device_memory_properties(pd);
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
-        let engine_swapchain = swapchain;
-        #[cfg(not(all(feature = "host-window", target_os = "macos")))]
-        let engine_swapchain = false;
         let caps = HostGpuCaps {
             memory: classify_memory(&memory_properties),
-            // Both memory rails ride on VK_EXT_external_memory_host; the display
-            // rail rides on dmabuf. Classified together here so no later site
-            // re-derives either answer from the device context's booleans.
-            zero_copy: ZeroCopyProfile::resolve(DmaMechanisms {
-                host_pointer_import: external_memory_host,
-                dmabuf_share: dmabuf_export,
-            }),
-            handoff: HandoffLadder::resolve(&HandoffInputs {
-                dmabuf_export,
-                engine_swapchain,
-            }),
             quirks: DriverQuirk::for_portability_subset(portability_subset),
             portability_subset,
             device_api_version: props.api_version,
@@ -563,32 +540,12 @@ impl DeviceContext {
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
-        // One-shot classification line: the matrix cell, the signal that
-        // decided the memory topology, and the frame-handoff rung actually
-        // chosen with a named reason for every better rung skipped. Load-bearing
-        // for portability debugging — "why is this host slow / blank" should be
-        // answerable from this single line.
+        // One-shot classification line: the memory topology, the signal that
+        // decided it, and whether this device can hand a frame to another
+        // device without a copy. Load-bearing for portability debugging — "why
+        // is this host slow / blank" starts here.
         crate::observe::off(caps.selection_line(&device_name));
-        // …and one line per degraded rail/rung, so each carries its own
-        // `reason=<slug>`. The summary above lists them as `rail:slug` inside a
-        // twenty-field line, which reads well and greps badly: a host running
-        // without `VK_EXT_external_memory_host` is a zero-copy regression, and
-        // "why is this host slow" should be answerable by grepping the slug, not
-        // by parsing a bracketed field. One-shot at device create, so no flood.
-        for (rail, decline) in caps.zero_copy.declined() {
-            let decline: &crate::backend::vulkan::caps::zero_copy::ZeroCopyDecline = decline;
-            crate::observe::Emit::decline("vk_caps_zero_copy_declined", decline)
-                .field("rail", rail)
-                .fail();
-        }
-        for (rung, decline) in caps.handoff.declined() {
-            let decline: &crate::backend::vulkan::caps::frame_interop::HandoffDecline = decline;
-            crate::observe::Emit::decline("vk_caps_handoff_declined", decline)
-                .field("rung", rung.slug())
-                .fail();
-        }
-        // Fine-grained capabilities that are not part of the matrix but do
-        // change what a draw can express.
+        // Fine-grained capabilities that do change what a draw can express.
         crate::observe::off(format!(
             "vk_device_select name={device_name:?} type={:?} depth_stencil_format={:?} bgra_storage_composite={} compute_capable={} quirks_no_deferred_batching={} quirks_guest_pages_authoritative={}",
             props.device_type,
@@ -650,19 +607,17 @@ impl DeviceContext {
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
+            sampled_r32f_linear_filter,
             pipeline_cache,
             vertex_divisor,
             vertex_formats,
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
-            ext_external_memory_host,
-            ext_external_memory_fd,
-            min_imported_host_pointer_alignment,
             depth_stencil_format,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
-            #[cfg(all(feature = "host-window", target_os = "macos"))]
+            #[cfg(feature = "host-window")]
             swapchain,
         })
     }
@@ -761,63 +716,17 @@ impl DeviceContext {
         select_memory_type(&self.memory_properties, type_bits, req)
     }
 
-    pub(crate) fn queue(&self) -> vk::Queue {
-        unsafe { self.device.get_device_queue(self.gq, 0) }
+    /// Whether a selected memory type is host-cached and whether it is coherent.
+    ///
+    /// [`MemoryClass::Readback`] ranks cached above coherent, so a readback
+    /// allocation can legitimately be non-coherent and its reader owes an
+    /// invalidate. A site that maps memory must ask rather than assume.
+    pub(crate) fn mapped_memory_kind(&self, memory_type_index: u32) -> MappedMemoryKind {
+        MappedMemoryKind::of(&self.memory_properties, memory_type_index)
     }
 
-    /// Import a host pointer range as `VkDeviceMemory` via
-    /// `VK_EXT_external_memory_host` (the Vulkan analog of Apple's
-    /// `commitIntoGPUPageTable` — the GPU addresses the pages in place, no copy).
-    ///
-    /// The caller owns the underlying host allocation; freeing the returned
-    /// `VkDeviceMemory` does **not** free the host pages. `host_ptr` must be
-    /// aligned to [`Self::min_imported_host_pointer_alignment`] and `size` an
-    /// integer multiple of it (both are Vulkan valid-usage). The imported memory
-    /// must be HOST_VISIBLE|HOST_COHERENT so a GPU DMA is immediately visible to
-    /// the guest CPU that owns the pages.
-    pub(crate) unsafe fn import_host_ptr(
-        &self,
-        host_ptr: *mut std::ffi::c_void,
-        size: u64,
-    ) -> Result<vk::DeviceMemory, DrawError> {
-        let ext = self.ext_external_memory_host.as_ref().ok_or_else(|| {
-            DrawError::Unsupported(super::reason::DrawReason::HostPointerImportUnavailable)
-        })?;
-        super::host_import_decline::validate_host_import_alignment(
-            host_ptr as usize,
-            size,
-            self.min_imported_host_pointer_alignment,
-        )
-        .map_err(DrawError::HostImport)?;
-        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
-        let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
-        (ext.fp().get_memory_host_pointer_properties_ext)(
-            self.device.handle(),
-            handle_type,
-            host_ptr,
-            &mut ptr_props,
-        )
-        .result()
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ContextHostPtrProps, e)))?;
-        // memory_type_bits: driver-allowed types for this pointer; intersect with
-        // HOST_VISIBLE|HOST_COHERENT (GPU writes must land in guest RAM directly).
-        let mt = self
-            .memory_type_for(ptr_props.memory_type_bits, MemoryClass::HostImport)
-            .ok_or_else(|| {
-                DrawError::Unsupported(super::reason::DrawReason::NoImportableHostMemoryType {
-                    memory_type_bits: ptr_props.memory_type_bits,
-                })
-            })?;
-        let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
-            .handle_type(handle_type)
-            .host_pointer(host_ptr);
-        let ai = vk::MemoryAllocateInfo::default()
-            .allocation_size(size)
-            .memory_type_index(mt)
-            .push_next(&mut import);
-        self.device
-            .allocate_memory(&ai, None)
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ContextImportHostPtrAlloc, e)))
+    pub(crate) fn queue(&self) -> vk::Queue {
+        unsafe { self.device.get_device_queue(self.gq, 0) }
     }
 }
 

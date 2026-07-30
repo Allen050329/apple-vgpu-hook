@@ -20,13 +20,18 @@
 use crate::contract::pixel_format::RGBA8_BPP;
 use crate::model::{DeviceState, HostSurface, MAX_SCANOUT_DIM};
 
+/// `generation` is issued by
+/// [`DeviceState::next_sampled_content_generation`] and is never derived from
+/// the entry being replaced: an entry-local counter restarts whenever the entry
+/// is re-created, and half of this cache's identity contract is that a
+/// generation names one content for the life of the device.
 fn store_into(
     map: &mut std::collections::BTreeMap<u32, HostSurface>,
     id: u32,
     width: u32,
     height: u32,
-    bgra: Vec<u8>,
-    log_tag: &str,
+    bgra: std::sync::Arc<Vec<u8>>,
+    generation: u64,
 ) {
     if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return;
@@ -37,39 +42,11 @@ fn store_into(
     if bgra.len() < need {
         return;
     }
-    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&bgra[..need]);
     let entry = map.entry(id).or_default();
-    // Measure geom clobber: smaller store replacing a larger encode under the
-    // same key (sky 1920×1152 → 64×64 atlas) — proxy only, no product branch.
-    if entry.width >= 1280
-        && entry.height >= 720
-        && (width < entry.width || height < entry.height)
-        && !entry.bgra.is_empty()
-    {
-        crate::observe::off(format!(
-            "host_cache_geom_clobber tag={log_tag} id={id} was={}x{} now={width}x{height}",
-            entry.width, entry.height
-        ));
-    }
-    entry.host_gen = entry.host_gen.wrapping_add(1);
-    if entry.host_gen == 0 {
-        entry.host_gen = 1;
-    }
+    entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
-    if width >= 1280 && height >= 720 {
-        // surface path keeps historical `mid=` key for greps; tex uses `tex=`.
-        let id_field = if log_tag == "tex" {
-            format!("tex={id}")
-        } else {
-            format!("mid={id}")
-        };
-        crate::observe::off(format!(
-            "host_cache_store {id_field} {width}x{height} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-            entry.host_gen, px0[0], px0[1], px0[2], px0[3]
-        ));
-    }
 }
 
 fn get_from(
@@ -86,7 +63,7 @@ fn get_from_with_gen(
     id: u32,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32)> {
+) -> Option<(&[u8], u64)> {
     let e = map.get(&id)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -102,19 +79,124 @@ fn get_from_with_gen(
 
 /// Insert/replace host-cache pixels for `surface_id` (type-4 present id).
 pub fn store(state: &mut DeviceState, surface_id: u32, width: u32, height: u32, bgra: Vec<u8>) {
+    store_shared(state, surface_id, width, height, std::sync::Arc::new(bgra));
+}
+
+/// [`store`] for a frame already held behind an `Arc` — the type-11 render Store
+/// arms its deferred window with the same allocation, so the frame is stored
+/// once and referenced twice.
+pub fn store_shared(
+    state: &mut DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    bgra: std::sync::Arc<Vec<u8>>,
+) {
+    let generation = state.next_sampled_content_generation();
     store_into(
         &mut state.host_surfaces,
         surface_id,
         width,
         height,
         bgra,
-        "surface",
+        generation,
     );
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
 pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
     get_from(&state.host_surfaces, surface_id, width, height)
+}
+
+/// Cede this mapping's cached frame to the engine resident a deferred type-11
+/// render Store just pinned: the entry keeps its geometry and its `host_gen`
+/// lineage, and holds no bytes.
+///
+/// The emptiness **is** the cession, and [`get_from`]'s `bgra.is_empty()` gate is
+/// what enforces it — so every reader that goes through [`get`] or [`get_shared`]
+/// misses and falls through to the source that does hold the frame:
+/// [`crate::runtime::scanout::capture_present_frame`] to
+/// `try_capture_from_resident`, and the type-11 LOAD seed to the surface's own
+/// guest pages, which lands this window first. Nothing has to be taught about a
+/// new state.
+///
+/// Retaining the stale bytes as a fallback would be worse than missing. A Store
+/// that skipped its readback has already superseded them, and a consumer served
+/// the previous frame renders a whole compositing layer one frame behind with no
+/// report — which is the class `deferred_flush_lost reason=cache_miss` cost 15
+/// layers in one boot to close.
+///
+/// Returns false for a geometry this cache would not have stored anyway, so the
+/// caller can refuse to arm rather than leave a live entry contradicting a
+/// resident-authoritative window.
+pub fn cede_surface_to_resident(
+    state: &mut DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    if surface_id == 0
+        || width == 0
+        || height == 0
+        || width > MAX_SCANOUT_DIM
+        || height > MAX_SCANOUT_DIM
+    {
+        return false;
+    }
+    let generation = state.next_sampled_content_generation();
+    let entry = state.host_surfaces.entry(surface_id).or_default();
+    entry.host_gen = generation;
+    entry.width = width;
+    entry.height = height;
+    entry.bgra = std::sync::Arc::new(Vec::new());
+    true
+}
+
+/// Whether this mapping's cache entry is the ceded shell
+/// [`cede_surface_to_resident`] leaves behind: present at exactly this geometry
+/// and carrying no bytes.
+///
+/// Read by the type-11 LOAD seed's decline classifier so a ceded entry is named
+/// as such instead of being reported as a stale-geometry hit — `get`'s miss is
+/// the same either way, and the two have different fixes.
+pub fn surface_ceded_to_resident(
+    state: &DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    state
+        .host_surfaces
+        .get(&surface_id)
+        .is_some_and(|e| e.bgra.is_empty() && e.width == width && e.height == height)
+}
+
+/// [`get`] as a shared handle, for a caller that needs to own the frame past the
+/// borrow of `state` — a Load seed does, and taking it this way costs a refcount
+/// rather than a full-framebuffer copy.
+///
+/// Hits exactly when [`get`] hits. A handle cannot be truncated the way [`get`]'s
+/// slice is, so the refcount is only taken when the stored buffer is *exactly*
+/// `width * height * 4`; a store carrying slop past that is copied instead.
+///
+/// The copy is not reachable today — every producer of `host_surfaces` allocates
+/// exactly that — but returning `None` there would be a silent seed loss, and a
+/// missing Load seed renders the pass onto a cleared target, which is a
+/// compositing layer going solid black. Matching [`get`] means a future producer
+/// with slop costs a copy rather than a defect.
+pub fn get_shared(
+    state: &DeviceState,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> Option<std::sync::Arc<Vec<u8>>> {
+    let need = get_from(&state.host_surfaces, surface_id, width, height)?.len();
+    let e = state.host_surfaces.get(&surface_id)?;
+    Some(if e.bgra.len() == need {
+        std::sync::Arc::clone(&e.bgra)
+    } else {
+        std::sync::Arc::new(e.bgra[..need].to_vec())
+    })
 }
 
 /// Type-2/3 encode cache by texture object ref (not surface_id).
@@ -125,13 +207,14 @@ pub fn store_texture(
     height: u32,
     bgra: Vec<u8>,
 ) {
+    let generation = state.next_sampled_content_generation();
     store_into(
         &mut state.host_texture_surfaces,
         texture_ref,
         width,
         height,
-        bgra,
-        "tex",
+        std::sync::Arc::new(bgra),
+        generation,
     );
 }
 
@@ -142,19 +225,6 @@ pub fn get_texture(
     height: u32,
 ) -> Option<&[u8]> {
     get_from(&state.host_texture_surfaces, texture_ref, width, height)
-}
-
-/// Borrow a texture-ref encode plus its producer generation.
-///
-/// This is diagnostic provenance for the linear-sample loss proxy; selection
-/// semantics are identical to [`get_texture`].
-pub fn get_texture_with_gen(
-    state: &DeviceState,
-    texture_ref: u32,
-    width: u32,
-    height: u32,
-) -> Option<(&[u8], u32)> {
-    get_from_with_gen(&state.host_texture_surfaces, texture_ref, width, height)
 }
 
 /// Any size under texture_ref (sample path when descriptor geom unknown).
@@ -420,22 +490,19 @@ pub fn mirror_linear_color_cache(
 /// Guest MapMemory2 unmap/remap changes PFNs under the same GVA but does **not**
 /// destroy the encode — see [`note_unmap_retain_gva`] (Unmap retains; Map notify-only).
 pub fn store_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32, bgra: Vec<u8>) {
-    store_gva_owned(state, gva, width, height, bgra, 0, 0, 0);
+    store_gva_owned(state, gva, width, height, bgra, 0);
 }
 
 /// Store a GVA encode with the decoded object identity that produced it.
 /// Type-2/type-3 wrappers are the same linear texture storage family when the
 /// GVA and geometry match; unrelated nonzero object-type transitions still
 /// identify a different resource class.
-#[allow(clippy::too_many_arguments)]
 pub fn store_gva_owned(
     state: &mut DeviceState,
     gva: u64,
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    task_id: u32,
-    texture_ref: u32,
     object_type: u8,
 ) {
     if gva == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM
@@ -448,24 +515,13 @@ pub fn store_gva_owned(
     if bgra.len() < need {
         return;
     }
-    let (rgb_nz, max_rgb, px0) = crate::observe::bgra_rgb_stats(&bgra[..need]);
+    let generation = state.next_sampled_content_generation();
     let entry = state.host_gva_surfaces.entry(gva).or_default();
-    entry.host_gen = entry.host_gen.wrapping_add(1);
-    if entry.host_gen == 0 {
-        entry.host_gen = 1;
-    }
+    entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
-    entry.bgra = bgra;
-    entry.producer_task_id = task_id;
-    entry.producer_texture_ref = texture_ref;
+    entry.bgra = std::sync::Arc::new(bgra);
     entry.producer_object_type = object_type;
-    if width >= 1280 && height >= 720 {
-        crate::observe::off(format!(
-            "host_cache_store tag=gva gva={gva:#x} {width}x{height} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-            entry.host_gen, px0[0], px0[1], px0[2], px0[3]
-        ));
-    }
 }
 
 pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
@@ -481,7 +537,7 @@ pub fn get_gva_with_gen(
     gva: u64,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32)> {
+) -> Option<(&[u8], u64)> {
     let e = state.host_gva_surfaces.get(&gva)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -495,13 +551,13 @@ pub fn get_gva_with_gen(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Borrow a GVA encode plus its decoded producer identity.
+/// Borrow a GVA encode plus its decoded producer object type.
 pub fn get_gva_with_owner(
     state: &DeviceState,
     gva: u64,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32, u32, u32, u8)> {
+) -> Option<(&[u8], u64, u8)> {
     let e = state.host_gva_surfaces.get(&gva)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -512,261 +568,17 @@ pub fn get_gva_with_owner(
     if e.bgra.len() < need {
         return None;
     }
-    Some((
-        &e.bgra[..need],
-        e.host_gen,
-        e.producer_task_id,
-        e.producer_texture_ref,
-        e.producer_object_type,
-    ))
-}
-
-/// Peek GVA encode without geom filter (tests / diagnostics).
-pub fn get_gva_any(state: &DeviceState, gva: u64) -> Option<(u32, u32, &[u8])> {
-    let e = state.host_gva_surfaces.get(&gva)?;
-    if e.width == 0 || e.height == 0 || e.bgra.is_empty() {
-        return None;
-    }
-    let need = (e.height as usize)
-        .saturating_mul(e.width as usize)
-        .saturating_mul(RGBA8_BPP as usize);
-    if e.bgra.len() < need {
-        return None;
-    }
-    Some((e.width, e.height, &e.bgra[..need]))
-}
-
-/// UnmapMemory of a guest GVA must **not** drop discrete encode content.
-///
-/// Live x86 wallpaper class (serial-20260714-022033): full sky store to
-/// `gva=0x2c22000` (rgb_nz=full) → UnmapMemory → MapMemory2 same VA, **new PFNs**
-/// → sample sees zero guest pages + empty host_cache → pipe stores black wipe.
-/// On unified Apple hosts Unmap tears down GPU VA; on this discrete rail the
-/// host_cache **is** the texture body — retain across unmap/remap of the same VA.
-///
-/// Measure-only: UnmapMemory retains any GVA encode (no size gate — RE is PT-only).
-pub fn note_unmap_retain_gva(state: &DeviceState, gva: u64) {
-    if gva == 0 {
-        return;
-    }
-    if let Some(e) = state.host_gva_surfaces.get(&gva) {
-        if e.bgra.is_empty() {
-            return;
-        }
-        let need = (e.height as usize)
-            .saturating_mul(e.width as usize)
-            .saturating_mul(RGBA8_BPP as usize);
-        let slice = &e.bgra[..need.min(e.bgra.len())];
-        let (rgb_nz, max_rgb, _) = crate::observe::bgra_rgb_stats(slice);
-        crate::observe::off(format!(
-            "host_cache_gva_retain_on_unmap gva={gva:#x} {}x{} host_gen={} rgb_nz={rgb_nz} max_rgb={max_rgb}",
-            e.width, e.height, e.host_gen
-        ));
-    }
+    Some((&e.bgra[..need], e.host_gen, e.producer_object_type))
 }
 
 /// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
-    if let Some(e) = state.host_gva_surfaces.remove(&gva) {
-        if !e.bgra.is_empty() {
-            crate::observe::off(format!(
-                "host_cache_evict tag=gva gva={gva:#x} {}x{} host_gen={}",
-                e.width, e.height, e.host_gen
-            ));
-        }
-    }
+    state.host_gva_surfaces.remove(&gva);
 }
 
 /// Drop host-cache entry (unmap / delete surface).
 pub fn evict(state: &mut DeviceState, surface_id: u32) {
-    if let Some(e) = state.host_surfaces.remove(&surface_id) {
-        if e.width >= 1280 && e.height >= 720 {
-            crate::observe::off(format!(
-                "host_cache_evict mid={surface_id} {}x{} host_gen={}",
-                e.width, e.height, e.host_gen
-            ));
-        }
-    }
-}
-
-/// Outcome of [`flush_surface_id_to_guest_pages`] (Synchronize / pageoff).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SyncFlushResult {
-    /// No type-4 host_cache entry for this object_id.
-    NoHostCache,
-    /// Mapping missing or has no page table entries.
-    NoMapping,
-    /// host_cache geom does not match latched mapping geom.
-    GeomMismatch,
-    /// `write_bgra8` failed (window/span/GPA).
-    WriteFail,
-    /// Host render-cache pushed into guest mapping pages.
-    WroteGuest {
-        width: u32,
-        height: u32,
-        host_gen: u32,
-    },
-}
-
-/// RE `CmdSynchronizeResources` (guest `synchronizeForUnwire` before pageoff):
-/// push type-4 **host render-cache** into **guest mapping pages** for `surface_id`.
-///
-/// Discrete rail can hold executed content only in `host_surfaces` while guest
-/// IOSurface pages lag; pageoff expects guest-visible bytes. Unified path that
-/// already writeback_guest on Store is a no-op here (`NoHostCache` or rewrite
-/// same bytes). Does **not** invent pages; requires mapped `page_entries`.
-///
-/// Type-2/3 GVA cache is **not** flushed here (keyed by GVA, not object_id);
-/// see [`flush_gva_host_cache_on_map`].
-pub fn flush_surface_id_to_guest_pages<
-    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
->(
-    state: &mut DeviceState,
-    host: &mut M,
-    surface_id: u32,
-) -> SyncFlushResult {
-    if surface_id == 0 {
-        return SyncFlushResult::NoHostCache;
-    }
-    let Some(cached) = state.host_surfaces.get(&surface_id).cloned() else {
-        return SyncFlushResult::NoHostCache;
-    };
-    if cached.bgra.is_empty() || cached.width == 0 || cached.height == 0 {
-        return SyncFlushResult::NoHostCache;
-    }
-    let Some(m) = state.mappings.get(&surface_id) else {
-        return SyncFlushResult::NoMapping;
-    };
-    if !m.mapped || m.page_entries.is_empty() {
-        return SyncFlushResult::NoMapping;
-    }
-    if m.has_geom && (m.width != cached.width || m.height != cached.height) {
-        return SyncFlushResult::GeomMismatch;
-    }
-    let w = cached.width;
-    let h = cached.height;
-    let stride = w.saturating_mul(RGBA8_BPP);
-    let host_gen = cached.host_gen;
-    let bgra = cached.bgra;
-    if !crate::runtime::mapping_write::write_bgra8(state, host, surface_id, &bgra, stride, w, h) {
-        return SyncFlushResult::WriteFail;
-    }
-    SyncFlushResult::WroteGuest {
-        width: w,
-        height: h,
-        host_gen,
-    }
-}
-
-/// Outcome of [`flush_gva_host_cache_on_map`] (MapMemory2 remount).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GvaMapFlushStats {
-    /// Host GVA cache entries written into guest pages.
-    pub wrote: u32,
-    /// Walker failed for cache entry base GVA.
-    pub walk_fail: u32,
-    /// No host_gva entry whose base falls in the Map range.
-    pub no_cache: u32,
-}
-
-/// RE MapMemory2 / UnmapMemory order:
-/// - **Unmap notify:** guest has **already** `PageTable::deallocate` — walker fails;
-///   host cannot flush via GVA (too late). Retain [`host_gva_surfaces`] for sample.
-/// - **Map notify:** guest has **already** installed leaf PPNs — walker works;
-///   new PFNs are empty until host re-writes encode.
-///
-/// Discrete type-2/3 encode lives in `host_gva_surfaces` (keyed by allocation
-/// base GVA). After remount, push that BGRA cache into the new guest pages so
-/// guest RAM matches host-executed content. This is **not** inventing PFNs
-/// (guest already wrote PTEs) and **not** inventing geometry (cache w/h).
-///
-/// `map_gva`/`map_len` are the MapMemory2 wire range; any cache key `k` with
-/// `map_gva <= k < map_gva+map_len` is flushed (allocation bases fall in map).
-pub fn flush_gva_host_cache_on_map<
-    M: crate::runtime::host::HostMemory + crate::runtime::host::HostOps,
->(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    map_gva: u64,
-    map_len: u64,
-) -> GvaMapFlushStats {
-    let mut stats = GvaMapFlushStats::default();
-    if map_gva == 0 || map_len == 0 {
-        return stats;
-    }
-    let map_end = map_gva.saturating_add(map_len);
-    let keys: Vec<u64> = state
-        .host_gva_surfaces
-        .keys()
-        .copied()
-        .filter(|&k| k != 0 && k >= map_gva && k < map_end)
-        .collect();
-    if keys.is_empty() {
-        stats.no_cache = 1;
-        return stats;
-    }
-    let _page_shift = state.page_shift;
-    for gva in keys {
-        let Some(e) = state.host_gva_surfaces.get(&gva).cloned() else {
-            continue;
-        };
-        if e.bgra.is_empty() || e.width == 0 || e.height == 0 {
-            continue;
-        }
-        let w = e.width;
-        let h = e.height;
-        let bpr = w.saturating_mul(RGBA8_BPP);
-        let span = (h as u64).saturating_mul(bpr as u64);
-        // Texture must fit in the mapped range from its base.
-        if gva.saturating_add(span) > map_end {
-            stats.walk_fail = stats.walk_fail.saturating_add(1);
-            continue;
-        }
-        let row_len = bpr as usize;
-        let mut ok = true;
-        for y in 0..h as usize {
-            let so = y.saturating_mul(row_len);
-            if so + row_len > e.bgra.len() {
-                ok = false;
-                break;
-            }
-            let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
-            if crate::runtime::gva_mem::write_task_gva_product(
-                state,
-                host,
-                task_id,
-                row_gva,
-                &e.bgra[so..so + row_len],
-            )
-            .is_err()
-            {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            stats.wrote = stats.wrote.saturating_add(1);
-            crate::observe::fail(format!(
-                "gva_map_flush ok gva={gva:#x} {w}x{h} task={task_id} host_gen={} map={map_gva:#x}+{map_len:#x}",
-                e.host_gen
-            ));
-        } else {
-            stats.walk_fail = stats.walk_fail.saturating_add(1);
-            crate::observe::fail(format!(
-                "gva_map_flush fail gva={gva:#x} {w}x{h} task={task_id} map={map_gva:#x}+{map_len:#x}"
-            ));
-        }
-    }
-    stats
-}
-
-/// Empty cache for tests.
-pub fn clear_all(state: &mut DeviceState) {
-    state.host_surfaces.clear();
-    state.host_texture_surfaces.clear();
-    state.host_gva_surfaces.clear();
-    state.host_linear_textures.clear();
+    state.host_surfaces.remove(&surface_id);
 }
 
 #[cfg(test)]
@@ -774,6 +586,75 @@ mod tests {
 
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+
+    /// A generation must name one content for the life of the device, and the
+    /// hard case is the one that shipped broken: the entry is *destroyed* in
+    /// between.
+    ///
+    /// `evict_gva` runs on every deferred GVA render Store arm, so this
+    /// sequence is the routine compositor path rather than a corner. With a
+    /// per-entry counter both stores report generation 1, the engine's sampled
+    /// cache matches `(gva, 1)` against the image it retained for the first
+    /// one, and binds the previous content — measured live as
+    /// `sampled_identity_stale identity_key=0xa4c000 generation=1` over two
+    /// different 64x64 icons.
+    ///
+    /// Asserting the two generations differ is the whole property; asserting
+    /// either value would pin the counter's history instead.
+    #[test]
+    fn a_gva_reused_after_eviction_never_repeats_a_generation() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (gva, w, h) = (0xa4_c000u64, 2u32, 2u32);
+
+        store_gva(&mut st, gva, w, h, vec![0x11; (w * h * 4) as usize]);
+        let (_, first, _) = get_gva_with_owner(&st, gva, w, h).expect("first store");
+
+        evict_gva(&mut st, gva);
+        assert!(
+            get_gva_with_owner(&st, gva, w, h).is_none(),
+            "the arm removes the entry outright"
+        );
+
+        store_gva(&mut st, gva, w, h, vec![0x22; (w * h * 4) as usize]);
+        let (bytes, second, _) = get_gva_with_owner(&st, gva, w, h).expect("second store");
+
+        assert_eq!(bytes[0], 0x22, "the cache holds the new content");
+        assert_ne!(
+            first, second,
+            "same gva, different bytes, same generation: the sampled cache \
+             would bind the first store's image for the second store's pixels"
+        );
+    }
+
+    /// The same rule across producers. The generations used to live in two
+    /// namespaces split by a `1 << 32` constant precisely because the counters
+    /// were independent; one counter removes the constant and the failure mode
+    /// it was guarding against, so nothing may reintroduce a second source.
+    #[test]
+    fn every_host_cache_producer_draws_from_one_generation_source() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let px = vec![0u8; 4 * 4 * 4];
+        let mut seen = std::collections::HashSet::new();
+
+        store(&mut st, 7, 4, 4, px.clone());
+        seen.insert(get_from_with_gen(&st.host_surfaces, 7, 4, 4).expect("mid store").1);
+        store_texture(&mut st, 9, 4, 4, px.clone());
+        seen.insert(
+            get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
+                .expect("ref store")
+                .1,
+        );
+        store_gva(&mut st, 0x5000, 4, 4, px);
+        seen.insert(get_gva_with_gen(&st, 0x5000, 4, 4).expect("gva store").1);
+        assert!(
+            cede_surface_to_resident(&mut st, 7, 4, 4),
+            "cession is a state change and must take a generation too"
+        );
+        seen.insert(st.host_surfaces.get(&7).expect("ceded entry").host_gen);
+
+        assert_eq!(seen.len(), 4, "four stores, four distinct generations");
+        assert!(!seen.contains(&0), "0 is reserved for 'no host content yet'");
+    }
 
     /// Deferred linear residency lifecycle: note marks the entry
     /// resident-authoritative with empty bytes, the resident getter validates
@@ -893,8 +774,7 @@ mod tests {
             2,
             MTL_FORMAT_RGBA16_FLOAT,
         );
-        st.linear_deferred_flush
-            .insert(obligation_key, (2, std::collections::HashSet::new()));
+        st.arm_linear_deferred_window(obligation_key, 2, std::collections::HashSet::new());
         assert!(st.delete_task(6));
         assert_eq!(st.retired_linear_residents.len(), 1);
         let key = st.retired_linear_residents[0];
@@ -910,7 +790,7 @@ mod tests {
         );
 
         st.define_task(6, 0x1000, 1);
-        st.insert_object(6, 21, crate::model::ObjectEntry::default());
+        st.insert_object(6, 21);
         assert!(note_linear_texture_resident(
             &mut st,
             6,
@@ -928,7 +808,7 @@ mod tests {
         // Non-resident entries retire nothing.
         st.retired_linear_residents.clear();
         let px = vec![0u8; 4 * 2 * 8];
-        st.insert_object(6, 22, crate::model::ObjectEntry::default());
+        st.insert_object(6, 22);
         assert!(store_linear_texture(
             &mut st,
             6,
@@ -1001,19 +881,27 @@ mod tests {
 
         let mut owned = vec![0u8; 16];
         owned[0] = 0xcc;
-        store_gva_owned(&mut st, gva, 2, 2, owned, 1, 110, 2);
-        let (got, generation, task, texture_ref, object_type) =
-            get_gva_with_owner(&st, gva, 2, 2).unwrap();
+        store_gva_owned(&mut st, gva, 2, 2, owned, 2);
+        let (got, generation, object_type) = get_gva_with_owner(&st, gva, 2, 2).unwrap();
         assert_eq!(got[0], 0xcc);
         assert_eq!(generation, 3);
-        assert_eq!((task, texture_ref, object_type), (1, 110, 2));
+        assert_eq!(object_type, 2);
         evict_gva(&mut st, gva);
         assert!(get_gva(&st, gva, 2, 2).is_none());
     }
 
-    /// Unmap must not drop GVA encode for any geom (PT-only RE; no size heuristic).
+    /// The GVA encode cache is keyed by virtual address alone, at any geometry.
+    ///
+    /// This is what makes "UnmapMemory retains the encode" work: the retain is
+    /// the *absence* of an evict on the unmap path, so the cache has to stay
+    /// readable through page-table churn without anyone re-registering it. The
+    /// live x86 wallpaper class was a full sky store to `gva=0x2c22000` followed
+    /// by UnmapMemory + MapMemory2 of the same VA with new PFNs; if the entry
+    /// did not survive on the VA key alone, the next sample found zero guest
+    /// pages and an empty cache and the pipe stored a black wipe. No size gate —
+    /// a 64x48 layer takes the same path as a full-screen one.
     #[test]
-    fn unmap_retains_gva_encode_any_size() {
+    fn gva_encode_is_keyed_by_address_at_any_size() {
         let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let gva = 0x2c22000u64;
         // Small layer — same retain path as wallpaper (no W×H gate).
@@ -1027,10 +915,7 @@ mod tests {
             chunk[3] = 255;
         }
         store_gva(&mut st, gva, w, h, px);
-        assert!(get_gva(&st, gva, w, h).is_some());
-        note_unmap_retain_gva(&st, gva);
-        let (gw, gh, got) = get_gva_any(&st, gva).expect("retained after unmap");
-        assert_eq!((gw, gh), (w, h));
+        let got = get_gva(&st, gva, w, h).expect("retained on the VA key");
         assert_eq!(got[0], 185);
         assert_eq!(got[2], 81);
     }
@@ -1064,7 +949,7 @@ mod tests {
             HostSurface {
                 width: w,
                 height: h,
-                bgra,
+                bgra: std::sync::Arc::new(bgra),
                 host_gen: 9,
                 ..Default::default()
             },
@@ -1084,7 +969,7 @@ mod tests {
         assert_eq!(get_from(&map, id, w, h), Some(bytes));
 
         // Empty bytes -> None even with matching geometry.
-        map.get_mut(&id).unwrap().bgra.clear();
+        map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(Vec::new());
         assert_eq!(
             get_from_with_gen(&map, id, w, h),
             None,
@@ -1092,11 +977,130 @@ mod tests {
         );
 
         // Non-empty but short of `need` -> None (truncated store, no partial serve).
-        map.get_mut(&id).unwrap().bgra = vec![0xABu8; need - 1];
+        map.get_mut(&id).unwrap().bgra = std::sync::Arc::new(vec![0xABu8; need - 1]);
         assert_eq!(
             get_from_with_gen(&map, id, w, h),
             None,
             "under-`need` bytes must not be served",
         );
+    }
+
+    /// Ceding a mapping to its resident must stop the cache answering for it —
+    /// with a miss, never with the frame the Store superseded.
+    ///
+    /// The whole point of the `skip_readback` rail is that no CPU copy of the new
+    /// frame exists, so anything still serving the *old* one is serving a frame
+    /// that is now a layer behind. `capture_present_frame` reads
+    /// `surface_cache::get` **before** it tries the resident, so a cession that
+    /// left the bytes in place would pin the display to the pre-Store frame for as
+    /// long as the rail stayed engaged, with nothing to report it.
+    ///
+    /// The restore direction is asserted too: the flush writes through
+    /// `mapping_write::write_bgra8`, whose tail republishes this entry, and that
+    /// is what ends the cession. A cession that could not be ended would leave the
+    /// mapping permanently dependent on a resident that only a pin protects.
+    #[test]
+    fn a_ceded_surface_serves_a_miss_and_says_it_was_ceded() {
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let (w, h) = (4u32, 4u32);
+        let need = (w * h * 4) as usize;
+        store(&mut state, 7, w, h, vec![0xA1u8; need]);
+        let before = state.host_surfaces.get(&7).map(|e| e.host_gen).unwrap();
+
+        assert!(cede_surface_to_resident(&mut state, 7, w, h));
+        assert_eq!(
+            get(&state, 7, w, h),
+            None,
+            "a ceded entry must not serve the frame the Store superseded"
+        );
+        assert!(
+            get_shared(&state, 7, w, h).is_none(),
+            "the shared handle must miss wherever the slice does"
+        );
+        assert!(surface_ceded_to_resident(&state, 7, w, h));
+        assert!(
+            state.host_surfaces.get(&7).unwrap().host_gen != before,
+            "the cession is a state change and must advance host_gen"
+        );
+
+        // A geometry this cache would not have stored anyway is refused, so the
+        // arm can fail closed rather than leave a live entry contradicting a
+        // resident-authoritative window.
+        assert!(!cede_surface_to_resident(&mut state, 0, w, h));
+        assert!(!cede_surface_to_resident(&mut state, 7, 0, h));
+        assert!(!cede_surface_to_resident(
+            &mut state,
+            7,
+            w,
+            MAX_SCANOUT_DIM + 1
+        ));
+
+        // The flush's republish ends it.
+        store(&mut state, 7, w, h, vec![0xB2u8; need]);
+        assert!(!surface_ceded_to_resident(&state, 7, w, h));
+        assert_eq!(get(&state, 7, w, h).map(|b| b[0]), Some(0xB2));
+    }
+
+    /// A ceded entry is not the same thing as a stale-geometry one, and the
+    /// classifier must not confuse them.
+    ///
+    /// Both make `get` miss, and folding them together would print
+    /// `have=4x4` against `want=4x4` on the LOAD-seed decline — a line that reads
+    /// as a contradiction rather than as the expected cost of the rail.
+    #[test]
+    fn cession_is_distinguishable_from_a_stale_geometry_entry() {
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        store(&mut state, 7, 8, 8, vec![0xA1u8; 8 * 8 * 4]);
+        assert!(
+            !surface_ceded_to_resident(&state, 7, 4, 4),
+            "an entry at another geometry is stale, not ceded"
+        );
+        assert!(
+            !surface_ceded_to_resident(&state, 9, 4, 4),
+            "an absent entry is absent, not ceded"
+        );
+        assert!(cede_surface_to_resident(&mut state, 7, 4, 4));
+        assert!(surface_ceded_to_resident(&state, 7, 4, 4));
+        assert!(
+            !surface_ceded_to_resident(&state, 7, 8, 8),
+            "the cession is scoped to the geometry it was taken at"
+        );
+    }
+
+    /// `get_shared` must hit exactly when `get` hits, including for a stored
+    /// buffer carrying slop past `width * height * 4`.
+    ///
+    /// Returning `None` there would be a silent seed loss, and a missing Load
+    /// seed renders the pass onto a cleared target — a compositing layer going
+    /// solid black. The shared handle cannot be truncated the way `get`'s slice
+    /// is, so the slop case pays a copy instead of missing.
+    #[test]
+    fn get_shared_hits_wherever_get_hits_and_never_serves_slop() {
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let (w, h) = (4u32, 4u32);
+        let need = (w * h * 4) as usize;
+
+        // Exact: shared, and the same bytes `get` serves.
+        store(&mut state, 7, w, h, vec![0xA1u8; need]);
+        let exact = get_shared(&state, 7, w, h).expect("exact store must hit");
+        assert_eq!(exact.len(), need);
+        assert_eq!(&exact[..], get(&state, 7, w, h).unwrap());
+
+        // Slop: still hits, truncated to the geometry the caller matched on —
+        // the engine rejects a seed whose length is not exactly that.
+        let mut slop = vec![0xB2u8; need + 16];
+        slop[need] = 0xCD;
+        state.host_surfaces.get_mut(&7).unwrap().bgra = std::sync::Arc::new(slop);
+        let got = get_shared(&state, 7, w, h).expect("a store with slop must still hit");
+        assert_eq!(got.len(), need, "must truncate to width*height*BPP");
+        assert!(got.iter().all(|&b| b == 0xB2), "no slop byte leaks in");
+        assert_eq!(&got[..], get(&state, 7, w, h).unwrap());
+
+        // Geometry mismatch misses in both, identically.
+        assert!(get_shared(&state, 7, w + 1, h).is_none());
+        assert!(get(&state, 7, w + 1, h).is_none());
     }
 }

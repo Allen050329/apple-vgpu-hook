@@ -19,7 +19,7 @@ use crate::contract::iosurface_pages::{
     DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT,
     PAGE_ENTRY_VALID,
 };
-use crate::model::{DeviceState, MappingEntry, ObjectEntry, MAX_MAPPINGS, MAX_TASKS};
+use crate::model::{DeviceState, MappingEntry, MAX_MAPPINGS, MAX_TASKS};
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
     OBJECT_TYPE_IOSURFACE,
@@ -349,8 +349,133 @@ fn decode_type4_plane(desc: &[u8], plane_index: usize) -> Option<Type4Plane> {
     })
 }
 
+/// The bytes of a type-4 surface descriptor that [`decode_type4_surface`] does
+/// **not** read: `+0x11..0x14` and everything past the plane records it
+/// consumed (`TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE ..`).
+///
+/// Decoded today: `length` (+0x00), `backing_pfn` (+0x08), `pixel_format`
+/// (+0x0c), `plane_count` (+0x10), and each plane's offset/width/height/packed
+/// bpr. That is everything we know about a surface when the guest creates it —
+/// and it is not enough to tell a desktop swapchain buffer from a same-geometry
+/// offscreen render target, because a WebKit content tile is also 1920x1080
+/// 'BGRA'. Membership is therefore reconstructed downstream by compositor-output
+/// edges, full-frame-publish detection, output groups, presented-ness, and the
+/// a/b seed.
+///
+/// **Measured: the guest is not telling us here.** Across one 1766 s x86/Vulkan
+/// session with a real GUI login (boot `20260728-163046`), the probe below
+/// emitted exactly two shapes for ≥5983 decodes over 453 distinct surface ids
+/// and 154 distinct geometries — desktop swapchain buffers and never-displayed
+/// content tiles alike:
+///
+/// ```text
+/// type4_desc_shape distinct=1 1920x1080 fmt=0x42475241 planes=1 len=36 undecoded_len=3 undecoded_nz=0
+/// type4_desc_shape distinct=2   320x320 fmt=0x34323066 planes=2 len=52 undecoded_len=3 undecoded_nz=0
+/// ```
+///
+/// `len` is `TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE` exactly, and it is
+/// the *guest's* number — [`read_descriptor`] honours `descriptor_length` with no
+/// clamp. The record ends where the plane array ends; the only bytes we skip are
+/// the three at `+0x11`, and they were zero every time. There is nowhere in this
+/// descriptor for a usage, bind, scanout or role hint to be, so no rule over
+/// surface identity can classify a brand-new buffer before its first draw.
+///
+/// Narrow: this is the type-4 record on the x86 PCI pathway. It says nothing
+/// about type-11 (`decode_iosurface_texture_descriptor`, which does not run
+/// here and whose 0x38/0x58 blobs are still read only to 0x20), and a
+/// create-time record we never read at all would be invisible to it.
+///
+/// A `plane_count` above [`TYPE4_PLANE_CAP`] is clamped by the decoder, so the
+/// records past the clamp fall into this span too — which is correct: they are
+/// bytes we did not read.
+///
+/// Public so the probe's notion of "undecoded" is pinned by a test rather than
+/// restated in a log format string.
+pub fn undecoded_type4_surface_bytes(desc: &[u8]) -> Vec<u8> {
+    if desc.len() < TYPE4_MIN_LEN {
+        return Vec::new();
+    }
+    let plane_count = (desc[TYPE4_PLANE_COUNT] as usize).min(TYPE4_PLANE_CAP);
+    let planes_end = TYPE4_PLANES + plane_count * TYPE4_PLANE_STRIDE;
+    let mut out = Vec::new();
+    out.extend_from_slice(&desc[0x11..TYPE4_PLANES]);
+    if planes_end < desc.len() {
+        out.extend_from_slice(&desc[planes_end..]);
+    }
+    out
+}
+
+/// One always-on line per distinct `(len, undecoded span)`, capped.
+///
+/// Keyed on the **content** of the undecoded bytes, never on the record length.
+/// The `display_txn_payload` probe keyed its budget on `(opcode, payload_len)`,
+/// the length never varied, and it exhausted itself inside the first 400 ms —
+/// it answered one question and then went blind for the rest of the session. A
+/// new *value* is the interesting event here, so that is the key.
+///
+/// Runs before the decoder's own validity checks, so a record that fails to
+/// decode still reports. An earlier version of this probe on the type-11
+/// descriptor sat after its length check and emitted nothing at all on a live
+/// boot; "the decoder never ran" and "the tail is constant" produced the same
+/// silence, which is the reading the probe exists to rule out.
+///
+/// Hitting the cap is reported once. A silent truncation would read like "we
+/// saw everything", which is the same class of error as a probe reporting a
+/// confident constant.
+fn note_type4_surface_shape(desc: &[u8]) {
+    const MAX_SHAPES: usize = 24;
+    const HEX_MAX: usize = 128;
+    use std::sync::Mutex;
+    type ShapeKey = (usize, Vec<u8>);
+    static SEEN: Mutex<Option<std::collections::BTreeSet<ShapeKey>>> = Mutex::new(None);
+
+    let undecoded = undecoded_type4_surface_bytes(desc);
+    let (fresh, distinct) = {
+        let mut guard = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = guard.get_or_insert_with(Default::default);
+        if seen.len() > MAX_SHAPES {
+            return;
+        }
+        (seen.insert((desc.len(), undecoded.clone())), seen.len())
+    };
+    if !fresh {
+        return;
+    }
+    if distinct > MAX_SHAPES {
+        crate::observe::fail(format!(
+            "type4_desc_shape outcome=cap_reached distinct={distinct} \
+             (the undecoded span varies per surface; it is not a constant tail)"
+        ));
+        return;
+    }
+    let (w, h, fmt, pc) = if desc.len() >= TYPE4_MIN_LEN {
+        (
+            ld32(&desc[TYPE4_PLANES + 4..]),
+            ld32(&desc[TYPE4_PLANES + 8..]),
+            ld32(&desc[TYPE4_PIXEL_FORMAT..]),
+            desc[TYPE4_PLANE_COUNT],
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let hex: String = desc
+        .iter()
+        .take(HEX_MAX)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    crate::observe::fail(format!(
+        "type4_desc_shape distinct={distinct} {w}x{h} fmt={fmt:#x} planes={pc} len={} \
+         undecoded_len={} undecoded_nz={} hex={hex}{}",
+        desc.len(),
+        undecoded.len(),
+        undecoded.iter().filter(|&&b| b != 0).count(),
+        if desc.len() > HEX_MAX { "…" } else { "" },
+    ));
+}
+
 /// Decode a type-4 surface descriptor blob.
 pub fn decode_type4_surface(desc: &[u8]) -> Option<Type4Surface> {
+    note_type4_surface_shape(desc);
     if desc.len() < TYPE4_MIN_LEN {
         return None;
     }
@@ -479,7 +604,7 @@ pub fn lookup_list_entry<M: HostMemory>(
     let off = list_object_entry_offset(ref_, task.object_list_count)?;
     let entry_gva = ((task.object_list_pfn as u64) << state.page_shift).checked_add(off)?;
     let mut raw = [0u8; OBJECT_LIST_ENTRY_LEN];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -506,7 +631,7 @@ pub fn read_descriptor<M: HostMemory>(
     let len = crate::runtime::metal_draw::host_alloc_len(entry.descriptor_length as u64)
         .filter(|&n| n > 0)?;
     let mut buf = vec![0u8; len];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -542,16 +667,9 @@ pub fn resolve_type11_ref<M: HostMemory>(
         );
         return None;
     };
-    // Cache in the sparse object table (model ObjectEntry).
-    let _ = state.insert_object(
-        task_id,
-        ref_,
-        ObjectEntry {
-            object_type: entry.object_type,
-            desc_gva: entry.descriptor_gva,
-            desc_len: entry.descriptor_length,
-        },
-    );
+    // Record the ref as live; the type and descriptor come from the guest's own
+    // list at every use, never from here.
+    let _ = state.insert_object(task_id, ref_);
     if entry.object_type != OBJECT_TYPE_IOSURFACE {
         // Legitimate: this ref is a different object type, not a texture. Normal
         // control flow (resolve_type11_refs skips it) — never a failure.
@@ -586,27 +704,6 @@ pub fn resolve_type11_ref<M: HostMemory>(
     // Resolved: re-arm so a later genuine failure on this ref logs again.
     clear_type11_fail(task_id, ref_);
     Some(mapping_id)
-}
-
-/// Resolve a batch of object refs; returns mapping ids that are type-11.
-pub fn resolve_type11_refs<M: HostMemory>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    refs: &[u32],
-) -> Vec<u32> {
-    let mut out = Vec::new();
-    for &r in refs {
-        if r == 0 {
-            continue;
-        }
-        if let Some(m) = resolve_type11_ref(state, host, task_id, r) {
-            if !out.contains(&m) {
-                out.push(m);
-            }
-        }
-    }
-    out
 }
 
 /// Apply a decoded type-4 surface as page-table backing for `surface_id`.
@@ -786,6 +883,7 @@ fn apply_type4_backing<M: HostMemory>(
     // Device desc from type-4 wire only (single- or multi-plane). No BGRA invent.
     let device_desc = synthesize_device_desc_from_type4(surf);
 
+    let state_page_shift = state.page_shift;
     if let Some(m) = state.mappings.get_mut(&surface_id) {
         // `map_surface` above stashed the prior bindings as the incarnation
         // fingerprint (the notify-vs-eager-resolve rule): compare the fresh
@@ -799,7 +897,7 @@ fn apply_type4_backing<M: HostMemory>(
         let changed = prior != entries;
         let replaced = !prior.is_empty() && changed;
         if changed {
-            crate::model::DeviceState::bump_map_generation(surface_id, m);
+            crate::model::DeviceState::bump_map_generation(m);
         }
         if replaced {
             // Recycled-mid backing-refresh census (not a drop; the recycle rate
@@ -810,10 +908,32 @@ fn apply_type4_backing<M: HostMemory>(
                 entries.len(),
                 m.map_generation
             ));
-            // Same recycled-mid rule for present evidence: a new backing may
-            // be a new surface — it must re-earn OutputGroup qualification by
-            // being presented again (one capture, ~1 frame).
-            state.present.presented_geoms.remove(&surface_id);
+            // Present evidence needs no prune here: this branch only runs when
+            // the plan changed, which bumped `map_generation` just above, and
+            // the evidence is stamped with the incarnation that recorded it.
+            // Pruning it unconditionally is what the identical-plan path used
+            // to do via `map_surface`, and that demoted a surface the compare
+            // had just called the SAME incarnation.
+        }
+        // The guest-physical footprint this incarnation authorises us to write.
+        // See `mapper::entry_gpa_span`; this is the type-4 adoption site and, on
+        // a live x86 boot, the one that actually runs — the mapper's own
+        // adoption stayed silent for whole boots while surfaces plainly had
+        // 2040 pages each, because the page list arrives here.
+        if let Some((lo, hi)) = crate::runtime::mapper::entry_gpa_span(&entries, state_page_shift) {
+            let key = (u64::from(surface_id) << 40) ^ (lo >> state_page_shift) ^ (hi << 20);
+            if crate::observe::first_sight("mapping_gpa_span", key) {
+                crate::observe::off(format!(
+                    "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 changed={} \
+                     lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
+                    m.map_generation,
+                    entries.len(),
+                    changed as u8,
+                    hi + (1u64 << state_page_shift),
+                    lo >> state_page_shift,
+                    hi >> state_page_shift,
+                ));
+            }
         }
         m.page_entries = entries;
         m.mapped = true;
@@ -870,19 +990,11 @@ pub fn resolve_type4_surface_force<M: HostMemory>(
 }
 
 /// Latch the task that owns `surface_id` as its type-4 backing so the next
-/// present-path scan tries it right after task 0, and record the scan census.
-fn record_type4_owner(
-    state: &mut DeviceState,
-    surface_id: u32,
-    task_id: u32,
-    probes: u64,
-    hint: u32,
-) {
+/// present-path scan tries it right after task 0.
+fn record_type4_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) {
     if let Some(m) = state.mappings.get_mut(&surface_id) {
         m.owner_task_hint = task_id;
     }
-    let hint_hit = hint != 0 && task_id == hint;
-    crate::runtime::census::ensure_surface_census::note_scan(probes, true, hint_hit);
 }
 
 fn resolve_type4_surface_ex<M: HostMemory>(
@@ -897,8 +1009,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
     // Task probe order: task 0 (kernel/global — historical type-4 home) first,
     // then the cached owner-task hint (so a hot present-path re-scan
     // short-circuits on the owning task instead of walking all 256 slots),
-    // then the remaining tasks. `ensure_surface_census.probes_per_scan`
-    // measures how much the hint cuts the per-bind scan.
+    // then the remaining tasks.
     let hint = state
         .mappings
         .get(&surface_id)
@@ -916,7 +1027,6 @@ fn resolve_type4_surface_ex<M: HostMemory>(
         order.push(tid);
     }
 
-    let mut probes: u64 = 0;
     for task_id in order {
         if task_id as usize >= state.tasks.len() {
             continue;
@@ -925,7 +1035,6 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             continue;
         }
         // Count the guest-read cost of one active-task object-list probe.
-        probes += 1;
         let Some(entry) = lookup_list_entry(state, host, task_id, surface_id) else {
             continue;
         };
@@ -943,15 +1052,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             );
             continue;
         };
-        let _ = state.insert_object(
-            task_id,
-            surface_id,
-            ObjectEntry {
-                object_type: entry.object_type,
-                desc_gva: entry.descriptor_gva,
-                desc_len: entry.descriptor_length,
-            },
-        );
+        let _ = state.insert_object(task_id, surface_id);
         let Some(surf) = decode_type4_surface(&desc) else {
             note_type4_fail(
                 surface_id,
@@ -987,7 +1088,7 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             if same_geom {
                 // Same geom + non-empty pages: keep (guest double-buffer
                 // may still rewrite page *content* without changing pfn).
-                record_type4_owner(state, surface_id, task_id, probes, hint);
+                record_type4_owner(state, surface_id, task_id);
                 return true;
             }
         } else if let Some(m) = state.mappings.get(&surface_id) {
@@ -1033,15 +1134,14 @@ fn resolve_type4_surface_ex<M: HostMemory>(
             }
         }
         if force_fresh {
-            record_type4_owner(state, surface_id, task_id, probes, hint);
+            record_type4_owner(state, surface_id, task_id);
             return true;
         }
         if apply_type4_backing(state, host, task_id, surface_id, &surf) {
-            record_type4_owner(state, surface_id, task_id, probes, hint);
+            record_type4_owner(state, surface_id, task_id);
             return true;
         }
     }
-    crate::runtime::census::ensure_surface_census::note_scan(probes, false, false);
     false
 }
 
@@ -1058,7 +1158,6 @@ pub fn ensure_surface_for_present<M: HostMemory + crate::runtime::host::HostOps>
     if surface_id == 0 {
         return false;
     }
-    crate::runtime::census::ensure_surface_census::note_call();
     let need = state
         .mappings
         .get(&surface_id)
@@ -1459,6 +1558,73 @@ mod tests {
         );
     }
 
+    /// A task the guest has defined but never given an object list to must
+    /// resolve **nothing** — not another task's list.
+    ///
+    /// This reproduces, at unit scale, what the rail was measured doing on every
+    /// boot. `TaskEntry::define` used to invent `object_list_pfn = 1` and
+    /// `count = 0x100000`, so a task with no `SetObjectList` still computed an
+    /// entry address of `0x1000 + off`. Nothing is mapped there for that task,
+    /// the walk failed `gva_zero_pfn`, and `read_task_gva_by_id` then walked
+    /// task `5 >> 1 == 2`'s page table at the same address — where task 2's
+    /// object list genuinely lives — and decoded task 2's entry as task 5's.
+    ///
+    /// Task 2's own lookup is asserted first so the fixture is known to be real:
+    /// a test where the donor list is unreadable would pass for the wrong reason.
+    #[test]
+    fn a_task_with_no_object_list_resolves_nothing_not_its_neighbours_list() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data_gpa = 4u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x1000, 0);
+        host.map_range(data_gpa, 0x1000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        // PTE for GVA page 1 (0x1000) → pfn 4, so task 2's list is readable.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        let _ = host.write_gpa(root_gpa + 4, &pte);
+
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(
+            &mut entry[0..],
+            (OBJECT_TYPE_SURFACE as u32) | (0x40u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa, &entry);
+
+        // Task 2 owns a real list at pfn 1. Task 5 has a directory that maps
+        // nothing, and `5 >> 1 == 2`.
+        assert!(state.define_task(2, 0x1000, 2));
+        assert!(state.set_object_list(2, 1, 4));
+        assert!(state.define_task(5, 0x1000, 9));
+
+        let donor = lookup_list_entry(&state, &host, 2, 0);
+        assert!(
+            donor.is_some(),
+            "fixture is not real: task 2's own list must be readable"
+        );
+
+        // The behavioural claim first, so a regression fails on the corruption
+        // itself rather than on the field that causes it.
+        assert_eq!(
+            lookup_list_entry(&state, &host, 5, 0),
+            None,
+            "task 5 has no object list, so it must resolve nothing — returning \
+             Some here is task 2's entry answering for task 5"
+        );
+        assert_eq!(
+            state.tasks[5].object_list_pfn, 0,
+            "a defined task has no list until SetObjectList says so"
+        );
+        assert_eq!(state.tasks[5].object_list_count, 0);
+    }
+
     fn setup_type4_candidate(
         host: &mut FakeHost,
         state: &mut DeviceState,
@@ -1644,5 +1810,81 @@ mod tests {
             0x42, 0x01, 0x0a, 0x00, 0, 0, 0, 0, 0x00, 0x04, 0, 0, 0x01, 0, 0, 0,
         ]);
         assert!(decode_type5_texture_view(&zw).is_none());
+    }
+
+    /// The probe's notion of "undecoded" must be exactly the bytes
+    /// `decode_type4_surface` skips, and it must distinguish two surfaces on
+    /// those bytes alone.
+    ///
+    /// This is the measurement that blocks the largest deletion in the present
+    /// path: nothing decoded at surface-create time separates a desktop
+    /// swapchain buffer from a same-geometry offscreen tile, so membership is
+    /// reconstructed by half a dozen downstream mechanisms. If the guest is
+    /// telling us in the undecoded span, the probe has to be able to see it.
+    #[test]
+    fn undecoded_type4_span_is_exactly_what_the_decoder_skips() {
+        // One plane: the decoder consumes 0x14..0x24, so the tail starts there.
+        let mut a = vec![0u8; 0x40];
+        st64(&mut a[TYPE4_LEN..], 0x800000);
+        st32(&mut a[TYPE4_BACKING_PFN..], 0x1234);
+        st32(&mut a[TYPE4_PIXEL_FORMAT..], 0x4247_5241); // 'BGRA'
+        a[TYPE4_PLANE_COUNT] = 1;
+        st32(&mut a[TYPE4_PLANES..], 0); // plane0 offset
+        st32(&mut a[TYPE4_PLANES + 4..], 1920);
+        st32(&mut a[TYPE4_PLANES + 8..], 1080);
+        st32(&mut a[TYPE4_PLANES + 12..], 1920 * 4);
+
+        // Every decoded field can change without moving the undecoded span.
+        let mut b = a.clone();
+        st64(&mut b[TYPE4_LEN..], 0x900000);
+        st32(&mut b[TYPE4_BACKING_PFN..], 0x9999);
+        st32(&mut b[TYPE4_PIXEL_FORMAT..], 0x4c31_3062);
+        st32(&mut b[TYPE4_PLANES + 4..], 1280);
+        st32(&mut b[TYPE4_PLANES + 8..], 720);
+        st32(&mut b[TYPE4_PLANES + 12..], 1280 * 4);
+        assert_eq!(
+            undecoded_type4_surface_bytes(&a),
+            undecoded_type4_surface_bytes(&b),
+            "changing only decoded fields must not look like a new shape"
+        );
+
+        // The span covers the three bytes after plane_count and the whole tail
+        // past the plane records the decoder consumed.
+        for probe in [0x11usize, 0x13, 0x24, 0x3f] {
+            let mut c = a.clone();
+            c[probe] ^= 0xff;
+            assert_ne!(
+                undecoded_type4_surface_bytes(&a),
+                undecoded_type4_surface_bytes(&c),
+                "byte {probe:#x} is undecoded and must be visible to the probe"
+            );
+        }
+
+        // Bytes the decoder DOES read must not be in the span, or ordinary
+        // surface-to-surface variation would look like a new shape forever.
+        // `plane_count` (+0x10) is excluded on purpose: it is decoded AND it
+        // moves the span's own boundary, which the two-plane case below pins.
+        for probe in [0x00usize, 0x08, 0x0c, 0x14, 0x23] {
+            let mut c = a.clone();
+            c[probe] ^= 0xff;
+            assert_eq!(
+                undecoded_type4_surface_bytes(&a),
+                undecoded_type4_surface_bytes(&c),
+                "byte {probe:#x} is decoded and must stay out of the span"
+            );
+        }
+
+        // A second plane moves the boundary: 0x24..0x34 becomes decoded.
+        let mut two = a.clone();
+        two[TYPE4_PLANE_COUNT] = 2;
+        assert_eq!(
+            undecoded_type4_surface_bytes(&two).len(),
+            undecoded_type4_surface_bytes(&a).len() - TYPE4_PLANE_STRIDE,
+            "the span shrinks by exactly one plane record"
+        );
+
+        // A record too short to decode reports nothing rather than a partial
+        // span that would compare unequal against every real one.
+        assert!(undecoded_type4_surface_bytes(&a[..TYPE4_MIN_LEN - 1]).is_empty());
     }
 }

@@ -22,18 +22,20 @@
 //!   `runtime/draw_log.rs`; the machinery was never the problem, the vocabulary
 //!   on top of it was.
 //!
-//! - [`decline`] — the [`Decline`] trait and the crate-wide slug registry.
+//! - [`decline`] — the [`Decline`] and [`Refusal`] traits every subsystem
+//!   names its refusals through.
 //! - [`emit`] — the one builder that renders `reason=<slug> k=v …`, and cannot
 //!   produce a line without a reason.
 //! - `gate` — static scans that keep the above true (test-only).
 //!
 //! # The obligation
 //!
-//! Per `AGENTS.md` I2: every path that rejects, drops, degrades or mis-executes
-//! a decoded guest command returns a **registered** typed decline whose slug is
-//! unique crate-wide and reaches the sink at some call site. A typed decline
-//! nobody logs is still a silent failure — that unchecked handoff is what
-//! `gate::every_registered_type_reaches_the_sink` closes.
+//! Per `AGENTS.md`: every path that rejects, drops, degrades or mis-executes a
+//! decoded guest command returns a typed decline whose slug is unique crate-wide
+//! and reaches the sink at some call site. `gate::no_two_declines_share_a_slug`
+//! reads the `Decline`/`Refusal` impls to hold the uniqueness half; that a
+//! decline is actually *logged* is the author's obligation, and a typed decline
+//! nobody logs is still a silent failure.
 //!
 //! The judgement no gate can make stays with the author: do **not** log
 //! speculative returns (a resolver legitimately answering "not ready yet" every
@@ -45,19 +47,23 @@ pub mod emit;
 mod gate;
 pub mod sink;
 
-pub use decline::{Decline, DeclineClass, Emission, Refusal, REGISTRY};
-pub use emit::Emit;
+/// Re-exported so call sites write `crate::observe::decline_display!(..)`
+/// next to the trait it implements, rather than reaching into the submodule.
+pub(crate) use decline::decline_display;
+pub use decline::{Decline, Refusal};
+pub use emit::{first_sight, state_changed, Emit};
 
 // The sink's surface is re-exported flat so call sites read `observe::fail(…)`
 // rather than `observe::sink::fail(…)`. `sink` stays public for the gate and
 // for readers who want the machinery.
 pub use sink::{
-    bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, fail, line, nonzero_stats, off,
-    redirect_logs_for_tests, rgba_rgb_a0_stats, rgba_rgb_stats,
+    bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, content_probe_enabled,
+    content_summary, fail, line, nonzero_stats, off, redirect_logs_for_tests, rgba_rgb_stats,
+    sampled_cache_disabled,
 };
-pub(crate) use sink::{draw_log_enabled, elapsed_ms, enabled};
+pub(crate) use sink::{draw_log_enabled, elapsed_ms};
 
 // Path accessors and the line matcher exist so tests can assert against the
 // real sink rather than a mock; production never reads them back.
 #[cfg(test)]
-pub(crate) use sink::{fail_log_path, line_is};
+pub(crate) use sink::{fail_log_path, line_is, FailCapture};

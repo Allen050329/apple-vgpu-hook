@@ -267,73 +267,8 @@ pub struct Command {
     pub fence: u32,
 }
 
-pub fn opcode_supported(opcode: u32) -> bool {
-    matches!(
-        opcode,
-        OP_COPY_BUFFER_TO_TEXTURE
-            | OP_COPY_BUFFER_TO_BUFFER
-            | OP_COPY_TEXTURE_TO_BUFFER
-            | OP_COPY_TEXTURE_TO_TEXTURE
-            | OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS
-            | OP_FILL_BUFFER
-            | OP_GENERATE_MIPMAPS
-            | OP_OPTIMIZE_CPU
-            | OP_OPTIMIZE_GPU
-            | OP_OPTIMIZE_IMAGE_CPU
-            | OP_OPTIMIZE_IMAGE_GPU
-            | OP_SYNCHRONIZE_RESOURCE
-            | OP_SYNCHRONIZE_TEXTURE_IMAGE
-            | OP_UPDATE_FENCE
-            | OP_WAIT_FENCE
-            | OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL
-    )
-}
-
 pub fn opcode_apple_rejected(opcode: u32) -> bool {
     matches!(opcode, REJECTED_131 | REJECTED_138 | REJECTED_139)
-}
-
-pub fn opcode_name(opcode: u32) -> &'static str {
-    match opcode {
-        OP_COPY_BUFFER_TO_TEXTURE => "decodeCopyFromBufferToTexture",
-        OP_COPY_BUFFER_TO_BUFFER => "decodeCopyFromBufferToBuffer",
-        OP_COPY_TEXTURE_TO_BUFFER => "decodeCopyFromTextureToBuffer",
-        OP_COPY_TEXTURE_TO_TEXTURE => "decodeCopyFromTextureToTexture",
-        OP_COPY_TEXTURE_TO_TEXTURE_OPTIONS => "decodeCopyFromTextureToTextureWithOptions",
-        OP_FILL_BUFFER => "decodeFillBuffer",
-        OP_GENERATE_MIPMAPS => "decodeGenerateMipmaps",
-        OP_OPTIMIZE_CPU | OP_OPTIMIZE_GPU => "decodeOptimize",
-        OP_OPTIMIZE_IMAGE_CPU | OP_OPTIMIZE_IMAGE_GPU => "decodeOptimizeImage",
-        OP_SYNCHRONIZE_RESOURCE => "decodeSynchronizeResource",
-        OP_SYNCHRONIZE_TEXTURE_IMAGE => "decodeSynchronizeTextureImage",
-        OP_UPDATE_FENCE => "decodeBlitUpdateFence",
-        OP_WAIT_FENCE => "decodeBlitWaitForFence",
-        OP_COPY_TEXTURE_TO_TEXTURE_SLICE_LEVEL => "decodeCopyFromTextureToTextureWithNumSliceLevel",
-        _ if opcode_apple_rejected(opcode) => "AppleException",
-        _ => "unknown",
-    }
-}
-
-pub fn kind_name(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Copy => "copy",
-        Kind::FillBuffer => "fillBuffer",
-        Kind::Resource => "resource",
-        Kind::Image => "image",
-        Kind::Fence => "fence",
-        Kind::Unknown => "unknown",
-    }
-}
-
-pub fn copy_kind_name(kind: CopyKind) -> &'static str {
-    match kind {
-        CopyKind::BufferToTexture => "copyFromBuffer:toTexture",
-        CopyKind::BufferToBuffer => "copyFromBuffer:toBuffer",
-        CopyKind::TextureToBuffer => "copyFromTexture:toBuffer",
-        CopyKind::TextureToTexture => "copyFromTexture:toTexture",
-        CopyKind::TextureToTextureSliceLevel => "copyFromTexture:toTexture:sliceLevel",
-        CopyKind::None => "none",
-    }
 }
 
 fn decode_origin(p: &[u8]) -> Point {
@@ -639,8 +574,6 @@ mod tests {
             decode(&hdr(0x999, 16)).unwrap_err(),
             DecodeStatus::ErrUnknownOpcode
         );
-        assert!(opcode_supported(OP_FILL_BUFFER));
-        assert!(!opcode_supported(REJECTED_131));
     }
 
     #[test]

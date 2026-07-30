@@ -2,7 +2,7 @@
 //!
 //! Loads per-function MTLB containers from the object list, materializes stream
 //! binds (vertex/fragment buffers, optional index buffer, viewport/scissor),
-//! calls [`crate::backend::metal::render::render_core`], and writes the RGBA
+//! calls [`crate::backend::metal::render::render_core_mrt`], and writes the RGBA
 //! result into the type-11 mapping via [`mapping_write`].
 
 #[cfg(feature = "backend-vulkan")]
@@ -14,8 +14,6 @@ use crate::contract::pixel_format::{self, TexelLayout, MTL_FORMAT_BGRA8_UNORM, R
 use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 use crate::observe::Decline;
-use crate::runtime::census::sample_seed_relation;
-use crate::runtime::census::sampled_census;
 use crate::runtime::census::srgb_census;
 use crate::runtime::census::t11_decline;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
@@ -38,7 +36,6 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
-use std::time::Instant;
 
 /// Upper bound on a single buffer materialization (pathological pooled allocs).
 /// Metal buffer/texture bind **index** cap (`REIMS_VGPU_METAL_MAX_BUFFERS`) — API slot
@@ -83,6 +80,29 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
         out[start..].copy_from_slice(rem);
     }
     out
+}
+
+/// Bring a frame into the channel order a consumer wants, in place and only when
+/// the two disagree.
+///
+/// The parameters name what the buffer *holds* and what is *wanted*, rather than
+/// a direction, because that is what makes the call sites auditable: a readback's
+/// order is a property of the attachment it came out of, so the caller states the
+/// fact it was told and the ordering logic lives here. Spelled as a direction
+/// ("swizzle if type-11") each site would re-derive the predicate, which is how
+/// the two halves of a conversion end up disagreeing.
+///
+/// The exchange is an involution, so one routine serves both directions. Trailing
+/// bytes that do not fill a whole pixel pass through untouched, matching
+/// [`swap_rb_channels`].
+#[inline]
+fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: bool) {
+    if have_bgra == want_bgra {
+        return;
+    }
+    for p in px.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
 }
 
 /// Whether a bound vertex buffer at Metal index `idx` must be exposed to the
@@ -684,7 +704,7 @@ fn load_mtlb<M: HostMemory + HostOps>(
     let len = host_alloc_len(f.blob_size as u64)?;
     let mut mtlb = vec![0u8; len];
     // Device page_shift (x86=12); unshifted helper defaults to arm14 and fails loads.
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -841,7 +861,7 @@ fn read_buffer_bytes_resolved<M: HostMemory>(
     let want = host_alloc_len(avail).filter(|&n| n > 0)?;
     let mut buf = vec![0u8; want];
     // Use device page_shift (x86=12); unshifted helper defaults to arm14 and fails.
-    if gva_mem::read_task_gva_fallback(
+    if gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -1021,7 +1041,7 @@ fn load_index_bytes_reason<M: HostMemory + HostOps>(
         return Err(R::OutOfBounds);
     }
     let mut buf = vec![0u8; need];
-    gva_mem::read_task_gva_fallback(
+    gva_mem::read_task_gva_by_id(
         host,
         &state.tasks,
         task_id,
@@ -1344,19 +1364,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 None,
             );
         };
-        // Measure-only: empty sample payloads (Favourites / icon class). Does
-        // not gate encode — proxies live in present_proxy / observe fail lines.
-        {
-            #[cfg(test)]
-            let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-            crate::runtime::census::present_proxy::note_empty_sample_if(
-                t.texture_ref,
-                w,
-                h,
-                &rgba,
-                "frag",
-            );
-        }
         frag_tex_items.push(TexItem {
             index: t.index,
             w,
@@ -1726,64 +1733,41 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         req.vertex_count as usize
     };
 
-    // Guest-backed attachments for type-11 targets (unified memory) — resolve
-    // BEFORE building ColorRt views so state/host borrows do not overlap.
-    let mut guest_texs: Vec<Option<metal::Texture>> = Vec::with_capacity(color_list.len());
+    // Type-11 color targets render into a host RT and are written back by the
+    // CPU. The guest-backed attachment that used to sit here aliased the
+    // mapping's `mach_vm_remap` view with `newBufferWithBytesNoCopy`, so Load
+    // read and Store wrote guest pages in place; that is exactly the access the
+    // host GPU must not have, and the alias is gone. What runs now is the same
+    // seed-and-write-back path the alias already fell through to on every
+    // contract refusal (unaligned offset or row stride, span out of range, no
+    // device), so this is a rung the rail has always had.
     for (i, c) in color_list.iter().enumerate() {
-        if c.mapping_id != 0 {
-            let Some(window) =
-                type11_attachment_window(state, host, c.mapping_id, width, height, c.format)
-            else {
+        if c.mapping_id == 0 {
+            continue;
+        }
+        if c.load_action == PASS_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
+            color_seeds[i] =
+                seed_color_load(state, host, req.task_id, c.texture_ref, 0, width, height);
+            if color_seeds[i].is_none() {
                 crate::observe::fail(format!(
-                    "metal_draw guest_attachment fail reason=window_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
-                    req.task_id, req.pipeline_ref, c.mapping_id, c.texture_ref, c.format, width, height
+                    "metal_draw guest_attachment_fallback_seed fail \
+                     reason=load_seed_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
+                    req.task_id,
+                    req.pipeline_ref,
+                    c.mapping_id,
+                    c.texture_ref,
+                    c.format,
+                    width,
+                    height
                 ));
-                return (
-                    EncodeStatus::MetalFailed("draw_mtl_guest_attachment_window"),
-                    None,
-                );
-            };
-            match type11_attachment_from_window(c.mapping_id, width, height, window) {
-                Ok(tex) => guest_texs.push(Some(tex)),
-                Err(status) => {
-                    crate::observe::Emit::refusal("metal_guest_attachment_fallback", &status)
-                        .expect("type-11 texture alias returned a refusal")
-                        .field("task", req.task_id)
-                        .field("pipe", req.pipeline_ref)
-                        .field("ref", c.texture_ref)
-                        .field("format", format!("{:#x}", c.format))
-                        .fail_once(c.mapping_id as u64);
-                    if c.load_action == PASS_LOAD_ACTION_LOAD && color_seeds[i].is_none() {
-                        color_seeds[i] = seed_color_load(
-                            state,
-                            host,
-                            req.task_id,
-                            c.texture_ref,
-                            0,
-                            width,
-                            height,
-                        );
-                        if color_seeds[i].is_none() {
-                            crate::observe::fail(format!(
-                            "metal_draw guest_attachment_fallback_seed fail reason=load_seed_unresolved task={} pipe={} mid={} ref={} fmt={:#x} {}x{}",
-                            req.task_id, req.pipeline_ref, c.mapping_id, c.texture_ref, c.format, width, height
-                        ));
-                        }
-                    }
-                    guest_texs.push(None);
-                }
             }
-        } else {
-            guest_texs.push(None);
         }
     }
 
     // Build ColorRt views with raw pointers into seeds/outs (disjoint mut slices).
     let mut color_rts: Vec<ColorRt<'_>> = Vec::with_capacity(color_list.len());
     for (i, c) in color_list.iter().enumerate() {
-        // GVA targets encode host RGBA8 for writeback conversion; guest-backed
-        // targets need neither seed nor readback (Store lands in guest pages).
-        let guest_backed = guest_texs[i].is_some();
+        // Every target encodes host RGBA8 for writeback conversion.
         let out_ptr = color_outs[i].as_mut_ptr();
         let out_len = color_outs[i].len();
         let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
@@ -1823,22 +1807,28 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             });
         color_rts.push(ColorRt {
             slot: c.slot,
-            // Guest-backed: native guest MTLPixelFormat (PSO keyed to match).
-            // GVA host RT: 0 = RGBA8Unorm (writeback conversion path).
-            pixel_format: if guest_backed { c.format as u32 } else { 0 },
-            seed_rgba8: if guest_backed {
-                None
-            } else {
-                color_seeds[i].as_deref()
-            },
-            out_rgba8: if guest_backed { None } else { Some(out) },
+            // Host RT: 0 = RGBA8Unorm (writeback conversion path).
+            pixel_format: 0,
+            seed_rgba8: color_seeds[i].as_deref(),
+            out_rgba8: Some(out),
             clear_r: c.clear_color[0],
             clear_g: c.clear_color[1],
             clear_b: c.clear_color[2],
             clear_a: c.clear_color[3],
             load_action: map_load_action(req.pipeline_ref, c.load_action),
             blend: slot_blend,
-            guest_tex: guest_texs[i].clone(),
+            // Read without the `blending_enabled` filter the blend resolve
+            // above applies: an unblended masked attachment still leaves its
+            // unwritten channels alone. No `first()` fallback either — a
+            // secondary slot with no entry of its own writes every channel,
+            // which is what the absent tag means.
+            write_mask: pipeline
+                .color_attachments
+                .iter()
+                .find(|a| a.slot == c.slot)
+                .map(|a| a.write_mask)
+                .unwrap_or_default()
+                .bits(),
         });
     }
 
@@ -1875,7 +1865,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         &mut color_rts,
         err,
     );
-    // Keep owned storage live through render_core (ReimsVgpu* hold raw pointers).
+    // Keep owned storage live through render_core_mrt (ReimsVgpu* hold raw pointers).
     let _ = (
         &vtx_storage,
         &frag_storage,
@@ -1899,63 +1889,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     let mut all_write = true;
     if !writeback_guest {
         // Still log + early paint latch only when storing; chain returns RGBA.
-        let out0 = color_outs.first().cloned();
-        if let Some(ref out_rgba) = out0 {
-            let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
-            let c = &color_list[0];
-            crate::observe::line(format!(
-                "metal_draw chain mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={} load={} pipe={}",
-                c.mapping_id, c.target_gva, c.format, width, height, nz, maxb, c.load_action, req.pipeline_ref
-            ));
-        }
-        return (EncodeStatus::Ok, out0);
+        return (EncodeStatus::Ok, color_outs.first().cloned());
     }
     for (i, c) in color_list.iter().enumerate() {
         if c.store_action == PASS_STORE_ACTION_DONT_CARE {
             continue;
         }
-        // Guest-backed type-11 attachment: the Metal Store already wrote guest
-        // memory (unified). Only advance the scanout generation and feed the
-        // measure-only display proxies (nz read from the same guest bytes).
-        let guest_backed = guest_texs.get(i).and_then(|t| t.as_ref()).is_some();
-        if c.mapping_id != 0 && guest_backed {
-            let _ = state.mark_mapping_written(c.mapping_id);
-            if width >= 1280 && height >= 720 {
-                let nz = type11_window_nz(state, host, c.mapping_id).unwrap_or(0);
-                if nz > 0 {
-                    let (peak, poison) = {
-                        #[cfg(test)]
-                        let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                        crate::runtime::census::present_proxy::note_display_store_nz(
-                            c.mapping_id,
-                            nz,
-                        )
-                    };
-                    if nz < 4_000_000 {
-                        crate::observe::fail(format!(
-                            "incomplete_store mid={} {}x{} nz={} load={} pipe={} peak={} poison={}",
-                            c.mapping_id,
-                            width,
-                            height,
-                            nz,
-                            c.load_action,
-                            req.pipeline_ref,
-                            peak,
-                            poison as u8
-                        ));
-                    } else if poison {
-                        crate::observe::fail(format!(
-                            "store_nz_drop mid={} {}x{} nz={} peak={} load={} pipe={}",
-                            c.mapping_id, width, height, nz, peak, c.load_action, req.pipeline_ref
-                        ));
-                    }
-                }
-            }
-            any_write = true;
-            continue;
-        }
         let out_rgba = &color_outs[i];
-        let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
         // Type-2/3 GVA keeps archive image_changed via store_seed_policy.
         let load_seed = color_seeds.get(i).and_then(|s| s.as_deref());
         let seed_for_store = store_seed_policy(force_full_store, c.load_action, load_seed);
@@ -2021,175 +1961,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     c.format,
                     out_rgba,
                 )
+                .is_ok()
             }
         } else {
             false
         };
         if wrote {
             any_write = true;
-            // Dual-mid census (REIMS_VGPU_DRAW_LOG=1): type-11 Stores after mode switch.
-            if c.mapping_id != 0 {
-                crate::observe::line(format!(
-                    "full_store mid={} ref={} gva={:#x} fmt={:#x} {}x{} nz={} load={} force_full={} seed_diff={} pipe={}",
-                    c.mapping_id,
-                    c.texture_ref,
-                    c.target_gva,
-                    c.format,
-                    width,
-                    height,
-                    nz,
-                    c.load_action,
-                    force_full_store as u8,
-                    seed_for_store.is_some() as u8,
-                    req.pipeline_ref
-                ));
-                // Measure-only: display-sized Store far below settled desktop
-                // nz (~6.2M live). Proxies dual-mid lagging incomplete composite
-                // without gating encode (live thrash mid ~3.0M vs 6.2M).
-                // Also track per-mid peak nz so a drop (poison) is visible next
-                // to incomplete_store without gating product behavior.
-                if width >= 1280 && height >= 720 && nz > 0 {
-                    let seed_nz = load_seed
-                        .map(|s| crate::observe::nonzero_stats(s).0)
-                        .unwrap_or(0);
-                    let (peak, poison) = {
-                        #[cfg(test)]
-                        let _proxy_shared = crate::runtime::census::present_proxy::test_shared();
-                        crate::runtime::census::present_proxy::note_display_store_nz(
-                            c.mapping_id,
-                            nz,
-                        )
-                    };
-                    if nz < 4_000_000 {
-                        crate::observe::fail(format!(
-                            "incomplete_store mid={} {}x{} nz={} load={} force_full={} pipe={} seed_nz={} peak={} poison={}",
-                            c.mapping_id,
-                            width,
-                            height,
-                            nz,
-                            c.load_action,
-                            force_full_store as u8,
-                            req.pipeline_ref,
-                            seed_nz,
-                            peak,
-                            poison as u8
-                        ));
-                    } else if poison {
-                        crate::observe::fail(format!(
-                            "store_nz_drop mid={} {}x{} nz={} peak={} load={} force_full={} pipe={} seed_nz={}",
-                            c.mapping_id,
-                            width,
-                            height,
-                            nz,
-                            peak,
-                            c.load_action,
-                            force_full_store as u8,
-                            req.pipeline_ref,
-                            seed_nz
-                        ));
-                    }
-                }
-            }
-            let attr_summary: Vec<String> = pipeline
-                .vertex_attributes
-                .iter()
-                .take(8)
-                .map(|a| {
-                    format!(
-                        "loc{} fmt={} off={} bi={} stride={}",
-                        a.location, a.format, a.offset, a.buffer_index, a.stride
-                    )
-                })
-                .collect();
-            let bind_summary: Vec<String> = req
-                .vertex_buffers
-                .iter()
-                .map(|b| format!("i{}:r{}@{}", b.index, b.buffer_ref, b.offset))
-                .collect();
-            // Fragment/vertex sampled-texture summary (wallpaper composite often
-            // has no vtx buf pattern change — only frag tex content differs).
-            let frag_tex_summary: Vec<String> = frag_tex_items
-                .iter()
-                .map(|it| {
-                    let (tnz, tmax) = crate::observe::nonzero_stats(&it.rgba);
-                    format!("f{}:{}x{} nz={} max={}", it.index, it.w, it.h, tnz, tmax)
-                })
-                .collect();
-            let vtx_tex_summary: Vec<String> = vtx_tex_items
-                .iter()
-                .map(|it| {
-                    let (tnz, tmax) = crate::observe::nonzero_stats(&it.rgba);
-                    format!("v{}:{}x{} nz={} max={}", it.index, it.w, it.h, tnz, tmax)
-                })
-                .collect();
-            // Stage-in first three float4s (position/color) for geometry diagnosis.
-            let mut vtx0 = String::from("-");
-            if let Some(a) = pipeline
-                .vertex_attributes
-                .iter()
-                .find(|a| a.format != 0 && a.stride != 0 && a.buffer_index == 1)
-            {
-                if let Some(pos) = vtx_bind_idx.iter().position(|&bi| bi == 1) {
-                    let data = &vtx_storage[pos];
-                    let stride = a.stride as usize;
-                    let mut parts = Vec::new();
-                    for vi in 0..3 {
-                        let base = a.offset as usize + vi * stride;
-                        if base + 16 <= data.len() {
-                            let x = f32::from_le_bytes(data[base..base + 4].try_into().unwrap());
-                            let y =
-                                f32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap());
-                            let z =
-                                f32::from_le_bytes(data[base + 8..base + 12].try_into().unwrap());
-                            let w =
-                                f32::from_le_bytes(data[base + 12..base + 16].try_into().unwrap());
-                            parts.push(format!("({x:.1},{y:.1},{z:.1},{w:.1})"));
-                        }
-                    }
-                    if !parts.is_empty() {
-                        vtx0 = parts.join("");
-                    }
-                }
-            }
-            let fbuf_summary: Vec<String> = req
-                .fragment_buffers
-                .iter()
-                .map(|b| format!("i{}:r{}@{}", b.index, b.buffer_ref, b.offset))
-                .collect();
-            crate::observe::line(format!(
-                "metal_draw ok mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={} clear=[{:.3},{:.3},{:.3},{:.3}] seed_nz={} load={} blend={} attrs={} attrs_with_data={} pipe={} binds={:?} fbufs={:?} ftex={:?} vtex={:?} vtx0={} vtx_idx={:?} idx={} scissor={:?} vp={:?} attr=[{}]",
-                c.mapping_id,
-                c.target_gva,
-                c.format,
-                width,
-                height,
-                nz,
-                maxb,
-                c.clear_color[0],
-                c.clear_color[1],
-                c.clear_color[2],
-                c.clear_color[3],
-                color_seeds
-                    .get(i)
-                    .and_then(|s| s.as_ref())
-                    .map(|s| crate::observe::nonzero_stats(s).0)
-                    .unwrap_or(0),
-                c.load_action,
-                if pipeline.color0.blending_enabled { 1 } else { 0 },
-                attrs.len(),
-                stage_in_with_data.len(),
-                req.pipeline_ref,
-                bind_summary,
-                fbuf_summary,
-                frag_tex_summary,
-                vtx_tex_summary,
-                vtx0,
-                vtx_bind_idx,
-                req.indexed.as_ref().map(|i| i.index_count).unwrap_or(0),
-                req.scissor,
-                req.viewport.map(|v| [v[0], v[1], v[2], v[3]]),
-                attr_summary.join("; "),
-            ));
             // Early-boot logo+pill: paint type-11 front before first DisplaySwap.
             if c.mapping_id != 0 {
                 crate::runtime::scanout::note_front_buffer_writeback(
@@ -2203,6 +1981,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             }
         } else {
             all_write = false;
+            let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
             crate::observe::fail(format!(
                 "metal_draw writeback fail mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={}",
                 c.mapping_id, c.target_gva, c.format, width, height, nz, maxb
@@ -2320,7 +2099,7 @@ fn load_linear_raw<M: HostMemory + HostOps>(
             Some(a) => a,
             None => return false,
         };
-        if gva_mem::read_task_gva_fallback(
+        if gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,
@@ -2362,118 +2141,24 @@ pub(crate) fn store_seed_policy(
     }
 }
 
-/// Composite Metal Load seed under **uncovered** draw texels (alpha==0 only).
-///
-/// Covered black `(0,0,0,A>0)` must stay black — restoring seed on zero-RGB alone
-/// froze loginwindow/logo bases and blocked full-screen black/desktop layers
-/// (live pipe-37 Load composites, 2026-07-13).
-///
-/// Returns `(pixels, filled_count)` where `filled_count` is seed texels written.
-#[cfg(test)]
-pub(crate) fn load_composite_alpha0_holes(draw_rgba: &[u8], seed_rgba: &[u8]) -> (Vec<u8>, usize) {
-    if draw_rgba.len() != seed_rgba.len() || !draw_rgba.len().is_multiple_of(4) {
-        return (draw_rgba.to_vec(), 0);
-    }
-    let mut composed = draw_rgba.to_vec();
-    let mut filled = 0usize;
-    for (dst, src) in composed.chunks_exact_mut(4).zip(seed_rgba.chunks_exact(4)) {
-        if dst[3] == 0 && (src[0] | src[1] | src[2] | src[3]) != 0 {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            dst[3] = src[3];
-            filled += 1;
-        }
-    }
-    (composed, filled)
-}
-
-/// Keep Load attachment seed when the fragment RGB is empty and sample state
-/// says the draw could not have authored real coverage.
-///
-/// - `samples_all_rgb_empty`: every bound sample is RGB-zero (serial-212329).
-/// - `had_empty_type3_linear`: at least one type-2/3 linear sample resolved to
-///   zero RGB (guest-zero wallpaper layer). Live serial-224146 pipe=60: i0 full
-///   sky + i3 type-3 empty → multi-bind frag wrote opaque black and
-///   `load_wipe` destroyed `seed_rgb=2073600` because not *all* samples were
-///   empty. Object-type + sample emptiness is bind state, not present rgb_nz.
-pub(crate) fn should_keep_seed_on_empty_draw(
-    max_rgb: u8,
-    seed_rgb: usize,
-    n_img: usize,
-    samples_all_rgb_empty: bool,
-    had_empty_type3_linear: bool,
-) -> bool {
-    max_rgb == 0 && seed_rgb > 0 && n_img > 0 && (samples_all_rgb_empty || had_empty_type3_linear)
-}
-
-/// How Linux/Vulkan should honor a type-11 color attachment Load.
-///
-/// Metal type-11 Load reads guest-backed attachment bytes (unified). Discrete
-/// Vulkan keeps the live surface on a **resident GPU image**; zero-copy Store
-/// then DMA's into guest pages and **evicts host_cache**. If LOAD falls through
-/// to engine Clear black (no `target_rgba8` / no `load_op`), each multi-pass
-/// Store wipes prior layers → class A empty present (`import_content res=0`
-/// progressive collapse, pill-only boot).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Type11LoadChoice {
-    /// `LoadOp::LoadFromTarget` — prior resident content is ready.
-    LoadFromTarget,
-    /// Keep / upload CPU seed (`target_rgba8` / `LoadSeed`).
-    UseCpuSeed,
-    /// No seed and no ready resident → engine Clear black.
-    ClearBlack,
-}
-
-/// Pure resolution for type-11 Load on the Linux product path.
-///
-/// - CLEAR / non-LOAD: not this helper's concern for LoadFromTarget (caller
-///   keeps Clear/seed policy).
-/// - LOAD + presented-since-last-draw + seed present: **UseCpuSeed** — the
-///   mapping's own present (CmdDisplaySwap) is the swapchain boundary; the
-///   caller seeds the pass from the retained front frame (`+0x188`, see
-///   [`present_front_frame_rgba`]) so the buffer inherits the display's
-///   current content before this frame's damage draws. Chaining the resident
-///   here keeps the buffer's stale base forever (dual-mid strobe class:
-///   boot-27 forensics — the guest performs no CPU copy and no blit between
-///   buffers; the one full-display pass lands in a single buffer). Falls back
-///   to the resident when no seed could be built.
-/// - LOAD + `resident_content_ready`: **LoadFromTarget** (GPU is
-///   authoritative after our Stores; host_cache may be empty or stale black).
-/// - LOAD + not ready + some CPU seed: UseCpuSeed.
-/// - LOAD + not ready + no seed: ClearBlack.
-pub(crate) fn resolve_type11_load_choice(
-    load_action: u16,
-    resident_content_ready: bool,
-    cpu_seed: Option<&[u8]>,
-    gpu_seed: bool,
-    presented_since_last_draw: bool,
-) -> Type11LoadChoice {
-    // Presence is the protocol fact. The bytes may legitimately describe a
-    // fully black or transparent attachment and must never affect this choice.
-    // A GPU boundary seed (engine resident→target copy armed on the request)
-    // counts as seed presence exactly like CPU bytes.
-    let has_seed = cpu_seed.is_some() || gpu_seed;
-    if load_action != PASS_LOAD_ACTION_LOAD {
-        // CLEAR / DONT_CARE: never LoadFromTarget via this helper.
-        return if has_seed {
-            Type11LoadChoice::UseCpuSeed
-        } else {
-            Type11LoadChoice::ClearBlack
-        };
-    }
-    if presented_since_last_draw && has_seed {
-        return Type11LoadChoice::UseCpuSeed;
-    }
-    if resident_content_ready {
-        return Type11LoadChoice::LoadFromTarget;
-    }
-    if has_seed {
-        Type11LoadChoice::UseCpuSeed
-    } else {
-        Type11LoadChoice::ClearBlack
-    }
-}
+// A six-way type-11 Load resolver stood here — `Type11LoadChoice`,
+// `Type11LoadDecision` and `resolve_type11_load_decision` — deciding whether a
+// LOAD should read the resident target, upload a CPU seed, or clear black, and
+// naming *which* check decided so the always-on census could separate the three
+// routes to a seed.
+//
+// It existed because a type-11 Store that landed by host-pointer import left the
+// attachment resident-only with no CPU bytes, so a later LOAD had to work out
+// which resident held the frame the guest's compositor computes its damage
+// against. Stores read back and seed from guest pages now, so every LOAD has its
+// bytes and there is nothing to resolve. Its one caller was inside the
+// `try_import` branch and went out with it.
+//
+// Worth noting what this resolver was for, because it was the honest half of a
+// problem that is now moot: its `PresentBoundary` arm was derived from live
+// forensics rather than any decoded field — the guest sends no "re-seed from the
+// front buffer" instruction — and the typed decisions existed so that arm could
+// be told apart from the two legitimate seed paths and weighed for deletion.
 
 /// Premultiplied `src` over `dst` with Metal factors **One / OneMinusSrcAlpha**.
 ///
@@ -2488,8 +2173,14 @@ pub(crate) fn resolve_type11_load_choice(
 /// transparent fragments. Opaque black still wins (intentional Clear-like black).
 ///
 /// Returns `(pixels, blended_texels)` where blended counts texels with `src.a < 255`.
-/// Software premult One/OMSA composite — retained as the **byte-parity oracle**
-/// for hardware Load+blend (D3). Product path no longer calls this.
+/// Software premult One/OMSA composite. **The product path does not call this**
+/// — the hardware does Load+blend — and its two unit tests only check it against
+/// hand-written constants, so it reads as dead on both of the obvious checks.
+/// It is not. `premult_one_omsa_gpu_matches_software_composite` in
+/// `tests/vk_engine_parity.rs` runs the real GPU blend and asserts it agrees
+/// with this function to within 1 LSB, which makes this the only independent
+/// statement of what that blend is supposed to compute. Deleting it deletes the
+/// check, not the duplication.
 pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (Vec<u8>, usize) {
     if draw_rgba.len() != seed_rgba.len() || !draw_rgba.len().is_multiple_of(4) {
         return (draw_rgba.to_vec(), 0);
@@ -2518,16 +2209,6 @@ pub fn load_composite_premult_one_omsa(draw_rgba: &[u8], seed_rgba: &[u8]) -> (V
         }
     }
     (out, blended)
-}
-
-/// True when type-7 color0 blend is premultiplied One / OneMinusSrcAlpha (live
-/// pipe 22/26 chrome). Used only to select Load composite math — not a content gate.
-fn color0_is_premult_one_omsa(pd: &RenderPipelineDescriptor) -> bool {
-    pd.color0.blending_enabled
-        && pd.color0.src_rgb == 1 // MTLBlendFactorOne
-        && pd.color0.dst_rgb == 5 // MTLBlendFactorOneMinusSrcAlpha
-        && pd.color0.src_alpha == 1
-        && pd.color0.dst_alpha == 5
 }
 
 /// Decoded `MTLLoadAction` → the Metal C ABI value.
@@ -2814,68 +2495,6 @@ fn default_sampler(binding: u32) -> crate::backend::metal::abi::ReimsVgpuSampler
     }
 }
 
-/// Probe type-2/3 empty display layers: GVA = handle<<page_shift + level0.offset,
-/// then whether a first-page GVA read is mapped and RGB-empty.
-///
-/// Distinguishes "guest never wrote wallpaper" (mapped zeros) from
-/// "MapMemory2/PT gap" (Unmapped) for the multi-bind i3 wallpaper class.
-#[cfg(feature = "backend-vulkan")]
-fn empty_layer_gva_probe<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &M,
-    task_id: u32,
-    texture_ref: u32,
-) -> String {
-    let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
-        return "gva_probe=no_entry".into();
-    };
-    if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
-    {
-        return format!("gva_probe=not_linear type={}", entry.object_type);
-    }
-    let Some(desc_bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
-        return "gva_probe=no_desc".into();
-    };
-    let Ok(tex) = decode_texture_descriptor(&desc_bytes) else {
-        return "gva_probe=desc_decode".into();
-    };
-    let Some((gva, layout)) = tex.level_gva(0, state.page_shift) else {
-        return format!(
-            "gva_probe=no_level0 handle={:#x} shift={} data_off={}",
-            tex.handle, state.page_shift, tex.data_offset
-        );
-    };
-    let mut page = [0u8; 64];
-    match gva_mem::read_task_gva_fallback(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        &mut page,
-        state.page_shift,
-    ) {
-        Ok(()) => {
-            let (rgb_nz, max_rgb, px0) = crate::observe::rgba_rgb_stats(&page);
-            // rgba_rgb_stats expects RGBA; raw GVA is BGRA for fmt 0x50 — still
-            // RGB occupancy is order-invariant for nz/max of first three channels.
-            format!(
-                "gva_probe=mapped gva={gva:#x} bpr={} {}x{} page64_rgb_nz={rgb_nz} max_rgb={max_rgb} px0=[{},{},{},{}]",
-                layout.row_stride,
-                layout.width,
-                layout.height,
-                px0[0],
-                px0[1],
-                px0[2],
-                px0[3]
-            )
-        }
-        Err(_) => format!(
-            "gva_probe=unmapped gva={gva:#x} handle={:#x} shift={} bpr={}",
-            tex.handle, state.page_shift, layout.row_stride
-        ),
-    }
-}
-
 /// Fail-visible diagnosis when a bound sample ref does not materialize.
 ///
 /// Kept off the success path; only called after a sampled resolver
@@ -3049,115 +2668,11 @@ fn load_type11_rgba<M: HostMemory + HostOps>(
     load_type11_mapping_rgba(state, host, mapping_id, format_override)
 }
 
-/// Guest-memory-backed Metal color attachment for a type-11 mapping.
-///
-/// Unified memory mapping: builds the mapping's contiguous
-/// guest-RAM view on first use and returns a linear texture aliasing it at
-/// the device-descriptor sample window. The texture IS the guest surface —
-/// Load reads guest bytes, Store writes them, no seed/writeback exists.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[derive(Clone, Copy)]
-struct Type11AttachmentWindow {
-    ptr: usize,
-    view_len: usize,
-    base_off: u64,
-    bpr: u32,
-    fmt: u16,
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn type11_attachment_window<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    format: u16,
-) -> Option<Type11AttachmentWindow> {
-    let (ptr, len) = mapper::ensure_contig_view(state, host, mapping_id)?;
-    let fmt = if format != 0 {
-        format
-    } else {
-        MTL_FORMAT_BGRA8_UNORM
-    };
-    let (base_off, bpr, _span_end) = {
-        let m = state.mappings.get(&mapping_id)?;
-        mapping_write::type11_sample_window(m, width, height, fmt)?
-    };
-    Some(Type11AttachmentWindow {
-        ptr,
-        view_len: len,
-        base_off,
-        bpr,
-        fmt,
-    })
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn type11_attachment_from_window(
-    mapping_id: u32,
-    width: u32,
-    height: u32,
-    window: Type11AttachmentWindow,
-) -> Result<metal::Texture, crate::backend::metal::util::Status> {
-    crate::backend::metal::runtime::type11_guest_texture(
-        mapping_id,
-        window.ptr,
-        window.view_len,
-        width,
-        height,
-        window.fmt as u32,
-        window.bpr,
-        window.base_off,
-    )
-}
-
-/// Nonzero byte count of a type-11 mapping's tight sample window, read from
-/// its contiguous guest view (measure-only display proxies).
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn type11_window_nz<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    mapping_id: u32,
-) -> Option<usize> {
-    let (ptr, len) = mapper::ensure_contig_view(state, host, mapping_id)?;
-    let (w, h, fmt) = {
-        let m = state.mappings.get(&mapping_id)?;
-        if !m.has_geom {
-            return None;
-        }
-        (
-            m.width,
-            m.height,
-            if m.format != 0 {
-                m.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-        )
-    };
-    let (base_off, bpr, span_end) = {
-        let m = state.mappings.get(&mapping_id)?;
-        mapping_write::type11_sample_window(m, w, h, fmt)?
-    };
-    if span_end > len as u64 {
-        return None;
-    }
-    let tight = pixel_format::tight_row_bytes(w, fmt)? as usize;
-    let mut nz = 0usize;
-    for y in 0..h as usize {
-        let off = base_off as usize + y * bpr as usize;
-        let row = unsafe { std::slice::from_raw_parts((ptr + off) as *const u8, tight) };
-        nz += row.iter().filter(|&&b| b != 0).count();
-    }
-    Some(nz)
-}
-
 /// Sample a type-11 mapping as tight RGBA8 from guest pages.
 ///
-/// Unified memory: guest pages ARE the surface content — GPU Stores land in
-/// them (guest-backed attachment) and guest CPU writes are immediately
-/// visible. There is exactly one source; no recovery ranking exists.
+/// Guest pages ARE the surface content: the CPU writeback lands Stores in them
+/// and guest CPU writes are immediately visible. There is exactly one source;
+/// no recovery ranking exists.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_type11_mapping_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3246,7 +2761,7 @@ fn load_linear_texture_rgba_at_level<M: HostMemory + HostOps>(
     let mut row = vec![0u8; tight as usize];
     for y in 0..h {
         let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
-        gva_mem::read_task_gva_fallback(
+        gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,
@@ -3696,14 +3211,6 @@ fn lookup_render_target<M: HostMemory + HostOps>(
         let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
         pixel_format::render_target_bpp(fmt)?;
         // mapping_id = surface_id; no linear GVA.
-        if m.width >= 1280 && m.height >= 720 {
-            crate::observe::line(format!(
-                "rt_resolve type4 tex_ref={resolved_ref} sid={surface_id} {}x{} fmt={fmt:#x} live_type={live_type:?} pages={}",
-                m.width,
-                m.height,
-                m.page_entries.len()
-            ));
-        }
         return Some((surface_id, 0, m.width, m.height, 0, fmt));
     }
     // type-2/3 linear GVA (wallpaper/background layers, UI intermediate RTs).
@@ -3875,25 +3382,17 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
             if mapping_id == 0 {
                 seed = Some(solid_rgba_local(mw, mh, &cl.clear_color));
             }
-            if mw >= 1280 && mh >= 720 && mapping_id != 0 {
-                crate::observe::fail(format!(
-                    "display_clear mid={mapping_id} {mw}x{mh} via=pass_clears pipe={pipeline_ref}"
-                ));
-            }
         } else if att.load_action == PASS_LOAD_ACTION_CLEAR {
             if mapping_id == 0 {
                 seed = Some(solid_rgba_local(mw, mh, &att.clear_color));
             }
-            if mw >= 1280 && mh >= 720 && mapping_id != 0 {
-                crate::observe::fail(format!(
-                    "display_clear mid={mapping_id} {mw}x{mh} via=load_action_clear pipe={pipeline_ref}"
-                ));
-            }
         } else if att.load_action == PASS_LOAD_ACTION_LOAD && mapping_id == 0 {
             // GVA linear target: ephemeral host RT needs a CPU seed (archive
             // reims_vgpu_backend_metal; NULL seed → Metal Clear invent, still encode).
-            // Type-11 needs NO seed: the guest-backed attachment already holds
-            // the surface bytes and Metal Load reads them directly.
+            // Type-11 is seeded later instead, at the attachment site in
+            // `encode_draw` — the same place the guest-backed alias used to be
+            // built, and the same seed it already took whenever the alias was
+            // refused. Seeding here would need the mapping read twice.
             //
             // A deferred GVA Store window at this exact target geometry means
             // the engine resident is the authoritative prior content — skip
@@ -3955,6 +3454,45 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
 /// Archive `apple_pv_gpu_write_gva_rgba`: tight RGBA8 → native rows at GVA.
 /// Packed contig HostOps view when possible; else multi-import per row
 /// ([`gva_view::write_span`]) — no `write_gpa` walk.
+///
+/// Carries the refusal out rather than collapsing to `false`: a caller has to be
+/// able to tell "the guest tore this target down" (`MemError::is_guest_teardown`)
+/// from a write that genuinely lost content.
+///
+/// # This writer is deliberately not gated on MapMemory2 spans
+///
+/// Its sibling [`crate::runtime::gva_mem::write_task_gva_product`] refuses
+/// `WriteGate::Outside`, and the obvious tidy-up is to make this one match. It
+/// was measured instead, report-only, over a driven x86/Vulkan boot, and the
+/// answer is no:
+///
+/// ```text
+/// rgba8_write_gate_totals exact=1155 no_spans=0 outside=893 total=2048
+/// ```
+///
+/// **44% of render-target Stores fall outside every span the writing task
+/// declared**, so refusing `Outside` here would drop nearly half of all Stores
+/// and blank the screen. `no_spans=0` says the gate always had a real registry
+/// to check against, so that is not an artefact of an empty one.
+///
+/// The reason is that MapMemory2 does not describe render targets. Enumerated on
+/// the same boot, task 0 files a single 64 MiB span (`0x101000..0x4101000`) and
+/// every other task files 128 KiB or 1 MiB spans in that same numeric range —
+/// while the refused Stores sit at GVAs like `0x4692000` and `0x5368000`, past
+/// all of them.
+///
+/// That also disposes of the tempting weaker gate, "allow when *some* task's
+/// span covers it". Every refused Store reported `owners=[0, …]`, which looks
+/// like corroboration and is not: `tasks_covering` compares GVAs numerically
+/// across **different address spaces**, and task 0's 64 MiB span numerically
+/// contains almost every other task's range. `owners` is not evidence that a
+/// range is legitimate and nothing may gate on it.
+///
+/// What does bound these writes: the deferred path checks that the window's
+/// guest pages have not moved since it was armed
+/// (`storage_flush::window_pages_still_ours`), and the synchronous Store paths
+/// run inline with the guest command that asked for them, so the target cannot
+/// be freed underneath them.
 #[allow(
     clippy::too_many_arguments,
     reason = "the archive writer mirrors the target GVA and native row geometry"
@@ -3969,20 +3507,21 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
     bpr: u32,
     format: u16,
     rgba: &[u8],
-) -> bool {
+) -> Result<(), crate::runtime::host::MemError> {
+    use crate::runtime::host::MemError;
     if gva == 0 || width == 0 || height == 0 || bpr == 0 {
-        return false;
+        return Err(MemError::BadArgs);
     }
     let Some(tight) = pixel_format::tight_row_bytes(width, format) else {
-        return false;
+        return Err(MemError::BadArgs);
     };
     if bpr < tight {
-        return false;
+        return Err(MemError::BadArgs);
     }
     let rgba_row = (width as usize).saturating_mul(RGBA8_BPP as usize);
     let need = rgba_row.saturating_mul(height as usize);
     if rgba.len() < need {
-        return false;
+        return Err(MemError::BadArgs);
     }
     let span = (height as u64).saturating_mul(bpr as u64);
     let mut row = vec![0u8; tight as usize];
@@ -3992,16 +3531,16 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
         crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span)
     {
         let (base, avail) = (span_map.ptr, span_map.avail);
-        let mut ok = true;
+        let mut res = Ok(());
         for y in 0..height as usize {
             let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
             if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-                ok = false;
+                res = Err(MemError::BadArgs);
                 break;
             }
             let off = y.saturating_mul(bpr as usize);
             if off + row.len() > avail {
-                ok = false;
+                res = Err(MemError::RunOutOfRange);
                 break;
             }
             // SAFETY: map_fresh_span covers `span`.
@@ -4010,23 +3549,27 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
             }
         }
         crate::runtime::gva_view::unmap_fresh_span(host, span_map);
-        return ok;
+        return res;
     }
     // Fragmented GVA: multi-import each converted row via write_span.
     for y in 0..height as usize {
         let src = &rgba[y * rgba_row..y * rgba_row + rgba_row];
         if !pixel_format::convert_rgba8_to_row(format, src, width, &mut row) {
-            return false;
+            return Err(MemError::BadArgs);
         }
         let row_gva = gva.saturating_add((y as u64).saturating_mul(bpr as u64));
-        if !crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row) {
+        if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
+        {
+            let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
-                "gva_write fail reason=not_contig task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 multi)"
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
+                 row={y} rowlen={:#x} (rgba8 multi)",
+                row.len()
             ));
-            return false;
+            return Err(err);
         }
     }
-    true
+    Ok(())
 }
 
 /// Store only the Metal scissor rect of a full-size tight RGBA8 buffer to GVA.
@@ -4120,9 +3663,13 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
         let row_gva = gva
             .saturating_add((y as u64).saturating_mul(bpr as u64))
             .saturating_add(x_bytes);
-        if !crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row) {
+        if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
+        {
+            let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
-                "gva_write fail reason=not_contig task={task_id} gva={row_gva:#x} span={span:#x} (rgba8 rect multi)"
+                "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \
+                 row={y} rowlen={:#x} (rgba8 rect multi)",
+                row.len()
             ));
             return false;
         }
@@ -4198,12 +3745,12 @@ fn solid_rgba_local(w: u32, h: u32, clear: &[f64; 4]) -> Vec<u8> {
 }
 
 /// Seed color RT LOAD from guest type-11 (BGRA→RGBA) or type-2/3/view linear RGBA.
-/// CPU Load seed for **ephemeral host RTs** (GVA linear targets, or type-11
-/// targets whose guest-backed Metal texture alias is rejected by alignment).
 ///
-/// The normal type-11 path is guest-memory-backed, so Metal Load reads the
-/// surface bytes directly (unified memory). The seed path exists only for the
-/// measured alias-reject fallback above.
+/// Every color RT is an ephemeral host RT now, so every `Load` needs this: the
+/// type-11 guest-memory alias that let Metal Load read the surface bytes in
+/// place is deleted. This used to run only on the alias-reject fallback
+/// (unaligned offset or row stride, span out of range, no device), which is why
+/// it is already a complete path and not a new one.
 fn seed_color_load<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4225,7 +3772,6 @@ fn seed_color_load<M: HostMemory + HostOps>(
     if width > 0 && height > 0 {
         let cached = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
-                .map(|bgra| (bgra, "gva_cache"))
         } else {
             None
         }
@@ -4235,81 +3781,14 @@ fn seed_color_load<M: HostMemory + HostOps>(
                     crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
                 })
                 .flatten()
-                .map(|bgra| (bgra, "texture_cache"))
         });
-        if let Some((bgra, source)) = cached {
-            let rgba = swap_rb_channels(bgra);
-            log_black_load_seed_preserved(
-                task_id,
-                texture_ref,
-                0,
-                target_gva,
-                width,
-                height,
-                source,
-                &rgba,
-            );
-            return Some(rgba);
+        if let Some(bgra) = cached {
+            return Some(swap_rb_channels(bgra));
         }
     }
     // Type-2/3 (or type-8 base) linear GVA → convert to RGBA8.
     let rgba = load_sampled_rgba_static(state, host, task_id, texture_ref)?;
-    log_black_load_seed_preserved(
-        task_id,
-        texture_ref,
-        0,
-        target_gva,
-        width,
-        height,
-        "guest",
-        &rgba,
-    );
     Some(rgba)
-}
-
-/// Measure-only proxy for the black-load-seed-discard class.
-///
-/// RGB content never participates in seed selection. This census proves a
-/// zero-RGB seed reached the selected Load path and is deduplicated by protocol
-/// identity so ordinary black UI targets cannot flood the always-on log.
-#[allow(clippy::too_many_arguments)]
-fn log_black_load_seed_preserved(
-    task_id: u32,
-    texture_ref: u32,
-    mapping_id: u32,
-    target_gva: u64,
-    width: u32,
-    height: u32,
-    source: &str,
-    rgba: &[u8],
-) {
-    let (rgb_nz, _, _) = crate::observe::rgba_rgb_stats(rgba);
-    if rgb_nz != 0 {
-        return;
-    }
-    let alpha_nz = rgba.chunks_exact(4).filter(|p| p[3] != 0).count();
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    type EmptyResidentSampleKey = (u32, u32, u32, u64, u32, u32, String, usize);
-    static SEEN: Mutex<Option<HashSet<EmptyResidentSampleKey>>> = Mutex::new(None);
-    let first = {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        seen.get_or_insert_with(HashSet::new).insert((
-            task_id,
-            texture_ref,
-            mapping_id,
-            target_gva,
-            width,
-            height,
-            source.to_owned(),
-            alpha_nz,
-        ))
-    };
-    if first {
-        crate::observe::off(format!(
-            "load_seed_black reason=zero_rgb_seed_preserved src={source} task={task_id} ref={texture_ref} mid={mapping_id} gva={target_gva:#x} {width}x{height} alpha_nz={alpha_nz}"
-        ));
-    }
 }
 
 /// Resolve sampled texture RGBA without requiring Metal feature (color LOAD seed path).
@@ -4350,42 +3829,6 @@ fn load_sampled_rgba_static<M: HostMemory + HostOps>(
         return load_type11_rgba_static(state, host, mid, fmt_override);
     }
     load_linear_texture_rgba_host(state, host, task_id, tex_ref, level, fmt_override)
-}
-
-/// Present-boundary seed: the retained front frame (PGDisplay `+0x188`) as
-/// tight RGBA8, or `None` when the retain is invalid or its geometry differs.
-///
-/// The guest's compositor damage-draws each swapchain buffer against the
-/// display's current front content; the present model is the only
-/// inter-buffer transfer it performs (no CPU copy, no blit — boot-27
-/// forensics). Geometry must match exactly: the retain is display-sized and
-/// only same-geometry compositor members may inherit it. Content never gates
-/// this choice — an all-black front frame is a valid seed.
-pub(crate) fn present_front_frame_rgba(
-    present: &crate::model::PresentState,
-    width: u32,
-    height: u32,
-) -> Option<Vec<u8>> {
-    if !present.frame_valid || present.frame_width != width || present.frame_height != height {
-        return None;
-    }
-    let need = (width as usize)
-        .checked_mul(height as usize)?
-        .checked_mul(RGBA8_BPP as usize)?;
-    if need == 0 || present.frame_bgra.len() < need {
-        return None;
-    }
-    let mut rgba = vec![0u8; need];
-    for (d, s) in rgba
-        .chunks_exact_mut(4)
-        .zip(present.frame_bgra.chunks_exact(4))
-    {
-        d[0] = s[2];
-        d[1] = s[1];
-        d[2] = s[0];
-        d[3] = s[3];
-    }
-    Some(rgba)
 }
 
 fn load_type11_rgba_static<M: HostMemory + HostOps>(
@@ -4432,6 +3875,25 @@ fn load_type11_rgba_static<M: HostMemory + HostOps>(
 /// magnification burst re-binds the same static icons ~1000×, so this collapses
 /// the `t11_guest` CPU copies that saturate the serial drain worker (the
 /// dock-hover whole-VM freeze). Returns `(rgba, identity)`.
+/// Size a recycled scratch buffer to `span` for a `filled`-byte rect, without
+/// re-zeroing the rect.
+///
+/// The caller's read overwrites all `filled` bytes and fails the whole bind if it
+/// cannot, so zeroing them first buys nothing. It is not free either: at the
+/// 1920x1080 that dominates this workload the rect is 8.3 MiB, and the memset was
+/// paid on the memo *hit* path — the path whose entire purpose is to avoid
+/// touching the surface.
+///
+/// The `host_alloc_len` padding past the rect is a different case: the read does
+/// not write it, so it is zeroed here. A recycled buffer must not carry a
+/// previous surface's tail into the memo comparison, where it would manufacture a
+/// miss and cost a full conversion.
+fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
+    let filled = filled.min(span);
+    scratch.resize(span, 0);
+    scratch[filled..].fill(0);
+}
+
 fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4454,16 +3916,22 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     // current native BGRA (read_mapping_bgra8 runs ensure_resolved_for_scanout +
     // flush internally). Reuse the scratch so a memo hit costs no allocation.
     let mut scratch = std::mem::take(&mut state.type11_memo_scratch);
-    scratch.clear();
-    scratch.resize(span, 0);
-    if !crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h) {
+    prepare_memo_scratch(
+        &mut scratch,
+        span,
+        (stride as usize).saturating_mul(h as usize),
+    );
+    if !{
+        crate::runtime::scanout::read_mapping_bgra8(state, host, mid, &mut scratch, stride, w, h)
+    } {
         state.type11_memo_scratch = scratch;
         return None;
     }
     // Identity key namespace: bits 63+62 mark type-11 memo content, distinct from
     // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
-    // The shared `guest_linear_gen` makes every (key, generation) pair unique
-    // across all three memo producers, so content can never alias on a collision.
+    // Every producer draws its generation from
+    // `DeviceState::next_sampled_content_generation`, so a (key, generation)
+    // pair is unique device-wide and content can never alias on a collision.
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
     if let Some(m) = state.type11_memo.get_touch(&key) {
@@ -4471,7 +3939,6 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
             let rgba = m.rgba.clone();
             let generation = m.generation;
             state.type11_memo_scratch = scratch;
-            sampled_census::note(sampled_census::Branch::T11Memo, 0);
             return Some((
                 rgba,
                 LinearSampleIdentity {
@@ -4483,22 +3950,21 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     }
     // First sight or the native bytes changed: convert BGRA→RGBA fresh.
     let mut rgba = vec![0u8; span];
-    for y in 0..h as usize {
+    let converted = (0..h as usize).all(|y| {
         let off = y * (stride as usize);
-        if !pixel_format::convert_row_to_rgba8(
+        pixel_format::convert_row_to_rgba8(
             sample_fmt,
             &scratch[off..off + (w as usize) * 4],
             w,
             &mut rgba[off..off + (w as usize) * 4],
-        ) {
-            state.type11_memo_scratch = scratch;
-            return None;
-        }
+        )
+    });
+    if !converted {
+        state.type11_memo_scratch = scratch;
+        return None;
     }
     let rgba = std::sync::Arc::new(rgba);
-    let rgba_len = rgba.len();
-    state.guest_linear_gen += 1;
-    let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
+    let generation = state.next_sampled_content_generation();
     let entry_bytes = scratch.len() + rgba.len();
     state.type11_memo.insert(
         key,
@@ -4510,7 +3976,6 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         },
         entry_bytes,
     );
-    sampled_census::note(sampled_census::Branch::T11Guest, rgba_len);
     Some((
         rgba,
         LinearSampleIdentity {
@@ -4523,3 +3988,56 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
 include!("texture_view.rs");
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod memo_scratch_tests {
+    use super::prepare_memo_scratch;
+
+    /// The rect is left alone and only the padding is zeroed.
+    ///
+    /// The first assertion is the change: this buffer is recycled across binds and
+    /// the caller's read overwrites the whole rect, so re-zeroing it was an
+    /// 8.3 MiB memset per bind at 1920x1080 on the memo *hit* path. A `clear()`
+    /// before the resize — which is what this replaced — fails it.
+    ///
+    /// The second is the hazard the first one introduces. `host_alloc_len` rounds
+    /// the allocation up past the rect and the read does not write that tail, so a
+    /// buffer still holding a previous surface's bytes there would differ from the
+    /// memo and manufacture a miss.
+    #[test]
+    fn the_rect_is_not_rezeroed_and_the_padding_is() {
+        let (span, filled) = (4096, 4000);
+        let mut scratch = vec![0xAAu8; span];
+        prepare_memo_scratch(&mut scratch, span, filled);
+        assert_eq!(scratch.len(), span);
+        assert!(
+            scratch[..filled].iter().all(|&b| b == 0xAA),
+            "the rect was re-zeroed; the caller's read overwrites it anyway"
+        );
+        assert!(
+            scratch[filled..].iter().all(|&b| b == 0),
+            "a recycled buffer carried its old tail into the memo comparison"
+        );
+    }
+
+    /// Growing and shrinking both land on exactly `span`, with the tail zeroed.
+    /// The scratch is shared across surfaces, so the geometry changes under it.
+    #[test]
+    fn a_recycled_buffer_resizes_either_way_with_a_clean_tail() {
+        let mut scratch = vec![0xAAu8; 1024];
+        prepare_memo_scratch(&mut scratch, 8192, 8000);
+        assert_eq!(scratch.len(), 8192);
+        assert!(scratch[8000..].iter().all(|&b| b == 0));
+
+        prepare_memo_scratch(&mut scratch, 512, 500);
+        assert_eq!(scratch.len(), 512);
+        assert!(scratch[500..].iter().all(|&b| b == 0));
+
+        // A rect that claims the whole span leaves no tail to zero, and a rect
+        // larger than the span (impossible geometry) must not panic on the slice.
+        prepare_memo_scratch(&mut scratch, 512, 512);
+        assert_eq!(scratch.len(), 512);
+        prepare_memo_scratch(&mut scratch, 512, 9999);
+        assert_eq!(scratch.len(), 512);
+    }
+}

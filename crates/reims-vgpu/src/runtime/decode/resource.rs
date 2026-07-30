@@ -1,6 +1,8 @@
 //! Resource descriptor decode (port of `host/utils/reims-vgpu-resource-decode`).
 
-use crate::contract::endian::{ld16, ld32, ld64, st16, st32}; // ld64: texture-view level base/count
+use crate::contract::endian::{ld16, ld32, ld64}; // ld64: texture-view level base/count
+#[cfg(test)]
+use crate::contract::endian::{st16, st32}; // ICB layout fixture encoder only
 
 /// A refusal from the descriptor decoder.
 ///
@@ -211,14 +213,6 @@ pub struct CompactTlv {
     pub has_u32: bool,
 }
 
-/// Legacy alias used by older call sites; tag is u32 for compatibility.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Tlv {
-    pub tag: u32,
-    pub length: u32,
-    pub value_offset: usize,
-}
-
 /// Linear buffer descriptor (type-1): allocation size + guest page handle.
 ///
 /// Contract: `reims_vgpu_resource_format.h` `REIMS_VGPU_RESOURCE_LINEAR_DESC_*`.
@@ -264,6 +258,48 @@ pub struct TextureLevelLayout {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+}
+
+impl TextureLevelLayout {
+    /// Bytes from [`Self::offset`] that a row-by-row reader or writer of this
+    /// level actually touches, given one tight row of its format.
+    ///
+    /// `row_stride * height` is the obvious answer and it overcounts by one
+    /// row of trailing padding: the last row occupies `tight_row` bytes, and
+    /// every reader in this crate walks `base + y * row_stride` for `tight_row`
+    /// bytes. Used as a bound against `TextureDescriptor::allocation_size`,
+    /// the looser form rejects allocations the guest sized correctly.
+    ///
+    /// Measured: a 27x27 `RG8Unorm` window-corner mask at offset 0x850 with a
+    /// 384-byte stride in a 12 288-byte allocation scores 12 496 under
+    /// `stride * height` and is refused, while its true extent is 12 166. That
+    /// refusal dropped the WindowServer's whole full-screen composite draw, so
+    /// the guest's rounded window corners and drop shadows rendered square.
+    ///
+    /// `None` for zero height (no rows) or on overflow. A bound this feeds must
+    /// treat `None` as a refusal, never as "no limit".
+    pub fn read_span(&self, tight_row: u32) -> Option<u64> {
+        self.height
+            .checked_sub(1)
+            .map(u64::from)?
+            .checked_mul(self.row_stride)?
+            .checked_add(u64::from(tight_row))
+    }
+
+    /// Bytes from [`Self::offset`] that a reader of one whole array slice /
+    /// cube face of this level touches, when `depth` planes are packed
+    /// contiguously inside the slice at `row_stride * height` each.
+    ///
+    /// Every plane below the last is walked in full; the last one ends at
+    /// [`Self::read_span`], because the padding after its final row is no more
+    /// read here than it is in the 2D case. `depth` 0 and 1 both mean one
+    /// plane, matching `TextureDescriptor`'s "0 means 2D" encoding.
+    pub fn slice_read_span(&self, tight_row: u32, depth: u32) -> Option<u64> {
+        u64::from(depth.max(1) - 1)
+            .checked_mul(self.row_stride)?
+            .checked_mul(u64::from(self.height))?
+            .checked_add(self.read_span(tight_row)?)
+    }
 }
 
 /// Type-2/3 linear texture geometry (`REIMS_VGPU_RESOURCE_TEXTURE_DESC_*`).
@@ -368,6 +404,49 @@ pub struct VertexAttribute {
     pub step_rate: u32,
 }
 
+/// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
+///
+/// A newtype rather than a bare `u32` for one reason: the value that means
+/// "write every channel" is `0xf`, and the value a derived `Default` would
+/// produce is `0` — which means *write nothing*. `PipelineColorAttachment` is
+/// built with `..Default::default()` in the decoder and defaulted outright at
+/// several call sites, so a bare field would make an omitted mask a black
+/// attachment. Here the omission is unwritable: `Default` is `all`, which is
+/// also what an entry that does not carry tag `0x09` means on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColorWriteMask {
+    /// Private so the only ways to obtain one are [`ColorWriteMask::new`],
+    /// which range-checks, and `Default`, which is `all`. A `pub` field would
+    /// also make this a decode field needing its own coverage disposition,
+    /// when the disposition that matters is `PipelineColorAttachment`'s.
+    bits: u32,
+}
+
+impl Default for ColorWriteMask {
+    fn default() -> Self {
+        Self {
+            bits: MTL_COLOR_WRITE_MASK_ALL,
+        }
+    }
+}
+
+impl ColorWriteMask {
+    /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
+    /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
+    pub fn new(bits: u32) -> Option<Self> {
+        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
+    }
+
+    pub fn bits(self) -> u32 {
+        self.bits
+    }
+
+    /// Whether every channel is written, i.e. whether the mask is inert.
+    pub fn is_all(self) -> bool {
+        self.bits == MTL_COLOR_WRITE_MASK_ALL
+    }
+}
+
 /// One pipeline color-attachment entry (format + blend) from the type-7 color section.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipelineColorAttachment {
@@ -381,6 +460,10 @@ pub struct PipelineColorAttachment {
     pub src_alpha: u32,
     pub dst_alpha: u32,
     pub op_alpha: u32,
+    /// Which channels this attachment writes. Independent of blending: a
+    /// masked attachment with blending off still leaves the unwritten channels
+    /// alone, so this cannot ride inside the blend state.
+    pub write_mask: ColorWriteMask,
 }
 
 /// Color-attachment[0] blend + format (compat alias for first entry).
@@ -604,6 +687,14 @@ pub fn texture_view_type_is_3d(texture_type: u16) -> bool {
     texture_type == TEXTURE_VIEW_MTL_TYPE_3D
 }
 
+// Colour-attachment TLV tags. `0x01..=0x09` are `MTLRenderPipelineColorAttach\
+// mentDescriptor`'s nine properties in the order `MTLRenderPipeline.h` declares
+// them — pixelFormat, blendingEnabled, sourceRGBBlendFactor,
+// destinationRGBBlendFactor, rgbBlendOperation, sourceAlphaBlendFactor,
+// destinationAlphaBlendFactor, alphaBlendOperation, writeMask — so the tag is
+// the property's one-based header index. Tag `0x00` sits before the first
+// property and is not one; it rides every entry with value 0 in every workload
+// measured and is reported by `note_color_entry_fields` as unconsumed.
 pub const COLOR_ATTACHMENT_TAG_PIXEL_FORMAT: u8 = 0x01;
 pub const COLOR_ATTACHMENT_TAG_BLEND_ENABLE: u8 = 0x02;
 pub const COLOR_ATTACHMENT_TAG_SRC_RGB: u8 = 0x03;
@@ -612,9 +703,28 @@ pub const COLOR_ATTACHMENT_TAG_RGB_OP: u8 = 0x05;
 pub const COLOR_ATTACHMENT_TAG_SRC_ALPHA: u8 = 0x06;
 pub const COLOR_ATTACHMENT_TAG_DST_ALPHA: u8 = 0x07;
 pub const COLOR_ATTACHMENT_TAG_ALPHA_OP: u8 = 0x08;
+/// `MTLColorWriteMask`, the ninth and last property.
+///
+/// Read off a live x86/Vulkan guest on 2026-07-30: the tag appears with
+/// `len=4 value=1` on a pipeline whose entry is `[00, 01, 02, 06, 09]`, and
+/// `value=1` is [`MTL_COLOR_WRITE_MASK_ALPHA`] — an alpha-only attachment,
+/// which is how a compositor punches a shape into a surface's alpha without
+/// touching its colour. Serialized entries omit properties left at their
+/// default, which is why only the one non-`all` mask in that boot appeared.
+pub const COLOR_ATTACHMENT_TAG_WRITE_MASK: u8 = 0x09;
 pub const BLEND_FACTOR_ZERO: u32 = 0;
 pub const BLEND_FACTOR_ONE: u32 = 1;
 pub const BLEND_OP_ADD: u32 = 0;
+
+// `MTLColorWriteMask` (Metal.framework Headers/MTLRenderPipeline.h). The bits
+// run alpha-first from the low end, which is the reverse of the RGBA reading
+// order the name suggests — `Red` is `1 << 3`, not `1 << 0`.
+pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
+pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
+pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
+pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
+pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
+pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
 
 /// Sampler descriptor length (type-7 subtype 0x03).
 pub const SAMPLER_DESC_LEN: usize = 36;
@@ -794,57 +904,6 @@ pub enum Descriptor {
     Unknown,
 }
 
-pub fn object_type_name(t: u8) -> &'static str {
-    match t {
-        OBJECT_TYPE_BUFFER => "buffer",
-        OBJECT_TYPE_TEXTURE => "texture",
-        OBJECT_TYPE_TEXTURE_VARIANT => "textureVariant",
-        OBJECT_TYPE_FUNCTION => "function",
-        OBJECT_TYPE_TYPE7 => "type7",
-        OBJECT_TYPE_TEXTURE_VIEW => "textureView",
-        OBJECT_TYPE_IOSURFACE => "iosurfaceTexture",
-        _ => "unknown",
-    }
-}
-
-pub fn descriptor_kind_name(k: DescriptorKind) -> &'static str {
-    match k {
-        DescriptorKind::Buffer => "buffer",
-        DescriptorKind::Texture => "texture",
-        DescriptorKind::Sampler => "sampler",
-        DescriptorKind::Function => "function",
-        DescriptorKind::RenderPipeline => "renderPipeline",
-        DescriptorKind::ComputePipeline => "computePipeline",
-        DescriptorKind::DepthStencil => "depthStencil",
-        DescriptorKind::TextureView => "textureView",
-        DescriptorKind::IOSurfaceTexture => "iosurfaceTexture",
-        DescriptorKind::IndirectCommandBuffer => "indirectCommandBuffer",
-        DescriptorKind::Unknown => "unknown",
-    }
-}
-
-pub fn object_type_producer_coverage(t: u8) -> ProducerCoverage {
-    match t {
-        OBJECT_TYPE_BUFFER
-        | OBJECT_TYPE_TEXTURE
-        | OBJECT_TYPE_TEXTURE_VARIANT
-        | OBJECT_TYPE_FUNCTION
-        | OBJECT_TYPE_TYPE7
-        | OBJECT_TYPE_TEXTURE_VIEW
-        | OBJECT_TYPE_IOSURFACE => ProducerCoverage::Emitted,
-        _ => ProducerCoverage::Unknown,
-    }
-}
-
-pub fn producer_coverage_name(c: ProducerCoverage) -> &'static str {
-    match c {
-        ProducerCoverage::Unknown => "unknown",
-        ProducerCoverage::Emitted => "emitted",
-        ProducerCoverage::Rejected => "rejected",
-        ProducerCoverage::HostOnly => "host-only",
-    }
-}
-
 /// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
@@ -892,27 +951,6 @@ pub fn decode_object_entry(bytes: &[u8]) -> Result<ObjectEntry, DecodeStatus> {
         ref_: ld32(&bytes[4..]),
         length: ld32(&bytes[8..]),
     })
-}
-
-/// Prefer live list offset; keep name for callers.
-pub fn object_entry_offset(ref_: u32, entry_count: u32) -> Option<u64> {
-    list_object_entry_offset(ref_, entry_count)
-}
-
-pub fn descriptor_read_len(object_type: u8, declared_len: u32) -> Option<u32> {
-    if declared_len == 0 {
-        return None;
-    }
-    match object_type {
-        OBJECT_TYPE_BUFFER
-        | OBJECT_TYPE_TEXTURE
-        | OBJECT_TYPE_TEXTURE_VARIANT
-        | OBJECT_TYPE_FUNCTION
-        | OBJECT_TYPE_TYPE7
-        | OBJECT_TYPE_TEXTURE_VIEW
-        | OBJECT_TYPE_IOSURFACE => Some(declared_len),
-        _ => None,
-    }
 }
 
 pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, DecodeStatus> {
@@ -1423,7 +1461,7 @@ pub fn decode_render_pipeline_descriptor(
             out.vertex_attributes = parse_vertex_block(bytes, first_tlv_end, color_abs)?;
         }
         if color_abs < declared {
-            out.color_attachments = parse_color_attachments(bytes, declared, color_abs)?;
+            out.color_attachments = parse_color_attachments(bytes, declared, color_abs);
             if let Some(c0) = out.color_attachments.first().copied() {
                 out.color0 = c0;
             }
@@ -1432,12 +1470,156 @@ pub fn decode_render_pipeline_descriptor(
     Ok(out)
 }
 
+/// A colour-attachment TLV field this decoder does not read.
+///
+/// The entry is `[field_count][tag][len][value…]*` and eight tags are consumed
+/// (`COLOR_ATTACHMENT_TAG_PIXEL_FORMAT` through `..._ALPHA_OP`). Anything else
+/// is a field the guest serialized and we dropped on the floor — including,
+/// per `translate/coverage.rs`, `colorAttachments[n].writeMask`, whose position
+/// in this block is unknown and is an RE question rather than a guess.
+struct ColorAttachDropped {
+    tag: u8,
+}
+
+impl crate::observe::Decline for ColorAttachDropped {
+    fn slug(&self) -> &'static str {
+        "color_attachment_field_dropped"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("tag", format!("0x{:02x}", self.tag))]
+    }
+}
+
+const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 9] = [
+    COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
+    COLOR_ATTACHMENT_TAG_BLEND_ENABLE,
+    COLOR_ATTACHMENT_TAG_SRC_RGB,
+    COLOR_ATTACHMENT_TAG_DST_RGB,
+    COLOR_ATTACHMENT_TAG_RGB_OP,
+    COLOR_ATTACHMENT_TAG_SRC_ALPHA,
+    COLOR_ATTACHMENT_TAG_DST_ALPHA,
+    COLOR_ATTACHMENT_TAG_ALPHA_OP,
+    COLOR_ATTACHMENT_TAG_WRITE_MASK,
+];
+
+/// A colour-attachment `writeMask` outside `MTLColorWriteMask`'s four bits.
+///
+/// This is the standing check on the tag identification itself. Tag `0x09` is
+/// `writeMask` because it is the ninth property in `MTLRenderPipeline.h` and
+/// tags `0x01..=0x08` are the first eight in order — an argument from the
+/// header, not from the one observed value. If the tag is something else, it
+/// will eventually carry a value no four-bit mask can hold, and that value
+/// arrives here by name instead of quietly masking channels off.
+struct ColorWriteMaskOutOfRange;
+
+impl crate::observe::Decline for ColorWriteMaskOutOfRange {
+    fn slug(&self) -> &'static str {
+        "color_write_mask_out_of_range"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+}
+
+/// The largest field value that rides in the dedup key.
+///
+/// A dropped field's *value distribution* is the identifying signal — an
+/// `MTLColorWriteMask` only ever takes 0..=15, which names the field from the
+/// wire alone without knowing its tag in advance. So small values each get
+/// their own line. A field carrying wide values would otherwise make this
+/// unbounded, so above the cap the key collapses to the tag and only the first
+/// value seen is printed.
+const COLOR_ATTACH_DROP_VALUE_CAP: u32 = 64;
+
+/// Report the shape of one colour-attachment entry and every field in it this
+/// decoder does not consume.
+///
+/// Two lines with different jobs, because a silent census cannot distinguish
+/// "the guest sends nothing but the eight tags we read" from "this walk never
+/// ran on a live guest":
+///
+/// * `type7_color_attach_shape` is the *branch*, deduped per distinct `(tag,
+///   len)` sequence. A boot with entries but no drop line is then a positive
+///   reading — the entries were seen and carried only consumed tags — rather
+///   than an absence.
+/// * `color_attachment_field_dropped` is the *loss*, one typed decline per
+///   dropped `(tag, len, value)`. A serialized field we never read is guest
+///   intent discarded, which the ground rules say must not be silent.
+///
+/// Pipeline descriptors are decoded once per distinct pipeline and cached, so
+/// this walk is not on a per-draw path.
+fn note_color_entry_fields(bytes: &[u8], len: usize, entry: usize, slot: u32) {
+    if entry >= len {
+        return;
+    }
+    let field_count = bytes[entry] as usize;
+    let mut p = entry + 1;
+    let mut shape = String::new();
+    let mut shape_key: u64 = 0;
+    let mut dropped: Vec<(u8, u8, u32)> = Vec::new();
+    for _ in 0..field_count {
+        if p + 2 > len {
+            break;
+        }
+        let tag = bytes[p];
+        let field_len = bytes[p + 1] as usize;
+        if p + 2 + field_len > len {
+            break;
+        }
+        let value = if field_len >= 4 {
+            ld32(&bytes[p + 2..])
+        } else {
+            0
+        };
+        let consumed = COLOR_ATTACHMENT_TAGS_CONSUMED.contains(&tag);
+        let sep = if shape.is_empty() { "" } else { "," };
+        let star = if consumed { "" } else { "*" };
+        let _ = std::fmt::Write::write_fmt(
+            &mut shape,
+            format_args!("{sep}{tag:02x}:{field_len}{star}"),
+        );
+        // Order-sensitive so a reordered entry reads as a different shape; the
+        // tag and length are what the walk depends on, the value is not.
+        shape_key = shape_key.rotate_left(9) ^ (u64::from(tag) << 8) ^ (field_len as u64);
+        if !consumed {
+            dropped.push((tag, field_len as u8, value));
+        }
+        p += 2 + field_len;
+    }
+    if crate::observe::first_sight("type7_color_attach_shape", shape_key) {
+        crate::observe::off(format!(
+            "type7_color_attach_shape slot={slot} nfields={field_count} \
+             tags=[{shape}] unconsumed={}",
+            dropped.len()
+        ));
+    }
+    for (tag, field_len, value) in dropped {
+        let keyed_value = if value <= COLOR_ATTACH_DROP_VALUE_CAP {
+            u64::from(value)
+        } else {
+            u64::from(COLOR_ATTACH_DROP_VALUE_CAP) + 1
+        };
+        let disc = (u64::from(tag) << 40) | (u64::from(field_len) << 32) | keyed_value;
+        if !crate::observe::first_sight("color_attachment_field_dropped", disc) {
+            continue;
+        }
+        crate::observe::Emit::decline("type7_color_attach", &ColorAttachDropped { tag })
+            .field("slot", slot)
+            .field("len", field_len)
+            .field("value", value)
+            .fail();
+    }
+}
+
 fn parse_one_color_entry(
     bytes: &[u8],
     len: usize,
     entry: usize,
     slot: u32,
-) -> Result<PipelineColorAttachment, DecodeStatus> {
+) -> PipelineColorAttachment {
+    note_color_entry_fields(bytes, len, entry, slot);
     let mut out = PipelineColorAttachment {
         slot,
         src_rgb: BLEND_FACTOR_ONE,
@@ -1497,7 +1679,20 @@ fn parse_one_color_entry(
         COLOR_ATTACHMENT_TAG_ALPHA_OP,
         BLEND_OP_ADD,
     );
-    Ok(out)
+    // An entry that omits the tag left the property at its default, which for
+    // `MTLColorWriteMask` is `all` — the same thing `ColorWriteMask::default()`
+    // says, so the absent case needs no branch.
+    if let Some(mask) = entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_WRITE_MASK) {
+        if let Some(decoded) = ColorWriteMask::new(mask) {
+            out.write_mask = decoded;
+        } else if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
+            crate::observe::Emit::decline("type7_color_attach", &ColorWriteMaskOutOfRange)
+                .field("slot", slot)
+                .field("value", mask)
+                .fail();
+        }
+    }
+    out
 }
 
 /// Parse all color-attachment entries (slot = entry index in the section).
@@ -1505,10 +1700,10 @@ pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
     section_off: usize,
-) -> Result<Vec<PipelineColorAttachment>, DecodeStatus> {
+) -> Vec<PipelineColorAttachment> {
     let mut out = Vec::new();
     if section_off == 0 || section_off + 8 > len {
-        return Ok(out);
+        return out;
     }
     let count = ld32(&bytes[section_off..]) as usize;
     for i in 0..count.min(8) {
@@ -1521,19 +1716,9 @@ pub fn parse_color_attachments(
             Some(e) if e < len => e,
             _ => break,
         };
-        out.push(parse_one_color_entry(bytes, len, entry, i as u32)?);
+        out.push(parse_one_color_entry(bytes, len, entry, i as u32));
     }
-    Ok(out)
-}
-
-/// Parse color-attachment[0] only (compat).
-pub fn parse_color_attachment0(
-    bytes: &[u8],
-    len: usize,
-    section_off: usize,
-) -> Result<PipelineColorAttachment0, DecodeStatus> {
-    let all = parse_color_attachments(bytes, len, section_off)?;
-    Ok(all.into_iter().next().unwrap_or_default())
+    out
 }
 
 pub fn decode_texture_view_descriptor(bytes: &[u8]) -> Result<TextureViewDescriptor, DecodeStatus> {
@@ -1649,23 +1834,33 @@ pub fn texture_type8_opcode(bytes: &[u8]) -> Option<u32> {
 
 const TYPE7_MIN_LEN: usize = 17;
 
+/// **Unused on the x86 PCI pathway.** A probe placed at the top of this function
+/// — before the length check, so a short record would also report — emitted
+/// nothing across a full interactive session. Type-11 geometry on that pathway
+/// is latched from the **type-4** surface backing descriptor instead
+/// (`runtime/objects.rs`, `decode_type4_surface` -> `set_mapping_geom`). Do not
+/// reason about what the guest tells us at surface-create time from this
+/// decoder without re-confirming it runs; measure `decode_type4_surface`.
 pub fn decode_iosurface_texture_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     // Matches reims-vgpu-iosurface-pages texture descriptor min layout (mappingID,
     // object self-ref, format, width, height). Live type-11 blobs are longer
-    // (0x38/0x58) with a constant tail; multi-mip level records are **not**
-    // part of this object type — Metal forbids mipmapped IOSurface textures
+    // (0x38/0x58); multi-mip level records are **not** part of this object type
+    // — Metal forbids mipmapped IOSurface textures
     // (`newTextureWithDescriptor:iosurface:` rejects mipmapLevelCount > 1),
     // and product resolve fail-closes non-zero levels rather than inventing
     // a pyramid packing in the mapping (see blit_exec::Type11Texture).
     if bytes.len() < 0x20 {
         return Err(DecodeStatus::ErrShort("res_iosurface_short"));
     }
+    let mapping_id = ld32(&bytes[0x00..]);
+    let width = ld32(&bytes[0x18..]);
+    let height = ld32(&bytes[0x1c..]);
     Ok(Descriptor::IOSurfaceTexture {
-        mapping_id: ld32(&bytes[0x00..]),
+        mapping_id,
         object_ref: ld32(&bytes[0x10..]),
         pixel_format: ld16(&bytes[0x16..]),
-        width: ld32(&bytes[0x18..]),
-        height: ld32(&bytes[0x1c..]),
+        width,
+        height,
     })
 }
 
@@ -1852,6 +2047,7 @@ pub fn decode_icb_command_layout(bytes: &[u8]) -> Result<IcbCommandLayout, Decod
 }
 
 /// Encode layout into 52 bytes (tests / fixtures).
+#[cfg(test)]
 pub fn encode_icb_command_layout(layout: &IcbCommandLayout) -> [u8; ICB_LAYOUT_LEN] {
     let mut b = [0u8; ICB_LAYOUT_LEN];
     st16(&mut b[0..], layout.command_type_offset);
@@ -1881,6 +2077,7 @@ pub fn encode_icb_command_layout(layout: &IcbCommandLayout) -> [u8; ICB_LAYOUT_L
 /// vertex → fragment → **object → mesh** → kernel, each `count × 0x14`, then
 /// attribute-stride table (`maxVertex × 8` when dynamic stride), object-TG
 /// lengths, kernel-TG lengths, then args.
+#[cfg(test)]
 pub fn render_icb_layout(
     max_vertex: u16,
     max_fragment: u16,
@@ -1890,6 +2087,7 @@ pub fn render_icb_layout(
 }
 
 /// Like [`render_icb_layout`] with object/mesh bind tables and object-TG lengths.
+#[cfg(test)]
 pub fn render_icb_layout_ex(
     max_vertex: u16,
     max_fragment: u16,
@@ -1964,36 +2162,43 @@ pub fn render_icb_layout_ex(
 }
 
 /// Draw-only convenience (commandTypes Draw).
+#[cfg(test)]
 pub fn render_only_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW)
 }
 
 /// DrawIndexed-only convenience.
+#[cfg(test)]
 pub fn render_draw_indexed_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW_INDEXED)
 }
 
 /// DrawPatches-only convenience (args 0x38 + tessellation factor table at 0x40).
+#[cfg(test)]
 pub fn render_draw_patches_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW_PATCHES)
 }
 
 /// DrawIndexedPatches-only convenience (args 0x4a).
+#[cfg(test)]
 pub fn render_draw_indexed_patches_icb_layout(max_vertex: u16) -> IcbCommandLayout {
     render_icb_layout(max_vertex, 0, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES)
 }
 
 /// DrawMeshThreads-only convenience (args 0x48, optional mesh bind slots).
+#[cfg(test)]
 pub fn render_draw_mesh_threads_icb_layout(max_mesh: u16) -> IcbCommandLayout {
     render_icb_layout_ex(0, 0, 0, max_mesh, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADS)
 }
 
 /// DrawMeshThreadgroups-only convenience (args 0x48).
+#[cfg(test)]
 pub fn render_draw_mesh_threadgroups_icb_layout() -> IcbCommandLayout {
     render_icb_layout(0, 0, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS)
 }
 
 /// Mesh draw with object + mesh bind tables.
+#[cfg(test)]
 pub fn render_draw_mesh_threads_icb_layout_with_binds(
     max_object: u16,
     max_mesh: u16,
@@ -2009,6 +2214,7 @@ pub fn render_draw_mesh_threads_icb_layout_with_binds(
 }
 
 /// Object+mesh drawMeshThreadgroups with optional object TG memory slots.
+#[cfg(test)]
 pub fn render_draw_mesh_threadgroups_icb_layout_ex(
     max_object: u16,
     max_mesh: u16,
@@ -2029,6 +2235,7 @@ pub fn render_draw_mesh_threadgroups_icb_layout_ex(
 /// Matches `AppleParavirtIndirectCommandBuffer setupCommandLayout:` for the
 /// common product case (commandTypes=`1<<5`, inheritBuffers=false,
 /// inheritPipelineState=false). Threadgroup-memory table size 0 (no TG binds).
+#[cfg(test)]
 pub fn compute_only_icb_layout(max_kernel: u16) -> IcbCommandLayout {
     compute_icb_layout(max_kernel, 0)
 }
@@ -2039,6 +2246,7 @@ pub fn compute_only_icb_layout(max_kernel: u16) -> IcbCommandLayout {
 /// 1. `max_kernel × 8` attribute-stride u64s at `attributeStrideOffset`
 /// 2. `max_kernel_tg × 8` TG-memory length u64s at `threadgroupMemoryLengthOffset`
 /// 3. dispatch args. Barrier is u32 at `barrierOffset` (typically 4).
+#[cfg(test)]
 pub fn compute_icb_layout(max_kernel: u16, max_kernel_tg: u16) -> IcbCommandLayout {
     let pipeline = 0x60u32;
     let kernel_bind = 0x64u32;
@@ -2187,38 +2395,6 @@ pub fn decode_type7_descriptor(bytes: &[u8]) -> Result<Descriptor, DecodeStatus>
     }
 }
 
-/// Legacy wide TLV stream (not live type-7). Kept for unit tests of the old shape.
-pub fn decode_pipeline_tlvs(bytes: &[u8]) -> Result<Vec<Tlv>, DecodeStatus> {
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + 8 <= bytes.len() {
-        let tag = ld32(&bytes[off..]);
-        let length = ld32(&bytes[off + 4..]) as usize;
-        if length < 8 || off + length > bytes.len() {
-            return Err(DecodeStatus::ErrBadLength("res_wide_tlv_bad_length"));
-        }
-        out.push(Tlv {
-            tag,
-            length: length as u32,
-            value_offset: off + 8,
-        });
-        off += length;
-    }
-    if off != bytes.len() {
-        return Err(DecodeStatus::ErrBadLength("res_wide_tlv_trailing_bytes"));
-    }
-    Ok(out)
-}
-
-/// Extract a u32 from a legacy wide TLV value region.
-pub fn tlv_u32_value(bytes: &[u8], tlv: &Tlv) -> Option<u32> {
-    let start = tlv.value_offset;
-    if start + 4 > bytes.len() {
-        return None;
-    }
-    Some(ld32(&bytes[start..]))
-}
-
 pub fn decode_descriptor(object_type: u8, bytes: &[u8]) -> Result<Descriptor, DecodeStatus> {
     match object_type {
         OBJECT_TYPE_BUFFER => Ok(Descriptor::Buffer(decode_buffer_descriptor(bytes)?)),
@@ -2278,10 +2454,6 @@ mod tests {
         assert_eq!(
             decode_type7_descriptor(&type7).unwrap_err().slug(),
             "res_type7_subtype_unknown"
-        );
-        assert_eq!(
-            decode_pipeline_tlvs(&[0u8; 8]).unwrap_err().slug(),
-            "res_wide_tlv_bad_length"
         );
     }
 
@@ -2465,7 +2637,6 @@ mod tests {
         assert_eq!(ent.object_type, 1);
         // Live list offset: ref * 12
         assert_eq!(list_object_entry_offset(3, 10), Some(36));
-        assert_eq!(object_entry_offset(3, 10), Some(36));
 
         let mut list = [0u8; 12];
         st32(&mut list[0..], 11u32 | (0x20u32 << 8));
@@ -2513,17 +2684,6 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
-    }
-
-    #[test]
-    fn tlv_stream_legacy_wide() {
-        let mut b = vec![0u8; 16];
-        st32(&mut b[0..], 1);
-        st32(&mut b[4..], 16);
-        st32(&mut b[8..], 0xdead);
-        let tlvs = decode_pipeline_tlvs(&b).unwrap();
-        assert_eq!(tlvs.len(), 1);
-        assert_eq!(tlvs[0].tag, 1);
     }
 
     #[test]
@@ -2694,15 +2854,284 @@ mod tests {
         buf[entry + 13] = COLOR_ATTACHMENT_TAG_DST_RGB;
         buf[entry + 14] = 4;
         st32(&mut buf[entry + 15..], 5); // OneMinusSourceAlpha
-        let c = parse_color_attachment0(&buf, buf.len(), off).unwrap();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        let c = all.first().copied().unwrap_or_default();
         assert!(c.has_pixel_format);
         assert_eq!(c.pixel_format, MTL_FORMAT_BGRA8_UNORM as u32);
         assert!(c.blending_enabled);
         assert_eq!(c.dst_rgb, 5);
         assert_eq!(c.src_rgb, BLEND_FACTOR_ONE);
         assert_eq!(c.slot, 0);
-        let all = parse_color_attachments(&buf, buf.len(), off).unwrap();
+        let all = parse_color_attachments(&buf, buf.len(), off);
         assert_eq!(all.len(), 1);
+    }
+
+    /// A colour-attachment field this decoder does not read is guest intent
+    /// dropped, and the shape line beside it is what makes a boot with *no*
+    /// drops readable as a measurement rather than as silence.
+    #[test]
+    fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        // A tag no other test in this process uses, so `first_sight` cannot
+        // have latched it already.
+        const UNKNOWN_TAG: u8 = 0x7f;
+        const UNKNOWN_VALUE: u32 = 13;
+        let off = 16usize;
+        let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
+        st32(&mut buf[off..], 1);
+        st32(&mut buf[off + 4..], 8);
+        let entry = off + 8;
+        buf[entry] = 2;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+        buf[entry + 7] = UNKNOWN_TAG;
+        buf[entry + 8] = 4;
+        st32(&mut buf[entry + 9..], UNKNOWN_VALUE);
+
+        let cap = crate::observe::FailCapture::start();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        let lines = cap.lines();
+        // The consumed field still decodes; the census does not disturb it.
+        assert_eq!(
+            all.first().map(|c| c.pixel_format),
+            Some(u32::from(MTL_FORMAT_BGRA8_UNORM))
+        );
+
+        let shape: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("type7_color_attach_shape"))
+            .collect();
+        assert_eq!(
+            shape.len(),
+            1,
+            "one shape line per distinct entry: {lines:?}"
+        );
+        assert!(
+            shape[0].contains("tags=[01:4,7f:4*]") && shape[0].contains("unconsumed=1"),
+            "the shape line names every tag and stars the unread ones: {}",
+            shape[0]
+        );
+
+        let drop: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("reason=color_attachment_field_dropped"))
+            .collect();
+        assert_eq!(drop.len(), 1, "one decline per dropped field: {lines:?}");
+        assert!(
+            drop[0].contains("tag=0x7f") && drop[0].contains("value=13"),
+            "the decline carries the tag and the value, which is what \
+             identifies the field: {}",
+            drop[0]
+        );
+
+        // Latched: a second identical entry reports neither line again.
+        let cap2 = crate::observe::FailCapture::start();
+        let _ = parse_color_attachments(&buf, buf.len(), off);
+        assert!(
+            cap2.lines().is_empty(),
+            "the census is deduped per shape and per (tag, len, value): {:?}",
+            cap2.lines()
+        );
+    }
+
+    /// The ninth colour-attachment tag is `MTLColorWriteMask`, and an entry
+    /// that omits it left the property at `all`.
+    #[test]
+    fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        // `[fieldCount][01 pixelFormat][09 writeMask]`, the shape the live
+        // guest sent (alpha-only, value 1).
+        let off = 16usize;
+        let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
+        st32(&mut buf[off..], 1);
+        st32(&mut buf[off + 4..], 8);
+        let entry = off + 8;
+        buf[entry] = 2;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+        buf[entry + 7] = COLOR_ATTACHMENT_TAG_WRITE_MASK;
+        buf[entry + 8] = 4;
+        st32(&mut buf[entry + 9..], MTL_COLOR_WRITE_MASK_ALPHA);
+        let masked = parse_color_attachments(&buf, buf.len(), off);
+        assert_eq!(
+            masked.first().map(|c| c.write_mask),
+            Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
+        );
+        assert!(!masked[0].write_mask.is_all());
+
+        // Same entry with the tag dropped: `all`, not `none`. This is the arm
+        // a derived `Default` on a bare `u32` would have made a black
+        // attachment, and every pipeline in the tree takes it.
+        buf[entry] = 1;
+        let plain = parse_color_attachments(&buf, buf.len(), off);
+        assert!(plain[0].write_mask.is_all());
+        assert_eq!(plain[0].write_mask, ColorWriteMask::default());
+    }
+
+    /// The tag identification is an argument from `MTLRenderPipeline.h`'s
+    /// property order, so it needs a standing check that it still holds. A
+    /// value no four-bit mask can carry refuses by name rather than masking
+    /// channels off on a guess.
+    #[test]
+    fn a_write_mask_outside_the_four_bits_refuses_by_name() {
+        use crate::contract::endian::st32;
+        let off = 16usize;
+        let mut buf = vec![0u8; off + 8 + 1 + 6];
+        st32(&mut buf[off..], 1);
+        st32(&mut buf[off + 4..], 8);
+        let entry = off + 8;
+        buf[entry] = 1;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_WRITE_MASK;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], 0x1234_5678);
+
+        let cap = crate::observe::FailCapture::start();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        assert!(
+            all[0].write_mask.is_all(),
+            "a refused mask leaves the attachment writing every channel, \
+             which is the pre-decode behaviour rather than a new failure"
+        );
+        let lines = cap.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=color_write_mask_out_of_range")
+                    && l.contains("value=305419896")),
+            "the refusal names the value that refuted it: {lines:?}"
+        );
+    }
+
+    /// The measured case, from an x86/Vulkan boot in Dark appearance: a 27x27
+    /// `RG8Unorm` corner mask at offset 0x850, 384-byte rows, in a 12 288-byte
+    /// allocation. `row_stride * height` scores 12 496 and refuses it; the
+    /// bytes actually read end at 12 166, with 122 to spare.
+    ///
+    /// The guest's allocation is exactly right, and the old bound demanded
+    /// trailing padding that no row occupies — so the refusal dropped the
+    /// WindowServer's whole composite draw and the window rendered with square
+    /// corners and no shadow.
+    #[test]
+    fn a_levels_read_span_stops_at_the_last_row_not_a_last_stride() {
+        const OFFSET: u64 = 0x850;
+        const STRIDE: u64 = 384;
+        const HEIGHT: u32 = 27;
+        const TIGHT: u32 = 27 * 2;
+        const ALLOCATION: u64 = 12288;
+
+        let span = TextureLevelLayout {
+            offset: OFFSET,
+            size: 0,
+            row_stride: STRIDE,
+            width: 27,
+            height: HEIGHT,
+            depth: 1,
+        }
+        .read_span(TIGHT)
+        .unwrap();
+        assert_eq!(span, 26 * STRIDE + TIGHT as u64);
+        assert_eq!(OFFSET + span, 12166);
+        assert!(
+            OFFSET + span <= ALLOCATION,
+            "the guest sized this allocation for exactly this image"
+        );
+        // The bound this replaced, stated so the regression is visible here
+        // rather than only on a live guest.
+        assert!(OFFSET + STRIDE * HEIGHT as u64 > ALLOCATION);
+
+        // A tight image (no padding) is unchanged: the two forms agree.
+        let tight_span = TextureLevelLayout {
+            offset: OFFSET,
+            size: 0,
+            row_stride: TIGHT as u64,
+            width: 27,
+            height: HEIGHT,
+            depth: 1,
+        }
+        .read_span(TIGHT)
+        .unwrap();
+        assert_eq!(tight_span, (TIGHT as u64) * HEIGHT as u64);
+
+        // A single row is its own tight length, with no stride charged at all.
+        assert_eq!(
+            TextureLevelLayout {
+                offset: OFFSET,
+                size: 0,
+                row_stride: STRIDE,
+                width: 27,
+                height: 1,
+                depth: 1
+            }
+            .read_span(TIGHT),
+            Some(TIGHT as u64)
+        );
+
+        // Zero height has no rows and therefore no span; the caller rejects
+        // that extent separately, and this must not underflow into a huge one.
+        assert_eq!(
+            TextureLevelLayout {
+                offset: OFFSET,
+                size: 0,
+                row_stride: STRIDE,
+                width: 27,
+                height: 0,
+                depth: 1
+            }
+            .read_span(TIGHT),
+            None
+        );
+    }
+
+    /// The array/volume form of the same rule. A slice is charged for every
+    /// plane below its last one in full, and for its last plane only as far as
+    /// the last row reaches — so an allocation sized exactly for N slices is
+    /// accepted rather than refused for the padding after the very last row.
+    #[test]
+    fn a_slice_read_span_charges_full_planes_and_a_tight_last_row() {
+        const STRIDE: u64 = 384;
+        const HEIGHT: u32 = 27;
+        const TIGHT: u32 = 27 * 2;
+        let layout = TextureLevelLayout {
+            offset: 0,
+            size: 0,
+            row_stride: STRIDE,
+            width: 27,
+            height: HEIGHT,
+            depth: 4,
+        };
+
+        // Depth 0 and 1 are both one plane, and then this is exactly `read_span`.
+        let flat = layout.read_span(TIGHT).unwrap();
+        assert_eq!(layout.slice_read_span(TIGHT, 1), Some(flat));
+        assert_eq!(layout.slice_read_span(TIGHT, 0), Some(flat));
+
+        // Three whole planes, then the fourth's rows.
+        let plane = STRIDE * HEIGHT as u64;
+        assert_eq!(layout.slice_read_span(TIGHT, 4), Some(3 * plane + flat));
+
+        // The stride form this replaced overcounts by exactly one row's padding,
+        // whatever the plane count.
+        for depth in [1u32, 2, 4] {
+            assert_eq!(
+                plane * u64::from(depth) - layout.slice_read_span(TIGHT, depth).unwrap(),
+                STRIDE - TIGHT as u64
+            );
+        }
+
+        // Zero height has no rows, so no span — and must not underflow.
+        assert_eq!(
+            TextureLevelLayout {
+                height: 0,
+                ..layout
+            }
+            .slice_read_span(TIGHT, 4),
+            None
+        );
     }
 
     #[test]
@@ -2865,8 +3294,6 @@ mod tests {
         for t in 0u8..16 {
             let bytes = vec![0u8; 128];
             let _ = decode_descriptor(t, &bytes);
-            let _ = object_type_name(t);
-            let _ = object_type_producer_coverage(t);
         }
     }
 }

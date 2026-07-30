@@ -9,6 +9,10 @@ use ash::vk;
 
 use super::reason::TranslateReason;
 use crate::backend::vulkan::engine::{BlendFactor, BlendOp, BlendStateResource};
+use crate::runtime::decode::resource::{
+    ColorWriteMask, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
+    MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_RED,
+};
 
 /// `MTLBlendFactor` (SDK numeric values, Metal header order).
 pub fn factor(mtl: u32) -> Result<BlendFactor, TranslateReason> {
@@ -68,6 +72,36 @@ pub fn state(
         alpha_op: operation(op_alpha)?,
         constants,
     })
+}
+
+/// `MTLColorWriteMask` → `VkColorComponentFlags`.
+///
+/// Metal's bits run alpha-first from the low end (`alpha = 1 << 0` …
+/// `red = 1 << 3`); Vulkan's run red-first (`R = 1 << 0` … `A = 1 << 3`). The
+/// two are bit-reversed over four bits, not equal, so a straight cast would
+/// swap red and alpha and leave green and blue exchanged — a mask asking for
+/// alpha-only would write red-only.
+///
+/// Total over the mask's range by construction: the input is `ColorWriteMask`,
+/// whose only producer is the decoder, and the decoder refuses anything above
+/// `MTLColorWriteMaskAll` by name. Bits above the fourth are ignored here
+/// rather than declined a second time.
+pub fn vk_color_write_mask(mask: ColorWriteMask) -> vk::ColorComponentFlags {
+    let bits = mask.bits();
+    let mut out = vk::ColorComponentFlags::empty();
+    if bits & MTL_COLOR_WRITE_MASK_RED != 0 {
+        out |= vk::ColorComponentFlags::R;
+    }
+    if bits & MTL_COLOR_WRITE_MASK_GREEN != 0 {
+        out |= vk::ColorComponentFlags::G;
+    }
+    if bits & MTL_COLOR_WRITE_MASK_BLUE != 0 {
+        out |= vk::ColorComponentFlags::B;
+    }
+    if bits & MTL_COLOR_WRITE_MASK_ALPHA != 0 {
+        out |= vk::ColorComponentFlags::A;
+    }
+    out
 }
 
 pub fn vk_factor(factor: BlendFactor) -> vk::BlendFactor {
@@ -161,6 +195,51 @@ mod tests {
             vk_operation(operation(2).unwrap()),
             vk::BlendOp::REVERSE_SUBTRACT
         );
+    }
+
+    /// Metal's mask bits are alpha-first and Vulkan's are red-first, so the
+    /// two are bit-reversed over four bits. A cast would swap red with alpha
+    /// and green with blue, and the mask that motivated decoding this field at
+    /// all — alpha-only — would come out as red-only, which writes colour and
+    /// drops the coverage the guest was punching in.
+    #[test]
+    fn the_metal_and_vulkan_write_mask_bit_orders_are_reversed_not_equal() {
+        use crate::runtime::decode::resource::{
+            MTL_COLOR_WRITE_MASK_ALL, MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN,
+            MTL_COLOR_WRITE_MASK_NONE,
+        };
+        let of = |bits: u32| vk_color_write_mask(ColorWriteMask::new(bits).unwrap());
+
+        assert_eq!(of(MTL_COLOR_WRITE_MASK_ALPHA), vk::ColorComponentFlags::A);
+        assert_eq!(of(MTL_COLOR_WRITE_MASK_RED), vk::ColorComponentFlags::R);
+        assert_eq!(of(MTL_COLOR_WRITE_MASK_GREEN), vk::ColorComponentFlags::G);
+        assert_eq!(of(MTL_COLOR_WRITE_MASK_BLUE), vk::ColorComponentFlags::B);
+        assert_eq!(of(MTL_COLOR_WRITE_MASK_ALL), vk::ColorComponentFlags::RGBA);
+        assert_eq!(
+            of(MTL_COLOR_WRITE_MASK_NONE),
+            vk::ColorComponentFlags::empty()
+        );
+        // The default is `all`, which is what an entry with no tag means.
+        assert_eq!(
+            vk_color_write_mask(ColorWriteMask::default()),
+            vk::ColorComponentFlags::RGBA
+        );
+        // A straight cast would agree on `all` and `none` and disagree on
+        // every single-channel mask; assert the disagreement so a later
+        // "simplification" to `from_raw(bits)` fails here.
+        assert_ne!(
+            of(MTL_COLOR_WRITE_MASK_ALPHA),
+            vk::ColorComponentFlags::from_raw(MTL_COLOR_WRITE_MASK_ALPHA)
+        );
+        // Every mask in range maps injectively — two collapsing onto one would
+        // silently merge distinct pipelines.
+        let mut seen: Vec<u32> = (0..=MTL_COLOR_WRITE_MASK_ALL)
+            .map(|m| of(m).as_raw())
+            .collect();
+        let before = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(before, seen.len());
     }
 
     /// A whole descriptor fails on its first bad component instead of

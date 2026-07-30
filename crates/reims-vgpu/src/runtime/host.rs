@@ -51,12 +51,40 @@ pub enum MemError {
     /// Neither the wire task id nor its `>> 1` define-task form names an active
     /// task, so there is no address space to resolve against.
     NoSuchTask,
-    /// The write span falls outside the mapping the guest declared for this
-    /// task — refused rather than trusted, per the no-scanning rule.
-    OutsideMap,
-    /// The span resolves but its pages are not contiguous in a host view, so a
-    /// single write cannot cover it.
-    NotContiguous,
+    /// A page of the span resolves to a GPA that is not guest RAM, so no host
+    /// mapping can cover it (mapper / wild-PFN class).
+    NotRam,
+    /// [`HostOps::map_pages`] refused a **packed** page run the walk had already
+    /// resolved — a RAMBlock or MemoryRegion edge, not a gap in the GPA list.
+    /// Fragmentation alone never reaches here: the multi-import path splits a
+    /// gapped span into packed runs and maps them one at a time.
+    MapPagesRefused,
+    /// A packed run's copy window fell outside the bytes `map_pages` returned or
+    /// outside the caller's buffer. Run arithmetic, not a guest condition.
+    RunOutOfRange,
+}
+
+impl MemError {
+    /// The guest's own page table says nothing is mapped at this address.
+    ///
+    /// A zero PFN in a task PTE is a *decoded guest fact*: the guest owns that
+    /// entry and wrote the zero. So a deferred writeback whose target answers
+    /// this has no target — the guest tore the range down — and that is a
+    /// different outcome from a write that failed while the target still
+    /// existed. Callers landing deferred content use it to pick between
+    /// "discharge the obligation" and "report lost guest work".
+    ///
+    /// Deliberately **only** the zero-PFN status. The other fourteen walk
+    /// refusals describe a table that is malformed, out of range or unreadable,
+    /// none of which is the guest saying "I unmapped this", and widening the set
+    /// to make a log quieter would turn this into the exception list the ground
+    /// rules forbid.
+    pub fn is_guest_teardown(&self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved(crate::contract::gva_resolve::ResolveStatus::ErrZeroPfn)
+        )
+    }
 }
 
 impl crate::observe::Decline for MemError {
@@ -88,8 +116,9 @@ impl crate::observe::Decline for MemError {
             Self::UnsupportedPageShift => "mem_unsupported_page_shift",
             Self::TaskRootRead => "mem_task_root_read",
             Self::NoSuchTask => "mem_no_such_task",
-            Self::OutsideMap => "mem_outside_map",
-            Self::NotContiguous => "mem_not_contiguous",
+            Self::NotRam => "mem_not_ram",
+            Self::MapPagesRefused => "mem_map_pages_refused",
+            Self::RunOutOfRange => "mem_run_out_of_range",
         }
     }
 
@@ -121,11 +150,10 @@ pub enum HostActionKind {
     Trace = 5,
     /// New software cursor glyph ready in device state (C pulls via ABI).
     CursorGlyph = 6,
-    /// Deprecated pre-host-window experiment: exported dmabuf fd for QEMU GL
-    /// scanout (`dpy_gl_scanout_dmabuf`). The supported product display path is
-    /// the Rust host window (`REIMS_VGPU_WINDOW=1`) and direct-present route, not QEMU's
-    /// GL console. Kept only to preserve the existing additive wire value.
-    ScanoutGl = 7,
+    // 7 is a retired wire value: it named a pre-host-window QEMU GL/dmabuf
+    // scanout action that no longer exists on either side. Every discriminant
+    // below is written out so removing it did not renumber the wire; do not
+    // reuse 7 for a new action.
     /// A guest keyboard key from the host-owned window (see
     /// [`crate::runtime::input`]). `a0` = Linux evdev keycode (`KEY_*`),
     /// `a1` = 1 down / 0 up. The window thread maps the platform key into the
@@ -185,10 +213,6 @@ impl HostAction {
         }
     }
 
-    pub fn scanout(mapping_id: u32, width: u32, height: u32) -> Self {
-        Self::scanout_gen(mapping_id, width, height, 0)
-    }
-
     pub fn scanout_gen(mapping_id: u32, width: u32, height: u32, generation: u32) -> Self {
         Self {
             kind: HostActionKind::ScanoutUpdate,
@@ -216,32 +240,6 @@ impl HostAction {
             a1: 0,
             a2: 0,
             a3: 0,
-        }
-    }
-
-    /// Deprecated QEMU GL/dmabuf scanout action. The export tuple is packed into
-    /// the four `u64` action slots (the C shim unpacks the same way to build its
-    /// `EGL_LINUX_DMA_BUF_EXT` import):
-    /// - `a0` = the dmabuf `fd` (always `>= 0` — the caller emits only on a
-    ///   successful export; the fd is a process-local handle valid across the
-    ///   in-process C ABI, and the importer owns closing it).
-    /// - `a1` = `row_pitch` (bytes per row of the LINEAR image — the EGL stride).
-    /// - `a2` = `width << 32 | height` (both fit in `u32`).
-    /// - `a3` = DRM `fourcc` (e.g. `DRM_FORMAT_ARGB8888` for the B8G8R8A8 export).
-    ///
-    /// The DRM modifier is **implicitly `DRM_FORMAT_MOD_LINEAR`** (the portable
-    /// baseline per the AGENTS.md portability rule), so it needs no slot; a single
-    /// plane at offset 0 is assumed (the export image binds one allocation at
-    /// offset 0). Coalescing / fd-lifetime policy is decided by the display
-    /// integration that emits this (only the latest present matters). Product
-    /// display work should use the custom host window/direct-present path instead.
-    pub fn scanout_gl(fd: i32, row_pitch: u64, fourcc: u32, width: u32, height: u32) -> Self {
-        Self {
-            kind: HostActionKind::ScanoutGl,
-            a0: fd as u64,
-            a1: row_pitch,
-            a2: (u64::from(width) << 32) | u64::from(height),
-            a3: u64::from(fourcc),
         }
     }
 
@@ -580,12 +578,6 @@ impl FakeHost {
         let _ = self.write_gpa(gpa, &b);
     }
 
-    /// Write a LE u16 at GPA.
-    pub fn put_u16(&mut self, gpa: u64, v: u16) {
-        let b = v.to_le_bytes();
-        let _ = self.write_gpa(gpa, &b);
-    }
-
     /// Read a LE u32 at GPA (zero if unmapped).
     pub fn get_u32(&self, gpa: u64) -> u32 {
         let mut b = [0u8; 4];
@@ -596,12 +588,6 @@ impl FakeHost {
     /// Count actions of a given kind.
     pub fn action_count(&self, kind: HostActionKind) -> usize {
         self.actions.iter().filter(|a| a.kind == kind).count()
-    }
-
-    /// Clear the action log (BH flag untouched).
-    pub fn clear_actions(&mut self) {
-        self.actions.clear();
-        self.bh_scheduled = false;
     }
 
     /// Set a synthetic X-register value (mapper capture tests).
@@ -940,12 +926,6 @@ pub fn write_u32<M: HostMemory>(mem: &mut M, gpa: u64, v: u32) -> Result<(), Mem
     mem.write_gpa(gpa, &v.to_le_bytes())
 }
 
-pub fn read_u16<M: HostMemory>(mem: &M, gpa: u64) -> Result<u16, MemError> {
-    let mut b = [0u8; 2];
-    mem.read_gpa(gpa, &mut b)?;
-    Ok(u16::from_le_bytes(b))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,27 +987,67 @@ mod tests {
         assert_eq!(scan.a3, 11);
     }
 
-    /// The deprecated GL/dmabuf scanout export tuple round-trips through the four
-    /// action slots exactly as the C shim will unpack it (fd, pitch, w|h, fourcc).
-    /// Locks the additive wire packing so historical probes keep decoding.
+    /// Exactly one refusal means "the guest unmapped this".
+    ///
+    /// `is_guest_teardown` decides whether a deferred writeback that could not
+    /// land is discharged quietly or reported as lost guest work, so widening it
+    /// silences real losses and is the exception-list anti-pattern in miniature.
+    /// Asserted exhaustively over every walk status and every `MemError` rather
+    /// than by naming the one, so a variant added later has to be classified
+    /// here on purpose instead of falling into whichever side `matches!`
+    /// happens to put it.
     #[test]
-    fn scanout_gl_packs_export_tuple() {
-        // Discriminant must match REIMS_VGPU_HOST_ACTION_SCANOUT_GL in the C header.
-        assert_eq!(HostActionKind::ScanoutGl as u32, 7);
+    fn only_a_zero_pfn_means_the_guest_tore_the_range_down() {
+        use crate::contract::gva_resolve::ResolveStatus as R;
+        const WALK: &[R] = &[
+            R::Ok,
+            R::ErrArgs,
+            R::ErrInactiveTask,
+            R::ErrNoDirectory,
+            R::ErrDirectoryRead,
+            R::ErrZeroRootPfn,
+            R::ErrZeroDepth,
+            R::ErrDepthTooDeep,
+            R::ErrAddressOutOfRange,
+            R::ErrPageTableRead,
+            R::ErrZeroPfn,
+            R::ErrMalformedPte,
+            R::ErrUnsupportedGeometry,
+        ];
+        let teardown: Vec<R> = WALK
+            .iter()
+            .copied()
+            .filter(|r| MemError::Unresolved(*r).is_guest_teardown())
+            .collect();
+        assert_eq!(teardown, vec![R::ErrZeroPfn]);
 
-        let (fd, pitch, fourcc, w, h) = (37i32, 7680u64, 0x3432_5241u32, 1920u32, 1080u32);
-        let a = HostAction::scanout_gl(fd, pitch, fourcc, w, h);
-        assert_eq!(a.kind, HostActionKind::ScanoutGl);
-        // C-side unpack: fd = a0, pitch = a1, w = a2>>32, h = a2 low32, fourcc = a3.
-        assert_eq!(a.a0 as i32, fd);
-        assert_eq!(a.a1, pitch);
-        assert_eq!((a.a2 >> 32) as u32, w);
-        assert_eq!((a.a2 & 0xffff_ffff) as u32, h);
-        assert_eq!(a.a3 as u32, fourcc);
-
-        // Full-HD dims never collide across the width|height split.
-        let big = HostAction::scanout_gl(1, 1, 0, 4096, 2160);
-        assert_eq!((big.a2 >> 32) as u32, 4096);
-        assert_eq!((big.a2 & 0xffff_ffff) as u32, 2160);
+        for e in [
+            MemError::Unmapped,
+            MemError::NoCpu,
+            MemError::Overflow,
+            MemError::BadArgs,
+            MemError::QemuReadGpaCallbackMissing,
+            MemError::QemuReadGpaCallbackFailed(-1),
+            MemError::QemuWriteGpaCallbackMissing,
+            MemError::QemuWriteGpaCallbackFailed(-1),
+            MemError::QemuReadKvaCallbackMissing,
+            MemError::QemuReadKvaCallbackFailed(-1),
+            MemError::XregUnavailable,
+            MemError::QemuReadXregCallbackMissing,
+            MemError::QemuReadXregCallbackFailed(-1),
+            MemError::NoTaskDirectory,
+            MemError::UnsupportedPageShift,
+            MemError::TaskRootRead,
+            MemError::NoSuchTask,
+            MemError::NotRam,
+            MemError::MapPagesRefused,
+            MemError::RunOutOfRange,
+        ] {
+            assert!(
+                !e.is_guest_teardown(),
+                "{} is not the guest saying it unmapped the range",
+                crate::observe::Decline::slug(&e)
+            );
+        }
     }
 }

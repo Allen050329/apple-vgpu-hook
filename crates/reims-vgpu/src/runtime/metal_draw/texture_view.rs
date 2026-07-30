@@ -149,15 +149,7 @@ impl Decline for TextureViewDecline {
     }
 }
 
-impl std::fmt::Display for TextureViewDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(TextureViewDecline);
 
 impl std::error::Error for TextureViewDecline {}
 
@@ -371,6 +363,103 @@ fn apply_view_swizzle_rgba8(
     Some(())
 }
 
+/// Why a linear (buffer-backed) texture could not be loaded for sampling.
+///
+/// [`load_linear_texture_impl`] runs fourteen distinct checks and used to
+/// return a bare `Option`, so its one caller on the sampling path printed a
+/// single label — `linear_sample_miss reason=guest_load` — for all of them.
+/// That label is the caller's assumption at full confidence: it says "the guest
+/// load failed" whether the object-list lookup missed, the descriptor would not
+/// decode, the format has no conversion, or a row's guest page is unmapped.
+/// Those have four different fixes.
+///
+/// The reason now comes *from* the check that refused. It is worth the type:
+/// this path failing drops a whole draw (`draw_vk_nothing_stored`), and the
+/// draw it was observed dropping is the WindowServer's full-screen composite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinearLoadRefusal {
+    /// The texture ref is not in this task's object list.
+    ObjectListMiss,
+    /// The list entry is not a texture or texture variant.
+    NotATexture { object_type: u8 },
+    /// The entry's descriptor bytes could not be read from guest memory.
+    DescriptorUnreadable,
+    /// The descriptor bytes are not a decodable texture descriptor.
+    DescriptorUndecodable,
+    /// The descriptor carries no pixel format, so nothing names its layout.
+    NoPixelFormat,
+    /// A type-8 view format that is not the same bytes-per-pixel as the base,
+    /// which would reinterpret the allocation rather than re-read it.
+    ViewFormatBppMismatch { base: u16, view: u16 },
+    /// The requested mip level has no address/layout in the descriptor.
+    NoLevelGva { level: u32 },
+    /// This format has no bytes-per-pixel in the contract table, so no row
+    /// length can be computed for it.
+    FormatBppUnknown { format: u16 },
+    /// The declared row stride is below one tight row of this format.
+    RowStrideBelowTight { stride: u64, tight: u32 },
+    /// Zero width or height.
+    ZeroExtent { width: u32, height: u32 },
+    /// A size computation overflowed, or the image exceeds the host allocation
+    /// ceiling.
+    SizeOverflow,
+    /// The level's rows run past the descriptor's own allocation size.
+    SpanExceedsAllocation { end: u64, allocation: u64 },
+    /// A tight-row bulk read of the whole image did not resolve in the task's
+    /// page table.
+    TightImageUnreadable,
+    /// One padded row did not resolve in the task's page table. `row` is the
+    /// first that failed, which says whether the allocation is partly mapped.
+    PaddedRowUnreadable { row: u32 },
+    /// The format has a bytes-per-pixel but no row conversion to RGBA8.
+    RowConvertUnsupported { format: u16 },
+}
+
+impl crate::observe::Decline for LinearLoadRefusal {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::ObjectListMiss => "linear_load_object_list_miss",
+            Self::NotATexture { .. } => "linear_load_not_a_texture",
+            Self::DescriptorUnreadable => "linear_load_descriptor_unreadable",
+            Self::DescriptorUndecodable => "linear_load_descriptor_undecodable",
+            Self::NoPixelFormat => "linear_load_no_pixel_format",
+            Self::ViewFormatBppMismatch { .. } => "linear_load_view_bpp_mismatch",
+            Self::NoLevelGva { .. } => "linear_load_no_level_gva",
+            Self::FormatBppUnknown { .. } => "linear_load_format_bpp_unknown",
+            Self::RowStrideBelowTight { .. } => "linear_load_stride_below_tight",
+            Self::ZeroExtent { .. } => "linear_load_zero_extent",
+            Self::SizeOverflow => "linear_load_size_overflow",
+            Self::SpanExceedsAllocation { .. } => "linear_load_span_exceeds_alloc",
+            Self::TightImageUnreadable => "linear_load_tight_image_unreadable",
+            Self::PaddedRowUnreadable { .. } => "linear_load_padded_row_unreadable",
+            Self::RowConvertUnsupported { .. } => "linear_load_row_convert_unsupported",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::NotATexture { object_type } => vec![("objtype", object_type.to_string())],
+            Self::ViewFormatBppMismatch { base, view } => vec![
+                ("base_fmt", format!("{base:#x}")),
+                ("view_fmt", format!("{view:#x}")),
+            ],
+            Self::NoLevelGva { level } => vec![("level", level.to_string())],
+            Self::FormatBppUnknown { format } | Self::RowConvertUnsupported { format } => {
+                vec![("fmt", format!("{format:#x}"))]
+            }
+            Self::RowStrideBelowTight { stride, tight } => {
+                vec![("stride", stride.to_string()), ("tight", tight.to_string())]
+            }
+            Self::ZeroExtent { width, height } => vec![("extent", format!("{width}x{height}"))],
+            Self::SpanExceedsAllocation { end, allocation } => {
+                vec![("end", end.to_string()), ("alloc", allocation.to_string())]
+            }
+            Self::PaddedRowUnreadable { row } => vec![("row", row.to_string())],
+            _ => Vec::new(),
+        }
+    }
+}
+
 fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -388,6 +477,7 @@ fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
         format_override,
         false,
     )
+    .ok()
     .map(|(bytes, _)| bytes)
 }
 
@@ -404,7 +494,7 @@ fn load_linear_texture_native_host<M: HostMemory + HostOps>(
     texture_ref: u32,
     level: u32,
     format_override: Option<u16>,
-) -> Option<(Vec<u8>, TexelLayout)> {
+) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
     load_linear_texture_impl(
         state,
         host,
@@ -455,38 +545,63 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     level: u32,
     format_override: Option<u16>,
     native_bgra8: bool,
-) -> Option<(Vec<u8>, TexelLayout)> {
-    let entry = objects::lookup_list_entry(state, host, task_id, texture_ref)?;
+) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal> {
+    use LinearLoadRefusal as R;
+    let entry =
+        objects::lookup_list_entry(state, host, task_id, texture_ref).ok_or(R::ObjectListMiss)?;
     if entry.object_type != OBJECT_TYPE_TEXTURE && entry.object_type != OBJECT_TYPE_TEXTURE_VARIANT
     {
-        return None;
+        return Err(R::NotATexture {
+            object_type: entry.object_type,
+        });
     }
-    let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
-    let tex = decode_texture_descriptor(&desc_bytes).ok()?;
+    let desc_bytes =
+        objects::read_descriptor(state, host, task_id, &entry).ok_or(R::DescriptorUnreadable)?;
+    let tex = decode_texture_descriptor(&desc_bytes).map_err(|_| R::DescriptorUndecodable)?;
     if !tex.has_pixel_format {
-        return None;
+        return Err(R::NoPixelFormat);
     }
     let base_fmt = tex.pixel_format;
-    let sample_fmt = effective_view_sample_format(base_fmt, format_override)?;
-    let (gva, layout) = tex.level_gva(level, state.page_shift)?;
+    let sample_fmt = effective_view_sample_format(base_fmt, format_override).ok_or(
+        R::ViewFormatBppMismatch {
+            base: base_fmt,
+            view: format_override.unwrap_or(base_fmt),
+        },
+    )?;
+    let (gva, layout) = tex
+        .level_gva(level, state.page_shift)
+        .ok_or(R::NoLevelGva { level })?;
     let w = layout.width;
     let h = layout.height;
     let bpr = layout.row_stride;
     if bpr > u32::MAX as u64 {
-        return None;
+        return Err(R::SizeOverflow);
     }
     let bpr_u32 = bpr as u32;
-    let tight = pixel_format::tight_row_bytes(w, base_fmt)?;
-    if bpr_u32 < tight || w == 0 || h == 0 {
-        return None;
+    let tight = pixel_format::tight_row_bytes(w, base_fmt)
+        .ok_or(R::FormatBppUnknown { format: base_fmt })?;
+    if w == 0 || h == 0 {
+        return Err(R::ZeroExtent {
+            width: w,
+            height: h,
+        });
+    }
+    if bpr_u32 < tight {
+        return Err(R::RowStrideBelowTight { stride: bpr, tight });
     }
     let need_rgba = (w as u64)
-        .checked_mul(h as u64)?
-        .checked_mul(RGBA8_BPP as u64)?;
-    let need_rgba = host_alloc_len(need_rgba)?;
-    let span = bpr.checked_mul(h as u64)?;
-    if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
-        return None;
+        .checked_mul(h as u64)
+        .and_then(|n| n.checked_mul(RGBA8_BPP as u64))
+        .and_then(host_alloc_len)
+        .ok_or(R::SizeOverflow)?;
+    // The extent actually read, not `bpr * h` — see `TextureLevelLayout::read_span`.
+    let span = layout.read_span(tight).ok_or(R::SizeOverflow)?;
+    let end = layout.offset.saturating_add(span);
+    if tex.allocation_size != 0 && end > tex.allocation_size {
+        return Err(R::SpanExceedsAllocation {
+            end,
+            allocation: tex.allocation_size,
+        });
     }
     // Deferred-writeback flush-on-access: the reads below walk raw task GVAs
     // and bypass the mapping-keyed hooks — land any resident-authoritative
@@ -498,32 +613,11 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // Safari source). Padded rows retain the conservative disjoint reads so we
     // never touch padding that the guest did not make readable.
     if bpr_u32 == tight {
-        let started = Instant::now();
         let (rgba, fmt) = load_tight_linear_rgba_with(w, h, sample_fmt, native_bgra8, |native| {
-            gva_mem::read_task_gva_fallback(
-                host,
-                &state.tasks,
-                task_id,
-                gva,
-                native,
-                state.page_shift,
-            )
-            .is_ok()
+            gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, native, state.page_shift)
+                .is_ok()
         })?;
-        if w >= 1280 && h >= 720 {
-            log_linear_sample_read(
-                task_id,
-                texture_ref,
-                gva,
-                w,
-                h,
-                bpr,
-                "bulk_tight",
-                1,
-                started.elapsed().as_micros() as u64,
-            );
-        }
-        return Some((rgba, fmt));
+        return Ok((rgba, fmt));
     }
     // Padded rows. When the source bytes are already in the final upload order
     // (RGBA8 always; BGRA8 under a native upload) AND the guest rows are 4-byte
@@ -531,46 +625,43 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
     // intermediate row buffer, no per-row convert/swizzle pass. This is the
     // Safari-scroll fallback hot path (`lin_guest_fb`), so the elided convert
     // pass is a full second walk over the sampled bytes off the drain worker.
-    let tight_4bpp = tight as u64 == (w as u64).checked_mul(RGBA8_BPP as u64)?;
+    let tight_4bpp = tight as u64
+        == (w as u64)
+            .checked_mul(RGBA8_BPP as u64)
+            .ok_or(R::SizeOverflow)?;
     if let Some(fmt) = linear_native_upload_format(sample_fmt, native_bgra8).filter(|_| tight_4bpp)
     {
         let row_bytes = tight as usize;
         let mut rgba = vec![0u8; need_rgba];
-        let started = Instant::now();
         for y in 0..h {
-            let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
-            let dst_off = (y as usize).checked_mul(row_bytes)?;
-            gva_mem::read_task_gva_fallback(
+            let row_gva = (y as u64)
+                .checked_mul(bpr)
+                .and_then(|off| gva.checked_add(off))
+                .ok_or(R::SizeOverflow)?;
+            let dst_off = (y as usize).checked_mul(row_bytes).ok_or(R::SizeOverflow)?;
+            let dst = rgba
+                .get_mut(dst_off..dst_off + row_bytes)
+                .ok_or(R::SizeOverflow)?;
+            gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
                 task_id,
                 row_gva,
-                rgba.get_mut(dst_off..dst_off + row_bytes)?,
+                dst,
                 state.page_shift,
             )
-            .ok()?;
+            .map_err(|_| R::PaddedRowUnreadable { row: y })?;
         }
-        if w >= 1280 && h >= 720 {
-            log_linear_sample_read(
-                task_id,
-                texture_ref,
-                gva,
-                w,
-                h,
-                bpr,
-                "row_padded_native",
-                h,
-                started.elapsed().as_micros() as u64,
-            );
-        }
-        return Some((rgba, fmt));
+        return Ok((rgba, fmt));
     }
     let mut rgba = vec![0u8; need_rgba];
     let mut row = vec![0u8; tight as usize];
-    let started = Instant::now();
     for y in 0..h {
-        let row_gva = gva.checked_add((y as u64).checked_mul(bpr)?)?;
-        gva_mem::read_task_gva_fallback(
+        let row_gva = (y as u64)
+            .checked_mul(bpr)
+            .and_then(|off| gva.checked_add(off))
+            .ok_or(R::SizeOverflow)?;
+        gva_mem::read_task_gva_by_id(
             host,
             &state.tasks,
             task_id,
@@ -578,26 +669,13 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
             &mut row,
             state.page_shift,
         )
-        .ok()?;
+        .map_err(|_| R::PaddedRowUnreadable { row: y })?;
         let dst_off = (y as usize) * (w as usize) * 4;
         if !pixel_format::convert_row_to_rgba8(sample_fmt, &row, w, &mut rgba[dst_off..]) {
-            return None;
+            return Err(R::RowConvertUnsupported { format: sample_fmt });
         }
     }
-    if w >= 1280 && h >= 720 {
-        log_linear_sample_read(
-            task_id,
-            texture_ref,
-            gva,
-            w,
-            h,
-            bpr,
-            "row_padded",
-            h,
-            started.elapsed().as_micros() as u64,
-        );
-    }
-    Some((rgba, TexelLayout::Rgba8))
+    Ok((rgba, TexelLayout::Rgba8))
 }
 
 fn load_tight_linear_rgba_with<F>(
@@ -606,21 +684,26 @@ fn load_tight_linear_rgba_with<F>(
     sample_format: u16,
     native_bgra8: bool,
     mut read: F,
-) -> Option<(Vec<u8>, TexelLayout)>
+) -> Result<(Vec<u8>, TexelLayout), LinearLoadRefusal>
 where
     F: FnMut(&mut [u8]) -> bool,
 {
-    let tight = pixel_format::tight_row_bytes(width, sample_format)?;
+    use LinearLoadRefusal as R;
+    let tight = pixel_format::tight_row_bytes(width, sample_format).ok_or(R::FormatBppUnknown {
+        format: sample_format,
+    })?;
     let native_len = (tight as u64)
         .checked_mul(height as u64)
-        .and_then(host_alloc_len)?;
-    let rgba_stride = width.checked_mul(RGBA8_BPP)?;
+        .and_then(host_alloc_len)
+        .ok_or(R::SizeOverflow)?;
+    let rgba_stride = width.checked_mul(RGBA8_BPP).ok_or(R::SizeOverflow)?;
     let rgba_len = (rgba_stride as u64)
         .checked_mul(height as u64)
-        .and_then(host_alloc_len)?;
+        .and_then(host_alloc_len)
+        .ok_or(R::SizeOverflow)?;
     let mut native = vec![0u8; native_len];
     if !read(&mut native) {
-        return None;
+        return Err(R::TightImageUnreadable);
     }
     // The compositor's common BGRA8/RGBA8 sources already have the output
     // allocation size. Convert them in place so the bulk page walk does not
@@ -632,7 +715,7 @@ where
         match pixel_format::sampled_class(sample_format) {
             Some(pixel_format::SampledClass::Rgba8Unorm) => {
                 note_srgb_upload_downgrade(srgb_census::site::TIGHT_LINEAR_LOAD, sample_format);
-                return Some((native, TexelLayout::Rgba8));
+                return Ok((native, TexelLayout::Rgba8));
             }
             Some(pixel_format::SampledClass::Bgra8Unorm) => {
                 note_srgb_upload_downgrade(srgb_census::site::TIGHT_LINEAR_LOAD, sample_format);
@@ -640,47 +723,32 @@ where
                     // Upload the guest's native BGRA8 order; the engine binds a
                     // BGRA8 image and the sampler swizzles in hardware. Elides
                     // the full-image CPU channel-swap pass over the read bytes.
-                    return Some((native, TexelLayout::Bgra8));
+                    return Ok((native, TexelLayout::Bgra8));
                 }
                 for pixel in native.chunks_exact_mut(RGBA8_BPP as usize) {
                     pixel.swap(0, 2);
                 }
-                return Some((native, TexelLayout::Rgba8));
+                return Ok((native, TexelLayout::Rgba8));
             }
             _ => {}
         }
     }
     let mut rgba = vec![0u8; rgba_len];
     for y in 0..height as usize {
-        let src_off = y.checked_mul(tight as usize)?;
-        let dst_off = y.checked_mul(rgba_stride as usize)?;
+        let src_off = y.checked_mul(tight as usize).ok_or(R::SizeOverflow)?;
+        let dst_off = y.checked_mul(rgba_stride as usize).ok_or(R::SizeOverflow)?;
         if !pixel_format::convert_row_to_rgba8(
             sample_format,
             &native[src_off..src_off + tight as usize],
             width,
             &mut rgba[dst_off..dst_off + rgba_stride as usize],
         ) {
-            return None;
+            return Err(R::RowConvertUnsupported {
+                format: sample_format,
+            });
         }
     }
-    Some((rgba, TexelLayout::Rgba8))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_linear_sample_read(
-    task_id: u32,
-    texture_ref: u32,
-    gva: u64,
-    width: u32,
-    height: u32,
-    row_stride: u64,
-    mode: &str,
-    calls: u32,
-    total_us: u64,
-) {
-    crate::observe::off(format!(
-        "linear_sample_read mode={mode} task={task_id} ref={texture_ref} gva={gva:#x} {width}x{height} bpr={row_stride} calls={calls} total_us={total_us}"
-    ));
+    Ok((rgba, TexelLayout::Rgba8))
 }
 
 #[cfg(test)]
@@ -712,9 +780,73 @@ mod texture_view_split_tests {
         .is_none());
         assert!(effective_view_sample_format(0, Some(MTL_FORMAT_RGBA8_UNORM)).is_none());
     }
-}
 
-#[allow(dead_code)]
-fn _ld32_keep(v: &[u8]) -> u32 {
-    ld32(v)
+    /// The point of typing this refusal is that the sink can tell the fifteen
+    /// checks apart. Two sharing a slug would put them back behind one label —
+    /// which is the state this replaced, where all fifteen printed
+    /// `reason=guest_load`.
+    #[test]
+    fn every_linear_load_refusal_has_its_own_slug() {
+        use crate::observe::Decline;
+        let all = [
+            LinearLoadRefusal::ObjectListMiss,
+            LinearLoadRefusal::NotATexture { object_type: 9 },
+            LinearLoadRefusal::DescriptorUnreadable,
+            LinearLoadRefusal::DescriptorUndecodable,
+            LinearLoadRefusal::NoPixelFormat,
+            LinearLoadRefusal::ViewFormatBppMismatch { base: 1, view: 2 },
+            LinearLoadRefusal::NoLevelGva { level: 3 },
+            LinearLoadRefusal::FormatBppUnknown { format: 4 },
+            LinearLoadRefusal::RowStrideBelowTight {
+                stride: 5,
+                tight: 6,
+            },
+            LinearLoadRefusal::ZeroExtent {
+                width: 0,
+                height: 7,
+            },
+            LinearLoadRefusal::SizeOverflow,
+            LinearLoadRefusal::SpanExceedsAllocation {
+                end: 8,
+                allocation: 9,
+            },
+            LinearLoadRefusal::TightImageUnreadable,
+            LinearLoadRefusal::PaddedRowUnreadable { row: 11 },
+            LinearLoadRefusal::RowConvertUnsupported { format: 12 },
+        ];
+        let mut slugs: Vec<&str> = all.iter().map(|r| r.slug()).collect();
+        let before = slugs.len();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(before, slugs.len(), "two refusals share a slug: {slugs:?}");
+        // Every one that carries data must print it, or the slug names the
+        // check without saying what it saw.
+        for r in &all {
+            let carries_data = !matches!(
+                r,
+                LinearLoadRefusal::ObjectListMiss
+                    | LinearLoadRefusal::DescriptorUnreadable
+                    | LinearLoadRefusal::DescriptorUndecodable
+                    | LinearLoadRefusal::NoPixelFormat
+                    | LinearLoadRefusal::SizeOverflow
+                    | LinearLoadRefusal::TightImageUnreadable
+            );
+            assert_eq!(
+                carries_data,
+                !r.fields().is_empty(),
+                "{} disagrees with itself about carrying fields",
+                r.slug()
+            );
+        }
+    }
+
+    /// A padded-row refusal names the first row that failed, which is what
+    /// separates "the allocation is not mapped at all" from "it is mapped up to
+    /// row N" — different bugs with different fixes.
+    #[test]
+    fn a_padded_row_refusal_names_the_row() {
+        use crate::observe::Decline;
+        let r = LinearLoadRefusal::PaddedRowUnreadable { row: 11 };
+        assert_eq!(r.fields(), vec![("row", "11".to_string())]);
+    }
 }

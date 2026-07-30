@@ -11,9 +11,7 @@ use crate::backend::metal::hash::{hash_bytes, hash_u64};
 use crate::backend::metal::raw_metal::{
     command_buffer_error_description, render_reflection_sampler_mask, set_line_width,
 };
-use crate::backend::metal::runtime::{
-    new_buffer_from_host, system_device, take_native_color_format, thread_queue,
-};
+use crate::backend::metal::runtime::{new_buffer_from_host, system_device, thread_queue};
 use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
 use crate::backend::metal::util::{
     bytes_of, clear_err, f32_from_bits, image_len, rgba_len, sampler_index, set_err, texture_index,
@@ -483,11 +481,14 @@ fn make_vertex_descriptor(
     }
 }
 
-/// Color RT slot + format + optional per-slot blend for PSO keying.
+/// Color RT slot + format + per-slot blend and write mask for PSO keying.
 pub struct ColorRtKey {
     pub slot: u32,
     pub pixel_format: u32,
     pub blend: Option<ReimsVgpuBlendState>,
+    /// `MTLColorWriteMask` bits. Not inside `blend`, because the mask applies
+    /// to an unblended attachment too.
+    pub write_mask: u32,
 }
 
 fn fill_render_pso_key(
@@ -556,6 +557,10 @@ fn fill_render_pso_key(
             key.color_blend_dst_alpha[i] = key.blend_dst_alpha;
             key.color_blend_op_alpha[i] = key.blend_op_alpha;
         }
+        // Outside both blend arms: `MTLColorWriteMask` is independent of
+        // `blendingEnabled`, so a masked attachment that does not blend still
+        // has to leave its unwritten channels alone.
+        key.color_write_mask[i] = rt.write_mask;
     }
     key.depth_pixel_format = depth_pixel_format;
     key.stencil_pixel_format = stencil_pixel_format;
@@ -595,6 +600,7 @@ fn fill_render_pso_key(
         h = hash_u64(h, key.color_blend_src_alpha[i] as u64);
         h = hash_u64(h, key.color_blend_dst_alpha[i] as u64);
         h = hash_u64(h, key.color_blend_op_alpha[i] as u64);
+        h = hash_u64(h, key.color_write_mask[i] as u64);
     }
     h = hash_u64(h, key.depth_pixel_format as u64);
     h = hash_u64(h, key.stencil_pixel_format as u64);
@@ -644,6 +650,13 @@ fn get_render_pipeline_state(
             if !rc.is_ok() {
                 return Err(rc);
             }
+            // Unconditional, unlike the blend above: the guest's mask governs
+            // an unblended attachment too. `MTLColorWriteMask`'s bit order is
+            // Metal's own here — no exchange, unlike the Vulkan arm — because
+            // this descriptor is the same API the value was serialized from.
+            color.set_write_mask(MTLColorWriteMask::from_bits_truncate(
+                key.color_write_mask[i] as NSUInteger,
+            ));
         }
     }
     if key.depth_pixel_format != 0 {
@@ -717,6 +730,7 @@ impl RenderPsoKeyClone for RenderPsoKey {
             color_blend_src_alpha: self.color_blend_src_alpha,
             color_blend_dst_alpha: self.color_blend_dst_alpha,
             color_blend_op_alpha: self.color_blend_op_alpha,
+            color_write_mask: self.color_write_mask,
             depth_pixel_format: self.depth_pixel_format,
             stencil_pixel_format: self.stencil_pixel_format,
         }
@@ -1332,24 +1346,22 @@ pub struct ColorRt<'a> {
     pub clear_g: f64,
     pub clear_b: f64,
     pub clear_a: f64,
-    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). With a guest-backed
-    /// attachment (`guest_tex`) this is honored verbatim — Metal Load reads
-    /// the guest surface bytes, exactly the Apple unified-memory semantics.
-    /// For ephemeral host RTs (GVA linear targets), Load requires a CPU seed
-    /// (archive `reims_vgpu_backend_metal`: NULL seed → Clear invent).
+    /// Guest MTL loadAction (0=DontCare, 1=Load, 2=Clear). Every color target
+    /// is an ephemeral host RT, so Load requires a CPU seed (archive
+    /// `reims_vgpu_backend_metal`: NULL seed → Clear invent).
     pub load_action: u32,
     /// Per-slot blend from pipeline color-attachment section (overrides global for this RT).
     pub blend: Option<ReimsVgpuBlendState>,
-    /// Guest-memory-backed attachment (unified memory): the texture aliases
-    /// the mapping's guest pages, so Load/Store need no seed/readback and the
-    /// Store result is guest-visible when the command buffer completes.
-    pub guest_tex: Option<Texture>,
+    /// Per-slot `MTLColorWriteMask` from the same section. `0xf` (all) is the
+    /// value for an attachment whose entry omits the tag.
+    pub write_mask: u32,
 }
 
-/// Resolve Metal loadAction for an **ephemeral host RT** color attachment
-/// (GVA linear targets). Archive `reims_vgpu_backend_metal` (fresh Shared RT every
-/// job): `loadAction = target_rgba8 ? Load : Clear` — guest Load without a
-/// CPU seed Clear-invents. Guest-backed attachments bypass this entirely.
+/// Resolve Metal loadAction for a color attachment. Archive
+/// `reims_vgpu_backend_metal` (fresh Shared RT every job):
+/// `loadAction = target_rgba8 ? Load : Clear` — guest Load without a CPU seed
+/// Clear-invents. This is now every color attachment: the guest-backed
+/// alias that used to honor `load_action` verbatim is gone.
 pub(crate) fn color_rt_load_action(guest_load: u32, has_seed: bool) -> u32 {
     use crate::backend::metal::abi::{
         REIMS_VGPU_MTL_LOAD_ACTION_CLEAR, REIMS_VGPU_MTL_LOAD_ACTION_DONT_CARE,
@@ -1447,97 +1459,6 @@ mod attachment_decline_tests {
             "metal_attachment_test reason=metal_render_stencil_store_action_unsupported class=args store_action=4294967295"
         );
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn render_core(
-    vert_mtlb: &[u8],
-    frag_mtlb: &[u8],
-    width: u32,
-    height: u32,
-    vertex_count: usize,
-    first_vertex: usize,
-    instance_count: usize,
-    base_instance: usize,
-    primitive_type: u32,
-    primitive_indirect: Option<&ReimsVgpuPrimitiveIndirectDraw>,
-    indexed: Option<&ReimsVgpuIndexedDraw>,
-    attrs: &[ReimsVgpuVertexAttr],
-    buffers: &[ReimsVgpuBuffer],
-    frag_buffers: &[ReimsVgpuBuffer],
-    vertex_images: &[ReimsVgpuSampledImage],
-    vertex_samplers: &[ReimsVgpuSampler],
-    images: &[ReimsVgpuSampledImage],
-    samplers: &[ReimsVgpuSampler],
-    viewports: &[ReimsVgpuViewport],
-    scissors: &[ReimsVgpuScissor],
-    raster: Option<&ReimsVgpuRasterState>,
-    depth_bias: Option<&ReimsVgpuDepthBiasState>,
-    depth_stencil: Option<&ReimsVgpuDepthStencilState>,
-    stencil_reference: Option<&ReimsVgpuStencilReferenceState>,
-    depth_attachment: Option<&mut ReimsVgpuDepthAttachment>,
-    stencil_attachment: Option<&mut ReimsVgpuStencilAttachment>,
-    blend: Option<&ReimsVgpuBlendState>,
-    mut color_pixel_format: u32,
-    target_rgba8: Option<&[u8]>,
-    out_rgba: Option<&mut [u8]>,
-    err: ErrOut<'_>,
-) -> Status {
-    if color_pixel_format == 0 {
-        let tl = take_native_color_format();
-        if tl != 0 {
-            color_pixel_format = tl;
-        }
-    }
-    let mut single = ColorRt {
-        slot: 0,
-        pixel_format: color_pixel_format,
-        seed_rgba8: target_rgba8,
-        out_rgba8: out_rgba,
-        clear_r: 0.0,
-        clear_g: 0.0,
-        clear_b: 0.0,
-        clear_a: 0.0,
-        // Single-RT helper: Load when seeded, else Clear (legacy callers).
-        load_action: if target_rgba8.is_some() {
-            crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD
-        } else {
-            crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_CLEAR
-        },
-        blend: blend.copied(),
-        guest_tex: None,
-    };
-    render_core_mrt(
-        vert_mtlb,
-        frag_mtlb,
-        width,
-        height,
-        vertex_count,
-        first_vertex,
-        instance_count,
-        base_instance,
-        primitive_type,
-        primitive_indirect,
-        indexed,
-        attrs,
-        buffers,
-        frag_buffers,
-        vertex_images,
-        vertex_samplers,
-        images,
-        samplers,
-        viewports,
-        scissors,
-        raster,
-        depth_bias,
-        depth_stencil,
-        stencil_reference,
-        depth_attachment,
-        stencil_attachment,
-        blend,
-        std::slice::from_mut(&mut single),
-        err,
-    )
 }
 
 /// Multi-render-target encode: one Metal pass with color attachments at given slots.
@@ -1728,6 +1649,7 @@ pub fn render_core_mrt(
                     blend.filter(|b| b.enable != 0).copied()
                 }
             }),
+            write_mask: c.write_mask,
         })
         .collect();
     let pso_key = fill_render_pso_key(
@@ -1761,64 +1683,50 @@ pub fn render_core_mrt(
     };
 
     let mut retained_tex: Vec<Texture> = Vec::new();
-    // (slot, tex, bpp, guest_backed)
-    let mut color_textures: Vec<(u32, Texture, usize, bool)> = Vec::new();
+    // (slot, tex, bpp)
+    let mut color_textures: Vec<(u32, Texture, usize)> = Vec::new();
     for (i, c) in colors.iter().enumerate() {
         let (slot, _fmt_u32, bpp, mtl_fmt) = color_meta[i];
-        let (target, guest_backed) = if let Some(g) = &c.guest_tex {
-            // Unified memory: the attachment IS the guest surface. No host
-            // copy exists, so no seed upload and no readback.
-            (g.clone(), true)
-        } else {
-            let target_descriptor = TextureDescriptor::new();
-            target_descriptor.set_texture_type(MTLTextureType::D2);
-            target_descriptor.set_pixel_format(mtl_fmt);
-            target_descriptor.set_width(width as u64);
-            target_descriptor.set_height(height as u64);
-            target_descriptor.set_storage_mode(MTLStorageMode::Shared);
-            target_descriptor
-                .set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-            let target = device.new_texture(&target_descriptor);
-            // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
-            // (fresh RT every job; NULL seed → Clear invent below).
-            if let Some(seed) = c.seed_rgba8 {
-                let region = MTLRegion {
-                    origin: MTLOrigin { x: 0, y: 0, z: 0 },
-                    size: MTLSize {
-                        width: width as u64,
-                        height: height as u64,
-                        depth: 1,
-                    },
-                };
-                unsafe {
-                    target.replace_region(
-                        region,
-                        0,
-                        seed.as_ptr() as *const _,
-                        (width as u64) * (bpp as u64),
-                    );
-                }
+        let target_descriptor = TextureDescriptor::new();
+        target_descriptor.set_texture_type(MTLTextureType::D2);
+        target_descriptor.set_pixel_format(mtl_fmt);
+        target_descriptor.set_width(width as u64);
+        target_descriptor.set_height(height as u64);
+        target_descriptor.set_storage_mode(MTLStorageMode::Shared);
+        target_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let target = device.new_texture(&target_descriptor);
+        // Archive reims_vgpu_backend_metal: upload target_rgba8 before Load
+        // (fresh RT every job; NULL seed → Clear invent below).
+        if let Some(seed) = c.seed_rgba8 {
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                target.replace_region(
+                    region,
+                    0,
+                    seed.as_ptr() as *const _,
+                    (width as u64) * (bpp as u64),
+                );
             }
-            (target, false)
-        };
+        }
         retained_tex.push(target.clone());
-        color_textures.push((slot, target, bpp, guest_backed));
+        color_textures.push((slot, target, bpp));
     }
     let mut retained_buf: Vec<Buffer> = Vec::new();
 
     let pass = RenderPassDescriptor::new();
     for (i, c) in colors.iter().enumerate() {
-        let (slot, target, _, guest_backed) = &color_textures[i];
+        let (slot, target, _) = &color_textures[i];
         if let Some(ca) = pass.color_attachments().object_at(*slot as u64) {
             ca.set_texture(Some(target));
-            // Guest-backed attachment: honor the guest loadAction verbatim —
-            // Metal Load reads the guest surface bytes (unified memory).
             // Ephemeral host RT: archive Load+seed / Clear invent.
-            let resolved = if *guest_backed {
-                c.load_action
-            } else {
-                color_rt_load_action(c.load_action, c.seed_rgba8.is_some())
-            };
+            let resolved = color_rt_load_action(c.load_action, c.seed_rgba8.is_some());
             let mtl_load = match resolved {
                 x if x == crate::backend::metal::abi::REIMS_VGPU_MTL_LOAD_ACTION_LOAD => {
                     MTLLoadAction::Load
@@ -2111,12 +2019,8 @@ pub fn render_core_mrt(
             if out.is_empty() {
                 continue;
             }
-            let (slot, target, bpp, guest_backed) = &color_textures[i];
+            let (slot, target, bpp) = &color_textures[i];
             let _ = slot;
-            if *guest_backed {
-                // Unified memory: the Store already landed in guest pages.
-                continue;
-            }
             let target_len = (width as usize)
                 .saturating_mul(height as usize)
                 .saturating_mul(*bpp);

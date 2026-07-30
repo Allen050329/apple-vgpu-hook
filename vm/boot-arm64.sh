@@ -125,6 +125,20 @@ die() { echo "boot-arm64.sh: $*" >&2; exit 1; }
 # translate, and QEMU inherits this script's PATH — resolve them here so a
 # missing toolchain fails now, not at the guest's first shader.
 require_shader_toolchain() {
+  # Homebrew keeps llvm keg-only, so a stock macOS box HAS llvm-dis and does
+  # not have it on PATH — the gate below would refuse a host that is in fact
+  # fully provisioned. Adopt it instead of refusing, and resolve it through
+  # `brew --prefix` rather than a hardcoded path: the prefix is /opt/homebrew
+  # on Apple Silicon and /usr/local on Intel. Prepending is the operative part
+  # rather than merely locating it, because QEMU inherits this PATH and
+  # metal2vulkan spawns the tool from it on every uncached translate.
+  if ! command -v llvm-dis >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+    local llvm_prefix
+    llvm_prefix="$(brew --prefix llvm 2>/dev/null || true)"
+    if [ -n "$llvm_prefix" ] && [ -x "$llvm_prefix/bin/llvm-dis" ]; then
+      export PATH="$llvm_prefix/bin:$PATH"
+    fi
+  fi
   command -v llvm-dis >/dev/null 2>&1 || die \
     "llvm-dis not found in PATH (install the LLVM tools, e.g. brew install llvm, then put \"\$(brew --prefix llvm)/bin\" on PATH)"
   command -v spirv-val >/dev/null 2>&1 || die \
@@ -144,24 +158,6 @@ build_reims_vgpu_efi() {
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
 }
 
-build_reims_vgpu_standalone() {
-  local backend="$1"
-  case "$backend" in
-    metal)
-      echo "boot-arm64.sh: building reims-vgpu crate (backend-metal) ..."
-      (cd "" && cargo build --release -p reims-vgpu --features backend-metal) \
-        || die "reims-vgpu build failed"
-      ;;
-    vulkan)
-      echo "boot-arm64.sh: building reims-vgpu crate (backend-vulkan,host-window) ..."
-      (cd "" && cargo build --release -p reims-vgpu \
-        --no-default-features --features backend-vulkan,host-window) \
-        || die "reims-vgpu build failed"
-      ;;
-    *) die "unknown REIMS_VGPU_BACKEND: $backend (metal | vulkan)" ;;
-  esac
-}
-
 require_shader_toolchain
 ensure_rust_tools
 build_reims_vgpu_efi
@@ -176,7 +172,11 @@ if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
   "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target aarch64 --backend "$REIMS_VGPU_BACKEND" \
     || die "qemu-build failed"
 else
-  build_reims_vgpu_standalone "$REIMS_VGPU_BACKEND"
+  # See the matching note in boot-x86.sh: an overridden QEMU_BIN already has the
+  # reims-vgpu staticlib linked into it, so rebuilding the crate cannot affect
+  # this boot. The build this replaced was `(cd "" && cargo build ...)`, a null
+  # `cd` that failed outright and made a pinned QEMU_BIN unbootable.
+  echo "boot-arm64.sh: QEMU_BIN pinned ($QEMU_BIN) — not building; the staticlib is already linked in"
 fi
 
 [ -x "$QEMU_BIN" ] || die "QEMU not available: $QEMU_BIN"
@@ -330,7 +330,17 @@ echo "boot-arm64.sh: ssh → localhost:$SSH_PORT   serial → $SERIAL_LOG   qmp 
 
 # Discard the per-boot working clone. Never deletes the provisioned master (used
 # write-through during bootstrap), only a RUN_DIR clone.
-discard_clone() { [ "${IS_CLONE:-1}" -eq 1 ] && rm -f "$DISK" "$AUX"; rm -f "$QMP_SOCK" "$RUN_DIR/qmp.sock"; }
+discard_clone() {
+  [ "${IS_CLONE:-1}" -eq 1 ] && rm -f "$DISK" "$AUX"
+  rm -f "$QMP_SOCK"
+  # Only drop the shared alias while it still names THIS boot's socket — same
+  # guard as boot-x86.sh. A dying instance that deletes the live instance's
+  # symlink makes the next driver run fail on a missing socket partway through,
+  # which is indistinguishable from a guest defect in the captures it leaves.
+  if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
+    rm -f "$RUN_DIR/qmp.sock"
+  fi
+}
 
 promote_to_snapshot() {
   # Save this boot's (modified) disk/aux as a NEW immutable snapshot and repoint

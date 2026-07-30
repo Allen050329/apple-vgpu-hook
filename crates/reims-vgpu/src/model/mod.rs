@@ -10,17 +10,14 @@ mod state;
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
-    ChannelRing, ChannelStamps, CompositorOutputMember, ComputeStorageResidencyKey, CursorState,
-    DeviceId, DeviceState, DisplayHandshake, ExecAggStats, ExecFault, ExecPacketSample, FailEvent,
-    FrameStats, GfxRegs, GuestLinearMemo, GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry,
-    GvaHostView, HostLinearTexture, HostSurface, IosfcRegs, LinearSampledMemo, MapperCapture,
-    MappingEntry, MmioWindow, ObjectEntry, PacketFault, PaintSrc, PendingStats, PendingWork,
-    PresentState, RenderDeferredEntry, RenderDeferredKey, StampSlot, SurfaceWriteKind, TaskEntry,
-    TaskMapSpan, TrancheStats, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
-    FENCE_DOMAIN_RENDER,
+    ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
+    DeviceState, DisplayHandshake, ExecFault, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
+    FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
+    GuestRunMemoEntry, GuestRunSpan, GvaDeferredEntry, GvaHostView, HostLinearTexture, HostSurface,
+    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, PacketFault, PaintSrc,
+    PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
+    TaskEntry, TaskMapSpan, WriteGate,
 };
-#[cfg(test)]
-pub(crate) use state::{TILE_GEN_GRID_H, TILE_GEN_GRID_W};
 
 use crate::backend::Backend;
 use crate::runtime::{self, host::HostOps};
@@ -94,38 +91,13 @@ impl<B: Backend> Device<B> {
         runtime::mmio::iosfc_write(&mut self.state, host, offset, data, size);
     }
 
-    /// BH body: drain pending work, then bind type-11 texture refs onto the backend.
+    /// BH body: drain pending work.
+    ///
+    /// `state.texture_to_mapping` is the authoritative type-11 ref → mapping
+    /// table and is read directly by `runtime/metal_draw`. This used to also
+    /// copy it into the backend on every drain, into a map nothing ever read.
     pub fn drain<H: runtime::host::HostMemory + HostOps>(&mut self, host: &mut H) {
         runtime::drain::drain_pending(&mut self.state, host);
-        for (&(_task, ref_), &mapping_id) in &self.state.texture_to_mapping {
-            self.backend.bind_texture_mapping(ref_, mapping_id);
-        }
-    }
-
-    /// Bind texture object ref → mapping_id on the backend (type-11).
-    pub fn bind_type11_texture(&mut self, ref_: u32, mapping_id: u32) {
-        self.backend.bind_texture_mapping(ref_, mapping_id);
-    }
-
-    /// Write BGRA8 into a guest mapping (contig HostOps view) and bump generation.
-    pub fn write_mapping_bgra8<H: runtime::host::HostMemory + runtime::host::HostOps>(
-        &mut self,
-        host: &mut H,
-        mapping_id: u32,
-        src: &[u8],
-        src_stride: u32,
-        width: u32,
-        height: u32,
-    ) -> bool {
-        runtime::mapping_write::write_bgra8(
-            &mut self.state,
-            host,
-            mapping_id,
-            src,
-            src_stride,
-            width,
-            height,
-        )
     }
 
     pub fn fails(&self) -> &[FailEvent] {
@@ -141,66 +113,9 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
     use crate::runtime::{
-        complete_async_job, enqueue_async_stamp, FakeHost, HostActionKind, HostMemory,
+        FakeHost, HostActionKind, HostMemory, complete_async_job, enqueue_async_stamp_surface,
     };
 
-    /// TrancheStats folds per-draw deltas cumulatively and `take` resets so a
-    /// tranche's breakdown never leaks into the next (the device_drain contract).
-    #[test]
-    fn tranche_stats_accumulate_and_take_reset() {
-        let mut t = TrancheStats::default();
-        t.add(TrancheStats {
-            draws: 1,
-            draw_total_us: 100,
-            setup_tex_us: 40,
-            engine_us: 30,
-            wait_us: 10,
-            reupload_bytes: 2048,
-            ..Default::default()
-        });
-        t.add(TrancheStats {
-            draws: 1,
-            draw_total_us: 50,
-            setup_tex_us: 5,
-            engine_us: 20,
-            reupload_bytes: 1024,
-            ..Default::default()
-        });
-        assert_eq!(t.draws, 2);
-        assert_eq!(t.draw_total_us, 150);
-        assert_eq!(t.setup_tex_us, 45);
-        assert_eq!(t.engine_us, 50);
-        assert_eq!(t.wait_us, 10);
-        assert_eq!(t.reupload_bytes, 3072);
-        // Non-draw classes accumulate via their own note_* entry points.
-        t.note_compute(300);
-        t.note_compute(200);
-        t.note_store(1000);
-        t.note_capture(700);
-        t.note_capture(300);
-        assert_eq!(t.compute_n, 2);
-        assert_eq!(t.compute_us, 500);
-        assert_eq!(t.store_n, 1);
-        assert_eq!(t.store_us, 1000);
-        assert_eq!(t.capture_n, 2);
-        assert_eq!(t.capture_us, 1000);
-        let taken = t.take();
-        assert_eq!(taken.compute_us, 500);
-        assert_eq!(taken.store_us, 1000);
-        assert_eq!(taken.capture_us, 1000);
-        assert_eq!(t.compute_us, 0);
-        assert_eq!(t.store_n, 0);
-        assert_eq!(t.capture_n, 0);
-        assert_eq!(taken.draws, 2);
-        assert_eq!(taken.draw_total_us, 150);
-        // After take the live accumulator is empty — no leak into the next tranche.
-        assert_eq!(t.draws, 0);
-        assert_eq!(t.draw_total_us, 0);
-        assert_eq!(t.setup_tex_us, 0);
-    }
-
-    /// x86 stamp page is 4 KiB → 1024 slots; arm 16 KiB → 4096. Indices that fit
-    /// the arm page but not x86 must be rejected on x86 (wild-write class).
     #[test]
     fn stamp_slot_offset_respects_guest_page_size() {
         assert_eq!(stamp_slot_offset(0, PAGE_SIZE_X86), Some(0));
@@ -392,7 +307,7 @@ mod tests {
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
         let ch = 1u32;
-        let job = enqueue_async_stamp(&mut d.state, ch, ch, 5).unwrap();
+        let job = enqueue_async_stamp_surface(&mut d.state, ch, ch, 5, 0).unwrap();
         d.state.child_stamps[ch as usize].push(StampSlot {
             stamp_index: ch,
             stamp_value: 6,
@@ -433,27 +348,11 @@ mod tests {
         let mut d = dev();
         assert!(d.state.define_task(2, 0x2000, 9));
         assert!(d.state.set_object_list(2, 3, 64));
-        assert!(d.state.insert_object(
-            2,
-            10,
-            ObjectEntry {
-                object_type: 11,
-                desc_gva: 0x1000,
-                desc_len: 0x20,
-            },
-        ));
-        assert_eq!(d.state.objects.get(&(2, 10)).unwrap().object_type, 11);
+        assert!(d.state.insert_object(2, 10));
+        assert!(d.state.objects.contains(&(2, 10)));
         assert!(d.state.delete_object(2, 10));
-        assert!(!d.state.objects.contains_key(&(2, 10)));
-        d.state.insert_object(
-            2,
-            1,
-            ObjectEntry {
-                object_type: 2,
-                desc_gva: 0,
-                desc_len: 0,
-            },
-        );
+        assert!(!d.state.objects.contains(&(2, 10)));
+        d.state.insert_object(2, 1);
         d.state.define_task(2, 0x2000, 9);
         assert!(d.state.objects.is_empty());
     }

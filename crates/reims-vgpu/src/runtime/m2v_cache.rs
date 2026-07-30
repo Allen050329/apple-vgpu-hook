@@ -153,15 +153,7 @@ impl Decline for M2vCacheDecline {
     }
 }
 
-impl std::fmt::Display for M2vCacheDecline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reason={}", self.slug())?;
-        for (key, value) in self.fields() {
-            write!(f, " {key}={value}")?;
-        }
-        Ok(())
-    }
-}
+crate::observe::decline_display!(M2vCacheDecline);
 
 impl std::error::Error for M2vCacheDecline {}
 
@@ -611,11 +603,7 @@ fn spirv_uses_builtin(spv: &[u8], builtin: u32) -> bool {
     false
 }
 
-pub fn translate_cached(air: &[u8], stage: Stage, pipeline_ref: u32) -> M2vResult<Vec<u8>> {
-    translate_cached_reflected(air, stage, pipeline_ref).map(|s| s.spirv.clone())
-}
-
-/// Like [`translate_cached`] but returns the whole [`CachedShader`] (SPIR-V +
+/// Translate `air` for `stage`, returning the whole [`CachedShader`] (SPIR-V +
 /// reflection) as a shared handle, so a consumer reads stage-interface facts
 /// (texture shapes, vertex builtins, descriptor bindings) from the reflection
 /// instead of re-walking the emitted SPIR-V. The returned `Arc` is a clone of the
@@ -699,7 +687,7 @@ pub fn translate_cached_kernel_reflected(
                 let hits = c.hits;
                 let misses = c.misses;
                 drop(c);
-                // Verbose-gated (see `translate_cached`): a compute-kernel cache hit
+                // Verbose-gated (see `translate_cached_reflected`): a compute-kernel cache hit
                 // is the hot path and only carries a cumulative counter.
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
@@ -868,8 +856,7 @@ mod tests {
             );
             c.order.push(key);
         }
-        // The reflected variant returns the bytes plus the (empty) reflection; the
-        // thin `translate_cached` wrapper returns just the bytes. One hit total.
+        // One hit total, carrying the bytes plus the (empty) reflection.
         let shader = translate_cached_reflected(air, Stage::Vertex, 99).expect("hit");
         assert_eq!(shader.spirv, vec![0x03, 0x02, 0x23, 0x07]);
         assert!(shader.reflection.vertex_builtins.is_none());
@@ -916,7 +903,11 @@ mod tests {
         );
         assert!(ensure_cached_async(air, Stage::Fragment, 7));
         assert_eq!(
-            translate_cached(air, Stage::Fragment, 7).unwrap_err(),
+            // `.err()` rather than `unwrap_err()`: the success arm is an
+            // `Arc<CachedShader>`, which carries no `Debug`.
+            translate_cached_reflected(air, Stage::Fragment, 7)
+                .err()
+                .expect("a Failed entry translates to its decline"),
             M2vCacheDecline::FragmentTranslate {
                 detail: "synthetic failure".into()
             }
