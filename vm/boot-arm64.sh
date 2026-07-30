@@ -125,6 +125,20 @@ die() { echo "boot-arm64.sh: $*" >&2; exit 1; }
 # translate, and QEMU inherits this script's PATH — resolve them here so a
 # missing toolchain fails now, not at the guest's first shader.
 require_shader_toolchain() {
+  # Homebrew keeps llvm keg-only, so a stock macOS box HAS llvm-dis and does
+  # not have it on PATH — the gate below would refuse a host that is in fact
+  # fully provisioned. Adopt it instead of refusing, and resolve it through
+  # `brew --prefix` rather than a hardcoded path: the prefix is /opt/homebrew
+  # on Apple Silicon and /usr/local on Intel. Prepending is the operative part
+  # rather than merely locating it, because QEMU inherits this PATH and
+  # metal2vulkan spawns the tool from it on every uncached translate.
+  if ! command -v llvm-dis >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+    local llvm_prefix
+    llvm_prefix="$(brew --prefix llvm 2>/dev/null || true)"
+    if [ -n "$llvm_prefix" ] && [ -x "$llvm_prefix/bin/llvm-dis" ]; then
+      export PATH="$llvm_prefix/bin:$PATH"
+    fi
+  fi
   command -v llvm-dis >/dev/null 2>&1 || die \
     "llvm-dis not found in PATH (install the LLVM tools, e.g. brew install llvm, then put \"\$(brew --prefix llvm)/bin\" on PATH)"
   command -v spirv-val >/dev/null 2>&1 || die \
