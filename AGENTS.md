@@ -1280,6 +1280,34 @@ argument call took `icb/tests.rs` from 7824 lines to 8499; dropping one redundan
 under the limit took it to 7314. Same extraction, opposite sign. Run `rustfmt` on the file — by path,
 never bare `cargo fmt`, which reformats pre-existing drift crate-wide — and re-count.
 
+**But `rustfmt <path>` is not the safe half of that advice, and both of its failure modes are
+silent.** The rule above is right that `cargo fmt` is worse; it is wrong that by-path is contained.
+
+- **`rustfmt <path>` recurses into every `mod` the file declares.** Formatting
+  `backend/vulkan/engine/mod.rs` rewrote `types.rs`, `caches.rs`, `context.rs`, `exec.rs`,
+  `slab.rs` and `pools/mod.rs` — none of them named on the command line, all of them carrying
+  pre-existing drift that then landed in the commit as unrelated hunks.
+- **`rustfmt <path>` defaults to style edition 2015; this tree is formatted to 2024.** Nothing
+  errors. `rustfmt.toml` says `edition = "2021"`, so even `cargo fmt` disagrees with the tree, and
+  `cargo fmt -- --check` reports diffs in files nobody has touched. The visible symptom is an
+  `assert!(Struct { … }.method())` reflowing one way and back, and `use` lists reordering by case.
+
+Use `rustfmt --edition 2021 --style-edition 2024 <path>`, and then **read `git status` and the hunk
+list**, not just the files you meant to change. The check that catches it is one command:
+
+```sh
+git diff <baseline> -- <file> | grep '^@@'
+```
+
+One hunk per edit you made, or you are committing somebody else's reformatting. That check is what
+found this; a clean `cargo clippy`, a green 986-test suite and a PASS from `feature-matrix.sh` all
+passed with six unrelated files in the commit.
+
+And note the trap that hid it for two rounds: verifying the baseline by copying a file to `/tmp` and
+running `rustfmt --check` on the copy reports **zero diffs for every file**, because the copy has no
+sibling modules and rustfmt bails instead of formatting. A null result from an instrument that could
+not run is not a baseline — compare in a real checkout or a `git worktree`.
+
 ### A Random Victim Is A Memory-Corruption Signature, Not Seven Unrelated Bugs
 
 The guest panics, and every panic looks like somebody else's bug until you line them up. Across 351
@@ -2554,7 +2582,7 @@ grep traps:
 | bare `cache_miss` | 175 — **all `engine_delta`'s `sampled_cache_misses` field name** |
 | `deferred_flush_lost` | 1, `reason=map_generation_drift` — the guard doing its job |
 | `host_window_slate_end` | 1, `frames=567 covered=1` — the firmware-boot run, guest frame on screen throughout; **no uncovered `host_window_slate` line at all** |
-| `present_unbacked` | 1, `mid=4 gen=0 reason=never_stored` — the documented boot-time class |
+| `present_unbacked` | 1, `mid=4 gen=0 reason=never_stored` — the documented boot-time class (4 over the full 524 s run; **all four had a resident carrying them — see below**) |
 
 Byte order was checked on pixels, since no failure line can see it: the testufo stutter banner
 renders **orange**, hyperlinks **blue**, the "Problems?" text **red**.
@@ -2587,6 +2615,63 @@ One genuine contract mismatch is worth recording even though it is refuted as th
 cannot express 120 Hz at all. It errs fast, so it cannot starve the guest, which is why the steady
 125.0 reading exonerates it. Deriving the grid from `DISPLAY_REFRESH_HZ` in microseconds would be the
 principled form, and it needs a finer poll than 4 ms to be worth anything.
+
+### An Unbacked Present Is Only Black When Nothing Carries It
+
+**The goal-2 detector was measuring a witness the resident rail stopped maintaining, and saying so in
+a sentence it could not support. Fixed by `459a0c4`.** The line's slug and shape changed: greps for
+`present_unbacked … reason=never_stored` no longer match, and the reasons are now
+`present_backing_never_stored` / `present_backing_restaled` with a new `carried=` field.
+
+`present_unbacked` is the always-on gate for the black-framebuffer class. Its witness is
+`dense_frame_seq`, and the only site that advances it is `publish_surface_store`, whose own doc says
+it runs for "a type-11 Store whose pixels have landed in the mapping's **guest pages**". The resident
+rail renders into the registry and skips that write. So "no full frame was published for this mid"
+stopped implying "nothing can show one" — while the line went on saying *"the surface is
+uninitialized, so this shows black"*.
+
+The 524 s boot above measured four `never_stored` lines making that claim. Against them, in the same
+slice:
+
+| | |
+|---|---|
+| `host_window_slate*` lines in the whole run | **1** — `slate_end … frames=567 covered=1` at t=22 s, the firmware-boot run |
+| uncovered `host_window_slate` (blank window) | **0** |
+| cadence windows bracketing all four events | `presents == offered`, `direct_frac=1.00`, no dip |
+
+A resident carried every one of them. `note_present_backing`'s own doc already said it "never [reads]
+the resident"; the *message* asserted a visual consequence anyway. That is "a reason the caller writes
+is not a reading", applied to an outcome rather than to a cause — and it is the more expensive
+direction, because the benign case and the real one were emitted identically. A genuine black-screen
+boot is exactly what this gate exists to rank, and this one could not.
+
+The fix asks the presenter's own question through the rule it already shares
+(`pools::slot_presentable`, via `engine::resident_presentable`) and splits on the answer the same way
+`host_window_slate` / `host_window_slate_end` already split: **a present nothing can carry is a black
+frame and goes to the failure channel; one a resident carries cost no guest work and is a census.**
+`PresentBacking` now carries its own reason (`impl Decline`), so the caller stops supplying the word.
+
+Three details worth keeping:
+
+- **Fail-closed on "cannot answer".** `carried` is `Option<bool>`, and the `None` arm — a build with
+  no target registry — stays on the failure channel. `carried != Some(true)` and
+  `carried == Some(false)` differ *only* there, which is precisely where a demoted black frame would
+  go unnoticed, so that one character has its own test
+  (`an_unbacked_present_fails_unless_a_resident_positively_carries_it`, verified to fail when it is
+  flipped).
+- **`carried=unknown` is a third word on purpose.** "Nothing carried it" and "we did not look" are a
+  defect and an unmeasured build; one field that collapsed them would be the same fusion this
+  vocabulary exists to prevent.
+- **Priced where it runs.** One registry lookup under the engine lock, *inside* the refusal arm — four
+  times in that boot, not 60 times a second. A carrier read on the healthy path would have been an
+  engine-lock acquisition per present on the drain worker.
+
+`resident_presentable` lost its `host-window` gate to do this: the question is about the target
+registry, not about a window.
+
+**Not yet observed live.** No boot since the change, so `carried=resident` demoting those four lines
+is a construction argument, not a measurement. The next boot's check is that they appear on the census
+channel with `carried=resident`, and that any `carried=nothing` is still a failure.
 
 ### The 20 Hz Present Cap Is The Host Panel Being Asleep, Not The Swapchain
 
@@ -2703,8 +2788,9 @@ Three consequences, and the second is the expensive one:
   these stalls, with the guest awake throughout (the user confirmed the guest was awake; an earlier
   reading blamed display sleep and is retracted). WindowServer re-creating its scanout surfaces after
   a second of no progress is a plausible response to the *host* going to sleep under it. The gap in
-  our code is still real and `present_unbacked reason=never_stored` still reports it, but the
-  *trigger* may not exist off this laptop.
+  our code is still real and `present_unbacked` still reports it, but the *trigger* may not exist off
+  this laptop. **Its slug and shape changed on 2026-07-30** — see "An Unbacked Present Is Only Black
+  When Nothing Carries It" below; a grep for `reason=never_stored` no longer matches.
 
 Note what did not work and why, because the same shortcut will look attractive again. The
 `staging_pool` census reports per-bucket **mean** microseconds per miss; the 262144 bucket showed
