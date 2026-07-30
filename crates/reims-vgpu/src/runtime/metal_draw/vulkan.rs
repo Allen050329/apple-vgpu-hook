@@ -2836,9 +2836,29 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 ///
 /// Reported rather than refused: refusing would change what is drawn, and
 /// nothing here has yet established what SHOULD be drawn when the host copy is
-/// gone. `lin_rung_blank_with_host_entry` is the count that decides whether
-/// this is the mechanism, and it carries its denominators
-/// (`lin_rung_gva_bypassed`, `lin_rung_guest_*`) in the same census line.
+/// gone.
+///
+/// **Measured, and it refutes the "we had the pixels" half of that.** One
+/// driven boot, ten Finder recomposites, x86/Vulkan:
+///
+///   lin_rung_gva_bypassed 725233   lin_rung_guest_memo 725231
+///   lin_rung_texref 2              lin_rung_guest_blank 3379
+///   lin_rung_blank_with_host_entry 0        gvac_hit 305
+///
+/// Two things follow. The GVA cache rung is bypassed on essentially every
+/// sampled linear load, and not because entries are being refused -- `gvac_hit`
+/// is 305 against 725 233 loads, so `has_gva` simply finds nothing for these
+/// spans. And of the 3 379 samples that came back a completely blank texture,
+/// **none** had a host entry for the same address. We did not have the pixels
+/// and paint nothing; we do not have them at all.
+///
+/// What survives as the open question is `lin_rung_guest_blank` itself: 3 379
+/// draws in one session sampled an image that was zero end to end, and none of
+/// them declined anything. A genuinely transparent layer is legitimate, so the
+/// count is not yet a defect -- but it is the population the blank icon and the
+/// blank Safari scroll patch must be inside, and the next question is where the
+/// content for a `producer=2` body actually lives if it is neither in this
+/// cache nor in the guest pages the descriptor names.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
