@@ -1216,15 +1216,27 @@ impl crate::observe::Decline for Type5ViewDecline {
 ///
 /// It had no report of any kind. `surface_cache::get_shared` returns `Option` and
 /// the arm simply left `target_rgba8` unset, so the loss was invisible on the
-/// always-on channel.
+/// always-on channel. Measured on one x86/Vulkan boot before the guest-pages rung
+/// existed: **121 distinct (mapping, geometry) wipes** in ~170 s, four of them at
+/// the full 1920x1080 composite extent, against 0 in the idle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedDecline {
-    /// The cache holds no entry for this mapping id at all.
+    /// The cache holds no entry for this mapping id and the mapping's own pages
+    /// could not be read at the requested extent either.
+    ///
+    /// This is the whole population the pre-fix boot measured: every one of the
+    /// 121 lines carried `hostgen=0`, and every one had `want == mapgeom`, which
+    /// is what said the guest pages were readable and made the fallback rung the
+    /// fix rather than a guess.
     CacheAbsent,
     /// An entry exists but at a different geometry, so the exact-geometry hit
     /// rule refuses it. `host_surfaces` keeps exactly one entry per mapping and
     /// every Store replaces it, so a Store at another geometry orphans every
     /// window still living at this one.
+    ///
+    /// Fired **0** times on that boot. Kept because it is a different check with
+    /// a different fix (the entry is stale, not missing), and folding it into
+    /// `CacheAbsent` would hide which one a future boot hit.
     CacheGeom { have_w: u32, have_h: u32 },
 }
 
@@ -1244,20 +1256,50 @@ impl crate::observe::Decline for Type11SeedDecline {
     }
 }
 
+/// Which rung of the type-11 `LOAD` seed ladder produced the attachment's prior
+/// contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Type11SeedRung {
+    /// The host render cache held this mapping at exactly this geometry.
+    Cache,
+    /// The cache missed and the surface's own guest IOSurface pages were read.
+    GuestPages,
+}
+
+impl Type11SeedRung {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cache => "cache_hit",
+            Self::GuestPages => "guest_pages",
+        }
+    }
+}
+
 /// Report which way the type-11 `LOAD` seed branch went, once per
 /// `(mapping, requested geometry, outcome)`.
 ///
-/// Both arms report, because a zero on the miss arm has to be readable. A probe
-/// that only fires on failure cannot separate "the cache always hit" from "this
-/// branch never ran", and the branch is reached only for `mapping_id != 0` under
-/// `PASS_LOAD_ACTION_LOAD` with no caller-supplied seed. With the hit arm beside
-/// it, an absent miss line next to present hit lines is evidence rather than
-/// silence.
+/// Every outcome reports, because a zero on the miss arm has to be readable. A
+/// probe that only fires on failure cannot separate "the cache always hit" from
+/// "this branch never ran", and the branch is reached only for `mapping_id != 0`
+/// under `PASS_LOAD_ACTION_LOAD` with no caller-supplied seed. With the served
+/// arms beside it, an absent miss line next to present hit lines is evidence
+/// rather than silence.
 ///
-/// The mapping's own latched geometry and generation ride along on both arms:
-/// they say whether the surface could have been re-read from its guest pages at
-/// the requested extent, which is what decides the shape of any fallback.
-fn note_type11_load_seed(state: &DeviceState, mapping_id: u32, w: u32, h: u32, hit: bool) {
+/// Naming the *rung* rather than just hit/miss is what prices the fallback: a
+/// `guest_pages` line is a cache miss that was recovered, and its rate is the
+/// only thing that says whether the recovery is cheap. Fusing it into `cache_hit`
+/// would make the fix unmeasurable the moment it worked.
+///
+/// The mapping's own latched geometry and generation ride along on every arm:
+/// `want == mapgeom` is the condition under which the guest-pages rung can serve
+/// at all, so the pair says whether a miss was recoverable.
+fn note_type11_load_seed(
+    state: &DeviceState,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+    served: Option<Type11SeedRung>,
+) {
     let (map_w, map_h, map_gen) = state
         .mappings
         .get(&mapping_id)
@@ -1268,17 +1310,21 @@ fn note_type11_load_seed(state: &DeviceState, mapping_id: u32, w: u32, h: u32, h
     let host_gen = cached.map(|e| e.host_gen).unwrap_or(0);
     // Latch before building the line: `Emit::field` renders eagerly, and this
     // sits on a branch the census measures at 28-111 entries a second.
-    let disc = (u64::from(mapping_id) << 40)
-        | (u64::from(w) << 20)
-        | u64::from(h)
-        | if hit { 1 << 63 } else { 0 };
-    if hit {
-        if !crate::observe::first_sight("type11_load_seed_hit", disc) {
+    let outcome_bits = match served {
+        None => 0u64,
+        Some(Type11SeedRung::Cache) => 1,
+        Some(Type11SeedRung::GuestPages) => 2,
+    };
+    let disc =
+        (u64::from(mapping_id) << 40) | (u64::from(w) << 20) | u64::from(h) | (outcome_bits << 62);
+    if let Some(rung) = served {
+        if !crate::observe::first_sight("type11_load_seed_served", disc) {
             return;
         }
         crate::observe::off(format!(
-            "type11_load_seed outcome=cache_hit mid={mapping_id} want={w}x{h} \
-             mapgeom={map_w}x{map_h} mapgen={map_gen} hostgen={host_gen}"
+            "type11_load_seed outcome={} mid={mapping_id} want={w}x{h} \
+             mapgeom={map_w}x{map_h} mapgen={map_gen} hostgen={host_gen}",
+            rung.name()
         ));
         return;
     }
@@ -1296,6 +1342,66 @@ fn note_type11_load_seed(state: &DeviceState, mapping_id: u32, w: u32, h: u32, h
         .field("mapgen", map_gen)
         .field("hostgen", host_gen)
         .fail();
+}
+
+/// The prior contents of a type-11 attachment under `PASS_LOAD_ACTION_LOAD`,
+/// with the byte order they are in.
+///
+/// Two rungs, in freshness order:
+///
+/// 1. **The host render cache.** The hot one: `store_routes` measures 28-111 of
+///    these a second under a browser workload. It holds guest scanout order and
+///    the pooled target is RGBA, so the buffer is handed over behind an `Arc` and
+///    the R/B exchange rides the engine's single copy into mapped staging rather
+///    than materializing a converted frame here.
+/// 2. **The surface's own guest IOSurface pages.** The cache is an accelerator,
+///    not the surface. What a type-11 attachment *contains* is its pages, so a
+///    cache miss is a reason to read them — not a reason to drop the guest's
+///    LOAD. Without this rung the pass began with `LoadOp::CLEAR` against the
+///    hardcoded `[0,0,0,0]` primary clear and the matching Store published that
+///    wipe, which is a whole compositing layer going solid black.
+///
+/// `load_type11_rgba_static` reads at the mapping's own latched geometry and
+/// converts to RGBA8, so the length check is what confirms the pass wanted that
+/// extent — the engine rejects a seed of any other length, and the decline this
+/// falls through to carries both geometries so a mismatch is diagnosable rather
+/// than silent. `paint_mapping` underneath it lands every intersecting deferred
+/// window first, so the read observes our own not-yet-written-back Stores rather
+/// than pre-Store bytes.
+///
+/// The sibling Metal path already had rung 2: type-11 `seed_color_load` falls
+/// through to the same reader via `load_sampled_rgba_static`. Only the Vulkan arm
+/// stopped at the cache.
+///
+/// `None` means the guest's LOAD could not be honoured at all, and
+/// [`note_type11_load_seed`] has already said which check refused.
+fn resolve_type11_load_seed<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    w: u32,
+    h: u32,
+) -> Option<(
+    std::sync::Arc<Vec<u8>>,
+    crate::backend::vulkan::engine::SeedOrder,
+)> {
+    use crate::backend::vulkan::engine::SeedOrder;
+    let served =
+        if let Some(bgra) = crate::runtime::surface_cache::get_shared(state, mapping_id, w, h) {
+            Some((bgra, SeedOrder::Bgra8, Type11SeedRung::Cache))
+        } else {
+            load_type11_rgba_static(state, host, mapping_id, None)
+                .filter(|rgba| rgba.len() == (w as usize) * (h as usize) * 4)
+                .map(|rgba| {
+                    (
+                        std::sync::Arc::new(rgba),
+                        SeedOrder::Rgba8,
+                        Type11SeedRung::GuestPages,
+                    )
+                })
+        };
+    note_type11_load_seed(state, mapping_id, w, h, served.as_ref().map(|s| s.2));
+    served.map(|(bytes, order, _)| (bytes, order))
 }
 
 /// Materialize the exact serialized Metal view carried by a type-5 object.
@@ -3797,20 +3903,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
                         }
                     } else if c0.mapping_id != 0 {
-                        // The type-11 Load seed, and the hot one: `store_routes`
-                        // measures 28-111 of these a second under a browser
-                        // workload. The cache holds guest scanout order and the
-                        // pooled target is RGBA, so this used to allocate, copy
-                        // and swizzle a whole framebuffer per seeded draw just to
-                        // restate pixels it already had. Hand the cache's own
-                        // buffer over and let the exchange ride the staging copy.
-                        if let Some(bgra) =
-                            crate::runtime::surface_cache::get_shared(state, c0.mapping_id, w, h)
+                        if let Some((bytes, order)) =
+                            resolve_type11_load_seed(state, host, c0.mapping_id, w, h)
                         {
-                            target_rgba8 = Some(bgra);
-                            seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
+                            target_rgba8 = Some(bytes);
+                            seed_order = order;
                         }
-                        note_type11_load_seed(state, c0.mapping_id, w, h, target_rgba8.is_some());
                     } else if c0.texture_ref != 0 {
                         // GVA type-2/3 Load: texture_ref encode cache (separate
                         // from surface_id mid map). Prefer GVA key when present.
@@ -5104,6 +5202,105 @@ mod vulkan_split_tests {
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
 
+    /// A type-11 `LOAD` whose host cache misses seeds from the surface's own
+    /// guest pages, and only refuses when those cannot serve the extent.
+    ///
+    /// Without the guest-pages rung this returns `None`, `target_rgba8` stays
+    /// unset, and `exec.rs` resolves the pass load action to `Clear` against the
+    /// hardcoded `[0,0,0,0]` — so the guest's request to preserve its surface
+    /// became a transparent-black wipe that the matching Store published. One
+    /// x86/Vulkan boot measured 121 distinct (mapping, geometry) instances of that
+    /// in ~170 s, four at the full 1920x1080 composite extent, with the host
+    /// window 62-90 % near-black during a desktop drag against 0.001 % at idle.
+    ///
+    /// Every one of those 121 lines had `want == mapgeom` and `hostgen=0`: the
+    /// cache had never held the surface and its pages were readable. That pair is
+    /// what makes reading them the fix rather than a guess.
+    #[test]
+    fn a_type11_load_seed_falls_back_to_the_surfaces_own_guest_pages() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        use crate::runtime::mapping_write::write_bgra8;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let mid = 911u32;
+        let pfn = 0x21u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_X86;
+        host.map_range(gpa, 0x4000, 0);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+        let (w, h) = (4u32, 2u32);
+        assert!(state.set_mapping_geom(mid, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+        // Guest-side content the compositor expects a LOAD to preserve. BGRA on
+        // the wire; distinct per channel so a swizzle error cannot pass.
+        let mut pages = vec![0u8; (w * h * 4) as usize];
+        for px in pages.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x10, 0x20, 0x30, 0xFF]);
+        }
+        assert!(write_bgra8(&mut state, &mut host, mid, &pages, w * 4, w, h));
+        // `write_bgra8` mirrors what it wrote into the host cache, so drop that
+        // mirror: the case under test is a surface whose pages hold content while
+        // the cache holds nothing, which is what every one of the 121 measured
+        // lines was (`hostgen=0`) — a first-ever LOAD, or a mapping whose remap
+        // made `unmap_surface` evict the entry.
+        crate::runtime::surface_cache::evict(&mut state, mid);
+        assert!(
+            crate::runtime::surface_cache::get(&state, mid, w, h).is_none(),
+            "the cache must be cold: this test is about the miss path"
+        );
+
+        // Capture the always-on lines so a failure here names the check that
+        // refused rather than showing a bare `None`: every rung on this ladder
+        // declines by name, and the panic message is where that is worth reading.
+        let cap = crate::observe::sink::FailCapture::start();
+        let served = resolve_type11_load_seed(&mut state, &mut host, mid, w, h);
+        let (bytes, order) = served.unwrap_or_else(|| {
+            panic!(
+                "a cold cache must not lose the guest's LOAD; sink said {:?}",
+                cap.lines()
+            )
+        });
+        drop(cap);
+        assert_eq!(
+            order,
+            crate::backend::vulkan::engine::SeedOrder::Rgba8,
+            "the guest-pages reader converts to RGBA8; mislabelling it swaps R and B"
+        );
+        assert_eq!(bytes.len(), (w * h * 4) as usize);
+        assert_eq!(
+            &bytes[..4],
+            &[0x30, 0x20, 0x10, 0xFF],
+            "BGRA guest bytes must arrive as semantic RGBA"
+        );
+
+        // A live cache entry still wins: it is the fresher copy (the last Store's
+        // output) and the fallback must stay a fallback.
+        let mut cached = vec![0u8; (w * h * 4) as usize];
+        for px in cached.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xFF]);
+        }
+        crate::runtime::surface_cache::store(&mut state, mid, w, h, cached);
+        let (bytes, order) = resolve_type11_load_seed(&mut state, &mut host, mid, w, h)
+            .expect("a warm cache must serve");
+        assert_eq!(order, crate::backend::vulkan::engine::SeedOrder::Bgra8);
+        assert_eq!(&bytes[..4], &[0xAA, 0xBB, 0xCC, 0xFF]);
+
+        // An extent the surface is not latched at cannot be served by either rung,
+        // and refusing is right: a seed of the wrong length is rejected by the
+        // engine anyway, and the decline names both geometries.
+        assert!(
+            resolve_type11_load_seed(&mut state, &mut host, mid, w, h + 1).is_none(),
+            "a mismatched extent must refuse by name, not seed something else"
+        );
+    }
+
     /// The type-11 `LOAD` seed branch reports both ways, and the miss arm names
     /// the geometry the cache actually holds.
     ///
@@ -5148,18 +5345,27 @@ mod vulkan_split_tests {
         };
 
         let cap = crate::observe::sink::FailCapture::start();
-        note_type11_load_seed(&state, mid, 8, 4, true);
+        note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
         let hit = only(&cap);
         assert!(hit.contains("outcome=cache_hit"), "{hit}");
         assert!(hit.contains("mapgeom=8x4"), "{hit}");
         assert!(hit.contains("mapgen=3"), "{hit}");
         drop(cap);
 
+        // The recovered arm is its own outcome, not folded into `cache_hit`: its
+        // rate is the only thing that prices the guest-pages fallback, and fusing
+        // it would make the fix unmeasurable the moment it worked.
+        let cap = crate::observe::sink::FailCapture::start();
+        note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
+        let pages = only(&cap);
+        assert!(pages.contains("outcome=guest_pages"), "{pages}");
+        drop(cap);
+
         // Same mapping, a geometry the cache does not hold: the entry's own
         // geometry is the load-bearing field, since it says a Store at another
         // extent orphaned every window still living at this one.
         let cap = crate::observe::sink::FailCapture::start();
-        note_type11_load_seed(&state, mid, 8, 1, false);
+        note_type11_load_seed(&state, mid, 8, 1, None);
         let geom = only(&cap);
         assert!(geom.contains("reason=type11_seed_cache_geom"), "{geom}");
         assert!(geom.contains("have=8x4"), "{geom}");
@@ -5168,7 +5374,7 @@ mod vulkan_split_tests {
 
         // A mapping the cache has never held reports absence, not a geometry.
         let cap = crate::observe::sink::FailCapture::start();
-        note_type11_load_seed(&state, 910, 8, 4, false);
+        note_type11_load_seed(&state, 910, 8, 4, None);
         let absent = only(&cap);
         assert!(
             absent.contains("reason=type11_seed_cache_absent"),
@@ -5180,9 +5386,10 @@ mod vulkan_split_tests {
         // Latched per (mapping, geometry, outcome): a repeat of any of the three
         // above emits nothing, so the branch is safe to leave on forever.
         let cap = crate::observe::sink::FailCapture::start();
-        note_type11_load_seed(&state, mid, 8, 4, true);
-        note_type11_load_seed(&state, mid, 8, 1, false);
-        note_type11_load_seed(&state, 910, 8, 4, false);
+        note_type11_load_seed(&state, mid, 8, 4, Some(Type11SeedRung::Cache));
+        note_type11_load_seed(&state, mid, 4, 4, Some(Type11SeedRung::GuestPages));
+        note_type11_load_seed(&state, mid, 8, 1, None);
+        note_type11_load_seed(&state, 910, 8, 4, None);
         assert!(
             cap.lines().is_empty(),
             "second sighting must be latched: {:?}",
