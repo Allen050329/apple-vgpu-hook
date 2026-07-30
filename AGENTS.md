@@ -2934,12 +2934,41 @@ exactly `w * h * 4`, i.e. **4 bytes per pixel**, which puts them in the `Rgba8Un
 the slice. This is the "count what your A/B actually changed" trap in miniature: two anomalies in
 one log are not therefore the same anomaly, and the byte count separates them in one command.
 
+**The dispatch is not being dropped: `compute_record` has fired 0 times in the entire accumulated
+log.** That is 17 MB spanning every boot ever run on this machine, so it is not a slice artefact and
+it eliminates the whole "the icon was never composited, so the guest cached whatever was in the
+buffer" family — which is otherwise the most natural reading of a solid-colour output.
+
+Getting there needed one correction worth carrying, because it nearly produced a false elimination
+from the *other* direction. `note_compute_refusal` reports through `.fail_once(pipeline_ref)`, so a
+pipeline that refuses once is **silent for every later refusal in that process**. A slice taken well
+after boot therefore cannot see a refusal that started before it, and "0 in my slice" would have
+meant nothing at all. A **zero over the whole log** does survive the dedup, which is why the check
+has to be run against the file rather than the slice. The same reasoning applies to every
+`fail_once` line in this crate.
+
+Two silent drops on that path are worth fixing on their own account even though neither is firing.
+`resolve_dispatch_dims` failing abandons the dispatch and reports only through `observe::line`, the
+`REIMS_VGPU_DRAW_LOG=1` tier — the identical shape AGENTS.md records for `try_recover_sentinel_grid`,
+where a verbose-only report kept a heuristic alive for several sessions. And the `tg_x == 0 || …`
+guard below it returns `BadGrid("compute_vk_zero_dims")` with no line of its own. Both are covered
+today *only* by the rail-boundary refusal, which is deduped per pipeline.
+
 So the specialization mismatch is real, unexplained, and **not** the icon defect. What is left is
 that the icon dispatches look entirely ordinary on every line this device emits — `3` samples and
 `2` skips per geometry, `access=write_only seed=1`, no decline — which is the finding: the next step
 is a probe on the dispatch that produces a guest-visible compute output, reporting its identity,
 whether the seed was skipped and whether its resident was freshly created, so a corrupt icon's
 geometry can be joined to its own dispatch. Nothing today permits that join.
+
+**The standing shape of the defect, after all of the above.** Every icon dispatch executes and
+returns `Ok`; three of six produce correct pixels and three do not, in the same window, from the
+same shader, with every logged parameter identical. That combination rules out the shader itself —
+a translation defect would not spare half the icons — and leaves two places for the error: **what
+the dispatch sampled**, or **where its output landed and was read back from**. The sample side is
+the one with machinery that can substitute an image (the resident-sample skip and the reinterpret
+sibling); both read 0 in the corrupt arms, so if it is the sample side it is a path neither of those
+lines covers.
 
 One weaker correlation is worth recording *as* weak, because it will look stronger than it is on
 re-reading. `type4_pages_stale` ("task PT translation moved; rebuilding") fires 3 and 4 times in the
