@@ -1394,6 +1394,89 @@ latched, so 138 `outcome=guest_pages` lines are distinct first sightings, not oc
 mapping's Store keeps failing, its LOAD would gather guest pages every frame; `outcome=guest_pages`
 count against `drain_duty` is how that gets read.
 
+### Where The Drain Worker's Time Actually Goes, Measured Rather Than Decomposed
+
+**`draw_phase`'s nine buckets sum to 72 % of `draw_us`.** The residual was ~245 ms per second on
+2026-07-30, stable at 25-30 % across 200 windows — larger than `stage_us` and `readback_us`, second
+only to `wait_us`. `draw_phase` brackets the *engine's* internals; this is the runtime work either
+side of them, and no instrument named it while several sessions used that table to choose what to
+fix.
+
+`store_routes` now carries it (`note_store_route_us`, same per-second map as the route counts, so it
+divides into the same window's `draw_us` with no join). Measured, `t11_*` spans on the type-11 arm:
+
+| | per second | share of the arm |
+|---|---|---|
+| `t11_store_us` (whole type-11 arm) | 180 ms | — |
+| `t11_convert_us` (the RGBA→BGRA frame) | **152 ms** | **84.5 %** |
+| `t11_publish_us` (`publish_surface_store`) | 0.008 ms | nil |
+| rest of the arm | 28 ms | 15 % |
+
+So one `rgba.to_vec()` plus an in-place R/B swap was 62 % of everything the phase table could not
+see. `publish_surface_store` being 8 *microseconds* per second is worth noting on its own: it had
+been described as a publish step and it is three metadata writes.
+
+**Split it before removing it.** A microbenchmark, per 8.29 MB frame: `to_vec()` 297 us, `to_vec()` +
+swap 782 us, swap in place 448 us. The clone is ~43 % and the swizzle ~57 %, so they are separate
+changes with separate risk.
+
+**The clone is gone (`fb89924`), scored at −19 % per Store.** `arm_surface_deferred_store_with` now
+takes `Vec<u8>` by value. It could not before because the caller returned the buffer as the draw's
+chain value — and that return is **dead on this route**: the arm is reached only under
+`writeback_guest`, `multi_draw_store_plan` grants that solely to the last record of a packet, `exec.rs`
+feeds `chain_rgba` into record N+1's seed (exec.rs:1609) and there is no N+1, and every other reader
+is an abandon arm in a loop that has just ended.
+
+The signature is `Result<u32, Vec<u8>>` rather than `bool` because a moved buffer cannot be un-moved:
+the type makes "refused" and "you still have the pixels" the same statement, and the three refusal
+gates hand the frame back to the synchronous route.
+`a_refused_deferred_arm_returns_the_frame_it_was_given` pins it — an `Err` built with an empty or
+wrong buffer still compiles and would write a blank frame into guest pages on every refusal.
+
+| | before | at `fb89924` |
+|---|---|---|
+| `t11_convert_us` **per Store** | 776 us | **627 us** |
+| unaccounted share of `draw_us` | 27.6 % | **22.2 %** |
+| `type11_seed_elided` / `uploaded` | 4588 / 278 | 5984 / 221 (96.4 %) |
+| `FAIL` lines | 0 | 0 |
+
+**Read the per-Store number, not the frame rate, and this boot is why.** Host presents went 21.9 Hz →
+17.2 Hz across the pair, which reads as a regression from a commit that deletes a `memcpy` and can
+only be neutral or better. The after-boot did **10 % more readback bytes/s (967 → 1065 MB), 6 % more
+draws/s and 34 % more presented layers** — a heavier workload, on a rig AGENTS.md already records with
+a 1.8x cross-boot spread. The Store rate was near-identical (196.5 vs 192.9/s), which is what makes
+`t11_convert_us / surface_deferred` comparable when nothing else is.
+
+Note also what the guest said on that boot: **testufo read 60.000 Hz / 60 fps**, against 41.000 Hz two
+boots earlier. The guest's own opinion is not our present rate and does not score this change — but it
+is the first time this rig has produced the goal's target number on the guest side.
+
+**Next, and it is the large one.** `wait_us` (287-311 ms/s) + `readback_us` (133-156 ms/s) ≈ **half of
+`draw_us`**, both charged per byte, and `store_routes surface_deferred` ~200/s against `readbacks`
+~208/s says essentially every readback is a type-11 composite Store. `skip_readback` returns from
+`execute_draw_inner` *before* `Phase::Wait`, so dropping that readback drops both together.
+
+Its prerequisite is `output_bgra` for type-11 residents, which also deletes the remaining swizzle
+(~87 ms/s) and is the gate on `read_resident_bgra` — the present path's resident rung, currently dead
+because `slot.bgra` is never true. Set it from the resolved identity (`matches!(.., Surface{..})`) so
+**every** draw targeting that identity agrees; an intermediate at `output_bgra=false` sharing an
+identity with a Store at `true` makes `registry_ensure` destroy and recreate the image every frame.
+
+Three order hazards to handle, all verified by reading:
+
+- `read_resident_chain` (`vulkan.rs:4935`) returns the resident's bytes straight to
+  `writeback_chain_rgba` on the abandon path. That becomes BGRA.
+- The `cpu_portability` route calls `write_rgba8_image_changed`; it needs the `write_bgra8` form.
+- The sampled reader at `vulkan.rs:900` does its own `swap_rb_channels` off `surface_cache`, which
+  stays BGRA — unaffected, but it is a **fourth** full-frame CPU pass nobody has priced.
+
+Consumers `skip_readback` must then re-source: `surface_cache` (present capture at `scanout.rs:248`,
+the ~4 % of LOADs that still seed, and the sampled bind), the deferred window's owned frame, and the
+guest writeback at flush (`storage_flush.rs:876`, which today reads the window's `Arc` and never
+touches the GPU). The pin machinery to keep the resident alive across that already exists and the GVA
+rail uses it (`pin_resident_target`, armed at `vulkan.rs:5282`, unpinned at `storage_flush.rs:527/535`
+and on the eviction path).
+
 ### The ~2 Hz Frame Rate Was One Bit In A Memory-Type Query
 
 **Fixed by `b19074e`. 1.49 Hz → 18.76 Hz on the same workload, and the mechanism is settled by a
