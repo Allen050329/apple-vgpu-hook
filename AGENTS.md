@@ -2622,7 +2622,99 @@ cannot express 120 Hz at all. It errs fast, so it cannot starve the guest, which
 125.0 reading exonerates it. Deriving the grid from `DISPLAY_REFRESH_HZ` in microseconds would be the
 principled form, and it needs a finer poll than 4 ms to be worth anything.
 
-### The Write Gate Is Over-Strict: The Refused Range Is Fully Mapped For The Writing Task
+### A MapMemory2 Notification Is Not An Authorization
+
+**FOUND AND FIXED by `76eaf66`, scored on a live boot: all five loss classes 0, and 14 of 14
+undeclared writes confirmed by a later notification. Do not re-add the refusal.**
+
+The guest's order is **allocate → install PTEs → use → notify**. `drain`'s own comment already
+recorded the first half ("Map notify: PTEs already live"); what nobody had checked is that the FIFO
+carrying the notification is ordered against *nothing that uses the memory*. So a `MapMemory2` span
+cannot authorise anything, and six rails were treating "not in the span registry" as "not writable".
+
+The decisive probe was `write_gate_late_map` (`5961a70`), which joins the write to the notification
+that follows it — a reading the refusal site cannot take, because its evidence arrives *after* the
+event. That is "an event count is not a state" pointing **forwards**: when a claim is "this never
+gets declared", the probe has to outlive the declaration, not fire at the write.
+
+    gva_write reason=write_gate_outside task=1 gva=0x1ada000 len=0x10000 … gpa_match=0
+    write_gate_late_map task=1 gva=0x1ada000 len=0x30000 span_gva=0x1ada000 span_len=0x30000 late_ms=37
+
+5 of 5 on the probe boot, at the **exact base address**, 0–29 ms later. The three refusals at
+`0x1ada000`/`0x1aea000`/`0x1afa000` are 3×0x10000 of one `OP_COPY_BUFFER_TO_TEXTURE`, and the span
+that follows is `0x30000` — the upload's total length, exactly.
+
+What was being lost per boot, all one cause: a 192 KiB texture upload (`copy_region` aborted three
+times), a whole deferred window (`guest=skip_uncovered`, 240x135 / 320x512 / 256x256), a linear
+writeback up to 1.3 MiB, six glyph-atlas compute writebacks (`reason=linear_unmapped`, 79x52, 90x20,
+8x8 …), and three flush obligations never armed (`guest_flush=0`).
+
+**The tree had already reached this answer once, on one rail, and it was not generalised.**
+`an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram` records `exact=1155
+no_spans=0 outside=893` over 2048 render Stores — **44 %** — and hand-exempted `write_gva_rgba8`
+because refusing blanks the screen. Six rails were not exempted. When one rail carries a measured
+exemption from a shared check, ask what the other callers of that check are doing.
+
+**Two refuted hypotheses, both from this file, both dead:**
+
+- *The owner declared it, so authorise on shared GPAs.* `gpa_match=0` on every refusal — tasks 0 and
+  1 resolve those GVAs to **different physical pages**. `owners=[0]` was a virtual-address
+  coincidence inside task 0's 64 MiB span. `tasks_covering` compares GVAs across address spaces and
+  therefore cannot mean ownership.
+- *Do not make the gate consult the page tables.* Still correct, and this is its conclusion rather
+  than its violation: the fix is not a second check, it is to stop refusing on a notification. What
+  bounds a host→guest write is the task's page table, which every writer already re-walks at write
+  time and fails closed on.
+
+`WriteGate::Outside` is now `WriteGate::Undeclared`, reported everywhere and refused nowhere;
+`gva_write_allowed` is deleted. All six rails report through one helper
+(`gva_mem::report_undeclared_write`) so they cannot drift apart, with `via=` naming the rail. Two
+joins make the two possible worlds legible: `write_gate_late_map … late_ms=` (the guest did notify,
+we were early) and `write_gate_never_declared … age_ms=` (evicted from the ring uncovered — the
+shape the open memory-corruption signature would take). Ranges **coalesce** when they overlap or
+touch, because `copy_region` and the linear fallback write a region one row at a time and an
+exact-range dedup would file 135 entries for a 135-row texture.
+
+Scored on one x86/Vulkan boot at `76eaf66` (`PANEL: On 15/15`, `present_hz` p50 **60.00**, guest
+testufo **60.000 Hz / 58 fps**, 2146 sliced lines):
+
+| | at `5961a70` | at `76eaf66` |
+|---|---|---|
+| `write_gate_outside` / `copy_region_write_io` | 5 / 5 | **0 / 0** |
+| `skip_uncovered` | 1 | **0** |
+| `linear_unmapped` | 8 | **0** |
+| `guest_flush=0` | 3 | **0** |
+| `write_gate_undeclared` (permitted, reported) | — | 14 |
+| **`write_gate_late_map`** | — | **14 — every one confirmed** |
+| **`write_gate_never_declared`** | — | **0** |
+
+`late_ms` was 0 ms ×5, 1 ms ×3, 2 ms ×4, 8 ms, 37 ms. The 14/14 ratio is **within-boot**, so it is
+not subject to this rig's documented cross-boot spread. Twelve goal-1-to-3 sentinels all 0, and the
+captured frame is correct on the checks no failure line can see: banner **orange**, hyperlinks
+**blue**, Blur Busters header **purple**.
+
+**A graceful-degradation path was hiding behind the gate, and removing the gate exposed it.** The
+compute rail's early return also happened to catch genuinely *unmapped* GVAs, and that degradation
+is correct. It is kept and now keyed on the condition itself: `write_linear_guest` returns
+`LinearWrite::{Written, Unmapped, Failed}` instead of `bool`. This is "one status for N checks"
+being load-bearing rather than merely untidy — the only caller able to degrade was doing so off a
+proxy that also caught healthy writes. When deleting a check, look for what else was riding on it.
+
+`MemError::OutsideMap` became unconstructible and is deleted (33 → 32 slugs).
+
+**Two fixture traps, both recorded in the tests.** A one-level page walk masks its index to the
+entry count, so `4096 * page` aliases index 0 and an "unmapped" assertion built on it passes for the
+wrong reason. And `note_task_map` ignores a zero base as a sentinel, so a confirmation at GVA 0 can
+never fire.
+
+**Diff hygiene, since this cost a round.** `rustfmt --edition 2021 --style-edition 2024` normalises
+pre-existing drift across the whole file *and* recurses into `mod` children: a first pass produced
+111 hunks across 7 files including one this change never touched. The fix is not to hand-revert
+hunks — format a **pristine checkout the same way** to get "HEAD + drift", then `git merge-file` only
+the difference. 111 → 41 hunks, and the semantic hunk count at `-U3` then matches the merged
+`git diff` exactly, which is the check that it worked.
+
+#### Superseded: the original reading of this class
 
 **Measured on one x86/Vulkan boot at `37365a0`. `named_mapped == pages` in every refusal. These are
 FALSE REFUSALS and they drop real guest work.** The mechanism of the fix is *not* settled; what is
@@ -2670,6 +2762,9 @@ Four facts from the same slice fix the decode, so do not re-litigate them:
   four removed arms stay removed.
 - `owner_mapped == pages` too, so *both* tasks resolve the range. Consistent with a shared buffer
   pool: task 0 declares it, task 1 also maps it and uses it.
+
+**RESOLVED — the paragraph below is the superseded plan, kept only because its warning is still
+right. The lead it proposes (compare resolved GPAs) is refuted: `gpa_match=0` on every refusal.**
 
 **Do not "fix" this by making the gate consult the page tables.** That defeats its purpose exactly.
 The gate is meaningful *because* page tables resolve more than `MapMemory2` declares — a task's own
