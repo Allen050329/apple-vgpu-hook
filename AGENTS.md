@@ -2540,6 +2540,12 @@ failure mode was a *dialog*, which in a downscaled thumbnail looks exactly like 
 
 ### 60 fps Is Reached, The Presenter Drops Nothing, And The Remaining Cap Is The Guest's Compositor
 
+**The "remaining cap" half of this heading is RETRACTED — see "60+ fps Confirmed On A Second
+Panel-Awake Boot" above. A later boot on the same code reaches `offered` p50 110 / max 120 with the
+guest reporting 115 fps, so the 60 measured here is a per-boot state and not a ceiling. The four
+refuted levers below still stand as refutations; what does not stand is the conclusion that 60 was
+the guest's fixed choice.**
+
 **Measured on one x86/Vulkan boot at `bbfb567` with the host panel held awake and the hold
 verified (`PANEL: On 14/14 samples`).** This is the first frame-rate reading in this file taken with
 its confounder controlled, and it settles the present-mode question in the negative: there is
@@ -2616,6 +2622,110 @@ cannot express 120 Hz at all. It errs fast, so it cannot starve the guest, which
 125.0 reading exonerates it. Deriving the grid from `DISPLAY_REFRESH_HZ` in microseconds would be the
 principled form, and it needs a finer poll than 4 ms to be worth anything.
 
+### The Write Gate Is Over-Strict: The Refused Range Is Fully Mapped For The Writing Task
+
+**Measured on one x86/Vulkan boot at `37365a0`. `named_mapped == pages` in every refusal. These are
+FALSE REFUSALS and they drop real guest work.** The mechanism of the fix is *not* settled; what is
+settled is which of the two candidate readings applies.
+
+`gva_write_gate` refuses a write when the writing task has filed at least one `MapMemory2` span and
+none covers the range. Five such refusals a boot each abort a whole guest upload
+(`blit_exec.rs:1168` → `MemError::OutsideMap` → `BlitStatus::GuestIo`, no partial work, no recovery).
+`37365a0` added the state read that separates "the gate is over-strict" from "the address was never
+reachable anyway". Every line came back the same way:
+
+```
+gva_write reason=write_gate_outside task=1 gva=0x1ada000 len=0x10000 owners=[0] own=4
+    pages=16 named_mapped=16 owner_mapped=16 via=runtime/blit_exec.rs:1168
+```
+
+| refusal | pages | named_mapped | owner_mapped | own |
+|---|---|---|---|---|
+| `0x1ada000 +0x10000` | 16 | **16** | 16 | 4 |
+| `0x1aea000 +0x10000` | 16 | **16** | 16 | 4 |
+| `0x1afa000 +0x10000` | 16 | **16** | 16 | 4 |
+| `0x3d23000 +0xf00` | 1 | **1** | 1 | 38 |
+| `0x38ab000 +0xf00` | 1 | **1** | 1 | 155 |
+
+**The writing task's own page tables resolve every page of every refused range.** So the write would
+have landed exactly where the guest asked, in the guest's own mapped memory, and `task_map_spans` is
+**not a complete authorization set** — a premise `drain/mod.rs`'s map site asserts in a comment and
+nothing verified. `own=155` on the last row rules out "task 1 declared nothing"; it had filed 155
+spans and none covered.
+
+What is lost is concrete: the first three are `opcode=0x12c` (`OP_COPY_BUFFER_TO_TEXTURE`) at
+offsets 0 / 65536 / 131072 — **three consecutive 64 KiB rows of one 192 KiB texture upload** — and
+the last two are `opcode=0x12e` (texture→buffer) at `size=240x135x1`, thumbnail-shaped.
+
+Four facts from the same slice fix the decode, so do not re-litigate them:
+
+- `map_memory2_key word=0x0 dec=0 gva=0x101000 len=0x4000000` and `word=0x1 dec=1 gva=0x9f9000
+  len=0x20000`. `0x1ada000` is inside task 0's 64 MiB declaration and outside task 1's 128 KiB one.
+  These are the exact values `only_the_writing_tasks_own_spans_authorise_a_write` was written from.
+- `define_task root raw=0x1 task=0 dir=0x4389e2` against `raw=0x2 task=1 dir=0x45789e` — **different
+  directory roots**, so tasks 0 and 1 are genuinely separate address spaces.
+- `define_task` raw words are `0x1` then strictly even; `map_memory2_key` words include `0x5,0x7,0x9`.
+  So `MapMemory2` names the slot directly and `exec_indirect2`'s word is in that same slot-id space:
+  `task=1` is the **correct** resolution of `raw=0x1`. **This does not reopen `task_id >> 1`** — all
+  four removed arms stay removed.
+- `owner_mapped == pages` too, so *both* tasks resolve the range. Consistent with a shared buffer
+  pool: task 0 declares it, task 1 also maps it and uses it.
+
+**Do not "fix" this by making the gate consult the page tables.** That defeats its purpose exactly.
+The gate is meaningful *because* page tables resolve more than `MapMemory2` declares — a task's own
+heap is mapped in its address space, and writing there through a mis-decoded GVA is the corruption
+class this guard exists for. `write_span` already fails closed on an unmapped page, so a page-table
+check adds nothing the writer does not already do.
+
+The lead worth pursuing instead: **a `MapMemory2` span plausibly authorizes physical pages, not one
+task's GVAs.** If task 0's declared range and task 1's usage resolve to the *same GPAs*, the honest
+gate compares resolved GPAs against the declared spans' GPAs — which authorizes these five writes
+while still refusing a write into an undeclared heap. That is **unmeasured**: `owner_mapped=16` says
+task 0 resolves 16 pages there, not that they are the same 16 physical pages. Extending
+`probe_write_gate_pages` to compare the two GPA sets is the next measurement and it is cheap — both
+walks already happen in that function.
+
+### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
+
+Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,
+149 cadence windows:
+
+| | |
+|---|---|
+| `present_hz` | p50 **107.20**, min 5.40 (boot), **max 118.90** |
+| `offered_hz` | p50 109.20, max **120.00** |
+| `presents` / `offered` | p50 108 / 110 |
+| `busy_acquire` | p50 38, max 309 |
+| `drain_duty` | **0.118** at 718 tranches and 648 draws/s |
+| `store_routes` | `surface_resident=428 type11_seed_elided=428` — 100 % resident rail |
+| `display_vbl` | `window_hz=125.0 grid_hz=125.0` |
+| guest testufo | **`Frame Rate 115 fps`** |
+
+**This retires the "the guest composites 60 and four levers are spent" reading in the section below.**
+The previous panel-awake boot measured `offered` p50 61 with Mission Control agreeing at 61, and that
+was written up as a guest-side pacing decision. It is not a ceiling: the same code, same workload and
+same guest reach 110 offered and 120 max. Whatever produced the 60 Hz arm is a per-boot state, not a
+cap — so treat *both* numbers as boot samples and quote the within-boot ratios instead.
+
+Read the testufo capture carefully, because its headline number is a trap: it shows **`20.000 Hz`**
+in the big readout with a red **SYNC FAILURE: Browser unable to VSYNC** banner and
+`Refresh Rate - Hz`. That big number is testufo's *failed refresh estimator*, not a frame rate. The
+frame rate field reads **115 fps**, and our own `present_hz` reads 107. Do not quote the 20.
+
+`busy_acquire` p50 38 is new and is the device now out-producing FIFO on this host (110 offered
+against the ~80-120 the awake panel takes), losing ~2 frames/s. That is the first reading that would
+make `PresentModeKHR::MAILBOX` worth anything — and it is worth ~2 %, not the 5x the asleep boot
+implied.
+
+Byte order checked on pixels: banner **red**, hyperlinks **blue**, `Problems?` **red**.
+
+**Goals 1-3 re-verified green on this slice** (2131 lines): `linear_load_span_exceeds_alloc`,
+`type11_seed_cache_absent`, `draw_vk_nothing_stored`, `resident_chain_abandoned_cpu_recovery`,
+`frame_bgra_short`, `chain_resident_land_fail`, `surface_resident_*`, `type11_window_invent`,
+`BadGrid`, `read_overrun`, `write_gate_no_spans`, uncovered `host_window_slate`, and
+`deferred_flush_lost … reason=cache_miss` — **all 0**. Failure channel 91 lines, led by the
+documented-benign `cmd_task_ambiguous` (13), `gva_zero_pfn` (11), `task_walk_ambiguous` (5).
+
 ### An Unbacked Present Is Only Black When Nothing Carries It
 
 **The goal-2 detector was measuring a witness the resident rail stopped maintaining, and saying so in
@@ -2669,9 +2779,16 @@ Three details worth keeping:
 `resident_presentable` lost its `host-window` gate to do this: the question is about the target
 registry, not about a window.
 
-**Not yet observed live.** No boot since the change, so `carried=resident` demoting those four lines
-is a construction argument, not a measurement. The next boot's check is that they appear on the census
-channel with `carried=resident`, and that any `carried=nothing` is still a failure.
+**Verified live on the `37365a0` boot.** Both occurrences read
+
+```
+OFF present_unbacked reason=present_backing_never_stored mid=5 geom=1920x1080 gen=0 carried=resident
+```
+
+— the `OFF ` prefix, i.e. the census channel, with `carried=resident`. Under the old code these were
+failure-channel lines asserting "the surface is uninitialized, so this shows black" while a resident
+carried them. `carried=nothing` has not been observed, so the failure arm is still untested by a live
+boot; that is the arm that matters and it needs a boot that actually loses a frame.
 
 ### The 20 Hz Present Cap Is The Host Panel Being Asleep, Not The Swapchain
 
