@@ -20,12 +20,18 @@
 use crate::contract::pixel_format::RGBA8_BPP;
 use crate::model::{DeviceState, HostSurface, MAX_SCANOUT_DIM};
 
+/// `generation` is issued by
+/// [`DeviceState::next_sampled_content_generation`] and is never derived from
+/// the entry being replaced: an entry-local counter restarts whenever the entry
+/// is re-created, and half of this cache's identity contract is that a
+/// generation names one content for the life of the device.
 fn store_into(
     map: &mut std::collections::BTreeMap<u32, HostSurface>,
     id: u32,
     width: u32,
     height: u32,
     bgra: std::sync::Arc<Vec<u8>>,
+    generation: u64,
 ) {
     if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return;
@@ -37,10 +43,7 @@ fn store_into(
         return;
     }
     let entry = map.entry(id).or_default();
-    entry.host_gen = entry.host_gen.wrapping_add(1);
-    if entry.host_gen == 0 {
-        entry.host_gen = 1;
-    }
+    entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
@@ -60,7 +63,7 @@ fn get_from_with_gen(
     id: u32,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32)> {
+) -> Option<(&[u8], u64)> {
     let e = map.get(&id)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -89,7 +92,15 @@ pub fn store_shared(
     height: u32,
     bgra: std::sync::Arc<Vec<u8>>,
 ) {
-    store_into(&mut state.host_surfaces, surface_id, width, height, bgra);
+    let generation = state.next_sampled_content_generation();
+    store_into(
+        &mut state.host_surfaces,
+        surface_id,
+        width,
+        height,
+        bgra,
+        generation,
+    );
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
@@ -132,11 +143,9 @@ pub fn cede_surface_to_resident(
     {
         return false;
     }
+    let generation = state.next_sampled_content_generation();
     let entry = state.host_surfaces.entry(surface_id).or_default();
-    entry.host_gen = entry.host_gen.wrapping_add(1);
-    if entry.host_gen == 0 {
-        entry.host_gen = 1;
-    }
+    entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
     entry.bgra = std::sync::Arc::new(Vec::new());
@@ -198,12 +207,14 @@ pub fn store_texture(
     height: u32,
     bgra: Vec<u8>,
 ) {
+    let generation = state.next_sampled_content_generation();
     store_into(
         &mut state.host_texture_surfaces,
         texture_ref,
         width,
         height,
         std::sync::Arc::new(bgra),
+        generation,
     );
 }
 
@@ -504,11 +515,9 @@ pub fn store_gva_owned(
     if bgra.len() < need {
         return;
     }
+    let generation = state.next_sampled_content_generation();
     let entry = state.host_gva_surfaces.entry(gva).or_default();
-    entry.host_gen = entry.host_gen.wrapping_add(1);
-    if entry.host_gen == 0 {
-        entry.host_gen = 1;
-    }
+    entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
     entry.bgra = std::sync::Arc::new(bgra);
@@ -528,7 +537,7 @@ pub fn get_gva_with_gen(
     gva: u64,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32)> {
+) -> Option<(&[u8], u64)> {
     let e = state.host_gva_surfaces.get(&gva)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -548,7 +557,7 @@ pub fn get_gva_with_owner(
     gva: u64,
     width: u32,
     height: u32,
-) -> Option<(&[u8], u32, u8)> {
+) -> Option<(&[u8], u64, u8)> {
     let e = state.host_gva_surfaces.get(&gva)?;
     if e.width != width || e.height != height || e.bgra.is_empty() {
         return None;
@@ -577,6 +586,75 @@ mod tests {
 
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+
+    /// A generation must name one content for the life of the device, and the
+    /// hard case is the one that shipped broken: the entry is *destroyed* in
+    /// between.
+    ///
+    /// `evict_gva` runs on every deferred GVA render Store arm, so this
+    /// sequence is the routine compositor path rather than a corner. With a
+    /// per-entry counter both stores report generation 1, the engine's sampled
+    /// cache matches `(gva, 1)` against the image it retained for the first
+    /// one, and binds the previous content — measured live as
+    /// `sampled_identity_stale identity_key=0xa4c000 generation=1` over two
+    /// different 64x64 icons.
+    ///
+    /// Asserting the two generations differ is the whole property; asserting
+    /// either value would pin the counter's history instead.
+    #[test]
+    fn a_gva_reused_after_eviction_never_repeats_a_generation() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (gva, w, h) = (0xa4_c000u64, 2u32, 2u32);
+
+        store_gva(&mut st, gva, w, h, vec![0x11; (w * h * 4) as usize]);
+        let (_, first, _) = get_gva_with_owner(&st, gva, w, h).expect("first store");
+
+        evict_gva(&mut st, gva);
+        assert!(
+            get_gva_with_owner(&st, gva, w, h).is_none(),
+            "the arm removes the entry outright"
+        );
+
+        store_gva(&mut st, gva, w, h, vec![0x22; (w * h * 4) as usize]);
+        let (bytes, second, _) = get_gva_with_owner(&st, gva, w, h).expect("second store");
+
+        assert_eq!(bytes[0], 0x22, "the cache holds the new content");
+        assert_ne!(
+            first, second,
+            "same gva, different bytes, same generation: the sampled cache \
+             would bind the first store's image for the second store's pixels"
+        );
+    }
+
+    /// The same rule across producers. The generations used to live in two
+    /// namespaces split by a `1 << 32` constant precisely because the counters
+    /// were independent; one counter removes the constant and the failure mode
+    /// it was guarding against, so nothing may reintroduce a second source.
+    #[test]
+    fn every_host_cache_producer_draws_from_one_generation_source() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let px = vec![0u8; 4 * 4 * 4];
+        let mut seen = std::collections::HashSet::new();
+
+        store(&mut st, 7, 4, 4, px.clone());
+        seen.insert(get_from_with_gen(&st.host_surfaces, 7, 4, 4).expect("mid store").1);
+        store_texture(&mut st, 9, 4, 4, px.clone());
+        seen.insert(
+            get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
+                .expect("ref store")
+                .1,
+        );
+        store_gva(&mut st, 0x5000, 4, 4, px);
+        seen.insert(get_gva_with_gen(&st, 0x5000, 4, 4).expect("gva store").1);
+        assert!(
+            cede_surface_to_resident(&mut st, 7, 4, 4),
+            "cession is a state change and must take a generation too"
+        );
+        seen.insert(st.host_surfaces.get(&7).expect("ceded entry").host_gen);
+
+        assert_eq!(seen.len(), 4, "four stores, four distinct generations");
+        assert!(!seen.contains(&0), "0 is reserved for 'no host content yet'");
+    }
 
     /// Deferred linear residency lifecycle: note marks the entry
     /// resident-authoritative with empty bytes, the resident getter validates

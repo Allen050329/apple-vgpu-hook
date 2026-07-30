@@ -3158,6 +3158,104 @@ the persistence within a round, and the tooling (`content_summary`, `state_chang
 `sampled_content`, `gva_sample_rung`). What does not survive is every sentence about the sampled-bind
 rung transition.
 
+### A Per-Entry Generation Cannot Name Content, Because The Entry Is Destroyed On The Hot Path
+
+**Found and fixed. The mechanism is settled by a unit test that fails without the fix, not by a
+boot.** This is the first named mechanism the icon class has had.
+
+The engine's sampled cache has two hit paths and only one of them looks at content.
+`find_cached_sampled`'s fallback hashes the incoming bytes and matches a 128-bit digest, so it
+cannot serve the wrong image. The **identity** fast path above it matches `SampledContentIdentity`
+(`key` + `generation`) and binds the retained `VkImage` **without hashing or comparing anything** —
+that is the whole saving. So the identity is a *claim*, and until now nothing on either side ever
+re-read it: the retained image has no CPU mirror, so a false claim is invisible from both directions.
+
+`audit_sampled_identity` (`REIMS_VGPU_CONTENT_PROBE=1`) hashes the incoming bytes on every identity
+hit and compares them against the digest the entry was admitted with. **It fired on the first boot:
+6 mismatches in 299 008 checked claims.**
+
+```
+sampled_identity_audit reason=sampled_identity_stale identity_key=0xa4c000 generation=1
+    retained=1680017cc77f6dc5bf1b2e2773463371 incoming=35c5df2df42ee4a49ad7a7cfd846b71c
+    geom=64x64 checked=262755 mismatched=1
+```
+
+Two fields attribute it with no further work. `geom=64x64` is the icon geometry — the subject of the
+repro, not a display-sized layer. `generation=1` was below the old `GUEST_LINEAR_GEN_BASE` (`1 << 32`),
+so the producer is the **GVA host cache** and not either guest memo.
+
+**The mechanism, read from the code.** `store_gva_owned` did
+`host_gva_surfaces.entry(gva).or_default()` then `host_gen.wrapping_add(1)` — a **per-entry** counter,
+so a freshly created entry is *always* generation 1. Entries are removed by `evict_gva`, and
+`evict_gva` is not rare: it is called on **every deferred GVA render Store arm**
+(`metal_draw/vulkan.rs`), which is the routine compositor path. So:
+
+1. gva X is stored — entry created, `host_gen = 1`, content A. The engine retains image A under
+   identity (X, 1).
+2. A deferred GVA render Store arms at X and calls `evict_gva` — the entry is destroyed.
+3. The next store re-creates it: `or_default()`, **`host_gen = 1` again**, content B.
+4. The next bind resolves B, claims (X, 1), and the engine's identity fast path binds **A**.
+
+`(gva, 1)` therefore names an unbounded number of distinct contents over a boot. That accounts for
+every property this class has: silent (nothing compared anything), load-dependent (deferred Store
+arms need compositor load), victim moves (which texture sits on a re-created entry varies), and
+decided once per composite then held.
+
+**The fix is uniqueness by construction, not a second check.** Every producer of a sampled-content
+identity now draws its generation from one device-global monotonic counter,
+`DeviceState::next_sampled_content_generation`. A value is issued once and never again, so identity
+uniqueness no longer depends on any producer's entry lifetime, key space or eviction policy. The
+guest-linear and type-5 memos were already sharing a counter and were sound; the GVA host cache was
+the one producer that was not, and the mid-keyed and ref-keyed caches had the same latent shape.
+
+That also **deletes `GUEST_LINEAR_GEN_BASE`**. The `1 << 32` namespace split existed only because two
+producers kept independent counters that could collide; one counter removes the constant and the
+failure mode it was guarding. `HostSurface.host_gen` and `LinearSampledMemo.host_gen` widen to `u64`
+(three diagnostic readers print it; `HostLinearTexture.host_gen` is a different quantity — the
+engine's u32 compute-resident generation — and is untouched).
+
+Three things worth carrying:
+
+- **The old tests asserted the namespace, which is a restatement of the constant, not the property.**
+  Three of them checked `generation > u32::MAX`, i.e. "the two counters are in different ranges". That
+  is true of the broken code as well: it says nothing about whether a generation ever repeats. The
+  test that matters is `a_gva_reused_after_eviction_never_repeats_a_generation` — store, `evict_gva`,
+  store — which fails on the parent commit with `left: 1`, the exact value the boot measured. **When a
+  test asserts a namespace, ask what it would say if the counter inside one namespace restarted.**
+- **A claim that crosses a module boundary needs an audit before it needs a fix.** This is the
+  `-> bool` collapse rule ("a reason the caller writes is not a reading") applied to an *identity*
+  rather than to a decline reason: the producer asserted "these bytes are unchanged" and the consumer
+  spent a whole cache on believing it. The audit cost ~40 lines and one boot, and it converted a class
+  that had survived a dozen commits of correlation into a two-line arithmetic bug.
+- **The audit is a lower bound on incidence, not a census of the defect.** It sees only identity
+  fast-path hits whose bytes actually differ, so a round can corrupt with zero lines — and two did on
+  that boot. Do not read a future zero as "the class is closed".
+
+**Repro tooling, in `.agents/repros/` (untracked, like the rest).** `icon-composite.sh` drives N
+rounds in one boot, asserts the load arm by process count, holds the panel, slices the log per round,
+and reports **SKIPPED** for a round byte-identical to its predecessor — the second `killall Finder`
+does not always recomposite, and a round that did not happen must not count as evidence in either
+direction. `iconscore.py` scores folder icons as connected blue blobs, so it needs no golden
+reference and no fixed crop: window position, capture scale and appearance all move between runs and
+blob geometry does not. Its `--across` presence table is the instrument this class was missing —
+
+| cell | rounds 1-6 | |
+|---|---|---|
+| `y 9 x 28` | `.#####` | Desktop, absent in round 1 |
+| `y 9 x 32` | `####.#` | Documents, absent in round 5 |
+| `y 9 x 37` | `###...` | Downloads, absent in rounds 4-6 |
+| `y 9 x 42` / `46` / `51`, `y 14 x 28` | `######` | always present |
+
+4 of 6 rounds corrupt and 2 clean, so **the clean control arm this file demands is produced by the
+same run at no extra cost** — which is exactly what the previous mechanism in this class died for the
+want of. Confirmed on pixels: round 5 renders Documents as a narrow dark vertical bar and Downloads
+as a shrunken top-left fragment; round 3 renders all seven correctly.
+
+`REIMS_VGPU_SAMPLED_CACHE_OFF=1` forces every sampled bind to miss and re-upload. It is the bisection
+that separates "the wrong bytes were resolved" from "the right bytes were resolved and a retained
+image was bound in their place". Unused so far — the audit answered first — and it costs one upload
+per bind, so a boot that sets it must not be read for frame rate.
+
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
 Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,

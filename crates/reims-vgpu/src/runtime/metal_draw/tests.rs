@@ -2765,12 +2765,15 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
     assert_eq!(&rgba[..4], &[10, 20, 40, 255]);
     let identity = identity.expect("GVA cache identity");
     assert_eq!(identity.key, texel_gva);
-    assert_eq!(identity.generation, 1);
+    // The value is whatever the device-global counter had reached; what the
+    // engine binds on is that it was issued once. Pinning a literal here would
+    // pin the counter's history, not the property.
+    assert_ne!(identity.generation, 0, "0 means no host content yet");
 }
 
 /// Guest-CPU-produced tight linear textures: unchanged native bytes must
-/// reuse the memoized RGBA Arc under a stable >u32::MAX generation
-/// identity; a guest write must be observed and produce a new generation.
+/// reuse the memoized RGBA Arc under a stable generation identity; a guest
+/// write must be observed and produce a new generation.
 #[test]
 fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     use crate::contract::endian::{st16, st32, st64};
@@ -2851,11 +2854,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     assert_eq!(&rgba1[..4], &[7, 5, 3, 255], "native BGRA8, unswizzled");
     let id1 = id1.expect("guest memo path must carry an identity");
     assert_eq!(id1.key, texel_gva);
-    assert!(
-        id1.generation > u32::MAX as u64,
-        "guest generations must not alias host_gen: {}",
-        id1.generation
-    );
+    assert_ne!(id1.generation, 0, "0 means no host content yet");
 
     let (_, _, rgba2, id2, _) =
         load_linear_from_host_caches(&mut state, &mut host, 1, tex_ref, &le_entry, &td)
@@ -2973,11 +2972,7 @@ fn padded_bgra8_memoized_uploads_native_without_swizzle() {
         "padded BGRA8 must upload native (no CPU swizzle)"
     );
     let id = identity.expect("the padded memo path carries a producer identity");
-    assert!(
-        id.generation > u32::MAX as u64,
-        "guest generations must not alias host_gen: {}",
-        id.generation
-    );
+    assert_ne!(id.generation, 0, "0 means no host content yet");
     // Tight output = the two source rows concatenated, native BGRA order,
     // padding stripped. Length is w*h*4 regardless of format.
     let mut want = Vec::new();
@@ -3406,9 +3401,9 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     );
     // Native footprint: two bytes per texel, tight rows (no RGBA8 expand).
     assert_eq!(rgba1.len(), (width * height * 2) as usize);
-    assert!(
-        id1.generation > (1u64 << 32),
-        "type-5 identities share the guest-linear generation namespace"
+    assert_ne!(
+        id1.generation, 0,
+        "0 means no host content yet; every real store takes a fresh generation"
     );
     assert_eq!(
         id1.key,

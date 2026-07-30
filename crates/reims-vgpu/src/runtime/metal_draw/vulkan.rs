@@ -1754,9 +1754,9 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
         });
     }
     // Identity key namespace: bit 63 marks type-5 view content (guest linear
-    // identities use the raw sampled GVA as key). Generations come from the
-    // shared `guest_linear_gen` counter, so a (key, generation) pair can never
-    // alias content across producers even on a key collision.
+    // identities use the raw sampled GVA as key). Every producer draws its
+    // generation from `DeviceState::next_sampled_content_generation`, so a
+    // (key, generation) pair cannot alias content even on a key collision.
     let identity_key = (1u64 << 63) | ((view.plane_index as u64) << 32) | mapping_id as u64;
     let memo_key = (
         mapping_id,
@@ -1844,8 +1844,7 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
     } else {
         std::sync::Arc::new(native.clone())
     };
-    state.guest_linear_gen += 1;
-    let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
+    let generation = state.next_sampled_content_generation();
     ok_line("fill", &rgba);
     let entry_bytes = native.len() + rgba.len();
     state.type5_view_memo.insert(
@@ -2586,7 +2585,7 @@ fn linear_sampled_memo_reuse(
     task_id: u32,
     texture_ref: u32,
     gva: u64,
-    host_gen: u32,
+    host_gen: u64,
     width: u32,
     height: u32,
 ) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -2599,12 +2598,6 @@ fn linear_sampled_memo_reuse(
     (m.gva == gva && m.host_gen == host_gen && m.width == width && m.height == height)
         .then(|| m.rgba.clone())
 }
-
-/// Generation namespace for guest-linear memo identities. Host-cache
-/// generations (`host_gen`) are nonzero u32; guest-memo generations live
-/// strictly above `u32::MAX` so the same `gva` identity key can never alias
-/// content across the two producers.
-const GUEST_LINEAR_GEN_BASE: u64 = 1 << 32;
 
 /// Serve a guest-CPU-produced linear texture (tight OR padded row stride)
 /// through the byte-exact revalidated memo. Every call re-reads the native
@@ -2743,8 +2736,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         state.guest_linear_scratch = scratch;
         return None;
     };
-    state.guest_linear_gen += 1;
-    let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
+    let generation = state.next_sampled_content_generation();
     let rgba = std::sync::Arc::new(rgba);
     let entry_bytes = scratch.len() + rgba.len();
     state.guest_linear_memo.insert(
@@ -2796,7 +2788,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         if gva_cache_owner_allows_object_type(producer_type, entry.object_type) {
             let identity = Some(LinearSampleIdentity {
                 key: gva,
-                generation: host_gen as u64,
+                generation: host_gen,
             });
             // Memo fast path: same authoritative entry (gva/gen/geom) means the
             // swizzled copy is already made - reuse the Arc, skip copy+swizzle.

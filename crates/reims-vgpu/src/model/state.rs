@@ -999,8 +999,15 @@ pub struct HostSurface {
     /// point at one allocation, and replacing the entry leaves the window's
     /// pixels intact instead of orphaning them.
     pub bgra: std::sync::Arc<Vec<u8>>,
-    /// Monotonic host store generation (independent of guest content_generation).
-    pub host_gen: u32,
+    /// Generation of the store that produced these bytes, issued by
+    /// [`DeviceState::next_sampled_content_generation`] (independent of guest
+    /// `content_generation`).
+    ///
+    /// Device-global rather than per-entry, because this value is half of the
+    /// sampled-content identity the engine binds on. A per-entry counter is
+    /// only unique while the entry lives, and this map's entries are removed
+    /// and re-created on the routine deferred-Store arm path.
+    pub host_gen: u64,
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
@@ -1280,7 +1287,7 @@ pub const LINEAR_SAMPLED_MEMO_BYTE_CAP: usize = 128 << 20;
 #[derive(Clone, Debug)]
 pub struct LinearSampledMemo {
     pub gva: u64,
-    pub host_gen: u32,
+    pub host_gen: u64,
     pub width: u32,
     pub height: u32,
     pub rgba: std::sync::Arc<Vec<u8>>,
@@ -1485,10 +1492,24 @@ pub struct DeviceState {
     /// ([`GUEST_LINEAR_MEMO_BYTE_CAP`]): a cap crossing evicts the least-recently
     /// -used entries down to a low-water mark, never bulk-clearing the hot set.
     pub guest_linear_memo: LruBytesMemo<(u32, u64, u32, u32, u16), GuestLinearMemo>,
-    /// Monotonic content-generation source for [`Self::guest_linear_memo`]
-    /// and [`Self::type5_view_memo`] (shared so a generation value never
-    /// repeats across the two producers).
-    pub guest_linear_gen: u64,
+    /// Monotonic source for every sampled-content generation this device
+    /// hands the engine. Read only through
+    /// [`DeviceState::next_sampled_content_generation`].
+    ///
+    /// The engine's sampled cache binds a retained image on `(key, generation)`
+    /// alone — no hash, no compare — so a generation that ever repeats over
+    /// different bytes binds the wrong picture, silently. One counter for all
+    /// producers is what makes that impossible: a value is issued once and
+    /// never again, so uniqueness does not depend on any producer's entry
+    /// lifetime, key space, or eviction policy.
+    ///
+    /// Each producer used to keep its own counter and the difference was
+    /// measured, not theorised. The guest-linear and type-5 memos shared this
+    /// one and were sound; the GVA host cache incremented a *per-entry* field
+    /// that restarted at 1 whenever the entry was re-created, and
+    /// `evict_gva` re-creates it on every deferred GVA render Store arm. One
+    /// boot's audit caught `(0xa4c000, 1)` naming two different 64x64 icons.
+    pub sampled_content_gen: u64,
     /// Reusable native-row read buffer for the guest-linear memo path.
     pub guest_linear_scratch: Vec<u8>,
     /// Byte-exact revalidated memo for type-5 serialized texture views
@@ -1736,7 +1757,7 @@ impl DeviceState {
             retired_gva_windows: Vec::new(),
             linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
-            guest_linear_gen: 0,
+            sampled_content_gen: 0,
             guest_linear_scratch: Vec::new(),
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
@@ -2968,6 +2989,22 @@ impl DeviceState {
         e.height = height;
         e.format = format;
         true
+    }
+
+    /// Issue a sampled-content generation that has never been issued before.
+    ///
+    /// Every producer of a sampled-content identity must take its generation
+    /// from here and nowhere else. The value is what the engine's sampled
+    /// cache binds on without looking at a single byte, so "never issued
+    /// before" is the whole of the contract — see
+    /// [`Self::sampled_content_gen`]. Never returns 0, which readers use for
+    /// "no host content yet".
+    pub fn next_sampled_content_generation(&mut self) -> u64 {
+        self.sampled_content_gen = self.sampled_content_gen.wrapping_add(1);
+        if self.sampled_content_gen == 0 {
+            self.sampled_content_gen = 1;
+        }
+        self.sampled_content_gen
     }
 
     /// Bump content generation after a write into the mapping (0 never skips).

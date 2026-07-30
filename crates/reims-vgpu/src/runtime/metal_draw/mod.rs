@@ -3929,8 +3929,9 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     }
     // Identity key namespace: bits 63+62 mark type-11 memo content, distinct from
     // raw-GVA keys (bit 63 clear) and type-5 view keys (bit 63 set, bit 62 clear).
-    // The shared `guest_linear_gen` makes every (key, generation) pair unique
-    // across all three memo producers, so content can never alias on a collision.
+    // Every producer draws its generation from
+    // `DeviceState::next_sampled_content_generation`, so a (key, generation)
+    // pair is unique device-wide and content can never alias on a collision.
     let identity_key = (1u64 << 63) | (1u64 << 62) | mid as u64;
     let key = (mid, w, h);
     if let Some(m) = state.type11_memo.get_touch(&key) {
@@ -3963,8 +3964,7 @@ fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
         return None;
     }
     let rgba = std::sync::Arc::new(rgba);
-    state.guest_linear_gen += 1;
-    let generation = GUEST_LINEAR_GEN_BASE + state.guest_linear_gen;
+    let generation = state.next_sampled_content_generation();
     let entry_bytes = scratch.len() + rgba.len();
     state.type11_memo.insert(
         key,
