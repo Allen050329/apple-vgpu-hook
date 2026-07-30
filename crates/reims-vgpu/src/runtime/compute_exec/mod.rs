@@ -854,6 +854,16 @@ enum TextureWriteback {
         width: u32,
         height: u32,
         bpp: u32,
+        /// Guest pages this window resolved to when the texture was staged,
+        /// i.e. **before** the dispatch that produces the bytes.
+        ///
+        /// `writeback_texture` runs after the GPU has finished, and the guest
+        /// runs on its own vCPUs across that gap; a walk taken then answers
+        /// where the address points *now*, which is a different question from
+        /// whether it is still this texture's memory. Empty when the stage-time
+        /// walk resolved nothing, which leaves the write unbounded exactly as
+        /// it was — the writer's own walk fails closed on its own terms.
+        pages: std::collections::HashSet<u64>,
     },
     Type11 {
         mapping_id: u32,
@@ -864,6 +874,43 @@ enum TextureWriteback {
         height: u32,
         bpp: u32,
     },
+}
+
+/// Guest pages a linear storage window resolves to at stage time.
+///
+/// Taken before the dispatch so the set names the memory the *command* was
+/// issued against, not whatever the address points at once the GPU is done.
+/// An empty set means the walk resolved nothing and the writeback stays
+/// unbounded, which is what it was before this existed.
+fn staged_window_pages<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    row_stride: u64,
+    height: u32,
+) -> std::collections::HashSet<u64> {
+    let mut pages = std::collections::HashSet::new();
+    if gva == 0 {
+        return pages;
+    }
+    let Some(span) = row_stride.checked_mul(height as u64) else {
+        return pages;
+    };
+    gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            pages.insert(gpa_page);
+            true
+        },
+    );
+    pages
 }
 
 pub(crate) struct StagedTexture {
@@ -2233,6 +2280,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             width: w,
             height: h,
             bpp,
+            pages: staged_window_pages(state, host, task_id, gva, layout.row_stride, h),
         }
     } else {
         TextureWriteback::None
@@ -2416,6 +2464,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
             width,
             height,
             bpp,
+            pages,
         } => {
             let tight = (*width as usize) * (*bpp as usize);
             let required = tight.saturating_mul(*height as usize);
@@ -2484,7 +2533,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
             // not arrived. The graceful degradation it provided is real and is
             // kept; what changed is that it is now keyed on the condition itself
             // rather than on a proxy that also catches healthy writes.
-            match write_linear_guest(
+            match write_linear_guest_within(
                 state,
                 host,
                 task_id,
@@ -2494,6 +2543,7 @@ fn writeback_texture<M: HostMemory + HostOps>(
                 *height,
                 &tex.bytes,
                 &format!("bind={}", tex.binding),
+                (!pages.is_empty()).then_some(pages),
             ) {
                 LinearWrite::Written => Ok(()),
                 // Nothing resolves under this task, so there is nowhere to put
@@ -2580,27 +2630,14 @@ pub(crate) enum LinearWrite {
 }
 
 /// Write tight-row `bytes` into a strided linear guest window through fresh
-/// task page-table walks (bulk view when packable, per-row fallback). Fail
-/// lines carry `ctx` for the call site.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    gva: u64,
-    row_stride: u64,
-    tight: usize,
-    height: u32,
-    bytes: &[u8],
-    ctx: &str,
-) -> LinearWrite {
-    write_linear_guest_within(
-        state, host, task_id, gva, row_stride, tight, height, bytes, ctx, None,
-    )
-}
-
-/// [`write_linear_guest`] bounded to the guest pages a deferred window was
-/// armed on.
+/// task page-table walks (bulk view when packable, per-row fallback), bounded
+/// to the guest pages the caller was authorised to write. Fail lines carry
+/// `ctx` for the call site.
+///
+/// There is no unbounded sibling. Both doors onto this rail — the deferred
+/// flush and the post-dispatch writeback — hand content produced earlier to a
+/// walk taken later, so both need the bound; a wrapper passing `None` would
+/// only be a way to reach the rail without one.
 ///
 /// The linear compute rail defers exactly as the GVA render rail does, and it
 /// re-walks at flush time for the same reason, so it has the same hazard and

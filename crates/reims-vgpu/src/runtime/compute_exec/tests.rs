@@ -1371,6 +1371,7 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
         seed_skipped: false,
         sample_resident: None,
         writeback: TextureWriteback::Linear {
+            pages: Default::default(),
             texture_ref,
             gva,
             pixel_format: MTL_FORMAT_RGBA8_UNORM,
