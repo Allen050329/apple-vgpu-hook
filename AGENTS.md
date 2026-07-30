@@ -3287,6 +3287,88 @@ without it, and it deletes a namespace constant. Keep it. Do not credit it with 
 wrong *image* rather than a wrong *rate*, it costs nothing unless the probe is on, and the next
 producer to invent a second generation source will be reported by name rather than by a screenshot.
 
+### The Desktop Wallpaper Renders Solid Black On Whole Boots, Silently, And It Is Not A Regression
+
+Found 2026-07-30. This is the cheapest handle the black-framebuffer class has had: **whole-screen,
+stable for an entire boot, and it needs no gesture, no browser and no drag**. Every other layer --
+Dock, menu bar, window chrome, Finder icons -- renders perfectly in the same frame, so it is a
+whole-compositing-layer loss. `.agents/repros/black-desktop.sh` scores it across N boots.
+
+Three things are settled, and the last one is the one that will otherwise be re-derived every session.
+
+**It is in the draw rail, not the present path.** The guest's own native `screencapture` is black in
+the same instant our host window is (desktop-region mean 0.001 against 0.37 on a good boot). That
+capture re-executes the guest's composite through us, so the wallpaper layer is black in the image
+the *guest* computes. `killall Dock` does not repair it, and neither does `killall WindowServer` --
+so it is not a one-shot loss at boot that a repaint fixes, and the whole "we presented a stale or
+partial composite" family is out.
+
+**It is completely silent.** On a black boot every sentinel this class has reads 0:
+`type11_seed_cache_absent`, `type11_seed_cache_geom`, `type11_seed_cache_ceded`,
+`deferred_flush_lost`, `draw_vk_nothing_stored`, `resident_chain_abandoned_cpu_recovery`,
+`chain_resident_land_fail`, `present_unbacked`, `linear_load_span_exceeds_alloc`,
+`draw_prepare_chain_resident_not_ready`, `draw_prepare_chain_resident_identity_missing`,
+`type11_window_invent`, `BadGrid`. The failure channel carries only the documented-benign
+`cmd_task_ambiguous` / `gva_zero_pfn` / `task_walk_ambiguous`. A whole layer of guest work is lost
+and nothing reports it, which is a ground-rules violation independent of the cause. A slug-set
+difference over 8 black and 3 good boots returns **nothing present in every black boot and absent
+from every good one**, in either direction -- so the next step for this class is a probe, and the
+census is not where to put it.
+
+**It is NOT a regression, and a bisect said it was.** This is the expensive part and it is the
+transferable one. The defect presented as perfectly deterministic -- 7 boots at `f818b11`, all black,
+`desk_mean` bit-identical to six significant figures at `0.000496384` -- and last night's `1c34f7c`
+rendered correctly, so `git bisect run` over the day's 100 commits was the obvious move. It ran to a
+confident answer. **The answer was garbage**: it bracketed the first bad commit between `98c8725`
+(scored good) and `45336a2` (scored bad), and
+
+```sh
+git diff 98c8725 45336a2 -- crates vendor vm scripts   # empty
+```
+
+Those two trees are **byte-identical outside AGENTS.md**, as are the two commits between them. Then a
+fresh boot at `f818b11` -- the same commit that had just gone black seven times -- rendered the
+wallpaper. The same binary produces both outcomes.
+
+So: **before believing a bisect, diff the code between the reported good and bad.** It costs one
+command. A flaky predicate does not make `git bisect` fail; it makes it succeed, and hand back a
+commit with a plausible-looking message. Three of the four candidates here were `:mag:` documentation
+commits, which is the other cheap tell -- if the culprit cannot have changed behaviour, the run is
+invalid, not surprising.
+
+**An empty `desktoppicture.db` does not mean "no wallpaper", and reading it that way cost a wrong
+"this is rig state" conclusion.** The guest's db has `pictures: 6, data: 0, preferences: 0`, which
+reads exactly like a wallpaper that was configured and then cleared -- and AGENTS.md even documents
+the trigger that GCs the orphaned `data` row. It is a red herring: **macOS falls back to the stock
+`Ventura Graphic.heic` when no preference row exists**, and boots with that same empty db render the
+wallpaper correctly. Nothing was stripped from the 2026-07-22 snapshot. Score the pixels, not the
+configuration.
+
+**Scoring, and the one-character trap in it.** Read the *desktop region only* -- the whole-screen mean
+cannot separate the populations well because the Dock and menu bar are bright in both. And pass
+`-alpha off`: these captures carry an opaque alpha channel and `%[fx:mean]` averages it in, which maps
+a pure-black desktop to 0.5 and a wallpaper to 0.715 -- two populations 0.2 apart, both clearing any
+sane floor, i.e. a scorer that silently cannot see the defect. With alpha dropped they are 0.0005 and
+0.43, three orders apart.
+
+**Open, and the next measurement.** The black boots and the good boots so far fall into two clean
+blocks that differ by *two* things at once -- whether the host panel was held awake, and an hour of
+wall clock:
+
+| arm | boots | black |
+|---|---|---|
+| panel unheld, 20:00-20:35 | 6 | **6** |
+| panel unheld (`--interactive`, same window) | 1 | **1** |
+| panel held awake, 21:50-22:30 | 8 | **0** |
+
+8/8 against 6/6 is a large split and it is **not attributed**: this is the "count what your A/B
+actually changed" trap in its standard form, and the panel arm is the more suspicious of the two only
+because it is the variable that was deliberately introduced. Note the host panel is already documented
+here as a 4x confound on `present_hz`; whether it can reach the *guest's own composite* is exactly what
+is unmeasured. Separating them needs the two arms **interleaved**, scored on the guest capture (which
+cannot be affected by whether the host panel is lit), with the `dpms` value sampled throughout and
+printed next to the verdict.
+
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
 Same boot as above, `.agents/repros/testufo-fps.sh /tmp/ufo-probe 45`, `PANEL: On 15/15 samples`,
