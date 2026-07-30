@@ -1887,6 +1887,13 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_read"));
         }
+        if crate::observe::content_probe_enabled() && !seed_skipped && sample_resident.is_none() {
+            crate::observe::off(format!(
+                "compute_content stage=stage_read mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} storage={} gen={seed_generation} {}",
+                is_storage as u8,
+                crate::observe::content_summary(&bytes, bpp),
+            ));
+        }
         let writeback = if is_storage {
             TextureWriteback::Type11 {
                 mapping_id,
@@ -2509,6 +2516,14 @@ fn writeback_texture<M: HostMemory + HostOps>(
             bpp,
         } => {
             let tight = width.saturating_mul(*bpp);
+            if crate::observe::content_probe_enabled() {
+                crate::observe::off(format!(
+                    "compute_content stage=write_out mapping={mapping_id} {width}x{height} fmt={:#x} bind={} {}",
+                    tex.pixel_format,
+                    tex.binding,
+                    crate::observe::content_summary(&tex.bytes, *bpp),
+                ));
+            }
             if !mapping_write::write_full_rect_raw_at(
                 state,
                 host,

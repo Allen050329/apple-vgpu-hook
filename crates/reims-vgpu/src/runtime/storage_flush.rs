@@ -1119,6 +1119,16 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         return false;
     }
     let tight = key.width.saturating_mul(texel);
+    if crate::observe::content_probe_enabled() {
+        crate::observe::off(format!(
+            "compute_content stage=flush_out mapping={} {}x{} fmt={:#x} gen={generation} {}",
+            key.mapping_id,
+            key.width,
+            key.height,
+            key.pixel_format,
+            crate::observe::content_summary(&bytes, texel),
+        ));
+    }
     if !crate::runtime::mapping_write::write_full_rect_raw_at(
         state,
         host,
