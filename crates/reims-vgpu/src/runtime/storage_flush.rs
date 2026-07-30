@@ -480,21 +480,31 @@ fn deferred_pages_still_ours<M: HostMemory + HostOps>(
             true
         },
     );
-    // An empty or short walk is the teardown case the writers name precisely;
-    // deciding it here too would take it away from the reason that fits it, and
-    // those paths already land cache-only.
-    if live.len() < armed.len() {
-        return true;
-    }
-    if live == *armed {
+    // The property that makes the write safe is not "the same number of pages
+    // came back", it is "every page this write can reach is one the window was
+    // given". `write_gva_rgba8` resolves the destination per row from a fresh
+    // walk, so the pages it can reach are exactly the ones this walk resolves —
+    // and a page of `live` that is not in `armed` is a page some other owner
+    // holds now.
+    //
+    // A subset is the benign teardown case: the guest dropped part of the range
+    // and the rest is still ours, so the rows that still resolve land in our own
+    // pages and the rest fail per-row on their own terms. That is what the
+    // length test was reaching for, and it is not what it tested — `live` can be
+    // shorter than `armed` while containing pages that were never ours, because
+    // pages can disappear and reappear pointing somewhere else in the same walk.
+    // The strictly-shorter arm returned "still ours" for that case, which is the
+    // one arrangement of this range that corrupts another owner's memory.
+    if live.iter().all(|p| armed.contains(p)) {
         return true;
     }
     crate::observe::fail(format!(
         "deferred_window_page_drift gva={gva:#x} task={task_id} {what} \
-         armed_pages={} live_pages={} moved={} guest=refused",
+         armed_pages={} live_pages={} moved={} foreign={} guest=refused",
         armed.len(),
         live.len(),
-        armed.difference(&live).count()
+        armed.difference(&live).count(),
+        live.difference(armed).count()
     ));
     false
 }
@@ -2597,6 +2607,53 @@ mod tests {
             "a window whose pages moved must be refused, not merely reported"
         );
         assert_eq!(drift_lines(at), 1, "a window whose pages moved must report");
+
+        // A window armed on TWO pages whose range now resolves ONE page, and
+        // that page is not one of the two. This is the arrangement a guest
+        // produces by releasing a GPU allocation and letting part of the virtual
+        // range be re-pointed: fewer pages come back, and what does come back
+        // belongs to somebody else.
+        //
+        // A guard keyed on page COUNT reads this as "shorter walk, therefore
+        // teardown, therefore nothing to protect" and permits it, and the writer
+        // then lands rows in `data0` — which this window never owned. Keyed on
+        // membership it is refused, which is what the guest's own crash reports
+        // say has to happen.
+        let at = mark();
+        assert!(
+            !super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[7 * page, 8 * page]),
+                "clear_store",
+            ),
+            "a short walk that resolves a page the window was never armed on is \
+             not a teardown — it is a write into another owner's pages"
+        );
+        assert_eq!(
+            drift_lines(at),
+            1,
+            "the refusal must be visible; a silent one cannot be scored"
+        );
+
+        // The benign half of the same shape: fewer pages come back, and every
+        // one of them is still ours. Refusing this would drop live Stores whose
+        // destination never moved, so the guard must not simply require equal
+        // sets.
+        let at = mark();
+        assert!(
+            super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[data0, 8 * page]),
+                "clear_store",
+            ),
+            "a walk that came back short but entirely inside the armed pages is \
+             the teardown case, and its rows land in this window's own memory"
+        );
+        assert_eq!(drift_lines(at), 0, "a subset walk must stay quiet");
     }
 
     /// The linear compute-storage rail gets the same drift decision as the GVA
