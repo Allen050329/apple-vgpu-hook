@@ -3337,13 +3337,31 @@ fn note_draw_coverage(
     // what the pass did with the texels outside it.
     //
     // `from_target` is load-bearing and was missing from the first version of
-    // this census, which is why its first reading has to be discarded. A LOAD
+    // this census, which is why its first reading had to be discarded. A LOAD
     // whose prior content lives in the engine resident takes the
     // `chain_load_from_target` arm above: it deliberately resolves no CPU seed,
     // sets `LoadOp::LoadFromTarget`, and preserves the attachment. Scoring
     // `target_rgba8.is_some()` alone put every one of those in the unseeded
-    // bucket and produced a 519 715-strong "defect" that is mostly the rail
-    // working. Splitting it is the difference between the two cases:
+    // bucket and produced a 519 715-strong "defect" that was the rail working.
+    //
+    // Split properly, over a driven boot of ten Finder recomposites:
+    //
+    //   draw_scissor_full             1112576
+    //   draw_scissor_partial           589283
+    //     draw_partial_load_from_target 517247
+    //     draw_partial_clear              48303
+    //     draw_partial_dontcare           23728
+    //     draw_partial_load_seeded             5
+    //     draw_partial_load_unseeded           0
+    //
+    // **Zero.** Every `MTLLoadActionLoad` on this pathway arrives with its
+    // prior content, by resident or by seed. At icon geometry specifically, the
+    // 64x64 partial identities are 29 `from_target=1`, 48 `seeded=1`, and 2
+    // `load=Some(0)` — DONT_CARE, undefined outside the scissor by declaration.
+    // No LOAD is being downgraded to a CLEAR, so a partial draw is not how the
+    // rest of a broken icon gets emptied.
+    //
+    // Splitting it is the difference between the three cases:
     //
     //   load_seeded  — LOAD and a seed was resolved. The rest is the old frame.
     //   load_unseeded— LOAD and no seed. Becomes a Vulkan CLEAR, so every texel
