@@ -383,12 +383,25 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
         // freshly zeroed memory (the black-tile class). A mismatch retires
         // the view fail-visibly and rebuilds fresh below.
         state.view_verify_ctr = state.view_verify_ctr.wrapping_add(1);
-        // The denominator. `gva_view_stale` reading zero says nothing on its
-        // own: it is equally the sound of a cache that never goes stale and of
-        // a check that never runs. `view_reuse` is every read served from a
-        // cached host pointer and `view_verify` is the subset that proved
-        // itself, so the two together say what fraction of reads are trusting
-        // a page table nobody re-walked.
+        // The denominator, and it turned out to be the whole answer.
+        // `gva_view_stale` reading zero says nothing on its own: it is equally
+        // the sound of a cache that never goes stale and of a check that never
+        // runs. `view_reuse` is every read served from a cached host pointer
+        // and `view_verify` the subset that proved itself.
+        //
+        // Measured across four driven x86/Vulkan boots: `view_reuse` is **0**.
+        // `find_covering_view` never matches on this pathway, so no read is
+        // ever served from a registered view, the 1-in-32 gate below never
+        // fires, and `gva_view_stale=0` was the sound of a check that never
+        // ran. Views are still built and retired (`gva_view_drop` is nonzero),
+        // so this is a cache with a zero hit rate rather than an idle module.
+        //
+        // Two consequences for anyone reading this next. The sampling gate is
+        // not protecting x86/Vulkan from anything and tuning it would change
+        // nothing here — it has to be justified, if at all, on a pathway where
+        // the reuse count is not zero. And a stale cached view is not how this
+        // pathway reads wrong bytes, because it does not read through cached
+        // views at all.
         crate::runtime::drain::note_store_route("view_reuse");
         if !state.view_verify_ctr.is_multiple_of(32) {
             return Some((vptr, vlen));
