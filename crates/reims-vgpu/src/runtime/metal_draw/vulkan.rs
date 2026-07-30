@@ -3255,6 +3255,26 @@ fn note_load_seed_outcome(
     } else {
         "load_seed_lost"
     });
+    // Per door, because the doors fail for unrelated reasons and a pooled zero
+    // hides a door that never opens. `gva_or_ref` in particular draws its seed
+    // from the two host caches the sampled ladder measured as nearly always
+    // empty for these spans (`gvac_hit` 305 and `lin_rung_texref` 2 against
+    // 725 233 loads), so it is the door most likely to be losing seeds, and a
+    // lost seed turns a LOAD attachment into a CLEAR — every texel the draw
+    // does not cover goes to the clear colour. That is the shape of both the
+    // broken icon cell and the Safari scroll patch.
+    crate::runtime::drain::note_store_route(match (door, seeded) {
+        ("color_seed", true) => "load_seed_ok_color",
+        ("color_seed", false) => "load_seed_lost_color",
+        ("req_seed", true) => "load_seed_ok_req",
+        ("req_seed", false) => "load_seed_lost_req",
+        ("mapping", true) => "load_seed_ok_mapping",
+        ("mapping", false) => "load_seed_lost_mapping",
+        ("gva_or_ref", true) => "load_seed_ok_gva_or_ref",
+        ("gva_or_ref", false) => "load_seed_lost_gva_or_ref",
+        (_, true) => "load_seed_ok_other",
+        (_, false) => "load_seed_lost_other",
+    });
     if seeded {
         return;
     }
