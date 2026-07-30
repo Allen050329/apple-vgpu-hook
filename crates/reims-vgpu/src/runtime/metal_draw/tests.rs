@@ -2656,7 +2656,17 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
         px[2] = 185;
         px[3] = 255;
     }
-    host_cache_store_gva_layer(&mut state, tex_ref, OBJECT_TYPE_TEXTURE, gva, w, h, &rgba);
+    host_cache_store_gva_layer(
+        &mut state,
+        &crate::runtime::host::FakeHost::new(),
+        0,
+        tex_ref,
+        OBJECT_TYPE_TEXTURE,
+        gva,
+        w,
+        h,
+        &rgba,
+    );
     let cached = crate::runtime::surface_cache::get_texture(&state, tex_ref, w, h)
         .expect("texture_ref encode cache");
     // BGRA storage
@@ -2748,6 +2758,7 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         h,
         bgra,
         OBJECT_TYPE_TEXTURE,
+        None,
     );
 
     let le_entry = objects::lookup_list_entry(&state, &host, 1, tex_ref)

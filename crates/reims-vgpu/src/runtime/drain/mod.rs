@@ -3324,10 +3324,22 @@ static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static
     std::sync::Mutex::new(None);
 
 pub fn note_store_route(route: &'static str) {
+    note_store_route_n(route, 1);
+}
+
+/// Add `n` to a named count in the same per-second window as [`note_store_route`].
+///
+/// For events that arrive in batches — one notify marking many cache entries —
+/// where the number that matters is the entries, not the notifies, and taking
+/// the lock once per entry would cost more than the census is worth.
+pub fn note_store_route_n(route: &'static str, n: u64) {
+    if n == 0 {
+        return;
+    }
     if let Ok(mut g) = STORE_ROUTES.lock() {
         *g.get_or_insert_with(Default::default)
             .entry(route)
-            .or_default() += 1;
+            .or_default() += n;
     }
 }
 

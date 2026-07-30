@@ -79,7 +79,10 @@ pub(crate) fn task_matches(view_task: u32, wire_task: u32) -> bool {
 /// Retire every registered GVA view that overlaps `[gva, gva+length)` under `task_id`.
 ///
 /// Pushes `(ptr, ptr_len)` into `retired_views` for [`mapper::flush_retired_views`].
-/// Does **not** touch `host_gva_surfaces` (encode content retained across Unmap).
+/// Does **not** evict `host_gva_surfaces` (encode content is retained across
+/// Unmap — a mapping that churns and comes back must not black out the
+/// wallpaper); it marks the overlapping entries suspect instead, so the next
+/// reader re-walks and finds out whether the GVA still names the same pages.
 ///
 /// Returns the number of views retired. Always-on proxy when `n > 0` is logged by caller.
 pub fn retire_gva_views_overlapping(
@@ -116,6 +119,13 @@ pub fn retire_gva_views_overlapping(
     state
         .flush_nohit_memo
         .retain(|&(t, g, s), _| !(task_matches(t, task_id) && ranges_overlap(g, s, gva, length)));
+    // The GVA-keyed encode cache survives this, but its key does not survive it
+    // unexamined: a remap can leave the same virtual address naming a different
+    // allocation. Exact task id — `task_matches`' aliased arm would mark
+    // another address space's entries on a coincidence.
+    let suspect =
+        crate::runtime::surface_cache::mark_gva_backing_suspect(state, task_id, gva, length);
+    crate::runtime::drain::note_store_route_n("gvac_suspect", suspect as u64);
     n
 }
 

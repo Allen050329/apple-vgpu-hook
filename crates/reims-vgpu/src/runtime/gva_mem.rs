@@ -611,6 +611,70 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
     stride_pages: u64,
     visit: &mut dyn FnMut(u64) -> bool,
 ) {
+    visit_task_gva_pages(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span,
+        page_shift,
+        stride_pages,
+        &mut |gpa| match gpa {
+            Some(gpa) => visit(gpa),
+            None => true,
+        },
+    );
+}
+
+/// Dense per-page leaf GPAs for `[gva, gva+span)`, `0` where a page does not resolve.
+///
+/// [`visit_task_gva_page_gpas`] drops unresolved pages, which is right for a
+/// lookup but wrong for an identity: two different mappings whose holes sit in
+/// different places would collapse to the same list. Callers recording *which
+/// pages these bytes came from* need one slot per page, in GVA order, with the
+/// holes still in them.
+pub fn task_gva_page_gpas_dense<M: HostMemory>(
+    host: &M,
+    tasks: &[TaskEntry],
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+) -> Vec<u64> {
+    let mut out = Vec::new();
+    visit_task_gva_pages(
+        host,
+        tasks,
+        task_id,
+        gva,
+        span,
+        page_shift,
+        1,
+        &mut |gpa| {
+            out.push(gpa.unwrap_or(0));
+            true
+        },
+    );
+    out
+}
+
+/// Shared page-table walk behind [`visit_task_gva_page_gpas`] and
+/// [`task_gva_page_gpas_dense`]: one root read and one walk cache for the whole
+/// range, visiting every `stride_pages`-th page plus the exact last page.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"
+)]
+fn visit_task_gva_pages<M: HostMemory>(
+    host: &M,
+    tasks: &[TaskEntry],
+    task_id: u32,
+    gva: u64,
+    span: u64,
+    page_shift: u32,
+    stride_pages: u64,
+    visit: &mut dyn FnMut(Option<u64>) -> bool,
+) {
     if span == 0 || stride_pages == 0 {
         return;
     }
@@ -646,7 +710,8 @@ pub fn visit_task_gva_page_gpas<M: HostMemory>(
             cur,
             Some(&mut cache),
         );
-        if t.status == ResolveStatus::Ok && !visit(t.gpa & !(page - 1)) {
+        let resolved = (t.status == ResolveStatus::Ok).then(|| t.gpa & !(page - 1));
+        if !visit(resolved) {
             return;
         }
         if cur == last {

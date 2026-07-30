@@ -987,6 +987,27 @@ pub struct GvaHostView {
     pub last_gpa: u64,
 }
 
+/// Which guest pages a GVA-keyed encode was stored against.
+///
+/// [`DeviceState::host_gva_surfaces`] is keyed by guest **virtual** address, and
+/// a GVA is only a name for whatever the guest's page table points it at right
+/// now. The guest recycles those names hard — the deferred-window drift census
+/// routinely reports every page of a GVA moving between arm and flush — so
+/// "same gva, same geometry" does not mean "same allocation". This records the
+/// physical backing the pixels were produced from, exactly, so a later lookup
+/// can tell a mapping that churned and came back (the retained wallpaper class)
+/// from a name the guest handed to a different resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GvaBacking {
+    /// Task whose page table the walk used.
+    pub task_id: u32,
+    /// Byte span the GPA list covers, from the stored geometry.
+    pub span: u64,
+    /// Page-aligned leaf GPAs in GVA order. Order is part of the identity: a
+    /// permutation is a different mapping, not the same one.
+    pub gpas: Vec<u64>,
+}
+
 /// Host-owned BGRA8 frame for a surface_id (Linux/Vulkan render-cache, §8.5).
 #[derive(Clone, Debug, Default)]
 pub struct HostSurface {
@@ -1011,6 +1032,15 @@ pub struct HostSurface {
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
+    /// Guest pages these bytes were produced from, for GVA-keyed entries.
+    /// `None` on the surface_id/texture_ref caches (their key is not a guest
+    /// virtual address) and on any GVA store whose walk did not resolve.
+    pub backing: Option<GvaBacking>,
+    /// The guest changed a page-table mapping overlapping this entry's span
+    /// since [`Self::backing`] was recorded, so the recorded pages may no
+    /// longer be the ones the GVA names. Cleared by the next lookup that
+    /// re-walks and confirms them.
+    pub backing_suspect: bool,
 }
 
 /// Raw type-2/3 texture content retained by the discrete backend.

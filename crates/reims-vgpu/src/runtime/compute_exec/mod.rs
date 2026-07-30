@@ -2456,6 +2456,8 @@ fn writeback_texture<M: HostMemory + HostOps>(
             }
             crate::runtime::surface_cache::mirror_linear_color_cache(
                 state,
+                host,
+                task_id,
                 *texture_ref,
                 *gva,
                 *pixel_format,

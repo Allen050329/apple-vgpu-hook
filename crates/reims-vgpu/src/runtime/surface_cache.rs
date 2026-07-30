@@ -18,7 +18,8 @@
 //! cache content when present so scanout matches what the host executed.
 
 use crate::contract::pixel_format::RGBA8_BPP;
-use crate::model::{DeviceState, HostSurface, MAX_SCANOUT_DIM};
+use crate::model::{DeviceState, GvaBacking, HostSurface, MAX_SCANOUT_DIM};
+use crate::runtime::host::HostMemory;
 
 /// `generation` is issued by
 /// [`DeviceState::next_sampled_content_generation`] and is never derived from
@@ -448,8 +449,14 @@ pub fn linear_mirrorable(pixel_format: u16) -> bool {
 
 /// Mirror normalized 8-bit compute output into the established BGRA sample
 /// caches so a later render view over the same object/GVA observes the encode.
-pub fn mirror_linear_color_cache(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the mirrored identity is the object, GVA, format, geometry, and guest backing"
+)]
+pub fn mirror_linear_color_cache<M: HostMemory>(
     state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
     texture_ref: u32,
     gva: u64,
     pixel_format: u16,
@@ -481,7 +488,8 @@ pub fn mirror_linear_color_cache(
         _ => return,
     }
     store_texture(state, texture_ref, width, height, bgra.clone());
-    store_gva(state, gva, width, height, bgra);
+    let backing = gva_backing(state, host, task_id, gva, width, height);
+    store_gva_owned(state, gva, width, height, bgra, 0, backing);
 }
 
 /// Type-2/3 encode cache by target GVA.
@@ -490,13 +498,57 @@ pub fn mirror_linear_color_cache(
 /// Guest MapMemory2 unmap/remap changes PFNs under the same GVA but does **not**
 /// destroy the encode — see [`note_unmap_retain_gva`] (Unmap retains; Map notify-only).
 pub fn store_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32, bgra: Vec<u8>) {
-    store_gva_owned(state, gva, width, height, bgra, 0);
+    store_gva_owned(state, gva, width, height, bgra, 0, None);
+}
+
+/// Guest pages currently backing `[gva, gva + width*height*4)` under `task_id`.
+///
+/// Returns `None` when the walk cannot name the backing at all — no task
+/// directory, an unsupported page shift, or a geometry that overflows. A `None`
+/// backing means the entry is simply not validatable, never that it is fresh.
+pub fn gva_backing<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+) -> Option<GvaBacking> {
+    if gva == 0 {
+        return None;
+    }
+    let span = (width as u64)
+        .checked_mul(height as u64)?
+        .checked_mul(RGBA8_BPP as u64)?;
+    if span == 0 {
+        return None;
+    }
+    let gpas = crate::runtime::gva_mem::task_gva_page_gpas_dense(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        span,
+        state.page_shift,
+    );
+    if gpas.is_empty() {
+        return None;
+    }
+    Some(GvaBacking {
+        task_id,
+        span,
+        gpas,
+    })
 }
 
 /// Store a GVA encode with the decoded object identity that produced it.
 /// Type-2/type-3 wrappers are the same linear texture storage family when the
 /// GVA and geometry match; unrelated nonzero object-type transitions still
 /// identify a different resource class.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cache identity is the GVA, its geometry, its producer, and its guest backing"
+)]
 pub fn store_gva_owned(
     state: &mut DeviceState,
     gva: u64,
@@ -504,6 +556,7 @@ pub fn store_gva_owned(
     height: u32,
     bgra: Vec<u8>,
     object_type: u8,
+    backing: Option<GvaBacking>,
 ) {
     if gva == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM
     {
@@ -522,10 +575,124 @@ pub fn store_gva_owned(
     entry.height = height;
     entry.bgra = std::sync::Arc::new(bgra);
     entry.producer_object_type = object_type;
+    // These bytes came from *this* backing, so it replaces whatever the
+    // previous store recorded — including a `None` that says the walk could
+    // not name it. Carrying the old list forward would let a validated entry
+    // vouch for pixels it did not produce.
+    entry.backing = backing;
+    entry.backing_suspect = false;
+}
+
+/// Whether a GVA-keyed entry's recorded backing is still what the GVA names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackingVerdict {
+    /// No page-table mapping change has touched this span since the store.
+    Unchanged,
+    /// The guest remapped the span and the pages came back identical — the
+    /// mapping churned, the allocation did not.
+    Confirmed,
+    /// The guest remapped the span and it now resolves to different pages:
+    /// this GVA names a different allocation than the one these bytes are of.
+    Moved,
+    /// Nothing was recorded to compare against (store-time walk failed, or a
+    /// non-GVA cache), so this entry cannot answer the question either way.
+    Unrecorded,
+}
+
+/// Re-walk a suspect GVA entry's span and compare it against the pages the
+/// stored bytes were produced from.
+///
+/// Called on the sampled read path *before* the lookup. A suspect entry costs
+/// one page-table walk once per guest remap of its span, not one per sample:
+/// [`BackingVerdict::Confirmed`] clears the flag.
+pub fn revalidate_gva_backing<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    gva: u64,
+) -> BackingVerdict {
+    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+        return BackingVerdict::Unrecorded;
+    };
+    if !entry.backing_suspect {
+        return if entry.backing.is_some() {
+            BackingVerdict::Unchanged
+        } else {
+            BackingVerdict::Unrecorded
+        };
+    }
+    let Some(recorded) = entry.backing.clone() else {
+        return BackingVerdict::Unrecorded;
+    };
+    // The walk must use the task the pixels were produced under. A GVA has no
+    // meaning apart from its page table, so re-resolving a different task's
+    // table would compare two unrelated address spaces and call the difference
+    // a move.
+    if recorded.task_id != task_id {
+        return BackingVerdict::Unrecorded;
+    }
+    let gpas = crate::runtime::gva_mem::task_gva_page_gpas_dense(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        recorded.span,
+        state.page_shift,
+    );
+    if gpas == recorded.gpas {
+        if let Some(entry) = state.host_gva_surfaces.get_mut(&gva) {
+            entry.backing_suspect = false;
+        }
+        return BackingVerdict::Confirmed;
+    }
+    BackingVerdict::Moved
+}
+
+/// Mark every GVA entry whose recorded span overlaps `[gva, gva+length)` under
+/// `task_id` as needing revalidation before its next read.
+///
+/// The Unmap/MapMemory2 notify is the guest telling us a virtual range now
+/// points somewhere else. This cache is deliberately **retained** across that
+/// notify (a mapping that churns and comes back must not black out the
+/// wallpaper), so the notify cannot evict — but it can record that the entry's
+/// name is no longer known-good, and make the next reader prove it.
+///
+/// Returns the number of entries marked.
+pub fn mark_gva_backing_suspect(
+    state: &mut DeviceState,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+) -> u32 {
+    if length == 0 {
+        return 0;
+    }
+    let mut n = 0u32;
+    for (&entry_gva, entry) in state.host_gva_surfaces.iter_mut() {
+        let Some(backing) = entry.backing.as_ref() else {
+            continue;
+        };
+        if backing.task_id != task_id || entry.backing_suspect {
+            continue;
+        }
+        if crate::runtime::gva_view::ranges_overlap(entry_gva, backing.span, gva, length) {
+            entry.backing_suspect = true;
+            n = n.saturating_add(1);
+        }
+    }
+    n
 }
 
 pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
     get_gva_with_gen(state, gva, width, height).map(|(bgra, _)| bgra)
+}
+
+/// Whether a [`get_gva`] for this key would hit, without borrowing the bytes.
+///
+/// Lets a caller that needs `&mut DeviceState` (backing revalidation) find out
+/// first whether there is anything to revalidate.
+pub fn has_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> bool {
+    get_gva_with_gen(state, gva, width, height).is_some()
 }
 
 /// Borrow a GVA encode plus its producer generation.
@@ -586,6 +753,7 @@ mod tests {
 
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+    use crate::runtime::host::FakeHost;
 
     /// A generation must name one content for the life of the device, and the
     /// hard case is the one that shipped broken: the entry is *destroyed* in
@@ -881,7 +1049,7 @@ mod tests {
 
         let mut owned = vec![0u8; 16];
         owned[0] = 0xcc;
-        store_gva_owned(&mut st, gva, 2, 2, owned, 2);
+        store_gva_owned(&mut st, gva, 2, 2, owned, 2, None);
         let (got, generation, object_type) = get_gva_with_owner(&st, gva, 2, 2).unwrap();
         assert_eq!(got[0], 0xcc);
         assert_eq!(generation, 3);
@@ -1102,5 +1270,186 @@ mod tests {
         // Geometry mismatch misses in both, identically.
         assert!(get_shared(&state, 7, w + 1, h).is_none());
         assert!(get(&state, 7, w + 1, h).is_none());
+    }
+
+    /// A depth-1 task page table where root PTE `i` points at PFN `PT_BASE + i`,
+    /// so a GVA of `i << PAGE_SHIFT_ARM64E` resolves to a page this test can
+    /// re-point by rewriting one PTE — which is exactly what the guest does when
+    /// it hands a virtual address to a different allocation.
+    fn setup_depth1_task(host: &mut FakeHost, state: &mut DeviceState) -> u64 {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        const DIR_PFN: u32 = 2;
+        const ROOT_PFN: u32 = 3;
+        const PT_BASE: u32 = 4;
+        let dir_gpa = (DIR_PFN as u64) << PAGE_SHIFT_ARM64E;
+        let root_gpa = (ROOT_PFN as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x4000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], ROOT_PFN);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        for i in 0..16u32 {
+            let pfn = PT_BASE + i;
+            host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+            let mut pte = [0u8; 4];
+            st32(&mut pte, pfn);
+            let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
+        }
+        assert!(state.define_task(1, 0x1000, DIR_PFN));
+        root_gpa
+    }
+
+    fn repoint_pte(host: &mut FakeHost, root_gpa: u64, index: u64, pfn: u32) {
+        use crate::contract::endian::st32;
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = host.write_gpa(root_gpa + index * 4, &pte);
+    }
+
+    /// The GVA encode cache is keyed by a *name*, and the guest reassigns names.
+    ///
+    /// `host_gva_surfaces` is retained across Unmap on purpose, so nothing on
+    /// the notify path evicts it; without a recorded backing, an entry stored
+    /// for one 64x64 icon is served for whatever the guest points that address
+    /// at next, at the same geometry, indefinitely. The backing is what lets a
+    /// reader tell the two apart: a mapping that churned and came back reads
+    /// `Confirmed`, and a mapping now resolving elsewhere reads `Moved`.
+    #[test]
+    fn gva_backing_separates_a_churned_mapping_from_a_reassigned_address() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let root_gpa = setup_depth1_task(&mut host, &mut st);
+        // 64x64 BGRA8 is 16 KiB — exactly one arm64e page, one PTE to re-point.
+        let (w, h) = (64u32, 64u32);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        let gva = page;
+        let backing = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
+        assert_eq!(backing.gpas.len(), 1, "64x64 BGRA8 covers one 16 KiB page");
+        assert_eq!(backing.span, (w as u64) * (h as u64) * 4);
+        store_gva_owned(
+            &mut st,
+            gva,
+            w,
+            h,
+            vec![0xA5u8; (w * h * 4) as usize],
+            0,
+            Some(backing),
+        );
+
+        // No notify has touched the span, so there is nothing to prove and no
+        // walk to pay for.
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Unchanged
+        );
+
+        // Unmap + Map2 of the same range restoring the same PFNs: the retained
+        // wallpaper class. The pixels are still this allocation's pixels.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 1, gva, page), 1);
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Confirmed
+        );
+        // Confirming clears the flag: the cost is one walk per remap, not one
+        // walk per sample.
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Unchanged
+        );
+
+        // The guest hands the same address to a different allocation.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 1, gva, page), 1);
+        repoint_pte(&mut host, root_gpa, 1, 12);
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Moved
+        );
+        // A `Moved` entry stays suspect. Nothing about asking twice makes the
+        // pixels belong to the new owner.
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Moved
+        );
+        // The lookup itself is unchanged by this commit: the census scores, it
+        // does not gate.
+        assert!(get_gva(&st, gva, w, h).is_some());
+    }
+
+    /// The suspect mark follows the span and the task, not every entry.
+    ///
+    /// A notify that marks unrelated entries costs a page-table walk each and
+    /// makes `gvac_moved` unreadable; one that marks across address spaces
+    /// would compare a GVA against a table that never named it.
+    #[test]
+    fn suspect_marking_is_bounded_by_span_and_task() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        let (w, h) = (64u32, 64u32);
+        for i in 1..4u64 {
+            let gva = i * page;
+            let backing = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
+            store_gva_owned(
+                &mut st,
+                gva,
+                w,
+                h,
+                vec![0u8; (w * h * 4) as usize],
+                0,
+                Some(backing),
+            );
+        }
+        // An entry stored with no recorded backing cannot be marked — there is
+        // nothing to compare it against, and it reports `Unrecorded` forever.
+        store_gva_owned(&mut st, 9 * page, w, h, vec![0u8; (w * h * 4) as usize], 0, None);
+
+        // Exactly the two entries the range overlaps.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 1, 2 * page, 2 * page), 2);
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, page),
+            BackingVerdict::Unchanged
+        );
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, 2 * page),
+            BackingVerdict::Confirmed
+        );
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, 9 * page),
+            BackingVerdict::Unrecorded
+        );
+
+        // Another task's notify names another address space.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 2, page, 8 * page), 0);
+        // And a lookup under a task the entry was not produced under cannot
+        // answer the question at all.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 1, page, page), 1);
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 2, page),
+            BackingVerdict::Unrecorded
+        );
+    }
+
+    /// An unresolved page is part of the identity, not a gap to be closed over.
+    #[test]
+    fn dense_page_walk_keeps_holes_in_place() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let root_gpa = setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        // Three pages: 64x192 BGRA8 = 48 KiB.
+        let (w, h) = (64u32, 192u32);
+        let gva = page;
+        let full = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
+        assert_eq!(full.gpas.len(), 3);
+
+        // Punt the middle page's PTE to an invalid PFN.
+        repoint_pte(&mut host, root_gpa, 2, 0);
+        let holed = gva_backing(&st, &host, 1, gva, w, h).expect("walk still names the span");
+        assert_eq!(holed.gpas.len(), 3, "one slot per page, holes included");
+        assert_eq!(holed.gpas[1], 0, "the hole sits where the page is");
+        assert_ne!(holed.gpas, full.gpas);
     }
 }

@@ -573,6 +573,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             .unwrap_or(0);
                     host_cache_store_gva_layer(
                         state,
+                        host,
+                        req.task_id,
                         c0.texture_ref,
                         producer_object_type,
                         c0.target_gva,
@@ -2817,6 +2819,15 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if state.gva_deferred_flush.contains_key(&gva) {
         crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, "gva_sample");
     }
+    // Census only, for now: score whether this GVA still names the pages the
+    // cached bytes were produced from, and serve either way. Scored on entries
+    // this lookup would actually serve, so the counters carry their own
+    // denominator; `gvac_*` in the per-second `store_routes` line.
+    if crate::runtime::surface_cache::has_gva(state, gva, w, h) {
+        note_gva_backing_verdict(crate::runtime::surface_cache::revalidate_gva_backing(
+            state, host, task_id, gva,
+        ));
+    }
     if let Some((bgra, host_gen, producer_type)) =
         crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h)
     {
@@ -2909,6 +2920,23 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     None
 }
 
+/// Score one GVA-keyed cache hit against the guest pages it was produced from.
+///
+/// `gvac_hit` is the denominator — every read this census sees. The other three
+/// partition it, so `gvac_moved / gvac_hit` is the rate at which this cache
+/// serves one allocation's pixels under another allocation's name. Without the
+/// denominator on the same line a zero is not interpretable.
+fn note_gva_backing_verdict(verdict: crate::runtime::surface_cache::BackingVerdict) {
+    use crate::runtime::surface_cache::BackingVerdict as V;
+    crate::runtime::drain::note_store_route("gvac_hit");
+    crate::runtime::drain::note_store_route(match verdict {
+        V::Unchanged => "gvac_unchanged",
+        V::Confirmed => "gvac_confirmed",
+        V::Moved => "gvac_moved",
+        V::Unrecorded => "gvac_unrecorded",
+    });
+}
+
 #[inline]
 fn gva_cache_linear_texture_type(object_type: u8) -> bool {
     matches!(
@@ -2931,12 +2959,18 @@ fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bo
 }
 
 /// Store type-2/3 encode into texture_ref + GVA host caches (BGRA).
+///
+/// `task_id` is the task whose page table gives the GVA meaning; the store
+/// records the pages it resolves to so a later sample can tell whether the
+/// address still names this allocation.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the cache identity mirrors the object, GVA, and texture geometry"
+    reason = "the cache identity mirrors the object, GVA, texture geometry, and guest backing"
 )]
-pub(crate) fn host_cache_store_gva_layer(
+pub(crate) fn host_cache_store_gva_layer<M: HostMemory>(
     state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
     texture_ref: u32,
     object_type: u8,
     gva: u64,
@@ -2964,6 +2998,8 @@ pub(crate) fn host_cache_store_gva_layer(
         );
     }
     if gva != 0 {
+        let backing =
+            crate::runtime::surface_cache::gva_backing(state, host, task_id, gva, width, height);
         crate::runtime::surface_cache::store_gva_owned(
             state,
             gva,
@@ -2971,6 +3007,7 @@ pub(crate) fn host_cache_store_gva_layer(
             height,
             bgra,
             object_type,
+            backing,
         );
     }
 }
@@ -4339,6 +4376,19 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         // GVA type-2/3 Load: texture_ref encode cache (separate
                         // from surface_id mid map). Prefer GVA key when present.
                         let gva_hit = if c0.target_gva != 0 {
+                            // Same census as the sampled read: a Load seed
+                            // served for a GVA the guest has re-pointed paints
+                            // another allocation's pixels into this pass.
+                            if crate::runtime::surface_cache::has_gva(state, c0.target_gva, w, h) {
+                                note_gva_backing_verdict(
+                                    crate::runtime::surface_cache::revalidate_gva_backing(
+                                        state,
+                                        host,
+                                        req.task_id,
+                                        c0.target_gva,
+                                    ),
+                                );
+                            }
                             crate::runtime::surface_cache::get_gva(state, c0.target_gva, w, h)
                                 .map(|b| b.to_vec())
                         } else {
