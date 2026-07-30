@@ -1880,6 +1880,77 @@ blames the `target_rgba8.is_none() && skip_readback` pair, but 599 draws now ski
 Some(LoadOp::LoadFromTarget))` is the untested suspect. Instrument which of the eight refuses
 before changing any of them.
 
+### The Presenter Is Not The Cap, And One Early Return Keeps Every Remaining Readback
+
+**Measured on one x86/Vulkan boot at `08110da`** (Safari fullscreen on
+testufo.com/refreshrate, 45 s settle, 2885 sliced lines, 47 cadence windows). Two
+questions the previous boot could not answer, both answered unanimously.
+
+**1. `offered == presents`, in every window. The window presents every frame it is
+offered, immediately.**
+
+```
+host_window_cadence presents=60 direct=60 busy=0 busy_fence=0 busy_acquire=0 offered=60
+    present_hz=59.8 offered_hz=59.8 direct_frac=1.00
+```
+
+`busy` was 0 in most windows and never above 4. So the host-window present path is
+**not** the frame-rate limit and must not be worked on for frame rate: the device's
+publish rate *is* the frame rate. This retires the reading that `presents=20
+busy=420` on the previous boot implied a 5x drop — a `Busy` return leaves the
+window's seq gate unchanged, so `busy` counted retries of the same 20 frames.
+`offered` is the denominator that says so, and `presents` alone never could.
+
+**2. `t11_keep_chain_from_resident` equals `surface_deferred` exactly, in all twelve
+windows. One condition, 100 % of the population.**
+
+| | per second |
+|---|---|
+| `surface_deferred` (the route that reads back) | 112 - 132 |
+| `t11_keep_chain_from_resident` | **112 - 132 — identical, every window** |
+| every other `t11_keep_*` | **0** |
+| `readbacks` / `readback_bytes` | 116 - 118 / **366 - 372 MB/s** (3.16 MB each) |
+| `surface_resident` (the route that does not) | 111 - 132 |
+
+`type11_store_identity` opens with `if req.chain_from_resident || !writeback_guest {
+return None }`, so a chained Store can never reach the resident rail however eligible
+its mapping is — `surface_resident_store` stays false, the record falls through to
+`M2vDrawSpan::Pixels`, reads its surface back, and lands on
+`arm_surface_deferred_store_with` (which defers the *writeback* and therefore needs
+the bytes). That early return is the entire remaining readback population.
+
+**The fix is small and the identity is already correct.** For these records the block
+above already ran `if req.chain_from_resident || (store_is_store && !writeback_guest)`
+and set `resources.target_identity = render_chain_identity(state, req)` — which is the
+**same function** `type11_store_identity` would have called. So the surface identity is
+already on the request; what is missing is `skip_readback = true` and the arm. The
+guard to keep is `writeback_guest`, which `multi_draw_store_plan` grants solely to the
+last record of a packet, plus `store_action == PASS_STORE_ACTION_STORE` and
+`mapping_id != 0` — i.e. this record *is* the guest-visible composite Store, not a
+chain intermediate. Note the ordered probe cannot separate "`chain_from_resident`" from
+"`identity_taken_by_another_rail`" here because it tests the former first and both are
+true; they are the same fact, not two.
+
+Do not confuse this with the retracted type-11 `LoadFromTarget` rail ("That was built,
+booted, and is refuted"). That was about a **Load** trusting a resident to hold the
+mapping's current pixels, which needs the front-buffer identity resolve. This is a
+**Store** skipping its own readback on the rail `4e5d03d` already ships and which 50 %
+of composite Stores already take successfully in the same boot.
+
+**3. The boot-to-boot frame-rate spread is at least 3.9x, on identical behaviour.**
+`3af5832` and `08110da` differ only by instrumentation, and `host_window_cadence`
+`present_hz` reads **p50 20.00 (106 windows)** on the first and **p50 78.20, 53-60
+sustained (47 windows)** on the second. Present boundaries read 109/s and 83/s; the
+guest's testufo read 20.000 Hz / 119 fps and 59.000 Hz / 61 fps. The layers-per-frame
+ratio moved from 5.5 to 1.5, so the guest settled into a different composite shape —
+which is a *workload* difference the harness does not control.
+
+That is far worse than the 1.8x `us_per_draw` spread this file already records, and it
+means **no single-boot frame-rate number scores anything on this rig**, in either
+direction. Score with within-boot ratios (`offered`/`presents`, `t11_keep_*`/`surface_deferred`,
+`readback_bytes`/`readback_us`) and treat Hz as colour. The 53-60 Hz window is
+encouraging and is not evidence that the 60 fps goal is met.
+
 ### The ~2 Hz Frame Rate Was One Bit In A Memory-Type Query
 
 **Fixed by `b19074e`. 1.49 Hz → 18.76 Hz on the same workload, and the mechanism is settled by a
