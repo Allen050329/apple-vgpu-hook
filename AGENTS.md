@@ -1555,6 +1555,65 @@ per second of wall clock against a busy `draw_us` of 832 ms and `duty` 0.983:
 `surface_deferred` runs 251/s against `readbacks` ~250/s, so essentially every readback is still a
 type-11 composite Store. `skip_readback` drops both together.
 
+**And the readback is almost entirely waste, which is now measured rather than argued.** Same slice:
+
+| | |
+|---|---|
+| `surface_deferred` / `surface_flush` | 19 995 / **450** — **97.75 % of Stores are never read by the guest** |
+| `readbacks` per Store | **1.02** — every one of them reads a whole frame anyway |
+| readback volume | **97.4 GB in 85 s, 1145 MB/s** |
+| `present_content` per Store | **0.169** |
+
+So the pixels are produced 251 times a second and wanted about 0.19 times per Store. A rail that read
+the resident only when a consumer asked would take roughly **5x fewer** readbacks, and `wait_us` is
+charged per byte (~270 us/MB, controlled instrument) so the two phases fall together.
+
+**Two of the three consumers turn out to need nothing, and that is the part that makes this tractable.**
+Verified by reading, at `d1b5c9d`:
+
+- **The sampled bind already prefers the resident.** `metal_draw/vulkan.rs`'s type-11 sample resolve
+  does `if resident_ready { return SampledSourceRequest::Target(resident_id) }` *before* it looks at
+  `surface_cache`, so the cache read below it is reached only when no resident is authoritative. Under
+  `skip_readback` the resident stays ready, so this consumer moves to the GPU path rather than needing
+  a lazy readback. `sampled_cache_hits` 7377 / misses 288 on that boot.
+- **The Load seed is already 96 % elided** by the `4c82c4d` epoch witness (`type11_seed_elided` 6284,
+  `uploaded` 285). The 4 % residual falls to `load_type11_rgba_static`, which reaches guest pages
+  through `scanout::read_mapping_bgra8` and therefore lands intersecting deferred windows first — so it
+  stays *correct* under `skip_readback`, just expensive. Materializing from the resident instead is an
+  optimization of a 4 % path, not a prerequisite.
+
+The linchpin for all of it: **`registry_mark_ready(identity)` is called unconditionally after submit,
+before the readback branch**, so `content_ready` does not depend on `skip_readback`. That is what keeps
+the resident authoritative for the sampled bind and the LOAD.
+
+That leaves exactly two consumers to re-source, and their combined rate is ~0.19 per Store:
+
+- **The present capture.** `try_capture_from_resident` already reads the resident via
+  `read_resident_bgra`, and that rung is live for the first time now that `slot.bgra` is true. The one
+  change it needs is ordering: `capture_present_frame` checks `surface_cache` *first*
+  (`if !from_host_cache && !try_capture_from_resident(..)`), so a Store that stops refreshing the cache
+  must also stop the cache from winning. Marking the entry resident-authoritative — `get` returns
+  `None` — does that without touching the present path at all.
+- **The flush to guest pages**, 2.25 % of Stores, which must read the resident instead of the window's
+  owned `Arc`.
+
+**The shape to copy for the cache is already shipped, for linear textures.**
+`HostLinearTexture::resident_gen` means "the pinned resident at this generation is authoritative and
+`bytes` is empty", with `note_linear_texture_resident` / `linear_texture_resident_gen` /
+`materialize_linear_resident` around it, and `get_linear_texture` returning `None` while it is set.
+`HostSurface` wants the same three, keyed on the `surface_content_epoch` witness that already exists.
+
+**What is genuinely at risk, and must be answered before writing it: durability.** AGENTS.md already
+records the rule this deliberately trades against — "a deferred obligation that names its data
+indirectly is only as durable as the indirection … prefer owning the bytes; with `Arc` it is free."
+Here owning the bytes *is* the readback, so the trade is the whole point and the mitigation has to be
+explicit: the window must pin the resident (`pin_resident_target`, as the GVA rail does), compare the
+epoch at flush, and emit a typed `deferred_flush_lost` rather than writing a wrong frame. Enumerate
+every path that can destroy a `Surface` resident — registry LRU/capacity eviction,
+`registry_ensure`'s destroy-on-mismatch, mapping teardown, the idle sweep, `test_reset_engine` — and
+confirm each honours the pin, before trusting it. A `deferred_flush_lost` on this rail is a whole
+compositing layer, which is the black-layer class this project has already paid for twice.
+
 Consumers `skip_readback` must then re-source: `surface_cache` (present capture at `scanout.rs:248`,
 the ~4 % of LOADs that still seed, and the sampled bind), the deferred window's owned frame, and the
 guest writeback at flush (`storage_flush.rs:876`, which today reads the window's `Arc` and never
