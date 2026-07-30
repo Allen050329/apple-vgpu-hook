@@ -2824,9 +2824,14 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     // this lookup would actually serve, so the counters carry their own
     // denominator; `gvac_*` in the per-second `store_routes` line.
     if crate::runtime::surface_cache::has_gva(state, gva, w, h) {
-        note_gva_backing_verdict(crate::runtime::surface_cache::revalidate_gva_backing(
-            state, host, task_id, gva,
-        ));
+        note_gva_backing_verdict(
+            crate::runtime::surface_cache::revalidate_gva_backing(state, host, task_id, gva),
+            "sample",
+            task_id,
+            gva,
+            w,
+            h,
+        );
     }
     if let Some((bgra, host_gen, producer_type)) =
         crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h)
@@ -2926,7 +2931,16 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
 /// partition it, so `gvac_moved / gvac_hit` is the rate at which this cache
 /// serves one allocation's pixels under another allocation's name. Without the
 /// denominator on the same line a zero is not interpretable.
-fn note_gva_backing_verdict(verdict: crate::runtime::surface_cache::BackingVerdict) {
+/// `site` names the read that asked — the sampled texture path or the Load
+/// seed — so a rate can be attributed to the rail that carries it.
+fn note_gva_backing_verdict(
+    verdict: crate::runtime::surface_cache::BackingVerdict,
+    site: &'static str,
+    task_id: u32,
+    gva: u64,
+    width: u32,
+    height: u32,
+) {
     use crate::runtime::surface_cache::BackingVerdict as V;
     crate::runtime::drain::note_store_route("gvac_hit");
     crate::runtime::drain::note_store_route(match verdict {
@@ -2935,6 +2949,58 @@ fn note_gva_backing_verdict(verdict: crate::runtime::surface_cache::BackingVerdi
         V::Moved => "gvac_moved",
         V::Unrecorded => "gvac_unrecorded",
     });
+    // A rate without identities cannot be acted on: it does not say which
+    // resource class is affected or how big the victims are. Deduplicated per
+    // (site, gva, geometry) so a compositor asking hundreds of times a second
+    // reports the span once.
+    if verdict == V::Moved
+        && crate::observe::first_sight(site, gva ^ ((width as u64) << 32) ^ (height as u64))
+    {
+        crate::observe::line(format!(
+            "gva_cache_backing_moved site={site} task={task_id} gva={gva:#x} {width}x{height}"
+        ));
+    }
+}
+
+/// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
+/// actually found for it.
+///
+/// A LOAD says the guest is drawing **onto the content already in this
+/// attachment**. When no seed is produced the attachment starts undefined, so
+/// every texel this pass does not itself draw is lost — which is a rectangle
+/// of a compositing layer going blank while the freshly drawn geometry
+/// survives, held until something redraws the whole layer. That is a real loss
+/// of guest work and belongs in the failure log, not in silence.
+///
+/// `chain_load_from_target` (the resident target already carries the chain) is
+/// a different arm and never reaches here: it is a seed that does not need
+/// uploading, not a seed that is missing.
+fn note_load_seed_outcome(
+    door: &'static str,
+    seeded: bool,
+    c0: &crate::runtime::metal_draw::ColorRtRequest,
+    w: u32,
+    h: u32,
+) {
+    crate::runtime::drain::note_store_route(if seeded {
+        "load_seed_ok"
+    } else {
+        "load_seed_lost"
+    });
+    if seeded {
+        return;
+    }
+    // Deduplicated per (door, target) so a compositor re-running the same lost
+    // pass hundreds of times a second reports the target once.
+    if crate::observe::first_sight(
+        door,
+        c0.target_gva ^ ((c0.texture_ref as u64) << 40) ^ ((c0.mapping_id as u64) << 20),
+    ) {
+        crate::observe::fail(format!(
+            "load_seed_lost door={door} gva={:#x} ref={} mid={} {w}x{h} bpr={} fmt={:#x}",
+            c0.target_gva, c0.texture_ref, c0.mapping_id, c0.row_stride, c0.format
+        ));
+    }
 }
 
 #[inline]
@@ -4355,17 +4421,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         Some(std::sync::Arc::new(solid_rgba_local(w, h, &c0.clear_color)));
                 }
                 x if x == PASS_LOAD_ACTION_LOAD => {
+                    // Which door this pass took, so a pass that ends with no
+                    // seed says which source was supposed to have one. A LOAD
+                    // means the guest is compositing *onto what is already
+                    // there*; arriving with nothing is the previous frame of
+                    // that layer being dropped, and everything outside the
+                    // geometry this pass draws goes blank.
+                    let mut seed_door = "none";
                     if let Some(seed) = c0.target_seed_rgba.as_ref() {
+                        seed_door = "color_seed";
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             // seed_color_load selected this by RT provenance.
                             // Black/transparent bytes are valid attachment data.
                             target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
                         }
                     } else if let Some(seed) = req.target_seed_rgba.as_ref() {
+                        seed_door = "req_seed";
                         if seed.len() == (w as usize) * (h as usize) * 4 {
                             target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
                         }
                     } else if c0.mapping_id != 0 {
+                        seed_door = "mapping";
                         if let Some((bytes, order)) =
                             resolve_type11_load_seed(state, host, c0.mapping_id, w, h)
                         {
@@ -4373,6 +4449,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             seed_order = order;
                         }
                     } else if c0.texture_ref != 0 {
+                        seed_door = "gva_or_ref";
                         // GVA type-2/3 Load: texture_ref encode cache (separate
                         // from surface_id mid map). Prefer GVA key when present.
                         let gva_hit = if c0.target_gva != 0 {
@@ -4387,6 +4464,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                         req.task_id,
                                         c0.target_gva,
                                     ),
+                                    "load_seed",
+                                    req.task_id,
+                                    c0.target_gva,
+                                    w,
+                                    h,
                                 );
                             }
                             crate::runtime::surface_cache::get_gva(state, c0.target_gva, w, h)
@@ -4404,6 +4486,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
                         }
                     }
+                    note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
                 }
                 _ => {}
             }

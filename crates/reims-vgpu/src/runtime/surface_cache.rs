@@ -672,7 +672,13 @@ pub fn mark_gva_backing_suspect(
         let Some(backing) = entry.backing.as_ref() else {
             continue;
         };
-        if backing.task_id != task_id || entry.backing_suspect {
+        // Widened task match, like every other invalidation this notify does.
+        // A mark is not a verdict — [`revalidate_gva_backing`] re-walks and
+        // decides — so an over-mark costs one walk that comes back
+        // `Confirmed`, while a missed mark leaves a stale entry serving with
+        // nobody ever asking it to prove itself.
+        if !crate::runtime::gva_view::task_matches(backing.task_id, task_id) || entry.backing_suspect
+        {
             continue;
         }
         if crate::runtime::gva_view::ranges_overlap(entry_gva, backing.span, gva, length) {
@@ -1421,11 +1427,18 @@ mod tests {
             BackingVerdict::Unrecorded
         );
 
-        // Another task's notify names another address space.
-        assert_eq!(mark_gva_backing_suspect(&mut st, 2, page, 8 * page), 0);
-        // And a lookup under a task the entry was not produced under cannot
-        // answer the question at all.
-        assert_eq!(mark_gva_backing_suspect(&mut st, 1, page, page), 1);
+        // An unrelated task's notify names an unrelated address space.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 5, page, 8 * page), 0);
+        // The shift-aliased id is marked on purpose: the mark is not the
+        // verdict, so over-marking costs a walk and under-marking costs a
+        // stale serve that nobody ever asks to prove itself. Two of the three
+        // entries in range — the one at `3 * page` is still suspect from the
+        // first notify and is not counted twice.
+        assert_eq!(mark_gva_backing_suspect(&mut st, 2, page, 8 * page), 2);
+        // Revalidation is the strict end. A GVA has no meaning apart from its
+        // page table, so a reader on another task cannot answer the question —
+        // walking its table would compare two address spaces and report the
+        // difference as a move.
         assert_eq!(
             revalidate_gva_backing(&mut st, &host, 2, page),
             BackingVerdict::Unrecorded
