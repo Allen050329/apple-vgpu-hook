@@ -5,6 +5,7 @@ use crate::backend::metal::abi::{
 };
 use crate::backend::metal::constants::*;
 use crate::backend::metal::hash::hash_u64;
+use crate::runtime::decode::resource::MTL_COLOR_WRITE_MASK_ALL;
 use metal::{ComputePipelineState, DepthStencilState, Function, RenderPipelineState, SamplerState};
 use parking_lot::Mutex;
 
@@ -49,6 +50,13 @@ pub struct RenderPsoKey {
     pub color_blend_src_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub color_blend_dst_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub color_blend_op_alpha: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+    /// Per-RT `MTLColorWriteMask`, in Metal's own bit order.
+    ///
+    /// Outside the `color_blend_*` group on purpose: the mask applies whether
+    /// or not the slot blends, so it is keyed and applied unconditionally
+    /// while the blend fields are only meaningful under
+    /// `color_blend_enable[i]`.
+    pub color_write_mask: [u32; REIMS_VGPU_METAL_MAX_COLOR_RTS],
     pub depth_pixel_format: u32,
     pub stencil_pixel_format: u32,
 }
@@ -88,6 +96,9 @@ impl Default for RenderPsoKey {
             color_blend_src_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
             color_blend_dst_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
             color_blend_op_alpha: [0; REIMS_VGPU_METAL_MAX_COLOR_RTS],
+            // `MTLColorWriteMaskAll`. Zero here would mean a default-built key
+            // describes a pipeline that writes no channel at all.
+            color_write_mask: [MTL_COLOR_WRITE_MASK_ALL; REIMS_VGPU_METAL_MAX_COLOR_RTS],
             depth_pixel_format: 0,
             stencil_pixel_format: 0,
         }
@@ -125,6 +136,7 @@ impl RenderPsoKey {
                 || self.color_blend_src_alpha[i] != other.color_blend_src_alpha[i]
                 || self.color_blend_dst_alpha[i] != other.color_blend_dst_alpha[i]
                 || self.color_blend_op_alpha[i] != other.color_blend_op_alpha[i]
+                || self.color_write_mask[i] != other.color_write_mask[i]
             {
                 return false;
             }

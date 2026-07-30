@@ -1794,6 +1794,18 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             clear_a: c.clear_color[3],
             load_action: map_load_action(req.pipeline_ref, c.load_action),
             blend: slot_blend,
+            // Read without the `blending_enabled` filter the blend resolve
+            // above applies: an unblended masked attachment still leaves its
+            // unwritten channels alone. No `first()` fallback either — a
+            // secondary slot with no entry of its own writes every channel,
+            // which is what the absent tag means.
+            write_mask: pipeline
+                .color_attachments
+                .iter()
+                .find(|a| a.slot == c.slot)
+                .map(|a| a.write_mask)
+                .unwrap_or_default()
+                .bits(),
         });
     }
 

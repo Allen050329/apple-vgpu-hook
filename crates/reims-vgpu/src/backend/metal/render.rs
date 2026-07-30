@@ -481,11 +481,14 @@ fn make_vertex_descriptor(
     }
 }
 
-/// Color RT slot + format + optional per-slot blend for PSO keying.
+/// Color RT slot + format + per-slot blend and write mask for PSO keying.
 pub struct ColorRtKey {
     pub slot: u32,
     pub pixel_format: u32,
     pub blend: Option<ReimsVgpuBlendState>,
+    /// `MTLColorWriteMask` bits. Not inside `blend`, because the mask applies
+    /// to an unblended attachment too.
+    pub write_mask: u32,
 }
 
 fn fill_render_pso_key(
@@ -554,6 +557,10 @@ fn fill_render_pso_key(
             key.color_blend_dst_alpha[i] = key.blend_dst_alpha;
             key.color_blend_op_alpha[i] = key.blend_op_alpha;
         }
+        // Outside both blend arms: `MTLColorWriteMask` is independent of
+        // `blendingEnabled`, so a masked attachment that does not blend still
+        // has to leave its unwritten channels alone.
+        key.color_write_mask[i] = rt.write_mask;
     }
     key.depth_pixel_format = depth_pixel_format;
     key.stencil_pixel_format = stencil_pixel_format;
@@ -593,6 +600,7 @@ fn fill_render_pso_key(
         h = hash_u64(h, key.color_blend_src_alpha[i] as u64);
         h = hash_u64(h, key.color_blend_dst_alpha[i] as u64);
         h = hash_u64(h, key.color_blend_op_alpha[i] as u64);
+        h = hash_u64(h, key.color_write_mask[i] as u64);
     }
     h = hash_u64(h, key.depth_pixel_format as u64);
     h = hash_u64(h, key.stencil_pixel_format as u64);
@@ -642,6 +650,13 @@ fn get_render_pipeline_state(
             if !rc.is_ok() {
                 return Err(rc);
             }
+            // Unconditional, unlike the blend above: the guest's mask governs
+            // an unblended attachment too. `MTLColorWriteMask`'s bit order is
+            // Metal's own here — no exchange, unlike the Vulkan arm — because
+            // this descriptor is the same API the value was serialized from.
+            color.set_write_mask(MTLColorWriteMask::from_bits_truncate(
+                key.color_write_mask[i] as NSUInteger,
+            ));
         }
     }
     if key.depth_pixel_format != 0 {
@@ -715,6 +730,7 @@ impl RenderPsoKeyClone for RenderPsoKey {
             color_blend_src_alpha: self.color_blend_src_alpha,
             color_blend_dst_alpha: self.color_blend_dst_alpha,
             color_blend_op_alpha: self.color_blend_op_alpha,
+            color_write_mask: self.color_write_mask,
             depth_pixel_format: self.depth_pixel_format,
             stencil_pixel_format: self.stencil_pixel_format,
         }
@@ -1336,6 +1352,9 @@ pub struct ColorRt<'a> {
     pub load_action: u32,
     /// Per-slot blend from pipeline color-attachment section (overrides global for this RT).
     pub blend: Option<ReimsVgpuBlendState>,
+    /// Per-slot `MTLColorWriteMask` from the same section. `0xf` (all) is the
+    /// value for an attachment whose entry omits the tag.
+    pub write_mask: u32,
 }
 
 /// Resolve Metal loadAction for a color attachment. Archive
@@ -1630,6 +1649,7 @@ pub fn render_core_mrt(
                     blend.filter(|b| b.enable != 0).copied()
                 }
             }),
+            write_mask: c.write_mask,
         })
         .collect();
     let pso_key = fill_render_pso_key(
