@@ -478,6 +478,15 @@ burst boundary it is **2.06 Hz**, and the fastest any single layer ever repeated
 So group bursts before quoting a rate, and print the distinct `mid` count next to it: if that drops
 to 1 the grouping is a no-op and the two numbers must agree. `.agents/repros/soak.sh` does this.
 
+**The ~2 Hz frame rate is FOUND and FIXED — see "The ~2 Hz Frame Rate Was One Bit In A Memory-Type
+Query" below.** It was `MemoryClass::Readback` requiring `HOST_COHERENT`, which discarded the
+`HOST_CACHED` preference on every driver that does not carry both, so every full-frame readback was an
+uncached memcpy at 460 MB/s. 1.49 Hz → 18.76 Hz. Everything in the rest of this section was measured
+correctly and its *attribution* is what to read carefully: the bytes were real, the duty cycle was
+real, and "it is the draws" was true — but the draws were slow for a reason none of it names, because
+none of it divided `readback_bytes` by `readback_us`. The remaining paragraphs stay because the
+deferred-rail analysis and the refutations below are still live.
+
 **Three things are already refuted as the cause of the ~2 Hz frame rate, each from the always-on
 channel.** Do not re-derive them:
 
@@ -1384,6 +1393,106 @@ following Store repopulates the cache, so it should be once per surface incarnat
 latched, so 138 `outcome=guest_pages` lines are distinct first sightings, not occurrences. If a
 mapping's Store keeps failing, its LOAD would gather guest pages every frame; `outcome=guest_pages`
 count against `drain_duty` is how that gets read.
+
+### The ~2 Hz Frame Rate Was One Bit In A Memory-Type Query
+
+**Fixed by `b19074e`. 1.49 Hz → 18.76 Hz on the same workload, and the mechanism is settled by a
+within-boot ratio rather than by the frame counter. Do not re-derive.**
+
+`MemoryClass::Readback` asked for `required: HOST_VISIBLE | HOST_COHERENT` with `HOST_CACHED`
+*preferred*. `select_memory_type` only ever tries a preference **together with** the requirement, so
+on a device whose cached type is not coherent both preferences match nothing and it falls through to
+the bare requirement. Vulkan guarantees a `HOST_VISIBLE|HOST_COHERENT` type exists, so this never
+fails and never logs; it just puts every readback buffer in uncached memory.
+
+Intel ANV is that device. `vulkaninfo` on the x86 dev host, five types over one 70 GiB DEVICE_LOCAL
+heap: `0x07` = `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` and `0x0b` =
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_CACHED`, each twice, with a PROTECTED type between them. **Nothing
+carries both bits.** The module's own doc comment had warned that an uncached CPU read is
+"catastrophically slow" — and had assumed that could only happen on the discrete row.
+
+The measurement, two boots either side, same workload (Safari fullscreen on
+testufo.com/refreshrate, `.agents/repros/testufo-fps.sh`):
+
+| | before | after |
+|---|---|---|
+| **`readback_bytes / readback_us`** | **460 MB/s** | **6137 MB/s** |
+| `readback_us`, per second of wall clock | 495-790 ms (**70-86 %** of all phase time) | 125-139 ms |
+| `readbacks` per second | 72 | **167** |
+| `max_tranche_us` | 504 592 - 744 671 | 54 176 - 70 481 |
+| `drain_duty tranches` per second | 6-9 | 53-62 |
+| us per draw | 7 134 | ~3 200 |
+| host presents, frame-grouped | **1.49 Hz** | **18.76 Hz** |
+| guest's own opinion (testufo) | 35.000 Hz | 38.000 Hz |
+
+Four things are worth carrying out of it.
+
+**The drift-free number is the ratio, not the frame rate.** AGENTS.md already records that
+`us_per_draw` has a 1.8x boot-to-boot spread and drifts upward within a session, so a sequential
+before/after cannot score frames on this rig. `readback_bytes / readback_us` is two counters from the
+*same* window of the *same* boot, and 460 → 6137 MB/s cannot be a session drift. The 12.6x frame
+number is consistent with it and is not what establishes it. Note also that the after arm did **2.3x
+more readbacks** in less than a fifth of the time, so the throughput gain is larger than the frame
+count shows.
+
+**The guest was never the limit, and its own instrument said so before the fix.** The guest reported
+35 Hz while we presented 1.49, and after the fix it reports 38 while we present 18.76. It was
+producing frames the whole time; `display_vbl not_claimed=28752 / delivered=29696` was the same fact
+from our side. A 23x guest/host gap is a *statement about the host*, and it took one screenshot of a
+page we did not write to get it — the arm AGENTS.md had listed as missing.
+
+**`draw_phase` already carried the answer and had never been sliced for it.** `Phase::Readback`
+brackets exactly `map_memory` + allocate + `copy_nonoverlapping` + `unmap_memory` — the fence wait is
+`wait_us` and read 53-75 ms/s throughout. So "70-86 % of all draw time is one memcpy" was on the
+always-on channel of every boot in this project's history, next to `readback_bytes`, and dividing the
+two takes one command. Identify before add, again.
+
+**A fixture more capable than the hardware cannot fail the way the hardware does.** `intel_igpu()`
+gave type 1 `HOST_COHERENT|HOST_CACHED` together — invented, while the Apple fixture beside it was
+transcribed from a live `vulkaninfo`. Every `MemoryClass::Readback` selection test passed against a
+device that does not exist. Worse, the test named for this property,
+`readback_prefers_cached_on_every_topology`, asserted that `preferred` mentioned `HOST_CACHED` and
+that `required` contained `HOST_COHERENT` — both true, and *jointly the cause*. A test that reads the
+query cannot see a preference that never matches; assert the **selected type**.
+
+Two consequences of dropping the coherence requirement, both load-bearing:
+
+- **Readers owe `vkInvalidateMappedMemoryRanges`, and a missed one returns the previous frame.** There
+  is now exactly one reader, `pools::read_back_slot`, and the four rails (draw, `read_target_inner` /
+  storage, compute storage-buffer, compute storage-image) all go through it. Patching only the draw
+  rail took `vk_engine_parity` to 38/41 with the two informative failures both reporting the *prior*
+  render — `a_view_swizzle_…` read `[203,91,17,255]` where `[17,91,203,255]` was due, which is exactly
+  the identity result coming out of the swizzled draw. A missed invalidate does not fault; it silently
+  hands back whatever the reader last read through that pooled buffer.
+- **`vk_engine_compute` was 6/14 at HEAD and nothing had said so.** Every SSBO case failed
+  `reason=vk_compute_exec_map_storage_readback vk_result=Mapping_of_a_memory_object_has_failed`: the
+  compute rail reads back out of slots it takes from `acquire_staging`, which maps for the slot's
+  lifetime, and `vkMapMemory` on an already-mapped object is `VK_ERROR_MEMORY_MAP_FAILED`. The same
+  choke point fixed it by honouring an existing mapping. **Run both GPU suites, not just
+  `vk_engine_parity`** — that regression survived because the last several sessions ran one of them.
+
+`readback_memory` is the standing report, always-on and latched per memory type. A healthy boot reads
+`readback_memory type=1 cached=1 coherent=0 topology=unified`; the degraded case is the typed decline
+`readback_memory_not_cached` carrying the type and the `memoryTypeBits` it had to choose from. It
+fires once per boot, before any slice mark a repro sets, so grep the whole log rather than a slice.
+
+**Where the time goes now, from the same line — the bottleneck moved and this is the next work.** Per
+second of wall clock, at ~280 draws/s and `duty` still 0.96-0.98:
+
+| phase | us per second | note |
+|---|---|---|
+| `wait_us` | **246 000 - 265 000** | fence wait; the new largest single phase |
+| `stage_us` | **148 000 - 163 000** | the 851 MB/s seed upload, mirror of the readback |
+| `readback_us` | 125 000 - 139 000 | now cached |
+| `acquire_us` | 31 000 - 61 000 | |
+| `prep_us` | 26 000 - 33 000 | |
+| `submit_us` | 24 000 - 26 000 | |
+| `record_us`, `pipeline_us`, `descriptors_us` | ≤ 6 400 | noise |
+
+`batch_opens=105 batch_joins=2` is unchanged: batching still gets ~1.02 draws per batch, and
+`engine_delta` says why — `readbacks=167` against `draws≈280`, so Stores and intermediates alternate
+and `begin_entry` flushes the open batch every time. That is a *scheduling* problem, not the join
+predicate AGENTS.md's older note points at.
 
 ### A Bounds Check That Charges A Stride For The Last Row Squares Window Corners
 
