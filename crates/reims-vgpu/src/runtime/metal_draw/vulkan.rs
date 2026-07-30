@@ -2949,25 +2949,11 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     None
 }
 
-/// Guest pages a synchronous GVA Store may write, resolved before the draw is
-/// submitted to the GPU.
+/// Guest pages the Vulkan draw's single synchronous GVA Store may write.
 ///
-/// The Store's write used to be unbounded on the argument that a synchronous
-/// command's authorisation is the page table at the moment it runs. That holds
-/// for the CLEAR store, which is a solid colour written on this thread with
-/// nothing in between. It does not hold for the draw Store: `encode_draw_chain`
-/// encodes, submits, waits for the GPU and reads the result back before the
-/// Store resolves `target_gva`, and the guest runs on its own vCPUs across that
-/// round trip. Resolving here makes the pages the command named and the pages
-/// the bytes reach the same set.
-///
-/// `None` — unbounded, the pre-existing behaviour — when there is no GVA target,
-/// when this record does not own guest writeback, or when the walk resolves no
-/// page at all. The last arm is counted (`sync_store_unbounded`) rather than
-/// tightened on suspicion: a span that resolves nothing here makes the writer's
-/// own walk fail closed on its own terms, and refusing on an empty capture
-/// would drop live Stores whenever the capture failed for an unrelated reason.
-/// If that counter stays at zero it can be tightened with evidence.
+/// The Vulkan rail writes back only color attachment 0, so this narrows
+/// [`sync_store_target_pages`] to that record and to the case where this record
+/// owns guest writeback at all.
 fn sync_store_allowed_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -2978,33 +2964,7 @@ fn sync_store_allowed_pages<M: HostMemory>(
     if !writeback_guest {
         return None;
     }
-    let c = color0.filter(|c| {
-        c.target_gva != 0
-            && c.store_action == PASS_STORE_ACTION_STORE
-            && c.width > 0
-            && c.height > 0
-    })?;
-    let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
-    let mut pages = std::collections::HashSet::new();
-    crate::runtime::gva_mem::visit_task_gva_page_gpas(
-        host,
-        &state.tasks,
-        task_id,
-        c.target_gva,
-        span,
-        state.page_shift,
-        1,
-        &mut |gpa_page| {
-            pages.insert(gpa_page);
-            true
-        },
-    );
-    if pages.is_empty() {
-        crate::runtime::drain::note_store_route("sync_store_unbounded");
-        return None;
-    }
-    crate::runtime::drain::note_store_route("sync_store_bound");
-    Some(pages)
+    sync_store_target_pages(state, host, task_id, color0?)
 }
 
 /// Score a GVA-keyed cache hit against the guest pages it was produced from,

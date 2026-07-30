@@ -1162,6 +1162,18 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     {
         return (EncodeStatus::BadArgs("draw_mtl_mrt_geom_mismatch"), None);
     }
+    // Pages each attachment's GVA Store may reach, resolved here rather than at
+    // writeback: `render_core_mrt` below submits and waits, and the guest keeps
+    // running on its own vCPUs across that. Indexed by attachment because MRT
+    // stores every color target, not just slot 0.
+    let sync_store_pages: Vec<Option<std::collections::HashSet<u64>>> = if writeback_guest {
+        color_list
+            .iter()
+            .map(|c| sync_store_target_pages(state, host, req.task_id, c))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let is_indexed = req
         .indexed
         .as_ref()
@@ -1932,6 +1944,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 )
             }
         } else if c.target_gva != 0 {
+            let allowed = sync_store_pages.get(i).and_then(|p| p.as_ref());
             if gva_partial {
                 let (sx, sy, sw, sh) = req.scissor.unwrap();
                 write_gva_rgba8_rect(
@@ -1948,9 +1961,10 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     sy,
                     sw,
                     sh,
+                    allowed,
                 )
             } else {
-                write_gva_rgba8(
+                write_gva_rgba8_within(
                     state,
                     host,
                     req.task_id,
@@ -1960,6 +1974,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                     c.row_stride,
                     c.format,
                     out_rgba,
+                    allowed,
                 )
                 .is_ok()
             }
@@ -3488,11 +3503,14 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
 /// contains almost every other task's range. `owners` is not evidence that a
 /// range is legitimate and nothing may gate on it.
 ///
-/// What does bound these writes: a deferred Store carries the page set it was
-/// armed on and goes through [`write_gva_rgba8_within`], so the walk that
-/// resolves its destination is also the walk that authorises it. A synchronous
-/// Store has no such set — the command being executed is what names its
-/// destination — and its authorisation is the page table at the moment it runs.
+/// What does bound these writes: every Store carries the page set its target
+/// GVA resolved to *before* the GPU round trip and goes through
+/// [`write_gva_rgba8_within`], so the walk that resolves its destination is also
+/// the walk that authorises it. That includes the synchronous Store — see
+/// [`sync_store_target_pages`] for why "synchronous" does not mean the guest
+/// stood still. This unbounded form survives only for callers replaying a write
+/// whose authorisation is the command being executed on this thread with no GPU
+/// wait in between.
 #[allow(
     clippy::too_many_arguments,
     reason = "the archive writer mirrors the target GVA and native row geometry"
@@ -3511,6 +3529,65 @@ pub(crate) fn write_gva_rgba8<M: HostMemory + HostOps>(
     write_gva_rgba8_within(
         state, host, task_id, gva, width, height, bpr, format, rgba, None,
     )
+}
+
+/// Guest pages one color attachment's synchronous GVA Store may write, resolved
+/// before the draw is submitted to the GPU.
+///
+/// The Store's write used to be unbounded on the argument that a synchronous
+/// command's authorisation is the page table at the moment it runs. That holds
+/// for the CLEAR store, which is a solid colour written on this thread with
+/// nothing in between. It does not hold for the draw Store: both backends'
+/// encode paths encode, submit, wait for the GPU and read the result back
+/// before the Store resolves `target_gva`, and the guest runs on its own vCPUs
+/// across that round trip. Resolving here makes the pages the command named and
+/// the pages the bytes reach the same set.
+///
+/// The span is the attachment's whole image (`row_stride * height`) rather than
+/// the scissor rect a partial store touches, because the packed rail maps the
+/// whole image in one view and authorises every page it aliases.
+///
+/// `None` — unbounded, the pre-existing behaviour — when there is no GVA target,
+/// when the record does not store, or when the walk resolves no page at all.
+/// The last arm is counted (`sync_store_unbounded`) rather than tightened on
+/// suspicion: a span that resolves nothing here makes the writer's own walk fail
+/// closed on its own terms, and refusing on an empty capture would drop live
+/// Stores whenever the capture failed for an unrelated reason. If that counter
+/// stays at zero it can be tightened with evidence.
+pub(crate) fn sync_store_target_pages<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    c: &ColorRtRequest,
+) -> Option<std::collections::HashSet<u64>> {
+    if c.target_gva == 0
+        || c.store_action != PASS_STORE_ACTION_STORE
+        || c.width == 0
+        || c.height == 0
+    {
+        return None;
+    }
+    let span = (c.row_stride as u64).checked_mul(c.height as u64)?;
+    let mut pages = std::collections::HashSet::new();
+    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        task_id,
+        c.target_gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            pages.insert(gpa_page);
+            true
+        },
+    );
+    if pages.is_empty() {
+        crate::runtime::drain::note_store_route("sync_store_unbounded");
+        return None;
+    }
+    crate::runtime::drain::note_store_route("sync_store_bound");
+    Some(pages)
 }
 
 /// [`write_gva_rgba8`] bounded to the guest pages a deferred window was armed
@@ -3611,9 +3688,26 @@ pub(crate) fn write_gva_rgba8_within<M: HostMemory + HostOps>(
     Ok(())
 }
 
-/// Store only the Metal scissor rect of a full-size tight RGBA8 buffer to GVA.
+/// Store only the Metal scissor rect of a full-size tight RGBA8 buffer to GVA,
+/// bounded to the pages the Store's target resolved to before the GPU ran.
 /// Packed contig view when possible; else multi-import each rect row.
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+///
+/// Only the Metal encode path issues a scissored guest store today, but nothing
+/// here is Metal-specific: it is plain page-table walking over [`HostMemory`],
+/// so it stays compiled and tested on every arm. Gating it behind the backend
+/// that happens to call it would put the guest-memory bound on the one matrix
+/// arm that cannot be built or run from a Linux host.
+#[cfg_attr(
+    not(all(feature = "backend-metal", target_os = "macos")),
+    allow(
+        dead_code,
+        reason = "only the Metal encode path scissors a guest store; the bound is tested everywhere"
+    )
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the archive writer mirrors the target GVA, native row geometry and the scissor rect"
+)]
 pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3628,6 +3722,7 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     origin_y: u32,
     rect_w: u32,
     rect_h: u32,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> bool {
     if gva == 0
         || full_w == 0
@@ -3661,9 +3756,11 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
     let mut row = vec![0u8; tight_rect as usize];
     let mut src_rgba = vec![0u8; (rect_w as usize) * (RGBA8_BPP as usize)];
     let span = (full_h as u64).saturating_mul(bpr as u64);
-    // Fresh PT walk at write time — never a cached view (stale-view class).
+    // Fresh PT walk at write time — never a cached view (stale-view class) —
+    // and that walk carries `allowed`, so the rect cannot land on a page the
+    // Store's own target did not resolve to before the GPU round trip.
     if let Some(span_map) =
-        crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span)
+        crate::runtime::gva_view::map_fresh_span_within(state, host, task_id, gva, span, allowed)
     {
         let (base, avail) = (span_map.ptr, span_map.avail);
         let mut ok = true;
@@ -3702,8 +3799,9 @@ pub(crate) fn write_gva_rgba8_rect<M: HostMemory + HostOps>(
         let row_gva = gva
             .saturating_add((y as u64).saturating_mul(bpr as u64))
             .saturating_add(x_bytes);
-        if let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, row_gva, &row)
-        {
+        if let Err(err) = crate::runtime::gva_view::write_span_within(
+            state, host, task_id, row_gva, &row, allowed,
+        ) {
             let reason = crate::observe::Decline::slug(&err);
             crate::observe::fail(format!(
                 "gva_write fail reason={reason} task={task_id} gva={row_gva:#x} span={span:#x} \

@@ -4055,30 +4055,79 @@ fn only_a_moved_backing_refuses_a_gva_cache_hit() {
 /// The two permissive arms are locked deliberately, because a bound that
 /// refuses when it should not drops live Stores: a record that does not own
 /// guest writeback and a target with no GVA both stay unbounded.
+/// Guest page frame the [`StoreRig`] page table hands out for entry `i`, and the
+/// spare frames a test re-points an entry at.
+const STORE_RIG_PT_BASE: u32 = 4;
+
+/// A task whose page table maps the first eight virtual pages one-to-one onto
+/// guest frames `STORE_RIG_PT_BASE + i`, plus the frames themselves.
+///
+/// Every bound test needs the same thing: a walkable task, a target GVA, and a
+/// way to re-point one of its PTEs at a frame the command never named. The rig
+/// exists so the interesting half of each test is the write, not the walk.
+struct StoreRig {
+    host: FakeHost,
+    state: DeviceState,
+    root_gpa: u64,
+}
+
+impl StoreRig {
+    /// Task 1, `entries` mapped virtual pages, `page_shift` geometry.
+    fn new(entries: u32) -> Self {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        let mut host = FakeHost::new();
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let (dir_pfn, root_pfn) = (2u32, 3u32);
+        let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
+        let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(dir_gpa, 0x20, 0);
+        host.map_range(root_gpa, 0x4000, 0);
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        let _ = host.write_gpa(dir_gpa, &d);
+        let mut rig = Self {
+            host,
+            state,
+            root_gpa,
+        };
+        for i in 0..entries {
+            rig.host
+                .map_range(Self::frame_gpa(STORE_RIG_PT_BASE + i), 0x4000, 0);
+            rig.point(i, STORE_RIG_PT_BASE + i);
+        }
+        assert!(rig.state.define_task(1, 0x1000, dir_pfn));
+        rig
+    }
+
+    /// Guest physical base of frame `pfn`.
+    fn frame_gpa(pfn: u32) -> u64 {
+        (pfn as u64) << PAGE_SHIFT_ARM64E
+    }
+
+    /// Point virtual page `entry` of the task at guest frame `pfn`.
+    fn point(&mut self, entry: u32, pfn: u32) {
+        use crate::contract::endian::st32;
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        let _ = self
+            .host
+            .write_gpa(self.root_gpa + (entry as u64) * 4, &pte);
+    }
+
+    /// Virtual address of the task's page `entry`.
+    fn gva(entry: u32) -> u64 {
+        (entry as u64) << PAGE_SHIFT_ARM64E
+    }
+}
+
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
-    use crate::contract::endian::st32;
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let (dir_pfn, root_pfn, pt_base) = (2u32, 3u32, 4u32);
-    let dir_gpa = (dir_pfn as u64) << PAGE_SHIFT_ARM64E;
-    let root_gpa = (root_pfn as u64) << PAGE_SHIFT_ARM64E;
-    host.map_range(dir_gpa, 0x20, 0);
-    host.map_range(root_gpa, 0x4000, 0);
-    let mut d = [0u8; 8];
-    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], root_pfn);
-    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-    let _ = host.write_gpa(dir_gpa, &d);
-    for i in 0..8u32 {
-        let pfn = pt_base + i;
-        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
-        let mut pte = [0u8; 4];
-        st32(&mut pte, pfn);
-        let _ = host.write_gpa(root_gpa + (i as u64) * 4, &pte);
-    }
-    assert!(state.define_task(1, 0x1000, dir_pfn));
+    let rig = StoreRig::new(8);
+    let (mut host, mut state, root_gpa) = (rig.host, rig.state, rig.root_gpa);
+    let pt_base = STORE_RIG_PT_BASE;
 
     let page = 1u64 << PAGE_SHIFT_ARM64E;
     // 64x64 BGRA8 with a tight stride is exactly one 16 KiB page.
@@ -4105,7 +4154,7 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
     // The guest hands that virtual page to a different allocation while the GPU
     // is working. The write that follows must not reach the new owner.
     let mut pte = [0u8; 4];
-    st32(&mut pte, pt_base + 6);
+    crate::contract::endian::st32(&mut pte, pt_base + 6);
     let _ = host.write_gpa(root_gpa + 4, &pte);
     let rgba = vec![0xffu8; 64 * 64 * 4];
     let err = write_gva_rgba8_within(
@@ -4149,4 +4198,123 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         sync_store_allowed_pages(&state, &host, 1, Some(&no_gva), true).is_none(),
         "no GVA target, nothing to bound"
     );
+}
+
+/// A scissored Store carries the same bound as a full-image one, on both of its
+/// rails.
+///
+/// `write_gva_rgba8_rect` is what the Metal encode path calls when a Load seed
+/// means only the scissor rect may be overwritten. It sits behind the same GPU
+/// round trip as the full-image Store -- `render_core_mrt` submits, waits and
+/// reads back before the writeback loop resolves `target_gva` -- so an
+/// unbounded rect write scatters exactly the same way, over a 64-row stripe
+/// instead of a whole frame.
+///
+/// Both rails are exercised because the writer picks between them on span
+/// contiguity, and only one of them existed before the bound: a packed span maps
+/// once through `map_fresh_span_within`, a fragmented one writes each row
+/// through `write_span_within`. A bound on one and not the other is no bound at
+/// all, since the guest chooses which by how it laid the allocation out.
+#[test]
+fn a_scissored_gva_store_is_bounded_on_both_its_rails() {
+    // 64x128 BGRA8, tight 256-byte rows: exactly two 16 KiB pages, so page 2
+    // holds rows 64..127 and any rect tall enough to reach them must be
+    // authorised for it.
+    const W: u32 = 64;
+    const H: u32 = 128;
+    const BPR: u32 = W * 4;
+    let fmt = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let target = ColorRtRequest {
+        slot: 0,
+        texture_ref: 7,
+        mapping_id: 0,
+        target_gva: StoreRig::gva(1),
+        row_stride: BPR,
+        width: W,
+        height: H,
+        format: fmt,
+        load_action: PASS_LOAD_ACTION_LOAD,
+        store_action: PASS_STORE_ACTION_STORE,
+        clear_color: [0.0; 4],
+        target_seed_rgba: None,
+    };
+    // Full height, left half only: the partial store the Load seed forces, and
+    // it crosses the page boundary at row 64.
+    let rect = (0u32, 0u32, W / 2, H);
+    let rgba = vec![0xffu8; (W * H * 4) as usize];
+    let moved_to = STORE_RIG_PT_BASE + 6;
+
+    // `packed` picks whether the two pages of the span are adjacent guest
+    // frames, which is the only thing that decides the writer's rail.
+    for packed in [true, false] {
+        let mut rig = StoreRig::new(8);
+        if !packed {
+            rig.point(2, STORE_RIG_PT_BASE + 5);
+        }
+        let armed = sync_store_target_pages(&rig.state, &rig.host, 1, &target)
+            .expect("a resolvable GVA target must be bounded");
+        assert_eq!(armed.len(), 2, "64x128 BGRA8 tight covers two 16 KiB pages");
+
+        // The guest re-points the span's second page mid-flight.
+        rig.point(2, moved_to);
+        let (x, y, rw, rh) = rect;
+        assert!(
+            !write_gva_rgba8_rect(
+                &mut rig.state,
+                &mut rig.host,
+                1,
+                target.target_gva,
+                W,
+                H,
+                BPR,
+                fmt,
+                &rgba,
+                x,
+                y,
+                rw,
+                rh,
+                Some(&armed),
+            ),
+            "packed={packed}: a page the command never named must be refused"
+        );
+        let mut victim = [0u8; 4];
+        let _ = rig
+            .host
+            .read_gpa(StoreRig::frame_gpa(moved_to), &mut victim);
+        assert_eq!(
+            victim, [0u8; 4],
+            "packed={packed}: the refused write must leave the new owner untouched"
+        );
+
+        // Unbounded, the same call lands in whatever owns that page now. This
+        // is the write the crash reports are of: 0xff is the white pixel run
+        // the guest kernel reported over its freed heap element.
+        assert!(
+            write_gva_rgba8_rect(
+                &mut rig.state,
+                &mut rig.host,
+                1,
+                target.target_gva,
+                W,
+                H,
+                BPR,
+                fmt,
+                &rgba,
+                x,
+                y,
+                rw,
+                rh,
+                None,
+            ),
+            "packed={packed}: without the bound the same write succeeds"
+        );
+        let _ = rig
+            .host
+            .read_gpa(StoreRig::frame_gpa(moved_to), &mut victim);
+        assert_eq!(
+            victim,
+            [0xffu8; 4],
+            "packed={packed}: and it succeeds by painting the new owner's page"
+        );
+    }
 }
