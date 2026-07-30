@@ -1575,17 +1575,82 @@ audits on this rail that were flatly wrong):
   that two disjoint sibling windows on one mapping (ping-pong canvases) cannot desync the pair — and it
   bounds the sibling count per mapping.
 
-So the work is: give `ResidentTargetSlot` a content epoch, record it when a type-11 Store's readback
-lands, and gate `LoadOp::LoadFromTarget` + `target_rgba8 = None` on agreement, fail-closed, with the
-sibling-currency rule the compute mirror already learned. Expected saving is `stage_us` (~155 ms/s) and
-the `target_rgba8.is_none()` half of the `joins` predicate; the readback itself is a separate step and
-`skip_readback` is the other half.
+**Built and scored by `4c82c4d`. `stage_us` roughly halved, 95 % of type-11 LOAD seeds are gone, and
+the screen is clean. Do not rebuild.**
 
-**One asymmetry to design for rather than discover.** The deferred writeback rail arms a window and does
-*not* write guest pages, so it does not bump `content_generation` at arm time — the bump comes later at
-flush. A resident stamped at arm time therefore goes stale on its own flush even though the pixels never
-changed. That is conservative (it falls back to the CPU seed, which is correct), so ship it that way
-first and only then decide whether the flush should carry the resident's stamp forward.
+The port is what the section above describes, with **one addition that the design as written would have
+got wrong**. `content_generation` is not a sufficient witness on its own. `surface_cache` holds exactly
+one entry per mapping, so a sibling Store at a *different geometry* replaces the entry an older
+geometry's resident is being compared against — and it does that without writing a guest page, so
+`content_generation` never moves and the stale resident reads as current. That is the same
+one-entry-per-mapping hazard that produced the `deferred_flush_lost reason=cache_miss` black-layer
+class, arriving from the other side.
+
+So the witness is a separate `MappingEntry::surface_content_epoch`, strictly coarser than
+`content_generation`: `mark_mapping_written` advances it (which closes the eight guest-page writers for
+free, by construction rather than by enumeration), and `note_surface_content_published` advances it for
+the deferred type-11 publish — the one writer that changes the pixels without touching guest pages. It
+stays a separate field so the compute rail's `seed_generation` semantics are untouched.
+
+`ResidentTargetSlot::content_epoch` is `Option<u32>`, `None` on create, recycle and **both**
+`registry_mark_ready*` arms. The `Option` is load-bearing: epoch 0 is a legal mapping value ("nothing
+published since attach"), so a bare `u32` sentinel would let a never-stamped slot match it. `None ==
+None` is `true` in Rust, so the comparison guards `is_some()` on the mapping side — without that,
+"no mapping entry" matches "never stamped" and the pass loads undefined memory as the guest's prior
+frame. That test (`an_unstamped_resident_never_matches_a_mapping_with_no_epoch`) was verified to fail
+with the guard dropped.
+
+Note also what the Store had to gain first: a type-11 composite Store previously set **no
+`target_identity` at all** — the first block's predicate is `chain_from_resident || (store_is_store &&
+!writeback_guest)` and the second requires `mapping_id == 0` — so there was no resident to load from.
+It now renders into the registry resident *and still reads back*, which is a configuration no test in
+`vk_engine_parity` covered (every other `LoadFromTarget` case sets `skip_readback = true`).
+
+Measured on one x86/Vulkan boot, Safari fullscreen on testufo.com/refreshrate, 45 s settle:
+
+| | reading |
+|---|---|
+| `type11_seed_elided` / `type11_seed_uploaded` | **4872 / 249 — 95.1 %** (1734 / 37, 97.9 %, over a drag window) |
+| `stage_us` per second | **p10 74.5 / p50 81.0 / p90 92.1 ms** (was 148-163) |
+| `seed_upload_bytes` / `readback_bytes` | **0.39-0.60** (was **exactly ~1.0** — "seed MB equals readback MB in every row") |
+| `target_evicts` | **0**, in all 81 windows |
+| `FAIL` lines | **0** |
+| `wait_us` per second | p50 **286 ms** — now unambiguously the largest single cost |
+| host presents, frame-grouped | 22.77 Hz |
+| guest's own opinion (testufo) | 41.000 Hz |
+
+**The number that establishes it is the elision ratio and the broken symmetry, not the frame rate.**
+Both are within-boot, so neither can be the `us_per_draw` drift. The seed/readback symmetry is the
+better of the two because AGENTS.md had already recorded it as *exact* across five independent windows
+on the old code; a ratio that was 1.03 and is now 0.44 is not a sampling artefact. 22.77 Hz against a
+18.76 Hz predecessor is one sequential pair on a rig with a documented 1.8x spread — consistent, and
+not evidence.
+
+Three things this boot does **not** show:
+
+- **Batching did not move.** `batch_opens=157 batch_joins=2` at ~1.02 draws per batch, unchanged. The
+  `joins` predicate needs `target_rgba8.is_none()` *and* `skip_readback`, and a composite Store reads
+  back by construction, so satisfying half of it buys nothing. The older note above predicting
+  "`joins` gains its half" is correct and irrelevant — two conditions, one still false.
+- **`target_evicts=0` is one boot's answer** to whether making composite Stores registry-resident
+  causes churn. Three or four surface identities were live; a workload with many more mappings has not
+  been run.
+- **The remaining `wait_us` is untouched.** It is now 286 of ~865 ms/s of `draw_us` and is the next
+  target. Per the measurement above it is per-submission, not per-byte — so it is fewer submit-and-wait
+  round trips, and `skip_readback` for the type-11 Store is the change that would deliver them.
+
+**One asymmetry that was designed for rather than discovered, and it held.** The deferred writeback rail
+arms a window and does *not* write guest pages, so it does not bump `content_generation` at arm time —
+the bump comes later at flush. A resident stamped at arm time therefore goes stale on its own flush even
+though the pixels never changed. That is conservative (it falls back to the CPU seed, which is correct)
+and it shipped that way; at 95 % elision the residual is not worth chasing.
+
+The deferred route also **captures its epoch at the publish rather than re-reading it at the end of the
+function**, which matters for a reason worth generalising: `evict_render_windows_to_cap` runs between
+those two points and can land a sibling window, which writes guest pages and replaces the
+one-per-mapping cache entry. Re-reading would stamp the resident with an epoch that already reflects
+somebody else's write. A deferred obligation must record the epoch *of its own act*, not the epoch it
+finds later.
 
 ### A Bounds Check That Charges A Stride For The Last Row Squares Window Corners
 
