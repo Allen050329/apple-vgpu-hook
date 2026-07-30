@@ -918,6 +918,55 @@ a `memcpy` and can only be neutral or better. That is the same shape as the 3-of
 result recorded above which survived a full revert of its supposed cause. Interleave, or score the
 change with a counter that measures the thing directly rather than the frame rate downstream of it.
 
+**The Linux host window is a second `VkDevice`, and that — not a capability — is why every present is
+a CPU round trip.** Mapped 2026-07-30. `host_window/present.rs` creates its own `ash::Entry`,
+`Instance` and `Device` (`VkState::new`), so a frame reaches the window as CPU bytes by construction:
+the drain reads the resident back (`read_target`, 8.15 MB), `publish_window_frame` copies it again
+(`p.frame_bgra[..need].to_vec()`), and the window thread memcpys it a third time into a persistently
+mapped LINEAR staging image before blitting that to the swapchain. **Three full-frame CPU passes per
+presented layer**, ~450 MB/s each at the measured rate. The module's own doc comment states the fix:
+"Presenting the engine's resident image directly on a shared `VkDevice` would remove that copy and is
+not implemented."
+
+macOS already does it. `engine/window_present.rs` blits the engine resident straight into the acquired
+swapchain image, and the file is **platform-agnostic** — it reaches the surface through
+`ash_window::create_surface`, which dispatches on the raw handle type, and nothing in it calls a macOS
+API. It was merely `#[cfg(target_os = "macos")]`. Ungating it compiles clean on Linux with zero
+warnings, and brings **nine unit tests that had never run on this host** (lib 969 → 978).
+
+Its capability gate is already written and already fail-closed: `WindowPresenter::create` refuses
+`SwapchainUnavailable` when the device extension is absent and `QueueCannotPresent { queue_family }`
+when `get_physical_device_surface_support` says no. That is the "gate on capabilities, not vendor
+names" rule already satisfied — do not write a second one.
+
+**The prerequisite this file recorded as blocking is dissolved, and the resident rail dissolved it.**
+The entry below says the export path asks the registry for the mapping the guest named
+(`outcome=orphan`, mid 2 while the registry held mid 1) and warns against substituting a peer's
+resident. That was measured before type-11 composite Stores became registry-resident. Re-measured on
+one x86/Vulkan boot at `fc61203`: **`target_reads` 58/s against ~57 presented layers/s**, with
+`export_present_miss`, `orphan`, `no_resident_content` and
+`vk_engine_export_present_unknown_identity` all **0**, across the three mids the guest actually
+presents (2, 5, 6). Essentially every presented layer is already served by a resident read today, so
+the identity question the retraction was waiting on is answered by construction: the Store that
+produces the frame pins and stamps the resident under the same mapping the present names.
+
+Both halves also select the **same physical device** — `host_window_vk_caps role=consumer` and
+`vk_caps` both name the RTX 5080 on this host — so sharing the engine device does not change which
+GPU renders.
+
+What is built: the engine instance now enables `VK_KHR_surface` plus whichever of
+xlib/xcb/wayland the loader advertises (the window does not exist when the context is created, so the
+platform cannot be known then, and an enabled surface extension with no surface is inert), the device
+enables `VK_KHR_swapchain` on Linux, and the presenter and its facade are ungated. What remains is the
+wiring: `host_window/present.rs`'s `resumed()` and `draw()` still take the `VkState` arm on Linux, and
+`publish_window_frame` still builds a resident source only under `#[cfg(target_os = "macos")]`.
+
+The one design question left is **what to do when no resident is ready**. macOS drops the frame and
+counts `window_publish::note(false)`; Linux has always had CPU bytes to fall back on. Publishing a
+resident when one is ready and CPU bytes otherwise keeps the window from freezing, but the capture
+that produces those bytes is the cost being removed — so the choice has to be made in
+`capture_present_frame`, before the readback, not at publish time.
+
 **Open lead: the window handoff is CPU staging on every present, and the two halves disagree about
 which mechanism is in use.** Every boot ends its throttled census the same way:
 

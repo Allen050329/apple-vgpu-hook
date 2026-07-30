@@ -250,8 +250,8 @@ pub(crate) struct DeviceContext {
     /// Byte length of the last persisted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
-    /// `VK_KHR_swapchain` was enabled for the macOS engine-owned host window.
-    #[cfg(all(feature = "host-window", target_os = "macos"))]
+    /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
+    #[cfg(feature = "host-window")]
     pub swapchain: bool,
 }
 
@@ -293,7 +293,21 @@ impl DeviceContext {
         if portability_enumeration {
             instance_extensions.push(vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr());
         }
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        // Surface extensions for the engine-owned host window.
+        //
+        // The window does not exist yet — the engine context is created on the
+        // first draw, long before winit has a handle — so which *platform*
+        // surface extension will be needed is not knowable here. Enabling every
+        // one the loader advertises is what makes the later
+        // `ash_window::create_surface` work for whichever handle arrives, and it
+        // costs nothing: an enabled instance extension with no surface created
+        // through it is inert.
+        //
+        // Enabling nothing unless `VK_KHR_surface` *and* at least one platform
+        // extension are both present keeps the failure at attach time, where it
+        // can be a typed decline and fall back to the CPU staging path, rather
+        // than failing instance creation for every headless run.
+        #[cfg(feature = "host-window")]
         {
             let advertised = entry
                 .enumerate_instance_extension_properties(None)
@@ -305,11 +319,29 @@ impl DeviceContext {
                     .iter()
                     .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
             };
-            if has_instance_extension(ash::khr::surface::NAME)
-                && has_instance_extension(ash::ext::metal_surface::NAME)
-            {
+            #[cfg(target_os = "macos")]
+            let platform: &[&CStr] = &[ash::ext::metal_surface::NAME];
+            // X11 and Wayland are both live on Linux desktops and the session
+            // type is a runtime property, so both are offered and each is taken
+            // only if advertised.
+            #[cfg(target_os = "linux")]
+            let platform: &[&CStr] = &[
+                ash::khr::xlib_surface::NAME,
+                ash::khr::xcb_surface::NAME,
+                ash::khr::wayland_surface::NAME,
+            ];
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let platform: &[&CStr] = &[];
+            let available: Vec<&CStr> = platform
+                .iter()
+                .copied()
+                .filter(|name| has_instance_extension(name))
+                .collect();
+            if has_instance_extension(ash::khr::surface::NAME) && !available.is_empty() {
                 instance_extensions.push(ash::khr::surface::NAME.as_ptr());
-                instance_extensions.push(ash::ext::metal_surface::NAME.as_ptr());
+                for name in available {
+                    instance_extensions.push(name.as_ptr());
+                }
             }
         }
         let mut ici = vk::InstanceCreateInfo::default()
@@ -407,7 +439,7 @@ impl DeviceContext {
         let enabled = features.enabled_features();
         let portability_subset = has_device_extension(vk::KHR_PORTABILITY_SUBSET_NAME);
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        #[cfg(feature = "host-window")]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
         // spec guarantees at least ONE of D32_SFLOAT_S8_UINT / D24_UNORM_S8_UINT
@@ -458,7 +490,7 @@ impl DeviceContext {
         if vertex_attribute_divisor {
             enabled_device_extensions.push(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME.as_ptr());
         }
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        #[cfg(feature = "host-window")]
         if swapchain {
             enabled_device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
         }
@@ -585,7 +617,7 @@ impl DeviceContext {
             depth_stencil_format,
             pipeline_cache_path: Some(pipeline_cache_path),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
-            #[cfg(all(feature = "host-window", target_os = "macos"))]
+            #[cfg(feature = "host-window")]
             swapchain,
         })
     }

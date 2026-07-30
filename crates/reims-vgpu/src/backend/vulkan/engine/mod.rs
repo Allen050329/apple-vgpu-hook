@@ -28,7 +28,7 @@ pub mod reason;
 mod slab;
 pub mod types;
 pub mod vk_call;
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 mod window_present;
 
 pub use compute_execution::ComputeExecutionDecline;
@@ -57,7 +57,7 @@ pub use types::{
     COLOR_INPUT_BINDING,
 };
 pub use vk_call::{VkCall, VkOp};
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 pub use window_present::WindowPresentOutcome;
 
 use caches::ObjectCaches;
@@ -73,7 +73,7 @@ struct EngineState {
     caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
-    #[cfg(all(feature = "host-window", target_os = "macos"))]
+    #[cfg(feature = "host-window")]
     window_presenter: Option<window_present::WindowPresenter>,
 }
 
@@ -84,7 +84,7 @@ impl EngineState {
             caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
-            #[cfg(all(feature = "host-window", target_os = "macos"))]
+            #[cfg(feature = "host-window")]
             window_presenter: None,
         }
     }
@@ -92,7 +92,7 @@ impl EngineState {
     fn flush_device_derived(&mut self) {
         if let Some(ctx) = self.owner.ctx.as_ref() {
             unsafe {
-                #[cfg(all(feature = "host-window", target_os = "macos"))]
+                #[cfg(feature = "host-window")]
                 if let Some(mut presenter) = self.window_presenter.take() {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
@@ -143,7 +143,7 @@ pub fn reset_guest_state() -> GuestResetStats {
     let EngineState {
         ref owner,
         ref mut pools,
-        #[cfg(all(feature = "host-window", target_os = "macos"))]
+        #[cfg(feature = "host-window")]
         ref mut window_presenter,
         ..
     } = &mut *guard;
@@ -153,7 +153,7 @@ pub fn reset_guest_state() -> GuestResetStats {
             crate::observe::Emit::decline("vulkan_guest_reset", &decline).fail_once(0);
         }
         unsafe {
-            #[cfg(all(feature = "host-window", target_os = "macos"))]
+            #[cfg(feature = "host-window")]
             if let Some(presenter) = window_presenter.as_mut() {
                 presenter.release_pins_after_idle(pools);
             }
@@ -174,7 +174,7 @@ pub fn reset_guest_state() -> GuestResetStats {
 
 /// Ensure the macOS host-window surface and swapchain exist on the engine's
 /// Vulkan instance/device.
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 pub fn window_present_attach(
     display: raw_window_handle::RawDisplayHandle,
     window: raw_window_handle::RawWindowHandle,
@@ -198,7 +198,7 @@ pub fn window_present_attach(
     Ok(())
 }
 
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 pub fn window_present_resize(width: u32, height: u32) {
     let mut guard = lock_engine();
     if let Some(presenter) = guard.window_presenter.as_mut() {
@@ -208,7 +208,7 @@ pub fn window_present_resize(width: u32, height: u32) {
 
 /// Present the current compositor resident through the engine-owned MoltenVK
 /// swapchain. Acquire is nonblocking, so a vblank wait never holds `ENGINE`.
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
 ) -> Result<WindowPresentOutcome, DrawError> {
@@ -229,7 +229,7 @@ pub fn window_present_frame(
 
 /// Destroy the engine-owned surface while the native AppKit window still
 /// exists. Called from winit's `exiting` callback.
-#[cfg(all(feature = "host-window", target_os = "macos"))]
+#[cfg(feature = "host-window")]
 pub fn window_present_detach() {
     let mut guard = lock_engine();
     let Some(mut presenter) = guard.window_presenter.take() else {
