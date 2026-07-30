@@ -1277,6 +1277,41 @@ The hazard those guards exist for is real and frequent, which is what makes the 
 a length, or one page will pass straight through that. Only a full PFN compare or a generation bumped
 by one will not.
 
+**A guard that re-resolves through the path it is guarding cannot see a substitution — it reproduces
+it.** `deferred_pages_still_ours` is the drift check above, and it decided whether a deferred window
+may still be written to guest RAM by comparing the armed page set against a *fresh* walk. Both walks
+went through `gva_mem::visit_task_gva_page_gpas`, under the same `entry.task_id`
+(`storage_flush.rs:438` ← `vulkan.rs:4934`) — and until 2026-07-30 that function resolved
+`for id in [task_id, task_id >> 1]`. So a window indexed under the neighbour's page table was
+re-indexed under the neighbour's page table, `live == *armed` held, and the guard reported the pages
+"still ours". The freshness of the second walk was real; its *task selection* was the thing in
+question, and it was copied rather than checked.
+
+That was the **fourth** `task_id >> 1` arm in this crate and the last to go. The others are worth
+listing together, because the pattern is that each was justified by "only one of the two slots is
+ever live" and that premise is simply false: `task_slot::resolve_task_word` decides raw-only
+(`raw_live.then_some(raw)`) and merely censuses the shifted case; `read_task_gva_by_id` refuses, after
+measuring 9-11 wrong substitutions per boot; `gva_view::resolve_task_for_walk` returns `None`. One
+healthy x86/Vulkan boot measures the premise directly — `task_walk_ambiguous` fires with
+`named=1 other=0`, `named=2 other=1`, `named=5 other=2`, `named=7 other=3`, i.e. **every** time, the
+`>> 1` slot was live *simultaneously* with the named one. `task_id >> 1` is not a spare spelling of
+the same task; it is a different, running task.
+
+Two process notes, both of which cost something here:
+
+- **The subagent audit that found it was wrong about the consequence**, and this is the second such
+  audit on this same rail (the `map_generation` one above is the first). It concluded "heap corruption
+  if GPAs resolve under a different task". That does not survive reading the writer:
+  `write_gva_rgba8` resolves through `gva_view::resolve_task_for_walk`, which is named-task-only and
+  fails closed, so a misdirected *write* was already impossible. The real cost was a deferred window
+  indexed against another task's pages, a drift guard agreeing with itself, and a flush choke point
+  that misses — stale pixels and lost writebacks. Treat the nomination as a pointer to a file; derive
+  the consequence by reading the code that actually performs the operation.
+- **A stale doc comment marked the spot.** `visit_task_gva_page_gpas` documented itself as resolving
+  "the same task selection as `read_task_gva_by_id`" while that function had already dropped its
+  shifted arm. When a doc claims parity with another function, the cheap check is whether the other
+  function still does what the doc says.
+
 **Do not pool a boot failure with a clean boot.** The same 351 logs contain **15 boots (4.3%) that
 never started macOS at all** — OpenCore `Boot failed - Aborted` — spread across many days and many
 commits, so it is rig flakiness. A harness that scores "did not panic" over all boots counts those 15
@@ -1828,6 +1863,24 @@ the `reason=` counts are what hold still.
 
 Slice a boot with `stat -c%s /tmp/reims-vgpu-fail.log` before it and `tail -c +$((M+1))` after — the
 log appends across boots, so an unsliced `grep -c` answers for every boot ever run on the machine.
+
+**Two slugs in those three boots have since been retired, so a newer slice will not match them.**
+`read_refused_neither` and `read_refused_shifted_would_serve` were the two arms of a counterfactual
+that walked `task_id >> 1`'s page table purely to label the refusal; both are gone, and the same
+events now report the reason the walk itself returned. A fourth healthy boot on 2026-07-30 (2535
+lines, same workload, host window verified rendering wallpaper, Dock, menu bar and Safari on
+Wikipedia) reads `air_loading` 182, `generation_match` 32, `cmd_task_ambiguous` 14,
+`write_gate_outside` 4, and in place of the two retired slugs: `gva_zero_pfn` 13, every one of them
+`gva_read_refused reason=gva_zero_pfn … via=runtime/objects.rs:607`. That is `lookup_list_entry`,
+which is exactly where AGENTS.md had already attributed the substitutions — so the typed reason
+confirms the attribution *and* names the site, which the two-arm caller label could not do. The
+uniformity is the same result the `gva_write` work got when it typed its reason: one real cause behind
+a label that had implied two.
+
+That boot's one `FAIL` line is `present_capture … gen=0 reason=no_resident_content`, the documented
+`gen=0` uninitialized-present class tied to the RTD3 host artifact above — pre-existing and on the
+present path, not a page-table result. Do not read `FAIL 0` in the three-boot baseline as a promise;
+it is three samples of a class that fires on an idle boundary.
 
 For Rust changes, run the relevant native tests serially from the repo root:
 
