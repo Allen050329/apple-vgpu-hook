@@ -499,6 +499,25 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
     gva: u64,
     buf: &[u8],
 ) -> Result<(), MemError> {
+    write_task_gva_product_within(state, host, task_id, gva, buf, None)
+}
+
+/// [`write_task_gva_product`] bounded to the guest pages a deferred window was
+/// armed on.
+///
+/// `allowed` is `None` for every writer whose authorisation is the command it
+/// is executing. It is `Some` only where the write is landing content that was
+/// captured earlier against a page set, which is the one case where the live
+/// page table answers a different question from the one that matters.
+#[track_caller]
+pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostOps>(
+    state: &mut crate::model::DeviceState,
+    host: &mut H,
+    task_id: u32,
+    gva: u64,
+    buf: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> Result<(), MemError> {
     if buf.is_empty() {
         return Ok(());
     }
@@ -533,7 +552,9 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
                 .fail();
         }
     }
-    let Err(err) = crate::runtime::gva_view::write_span(state, host, task_id, gva, buf) else {
+    let Err(err) =
+        crate::runtime::gva_view::write_span_within(state, host, task_id, gva, buf, allowed)
+    else {
         return Ok(());
     };
     crate::observe::Emit::decline("gva_write", &err)

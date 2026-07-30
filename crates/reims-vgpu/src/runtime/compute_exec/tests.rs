@@ -1926,7 +1926,7 @@ fn bulk_linear_write_scatters_rows_and_preserves_padding() {
         .unwrap();
     let bytes: Vec<u8> = (0..tight * h as usize).map(|i| i as u8 + 1).collect();
     assert!(write_linear_texture_bulk(
-        &mut state, &mut host, 1, gva, stride, tight, h, &bytes
+        &mut state, &mut host, 1, gva, stride, tight, h, &bytes, None
     ));
     for y in 0..h as u64 {
         let mut row = vec![0u8; stride as usize];
@@ -1943,6 +1943,92 @@ fn bulk_linear_write_scatters_rows_and_preserves_padding() {
             );
         }
     }
+}
+
+/// The linear compute rail carries the deferred-window bound on BOTH of its
+/// writers, so which one a real flush takes cannot decide whether the bound
+/// applies.
+///
+/// `write_linear_guest_within` tries the packed bulk view first and drops to a
+/// per-row `write_task_gva_product_within` when the span is fragmented. Here the
+/// task's page table resolves `data0`, and the window says it was armed on a
+/// page it does not own — the shape the guest produces by releasing a GPU
+/// allocation and letting the range be re-pointed. Both writers must refuse, and
+/// `data0` must be byte-unchanged: an unbounded writer would have scattered a
+/// compute storage image into whatever owns it now.
+#[test]
+fn a_linear_flush_cannot_write_pages_its_window_was_not_armed_on() {
+    let mut host = FakeHost::new();
+    host.strict_linux_map = true;
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    setup_linear_task_x86(&mut host, &mut state, &[4, 5]);
+    let (tight, stride, h) = (8usize, 16u64, 3u32);
+    let gva = 0x40u64;
+    let data0 = 4u64 << PAGE_SHIFT_X86;
+    let span = (h as u64) * stride;
+    host.write_gpa(data0 + gva, &vec![0xEEu8; span as usize])
+        .unwrap();
+    let bytes: Vec<u8> = (0..tight * h as usize).map(|i| i as u8 + 1).collect();
+
+    // A page set naming somewhere this window's GVA does not resolve to.
+    let foreign: std::collections::HashSet<u64> = [9u64 << PAGE_SHIFT_X86].into_iter().collect();
+    assert!(
+        !write_linear_texture_bulk(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            stride,
+            tight,
+            h,
+            &bytes,
+            Some(&foreign)
+        ),
+        "the bulk view must refuse a span outside the armed pages"
+    );
+    assert_eq!(
+        write_linear_guest_within(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            stride,
+            tight,
+            h,
+            &bytes,
+            "test",
+            Some(&foreign),
+        ),
+        LinearWrite::Failed,
+        "the per-row fallback must refuse it too, not quietly land the rows"
+    );
+    let mut back = vec![0u8; span as usize];
+    host.read_gpa(data0 + gva, &mut back).unwrap();
+    assert!(
+        back.iter().all(|&b| b == 0xEE),
+        "not one byte may reach a page the window was not armed on"
+    );
+
+    // Control: armed on the page it actually resolves to, the same flush lands.
+    let armed: std::collections::HashSet<u64> = [data0].into_iter().collect();
+    assert_eq!(
+        write_linear_guest_within(
+            &mut state,
+            &mut host,
+            1,
+            gva,
+            stride,
+            tight,
+            h,
+            &bytes,
+            "test",
+            Some(&armed),
+        ),
+        LinearWrite::Written,
+        "a window writing its own pages must still write"
+    );
+    host.read_gpa(data0 + gva, &mut back).unwrap();
+    assert_eq!(&back[..tight], &bytes[..tight]);
 }
 
 /// Fragmented PFNs under strict Linux map: the packed view fails, both
@@ -1964,7 +2050,7 @@ fn bulk_linear_helpers_fall_back_on_fragmented_span() {
         &mut state, &mut host, 1, gva, stride, tight, h, &mut bytes
     ));
     assert!(!write_linear_texture_bulk(
-        &mut state, &mut host, 1, gva, stride, tight, h, &bytes
+        &mut state, &mut host, 1, gva, stride, tight, h, &bytes, None
     ));
     // The fallback primitive still lands bytes across the fragmented span.
     let payload = [0xABu8; 8];

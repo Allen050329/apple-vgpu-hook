@@ -2355,6 +2355,7 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     tight: usize,
     height: u32,
     bytes: &[u8],
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
 ) -> bool {
     if height == 0 || tight == 0 || bytes.len() < (height as usize).saturating_mul(tight) {
         return false;
@@ -2376,10 +2377,13 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
         span_len,
         "write_linear_guest",
     );
-    // Fresh PT walk at write time — never a cached view (stale-view class).
-    let Some(span_map) =
-        crate::runtime::gva_view::map_fresh_span(state, host, task_id, gva, span_len)
-    else {
+    // Fresh PT walk at write time — never a cached view (stale-view class) —
+    // carrying `allowed` so a deferred window's bytes cannot reach a page
+    // outside the set it was armed on, however the guest re-points the range
+    // between the flush decision and this walk.
+    let Some(span_map) = crate::runtime::gva_view::map_fresh_span_within(
+        state, host, task_id, gva, span_len, allowed,
+    ) else {
         return false;
     };
     let ptr = span_map.ptr;
@@ -2588,7 +2592,39 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
     bytes: &[u8],
     ctx: &str,
 ) -> LinearWrite {
-    if write_linear_texture_bulk(state, host, task_id, gva, row_stride, tight, height, bytes) {
+    write_linear_guest_within(
+        state, host, task_id, gva, row_stride, tight, height, bytes, ctx, None,
+    )
+}
+
+/// [`write_linear_guest`] bounded to the guest pages a deferred window was
+/// armed on.
+///
+/// The linear compute rail defers exactly as the GVA render rail does, and it
+/// re-walks at flush time for the same reason, so it has the same hazard and
+/// takes the same answer: the armed page set travels into the walk that
+/// resolves the destination, and both the bulk view and the per-row fallback
+/// carry it. Leaving the bound on one of the two would make it depend on how
+/// the guest happened to lay the pages out.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the linear writer mirrors the window's guest geometry"
+)]
+pub(crate) fn write_linear_guest_within<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    row_stride: u64,
+    tight: usize,
+    height: u32,
+    bytes: &[u8],
+    ctx: &str,
+    allowed: crate::runtime::gva_view::WindowPages<'_>,
+) -> LinearWrite {
+    if write_linear_texture_bulk(
+        state, host, task_id, gva, row_stride, tight, height, bytes, allowed,
+    ) {
         return LinearWrite::Written;
     }
     // The bulk path declines for several reasons and the per-row fallback below
@@ -2622,12 +2658,13 @@ pub(crate) fn write_linear_guest<M: HostMemory + HostOps>(
             ));
             return LinearWrite::Failed;
         };
-        if let Err(e) = gva_mem::write_task_gva_product(
+        if let Err(e) = gva_mem::write_task_gva_product_within(
             state,
             host,
             task_id,
             row_gva,
             &row[..row_stride as usize],
+            allowed,
         ) {
             crate::observe::fail(format!(
                 "compute_writeback_tex fail reason=linear_gva_write task={task_id} {ctx} gva={row_gva:#x} y={y} row_stride={row_stride} height={height} err={e:?}"

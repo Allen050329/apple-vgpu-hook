@@ -756,7 +756,12 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             key.span_end,
             "linear_deferred_flush",
         );
-        match crate::runtime::compute_exec::write_linear_guest(
+        // Same bound as the GVA rail: the armed page set travels into the
+        // writer's own walk, so the decision `still_ours` reached above cannot be
+        // invalidated by the guest between that walk and this one. `None` here
+        // would be a window with no armed pages, which is a window this rail
+        // never bounded in the first place.
+        match crate::runtime::compute_exec::write_linear_guest_within(
             state,
             host,
             task_id,
@@ -766,6 +771,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             key.height,
             &bytes,
             &format!("flush ref={texture_ref}"),
+            armed_pages.as_ref(),
         ) {
             crate::runtime::compute_exec::LinearWrite::Written => "written",
             // Nothing resolves at this GVA, so there is no guest memory to land
