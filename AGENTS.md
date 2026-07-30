@@ -2693,6 +2693,20 @@ not subject to this rig's documented cross-boot spread. Twelve goal-1-to-3 senti
 captured frame is correct on the checks no failure line can see: banner **orange**, hyperlinks
 **blue**, Blur Busters header **purple**.
 
+**Replicated on a second boot at `98c8725`** (`PANEL: On 14/14`, `present_hz` p50 **111.10**, max
+119.00, guest testufo **119.968 Hz / 120 fps**, 2316 sliced lines): `write_gate_undeclared` **17**,
+`write_gate_late_map` **17** — again every undeclared write confirmed by a later notification — and
+`write_gate_never_declared` **0**. The same twelve goal-1-to-3 sentinels are 0, `deferred_flush_lost
+… reason=cache_miss` is 0, and the failure channel is 59 lines led by the documented-benign
+`cmd_task_ambiguous` (11), `gva_zero_pfn` (10) and `task_walk_ambiguous` (4). A longer
+`darkmode-corners.sh` window on the same boot read **71 of 76**, the five outstanding being windows
+still inside the ring rather than losses.
+
+So the ratio holds at two boots and 31 of 31 joined writes. `write_gate_never_declared` — the arm
+that would carry the open memory-corruption signature — is **still untested live**, in the same
+sense that `present_unbacked`'s `carried=nothing` is: it has never once fired, so its report path
+has no positive evidence behind it.
+
 **A graceful-degradation path was hiding behind the gate, and removing the gate exposed it.** The
 compute rail's early return also happened to catch genuinely *unmapped* GVAs, and that degradation
 is correct. It is kept and now keyed on the condition itself: `write_linear_guest` returns
@@ -2779,6 +2793,99 @@ while still refusing a write into an undeclared heap. That is **unmeasured**: `o
 task 0 resolves 16 pages there, not that they are the same 16 physical pages. Extending
 `probe_write_gate_pages` to compare the two GPA sets is the next measurement and it is cheap — both
 walks already happen in that function.
+
+### Goal 2 Has A Cheap Repro At Last: A Finder Icon Composited Under Load
+
+**Found 2026-07-30 on one x86/Vulkan boot at `98c8725`. The subject is a 64x64 icon rather than a
+1920x1080 layer, the trigger is one ssh command, and nothing in the always-on channel reports it.**
+
+Every previous handle on the black-framebuffer class was a whole compositing layer, caught by
+dragging a Safari window and hoping the capture landed on the bad swap buffer. This one is small,
+cheap and repeatable, and it reproduces the same family of artefacts.
+
+The recipe, on a guest already at a real session:
+
+```sh
+ssh macos-vm 'open -a Safari "https://testufo.com/refreshrate"; sleep 35;
+              killall Finder; sleep 4; open ~; sleep 6'
+```
+
+then capture the host window and magnify the icon row of the Finder window. The load is what
+matters; `killall Finder; open ~` is only a way to force every icon in the window to be composited
+*while* it is running.
+
+Measured, in one such capture at 1280x719, cropped `640x110+340+140` and magnified 180 % with
+`-filter point`:
+
+| icon | rendered |
+|---|---|
+| Desktop | a small solid **red** square |
+| Documents, Downloads, Movies | correct |
+| Music | a tiny dark glyph fragment, upper-right of its cell |
+| Pictures | a narrow solid **black** vertical bar |
+| Public | very nearly absent |
+
+An earlier capture in the same boot, at a different moment, had a *different* set wrong and a
+different set right — Pictures correct while Public was a full-size black rectangle, Desktop a black
+rect with a white glyph, and four others shrunken. **Which icons come out wrong varies between
+composites; that they come out wrong does not.** That is the same "one of the two swap framebuffers"
+intermittency the goal statement describes, in a form small enough to magnify.
+
+Read the *shapes*, because they are the finding and they rule out a whole family at once. The wrong
+icons are **solid single colours** (a red square, a black bar) and **shrunken fragments of the
+icon's inner glyph with the blue folder body absent** — Downloads' download-arrow ring at a fraction
+of its size, Movies' film glyph, Desktop's monitor screen. A correct icon has both layers. Stale
+content would render as a *previous icon*; it does not. Format conversion, subsampling and tiling
+all predict per-pixel error and these are whole-cell.
+
+**Three hypotheses are already refuted, each by a controlled arm on this boot. Do not re-derive.**
+
+- *The idle resident sweep ages something out.* A Finder window left completely untouched was
+  captured at t = 4, 20, 40, 70 and 110 s. **All six icons correct in all five frames.** So
+  `maintain_idle_residents` and every other decay mechanism is out: a static window does not rot.
+- *The appearance flip does it.* `defaults write -g AppleInterfaceStyle Dark; killall Dock`, then a
+  capture 14 s later: **all six icons correct.** The flip forces a full icon re-composition and is
+  harmless on its own. This matters because the defect was *first* seen in a dark-mode run and the
+  obvious reading was that dark mode caused it.
+- *It is dark mode at all.* The `darkmode-corners.sh` **light** capture was already corrupt —
+  Desktop and Documents ghost-glyphs, Pictures and Public narrow orange bars, orange being exactly
+  the wallpaper colour behind them. Both appearances, same defect.
+
+What separates the clean arms from the reproducing one is that the reproducing arm had a **heavy GPU
+workload running while the icons were composited**. In the clean arms the window was composited on
+an idle device.
+
+**Nothing reports it.** The failure channel over the reproducing slice (1804 lines) is 2
+`cmd_task_ambiguous`, 1 `task_walk_ambiguous`, 1 `gva_zero_pfn` and 1 `deferred_flush_lost
+kind=compute mapping=47 16x16 … reason=map_generation_drift` — that last being the guard working, at
+a geometry no icon has. `linear_deferred_dropped reason=retired` fires once. Three or four icons are
+wrong and the device says nothing about any of them, which makes this a silent loss under the ground
+rules and means the next step is a probe rather than another slice.
+
+Where to point it: icons reach the screen on the **compute** rail, not the render rail. The slice
+carries 233 `compute_linux`, 73 `compute_stage_resident_sample` and 32 `compute_stage_resident_skip`,
+and the icon windows are visible in them by geometry — `mapping=7 32x32 fmt=0x73 bytes=8192` and
+`mapping=7 64x64 … bytes=32768`, i.e. 8 bytes per pixel, `Rgba16Float`.
+
+Two things were checked there and are **not** the answer, so they do not need re-reading:
+
+- **`ComputeStorageResidencyKey` includes `width`, `height` and `pixel_format`**, so the same mapping
+  at two geometries is two keys. The one-entry-per-mapping hazard that produced the black-layer
+  `cache_miss` class does not apply to this map.
+- **`invalidate_storage_residency_window` tests intersection, not exact match**
+  (`key.span_end <= lo || key.surface_offset >= hi`), so an overlapping guest write does drop the
+  mirror. The comment above the skip gate in `compute_exec/mod.rs` calls it "exact-window
+  invalidation" and is stale — the code is right and the comment is wrong.
+
+One reading is **open and unmeasured**: `compute_linux storage_format_specialize` reports
+`spirv=R32Float specialized=Rgba16Float engine=Rgba16Float guest=Rgba16Float guest_bpp=8
+shader_bpp=4` nine times in the slice. The shader declares a 4-byte storage-image format for an
+8-byte resource and we rewrite the declaration. The same line reports `specialized=Unknown` for
+`Bgra8Unorm` (`guest_bpp=4 shader_bpp=4`) and `specialized=Rgba8Unorm` for `Rgba8Unorm` — so three
+different specialization strategies are in use and only the `Rgba16Float` one carries a
+bytes-per-pixel disagreement. Whether that disagreement is benign (a declaration rewrite the driver
+honours) or is the defect is **not established**, and a bpp ratio of 2 against artefacts that are
+half-width bars is suggestive rather than evidence. Instrument the branch before believing it.
 
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
