@@ -158,6 +158,26 @@ pub fn first_sight(reason: &'static str, discriminant: u64) -> bool {
         .unwrap_or(true)
 }
 
+/// `true` when `state` differs from the last state recorded for `subject` under
+/// `reason`. Records it either way, and is `true` on the first sighting.
+///
+/// [`first_sight`] answers "has this ever happened"; this answers "has this
+/// *changed*". They are different questions and the difference matters when a
+/// subject is served by one of several rungs over its life and the thing worth
+/// reporting is the switch: a first-sighting latch cannot see a switch at all,
+/// because it goes quiet after the first one. An undeduped line on a per-bind
+/// path floods instead. A transition report is bounded by the number of real
+/// changes, which is what makes it cheap enough to leave on.
+pub fn state_changed(reason: &'static str, subject: u64, state: u64) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<HashMap<(&'static str, u64), u64>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|mut m| m.insert((reason, subject), state) != Some(state))
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +225,29 @@ mod tests {
         assert!(
             first_sight("latch_test_other", 0x40),
             "a different reason is a different event"
+        );
+    }
+
+    /// The property that separates this from [`first_sight`]: a subject that
+    /// returns to a state it has already been in must report the switch, since
+    /// the switch is the event. A first-sighting latch reports it once and then
+    /// never again, which is exactly the blindness this exists to fix.
+    #[test]
+    fn a_state_that_returns_is_still_a_transition() {
+        assert!(state_changed("flip_test", 1, 100), "first sighting reports");
+        assert!(!state_changed("flip_test", 1, 100), "same state is quiet");
+        assert!(state_changed("flip_test", 1, 200), "a switch reports");
+        assert!(
+            state_changed("flip_test", 1, 100),
+            "switching back is a switch too"
+        );
+        assert!(
+            state_changed("flip_test", 2, 100),
+            "a different subject keeps its own state"
+        );
+        assert!(
+            state_changed("flip_other", 1, 100),
+            "a different reason keeps its own state"
         );
     }
 }

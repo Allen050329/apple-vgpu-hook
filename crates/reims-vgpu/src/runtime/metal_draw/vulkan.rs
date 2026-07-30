@@ -3866,18 +3866,27 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // this exists for is static once composited, and the line
                     // is timestamped, so first sighting still attributes to the
                     // composite that produced it.
-                    let rung = match &loaded {
-                        SampledSourceRequest::Bytes(..) => "bytes",
+                    let (rung, empty) = match &loaded {
+                        // Emptiness short-circuits on the first nonzero byte, so
+                        // a texture that has content costs a handful of loads.
+                        // Only an all-zero buffer pays the full walk, and that is
+                        // the case worth paying for.
+                        SampledSourceRequest::Bytes(rgba, ..) => {
+                            ("bytes", rgba.iter().all(|&b| b == 0))
+                        }
                         #[cfg(feature = "backend-vulkan")]
-                        SampledSourceRequest::Target(_) => "resident",
+                        SampledSourceRequest::Target(_) => ("resident", false),
                         #[cfg(feature = "backend-vulkan")]
-                        SampledSourceRequest::GuestRuns(..) => "guest_runs",
+                        SampledSourceRequest::GuestRuns(..) => ("guest_runs", false),
                     };
-                    let mut key = std::hash::DefaultHasher::new();
-                    std::hash::Hash::hash(&(texture_ref, tw, th, rung), &mut key);
-                    if crate::observe::first_sight(
+                    let mut subject = std::hash::DefaultHasher::new();
+                    std::hash::Hash::hash(&(texture_ref, tw, th), &mut subject);
+                    let mut state = std::hash::DefaultHasher::new();
+                    std::hash::Hash::hash(&(rung, empty), &mut state);
+                    if crate::observe::state_changed(
                         "sampled_content",
-                        std::hash::Hasher::finish(&key),
+                        std::hash::Hasher::finish(&subject),
+                        std::hash::Hasher::finish(&state),
                     ) {
                         let detail = match &loaded {
                             SampledSourceRequest::Bytes(rgba, _, layout) => {
@@ -3896,8 +3905,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             }
                         };
                         crate::observe::off(format!(
-                            "sampled_content stage={} idx={index} ref={texture_ref} {tw}x{th} mid={sampled_mid} rung={rung} {detail}",
+                            "sampled_content stage={} idx={index} ref={texture_ref} {tw}x{th} mid={sampled_mid} rung={rung} empty={} {detail}",
                             if frag_stage { "fragment" } else { "vertex" },
+                            empty as u8,
                         ));
                     }
                 }
