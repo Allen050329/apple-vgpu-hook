@@ -2901,6 +2901,17 @@ shape a load-dependent defect invites, which is why they are worth recording as 
   tests or the pre-submit `force_loss` arm, where nothing has been submitted. The real path moves
   `staging_live` into the submission entry (`std::mem::take`), which is retired on its fence. Pool
   wrap-around under load is therefore not reachable here.
+- *The reinterpret-sibling sample source.* `compute_stage_tex` will serve a sampled view from a
+  *different* resident of the same byte window when the two agree on height and row bytes — matching
+  on neither width nor format, which reads exactly like the kind of guess that produces a wrong
+  image. It is sound in principle (same window, same height, same row stride means the same bytes,
+  and the guest asked for two views over them), and in any case it **fires 0 times in both corrupt
+  arms**, so it is not this defect. Its line is `compute_stage_resident_reinterpret`.
+- *The fail-closed arm catching an eviction between the gate and the acquire.* The runtime checks
+  `compute_resident_storage_generation` under one `lock_engine()` and the engine acquires under
+  another, so an LRU eviction can land in between; the design covers that with
+  `ResidentSeedGenerationLost`. That decline fires **0 times** in both corrupt arms, so the window is
+  not being taken either.
 - *A fresh resident matching a stale mirror at generation 0.* `ensure_resident_storage_image`
   creates evicted-and-recreated residents at `generation: 0` with `layout: UNDEFINED`, and the seed
   skip gate is `mirror == engine_generation` — so a mirror holding 0 would skip the seed into an

@@ -974,9 +974,10 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
     // same currency — not the mapping-level content generation — so disjoint
     // sibling-window writebacks (ping-pong canvases) cannot desync the pair.
     let generation = next_mapping_content_generation(candidate.seed_generation);
-    // Drop intersecting windows (normally already gone via the writeback's
-    // exact-window invalidation — kept here as defense in depth); keep
-    // disjoint siblings (ping-pong canvases) but bound the count.
+    // Drop intersecting windows (normally already gone, because the writeback
+    // wrote guest pages and every guest-page writer calls the same overlap
+    // invalidation — kept here as defense in depth); keep disjoint siblings
+    // (ping-pong canvases) but bound the count.
     let mapping_id = candidate.key.mapping_id;
     state.invalidate_storage_residency_window(
         mapping_id,
@@ -1758,10 +1759,12 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         };
         // Chained-dispatch restage skip: when guest pages still hold exactly
         // our own last writeback for THIS WINDOW (mirror entry survives only
-        // while no intersecting guest write lands — exact-window invalidation
-        // in mapping_write/mapper) AND the engine still holds the resident
-        // image at the mirror's generation, reading ~15 MB from guest pages
-        // reproduces what the GPU already has. The mapping-level content
+        // while no intersecting guest write lands — `DeviceState::
+        // invalidate_storage_residency_window`, called from mapping_write and
+        // mapper, drops every mirror entry whose byte window overlaps the
+        // write and keeps the disjoint siblings) AND the engine still holds the
+        // resident image at the mirror's generation, reading ~15 MB from guest
+        // pages reproduces what the GPU already has. The mapping-level content
         // generation may have advanced via disjoint sibling windows
         // (ping-pong canvases), so the gate pairs mirror↔engine directly.
         // The zero placeholder is never seeded — the engine fails visibly
