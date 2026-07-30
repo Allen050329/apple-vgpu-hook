@@ -2909,15 +2909,34 @@ shape a load-dependent defect invites, which is why they are worth recording as 
   through `flush_one`, whose value came from an armed window. The newly-created arm also hardcodes
   `generation_match: false`.
 
-One reading is **open and unmeasured**: `compute_linux storage_format_specialize` reports
-`spirv=R32Float specialized=Rgba16Float engine=Rgba16Float guest=Rgba16Float guest_bpp=8
-shader_bpp=4` nine times in the slice. The shader declares a 4-byte storage-image format for an
-8-byte resource and we rewrite the declaration. The same line reports `specialized=Unknown` for
-`Bgra8Unorm` (`guest_bpp=4 shader_bpp=4`) and `specialized=Rgba8Unorm` for `Rgba8Unorm` — so three
-different specialization strategies are in use and only the `Rgba16Float` one carries a
-bytes-per-pixel disagreement. Whether that disagreement is benign (a declaration rewrite the driver
-honours) or is the defect is **not established**, and a bpp ratio of 2 against artefacts that are
-half-width bars is suggestive rather than evidence. Instrument the branch before believing it.
+**Do not chase the `storage_format_specialize` bytes-per-pixel disagreement — it is on a different
+population from the icons.** The line reports three specialization strategies in the reproducing
+slice: `specialized=Rgba16Float` (9x, `guest_bpp=8 shader_bpp=4`), `specialized=Unknown` for
+`Bgra8Unorm` (15x, 4 and 4) and `specialized=Rgba8Unorm` (6x, 4 and 4). Only the `Rgba16Float` one
+disagrees about bpp, and a ratio of 2 next to half-width bar artefacts reads as a strong lead.
+
+It is not one, and the arithmetic says so. The icon dispatches are identifiable by geometry and
+byte count: `66x66` at 17 424 bytes, `64x65` at 16 640, `46x28` at 5 152, `44x26` at 4 576 — all
+exactly `w * h * 4`, i.e. **4 bytes per pixel**, which puts them in the `Rgba8Unorm` group where
+`guest_bpp == shader_bpp`. Six such dispatches for six icons. The 8-bpp `Rgba16Float` windows
+(`mapping=7 32x32 bytes=8192`, `64x64 bytes=32768`) are a separate population that happens to share
+the slice. This is the "count what your A/B actually changed" trap in miniature: two anomalies in
+one log are not therefore the same anomaly, and the byte count separates them in one command.
+
+So the specialization mismatch is real, unexplained, and **not** the icon defect. What is left is
+that the icon dispatches look entirely ordinary on every line this device emits — `3` samples and
+`2` skips per geometry, `access=write_only seed=1`, no decline — which is the finding: the next step
+is a probe on the dispatch that produces a guest-visible compute output, reporting its identity,
+whether the seed was skipped and whether its resident was freshly created, so a corrupt icon's
+geometry can be joined to its own dispatch. Nothing today permits that join.
+
+One weaker correlation is worth recording *as* weak, because it will look stronger than it is on
+re-reading. `type4_pages_stale` ("task PT translation moved; rebuilding") fires 3 and 4 times in the
+two corrupt arms and **0** times in both clean arms — a 2-vs-2 split. Against it: the surfaces whose
+pages moved are 500-page ones (`sid=14`, `sid=90`), not the icon surfaces; load is an obvious
+confounder, since the corrupt arms are also the busy ones; and the line fires on *re-derivation*, so
+it is an event count and not a state. Treat it as an observation about the environment the defect
+occurs in, not as its mechanism.
 
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
