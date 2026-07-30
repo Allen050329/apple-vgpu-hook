@@ -442,18 +442,35 @@ pub fn write_task_gva_product<H: HostMemory + crate::runtime::host::HostOps>(
         // taken when the refusal fires — so a zero is readable rather than
         // meaning "we never got here".
         let probe = probe_write_gate_pages(state, host, task_id, gva, buf.len() as u64, &owners);
+        // Where the range sits relative to the spans this task filed for
+        // *itself*, which is the only registry the gate consulted. `owners` looks
+        // across tasks and cannot answer it.
+        let own = state.task_span_readout(task_id, gva, buf.len() as u64, state.page_shift);
         crate::observe::Emit::decline("gva_write", &gate)
             .field("task", task_id)
             .field("gva", format!("{gva:#x}"))
             .field("len", format!("{:#x}", buf.len()))
             .field("owners", format!("{owners:?}"))
-            .field("own", state.task_own_span_count(task_id))
+            .field("own", own.own)
             .field("pages", probe.pages)
             .field("named_mapped", probe.named_mapped)
             .field("owner_mapped", probe.owner_mapped)
             .field("gpa_match", u8::from(probe.gpa_match))
+            .field("own_union", own.union)
+            .field("own_lo", format!("{:#x}", own.lo))
+            .field("own_hi", format!("{:#x}", own.hi))
+            .field(
+                "own_gap",
+                own.nearest_gap
+                    .map_or_else(|| "none".to_string(), |g| format!("{g:#x}")),
+            )
             .field("via", via)
             .fail();
+        // Held so a MapMemory2 arriving later can report that the guest does
+        // declare this range and the write merely ran ahead of the declaration.
+        // Silence from `write_gate_late_map` is the other reading, and it is
+        // only legible because the ring does not evict at this rate.
+        state.note_refused_write(task_id, gva, buf.len() as u64);
         return Err(MemError::OutsideMap);
     }
     // The one remaining permissive arm, latched per (task, caller). `no_spans`

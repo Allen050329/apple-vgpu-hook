@@ -397,6 +397,61 @@ impl crate::observe::Decline for WriteGate {
     }
 }
 
+/// A range [`DeviceState::gva_write_gate`] refused, held until a later
+/// MapMemory2 covers it or the ring evicts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusedWrite {
+    pub task_id: u32,
+    pub gva: u64,
+    pub len: u64,
+    /// `observe::elapsed_ms` at the refusal, so the report can carry how long
+    /// the declaration took to arrive rather than only that it did.
+    pub at_ms: u64,
+}
+
+/// How many refused ranges [`DeviceState::refused_writes`] keeps.
+///
+/// Not a protocol value. Sized so the four refusals a live boot produces all
+/// stay resident for the whole run: nothing evicts, so a missing report means
+/// no span ever covered the range rather than that the ring wrapped.
+pub const REFUSED_WRITE_RING: usize = 32;
+
+/// Where a refused write sits relative to the spans its own task declared.
+///
+/// See [`DeviceState::task_span_readout`] for what each combination means. All
+/// four fields are readings of the span registry at the instant of the refusal;
+/// nothing branches on them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskSpanReadout {
+    /// Pages the refused range touches.
+    pub pages: u64,
+    /// Of those, how many the **union** of the task's own spans covers.
+    pub union: u64,
+    /// How many spans the task filed for itself.
+    pub own: u64,
+    /// Lowest GVA any of those spans starts at.
+    pub lo: u64,
+    /// Highest GVA any of them ends at.
+    pub hi: u64,
+    /// Bytes from the refused range to the nearest own span, `Some(0)` when one
+    /// overlaps without covering, `None` when the task filed nothing.
+    pub nearest_gap: Option<u64>,
+}
+
+impl TaskSpanReadout {
+    /// Whether `gva` falls within `[lo, hi)`, the extent of everything the task
+    /// declared.
+    ///
+    /// This is what tells a *hole* between two declarations apart from a range
+    /// in a region the task never declared anything in, and both come back
+    /// `union == 0`. `own == 0` is neither: a task that filed nothing has no
+    /// extent, and `lo == hi == 0` must not read as "everything is outside it"
+    /// by arithmetic accident.
+    pub fn gva_inside_extent(&self, gva: u64) -> bool {
+        self.own > 0 && gva >= self.lo && gva < self.hi
+    }
+}
+
 /// Guest-declared MapMemory2 span (notify-only; no host PTE invent).
 ///
 /// Used to fail-closed product GVA writes outside any recorded map when the
@@ -1352,6 +1407,20 @@ pub struct DeviceState {
     /// Live MapMemory2 spans per task (wire notify ranges). Cleared on Unmap /
     /// delete_task / redefine. Product GVA writes check coverage when non-empty.
     pub task_map_spans: Vec<TaskMapSpan>,
+    /// Ranges the write gate refused, kept so a later MapMemory2 covering one
+    /// can say so.
+    ///
+    /// The refusal itself cannot distinguish "the guest never declares this
+    /// memory" from "the guest declares it, and the write raced ahead of the
+    /// declaration". Those call for opposite fixes and an event count at the
+    /// refusal cannot separate them, because the evidence for the second arrives
+    /// *after* the event — the same shape as "an event count is not a state",
+    /// with the state living in the future rather than the past.
+    ///
+    /// Bounded FIFO: a boot produces four of these, and a run that produced
+    /// thousands would be reporting a different defect than the one this is
+    /// built to read.
+    pub refused_writes: Vec<RefusedWrite>,
     /// Live object refs per task, as `(task_id, ref)`.
     ///
     /// Membership only — deliberately carries no descriptor payload. Every
@@ -1615,6 +1684,7 @@ impl DeviceState {
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
             task_map_spans: Vec::new(),
+            refused_writes: Vec::new(),
             objects: std::collections::BTreeSet::new(),
             texture_to_mapping: BTreeMap::new(),
             mappings: BTreeMap::new(),
@@ -2142,6 +2212,70 @@ impl DeviceState {
             gva,
             length,
         });
+        self.report_late_map_for_refused(task_id, gva, length);
+    }
+
+    /// Say so when a MapMemory2 covers a range the write gate already refused.
+    ///
+    /// A refusal and a later declaration of the same range is one finding — the
+    /// guest *does* declare this memory and the write ran ahead of the
+    /// declaration — and it is invisible at the refusal, which is the only place
+    /// anything currently reports. Emitting from the map side is what makes the
+    /// two halves one reading.
+    ///
+    /// A range that never gets covered is reported by **absence**, which is only
+    /// legible because the ring does not evict at the observed rate; see
+    /// [`REFUSED_WRITE_RING`].
+    fn report_late_map_for_refused(&mut self, task_id: u32, gva: u64, length: u64) {
+        if self.refused_writes.is_empty() {
+            return;
+        }
+        let span = TaskMapSpan {
+            task_id,
+            gva,
+            length,
+        };
+        let now = crate::observe::elapsed_ms() as u64;
+        let mut landed: Vec<RefusedWrite> = Vec::new();
+        self.refused_writes.retain(|r| {
+            if r.task_id != task_id || !span.covers(r.gva, r.len) {
+                return true;
+            }
+            landed.push(*r);
+            false
+        });
+        for r in landed {
+            let late_ms = now.saturating_sub(r.at_ms);
+            crate::observe::off(format!(
+                "write_gate_late_map task={} gva={:#x} len={:#x} \
+                 span_gva={gva:#x} span_len={length:#x} late_ms={late_ms}",
+                r.task_id, r.gva, r.len
+            ));
+        }
+    }
+
+    /// Remember a range the gate refused, for [`Self::report_late_map_for_refused`].
+    ///
+    /// Deduplicated on the exact range so a per-row caller re-refusing the same
+    /// bytes cannot fill the ring and evict an older, different finding.
+    pub fn note_refused_write(&mut self, task_id: u32, gva: u64, len: u64) {
+        if len == 0
+            || self
+                .refused_writes
+                .iter()
+                .any(|r| r.task_id == task_id && r.gva == gva && r.len == len)
+        {
+            return;
+        }
+        if self.refused_writes.len() >= REFUSED_WRITE_RING {
+            self.refused_writes.remove(0);
+        }
+        self.refused_writes.push(RefusedWrite {
+            task_id,
+            gva,
+            len,
+            at_ms: crate::observe::elapsed_ms() as u64,
+        });
     }
 
     /// Drop MapMemory2 spans overlapping Unmap `[gva, gva+length)`.
@@ -2260,6 +2394,83 @@ impl DeviceState {
     /// Whether the gate permits the write. See [`Self::gva_write_gate`] for why.
     pub fn gva_write_allowed(&self, task_id: u32, gva: u64, len: u64) -> bool {
         self.gva_write_gate(task_id, gva, len) != WriteGate::Outside
+    }
+
+    /// Where a refused range sits relative to the spans the writing task filed
+    /// **for itself**, at page granularity.
+    ///
+    /// The refusal already says the range is not covered by one span. That is
+    /// consistent with at least three different defects and the fix differs for
+    /// each, so the line has to say which:
+    ///
+    /// - `union == pages` — every page *is* declared, just not by a single
+    ///   span, and [`Self::gva_write_gate`]'s one-span rule is the whole bug.
+    /// - `union == 0` and the range sits outside `[lo, hi)` — the task uses an
+    ///   allocation regime it never declares, so `task_map_spans` is not an
+    ///   authorization set at all and no relaxation of the rule can help.
+    /// - `union == 0` inside `[lo, hi)` — a hole between declared spans, which
+    ///   points at [`Self::note_task_unmap`] dropping more than it should, or a
+    ///   map we never recorded.
+    ///
+    /// Counted per page rather than per byte because that is the granularity
+    /// the guest's own page tables and every walk in this crate work in, and a
+    /// partial page cannot be authorised separately from the page holding it.
+    pub fn task_span_readout(
+        &self,
+        task_id: u32,
+        gva: u64,
+        len: u64,
+        page_shift: u32,
+    ) -> TaskSpanReadout {
+        let mut out = TaskSpanReadout::default();
+        if len == 0 {
+            return out;
+        }
+        let page = 1u64 << page_shift;
+        let first = gva & !(page - 1);
+        let last = gva.saturating_add(len - 1) & !(page - 1);
+        out.pages = ((last - first) >> page_shift).saturating_add(1);
+        let end = gva.saturating_add(len);
+        for s in self.task_map_spans.iter().filter(|s| s.task_id == task_id) {
+            let s_end = s.gva.saturating_add(s.length);
+            out.lo = if out.own == 0 {
+                s.gva
+            } else {
+                out.lo.min(s.gva)
+            };
+            out.hi = out.hi.max(s_end);
+            out.own += 1;
+            // Distance to the nearest declared span, 0 when one overlaps at all.
+            // An overlapping-but-not-covering span is a different finding from a
+            // range that lands nowhere near anything the task declared, and the
+            // single-span rule renders both as `Outside`.
+            let gap = if s.gva < end && gva < s_end {
+                0
+            } else if s.gva >= end {
+                s.gva - end
+            } else {
+                gva - s_end
+            };
+            out.nearest_gap = Some(out.nearest_gap.map_or(gap, |g: u64| g.min(gap)));
+        }
+        // Second pass: page coverage by the union. Separate from the extent scan
+        // above because a page is covered by *any* span, so it cannot be decided
+        // while still walking them.
+        let mut cur = first;
+        loop {
+            let covered = self
+                .task_map_spans
+                .iter()
+                .any(|s| s.task_id == task_id && s.covers(cur, page));
+            if covered {
+                out.union += 1;
+            }
+            if cur == last {
+                break;
+            }
+            cur += page;
+        }
+        out
     }
 
     /// PVG `CmdDeleteTask` (op `0x20`): drop task directory + object list entries.
@@ -2948,5 +3159,104 @@ mod fail_vocabulary_tests {
         assert!(!state.set_mapping_geom(1, 0, 64, 0x50));
         assert!(!state.set_mapping_geom(1, 64, 0, 0x50));
         assert!(!state.mappings.contains_key(&1));
+    }
+
+    /// `Outside` is one word for at least three defects, and each wants a
+    /// different fix. The readout has to separate them or the refusal is a dead
+    /// end — which is where the live rail has been sitting.
+    #[test]
+    fn a_refused_range_is_placed_against_the_tasks_own_spans() {
+        const SH: u32 = crate::model::PAGE_SHIFT_X86;
+        let page = 1u64 << SH;
+        let mut state = DeviceState::new(DeviceId(1), SH);
+
+        // Two adjacent declarations and a write straddling the seam. Neither
+        // span covers it, so the gate refuses — and every page is declared.
+        state.note_task_map(1, 0x10000, 2 * page);
+        state.note_task_map(1, 0x12000, 2 * page);
+        assert_eq!(
+            state.gva_write_gate(1, 0x11000, 2 * page),
+            WriteGate::Outside
+        );
+        let seam = state.task_span_readout(1, 0x11000, 2 * page, SH);
+        assert_eq!(
+            (seam.pages, seam.union),
+            (2, 2),
+            "the union declares every page, so the one-span rule is the refusal"
+        );
+        assert_eq!(
+            seam.nearest_gap,
+            Some(0),
+            "a span overlaps without covering"
+        );
+
+        // Far outside anything the task declared: no relaxation of the covering
+        // rule reaches this, and the two must not render alike.
+        let away = state.task_span_readout(1, 0x900000, page, SH);
+        assert_eq!((away.pages, away.union), (1, 0));
+        assert_eq!((away.lo, away.hi), (0x10000, 0x14000));
+        assert_eq!(
+            away.nearest_gap,
+            Some(0x900000 - 0x14000),
+            "distance to the nearest declaration, not merely that there is none"
+        );
+        assert_ne!(seam.union, away.union);
+
+        // A hole *between* declarations, inside the extent: same `union == 0` as
+        // the far case, told apart by sitting within `[lo, hi)`.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        state.note_task_map(1, 0x10000, page);
+        state.note_task_map(1, 0x12000, page);
+        let hole = state.task_span_readout(1, 0x11000, page, SH);
+        assert_eq!((hole.pages, hole.union, hole.own), (1, 0, 2));
+        assert!(
+            hole.gva_inside_extent(0x11000),
+            "inside the declared extent is what separates a hole from a foreign range"
+        );
+
+        // A task that filed nothing has no nearest span — not a gap of zero,
+        // which is what an overlap reports.
+        let none = state.task_span_readout(9, 0x11000, page, SH);
+        assert_eq!((none.own, none.union), (0, 0));
+        assert_eq!(none.nearest_gap, None);
+    }
+
+    /// A refusal cannot see a declaration that has not arrived yet, so the two
+    /// halves have to be joined from the map side.
+    #[test]
+    fn a_later_map_covering_a_refused_range_retires_it() {
+        const SH: u32 = crate::model::PAGE_SHIFT_X86;
+        let page = 1u64 << SH;
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        state.note_refused_write(1, 0x20000, page);
+
+        // A map that does not cover it, and one for another task, both leave the
+        // record standing — otherwise absence would stop meaning "never
+        // declared".
+        state.note_task_map(1, 0x30000, page);
+        state.note_task_map(2, 0x20000, page);
+        assert_eq!(state.refused_writes.len(), 1);
+
+        // Partial cover is not cover: the write needed all of it.
+        state.note_task_map(1, 0x20000, page / 2);
+        assert_eq!(state.refused_writes.len(), 1);
+
+        state.note_task_map(1, 0x1f000, 4 * page);
+        assert!(
+            state.refused_writes.is_empty(),
+            "a covering span retires the record, which is what emits the report"
+        );
+
+        // A per-row caller re-refusing the same bytes must not evict older,
+        // different findings out of the ring.
+        let mut state = DeviceState::new(DeviceId(1), SH);
+        for _ in 0..(REFUSED_WRITE_RING * 4) {
+            state.note_refused_write(1, 0x20000, page);
+        }
+        assert_eq!(state.refused_writes.len(), 1);
+        for i in 0..(REFUSED_WRITE_RING as u64 * 2) {
+            state.note_refused_write(1, 0x40000 + i * page, page);
+        }
+        assert_eq!(state.refused_writes.len(), REFUSED_WRITE_RING);
     }
 }
