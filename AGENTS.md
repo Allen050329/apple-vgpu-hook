@@ -1777,6 +1777,109 @@ presents from. Do not read the frame rates across these boots as evidence either
 12.09 Hz, with the guest's own testufo readout at 119.959 Hz / 98 fps and then 61.000 Hz / 60 fps, on
 a rig with a documented 1.8x spread and an instrumentation-only commit between them.
 
+### The Present Round Trip Is Gone: The Window Blits The Engine's Own Resident
+
+**Built by `3af5832`, scored on two x86/Vulkan boots either side. `target_read_bytes`
+621 MB/s → 0. Do not rebuild the CPU path.**
+
+`host_window/present.rs` created its own `ash::Entry`/`Instance`/`Device`, so a frame
+reached the window as CPU bytes by construction — three full-frame passes per presented
+layer: the drain's `read_target`, `publish_window_frame`'s `frame_bgra[..need].to_vec()`,
+and the window thread's memcpy into a mapped LINEAR staging image. `c3ae935` made the
+engine able to own a Linux swapchain; `3af5832` wired it.
+
+Same workload both boots (Safari fullscreen on testufo.com/refreshrate, 45 s settle,
+`.agents/repros/testufo-fps.sh`), per-second medians over the busy windows:
+
+| | at `c3ae935` | at `3af5832` |
+|---|---|---|
+| `target_reads` / `target_read_bytes` | 76 / **621 MB/s** | **0 / 0** |
+| `capture_sampling` | `full=4096 light=0` | **`full=1 light=8191`** |
+| `publish_us` per second | 50 000 us | **65 us** |
+| `drain_us − draw_us − flush_us` (unattributed) | **341 ms — 39 %** | **25 ms — 5 %** |
+| `drain_duty` | 0.88 - 0.92 | **0.48 - 0.51** |
+| `tranches` per second | 194 - 253 | **597 - 628** |
+| draws per second | 504 - 555 | 789 - 855 |
+| **present boundaries per second** | **74.3** | **109.0** |
+| guest's own opinion (testufo) | 104 fps | 119 fps |
+
+**Read `capture_sampling`, not the frame rate.** `full=1 light=8191` says one full CPU
+capture happened in the entire boot and every present after it elided the readback — a
+within-boot statement of the mechanism that no cross-boot drift can manufacture.
+`target_read_bytes` going to a literal **0** is the other one: this is a cost *deleted*,
+not moved, which is the distinction `ce3f095` split the counter to make visible and which
+the deferred-Store rail before it got wrong.
+
+The 1.47x on present boundaries is a cross-boot comparison and is therefore subject to the
+documented 1.8x `us_per_draw` spread. It is corroboration, not proof.
+
+Three things worth carrying:
+
+- **The two halves must ask the same question, and they did not.** The publish path decides
+  a frame AHEAD of the presenter whether to read the frame back at all. `resident_content_ready`
+  checked `content_ready`; the presenter's selection checked `content_ready && bgra &&
+  width == want && height == want`. A looser predicate on the publish side elides the readback
+  for a frame the presenter then refuses — a blank window with no CPU pixels behind it, and a
+  disagreement **neither call site can see on its own**. `pools::slot_presentable` is now the
+  single rule and both call it. This is the same shape as the flush-choke-point audit above:
+  a contract split across two sites is only as good as the predicate they share.
+- **The CPU fallback is not a second rail and must not be deleted.** Presents with no resident
+  at all are normal — the firmware framebuffer, a mapping the compositor cleared but never
+  rendered into, the frames after a device reset. The presenter stages those into a
+  host-visible LINEAR image. One boot logged exactly **one** `host_window_cpu_fallback` run
+  (boot) closed by one `host_window_slate_end`, and zero `host_window_slate`. That split is
+  deliberate: a covered run shows the guest's frame and only costs the host copy (census,
+  `off()`), an uncovered one is a blank window (failure, `fail()`). Reporting both as blank
+  would have cried wolf on every boot.
+- **A LINEAR image written through a persistent map must stay in `GENERAL`.** `BlitSource`
+  carries that: a resident moves to `TRANSFER_SRC_OPTIMAL`, the staging image takes a
+  `HOST_WRITE → TRANSFER_READ` barrier and is read from `GENERAL`, and the `PREINITIALIZED →
+  GENERAL` first-use transition is recorded only **after** the submit succeeds — declaring
+  `GENERAL` as the old layout of an image still in `PREINITIALIZED` discards the frame it
+  holds.
+
+**The instrument this removed, and what replaced it.** `present_content` carries `rgb_nz`,
+a whole-frame pixel scan of the CPU capture — so deleting the capture deleted the line, and
+`testufo-fps.sh` came back `HOST: too few presents to read (n=0)` on a boot that was 1.5x
+faster. That reads exactly like a catastrophic regression. Two readings replace it and both
+are now in the repro: `host_window_cadence`'s `present_hz`/`direct_frac`, which counts actual
+`vkQueuePresentKHR` calls, and `capture_sampling`, which counts present boundaries and is the
+one rate emitted on **both** rails. Expect this whenever a fix removes a computation an
+instrument was reading — check what the probe was made of before reading its silence.
+
+**A latent defect this retired.** `0760635` dropped a parameter from `window_write_frame` and
+updated the Linux call site only, so the macOS arm passed six arguments to a five-parameter
+function for eight commits. It could not have compiled, and nothing said so because
+`backend-metal`/macOS never builds on this host — the "a build that never runs" class this
+file already records. Unifying the two publish arms deleted the cfg that hid it.
+
+**What is left, measured on the fix boot.** `drain_duty` now has headroom (0.48) and the cost
+is entirely in `draw_us` (460 ms/s), where the readback/seed pair is **symmetric to the byte**:
+
+| | per second |
+|---|---|
+| `readbacks` / `readback_bytes` | 256 / **760 MB/s** |
+| `seed_uploads` / `seed_upload_bytes` | 256 / **760 MB/s** |
+| mean readback | **2.97 MB** — not a 1920x1080 frame (8.29 MB) |
+| `render_post_wait_skips` | 599 of 855 draws |
+| `wait_us` / `readback_us` | 263 ms / 58 ms |
+| `batch_opens` / `batch_joins` / `batch_flush_draws` | **479 / 0 / 479** |
+| `surface_deferred` / `surface_resident` | 256 / **240 — 94 % take the resident rail** |
+
+So the type-11 composites are deferring correctly (mean readback is a third of a full frame,
+and `surface_resident` is 94 %), and what remains is **non-composite Store records reading
+their result back to host memory and feeding it straight back as the next record's seed** —
+760 MB/s each way, at ~3 MB per layer. That round trip is the next target, and it is the
+same shape the type-11 rail already solved one namespace over.
+
+`batch_joins` is **0**, not merely low. `joins` has eight conditions and `begin_entry` flushes
+the open batch, so a single non-joining draw between two joinable ones closes the batch — 479
+opens for 479 draws is every batch a singleton. Do not assume the cause: AGENTS.md's older note
+blames the `target_rgba8.is_none() && skip_readback` pair, but 599 draws now skip readback and
+605 carry no seed, so ~599 should satisfy that pair and none joins. `matches!(req.load_op,
+Some(LoadOp::LoadFromTarget))` is the untested suspect. Instrument which of the eight refuses
+before changing any of them.
+
 ### The ~2 Hz Frame Rate Was One Bit In A Memory-Type Query
 
 **Fixed by `b19074e`. 1.49 Hz → 18.76 Hz on the same workload, and the mechanism is settled by a
