@@ -2823,8 +2823,8 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     // cached bytes were produced from, and serve either way. Scored on entries
     // this lookup would actually serve, so the counters carry their own
     // denominator; `gvac_*` in the per-second `store_routes` line.
-    if crate::runtime::surface_cache::has_gva(state, gva, w, h) {
-        note_gva_backing_verdict(
+    let gva_names_these_pages = !crate::runtime::surface_cache::has_gva(state, gva, w, h)
+        || note_gva_backing_verdict(
             crate::runtime::surface_cache::revalidate_gva_backing(state, host, task_id, gva),
             "sample",
             task_id,
@@ -2832,9 +2832,9 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             w,
             h,
         );
-    }
-    if let Some((bgra, host_gen, producer_type)) =
-        crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h)
+    if let Some((bgra, host_gen, producer_type)) = gva_names_these_pages
+        .then(|| crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h))
+        .flatten()
     {
         if gva_cache_owner_allows_object_type(producer_type, entry.object_type) {
             let identity = Some(LinearSampleIdentity {
@@ -2925,14 +2925,27 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     None
 }
 
-/// Score one GVA-keyed cache hit against the guest pages it was produced from.
+/// Score a GVA-keyed cache hit against the guest pages it was produced from,
+/// and answer whether the entry may be served.
 ///
-/// `gvac_hit` is the denominator — every read this census sees. The other three
-/// partition it, so `gvac_moved / gvac_hit` is the rate at which this cache
-/// serves one allocation's pixels under another allocation's name. Without the
-/// denominator on the same line a zero is not interpretable.
-/// `site` names the read that asked — the sampled texture path or the Load
-/// seed — so a rate can be attributed to the rail that carries it.
+/// `false` **only** for `BackingVerdict::Moved`: the guest remapped this span
+/// and it now resolves to different pages, so the address the cache is keyed by
+/// no longer names the allocation the bytes are of. Serving them paints one
+/// resource's pixels under another's name. The reader falls through to its next
+/// rung — the texture_ref cache, then the guest's own pages — each keyed by
+/// something this remap did not invalidate.
+///
+/// Every other verdict serves. `Unchanged` means no notify has touched the
+/// span. `Confirmed` means the mapping churned and the same pages came back,
+/// which is precisely the retained wallpaper class the Unmap retain exists for.
+/// `Unrecorded` means there is nothing to compare against, and a cache that
+/// cannot answer the question is left alone rather than thrown away on
+/// suspicion.
+///
+/// `gvac_hit` is the denominator — every read this census sees — and the four
+/// verdict counters partition it. `site` names the read that asked, the sampled
+/// texture path or the Load seed, so a rate can be attributed to its rail.
+#[must_use]
 fn note_gva_backing_verdict(
     verdict: crate::runtime::surface_cache::BackingVerdict,
     site: &'static str,
@@ -2940,7 +2953,7 @@ fn note_gva_backing_verdict(
     gva: u64,
     width: u32,
     height: u32,
-) {
+) -> bool {
     use crate::runtime::surface_cache::BackingVerdict as V;
     crate::runtime::drain::note_store_route("gvac_hit");
     crate::runtime::drain::note_store_route(match verdict {
@@ -2953,13 +2966,15 @@ fn note_gva_backing_verdict(
     // resource class is affected or how big the victims are. Deduplicated per
     // (site, gva, geometry) so a compositor asking hundreds of times a second
     // reports the span once.
-    if verdict == V::Moved
-        && crate::observe::first_sight(site, gva ^ ((width as u64) << 32) ^ (height as u64))
-    {
-        crate::observe::line(format!(
+    if verdict != V::Moved {
+        return true;
+    }
+    if crate::observe::first_sight(site, gva ^ ((width as u64) << 32) ^ (height as u64)) {
+        crate::observe::off(format!(
             "gva_cache_backing_moved site={site} task={task_id} gva={gva:#x} {width}x{height}"
         ));
     }
+    false
 }
 
 /// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
@@ -4456,22 +4471,31 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // Same census as the sampled read: a Load seed
                             // served for a GVA the guest has re-pointed paints
                             // another allocation's pixels into this pass.
-                            if crate::runtime::surface_cache::has_gva(state, c0.target_gva, w, h) {
-                                note_gva_backing_verdict(
-                                    crate::runtime::surface_cache::revalidate_gva_backing(
-                                        state,
-                                        host,
+                            let names_these_pages =
+                                !crate::runtime::surface_cache::has_gva(state, c0.target_gva, w, h)
+                                    || note_gva_backing_verdict(
+                                        crate::runtime::surface_cache::revalidate_gva_backing(
+                                            state,
+                                            host,
+                                            req.task_id,
+                                            c0.target_gva,
+                                        ),
+                                        "load_seed",
                                         req.task_id,
                                         c0.target_gva,
-                                    ),
-                                    "load_seed",
-                                    req.task_id,
-                                    c0.target_gva,
-                                    w,
-                                    h,
-                                );
-                            }
-                            crate::runtime::surface_cache::get_gva(state, c0.target_gva, w, h)
+                                        w,
+                                        h,
+                                    );
+                            names_these_pages
+                                .then(|| {
+                                    crate::runtime::surface_cache::get_gva(
+                                        state,
+                                        c0.target_gva,
+                                        w,
+                                        h,
+                                    )
+                                })
+                                .flatten()
                                 .map(|b| b.to_vec())
                         } else {
                             None

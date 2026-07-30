@@ -4017,3 +4017,28 @@ fn guest_run_memo_stale_probe_detects_pt_rewire() {
     assert_eq!(state.tranche.run_memo_stale, 2);
     assert!(state.guest_run_memo.is_empty());
 }
+
+/// A read whose GVA no longer names the pages the cached bytes were produced
+/// from must miss, and every other verdict must hit.
+///
+/// This is the whole policy in one place, because the three call sites read it
+/// as a bare `bool`. The direction matters: `Moved` is the only proven-wrong
+/// state, and turning any of the other three into a miss would throw away a
+/// cache the guest still expects to be there -- `Confirmed` in particular is
+/// the retained wallpaper class, a mapping that churned and came back.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn only_a_moved_backing_refuses_a_gva_cache_hit() {
+    use crate::runtime::surface_cache::BackingVerdict as V;
+    let serve = |v| note_gva_backing_verdict(v, "test", 1, 0xa42000, 64, 64);
+    assert!(serve(V::Unchanged), "no notify has touched the span");
+    assert!(serve(V::Confirmed), "the same pages came back (wallpaper class)");
+    assert!(
+        serve(V::Unrecorded),
+        "nothing to compare against is not evidence of a move"
+    );
+    assert!(
+        !serve(V::Moved),
+        "the address names a different allocation than these bytes are of"
+    );
+}
