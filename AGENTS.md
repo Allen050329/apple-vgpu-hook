@@ -1676,6 +1676,58 @@ touches the GPU). The pin machinery to keep the resident alive across that alrea
 rail uses it (`pin_resident_target`, armed at `vulkan.rs:5282`, unpinned at `storage_flush.rs:527/535`
 and on the eviction path).
 
+**Built (`e5d13d2`, `4e5d03d`) and now scored. The rail works, and the readback it removed did not go
+away — it moved to the present capture, which is not in `draw_us`.** That distinction was invisible
+until `ce3f095` split the counter, and the way it hid is the transferable part.
+
+`readbacks` pooled two populations: the copy a draw takes as its own tail, and the full-frame
+`read_target` a consumer asks for later. A deferred Store *moves* a copy between them, so the one
+number meant to score the rail reads the same whether the deferral worked or merely rescheduled the
+work. The first boot of the rail came back with `readbacks / surface_deferred` at **1.39**, up from
+1.02, which reads as an outright regression and is not one. `render_post_wait_skips` — which would
+have said so immediately — was already incremented on every `skip_readback` draw and **had no reader
+anywhere**, the third instrument in this tree found fully built and never called.
+
+Split, on one x86/Vulkan boot (testufo fullscreen, 45 s settle, per-second medians over 7 819 lines):
+
+| | per second |
+|---|---|
+| `surface_deferred` / `surface_resident` | 124 / **116 — 93.5 % of composite Stores defer** |
+| `surface_flush` | **3** — 2.4 % of arms are ever asked for |
+| `render_post_wait_skips` | **258** of 384 draws, i.e. 67 % skip their fence wait |
+| `readbacks` (draw rail) | 124 at **383 MB/s** |
+| `target_reads` (resident reads) | **58 at 473 MB/s**, mean **8.15 MB** = a whole 1920x1080 frame |
+| `target_evicts` | **0**, every window |
+
+`58 - 3 = 55` of those full-frame reads per second are the **present capture**, and that is where the
+cost went. The Store no longer reads its frame back; the present boundary reads it instead, once per
+presented layer, because arming the window cedes the host cache and `capture_present_frame` then falls
+through to `try_capture_from_resident`.
+
+**Which is why `draw_us` fell and the frame rate did not.** `publish_present_boundary` runs inside
+`device_drain`'s tranche but outside every `DrainPhase`, so the moved cost landed in a bucket no
+instrument named:
+
+| | ms/s |
+|---|---|
+| `drain_us` | 738 |
+| `draw_us` + `flush_us` + `compute_us` | 440 + 6 + 0 |
+| **unattributed residual** | **292 — 40 % of the tranche** |
+| predicted from `target_read_bytes` alone | 128 fence wait (at the measured 270 us/MB) + 77 memcpy (at 6137 MB/s) = **205** |
+
+So the present capture accounts for roughly 70 % of a residual that had no name, and the arithmetic
+closes without a free parameter. Read `drain_us - draw_us` on any future rail that claims to remove a
+cost from the draw phase: a cost moved out of `draw_us` into the tranche's unattributed remainder
+looks exactly like a cost deleted.
+
+**The next step is therefore not another deferral — it is the present round trip itself.** Each
+presented layer currently pays GPU→CPU 8.15 MB *and then* CPU→GPU 8.15 MB, because
+`direct_present_source` reports `staging_blits` on every present and `dmabuf_blits=0`. That is a
+full-frame round trip through host memory for an image that is already on the device the window
+presents from. Do not read the frame rates across these boots as evidence either way: 14.41 Hz then
+12.09 Hz, with the guest's own testufo readout at 119.959 Hz / 98 fps and then 61.000 Hz / 60 fps, on
+a rig with a documented 1.8x spread and an instrumentation-only commit between them.
+
 ### The ~2 Hz Frame Rate Was One Bit In A Memory-Type Query
 
 **Fixed by `b19074e`. 1.49 Hz → 18.76 Hz on the same workload, and the mechanism is settled by a
