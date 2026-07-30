@@ -40,9 +40,25 @@ use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use std::sync::Arc;
 
 /// Max descriptors per ExecIndirect2 (wire table size), not a byte budget.
 const MAX_CMDBUFS: usize = 16;
+
+/// One stage's bind table as a draw sees it.
+///
+/// `Arc` rather than a plain `Vec` because a render stream's draws share their
+/// bind state: the guest sets a table once and then issues many draws against
+/// it, so snapshotting per draw copied the same entries over and over. The
+/// accumulator mutates through [`Arc::make_mut`], which copies only when a
+/// snapshot is actually outstanding — so a stream that binds once and draws 400
+/// times allocates one table and 400 pointers.
+///
+/// That is what makes an unbounded draw list affordable, and an unbounded draw
+/// list is what the protocol requires: the guest emits as many records as its
+/// encoder recorded and every one of them contributes to the same attachment
+/// set. See [`StreamDrawDrop`].
+type BindTable<T> = Arc<Vec<T>>;
 
 /// Pending render-pass ICB execute (range form or indirect range buffer).
 #[derive(Clone, Debug, Default)]
@@ -67,12 +83,12 @@ struct PendingDraw {
     /// (count, instance, prim, first_vertex)
     draw: (u32, u32, u32, u32),
     indexed: Option<IndexedDrawInfo>,
-    vertex_buffers: Vec<BufferBind>,
-    fragment_buffers: Vec<BufferBind>,
-    vertex_textures: Vec<TextureBind>,
-    fragment_textures: Vec<TextureBind>,
-    vertex_samplers: Vec<SamplerBind>,
-    fragment_samplers: Vec<SamplerBind>,
+    vertex_buffers: BindTable<BufferBind>,
+    fragment_buffers: BindTable<BufferBind>,
+    vertex_textures: BindTable<TextureBind>,
+    fragment_textures: BindTable<TextureBind>,
+    vertex_samplers: BindTable<SamplerBind>,
+    fragment_samplers: BindTable<SamplerBind>,
     viewport: Option<[f64; 6]>,
     scissor: Option<(u32, u32, u32, u32)>,
     blend_color: Option<[f32; 4]>,
@@ -98,12 +114,12 @@ struct StreamAccum {
     saw_draw: bool,
     /// Last render ICB execute (`0x14`/`0x15`) in this stream.
     execute_icb: Option<RenderIcbExecute>,
-    vertex_buffers: Vec<BufferBind>,
-    fragment_buffers: Vec<BufferBind>,
-    vertex_textures: Vec<TextureBind>,
-    fragment_textures: Vec<TextureBind>,
-    vertex_samplers: Vec<SamplerBind>,
-    fragment_samplers: Vec<SamplerBind>,
+    vertex_buffers: BindTable<BufferBind>,
+    fragment_buffers: BindTable<BufferBind>,
+    vertex_textures: BindTable<TextureBind>,
+    fragment_textures: BindTable<TextureBind>,
+    vertex_samplers: BindTable<SamplerBind>,
+    fragment_samplers: BindTable<SamplerBind>,
     viewport: Option<[f64; 6]>,
     scissor: Option<(u32, u32, u32, u32)>,
     indexed: Option<IndexedDrawInfo>,
@@ -115,14 +131,10 @@ struct StreamAccum {
     stencil_ref: Option<(u32, u32)>,
     depth_attach: Option<DepthAttachment>,
     stencil_attach: Option<StencilAttachment>,
-    /// Draw records this stream decoded but did not keep, and why. See
+    /// Draw records this stream decoded but did not keep. See
     /// [`StreamDrawDrop`]; reported once per stream by [`note_stream_draw_drops`].
-    dropped_cap: u32,
     dropped_unbound: u32,
 }
-
-/// Cap multi-draw records per stream (archive REIMS_VGPU_MAX_DRAWS_PER_JOB order).
-const MAX_DRAWS_PER_STREAM: usize = 64;
 
 /// Why a decoded `RenderKind::Draw` record never became a `PendingDraw`.
 ///
@@ -131,36 +143,37 @@ const MAX_DRAWS_PER_STREAM: usize = 64;
 /// that draw would have written as whatever the earlier records put there —
 /// which, for a compositor doing per-element damage draws, is a rectangle of
 /// the target holding the wrong picture and holding it until the next full
-/// redraw. Both arms below used to be a bare `if` with no `else`, so a stream
-/// could lose arbitrarily many draws and say nothing.
+/// redraw.
+///
+/// There used to be a second arm here: a `MAX_DRAWS_PER_STREAM = 64` ceiling
+/// that truncated the list inside a bare `if` with no `else`. It is gone. The
+/// number was this crate's, not the protocol's — its comment named an archive
+/// environment variable rather than a wire field — and a live boot found streams
+/// pressing right against it (8013 streams at 33–63 draws, two truncated, one
+/// losing four draws). What bounds the list now is the stream itself: a draw
+/// record has a minimum encoded length, so the record count cannot exceed the
+/// stream bytes this crate already holds in memory, and [`BindTable`] keeps the
+/// per-record cost at one pointer per stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamDrawDrop {
-    /// The stream decoded more than [`MAX_DRAWS_PER_STREAM`] eligible draws.
-    ///
-    /// The cap is this crate's, not the protocol's: the guest emits as many
-    /// records as its encoder recorded and Apple's device runs all of them.
-    Cap { cap: usize, dropped: u32 },
     /// The record arrived with no pipeline bound or a zero primitive count.
     ///
-    /// Kept separate because it is a different claim with a different fix: the
-    /// cap is a resource decision, this is either a genuinely empty draw (legal,
-    /// and nothing is lost) or a `SetPipeline` this decoder failed to latch.
+    /// Either a genuinely empty draw — legal, and nothing is lost — or a
+    /// `SetPipeline` this decoder failed to latch, which is a lost draw. The
+    /// count is what separates the two: a rate that tracks the draw rate is the
+    /// second reading, an occasional one is the first.
     Unbound { dropped: u32 },
 }
 
 impl crate::observe::Decline for StreamDrawDrop {
     fn slug(&self) -> &'static str {
         match self {
-            Self::Cap { .. } => "stream_draw_dropped_cap",
             Self::Unbound { .. } => "stream_draw_dropped_unbound",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::Cap { cap, dropped } => {
-                vec![("cap", cap.to_string()), ("dropped", dropped.to_string())]
-            }
             Self::Unbound { dropped } => vec![("dropped", dropped.to_string())],
         }
     }
@@ -955,8 +968,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 if buffer_ref == 0 {
                     match cmd.stage {
-                        Stage::Vertex => acc.vertex_buffers.retain(|b| b.index != index),
-                        Stage::Fragment => acc.fragment_buffers.retain(|b| b.index != index),
+                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers).retain(|b| b.index != index),
+                        Stage::Fragment => {
+                            Arc::make_mut(&mut acc.fragment_buffers).retain(|b| b.index != index)
+                        }
                         _ => {}
                     }
                     out.buffer_unbinds = out.buffer_unbinds.saturating_add(1);
@@ -969,8 +984,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     offset,
                 };
                 match cmd.stage {
-                    Stage::Vertex => upsert_buffer(&mut acc.vertex_buffers, bind),
-                    Stage::Fragment => upsert_buffer(&mut acc.fragment_buffers, bind),
+                    Stage::Vertex => upsert_buffer(Arc::make_mut(&mut acc.vertex_buffers), bind),
+                    Stage::Fragment => upsert_buffer(Arc::make_mut(&mut acc.fragment_buffers), bind),
                     _ => {}
                 }
             }
@@ -979,8 +994,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // Archive apply_buffer_offset: update offset on an already-bound slot.
             if cmd.first < MAX_BIND_SLOTS {
                 let list = match cmd.stage {
-                    Stage::Vertex => &mut acc.vertex_buffers,
-                    Stage::Fragment => &mut acc.fragment_buffers,
+                    Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
+                    Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
                     _ => {
                         return;
                     }
@@ -1000,8 +1015,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 if texture_ref == 0 {
                     match cmd.stage {
-                        Stage::Vertex => acc.vertex_textures.retain(|b| b.index != index),
-                        Stage::Fragment => acc.fragment_textures.retain(|b| b.index != index),
+                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_textures).retain(|b| b.index != index),
+                        Stage::Fragment => {
+                            Arc::make_mut(&mut acc.fragment_textures).retain(|b| b.index != index)
+                        }
                         _ => {}
                     }
                     out.texture_unbinds = out.texture_unbinds.saturating_add(1);
@@ -1016,8 +1033,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     texture_ref,
                 };
                 match cmd.stage {
-                    Stage::Vertex => upsert_texture(&mut acc.vertex_textures, bind),
-                    Stage::Fragment => upsert_texture(&mut acc.fragment_textures, bind),
+                    Stage::Vertex => upsert_texture(Arc::make_mut(&mut acc.vertex_textures), bind),
+                    Stage::Fragment => upsert_texture(Arc::make_mut(&mut acc.fragment_textures), bind),
                     _ => {}
                 }
                 if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
@@ -1041,8 +1058,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 }
                 if sampler_ref == 0 {
                     match cmd.stage {
-                        Stage::Vertex => acc.vertex_samplers.retain(|b| b.index != index),
-                        Stage::Fragment => acc.fragment_samplers.retain(|b| b.index != index),
+                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_samplers).retain(|b| b.index != index),
+                        Stage::Fragment => {
+                            Arc::make_mut(&mut acc.fragment_samplers).retain(|b| b.index != index)
+                        }
                         _ => {}
                     }
                     out.sampler_unbinds = out.sampler_unbinds.saturating_add(1);
@@ -1054,8 +1073,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     sampler_ref,
                 };
                 match cmd.stage {
-                    Stage::Vertex => upsert_sampler(&mut acc.vertex_samplers, bind),
-                    Stage::Fragment => upsert_sampler(&mut acc.fragment_samplers, bind),
+                    Stage::Vertex => upsert_sampler(Arc::make_mut(&mut acc.vertex_samplers), bind),
+                    Stage::Fragment => upsert_sampler(Arc::make_mut(&mut acc.fragment_samplers), bind),
                     _ => {}
                 }
             }
@@ -1197,8 +1216,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // Snapshot bind state for this draw (archive multi-draw job).
             if acc.pipeline_ref == 0 || count == 0 {
                 acc.dropped_unbound = acc.dropped_unbound.saturating_add(1);
-            } else if acc.draws.len() >= MAX_DRAWS_PER_STREAM {
-                acc.dropped_cap = acc.dropped_cap.saturating_add(1);
             } else {
                 acc.draws.push(PendingDraw {
                     pipeline_ref: acc.pipeline_ref,
@@ -1389,16 +1406,20 @@ fn upsert_sampler(list: &mut Vec<SamplerBind>, bind: SamplerBind) {
 
 /// Report what this stream's draw list cost, and anything it lost building it.
 ///
-/// The distribution is the half that has to be readable even when nothing is
-/// dropped: `stream_draws_at_cap` alone cannot say whether the cap is a ceiling
-/// real workloads press against or a number no stream ever approaches, and the
-/// difference decides whether [`MAX_DRAWS_PER_STREAM`] is a latent defect or an
-/// irrelevance. Buckets rather than a mean because the question is about the
-/// tail: one 400-draw compositor stream among thousands of 2-draw ones is
-/// exactly the case that matters and is exactly what a mean hides.
+/// The distribution stays after the cap is gone, because it is now the only
+/// thing that prices the decision to keep every record: it says how long a real
+/// render stream is, and therefore what an unbounded list actually costs. The
+/// boot that removed the cap read 118 307 streams as 39 913 single-draw, 55 306
+/// at 2–4, 14 579 at 9–16 and 8013 at 33–63, with two above 64 — a tail that
+/// exists and a body that does not.
+///
+/// Buckets rather than a mean because the question is about that tail: one
+/// 400-draw compositor stream among thousands of 2-draw ones is exactly the case
+/// that matters and is exactly what a mean hides. The two buckets above the old
+/// ceiling are what say whether removing it changed which streams complete.
 fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
     let kept = acc.draws.len();
-    if kept == 0 && acc.dropped_cap == 0 && acc.dropped_unbound == 0 {
+    if kept == 0 && acc.dropped_unbound == 0 {
         return;
     }
     crate::runtime::drain::note_store_route(match kept {
@@ -1409,26 +1430,12 @@ fn note_stream_draw_drops(task_id: u32, acc: &StreamAccum) {
         9..=16 => "stream_draws_9_16",
         17..=32 => "stream_draws_17_32",
         33..=63 => "stream_draws_33_63",
-        _ => "stream_draws_at_cap",
+        64..=255 => "stream_draws_64_255",
+        _ => "stream_draws_over_255",
     });
     // Latched on the *magnitude* of the loss, not on the task: the same stream
     // shape recurs every frame, so a per-task key would print once and hide a
     // loss that grew, while a bucket key prints again when it gets worse.
-    if acc.dropped_cap > 0 {
-        let d = StreamDrawDrop::Cap {
-            cap: MAX_DRAWS_PER_STREAM,
-            dropped: acc.dropped_cap,
-        };
-        if crate::observe::first_sight(
-            crate::observe::Decline::slug(&d),
-            u64::from(acc.dropped_cap.next_power_of_two()),
-        ) {
-            crate::observe::Emit::decline("stream_draw", &d)
-                .field("task", task_id)
-                .field("kept", kept)
-                .fail();
-        }
-    }
     if acc.dropped_unbound > 0 {
         let d = StreamDrawDrop::Unbound {
             dropped: acc.dropped_unbound,
@@ -1978,12 +1985,12 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 }
 
 fn fill_draw_binds_from_pending(req: &mut metal_draw::DrawEncodeRequest, pd: &PendingDraw) {
-    req.vertex_buffers = pd.vertex_buffers.clone();
-    req.fragment_buffers = pd.fragment_buffers.clone();
-    req.vertex_textures = pd.vertex_textures.clone();
-    req.fragment_textures = pd.fragment_textures.clone();
-    req.vertex_samplers = pd.vertex_samplers.clone();
-    req.fragment_samplers = pd.fragment_samplers.clone();
+    req.vertex_buffers = pd.vertex_buffers.as_ref().clone();
+    req.fragment_buffers = pd.fragment_buffers.as_ref().clone();
+    req.vertex_textures = pd.vertex_textures.as_ref().clone();
+    req.fragment_textures = pd.fragment_textures.as_ref().clone();
+    req.vertex_samplers = pd.vertex_samplers.as_ref().clone();
+    req.fragment_samplers = pd.fragment_samplers.as_ref().clone();
     req.viewport = pd.viewport;
     req.scissor = pd.scissor;
     req.indexed = pd.indexed.clone();
@@ -2625,16 +2632,16 @@ mod tests {
         assert_eq!(acc.draws[0].draw, (6, 1, 3, 0));
     }
 
-    /// A stream that decodes more draws than the crate keeps must say so.
+    /// Every decoded draw in a stream reaches the draw list.
     ///
-    /// The cap silently truncated `acc.draws`, so a compositor stream with more
-    /// records than [`MAX_DRAWS_PER_STREAM`] lost every draw past the 64th with
-    /// nothing on any channel — no counter, no line, and an `ExecResult` that
-    /// reports the truncated list as fully executed. The two arms are asserted
-    /// apart because they are different claims: an over-cap draw is guest work
-    /// this crate refused to run, an unbound one may be a legal empty draw.
+    /// `MAX_DRAWS_PER_STREAM = 64` truncated `acc.draws` inside a bare `if` with
+    /// no `else`, so a compositor stream with more records than that lost every
+    /// draw past the 64th with nothing on any channel — no counter, no line, and
+    /// an `ExecResult` describing the truncated list as a fully executed pass.
+    /// 71 is chosen to straddle that old ceiling: this test fails on the capped
+    /// code at exactly 64.
     #[test]
-    fn a_stream_past_the_draw_cap_accounts_for_what_it_dropped() {
+    fn every_decoded_draw_in_a_stream_reaches_the_draw_list() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let host = FakeHost::new();
         let mut out = ExecResult::default();
@@ -2657,25 +2664,125 @@ mod tests {
             bytes_offset: 0,
         };
 
-        let over = 7;
-        for _ in 0..MAX_DRAWS_PER_STREAM + over {
+        let records = 71;
+        for _ in 0..records {
             handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
         }
 
-        assert_eq!(acc.draws.len(), MAX_DRAWS_PER_STREAM, "cap still holds");
-        assert_eq!(
-            acc.dropped_cap, over as u32,
-            "every draw past the cap must be counted, not vanish"
-        );
+        assert_eq!(acc.draws.len(), records, "no draw may be truncated away");
         assert_eq!(acc.dropped_unbound, 0, "all of these had a pipeline bound");
 
-        // With no pipeline latched the same record is the other arm, and must
-        // not be charged to the cap.
+        // With no pipeline latched the same record is the other arm: still not
+        // a `PendingDraw`, but counted rather than vanishing.
         let mut unbound = StreamAccum::default();
         handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut unbound);
         assert_eq!(unbound.dropped_unbound, 1);
-        assert_eq!(unbound.dropped_cap, 0);
         assert!(unbound.draws.is_empty());
+    }
+
+    /// A stream that binds once and draws many times must not copy its bind
+    /// tables per draw.
+    ///
+    /// This is the property that makes an unbounded draw list affordable, and
+    /// therefore the property the cap's removal rests on. It is asserted by
+    /// pointer identity because that is the only thing that distinguishes a
+    /// shared table from an equal copy — `assert_eq!` on the contents passes
+    /// either way, which is exactly how a regression here would hide.
+    #[test]
+    fn draws_sharing_a_bind_table_share_its_allocation() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            vertex_buffers: Arc::new(vec![BufferBind {
+                stage: Stage::Vertex,
+                index: 0,
+                buffer_ref: 9,
+                offset: 0,
+            }]),
+            ..Default::default()
+        };
+        let mut command = vec![0u8; 0x20];
+        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        let rec = stream::Record {
+            segment_index: 0,
+            segment_type: 0,
+            offset: 0,
+            length: command.len() as u32,
+            opcode: render::OP_DRAW_INDEXED_WIDE,
+            bytes_offset: 0,
+        };
+
+        for _ in 0..100 {
+            handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+        }
+
+        assert_eq!(acc.draws.len(), 100);
+        for (i, pd) in acc.draws.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(&pd.vertex_buffers, &acc.vertex_buffers),
+                "draw {i} copied a bind table nothing had changed"
+            );
+        }
+    }
+
+    /// A bind that changes after a draw must not reach back into that draw.
+    ///
+    /// The other half of the copy-on-write contract: sharing is only safe if a
+    /// later mutation forks. `Arc::make_mut` is what does that, and a mutation
+    /// site that reached the `Vec` some other way would silently rewrite a
+    /// snapshot the guest already committed to.
+    #[test]
+    fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum {
+            pipeline_ref: 61,
+            vertex_buffers: Arc::new(vec![BufferBind {
+                stage: Stage::Vertex,
+                index: 0,
+                buffer_ref: 9,
+                offset: 0,
+            }]),
+            ..Default::default()
+        };
+        let mut command = vec![0u8; 0x20];
+        st32(&mut command[0..], render::OP_DRAW_INDEXED_WIDE);
+        st32(&mut command[4..], 0x20);
+        st16(&mut command[8..], 3);
+        st32(&mut command[12..], 0x3e);
+        st32(&mut command[16..], 6);
+        let rec = stream::Record {
+            segment_index: 0,
+            segment_type: 0,
+            offset: 0,
+            length: command.len() as u32,
+            opcode: render::OP_DRAW_INDEXED_WIDE,
+            bytes_offset: 0,
+        };
+        handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
+
+        upsert_buffer(
+            Arc::make_mut(&mut acc.vertex_buffers),
+            BufferBind {
+                stage: Stage::Vertex,
+                index: 0,
+                buffer_ref: 77,
+                offset: 0,
+            },
+        );
+
+        assert_eq!(
+            acc.draws[0].vertex_buffers[0].buffer_ref, 9,
+            "the committed draw kept the buffer it was encoded with"
+        );
+        assert_eq!(acc.vertex_buffers[0].buffer_ref, 77);
     }
 
     #[test]
@@ -3050,17 +3157,17 @@ mod tests {
             pipeline_ref: 1,
             draw: (3, 1, 3, 0),
             indexed: None,
-            vertex_buffers: vec![BufferBind {
+            vertex_buffers: Arc::new(vec![BufferBind {
                 stage: Stage::Vertex,
                 index: 0,
                 buffer_ref: 1,
                 offset: 0,
-            }],
-            fragment_buffers: Vec::new(),
-            vertex_textures: Vec::new(),
-            fragment_textures: Vec::new(),
-            vertex_samplers: Vec::new(),
-            fragment_samplers: Vec::new(),
+            }]),
+            fragment_buffers: Arc::default(),
+            vertex_textures: Arc::default(),
+            fragment_textures: Arc::default(),
+            vertex_samplers: Arc::default(),
+            fragment_samplers: Arc::default(),
             viewport: None,
             scissor: None,
             blend_color: None,
@@ -3144,17 +3251,17 @@ mod tests {
             pipeline_ref: 7,
             draw: (3, 1, 3, 0),
             indexed: None,
-            vertex_buffers: vec![BufferBind {
+            vertex_buffers: Arc::new(vec![BufferBind {
                 stage: Stage::Vertex,
                 index: 0,
                 buffer_ref: 1,
                 offset: 0,
-            }],
-            fragment_buffers: Vec::new(),
-            vertex_textures: Vec::new(),
-            fragment_textures: Vec::new(),
-            vertex_samplers: Vec::new(),
-            fragment_samplers: Vec::new(),
+            }]),
+            fragment_buffers: Arc::default(),
+            vertex_textures: Arc::default(),
+            fragment_textures: Arc::default(),
+            vertex_samplers: Arc::default(),
+            fragment_samplers: Arc::default(),
             viewport: None,
             scissor: None,
             blend_color: None,
