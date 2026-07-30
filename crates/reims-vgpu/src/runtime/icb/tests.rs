@@ -679,20 +679,7 @@ fn fill_and_execute_mul3add1_writeback() {
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
     // Function + pipeline + data buffer (mul3add1).
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &mtlb);
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    let fdesc_gva = 0x100u64;
-    put_object(
-        &mut host,
-        &state,
-        5,
-        OBJECT_TYPE_FUNCTION,
-        fdesc_gva,
-        &fdesc,
-    );
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -1872,20 +1859,7 @@ fn buffer_backed_fill_execute_mul3add1() {
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let blob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], blob_gva, &mtlb);
-    let mut fdesc = vec![0u8; 32];
-    st64(&mut fdesc[0..], blob_gva);
-    st32(&mut fdesc[8..], mtlb.len() as u32);
-    let fdesc_gva = 0x100u64;
-    put_object(
-        &mut host,
-        &state,
-        5,
-        OBJECT_TYPE_FUNCTION,
-        fdesc_gva,
-        &fdesc,
-    );
+    put_function_object(&mut host, &state, 5, 0x100, 2, &mtlb);
 
     let mut pdesc = vec![0u8; 32];
     st32(&mut pdesc[0..], TYPE7_OBJECT_COMPUTE_PIPELINE);
@@ -2095,35 +2069,9 @@ fn fill_render_draw_indexed_execute_oracle() {
 
     // Vertex function (ref 2) + fragment function (ref 3).
     // Descriptor GVAs stay past object-list region (32×12 = 0x180).
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    put_object(
-        &mut host,
-        &state,
-        2,
-        OBJECT_TYPE_FUNCTION,
-        vfdesc_gva,
-        &vfdesc,
-    );
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    put_object(
-        &mut host,
-        &state,
-        3,
-        OBJECT_TYPE_FUNCTION,
-        ffdesc_gva,
-        &ffdesc,
-    );
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     // Render pipeline type-7 (ref 6): vertex=2, fragment=3.
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
@@ -2239,35 +2187,9 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    put_object(
-        &mut host,
-        &state,
-        2,
-        OBJECT_TYPE_FUNCTION,
-        vfdesc_gva,
-        &vfdesc,
-    );
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    put_object(
-        &mut host,
-        &state,
-        3,
-        OBJECT_TYPE_FUNCTION,
-        ffdesc_gva,
-        &ffdesc,
-    );
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -3774,35 +3696,9 @@ fn inherit_buffers_encoder_fragment_color() {
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    put_object(
-        &mut host,
-        &state,
-        2,
-        OBJECT_TYPE_FUNCTION,
-        vfdesc_gva,
-        &vfdesc,
-    );
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    put_object(
-        &mut host,
-        &state,
-        3,
-        OBJECT_TYPE_FUNCTION,
-        ffdesc_gva,
-        &ffdesc,
-    );
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -3922,35 +3818,9 @@ fn inherit_pipeline_encoder_fragment_color() {
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    put_object(
-        &mut host,
-        &state,
-        2,
-        OBJECT_TYPE_FUNCTION,
-        vfdesc_gva,
-        &vfdesc,
-    );
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    put_object(
-        &mut host,
-        &state,
-        3,
-        OBJECT_TYPE_FUNCTION,
-        ffdesc_gva,
-        &ffdesc,
-    );
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
@@ -4080,35 +3950,9 @@ fn fill_render_stagein_draw_execute_oracle() {
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    put_object(
-        &mut host,
-        &state,
-        2,
-        OBJECT_TYPE_FUNCTION,
-        vfdesc_gva,
-        &vfdesc,
-    );
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    put_object(
-        &mut host,
-        &state,
-        3,
-        OBJECT_TYPE_FUNCTION,
-        ffdesc_gva,
-        &ffdesc,
-    );
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     let pdesc_gva = 0x240u64;
@@ -5575,35 +5419,9 @@ fn fill_render_nonzero_bind_offset_oracle() {
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     put_object(&mut host, &state, 9, OBJECT_TYPE_TYPE7, icb_gva, &icb_desc);
 
-    let vblob_gva = 2u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], vblob_gva, &vert_mtlb);
-    let mut vfdesc = vec![0u8; 32];
-    st64(&mut vfdesc[0..], vblob_gva);
-    st32(&mut vfdesc[8..], vert_mtlb.len() as u32);
-    let vfdesc_gva = 0x200u64;
-    put_object(
-        &mut host,
-        &state,
-        2,
-        OBJECT_TYPE_FUNCTION,
-        vfdesc_gva,
-        &vfdesc,
-    );
+    put_function_object(&mut host, &state, 2, 0x200, 2, &vert_mtlb);
 
-    let fblob_gva = 3u64 << RESOURCE_PAGE_SHIFT;
-    gva_mem::write_task_gva_arm64e(&mut host, &state.tasks[1], fblob_gva, &frag_mtlb);
-    let mut ffdesc = vec![0u8; 32];
-    st64(&mut ffdesc[0..], fblob_gva);
-    st32(&mut ffdesc[8..], frag_mtlb.len() as u32);
-    let ffdesc_gva = 0x220u64;
-    put_object(
-        &mut host,
-        &state,
-        3,
-        OBJECT_TYPE_FUNCTION,
-        ffdesc_gva,
-        &ffdesc,
-    );
+    put_function_object(&mut host, &state, 3, 0x220, 3, &frag_mtlb);
 
     let mut pdesc = vec![0u8; 16 + 1 + 6 + 6];
     let blen = pdesc.len() as u32;
