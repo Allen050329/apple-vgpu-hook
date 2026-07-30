@@ -1494,35 +1494,48 @@ second of wall clock, at ~280 draws/s and `duty` still 0.96-0.98:
 and `begin_entry` flushes the open batch every time. That is a *scheduling* problem, not the join
 predicate AGENTS.md's older note points at.
 
-**`wait_us` is a fixed ~1.5 ms per readback submission and does not scale with the bytes copied. The
-regression that says so needed no boot** — it is 89 one-second windows of the boot already taken,
-joined on timestamp between `draw_phase` and `engine_delta`. Splitting them by bytes-per-readback into
-outer quartiles:
+**`wait_us` scales with the bytes read back, at ~270 us/MB. It is the bytes.**
 
-| | MB per readback | us per readback | us per MB |
-|---|---|---|---|
-| smallest quartile | 4.18 | **1499** | 361 |
-| largest quartile | 5.18 | **1551** | 300 |
+**This reverses a standing exclusion, and the way it was wrong is worth more than the result.** The
+entry here used to read "`wait_us` is a fixed ~1.5 ms per readback submission and does not scale with
+the bytes copied", drawn from 89 one-second windows of a live boot split into outer quartiles by
+bytes-per-readback: 24 % more bytes bought 3.5 % more time, with `us/MB` moving inversely and
+`us/readback` showing a tighter CV than `us/MB`. It concluded "cutting it means fewer submit-and-wait
+round trips, not fewer bytes", which is the opposite of the truth and would have aimed a session at
+batching — the one lever already refuted.
 
-24 % more bytes bought **3.5 %** more time, and `us/MB` moved *inversely*. Across all 89 windows
-`us/readback` has CV **0.042** against `us/MB`'s **0.103**. So the wait is per-submission, not
-per-byte.
+Re-run on 214 windows of the 2026-07-30 boot, the same split reproduces exactly and **both models now
+fit equally**: `us/readback` CV **0.089** against `us/MB` CV **0.090**. Indistinguishable. That is the
+tell, and it is the general point:
 
-**Say exactly what that excludes.** It rules out the image→buffer *copy* as the cost of `wait_us`. It
-does **not** rule out GPU render time: the quartiles were split on readback bytes, and the render work
-of a full-screen composite layer is not proportional to them. So `wait_us` is either fixed submission
-latency or per-pass render time, and this measurement cannot separate those two — it only kills the
-third candidate. The first probe on this path must vary *pass* size, not readback size.
+> **A ratio test has no power when its denominator barely varies.** `MB per readback` spans 4.49 to
+> 5.20 across a whole live boot — a 16 % range against ~9 % residual noise. Neither normalisation can
+> win, so whichever CV comes out lower is noise, and the first run's 0.042-vs-0.103 gap was read as a
+> result. Before splitting by a quantity, print its range: if the split variable moves less than the
+> scatter, the test cannot answer and the honest output is "no power", not a conclusion.
 
-Either way the actionable form is the same: **250 ms per second is spent with the drain worker — the
-device's only executor, holding the device lock — blocked on a fence 167 times a second.** Cutting it
-means fewer submit-and-wait round trips, not fewer bytes.
+The experiment with power is `measure_draw_cost_against_pass_size` (`#[ignore]`d in
+`vk_engine_parity`), which varies geometry over a **256x** range with everything else held: 16x16 costs
+278 us and 1920x1080 costs 2386 us. Same submission, same fence, same one draw — **8.6x the time for
+8000x the bytes.** No per-submission model survives that single comparison, and no observational slice
+of a live boot can overturn it. Floor ~270 us, slope ~270 us/MB.
 
-**And the three remaining costs are one item.** `wait_us` 250 + `stage_us` 155 + `readback_us` 135 =
-540 ms of the 880 ms `draw_us`, and all three are the same type-11 composite round trip: seed the
-target's prior contents from host memory, draw, read the whole target back. Removing it is what the
-"give the type-11 render Store a deferred rail" note above is about, and the note's own retraction
-records why the obvious form does not work.
+The two agree in absolute terms, which is the corroboration: the live boot reads **279 us/MB** against
+the controlled **270 us/MB**. So of the measured 1356 us mean wait, the ~4.7 MB average readback
+accounts for ~1270 us and the fixed floor for ~270 — call it 80/20. Batching therefore caps out at the
+floor, 230/s × 270 us ≈ **62 ms/s of 286**, which is the same conclusion the instrument's own doc
+comment reached by a different route.
+
+**So the actionable form is: move fewer bytes.** At 1.08 GB/s of readback, the bytes cost ~292 ms/s of
+fence wait *plus* the 135 ms/s `readback_us` memcpy that follows it — **~427 ms/s, 49 % of `draw_us`**.
+And `store_routes` says where they come from: `surface_deferred` runs ~218/s against `readbacks` 230/s,
+so **essentially every readback is a type-11 composite Store**.
+
+`skip_readback` returns from `execute_draw_inner` *before* `Phase::Wait` (`render_post_wait_skips`), so
+a composite Store that stopped reading back would drop both costs together, not one of them. That is
+the next step, and the seed elision above was its prerequisite — what it still needs is a source for
+the three consumers the readback currently feeds: `surface_cache` (present capture + the ~5 % of LOADs
+that still seed), the deferred window's owned frame, and the guest writeback at flush.
 
 **The hazard that retraction actually named, restated so the next attempt starts from it.** A
 `LoadFromTarget` on a type-11 surface trusts the resident to hold the mapping's current pixels, and
