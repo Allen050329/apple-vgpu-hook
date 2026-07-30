@@ -1201,6 +1201,103 @@ impl crate::observe::Decline for Type5ViewDecline {
     }
 }
 
+/// Why a type-11 attachment `LOAD` could not be seeded with the surface's own
+/// prior contents.
+///
+/// This is not a degradation the caller absorbs. `exec.rs` resolves the pass load
+/// action as "explicit `load_op` > `target_rgba8` > **Clear**", so a seed of
+/// `None` makes `PassKey::single(load = false)` and the render pass begins with
+/// `LoadOp::CLEAR` against the hardcoded `[0,0,0,0]` primary clear value. The
+/// guest asked for its surface to be preserved and got a transparent-black wipe,
+/// and the matching Store then reads that wipe back and publishes it. On a
+/// compositor doing a damage-rect redraw that is one whole layer rendering solid
+/// black — the reported black-rectangle class, whose screenshots show sharp
+/// axis-aligned rectangles at layer boundaries.
+///
+/// It had no report of any kind. `surface_cache::get_shared` returns `Option` and
+/// the arm simply left `target_rgba8` unset, so the loss was invisible on the
+/// always-on channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Type11SeedDecline {
+    /// The cache holds no entry for this mapping id at all.
+    CacheAbsent,
+    /// An entry exists but at a different geometry, so the exact-geometry hit
+    /// rule refuses it. `host_surfaces` keeps exactly one entry per mapping and
+    /// every Store replaces it, so a Store at another geometry orphans every
+    /// window still living at this one.
+    CacheGeom { have_w: u32, have_h: u32 },
+}
+
+impl crate::observe::Decline for Type11SeedDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::CacheAbsent => "type11_seed_cache_absent",
+            Self::CacheGeom { .. } => "type11_seed_cache_geom",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::CacheAbsent => Vec::new(),
+            Self::CacheGeom { have_w, have_h } => vec![("have", format!("{have_w}x{have_h}"))],
+        }
+    }
+}
+
+/// Report which way the type-11 `LOAD` seed branch went, once per
+/// `(mapping, requested geometry, outcome)`.
+///
+/// Both arms report, because a zero on the miss arm has to be readable. A probe
+/// that only fires on failure cannot separate "the cache always hit" from "this
+/// branch never ran", and the branch is reached only for `mapping_id != 0` under
+/// `PASS_LOAD_ACTION_LOAD` with no caller-supplied seed. With the hit arm beside
+/// it, an absent miss line next to present hit lines is evidence rather than
+/// silence.
+///
+/// The mapping's own latched geometry and generation ride along on both arms:
+/// they say whether the surface could have been re-read from its guest pages at
+/// the requested extent, which is what decides the shape of any fallback.
+fn note_type11_load_seed(state: &DeviceState, mapping_id: u32, w: u32, h: u32, hit: bool) {
+    let (map_w, map_h, map_gen) = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| (m.width, m.height, m.map_generation))
+        .unwrap_or((0, 0, 0));
+    let cached = state.host_surfaces.get(&mapping_id);
+    let have = cached.map(|e| (e.width, e.height));
+    let host_gen = cached.map(|e| e.host_gen).unwrap_or(0);
+    // Latch before building the line: `Emit::field` renders eagerly, and this
+    // sits on a branch the census measures at 28-111 entries a second.
+    let disc = (u64::from(mapping_id) << 40)
+        | (u64::from(w) << 20)
+        | u64::from(h)
+        | if hit { 1 << 63 } else { 0 };
+    if hit {
+        if !crate::observe::first_sight("type11_load_seed_hit", disc) {
+            return;
+        }
+        crate::observe::off(format!(
+            "type11_load_seed outcome=cache_hit mid={mapping_id} want={w}x{h} \
+             mapgeom={map_w}x{map_h} mapgen={map_gen} hostgen={host_gen}"
+        ));
+        return;
+    }
+    let d = match have {
+        Some((have_w, have_h)) => Type11SeedDecline::CacheGeom { have_w, have_h },
+        None => Type11SeedDecline::CacheAbsent,
+    };
+    if !crate::observe::first_sight(crate::observe::Decline::slug(&d), disc) {
+        return;
+    }
+    crate::observe::Emit::decline("type11_load_seed", &d)
+        .field("mid", mapping_id)
+        .field("want", format!("{w}x{h}"))
+        .field("mapgeom", format!("{map_w}x{map_h}"))
+        .field("mapgen", map_gen)
+        .field("hostgen", host_gen)
+        .fail();
+}
+
 /// Materialize the exact serialized Metal view carried by a type-5 object.
 ///
 /// The underlying type-4 FourCC is allocation metadata, not necessarily the
@@ -3713,6 +3810,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             target_rgba8 = Some(bgra);
                             seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
                         }
+                        note_type11_load_seed(state, c0.mapping_id, w, h, target_rgba8.is_some());
                     } else if c0.texture_ref != 0 {
                         // GVA type-2/3 Load: texture_ref encode cache (separate
                         // from surface_id mid map). Prefer GVA key when present.
@@ -5005,6 +5103,92 @@ mod vulkan_split_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
     use crate::runtime::host::FakeHost;
+
+    /// The type-11 `LOAD` seed branch reports both ways, and the miss arm names
+    /// the geometry the cache actually holds.
+    ///
+    /// The miss is a whole-layer loss, not a degradation: with no seed the engine
+    /// resolves the pass load action to `Clear` against the hardcoded
+    /// `[0,0,0,0]`, so the guest's request to preserve its surface becomes a
+    /// transparent-black wipe that the matching Store publishes. It reported
+    /// nothing at all before this.
+    ///
+    /// The hit arm is asserted too, because a zero on the miss arm has to be
+    /// readable: without a hit line beside it, "the cache always hit" and "this
+    /// branch never ran" produce the same empty grep.
+    ///
+    /// Mapping ids here are chosen not to collide with any other test's, because
+    /// `first_sight` latches per `(reason, discriminant)` for the life of the
+    /// process and never resets.
+    #[test]
+    fn the_type11_load_seed_branch_reports_both_ways() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mid = 909u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.has_geom = true;
+            m.width = 8;
+            m.height = 4;
+            m.map_generation = 3;
+        }
+        crate::runtime::surface_cache::store(&mut state, mid, 8, 4, vec![0u8; 8 * 4 * 4]);
+
+        // The captured lines carry the sink's `OFF `/`FAIL ` severity prefix, so
+        // match on the event token rather than on the first word.
+        let only = |cap: &crate::observe::sink::FailCapture| -> String {
+            let hits: Vec<String> = cap
+                .lines()
+                .into_iter()
+                .filter(|l| l.contains("type11_load_seed"))
+                .collect();
+            assert_eq!(hits.len(), 1, "expected exactly one line, got {hits:?}");
+            hits.into_iter().next().unwrap_or_default()
+        };
+
+        let cap = crate::observe::sink::FailCapture::start();
+        note_type11_load_seed(&state, mid, 8, 4, true);
+        let hit = only(&cap);
+        assert!(hit.contains("outcome=cache_hit"), "{hit}");
+        assert!(hit.contains("mapgeom=8x4"), "{hit}");
+        assert!(hit.contains("mapgen=3"), "{hit}");
+        drop(cap);
+
+        // Same mapping, a geometry the cache does not hold: the entry's own
+        // geometry is the load-bearing field, since it says a Store at another
+        // extent orphaned every window still living at this one.
+        let cap = crate::observe::sink::FailCapture::start();
+        note_type11_load_seed(&state, mid, 8, 1, false);
+        let geom = only(&cap);
+        assert!(geom.contains("reason=type11_seed_cache_geom"), "{geom}");
+        assert!(geom.contains("have=8x4"), "{geom}");
+        assert!(geom.contains("want=8x1"), "{geom}");
+        drop(cap);
+
+        // A mapping the cache has never held reports absence, not a geometry.
+        let cap = crate::observe::sink::FailCapture::start();
+        note_type11_load_seed(&state, 910, 8, 4, false);
+        let absent = only(&cap);
+        assert!(
+            absent.contains("reason=type11_seed_cache_absent"),
+            "{absent}"
+        );
+        assert!(!absent.contains("have="), "{absent}");
+        drop(cap);
+
+        // Latched per (mapping, geometry, outcome): a repeat of any of the three
+        // above emits nothing, so the branch is safe to leave on forever.
+        let cap = crate::observe::sink::FailCapture::start();
+        note_type11_load_seed(&state, mid, 8, 4, true);
+        note_type11_load_seed(&state, mid, 8, 1, false);
+        note_type11_load_seed(&state, 910, 8, 4, false);
+        assert!(
+            cap.lines().is_empty(),
+            "second sighting must be latched: {:?}",
+            cap.lines()
+        );
+    }
 
     /// One window that refuses to land must not wedge the cap for every other
     /// mapping.
