@@ -2820,6 +2820,63 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     ))
 }
 
+/// Report a sampled texture served entirely as zeroes out of the guest's pages
+/// while a host entry for the same address is sitting in the cache.
+///
+/// A type-2/3 texture's guest GVA pages are a *pageable alias* of a body this
+/// device owns -- `surface_cache::store_linear_texture` says so, and the
+/// measured reading agrees: on every sampled bind audited with
+/// `REIMS_VGPU_CONTENT_PROBE=1`, the cache held content and the guest's pages
+/// for the same span were zero end to end, 7 of 7. The guest never writes
+/// them. So the ladder's lower rungs are not a fallback for this class at all;
+/// reading them returns a blank texture, the draw succeeds, nothing declines,
+/// and a blank cell is painted and held. That is the silent loss of guest work
+/// the ground rules forbid, and it is the shape both the surviving Finder icon
+/// class and the Safari scroll-buffer patches have.
+///
+/// Reported rather than refused: refusing would change what is drawn, and
+/// nothing here has yet established what SHOULD be drawn when the host copy is
+/// gone. `lin_rung_blank_with_host_entry` is the count that decides whether
+/// this is the mechanism, and it carries its denominators
+/// (`lin_rung_gva_bypassed`, `lin_rung_guest_*`) in the same census line.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the census line carries the identity of the sample it scored"
+)]
+fn note_guest_rung_blank(
+    state: &DeviceState,
+    rung: &'static str,
+    task_id: u32,
+    texture_ref: u32,
+    gva: u64,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) {
+    crate::runtime::drain::note_store_route(match rung {
+        "guest_memo" => "lin_rung_guest_memo",
+        _ => "lin_rung_guest_native",
+    });
+    if rgba.is_empty() || rgba.iter().any(|&b| b != 0) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("lin_rung_guest_blank");
+    if !crate::runtime::surface_cache::has_gva(state, gva, w, h) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("lin_rung_blank_with_host_entry");
+    if crate::observe::first_sight(
+        "lin_rung_blank_with_host_entry",
+        gva ^ ((w as u64) << 32) ^ h as u64,
+    ) {
+        crate::observe::fail(format!(
+            "lin_rung_blank_with_host_entry rung={rung} task={task_id} ref={texture_ref} \
+             gva={gva:#x} {w}x{h} bytes={} (guest alias is zero and the host cache has this span)",
+            rgba.len()
+        ));
+    }
+}
+
 /// Probe only: does the GVA cache entry we just served still agree with the
 /// guest's own pages?
 ///
@@ -2983,7 +3040,9 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             return Some((w, h, rgba, identity, TexelLayout::Rgba8));
         }
     }
+    crate::runtime::drain::note_store_route("lin_rung_gva_bypassed");
     if let Some(bgra) = crate::runtime::surface_cache::get_texture(state, texture_ref, w, h) {
+        crate::runtime::drain::note_store_route("lin_rung_texref");
         let rgba = swap_rb_channels(bgra);
         return Some((w, h, std::sync::Arc::new(rgba), None, TexelLayout::Rgba8));
     }
@@ -2994,6 +3053,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if let Some((rgba, identity, byte_format)) =
         load_linear_guest_memoized(state, host, task_id, tex, gva, w, h)
     {
+        note_guest_rung_blank(state, "guest_memo", task_id, texture_ref, gva, w, h, &rgba);
         return Some((w, h, rgba, identity, byte_format));
     }
     let (rgba, byte_format) =
@@ -3031,6 +3091,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         } else {
             std::sync::Arc::new(rgba[..need].to_vec())
         };
+        note_guest_rung_blank(state, "guest_native", task_id, texture_ref, gva, w, h, &arc);
         return Some((w, h, arc, None, byte_format));
     }
     crate::observe::fail(format!(
