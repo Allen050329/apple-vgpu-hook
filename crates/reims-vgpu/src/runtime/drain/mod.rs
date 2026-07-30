@@ -3241,6 +3241,24 @@ pub fn note_store_route(route: &'static str) {
     }
 }
 
+/// Accumulate microseconds against a named cost, into the same per-second window
+/// as the route counts above.
+///
+/// The same map on purpose. `store_routes` is already drained once a second
+/// beside `drain_duty`, so a cost reported here divides into that window's
+/// `draw_us` with no join and no cross-boot comparison. `draw_phase` cannot
+/// carry these: it brackets the *engine's* internals, and this is the runtime
+/// work on either side of them — which is where **28 % of `draw_us`** was
+/// going unattributed (~245 ms per second, stable across 200 windows of the
+/// 2026-07-30 boot, larger than `stage_us` and `readback_us` and second only to
+/// `wait_us`). A phase table that sums to 72 % of the thing it decomposes
+/// cannot be used to choose what to fix.
+pub fn note_store_route_us(name: &'static str, us: u64) {
+    if let Ok(mut g) = STORE_ROUTES.lock() {
+        *g.get_or_insert_with(Default::default).entry(name).or_default() += us;
+    }
+}
+
 /// Drain and format the window's route counts, or `None` if none were taken.
 fn take_store_routes() -> Option<String> {
     let mut g = STORE_ROUTES.lock().ok()?;

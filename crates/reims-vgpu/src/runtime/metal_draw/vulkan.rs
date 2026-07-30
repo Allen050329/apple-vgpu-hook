@@ -289,6 +289,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 // invariant. There is no invariant left to preserve, and the
                 // else arm was a refusal for a rail that cannot be chosen.
                 {
+                    // Brackets the whole type-11 arm, into the same per-second
+                    // window it divides into. `draw_phase` stops at the engine
+                    // boundary, so this arm — the BGRA conversion, the cache
+                    // publish, the window arm, the guest scatter — is the bulk
+                    // of the ~245 ms/s (28 % of `draw_us`) that no phase claimed.
+                    let _span = StoreCostSpan::new("t11_store_us");
                     // Deferred writeback: publish the frame to `surface_cache`
                     // — the source every other consumer already reads, so the
                     // Load seed and the present capture see exactly what they
@@ -318,14 +324,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     };
                     if let Some(epoch) = deferred {
                         note_type11_store_route("surface_deferred");
-                        publish_surface_store(
-                            state,
-                            host,
-                            c0.mapping_id,
-                            c0.width,
-                            c0.height,
-                            c0.format,
-                        );
+                        {
+                            let _span = StoreCostSpan::new("t11_publish_us");
+                            publish_surface_store(
+                                state,
+                                host,
+                                c0.mapping_id,
+                                c0.width,
+                                c0.height,
+                                c0.format,
+                            );
+                        }
                         stamp_type11_resident(state, req, writeback_guest, epoch);
                         return (EncodeStatus::Ok, Some(rgba));
                     }
@@ -355,14 +364,17 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         // `present_unbacked` gate is structurally dead on the
                         // CPU-portability Store path: no mapping's
                         // `dense_frame_seq` would ever advance.
-                        publish_surface_store(
-                            state,
-                            host,
-                            c0.mapping_id,
-                            c0.width,
-                            c0.height,
-                            c0.format,
-                        );
+                        {
+                            let _span = StoreCostSpan::new("t11_publish_us");
+                            publish_surface_store(
+                                state,
+                                host,
+                                c0.mapping_id,
+                                c0.width,
+                                c0.height,
+                                c0.format,
+                            );
+                        }
                         if let Some(epoch) = sync_epoch {
                             stamp_type11_resident(state, req, writeback_guest, epoch);
                         }
@@ -2809,6 +2821,38 @@ enum M2vDrawSpan {
 /// shows ~20 full-frame readbacks a second and the routes are what attribute
 /// them. So the dedup'd line stays and the rate is counted alongside it, into
 /// the same one-second window as `drain_duty`.
+/// Accumulates its own lifetime into the per-second `store_routes` window.
+///
+/// A guard rather than a pair of `Instant` reads because the block it brackets
+/// `return`s out of its own middle on the deferred route — the measurement that
+/// matters most — and a hand-closed bracket there records nothing while looking
+/// exactly like one that does. Reporting on `Drop` makes every exit pay.
+#[cfg(feature = "backend-vulkan")]
+struct StoreCostSpan {
+    name: &'static str,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl StoreCostSpan {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+impl Drop for StoreCostSpan {
+    fn drop(&mut self) {
+        crate::runtime::drain::note_store_route_us(
+            self.name,
+            self.started.elapsed().as_micros() as u64,
+        );
+    }
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn note_type11_store_route(route: &'static str) {
     use std::sync::Mutex;
@@ -5033,13 +5077,22 @@ fn arm_surface_deferred_store_with<M: HostMemory + HostOps>(
     // seed and the present capture read it through `surface_cache`, and the
     // window below owns it so the writeback it defers can always be performed.
     // This is the one copy this rail still pays.
-    let frame = std::sync::Arc::new({
-        let mut bgra = rgba.to_vec();
-        for px in bgra.chunks_exact_mut(4) {
-            px.swap(0, 2);
-        }
-        bgra
-    });
+    let frame = {
+        // The one copy this rail still pays, and the first candidate for the
+        // unattributed share of `draw_us`: an allocation and a copy of a whole
+        // frame, then a read-modify-write pass over it, at ~218 Stores/s and
+        // ~4.7 MB each. `output_bgra` would delete it outright — the readback
+        // would already be in this order — so pricing it decides whether that
+        // is worth doing.
+        let _span = StoreCostSpan::new("t11_convert_us");
+        std::sync::Arc::new({
+            let mut bgra = rgba.to_vec();
+            for px in bgra.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            bgra
+        })
+    };
     crate::runtime::surface_cache::store_shared(
         state,
         mapping_id,
