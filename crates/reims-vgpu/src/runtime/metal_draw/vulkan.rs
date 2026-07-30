@@ -2938,6 +2938,15 @@ fn build_secondary_targets(
         // `or_else(first())` fallback here — the Metal path has one for its
         // compat `color0` alias, but a secondary slot with no entry of its own
         // has no blend state, and borrowing slot 0's would be inventing one.
+        // The mask is read from the same entry but *not* through the
+        // `blending_enabled` filter below: `MTLColorWriteMask` applies whether
+        // or not the slot blends, and an entry with no mask means `all`.
+        let color_write_mask = pipeline
+            .color_attachments
+            .iter()
+            .find(|a| a.slot == c.slot)
+            .map(|a| a.write_mask)
+            .unwrap_or_default();
         let blend = pipeline
             .color_attachments
             .iter()
@@ -2975,6 +2984,7 @@ fn build_secondary_targets(
             clear,
             load,
             blend,
+            color_write_mask,
         });
     }
     out
@@ -4104,6 +4114,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
         // dock/chrome layers that Metal would alpha-blend over the attachment.
         // Contract: type-7 color attachment blend tags (decode/resource.rs).
+        // Outside the `blending_enabled` guard below, and deliberately: an
+        // unblended attachment with a mask still leaves its unwritten channels
+        // alone, so gating the mask on blending would drop it exactly where the
+        // guest is replacing rather than compositing.
+        resources.color_write_mask = pd.color0.write_mask;
         if pd.color0.blending_enabled {
             let constants = req.blend_color.unwrap_or([0.0; 4]);
             match translate::blend::state(

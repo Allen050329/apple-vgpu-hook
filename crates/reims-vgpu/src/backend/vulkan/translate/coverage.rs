@@ -265,15 +265,14 @@ const RENDER_PIPELINE: &[FieldCoverage] = &[
         "PipelineColorAttachment.op_alpha",
         "backend/vulkan/engine/caches.rs:blend_att",
     ),
-    // The lapse this manifest exists for. `caches.rs` pins
-    // `color_write_mask(RGBA)` on every attachment, so a guest pipeline that
-    // masks alpha writes gets all four channels and nothing says so.
-    absent(
+    // The lapse this manifest exists for, now closed. The tag was read off a
+    // live guest by `note_color_entry_fields` rather than guessed: it is
+    // `0x09`, the ninth property in `MTLRenderPipeline.h`, following the eight
+    // above it in header order.
+    honored(
         "colorAttachments[n].writeMask",
-        "MTLColorWriteMask is not decoded: `PipelineColorAttachment` has no \
-         field for it and `parse_color_attachments` reads none. The builder \
-         pins ColorComponentFlags::RGBA unconditionally. Where it sits in the \
-         type-7 colour-attachment block is unknown — an RE task, not a guess.",
+        "PipelineColorAttachment.write_mask",
+        "backend/vulkan/engine/caches.rs:blend_att",
     ),
     absent(
         "rasterSampleCount",
@@ -1107,7 +1106,11 @@ const BUFFER_TEXTURE: &[FieldCoverage] = decoded_fields! {
 pub const MANIFEST: &[DescriptorFamily] = &[
     DescriptorFamily {
         descriptor: "MTLRenderPipelineDescriptor",
-        decode_structs: &["RenderPipelineDescriptor", "PipelineColorAttachment"],
+        decode_structs: &[
+            "RenderPipelineDescriptor",
+            "PipelineColorAttachment",
+            "ColorWriteMask",
+        ],
         fields: RENDER_PIPELINE,
     },
     DescriptorFamily {
@@ -1621,8 +1624,8 @@ mod tests {
         );
         assert_eq!(
             (structs.len(), actual_enums.len()),
-            (42, 21),
-            "the public decode type census moved; keep the 42-struct field \
+            (43, 21),
+            "the public decode type census moved; keep the 43-struct field \
              manifest and 21-enum inventory exhaustive, then update this pin"
         );
     }
@@ -1745,16 +1748,14 @@ mod tests {
     /// it overrides.
     #[test]
     fn a_pinned_builder_value_is_never_claimed_honored() {
-        const PINNED: &[(&str, &str)] = &[
-            (
-                ".color_write_mask(vk::ColorComponentFlags::RGBA)",
-                "colorAttachments[n].writeMask",
-            ),
-            (
-                ".rasterization_samples(vk::SampleCountFlags::TYPE_1)",
-                "rasterSampleCount",
-            ),
-        ];
+        // `.color_write_mask(vk::ColorComponentFlags::RGBA)` used to head this
+        // list and is gone: the builder now derives the mask from the guest's
+        // decoded `writeMask`, so the field is `Honored` and there is nothing
+        // left to pin it against.
+        const PINNED: &[(&str, &str)] = &[(
+            ".rasterization_samples(vk::SampleCountFlags::TYPE_1)",
+            "rasterSampleCount",
+        )];
         let builder = read("backend/vulkan/engine/caches.rs");
         for (call, field) in PINNED {
             assert!(
@@ -1887,7 +1888,10 @@ mod tests {
         }
         assert_eq!(
             (honored, declined, dropped, absent),
-            (250, 60, 23, 25),
+            // Moved 2026-07-30: `colorAttachments[n].writeMask` went
+            // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
+            // rose by one. It is on the wire after all, as tag 0x09.
+            (251, 60, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

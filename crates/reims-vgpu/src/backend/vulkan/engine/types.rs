@@ -6,6 +6,7 @@
 use ash::vk;
 
 use crate::backend::vulkan::translate;
+pub use crate::runtime::decode::resource::ColorWriteMask;
 
 /// Named engine failure. Stable prefixes for observe greps (`vk_engine_*`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +251,13 @@ pub struct DrawRequest {
     /// materialize a converted frame to seed a draw with them.
     pub target_seed_order: SeedOrder,
     pub blend: Option<BlendStateResource>,
+    /// Which channels the primary colour attachment writes.
+    ///
+    /// Separate from `blend` because `MTLColorWriteMask` is independent of
+    /// `blendingEnabled`: an unblended attachment with a mask still leaves the
+    /// unwritten channels alone, so folding it into `Option<BlendStateResource>`
+    /// would drop it on every unblended draw.
+    pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
     /// Explicit load action. When `None`, derived from `target_rgba8`
@@ -338,6 +346,9 @@ pub struct SecondaryColorTarget {
     /// long as MRT has existed. Only the Vulkan `PipelineKey` collapsed them to
     /// one, so a guest MRT pipeline that blended slot 1 got a raw store.
     pub blend: Option<BlendStateResource>,
+    /// This slot's own `MTLColorWriteMask`, for the same reason the primary
+    /// carries one: it is not part of the blend state.
+    pub color_write_mask: ColorWriteMask,
 }
 
 #[derive(Debug, Default)]

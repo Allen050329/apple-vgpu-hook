@@ -1798,6 +1798,70 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     );
 }
 
+/// An alpha-only `MTLColorWriteMask` must leave the attachment's colour
+/// channels exactly as the Load seed left them.
+///
+/// This is the shape a compositor uses to punch coverage into a surface without
+/// touching its colour, and it is the one non-`all` mask a live x86/Vulkan guest
+/// was measured sending (tag `0x09`, value 1). Before the mask was decoded the
+/// builder pinned `ColorComponentFlags::RGBA` on every attachment, so this draw
+/// replaced the whole pixel: the assertion below fails with the shader's
+/// (64, 128, 191) in place of the seed.
+///
+/// Both halves are asserted. RGB must survive — that is the fix — and alpha must
+/// change, which is what separates "the mask worked" from "the draw never ran".
+/// A test that only checked RGB would pass against a pipeline that rendered
+/// nothing at all.
+#[test]
+fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
+    use reims_vgpu::backend::vulkan::engine::ColorWriteMask;
+    let _g = engine_test_session();
+    let (vert, frag) = triangle_spirv();
+    let (w, h) = (16u32, 16u32);
+    // Distinct from the shader's (64, 128, 191, 255) in every channel, so an
+    // ignored mask is visible whichever channel is read.
+    let seed = [17u8, 91, 203, 7];
+
+    let mut req = engine_req(&vert, &frag, w, h);
+    req.load_op = Some(LoadOp::LoadSeed(seed.repeat((w * h) as usize)));
+    req.color_write_mask = ColorWriteMask::new(1).expect("MTLColorWriteMaskAlpha");
+    let masked = match engine::execute_draw_request(&req) {
+        Ok(out) => out.pixels,
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP alpha-only write mask: {e}");
+            return;
+        }
+        Err(e) => panic!("alpha-only write mask: {e}"),
+    };
+    let i = ((h / 2) * w + w / 2) as usize * 4;
+    assert_eq!(
+        &masked[i..i + 3],
+        &seed[..3],
+        "an alpha-only mask must not write colour; got the shader's output, so \
+         the mask was dropped"
+    );
+    assert!(
+        near(masked[i + 3], 255),
+        "alpha is the one channel the mask permits, and it must have changed \
+         from the seed's {} — otherwise nothing rendered and the RGB check \
+         above is vacuous",
+        seed[3]
+    );
+
+    // Control: the same draw with the default `all` mask writes every channel.
+    // Run in the same session so a difference cannot come from device state.
+    req.color_write_mask = ColorWriteMask::default();
+    let unmasked = engine::execute_draw_request(&req)
+        .expect("unmasked control draw")
+        .pixels;
+    assert_fullscreen_fragment_color("unmasked control", &unmasked, w, h);
+    assert_ne!(
+        &masked[i..i + 3],
+        &unmasked[i..i + 3],
+        "the two arms must differ, or the mask is not what produced the result"
+    );
+}
+
 /// A `SeedOrder::Bgra8` seed into the default RGBA target must land the same
 /// semantic pixels as the equivalent `SeedOrder::Rgba8` seed.
 ///
@@ -2421,6 +2485,7 @@ fn mrt_secondary_attachment_becomes_sampleable_resident() {
         // Unblended: this parity case checks the attachment is written at
         // all, not how it composites.
         blend: None,
+        color_write_mask: Default::default(),
     });
     match engine::execute_draw_request(&mrt) {
         // Slot 0 (primary) still receives the shader's location-0 output.
@@ -2505,6 +2570,7 @@ fn mrt_rg16float_secondary_builds_and_renders() {
         // raw store. Which is exactly why every secondary used to be forced
         // unblended — one real case generalized into a rule for all of them.
         blend: None,
+        color_write_mask: Default::default(),
     });
     match engine::execute_draw_request(&mrt) {
         Ok(o) => assert_fullscreen_fragment_color("mrt_rg16f_primary", &o.pixels, 32, 32),

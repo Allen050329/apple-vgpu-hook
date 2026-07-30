@@ -362,6 +362,49 @@ pub struct VertexAttribute {
     pub step_rate: u32,
 }
 
+/// `MTLColorWriteMask` for one attachment, in Metal's own bit order.
+///
+/// A newtype rather than a bare `u32` for one reason: the value that means
+/// "write every channel" is `0xf`, and the value a derived `Default` would
+/// produce is `0` — which means *write nothing*. `PipelineColorAttachment` is
+/// built with `..Default::default()` in the decoder and defaulted outright at
+/// several call sites, so a bare field would make an omitted mask a black
+/// attachment. Here the omission is unwritable: `Default` is `all`, which is
+/// also what an entry that does not carry tag `0x09` means on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ColorWriteMask {
+    /// Private so the only ways to obtain one are [`ColorWriteMask::new`],
+    /// which range-checks, and `Default`, which is `all`. A `pub` field would
+    /// also make this a decode field needing its own coverage disposition,
+    /// when the disposition that matters is `PipelineColorAttachment`'s.
+    bits: u32,
+}
+
+impl Default for ColorWriteMask {
+    fn default() -> Self {
+        Self {
+            bits: MTL_COLOR_WRITE_MASK_ALL,
+        }
+    }
+}
+
+impl ColorWriteMask {
+    /// `None` for a value outside `MTLColorWriteMask`'s four bits — see
+    /// [`ColorWriteMaskOutOfRange`], which is what the decoder reports for it.
+    pub fn new(bits: u32) -> Option<Self> {
+        (bits <= MTL_COLOR_WRITE_MASK_ALL).then_some(Self { bits })
+    }
+
+    pub fn bits(self) -> u32 {
+        self.bits
+    }
+
+    /// Whether every channel is written, i.e. whether the mask is inert.
+    pub fn is_all(self) -> bool {
+        self.bits == MTL_COLOR_WRITE_MASK_ALL
+    }
+}
+
 /// One pipeline color-attachment entry (format + blend) from the type-7 color section.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PipelineColorAttachment {
@@ -375,6 +418,10 @@ pub struct PipelineColorAttachment {
     pub src_alpha: u32,
     pub dst_alpha: u32,
     pub op_alpha: u32,
+    /// Which channels this attachment writes. Independent of blending: a
+    /// masked attachment with blending off still leaves the unwritten channels
+    /// alone, so this cannot ride inside the blend state.
+    pub write_mask: ColorWriteMask,
 }
 
 /// Color-attachment[0] blend + format (compat alias for first entry).
@@ -598,6 +645,14 @@ pub fn texture_view_type_is_3d(texture_type: u16) -> bool {
     texture_type == TEXTURE_VIEW_MTL_TYPE_3D
 }
 
+// Colour-attachment TLV tags. `0x01..=0x09` are `MTLRenderPipelineColorAttach\
+// mentDescriptor`'s nine properties in the order `MTLRenderPipeline.h` declares
+// them — pixelFormat, blendingEnabled, sourceRGBBlendFactor,
+// destinationRGBBlendFactor, rgbBlendOperation, sourceAlphaBlendFactor,
+// destinationAlphaBlendFactor, alphaBlendOperation, writeMask — so the tag is
+// the property's one-based header index. Tag `0x00` sits before the first
+// property and is not one; it rides every entry with value 0 in every workload
+// measured and is reported by `note_color_entry_fields` as unconsumed.
 pub const COLOR_ATTACHMENT_TAG_PIXEL_FORMAT: u8 = 0x01;
 pub const COLOR_ATTACHMENT_TAG_BLEND_ENABLE: u8 = 0x02;
 pub const COLOR_ATTACHMENT_TAG_SRC_RGB: u8 = 0x03;
@@ -606,9 +661,28 @@ pub const COLOR_ATTACHMENT_TAG_RGB_OP: u8 = 0x05;
 pub const COLOR_ATTACHMENT_TAG_SRC_ALPHA: u8 = 0x06;
 pub const COLOR_ATTACHMENT_TAG_DST_ALPHA: u8 = 0x07;
 pub const COLOR_ATTACHMENT_TAG_ALPHA_OP: u8 = 0x08;
+/// `MTLColorWriteMask`, the ninth and last property.
+///
+/// Read off a live x86/Vulkan guest on 2026-07-30: the tag appears with
+/// `len=4 value=1` on a pipeline whose entry is `[00, 01, 02, 06, 09]`, and
+/// `value=1` is [`MTL_COLOR_WRITE_MASK_ALPHA`] — an alpha-only attachment,
+/// which is how a compositor punches a shape into a surface's alpha without
+/// touching its colour. Serialized entries omit properties left at their
+/// default, which is why only the one non-`all` mask in that boot appeared.
+pub const COLOR_ATTACHMENT_TAG_WRITE_MASK: u8 = 0x09;
 pub const BLEND_FACTOR_ZERO: u32 = 0;
 pub const BLEND_FACTOR_ONE: u32 = 1;
 pub const BLEND_OP_ADD: u32 = 0;
+
+// `MTLColorWriteMask` (Metal.framework Headers/MTLRenderPipeline.h). The bits
+// run alpha-first from the low end, which is the reverse of the RGBA reading
+// order the name suggests — `Red` is `1 << 3`, not `1 << 0`.
+pub const MTL_COLOR_WRITE_MASK_NONE: u32 = 0;
+pub const MTL_COLOR_WRITE_MASK_ALPHA: u32 = 1 << 0;
+pub const MTL_COLOR_WRITE_MASK_BLUE: u32 = 1 << 1;
+pub const MTL_COLOR_WRITE_MASK_GREEN: u32 = 1 << 2;
+pub const MTL_COLOR_WRITE_MASK_RED: u32 = 1 << 3;
+pub const MTL_COLOR_WRITE_MASK_ALL: u32 = 0xf;
 
 /// Sampler descriptor length (type-7 subtype 0x03).
 pub const SAMPLER_DESC_LEN: usize = 36;
@@ -1375,7 +1449,7 @@ impl crate::observe::Decline for ColorAttachDropped {
     }
 }
 
-const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 8] = [
+const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 9] = [
     COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
     COLOR_ATTACHMENT_TAG_BLEND_ENABLE,
     COLOR_ATTACHMENT_TAG_SRC_RGB,
@@ -1384,7 +1458,28 @@ const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 8] = [
     COLOR_ATTACHMENT_TAG_SRC_ALPHA,
     COLOR_ATTACHMENT_TAG_DST_ALPHA,
     COLOR_ATTACHMENT_TAG_ALPHA_OP,
+    COLOR_ATTACHMENT_TAG_WRITE_MASK,
 ];
+
+/// A colour-attachment `writeMask` outside `MTLColorWriteMask`'s four bits.
+///
+/// This is the standing check on the tag identification itself. Tag `0x09` is
+/// `writeMask` because it is the ninth property in `MTLRenderPipeline.h` and
+/// tags `0x01..=0x08` are the first eight in order — an argument from the
+/// header, not from the one observed value. If the tag is something else, it
+/// will eventually carry a value no four-bit mask can hold, and that value
+/// arrives here by name instead of quietly masking channels off.
+struct ColorWriteMaskOutOfRange;
+
+impl crate::observe::Decline for ColorWriteMaskOutOfRange {
+    fn slug(&self) -> &'static str {
+        "color_write_mask_out_of_range"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+}
 
 /// The largest field value that rides in the dedup key.
 ///
@@ -1542,6 +1637,19 @@ fn parse_one_color_entry(
         COLOR_ATTACHMENT_TAG_ALPHA_OP,
         BLEND_OP_ADD,
     );
+    // An entry that omits the tag left the property at its default, which for
+    // `MTLColorWriteMask` is `all` — the same thing `ColorWriteMask::default()`
+    // says, so the absent case needs no branch.
+    if let Some(mask) = entry_tag_u32_present(bytes, len, entry, COLOR_ATTACHMENT_TAG_WRITE_MASK) {
+        if let Some(decoded) = ColorWriteMask::new(mask) {
+            out.write_mask = decoded;
+        } else if crate::observe::first_sight("color_write_mask_out_of_range", u64::from(mask)) {
+            crate::observe::Emit::decline("type7_color_attach", &ColorWriteMaskOutOfRange)
+                .field("slot", slot)
+                .field("value", mask)
+                .fail();
+        }
+    }
     out
 }
 
@@ -2783,6 +2891,77 @@ mod tests {
             cap2.lines().is_empty(),
             "the census is deduped per shape and per (tag, len, value): {:?}",
             cap2.lines()
+        );
+    }
+
+    /// The ninth colour-attachment tag is `MTLColorWriteMask`, and an entry
+    /// that omits it left the property at `all`.
+    #[test]
+    fn a_colour_attachment_write_mask_decodes_and_defaults_to_all() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        // `[fieldCount][01 pixelFormat][09 writeMask]`, the shape the live
+        // guest sent (alpha-only, value 1).
+        let off = 16usize;
+        let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
+        st32(&mut buf[off..], 1);
+        st32(&mut buf[off + 4..], 8);
+        let entry = off + 8;
+        buf[entry] = 2;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+        buf[entry + 7] = COLOR_ATTACHMENT_TAG_WRITE_MASK;
+        buf[entry + 8] = 4;
+        st32(&mut buf[entry + 9..], MTL_COLOR_WRITE_MASK_ALPHA);
+        let masked = parse_color_attachments(&buf, buf.len(), off);
+        assert_eq!(
+            masked.first().map(|c| c.write_mask),
+            Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
+        );
+        assert!(!masked[0].write_mask.is_all());
+
+        // Same entry with the tag dropped: `all`, not `none`. This is the arm
+        // a derived `Default` on a bare `u32` would have made a black
+        // attachment, and every pipeline in the tree takes it.
+        buf[entry] = 1;
+        let plain = parse_color_attachments(&buf, buf.len(), off);
+        assert!(plain[0].write_mask.is_all());
+        assert_eq!(plain[0].write_mask, ColorWriteMask::default());
+    }
+
+    /// The tag identification is an argument from `MTLRenderPipeline.h`'s
+    /// property order, so it needs a standing check that it still holds. A
+    /// value no four-bit mask can carry refuses by name rather than masking
+    /// channels off on a guess.
+    #[test]
+    fn a_write_mask_outside_the_four_bits_refuses_by_name() {
+        use crate::contract::endian::st32;
+        let off = 16usize;
+        let mut buf = vec![0u8; off + 8 + 1 + 6];
+        st32(&mut buf[off..], 1);
+        st32(&mut buf[off + 4..], 8);
+        let entry = off + 8;
+        buf[entry] = 1;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_WRITE_MASK;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], 0x1234_5678);
+
+        let cap = crate::observe::FailCapture::start();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        assert!(
+            all[0].write_mask.is_all(),
+            "a refused mask leaves the attachment writing every channel, \
+             which is the pre-decode behaviour rather than a new failure"
+        );
+        let lines = cap.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=color_write_mask_out_of_range")
+                    && l.contains("value=305419896")),
+            "the refusal names the value that refuted it: {lines:?}"
         );
     }
 

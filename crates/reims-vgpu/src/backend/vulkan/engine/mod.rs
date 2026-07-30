@@ -44,7 +44,7 @@ pub use facade_decline::EngineFacadeDecline;
 pub use init_decline::InitDecline;
 pub use reason::DrawReason;
 pub use types::{
-    BlendFactor, BlendOp, BlendStateResource, BufferContent, ComputeBufferOutput,
+    BlendFactor, BlendOp, BlendStateResource, BufferContent, ColorWriteMask, ComputeBufferOutput,
     ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
     DepthState, DrawError, DrawOutput, DrawRequest, DrawTicket, GuestRun, GuestRunSource,

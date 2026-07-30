@@ -13,8 +13,8 @@ use super::counters::EngineCounters;
 use super::digest::Digest128;
 use super::pools::{DeferredHandle, ResourcePools};
 use super::types::{
-    BlendKey, CullMode, DrawError, PrimitiveTopology, SamplerStateKey, VertexAttributeFormat,
-    VertexStepFunction,
+    BlendKey, ColorWriteMask, CullMode, DrawError, PrimitiveTopology, SamplerStateKey,
+    VertexAttributeFormat, VertexStepFunction,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -151,6 +151,14 @@ pub(crate) struct PipelineKey {
     /// different pipelines, and before this they would have aliased onto
     /// whichever was created first.
     pub secondary_blend: [Option<BlendKey>; MAX_SECONDARY_ATTACH],
+    /// Per-slot `MTLColorWriteMask`, index 0 the primary attachment and index
+    /// `n` the secondary parallel to `pass.secondary[n - 1]`.
+    ///
+    /// In the key, not just the builder input: two draws sharing shaders, pass
+    /// shape and blend but masking different channels need different
+    /// pipelines. Vulkan's write mask is pipeline state with no dynamic
+    /// spelling below `VK_EXT_extended_dynamic_state3`.
+    pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
     pub pass: PassKey,
     pub flip_y: bool,
     /// Face culling. `None` (the 2D UI default) keeps the raster state at
@@ -994,27 +1002,35 @@ impl ObjectCaches {
         // fields per slot. Only this key collapsed them, so a guest MRT
         // pipeline that asked to blend slot 1 silently got a raw store.
         //
-        // The colour write mask is still pinned to RGBA on every slot. That one
-        // is real: `MTLColorWriteMask` is genuinely not decoded, and the
-        // coverage manifest records it as `NotOnTheWire` rather than pretending
-        // otherwise.
-        let attachment_blend = |blend: Option<BlendKey>| match blend {
-            Some(b) => vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(true)
-                .src_color_blend_factor(b.src_color.vk())
-                .dst_color_blend_factor(b.dst_color.vk())
-                .color_blend_op(b.color_op.vk())
-                .src_alpha_blend_factor(b.src_alpha.vk())
-                .dst_alpha_blend_factor(b.dst_alpha.vk())
-                .alpha_blend_op(b.alpha_op.vk()),
-            None => vk::PipelineColorBlendAttachmentState::default()
-                .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(false),
+        // The colour write mask comes from the guest too, and it is applied on
+        // both arms because `MTLColorWriteMask` is independent of
+        // `blendingEnabled` — an unblended masked attachment still leaves its
+        // unwritten channels alone. Metal's bits are alpha-first and Vulkan's
+        // are red-first, so the exchange goes through `vk_color_write_mask`
+        // rather than a cast.
+        let attachment_blend = |blend: Option<BlendKey>, mask: ColorWriteMask| {
+            let write = translate::blend::vk_color_write_mask(mask);
+            match blend {
+                Some(b) => vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(write)
+                    .blend_enable(true)
+                    .src_color_blend_factor(b.src_color.vk())
+                    .dst_color_blend_factor(b.dst_color.vk())
+                    .color_blend_op(b.color_op.vk())
+                    .src_alpha_blend_factor(b.src_alpha.vk())
+                    .dst_alpha_blend_factor(b.dst_alpha.vk())
+                    .alpha_blend_op(b.alpha_op.vk()),
+                None => vk::PipelineColorBlendAttachmentState::default()
+                    .color_write_mask(write)
+                    .blend_enable(false),
+            }
         };
-        let mut blend_att = vec![attachment_blend(key.blend)];
+        let mut blend_att = vec![attachment_blend(key.blend, key.color_write_mask[0])];
         for slot in 0..key.pass.secondary_count as usize {
-            blend_att.push(attachment_blend(key.secondary_blend[slot]));
+            blend_att.push(attachment_blend(
+                key.secondary_blend[slot],
+                key.color_write_mask[slot + 1],
+            ));
         }
         let blend_constants = key
             .blend

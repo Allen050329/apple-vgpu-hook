@@ -16,8 +16,8 @@ use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
 use super::types::{
-    BufferContent, DrawError, DrawOutput, DrawRequest, LoadOp, SampledSource, ScissorResource,
-    SeedOrder, VertexStepFunction, ViewportResource,
+    BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, LoadOp, SampledSource,
+    ScissorResource, SeedOrder, VertexStepFunction, ViewportResource,
 };
 use super::vk_call::{VkCall, VkOp};
 
@@ -960,6 +960,19 @@ pub(crate) unsafe fn execute_draw_inner(
                 .enumerate()
             {
                 per_slot[slot] = target.blend.map(|b| b.key());
+            }
+            per_slot
+        },
+        color_write_mask: {
+            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+            per_slot[0] = req.color_write_mask;
+            for (slot, target) in req
+                .secondary_targets
+                .iter()
+                .take(MAX_SECONDARY_ATTACH)
+                .enumerate()
+            {
+                per_slot[slot + 1] = target.color_write_mask;
             }
             per_slot
         },
