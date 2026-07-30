@@ -3363,11 +3363,32 @@ wall clock:
 
 8/8 against 6/6 is a large split and it is **not attributed**: this is the "count what your A/B
 actually changed" trap in its standard form, and the panel arm is the more suspicious of the two only
-because it is the variable that was deliberately introduced. Note the host panel is already documented
-here as a 4x confound on `present_hz`; whether it can reach the *guest's own composite* is exactly what
-is unmeasured. Separating them needs the two arms **interleaved**, scored on the guest capture (which
-cannot be affected by whether the host panel is lit), with the `dpms` value sampled throughout and
-printed next to the verdict.
+because it is the variable that was deliberately introduced.
+
+**The panel half is now REFUTED, and it needed no boot — the always-on channel already carried the
+answer.** A blanked output is documented above as reading `present_hz` p50 **20.00** with
+`busy_acquire` p50 ~**409**; that is its signature, and `host_window_cadence` is emitted on every
+boot whether or not anyone is asking. Sliced out of the saved per-boot logs:
+
+| boot | verdict | `present_hz` p50 | `busy_acquire` p50 |
+|---|---|---|---|
+| `blackdesk/r1`, `r5` | **BLACK** | 29.6 | **0** |
+| `bd2/r1`, `bd2/r7`, `bd3/r3` | GOOD | 29.5 - 29.6 | **0** |
+
+Identical, and neither is the throttle. **The host panel was awake during the black boots too**, so it
+is not the variable and no arm needs to be run with a human's screen blanked. That is "identify comes
+before add" paying for itself again: the probe that settled it was already in every log, and the
+alternative was eight boots of a deliberately blanked panel.
+
+What remains is a bare wall-clock block: 7 boots black in a ~35-minute window, then **20 consecutive
+clean boots** across the following 2.5 hours at the same commit. So the defect is **not currently
+reproducible**, and nothing measured so far separates the two windows. Do not spend another session
+theorising about which environmental knob it was; the two things worth doing when it next appears are
+to grab the boot's log slice (`black-desktop.sh` saves one per round) and to check whether the
+wallpaper was mid-crossfade — the stock desktop is a *dynamic* multi-variant HEIC whose variant
+selection moves with the guest clock, and the black window sits near a variant transition while the
+20 clean boots all scored a pinned `0.369053`. That is a **correlation with one uncontrolled
+variable**, offered as the next thing to test and not as a mechanism.
 
 ### 60+ fps Confirmed On A Second Panel-Awake Boot, And The 60 Hz Ceiling Was Not Real
 
