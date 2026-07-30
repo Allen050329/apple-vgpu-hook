@@ -800,24 +800,27 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // Prefer level.size when it is an exact multiple of one-slice bytes (multi-slice alloc).
     let one_slice = derived_slice_stride(layout.row_stride, layout.height, depth)
         .ok_or_else(|| br(BlitStatus::Capacity, "tex_slice_stride"))?;
-    let slice_stride =
-        if layout.size != 0 && layout.size % one_slice == 0 && layout.size >= one_slice {
-            // When size == one_slice, only one slice lives at this level offset.
-            // When size is a multiple, slices are packed with stride one_slice.
-            one_slice
-        } else {
-            one_slice
-        };
     if slice != 0 {
         // Bounds: selected slice must fit in allocation when known.
         // Live x86 buffer→texture (opcode 0x12c) uses slice=1,2 with
         // size=16384x1x1 at off=64K/128K — array packing into one allocation
         // even when the L0 level record's `size` equals one_slice. Prefer
         // allocation_size over the level-size single-slice reject.
+        //
+        // The selected slice is charged the bytes it is *read* through, not a
+        // whole `one_slice` stride: `texel_offset` walks rows and planes and
+        // the trailing padding after the final row is never touched. Charging
+        // it refuses allocations sized exactly for the array — see
+        // `TextureLevelLayout::slice_read_span`.
+        let tight_row = pixel_format::tight_row_bytes(layout.width, tex.pixel_format)
+            .ok_or_else(|| br(BlitStatus::Unsupported, "tex_slice_tight_row"))?;
+        let slice_read = layout
+            .slice_read_span(tight_row, depth)
+            .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_read_span"))?;
         let slice_end = (slice as u64)
-            .checked_mul(slice_stride)
+            .checked_mul(one_slice)
             .and_then(|o| o.checked_add(level_offset))
-            .and_then(|o| o.checked_add(one_slice))
+            .and_then(|o| o.checked_add(slice_read))
             .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_overflow"))?;
         if tex.allocation_size != 0 && slice_end > tex.allocation_size {
             crate::observe::fail(format!(
@@ -836,7 +839,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         alloc_size: tex.allocation_size,
         level_offset,
         row_stride: layout.row_stride,
-        slice_stride,
+        slice_stride: one_slice,
         slice_index: slice as u32,
         width: layout.width,
         height: layout.height,
@@ -3893,6 +3896,67 @@ mod tests {
         st32(&mut list_entry[0..], packed);
         list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
         write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+    }
+
+    /// Overwrite an installed texture descriptor's `allocation_size` in place.
+    /// The `install_linear_*` helpers floor it at 0x1000, and a bounds test
+    /// needs an allocation sized to the image and nothing more.
+    fn set_installed_allocation_size(
+        host: &mut FakeHost,
+        state: &DeviceState,
+        obj_ref: u32,
+        alloc: u64,
+    ) {
+        let desc_gva = 0x200u64 + (obj_ref as u64) * 0x80;
+        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &alloc.to_le_bytes());
+    }
+
+    /// The array-slice form of the corner-mask bounds defect: the selected
+    /// slice was charged a whole `row_stride * height` stride, so an allocation
+    /// the guest sized for exactly two padded slices was refused for trailing
+    /// padding that `texel_offset` never reaches.
+    #[test]
+    fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
+        // 4x2 RGBA8: tight rows are 16 B, the guest pads to 24, so one slice
+        // spans 48 B and the bytes read of a slice end at 24 + 16 = 40.
+        const STRIDE: u32 = 24;
+        const TIGHT: u64 = 4 * 4;
+        const ONE_SLICE: u64 = STRIDE as u64 * 2;
+        const READ: u64 = STRIDE as u64 + TIGHT;
+        const EXACT: u64 = ONE_SLICE + READ;
+
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        install_linear_rgba(&mut host, &mut state, 2, 2, 4, 2, STRIDE);
+        set_installed_allocation_size(&mut host, &state, 2, EXACT);
+
+        let backing = resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1)
+            .expect("slice 1 fits an allocation sized for exactly two slices");
+        let stride = match backing {
+            TextureBacking::Linear(t) => {
+                assert_eq!(t.slice_stride, ONE_SLICE, "slices stay a full stride apart");
+                assert_eq!(t.slice_index, 1);
+                // The last byte the reader can touch, and it is inside.
+                assert_eq!(t.texel_offset(3, 1, 0), Some(ONE_SLICE + STRIDE as u64 + 12));
+                assert!(t.texel_offset(3, 1, 0).unwrap() + 4 <= EXACT);
+                t.slice_stride
+            }
+            TextureBacking::Type11(_) => panic!("linear texture resolved as type-11"),
+        };
+
+        // The bound this replaced charged a second whole stride and refused this
+        // allocation, so the regression is visible here rather than only on a
+        // live guest.
+        assert!(
+            ONE_SLICE + stride > EXACT,
+            "the stride form must overcount, or this case proves nothing"
+        );
+        set_installed_allocation_size(&mut host, &state, 2, EXACT - 1);
+        match resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1) {
+            Err(st) => assert_eq!(st, BlitStatus::Bounds),
+            Ok(_) => panic!("one byte short of the read extent must still be refused"),
+        }
     }
 
     #[test]

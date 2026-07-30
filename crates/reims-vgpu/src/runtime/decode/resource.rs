@@ -285,6 +285,21 @@ impl TextureLevelLayout {
             .checked_mul(self.row_stride)?
             .checked_add(u64::from(tight_row))
     }
+
+    /// Bytes from [`Self::offset`] that a reader of one whole array slice /
+    /// cube face of this level touches, when `depth` planes are packed
+    /// contiguously inside the slice at `row_stride * height` each.
+    ///
+    /// Every plane below the last is walked in full; the last one ends at
+    /// [`Self::read_span`], because the padding after its final row is no more
+    /// read here than it is in the 2D case. `depth` 0 and 1 both mean one
+    /// plane, matching `TextureDescriptor`'s "0 means 2D" encoding.
+    pub fn slice_read_span(&self, tight_row: u32, depth: u32) -> Option<u64> {
+        u64::from(depth.max(1) - 1)
+            .checked_mul(self.row_stride)?
+            .checked_mul(u64::from(self.height))?
+            .checked_add(self.read_span(tight_row)?)
+    }
 }
 
 /// Type-2/3 linear texture geometry (`REIMS_VGPU_RESOURCE_TEXTURE_DESC_*`).
@@ -3068,6 +3083,53 @@ mod tests {
                 depth: 1
             }
             .read_span(TIGHT),
+            None
+        );
+    }
+
+    /// The array/volume form of the same rule. A slice is charged for every
+    /// plane below its last one in full, and for its last plane only as far as
+    /// the last row reaches — so an allocation sized exactly for N slices is
+    /// accepted rather than refused for the padding after the very last row.
+    #[test]
+    fn a_slice_read_span_charges_full_planes_and_a_tight_last_row() {
+        const STRIDE: u64 = 384;
+        const HEIGHT: u32 = 27;
+        const TIGHT: u32 = 27 * 2;
+        let layout = TextureLevelLayout {
+            offset: 0,
+            size: 0,
+            row_stride: STRIDE,
+            width: 27,
+            height: HEIGHT,
+            depth: 4,
+        };
+
+        // Depth 0 and 1 are both one plane, and then this is exactly `read_span`.
+        let flat = layout.read_span(TIGHT).unwrap();
+        assert_eq!(layout.slice_read_span(TIGHT, 1), Some(flat));
+        assert_eq!(layout.slice_read_span(TIGHT, 0), Some(flat));
+
+        // Three whole planes, then the fourth's rows.
+        let plane = STRIDE * HEIGHT as u64;
+        assert_eq!(layout.slice_read_span(TIGHT, 4), Some(3 * plane + flat));
+
+        // The stride form this replaced overcounts by exactly one row's padding,
+        // whatever the plane count.
+        for depth in [1u32, 2, 4] {
+            assert_eq!(
+                plane * u64::from(depth) - layout.slice_read_span(TIGHT, depth).unwrap(),
+                STRIDE - TIGHT as u64
+            );
+        }
+
+        // Zero height has no rows, so no span — and must not underflow.
+        assert_eq!(
+            TextureLevelLayout {
+                height: 0,
+                ..layout
+            }
+            .slice_read_span(TIGHT, 4),
             None
         );
     }
