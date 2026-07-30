@@ -808,12 +808,21 @@ Do not assume `flush_one` can be called as-is: the compute flush reads a *storag
 `ComputeStorageResidencyKey`, and a render Store's pixels live in a *target* resident by
 `TargetIdentity`. The index and the triggers are reusable; the read is not.
 
-**`req.output_bgra` is built, tested, and unreachable from product code — turning it on is part of
-this fix.** `grep -rn output_bgra crates/reims-vgpu` finds it read in five places in
-`engine/exec.rs`, and assigned `true` in exactly six places, *all of them in
-`tests/vk_engine_parity.rs`*. No `src/` file ever sets it, so `let output_bgra = req.output_bgra &&
-req.target_identity.is_some()` is permanently false and the engine's "BGRA output, so a raw
-image→buffer copy lands guest scanout order with **no CPU swizzle**" path never runs.
+**`req.output_bgra` was built, tested, and unreachable from product code. As of `e2c2dee` the BGRA
+resident path is live, but not through that flag** — do not read the paragraphs below as still
+describing the tree. `req.output_bgra` is *still* set nowhere in `src/`; what changed is that
+`exec.rs` now reads `output_bgra` as `identity.is_bgra() || req.output_bgra`, so every
+`TargetIdentity::Surface` resident is BGRA whether or not a caller asks. The flag survives as an
+explicit opt-in for namespaces whose identity does not imply an order, and the reasoning below about
+what the dead path cost and what it already had test coverage for is the argument that motivated
+turning it on. See "Its prerequisite shipped in `e2c2dee`" further down for the shipped form.
+
+The original reading, kept because the *cost* accounting in it is still correct: `grep -rn
+output_bgra crates/reims-vgpu` found it read in five places in `engine/exec.rs`, and assigned `true`
+in exactly six places, *all of them in `tests/vk_engine_parity.rs`*. No `src/` file ever set it, so
+`let output_bgra = req.output_bgra && req.target_identity.is_some()` was permanently false and the
+engine's "BGRA output, so a raw image→buffer copy lands guest scanout order with **no CPU swizzle**"
+path never ran.
 
 That mattered twice over. It *was* why the runtime paid `swap_rb_channels` on every type-11 Load seed
 — see the seed-order work below, which removed that half without touching the flag. And it means the
@@ -1456,19 +1465,47 @@ is the first time this rig has produced the goal's target number on the guest si
 ~208/s says essentially every readback is a type-11 composite Store. `skip_readback` returns from
 `execute_draw_inner` *before* `Phase::Wait`, so dropping that readback drops both together.
 
-Its prerequisite is `output_bgra` for type-11 residents, which also deletes the remaining swizzle
-(~87 ms/s) and is the gate on `read_resident_bgra` — the present path's resident rung, currently dead
-because `slot.bgra` is never true. Set it from the resolved identity (`matches!(.., Surface{..})`) so
-**every** draw targeting that identity agrees; an intermediate at `output_bgra=false` sharing an
-identity with a Store at `true` makes `registry_ensure` destroy and recreate the image every frame.
+**Its prerequisite shipped in `e2c2dee`: a `Surface` resident is BGRA, and the order is now a property
+of the identity rather than of the draw.** `TargetIdentity::is_bgra()` is the single rule, read by
+`exec.rs`'s `output_bgra` derivation, and it deletes the ~152 ms/s (776 us/Store, 84.5 % of
+`t11_store_us`) whole-frame swizzle outright instead of moving it. `req.output_bgra` survives as an
+explicit opt-in for namespaces that do not imply an order, and is still set nowhere in `src/`.
 
-Three order hazards to handle, all verified by reading:
+Two design points worth carrying, because both were nearly got wrong:
 
-- `read_resident_chain` (`vulkan.rs:4935`) returns the resident's bytes straight to
-  `writeback_chain_rgba` on the abandon path. That becomes BGRA.
-- The `cpu_portability` route calls `write_rgba8_image_changed`; it needs the `write_bgra8` form.
-- The sampled reader at `vulkan.rs:900` does its own `swap_rb_channels` off `surface_cache`, which
-  stays BGRA — unaffected, but it is a **fourth** full-frame CPU pass nobody has priced.
+- **Derive the order from the identity, not from the rail.** `registry_ensure` destroys and recreates
+  the image whenever a draw disagrees with the slot, and a composite Store, a chain intermediate and an
+  MRT primary all reach one surface through `render_chain_identity`. Keying on what they already agree
+  on makes them agree here for free; a per-path predicate that one path spells differently is a full
+  reallocation per composite — `target_evicts` climbing, not a wrong colour.
+- **Then make the engine *report* the order, because the runtime cannot re-derive it.** Whether a
+  record got a resident or a pooled target depends on whether an identity resolved, so
+  `DrawOutput::pixels_bgra` and `TargetReadback { pixels, bgra }` carry it (the latter read from the
+  registry slot under the same lock as the copy). This is "a reason the caller writes is not a reading"
+  applied to byte order, and what it forecloses is a silent R/B exchange on a whole frame — a defect
+  class **no assertion in this crate was watching for**, which is why the parity suite could not have
+  caught it. Those cases now normalize through the reported order (`semantic_rgba`, `into_rgba8`) where
+  they assert colour and keep raw `.pixels` where they assert layout, so they no longer silently follow
+  whatever the engine picks.
+
+The three order hazards the plan named were all real and are handled: `read_resident_chain` normalizes
+at the one place its three callers share; the `cpu_portability` route now calls `write_bgra8` (same
+tail — residency invalidation, `mark_mapping_written`, cache republish — so a substitution, and its
+changed-span rung was never used from that site); the sampled reader off `surface_cache` is unaffected
+and is still an unpriced fourth full-frame pass.
+
+One thing fell out that the plan did not list: a type-11 Store was returning its whole frame as the
+packet's chain value, and that binding **has no reader**. `writeback_guest` is granted only to
+`di == last_i`, so there is no record N+1 to seed and every other reader in `exec.rs` is inside the
+record loop that just ended. Now `None`.
+
+**Not yet scored on a boot.** The within-boot numbers to read are `t11_convert_us` per Store (expected
+to collapse toward zero — the call is now a compare, and
+`reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree` is what stops a future edit restoring
+the cost with the pixels still correct) and `target_evicts` (expected to stay 0). Not the host frame
+rate, per the 1.8x spread above. `read_resident_bgra`'s present rung is now *reachable* for the first
+time and is still never taken, because the present capture prefers `surface_cache` and the Store keeps
+refreshing it — that rung is the gate for the work below and this commit does not exercise it.
 
 Consumers `skip_readback` must then re-source: `surface_cache` (present capture at `scanout.rs:248`,
 the ~4 % of LOADs that still seed, and the sampled bind), the deferred window's owned frame, and the
