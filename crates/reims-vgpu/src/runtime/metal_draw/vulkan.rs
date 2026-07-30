@@ -3303,7 +3303,20 @@ fn note_gva_backing_verdict(
 /// population of partial-scissor draws, so "the seed path is not entered for
 /// these at all" is the reading to test first. A seed that is never resolved is
 /// not a seed that is lost, and `load_seed_lost` cannot see it.
-fn note_draw_coverage(x: u32, y: u32, sw: u32, sh: u32, target_w: u32, target_h: u32) {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
+)]
+fn note_draw_coverage(
+    x: u32,
+    y: u32,
+    sw: u32,
+    sh: u32,
+    target_w: u32,
+    target_h: u32,
+    load_action: Option<u16>,
+    seeded: bool,
+) {
     let covers = x == 0 && y == 0 && sw >= target_w && sh >= target_h;
     crate::runtime::drain::note_store_route(if covers {
         "draw_scissor_full"
@@ -3313,6 +3326,24 @@ fn note_draw_coverage(x: u32, y: u32, sw: u32, sh: u32, target_w: u32, target_h:
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
+    // The join. A partial draw is correct exactly when the attachment already
+    // holds the rest of the picture, so what matters is not that the scissor is
+    // small but what the pass did with the texels outside it:
+    //
+    //   load_seeded  — LOAD and a seed was resolved. The rest is the old frame.
+    //   load_unseeded— LOAD and no seed. Becomes a Vulkan CLEAR, so every texel
+    //                  outside the scissor is destroyed. This is the defect
+    //                  shape, and `load_seed_lost` cannot count it when the
+    //                  seed branch is never entered at all.
+    //   clear        — CLEAR was asked for. Destroying them is the contract.
+    //   dontcare     — undefined outside the scissor by declaration.
+    crate::runtime::drain::note_store_route(match load_action {
+        Some(PASS_LOAD_ACTION_LOAD) if seeded => "draw_partial_load_seeded",
+        Some(PASS_LOAD_ACTION_LOAD) => "draw_partial_load_unseeded",
+        Some(PASS_LOAD_ACTION_CLEAR) => "draw_partial_clear",
+        Some(PASS_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
+        _ => "draw_partial_load_unknown",
+    });
     if crate::observe::first_sight(
         "draw_scissor_partial",
         (target_w as u64) << 48
@@ -3323,7 +3354,9 @@ fn note_draw_coverage(x: u32, y: u32, sw: u32, sh: u32, target_w: u32, target_h:
             ^ y as u64,
     ) {
         crate::observe::off(format!(
-            "draw_scissor_partial target={target_w}x{target_h} scissor={sw}x{sh}+{x}+{y}"
+            "draw_scissor_partial target={target_w}x{target_h} scissor={sw}x{sh}+{x}+{y} \
+             load={load_action:?} seeded={}",
+            u8::from(seeded)
         ));
     }
 }
@@ -4934,7 +4967,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 });
         }
         if let Some((x, y, sw, sh)) = req.scissor {
-            note_draw_coverage(x, y, sw, sh, w, h);
+            note_draw_coverage(
+                x,
+                y,
+                sw,
+                sh,
+                w,
+                h,
+                req.colors.first().map(|c| c.load_action),
+                target_rgba8.is_some(),
+            );
             resources
                 .scissors
                 .push(crate::backend::vulkan::engine::ScissorResource {
