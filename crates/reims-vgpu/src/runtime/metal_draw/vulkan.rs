@@ -4404,39 +4404,68 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         let mut surface_resident_store = false;
         #[cfg(feature = "backend-vulkan")]
-        let identity_taken_by_another_rail = resources.target_identity.is_some();
-        #[cfg(feature = "backend-vulkan")]
         if resources.target_identity.is_none() {
             resources.target_identity = type11_resident_target.clone();
-            if type11_resident_target.is_some()
-                && deferred_gpu_only_content_allowed_for_surface()
-                && surface_store_defer_eligible(state, req).is_some()
-            {
-                resources.skip_readback = true;
-                surface_resident_store = true;
-            }
+        }
+        // Whether the slot this record renders into is the one this rail would
+        // pin, asked by comparing the two identities rather than by testing that
+        // no other rail set one.
+        //
+        // The difference is the whole change. A composite Store arrives here with
+        // `target_identity` already set when it is the last record of a resident
+        // render-pass chain: the block above resolved `render_chain_identity` so
+        // the record could take `LoadOp::LoadFromTarget`, and for `mapping_id != 0`
+        // that *is* the `surface_identity` `type11_store_identity` returns. An
+        // `is_none()` test read that agreement as a conflict and kept the readback
+        // for 100 % of the population. The GVA rail cannot collide — its identity
+        // requires `mapping_id == 0` and this one requires `mapping_id != 0` — so a
+        // genuine mismatch means another namespace owns the attachment and the
+        // frame this rail would vouch for is not in the slot it would pin.
+        #[cfg(feature = "backend-vulkan")]
+        let renders_into_surface_identity =
+            type11_resident_target.is_some() && resources.target_identity == type11_resident_target;
+        #[cfg(feature = "backend-vulkan")]
+        let identity_taken_by_another_rail =
+            resources.target_identity.is_some() && !renders_into_surface_identity;
+        // `!skip_readback` is implied — a set flag means one of the rails above
+        // claimed this record, and each returns its own span before
+        // `ResidentSurfaceStore` is reached, so a record that armed here as well
+        // would skip its readback and never arm anything. Stated rather than
+        // derived, because the derivation is a property of two other blocks.
+        #[cfg(feature = "backend-vulkan")]
+        if renders_into_surface_identity
+            && !resources.skip_readback
+            && deferred_gpu_only_content_allowed_for_surface()
+            && surface_store_defer_eligible(state, req).is_some()
+        {
+            resources.skip_readback = true;
+            surface_resident_store = true;
         }
         // Every rail that could skip this Store's readback has now had its say.
         // A composite Store that still reads back costs a full-surface GPU→CPU
         // copy plus the fence wait that is charged per byte, and the always-on
-        // channel could not say which of six conditions kept it: `store_routes`
+        // channel could not say which of these conditions kept it: `store_routes`
         // counts the route TAKEN, so the 256/s that land on `surface_deferred`
         // are indistinguishable from each other. Ordered first-failure, into the
         // same per-second window `drain_duty` divides, so the count sits beside
         // the `readbacks` it explains.
+        //
+        // `t11_keep_chain_from_resident` used to head this list and owned the
+        // whole population; it is gone because a chained Store is no longer
+        // refused. The reason it could head the list at all is worth keeping in
+        // mind when reading this probe: an ordered first-failure cannot separate
+        // two conditions that are the same fact, and `chain_from_resident` and
+        // `identity_taken_by_another_rail` were both true on every one of those
+        // Stores.
         #[cfg(feature = "backend-vulkan")]
         if !resources.skip_readback && store_is_store && writeback_guest {
             if let Some(c0) = req.colors.first() {
                 if c0.mapping_id != 0 {
-                    crate::runtime::drain::note_store_route(if req.chain_from_resident {
-                        // `type11_store_identity` refuses outright for a chained
-                        // Store, so this Store can never reach the rail however
-                        // eligible its mapping is.
-                        "t11_keep_chain_from_resident"
-                    } else if identity_taken_by_another_rail {
+                    // No `store_action` arm: `store_is_store` gating this block is
+                    // that same field read off that same `c0`, so an arm testing it
+                    // again could not fire. It was written as one and never could.
+                    crate::runtime::drain::note_store_route(if identity_taken_by_another_rail {
                         "t11_keep_identity_taken"
-                    } else if c0.store_action != PASS_STORE_ACTION_STORE {
-                        "t11_keep_store_action"
                     } else if type11_resident_target.is_none() {
                         "t11_keep_no_chain_identity"
                     } else if !deferred_gpu_only_content_allowed_for_surface() {
@@ -5066,13 +5095,26 @@ fn render_chain_identity(
 /// currency check and the Store's epoch stamp must name the same slot; deriving
 /// it three times from three spellings of the predicate is how a stamp ends up
 /// vouching for an image the draw never rendered into.
+///
+/// `chain_from_resident` is **not** a refusal, and used to be. The last record of
+/// a resident render-pass chain is both the chain's consumer and the packet's
+/// guest-visible Store, and refusing it here cost the whole composite readback
+/// population: `t11_keep_chain_from_resident` measured equal to
+/// `surface_deferred` in all twelve windows of one boot, 112-132 Stores a second
+/// at 366-372 MB/s, with every other keep-reason at zero. Nothing about the chain
+/// changes which slot this record renders into — `retarget_render_pass_draw`
+/// builds every record of a packet from one attachment template, so records N-1
+/// and N carry the same `mapping_id` and geometry and therefore the same
+/// [`render_chain_identity`] — and the intermediates already render into that
+/// resident under `skip_readback` with `LoadOp::LoadFromTarget`. The last record
+/// differs only in what happens *after* the draw.
 #[cfg(feature = "backend-vulkan")]
 fn type11_store_identity(
     state: &DeviceState,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
-    if req.chain_from_resident || !writeback_guest {
+    if !writeback_guest {
         return None;
     }
     let c0 = req.colors.first()?;
@@ -5477,36 +5519,21 @@ fn prepare_surface_deferred_window<M: HostMemory + HostOps>(
     if key.mapping_id != mapping_id || key.width != width || key.height != height {
         return None;
     }
-    // Supersede — do not flush — the window this Store fully covers.
-    //
-    // This is `supersede_gva_window`'s rule, and it is what makes the rail a
-    // deferral instead of a rescheduling. A compositor painting the same surface
-    // every frame re-Stores the identical guest range, so the previous window
-    // always intersects: flushing it here would perform exactly the guest write
-    // this rail exists to skip, once per Store, and `surface_flush` would track
-    // `surface_deferred` at a ratio of 1.
-    //
-    // Dropping is sound for the reason it is sound on the GVA rail: those bytes
-    // were never observable without a flush — any reader would have taken the
-    // window first — and this Store's pixels cover every byte of the range.
-    let covered: Vec<crate::model::ComputeStorageResidencyKey> = state
-        .compute_deferred_flush
-        .iter()
-        .filter(|(k, o)| {
-            k.mapping_id == key.mapping_id
-                && k.surface_offset == key.surface_offset
-                && k.span_end == key.span_end
-                && matches!(o, crate::model::DeferredOwner::Render { .. })
-        })
-        .map(|(k, _)| *k)
-        .collect();
-    for old in covered {
-        if state.take_deferred_flush_window_exact(&old).is_some() {
-            crate::observe::line(format!(
-                "surface_deferred_superseded mapping={} {}x{} fmt={:#x}",
-                old.mapping_id, old.width, old.height, old.pixel_format
-            ));
-        }
+    // Supersede — do not flush — the window this Store fully covers. The rule and
+    // the reason it is sound live with the release, in
+    // `storage_flush::supersede_covered_render_windows`, because taking a window
+    // and dropping its hold are one act and this site used to do only the first.
+    for (old, unpinned) in
+        crate::runtime::storage_flush::supersede_covered_render_windows(state, &key)
+    {
+        crate::observe::line(format!(
+            "surface_deferred_superseded mapping={} {}x{} fmt={:#x} unpinned={}",
+            old.mapping_id,
+            old.width,
+            old.height,
+            old.pixel_format,
+            unpinned.is_some() as u8
+        ));
     }
     // Whatever still intersects covers guest bytes this Store does *not* write —
     // a different plane window on the same mapping — so it has to land.

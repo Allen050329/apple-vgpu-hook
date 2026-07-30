@@ -842,7 +842,10 @@ fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
         for order in [false, true] {
             let mut same = src.clone();
             crate::runtime::metal_draw::reorder_rb_in_place(&mut same, order, order);
-            assert_eq!(same, src, "len={len} order={order}: agreement must not copy");
+            assert_eq!(
+                same, src,
+                "len={len} order={order}: agreement must not copy"
+            );
         }
         // Disagreement in either direction is exactly the established swizzle,
         // tail included.
@@ -957,6 +960,80 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
             height: 32,
             generation: 0,
         })
+    );
+}
+
+/// The last record of a resident render-pass chain is both the chain's consumer
+/// and the packet's guest-visible Store, and it must name the resident it loads
+/// from so it can skip its own readback.
+///
+/// Refusing `chain_from_resident` here cost the entire remaining composite
+/// readback population — `t11_keep_chain_from_resident` measured equal to
+/// `surface_deferred` in every window of one boot. The assertion that matters is
+/// the *equality*: `retarget_render_pass_draw` builds every record of a packet
+/// from one attachment template, so the record that loads from the resident is by
+/// construction the record that renders into it, and a Store naming a different
+/// slot than its own LOAD would pin an image its frame is not in.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_chained_composite_store_names_the_resident_it_loads_from() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert!(state.map_surface(7));
+    let mut req = DrawEncodeRequest {
+        width: 128,
+        height: 64,
+        ..Default::default()
+    };
+    req.colors.push(ColorRtRequest {
+        slot: 0,
+        texture_ref: 3,
+        mapping_id: 7,
+        width: 128,
+        height: 64,
+        load_action: PASS_LOAD_ACTION_LOAD,
+        store_action: PASS_STORE_ACTION_STORE,
+        ..Default::default()
+    });
+
+    let unchained = type11_store_identity(&state, &req, true);
+    assert!(
+        unchained.is_some(),
+        "an unchained composite Store resolves its resident"
+    );
+
+    req.chain_from_resident = true;
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        unchained,
+        "a chained Store must name the same resident an unchained one does — it is \
+         the same attachment template, so the chain cannot move the slot"
+    );
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        render_chain_identity(&state, &req),
+        "the Store identity and the LoadFromTarget identity must be one slot"
+    );
+
+    // The gates that are still refusals. `writeback_guest` is the one that
+    // separates the packet's last record from its intermediates, and an
+    // intermediate has no guest Store to defer.
+    assert_eq!(
+        type11_store_identity(&state, &req, false),
+        None,
+        "an intermediate record stores nothing guest-visible"
+    );
+    req.colors[0].store_action = crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        None,
+        "a record that discards its target has no frame to defer"
+    );
+    req.colors[0].store_action = PASS_STORE_ACTION_STORE;
+    req.colors[0].mapping_id = 0;
+    assert_eq!(
+        type11_store_identity(&state, &req, true),
+        None,
+        "a GVA target is the other rail's; this one requires a mapping"
     );
 }
 

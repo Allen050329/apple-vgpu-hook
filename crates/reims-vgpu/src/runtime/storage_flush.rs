@@ -1137,6 +1137,63 @@ pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
     }
 }
 
+/// Drop — do not land — every render window whose guest byte range this Store
+/// fully covers, releasing what each one held.
+///
+/// Lives here rather than at the arm site because the *release* lives here, and
+/// the arm site got it wrong for exactly that reason: it took each covered window
+/// with a bare `take_deferred_flush_window_exact` and discarded it, so a
+/// `Resident` window's counted registry pin was never dropped. That is one leaked
+/// pin per composite Store on a surface the compositor repaints — and because the
+/// re-Store carries the *same* key, it is the same slot's `pin_count` climbing
+/// without bound. `evict_registry_to_cap` rotates pinned slots instead of
+/// evicting and the idle drain requires `pin_count == 0`, so a slot that gets
+/// there can never be reclaimed again: the "~260 stale residents (~516 MiB)
+/// pinned for the guest lifetime" shape, arrived at one frame at a time.
+///
+/// Dropping rather than flushing is what makes the rail a deferral instead of a
+/// rescheduling — a compositor painting one surface re-Stores the identical range
+/// every frame, so the previous window always intersects, and landing it here
+/// would perform exactly the guest write the rail exists to skip. It is sound for
+/// the reason it is sound on the GVA rail: those bytes were never observable
+/// without a flush, since any reader would have taken the window first, and this
+/// Store's pixels cover every byte of the range.
+///
+/// Returns the identities whose pins were released, so a caller can log them and
+/// a test can read the decision. `None` for an `Owned` window is the answer, not
+/// a missing one: its pixels are an `Arc` and dropping it *is* the release.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn supersede_covered_render_windows(
+    state: &mut DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+) -> Vec<(
+    crate::model::ComputeStorageResidencyKey,
+    Option<crate::backend::vulkan::engine::TargetIdentity>,
+)> {
+    // Matched on the guest byte range, not on geometry: a sibling Store at a
+    // different size over the same span writes the same pages, so its window is
+    // covered even though its key differs. `release_window_pin` therefore has to
+    // rebuild the identity from the *old* key, which is why it takes one.
+    let covered: Vec<crate::model::ComputeStorageResidencyKey> = state
+        .compute_deferred_flush
+        .iter()
+        .filter(|(k, o)| {
+            k.mapping_id == key.mapping_id
+                && k.surface_offset == key.surface_offset
+                && k.span_end == key.span_end
+                && matches!(o, crate::model::DeferredOwner::Render { .. })
+        })
+        .map(|(k, _)| *k)
+        .collect();
+    let mut released = Vec::with_capacity(covered.len());
+    for old in covered {
+        if let Some(owner) = state.take_deferred_flush_window_exact(&old) {
+            released.push((old, release_window_pin(&old, &owner)));
+        }
+    }
+    released
+}
+
 /// Release whatever a taken window held, according to its rail.
 ///
 /// Every site that takes a window and does not flush it must go through this
@@ -1145,14 +1202,20 @@ pub fn drop_windows(state: &mut DeviceState, mapping_id: u32, reason: &str) {
 /// are a `surface_cache` entry, which is LRU-managed and shared with the Load
 /// seed, so it must not be evicted here. Unpinning storage for a render window
 /// would name a key the storage registry never held and succeed silently.
+///
+/// Returns the render identity it unpinned, if any. `unpin_resident_target` is a
+/// silent no-op for an absent slot and the engine keeps no log of it, so without
+/// this return value "the pin was released" is a claim no test and no boot can
+/// read — which is how the supersede site went several commits leaking one.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn release_window_pin(
     key: &crate::model::ComputeStorageResidencyKey,
     owner: &crate::model::DeferredOwner,
-) {
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     match owner {
         crate::model::DeferredOwner::Storage { .. } => {
-            crate::backend::vulkan::engine::unpin_resident_storage(key)
+            crate::backend::vulkan::engine::unpin_resident_storage(key);
+            None
         }
         crate::model::DeferredOwner::Render { source, .. } => {
             release_window_pin_for_key(key, source)
@@ -1163,18 +1226,22 @@ pub(crate) fn release_window_pin(
 /// Release whatever GPU hold a render window's source carries.
 ///
 /// An `Owned` window holds nothing — its pixels are an `Arc` and dropping it is
-/// the release. A `Resident` window holds a counted registry pin, and **every**
-/// exit that abandons the window has to drop it: `evict_registry_to_cap` and the
-/// idle drain both skip pinned slots by design, so a leaked pin strands a whole
-/// framebuffer for the guest lifetime rather than merely delaying a reclaim.
+/// the release, so `None` here is the answer and not a miss. A `Resident` window
+/// holds a counted registry pin, and **every** exit that abandons the window has
+/// to drop it: `evict_registry_to_cap` and the idle drain both skip pinned slots
+/// by design, so a leaked pin strands a whole framebuffer for the guest lifetime
+/// rather than merely delaying a reclaim.
 #[cfg(feature = "backend-vulkan")]
 fn release_window_pin_for_key(
     key: &crate::model::ComputeStorageResidencyKey,
     source: &crate::model::RenderWindowSource,
-) {
-    if matches!(source, crate::model::RenderWindowSource::Resident { .. }) {
-        crate::backend::vulkan::engine::unpin_resident_target(&render_window_identity(key));
+) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
+    if !matches!(source, crate::model::RenderWindowSource::Resident { .. }) {
+        return None;
     }
+    let identity = render_window_identity(key);
+    crate::backend::vulkan::engine::unpin_resident_target(&identity);
+    Some(identity)
 }
 
 pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
@@ -1596,15 +1663,69 @@ mod tests {
             "arming indexes the mapping's pages for the raw-GVA guard"
         );
 
-        let owner = state.take_deferred_flush_window_exact(&k);
-        assert!(
-            matches!(owner, Some(crate::model::DeferredOwner::Render { .. })),
+        let released = super::supersede_covered_render_windows(&mut state, &k);
+        assert_eq!(
+            released.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![k],
             "the exact key is the one taken"
         );
         assert!(state.compute_deferred_flush.is_empty());
         assert!(
             !state.deferred_alias_pages.contains_key(&9),
             "the last window leaving must drop the mapping's alias-page refs"
+        );
+    }
+
+    /// The other half of dropping a superseded window: a `Resident` one holds a
+    /// counted registry pin, and the supersede is one of the exits
+    /// `release_window_pin` names.
+    ///
+    /// The arm site got this wrong. It took each covered window with a bare
+    /// `take_deferred_flush_window_exact` and discarded it, so every composite
+    /// Store on a repainted surface leaked one pin — and since the re-Store
+    /// carries the same key, it is the same slot's `pin_count` climbing without
+    /// bound until nothing can ever reclaim it. `unpin_resident_target` is a
+    /// silent no-op with no engine here, so the assertion is on the *identity*
+    /// the release named: it has to be rebuilt from the superseded window's own
+    /// key, since a covered sibling may carry a different geometry over the same
+    /// guest range.
+    #[test]
+    fn superseding_a_resident_window_releases_the_pin_it_held() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut k = key(9, 0, 256);
+        k.map_generation = 3;
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 1,
+                source: crate::model::RenderWindowSource::Resident { epoch: 11 },
+            },
+        );
+
+        let released = super::supersede_covered_render_windows(&mut state, &k);
+        assert_eq!(
+            released,
+            vec![(
+                k,
+                Some(TargetIdentity::Surface {
+                    id: 9,
+                    width: k.width,
+                    height: k.height,
+                    generation: 3,
+                })
+            )],
+            "a resident window's pin must be released, under the identity its own key names"
+        );
+
+        // An `Owned` window holds nothing on the GPU, so `None` is the answer and
+        // not a missed release — unpinning for one would name a slot the arm never
+        // pinned and succeed silently.
+        state.compute_deferred_flush.insert(k, render_owner(2));
+        assert_eq!(
+            super::supersede_covered_render_windows(&mut state, &k),
+            vec![(k, None)],
+            "an owned window releases nothing"
         );
     }
 
@@ -1623,7 +1744,10 @@ mod tests {
             .compute_deferred_flush
             .insert(sibling, render_owner(2));
 
-        assert!(state.take_deferred_flush_window_exact(&covered).is_some());
+        assert_eq!(
+            super::supersede_covered_render_windows(&mut state, &covered).len(),
+            1
+        );
         assert!(
             state.compute_deferred_flush.contains_key(&sibling),
             "a different range is a different obligation"
