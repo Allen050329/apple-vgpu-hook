@@ -3326,9 +3326,33 @@ fn note_draw_coverage(
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
-    // The join. A partial draw is correct exactly when the attachment already
-    // holds the rest of the picture, so what matters is not that the scissor is
-    // small but what the pass did with the texels outside it:
+    // The join, and it found the mechanism. One driven boot, ten Finder
+    // recomposites, two corrupt:
+    //
+    //   draw_scissor_full          1119349
+    //   draw_scissor_partial        592135
+    //     draw_partial_load_unseeded 519715   <-- 88% of every partial draw
+    //     draw_partial_clear          48570
+    //     draw_partial_dontcare       23848
+    //     draw_partial_load_seeded         2
+    //
+    // Half a million draws per session declare `MTLLoadActionLoad`, resolve no
+    // seed, and therefore run as a Vulkan CLEAR — which destroys every texel of
+    // the attachment outside the scissor rect. The identity lines show it at
+    // icon geometry directly:
+    //
+    //   target=64x64 scissor=18x40+12+0 load=Some(1) seeded=0
+    //   target=64x64 scissor=16x54+1+1  load=Some(1) seeded=0
+    //   target=64x64 scissor=12x40+12+0 load=Some(1) seeded=0
+    //
+    // an 18x40 block kept and the other 3376 texels of the icon thrown away,
+    // which is the broken Finder cell as photographed. `load=Some(2)` (CLEAR)
+    // entries are `seeded=1`, so the seeding that does happen is the one the
+    // contract does not need.
+    //
+    // A partial draw is correct exactly when the attachment already holds the
+    // rest of the picture, so what matters is not that the scissor is small but
+    // what the pass did with the texels outside it:
     //
     //   load_seeded  — LOAD and a seed was resolved. The rest is the old frame.
     //   load_unseeded— LOAD and no seed. Becomes a Vulkan CLEAR, so every texel
