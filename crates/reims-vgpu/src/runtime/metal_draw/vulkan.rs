@@ -2607,15 +2607,26 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     {
         return Some((w, h, rgba, identity, byte_format));
     }
-    let Some((rgba, byte_format)) =
-        load_linear_texture_native_host(state, host, task_id, texture_ref, 0, None)
-    else {
-        crate::observe::fail(format!(
-            "linear_sample_miss reason=guest_load task={task_id} ref={texture_ref} type={} gva={gva:#x} fmt={:#x} {w}x{h} bpr={}",
-            entry.object_type, tex.pixel_format, layout.row_stride
-        ));
-        return None;
-    };
+    let (rgba, byte_format) =
+        match load_linear_texture_native_host(state, host, task_id, texture_ref, 0, None) {
+            Ok(loaded) => loaded,
+            // The reason comes from the check that refused, not from this
+            // caller. It used to read `reason=guest_load` for all fifteen of
+            // the loader's refusals, which is the caller's assumption printed
+            // at full confidence in the field a reader trusts most.
+            Err(refusal) => {
+                crate::observe::Emit::decline("linear_sample_miss", &refusal)
+                    .field("task", task_id)
+                    .field("ref", texture_ref)
+                    .field("objtype", entry.object_type)
+                    .field("gva", format!("{gva:#x}"))
+                    .field("fmt", format!("{:#x}", tex.pixel_format))
+                    .field("geom", format!("{w}x{h}"))
+                    .field("bpr", layout.row_stride)
+                    .fail();
+                return None;
+            }
+        };
     let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
     if rgba.len() >= need {
         // `load_linear_texture_native_host` already returns a tight `need`-byte
