@@ -1354,12 +1354,135 @@ pub fn decode_render_pipeline_descriptor(
     Ok(out)
 }
 
+/// A colour-attachment TLV field this decoder does not read.
+///
+/// The entry is `[field_count][tag][len][value…]*` and eight tags are consumed
+/// (`COLOR_ATTACHMENT_TAG_PIXEL_FORMAT` through `..._ALPHA_OP`). Anything else
+/// is a field the guest serialized and we dropped on the floor — including,
+/// per `translate/coverage.rs`, `colorAttachments[n].writeMask`, whose position
+/// in this block is unknown and is an RE question rather than a guess.
+struct ColorAttachDropped {
+    tag: u8,
+}
+
+impl crate::observe::Decline for ColorAttachDropped {
+    fn slug(&self) -> &'static str {
+        "color_attachment_field_dropped"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![("tag", format!("0x{:02x}", self.tag))]
+    }
+}
+
+const COLOR_ATTACHMENT_TAGS_CONSUMED: [u8; 8] = [
+    COLOR_ATTACHMENT_TAG_PIXEL_FORMAT,
+    COLOR_ATTACHMENT_TAG_BLEND_ENABLE,
+    COLOR_ATTACHMENT_TAG_SRC_RGB,
+    COLOR_ATTACHMENT_TAG_DST_RGB,
+    COLOR_ATTACHMENT_TAG_RGB_OP,
+    COLOR_ATTACHMENT_TAG_SRC_ALPHA,
+    COLOR_ATTACHMENT_TAG_DST_ALPHA,
+    COLOR_ATTACHMENT_TAG_ALPHA_OP,
+];
+
+/// The largest field value that rides in the dedup key.
+///
+/// A dropped field's *value distribution* is the identifying signal — an
+/// `MTLColorWriteMask` only ever takes 0..=15, which names the field from the
+/// wire alone without knowing its tag in advance. So small values each get
+/// their own line. A field carrying wide values would otherwise make this
+/// unbounded, so above the cap the key collapses to the tag and only the first
+/// value seen is printed.
+const COLOR_ATTACH_DROP_VALUE_CAP: u32 = 64;
+
+/// Report the shape of one colour-attachment entry and every field in it this
+/// decoder does not consume.
+///
+/// Two lines with different jobs, because a silent census cannot distinguish
+/// "the guest sends nothing but the eight tags we read" from "this walk never
+/// ran on a live guest":
+///
+/// * `type7_color_attach_shape` is the *branch*, deduped per distinct `(tag,
+///   len)` sequence. A boot with entries but no drop line is then a positive
+///   reading — the entries were seen and carried only consumed tags — rather
+///   than an absence.
+/// * `color_attachment_field_dropped` is the *loss*, one typed decline per
+///   dropped `(tag, len, value)`. A serialized field we never read is guest
+///   intent discarded, which the ground rules say must not be silent.
+///
+/// Pipeline descriptors are decoded once per distinct pipeline and cached, so
+/// this walk is not on a per-draw path.
+fn note_color_entry_fields(bytes: &[u8], len: usize, entry: usize, slot: u32) {
+    if entry >= len {
+        return;
+    }
+    let field_count = bytes[entry] as usize;
+    let mut p = entry + 1;
+    let mut shape = String::new();
+    let mut shape_key: u64 = 0;
+    let mut dropped: Vec<(u8, u8, u32)> = Vec::new();
+    for _ in 0..field_count {
+        if p + 2 > len {
+            break;
+        }
+        let tag = bytes[p];
+        let field_len = bytes[p + 1] as usize;
+        if p + 2 + field_len > len {
+            break;
+        }
+        let value = if field_len >= 4 {
+            ld32(&bytes[p + 2..])
+        } else {
+            0
+        };
+        let consumed = COLOR_ATTACHMENT_TAGS_CONSUMED.contains(&tag);
+        let sep = if shape.is_empty() { "" } else { "," };
+        let star = if consumed { "" } else { "*" };
+        let _ = std::fmt::Write::write_fmt(
+            &mut shape,
+            format_args!("{sep}{tag:02x}:{field_len}{star}"),
+        );
+        // Order-sensitive so a reordered entry reads as a different shape; the
+        // tag and length are what the walk depends on, the value is not.
+        shape_key = shape_key.rotate_left(9) ^ (u64::from(tag) << 8) ^ (field_len as u64);
+        if !consumed {
+            dropped.push((tag, field_len as u8, value));
+        }
+        p += 2 + field_len;
+    }
+    if crate::observe::first_sight("type7_color_attach_shape", shape_key) {
+        crate::observe::off(format!(
+            "type7_color_attach_shape slot={slot} nfields={field_count} \
+             tags=[{shape}] unconsumed={}",
+            dropped.len()
+        ));
+    }
+    for (tag, field_len, value) in dropped {
+        let keyed_value = if value <= COLOR_ATTACH_DROP_VALUE_CAP {
+            u64::from(value)
+        } else {
+            u64::from(COLOR_ATTACH_DROP_VALUE_CAP) + 1
+        };
+        let disc = (u64::from(tag) << 40) | (u64::from(field_len) << 32) | keyed_value;
+        if !crate::observe::first_sight("color_attachment_field_dropped", disc) {
+            continue;
+        }
+        crate::observe::Emit::decline("type7_color_attach", &ColorAttachDropped { tag })
+            .field("slot", slot)
+            .field("len", field_len)
+            .field("value", value)
+            .fail();
+    }
+}
+
 fn parse_one_color_entry(
     bytes: &[u8],
     len: usize,
     entry: usize,
     slot: u32,
 ) -> PipelineColorAttachment {
+    note_color_entry_fields(bytes, len, entry, slot);
     let mut out = PipelineColorAttachment {
         slot,
         src_rgb: BLEND_FACTOR_ONE,
@@ -2591,6 +2714,76 @@ mod tests {
         assert_eq!(c.slot, 0);
         let all = parse_color_attachments(&buf, buf.len(), off);
         assert_eq!(all.len(), 1);
+    }
+
+    /// A colour-attachment field this decoder does not read is guest intent
+    /// dropped, and the shape line beside it is what makes a boot with *no*
+    /// drops readable as a measurement rather than as silence.
+    #[test]
+    fn an_unconsumed_colour_attachment_field_reports_its_tag_and_value() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        // A tag no other test in this process uses, so `first_sight` cannot
+        // have latched it already.
+        const UNKNOWN_TAG: u8 = 0x7f;
+        const UNKNOWN_VALUE: u32 = 13;
+        let off = 16usize;
+        let mut buf = vec![0u8; off + 8 + 1 + 2 * 6];
+        st32(&mut buf[off..], 1);
+        st32(&mut buf[off + 4..], 8);
+        let entry = off + 8;
+        buf[entry] = 2;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+        buf[entry + 7] = UNKNOWN_TAG;
+        buf[entry + 8] = 4;
+        st32(&mut buf[entry + 9..], UNKNOWN_VALUE);
+
+        let cap = crate::observe::FailCapture::start();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        let lines = cap.lines();
+        // The consumed field still decodes; the census does not disturb it.
+        assert_eq!(
+            all.first().map(|c| c.pixel_format),
+            Some(u32::from(MTL_FORMAT_BGRA8_UNORM))
+        );
+
+        let shape: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("type7_color_attach_shape"))
+            .collect();
+        assert_eq!(
+            shape.len(),
+            1,
+            "one shape line per distinct entry: {lines:?}"
+        );
+        assert!(
+            shape[0].contains("tags=[01:4,7f:4*]") && shape[0].contains("unconsumed=1"),
+            "the shape line names every tag and stars the unread ones: {}",
+            shape[0]
+        );
+
+        let drop: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("reason=color_attachment_field_dropped"))
+            .collect();
+        assert_eq!(drop.len(), 1, "one decline per dropped field: {lines:?}");
+        assert!(
+            drop[0].contains("tag=0x7f") && drop[0].contains("value=13"),
+            "the decline carries the tag and the value, which is what \
+             identifies the field: {}",
+            drop[0]
+        );
+
+        // Latched: a second identical entry reports neither line again.
+        let cap2 = crate::observe::FailCapture::start();
+        let _ = parse_color_attachments(&buf, buf.len(), off);
+        assert!(
+            cap2.lines().is_empty(),
+            "the census is deduped per shape and per (tag, len, value): {:?}",
+            cap2.lines()
+        );
     }
 
     #[test]
