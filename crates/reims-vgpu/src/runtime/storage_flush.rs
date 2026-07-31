@@ -523,6 +523,56 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     false
 }
 
+/// Land every armed GVA render-Store window, because the guest is about to be
+/// told the work is finished.
+///
+/// This is the deferral rail's contract with the guest, and it is the one thing
+/// [`deferred_pages_still_ours`] cannot substitute for. A completion stamp is
+/// this device's only statement that a render is done; from the instant it lands
+/// the guest may free the target, and its own allocator may hand those pages to
+/// anything at all without touching a page table — so no later walk, page-set
+/// comparison or content test can tell the memory apart from the target it used
+/// to be. The only sound moment to write a render's bytes into guest RAM is
+/// before the fence that claims they are already there.
+///
+/// Apple's device needs no equivalent because it has no equivalent window: the
+/// render target *is* the guest allocation, so completion and "the bytes are in
+/// guest memory" are the same event. This is that invariant restated for a rail
+/// that has to copy.
+///
+/// What the deferral still buys is everything inside one fence: a chain of
+/// passes rendering into the same target reuses the registry resident, and
+/// `supersede_gva_window` still drops a window the same submission re-renders.
+/// What it stops buying is survival across the fence, which was never the
+/// device's to sell.
+///
+/// `REIMS_VGPU_FENCE_FLUSH_OFF=1` restores the old unbounded behaviour so an
+/// arm and its control can be measured on one binary.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    if state.gva_deferred_flush.is_empty() || crate::observe::fence_flush_disabled() {
+        return;
+    }
+    // Oldest-first, so windows land in the order they were rendered: a later
+    // Store at an address the guest recycled within one submission must not be
+    // overwritten by the earlier one.
+    while let Some((gva, entry)) = state.take_oldest_gva_deferred_window() {
+        crate::runtime::drain::note_store_route("gvaw_fence_flush");
+        let _ = flush_gva_one(state, host, gva, &entry, true, "fence");
+    }
+}
+
+/// Metal-direct builds never arm GVA windows — nothing to land at the fence.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
 /// Score a deferred window about to write guest RAM against the guest's fence.
 ///
 /// [`crate::runtime::drain::write_stamp`] is the only thing this device says to
@@ -2776,6 +2826,39 @@ mod tests {
     /// claims. Logging drift while still writing is exactly what this used to
     /// do, and the guest heap corruption that allowed — WindowServer aborting in
     /// `small_free_list_remove_ptr_no_clear` — is why it decides now.
+    /// A completion stamp is the guest's licence to free everything it allocated
+    /// for the work being completed, so the stamp must leave nothing owed to
+    /// guest RAM. Asserted through [`crate::runtime::drain::write_stamp`] itself
+    /// rather than against the helper, because the claim that matters is the
+    /// wiring: a helper nothing calls at the fence is the bug this fixes.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_completion_stamp_leaves_no_window_still_owing_guest_ram() {
+        use crate::runtime::host::FakeHost;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let stamp_pfn = 9u32;
+        host.map_range(u64::from(stamp_pfn) << PAGE_SHIFT_X86, page as usize, 0);
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.gfx.fifo_base_page = stamp_pfn;
+
+        state.arm_gva_deferred_window(0x1000, gva_entry(1, 4, 4, &[]));
+        state.arm_gva_deferred_window(0x2000, gva_entry(1, 4, 4, &[]));
+        assert_eq!(state.gva_deferred_flush.len(), 2, "two windows armed");
+
+        crate::runtime::drain::write_stamp(&mut state, &mut host, 1, 0x55);
+
+        assert!(
+            state.gva_deferred_flush.is_empty(),
+            "the guest may free every one of these targets the instant it reads \
+             the stamp, so none of them may still be waiting to be written"
+        );
+        assert_eq!(
+            state.completion_stamp_seq, 1,
+            "the fence the windows are measured against must have moved"
+        );
+    }
+
     /// The guest's fence is the only thing that separates a deferred write from
     /// a write into somebody else's allocation, and the page-set guard cannot
     /// see it: free-then-reuse inside one process leaves the translation

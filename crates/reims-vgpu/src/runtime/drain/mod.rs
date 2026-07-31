@@ -314,6 +314,13 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     if state.gfx.fifo_base_page == 0 {
         return;
     }
+    // Before the guest is told anything finished, everything this device still
+    // owes guest RAM has to be in guest RAM. After this write the guest may free
+    // the render targets and its allocator may hand those pages to anything, and
+    // no later check can tell that memory apart from the target it used to be —
+    // which is why the page-set guard passed on 810 of 810 landings and the heap
+    // corruption continued. See `storage_flush::flush_gva_windows_before_fence`.
+    crate::runtime::storage_flush::flush_gva_windows_before_fence(state, host);
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };

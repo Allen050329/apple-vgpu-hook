@@ -740,6 +740,21 @@ pub fn store_defer_disabled(rail: StoreDeferRail) -> bool {
     store_defer_spec_arms(spec.as_deref(), rail)
 }
 
+/// Bisection knob (`REIMS_VGPU_FENCE_FLUSH_OFF=1`): let deferred GVA windows
+/// outlive the completion stamp again, the way they did before
+/// `storage_flush::flush_gva_windows_before_fence`.
+///
+/// A control for this cannot be recorded on an earlier binary: `vm/boot-x86.sh`
+/// rebuilds QEMU every boot, and a whole session on this branch went to reading
+/// a baseline taken three commits back as if it were the arm's control. The
+/// knob is what makes the arm and its control one binary apart.
+pub fn fence_flush_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_FENCE_FLUSH_OFF").is_some_and(|v| v == "1")
+    })
+}
+
 /// The parse, split out so it is testable without an environment. Same
 /// unrecognised-token rule as [`content_reuse_spec_arms`]: a typo arms nothing.
 fn store_defer_spec_arms(spec: Option<&str>, rail: StoreDeferRail) -> bool {
