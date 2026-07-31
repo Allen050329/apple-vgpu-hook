@@ -3385,6 +3385,43 @@ fn note_gva_backing_verdict(
 /// Buckets are texel counts at the powers that separate the shapes this device
 /// deals in: a 64x64 icon is 4096, a 256x256 thumbnail 65536, a 1920x1080
 /// composite 2073600.
+///
+/// # What it measured, and what it rules out
+///
+/// One driven boot, x86 / Vulkan, six Finder recomposites:
+///
+///     type11_seed_elided      41389      t11elide_le_64x64          5
+///     type11_seed_uploaded      242      t11elide_le_256x256        4
+///                                        t11elide_le_512x512      903
+///                                        t11elide_le_1024x1024  15641
+///                                        t11elide_display       24836
+///     t11elide_texels   59 377 325 642   mean 1 434 616 texels/elision
+///
+/// Two things follow, and they point in opposite directions.
+///
+/// **An unconditional revalidation is not affordable.** At RGBA8 the elided
+/// extent is ~237 GB of guest reads per session. The rail is not a micro-
+/// optimisation to be traded away for correctness; it is carrying essentially
+/// all of the composite seed traffic, and `type11_seed_uploaded` at 242 against
+/// 41 389 says what the un-elided rate would be.
+///
+/// **The latch is not on the icon target.** Nine elisions in the entire session
+/// covered 256x256 or less, and five covered 64x64 or less — so a 64x64 icon
+/// attachment is essentially never the surface being elided. The rail that holds
+/// the broken cell is the *display-sized composite*: its resident carries a bad
+/// region, every later damage draw loads from it and preserves everything it did
+/// not cover, and the region stays. That is consistent with every observation in
+/// this class, including the small guest damage scissors that made the icon look
+/// like a partial draw.
+///
+/// So the repair cannot be "revalidate before trusting", and it cannot be
+/// "drop the elision". What is missing is a witness for guest CPU writes that
+/// does not cost a read of the surface, and the hypervisor already has one:
+/// dirty-page tracking over the mapping's guest pages, which is exactly the
+/// mechanism emulated display devices use to notice a guest painting its own
+/// framebuffer. Plumbing that through `HostOps` as "were any of these pages
+/// dirtied since epoch N" makes the existing witness sound at O(pages/8) instead
+/// of O(bytes), and leaves the 237 GB saved.
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
