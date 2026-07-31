@@ -1736,7 +1736,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
         let (src_stage, src_access) =
-            seed_target_source_scope(target_snapshotted, target_old_layout)?;
+            target_write_source_scope(target_snapshotted, target_old_layout)?;
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1814,7 +1814,7 @@ pub(crate) unsafe fn execute_draw_inner(
             );
         }
         let (dst_stage, dst_access) =
-            seed_target_source_scope(target_snapshotted, target_old_layout)?;
+            target_write_source_scope(target_snapshotted, target_old_layout)?;
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(dst_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1909,15 +1909,32 @@ pub(crate) unsafe fn execute_draw_inner(
             &[],
             &barrier,
         );
-    } else if target_snapshotted {
+    } else if target_snapshotted || target_old_layout != vk::ImageLayout::UNDEFINED {
         // The Clear render pass discards prior content via initialLayout
-        // UNDEFINED, but its write must still wait for the snapshot read.
+        // UNDEFINED, so nothing here preserves pixels — but its colour writes
+        // still have to wait for whoever last read them, and on this path the
+        // render pass supplies no such wait. The colour-only pass declares no
+        // external subpass dependency, and Vulkan's implicit one carries
+        // `srcStageMask = TOP_OF_PIPE` with `srcAccessMask = 0`, which orders
+        // against nothing at all.
+        //
+        // `target_snapshotted` is this draw's own snapshot read and names the
+        // newer access. Otherwise the registry's tracked layout names the
+        // previous draw's: `SHADER_READ_ONLY_OPTIMAL` when it sampled this
+        // resident, `TRANSFER_SRC_OPTIMAL` when it read it back or presented
+        // it. Both are reads that a clear would otherwise be free to overtake.
+        //
+        // A pooled or freshly created target tracks `UNDEFINED` — nothing has
+        // touched it, so it is excluded rather than barriered, which keeps this
+        // off the pooled path entirely.
+        let (src_stage, src_access) =
+            target_write_source_scope(target_snapshotted, target_old_layout)?;
         let barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::TRANSFER,
+            src_stage,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::DependencyFlags::empty(),
             &barrier,
@@ -2404,32 +2421,34 @@ fn color_range() -> vk::ImageSubresourceRange {
     }
 }
 
-/// First synchronization scope for the barrier that puts a draw's own colour
-/// target into `TRANSFER_DST_OPTIMAL` so a full-target seed can be copied over
-/// it.
+/// First synchronization scope for a write to *this draw's own colour target*
+/// that the render pass does not order for us — the seed copies that stage
+/// pixels into it through `TRANSFER_DST_OPTIMAL`, and the clear-path colour
+/// writes that begin the pass.
 ///
-/// The seed covers every texel of the attachment, so the *contents* are
-/// discardable and the barrier keeps `oldLayout = UNDEFINED` — there is no
-/// reason to pay a driver decompress preserving pixels the very next command
-/// overwrites. What is not discardable is the ordering: the copy must not
-/// overtake whatever last touched this image.
+/// None of those writes preserves content. A seed covers every texel, and a
+/// CLEAR pass discards through `initialLayout = UNDEFINED`; both keep the
+/// discard, because paying a driver decompress to preserve pixels the very next
+/// command overwrites buys nothing. What is not discardable is the *ordering*:
+/// the write must not overtake whatever last read this image.
 ///
 /// A resident target carries its tracked layout across draws. The primary
 /// attachment resolves to `TRANSFER_SRC_OPTIMAL` at the end of every render
 /// pass, and a draw that sampled it leaves it `SHADER_READ_ONLY_OPTIMAL` — both
-/// are *reads*, and a `TRANSFER_WRITE` that starts before they finish is a
+/// are *reads*, and a write that starts before they finish is a
 /// write-after-read hazard on the exact pixels the reader is consuming.
 ///
-/// Naming `TOP_OF_PIPE`/no access here, as this did, makes the barrier a bare
+/// Naming `TOP_OF_PIPE`/no access, as these sites did, makes the barrier a bare
 /// layout transition with no execution dependency at all. Nothing else supplies
-/// one: a seeded draw never joins an open batch (`joins` requires
-/// `LoadFromTarget` and no seed), so it opens its own command buffer, and the
-/// flush of the previous batch only *submits* it. Queue submission order starts
-/// command buffers in order; it does not finish them in order. So the seed of
-/// frame N+1 could land in an icon that frame N's window pass was still
-/// sampling — one composite reading a half-replaced texture, which is a defect
-/// no population counter can see and that grows more likely exactly as queue
-/// occupancy rises under load.
+/// one. The colour-only render pass declares no external subpass dependency, and
+/// Vulkan's implicit one is itself `TOP_OF_PIPE`/`0`. A seeded draw never joins
+/// an open batch (`joins` requires `LoadFromTarget` and no seed), so it opens
+/// its own command buffer, and the flush of the previous batch only *submits*
+/// it. Queue submission order starts command buffers in order; it does not
+/// finish them in order. So frame N+1's write could land in an icon that frame
+/// N's window pass was still sampling — one composite reading a half-replaced
+/// texture, which is a defect no population counter can see and that grows more
+/// likely exactly as queue occupancy rises under load.
 ///
 /// `snapshotted` is this draw's own snapshot copy of the target, taken after
 /// the tracked layout was read, so it names the newer access and wins.
@@ -2454,7 +2473,7 @@ fn color_range() -> vk::ImageSubresourceRange {
 /// pixels survive to the next one. No fence stands between one draw's use of it
 /// and the next, which is exactly what makes it useful — and exactly why this
 /// barrier, alone among the four, has to state what it is waiting for.
-fn seed_target_source_scope(
+fn target_write_source_scope(
     snapshotted: bool,
     tracked: vk::ImageLayout,
 ) -> Result<(vk::PipelineStageFlags, vk::AccessFlags), DrawError> {
@@ -2563,7 +2582,7 @@ mod tests {
     #[test]
     fn seeding_a_sampled_target_waits_for_the_sampler() {
         let (stage, access) =
-            seed_target_source_scope(false, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            target_write_source_scope(false, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .expect("tracked layout is supported");
         assert!(
             stage.contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
@@ -2579,7 +2598,7 @@ mod tests {
     #[test]
     fn seeding_a_drawn_target_waits_for_the_transfer_read() {
         let (stage, access) =
-            seed_target_source_scope(false, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            target_write_source_scope(false, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                 .expect("tracked layout is supported");
         assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
         assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
@@ -2590,7 +2609,7 @@ mod tests {
     /// is the one case the old unconditional `TOP_OF_PIPE` got right.
     #[test]
     fn seeding_an_untouched_target_waits_for_nothing() {
-        let (stage, access) = seed_target_source_scope(false, vk::ImageLayout::UNDEFINED)
+        let (stage, access) = target_write_source_scope(false, vk::ImageLayout::UNDEFINED)
             .expect("an untouched target is not a tracking bug");
         assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
         assert_eq!(access, vk::AccessFlags::empty());
@@ -2606,10 +2625,36 @@ mod tests {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         ] {
             let (stage, access) =
-                seed_target_source_scope(true, tracked).expect("snapshot needs no tracked layout");
+                target_write_source_scope(true, tracked).expect("snapshot needs no tracked layout");
             assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
             assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
         }
+    }
+
+    /// The clear path skips its barrier on `UNDEFINED` alone, which is only
+    /// sound if `UNDEFINED` is the only tracked layout with nothing to wait
+    /// for. That is the invariant the skip rests on, so assert it over every
+    /// layout the registry can hold rather than restating the call site's
+    /// condition — a tautology would pass no matter which way the skip went.
+    #[test]
+    fn undefined_is_the_only_tracked_layout_with_no_prior_access() {
+        for tracked in [
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ] {
+            let (stage, _) = target_write_source_scope(false, tracked)
+                .expect("every layout the registry tracks is supported");
+            assert_ne!(
+                stage,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                "{tracked:?} names a prior access, so skipping its barrier would drop a dependency"
+            );
+        }
+        let (stage, access) = target_write_source_scope(false, vk::ImageLayout::UNDEFINED)
+            .expect("an untouched target is not a tracking bug");
+        assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+        assert_eq!(access, vk::AccessFlags::empty());
     }
 
     /// A layout the tracker should never hold is a bug in the tracker. It must
@@ -2617,7 +2662,7 @@ mod tests {
     /// failure this whole helper exists to stop being silent.
     #[test]
     fn an_untracked_seed_target_layout_declines_by_name() {
-        let decline = match seed_target_source_scope(false, vk::ImageLayout::PRESENT_SRC_KHR) {
+        let decline = match target_write_source_scope(false, vk::ImageLayout::PRESENT_SRC_KHR) {
             Err(DrawError::DrawExecution(decline)) => decline,
             Err(other) => panic!("expected typed draw execution decline, got {other}"),
             Ok(_) => panic!("expected unsupported tracked layout"),
