@@ -727,7 +727,7 @@ pub fn store_gva_owned(
         // the only moment a baseline may be latched: the bytes are in hand.
         entry.guest_write_gen_at_store = 0;
         charge_gva_cache_bytes(state, reclaimed, charged);
-        enforce_gva_cache_cap(state);
+        enforce_gva_cache_cap(state, gva);
         return;
     }
     // Any other change retires the token, including a `None` that says the walk
@@ -744,7 +744,7 @@ pub fn store_gva_owned(
         state.retired_guest_write_tokens.push(stale);
     }
     charge_gva_cache_bytes(state, reclaimed, charged);
-    enforce_gva_cache_cap(state);
+    enforce_gva_cache_cap(state, gva);
 }
 
 /// Move [`DeviceState::gva_cache_bytes`] by one entry's replacement.
@@ -778,10 +778,16 @@ fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: us
 ///   Goal 3 loss class. That is a correctness exclusion, not a heuristic — the
 ///   obligation is recorded, not guessed.
 ///
-/// An entry larger than the whole cap is admitted alone rather than rejected,
-/// matching the sibling memo: refusing to cache a surface because it is big is
-/// how a 4K wallpaper stops being cached at all.
-pub fn enforce_gva_cache_cap(state: &mut DeviceState) {
+/// `protect` is the address the store that triggered this just wrote, and it is
+/// never evicted. Without it a single entry bigger than the low-water mark is
+/// dropped by its own store — the map holds one entry, that entry is over, and
+/// it is the only eviction candidate — so the surface is never cached at all.
+/// That is reachable rather than theoretical: `MAX_SCANOUT_DIM` is 8192, so an
+/// entry may be up to 256 MiB against a 112 MiB low-water mark. An oversized
+/// entry therefore rides alone and over the cap, matching the sibling memo,
+/// because refusing to cache a surface for being big is how a 4K wallpaper
+/// stops being cached at all.
+pub fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
     if crate::observe::gva_cache_cap_disabled() {
         return;
     }
@@ -799,7 +805,7 @@ pub fn enforce_gva_cache_cap(state: &mut DeviceState) {
     let mut by_touch: Vec<(u64, u64)> = state
         .host_gva_surfaces
         .iter()
-        .filter(|(gva, _)| !state.gva_deferred_flush.contains_key(gva))
+        .filter(|(gva, _)| **gva != protect && !state.gva_deferred_flush.contains_key(gva))
         .map(|(&gva, e)| (e.last_touch, gva))
         .collect();
     by_touch.sort_unstable();
@@ -3129,6 +3135,41 @@ mod cap_tests {
             state.gva_eviction_witness.wanted.load(Relaxed),
             0,
             "uncounted, and `forgotten` is the flag that keeps that honest"
+        );
+    }
+
+    /// A store must not be undone by its own cap enforcement.
+    ///
+    /// Enforcement runs *after* the insert, so a single entry over the
+    /// low-water mark is the only candidate in an otherwise empty map and
+    /// evicts itself — the surface is then never cached at all, which is the
+    /// "refused for being big" behaviour the cap explicitly must not have.
+    ///
+    /// Reachable in production, not only at test sizes: `MAX_SCANOUT_DIM` is
+    /// 8192, so one entry may be 256 MiB against a 112 MiB low-water mark.
+    #[test]
+    fn an_entry_bigger_than_the_cap_is_admitted_alone_not_evicted_by_its_own_store() {
+        let (w, h) = (64u32, 64u32);
+        let big = (w * h * 4) as usize;
+        let mut state = state_capped(big / 4);
+        let gva = 0x8_0000u64;
+        store_gva_owned(&mut state, gva, w, h, vec![0x77; big], 0, None);
+
+        let served = get_gva(&state, gva, w, h)
+            .expect("an oversized entry rides alone rather than being refused");
+        assert!(served.iter().all(|&b| b == 0x77));
+        assert_eq!(state.gva_cache_bytes, big, "and the total still describes it");
+        assert_eq!(
+            state.gva_eviction_witness.evicted, 0,
+            "nothing was evicted: there was nothing else to evict"
+        );
+
+        // It also does not pin the map forever — a later store at another
+        // address makes it an ordinary candidate and the coldest thing present.
+        store_frame(&mut state, 0x8_1000, 0x11);
+        assert!(
+            get_gva(&state, gva, w, h).is_none(),
+            "once it is not the store's own key it is an ordinary eviction candidate"
         );
     }
 
