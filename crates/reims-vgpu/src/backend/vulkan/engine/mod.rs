@@ -655,11 +655,18 @@ struct ReadbackOps {
 ///
 /// Async ring advance (retires only the one slot it reuses), NOT a whole-ring
 /// quiesce: this reads content that is already ready, not an UNDEFINED-layout
-/// seed, so the `ALL_COMMANDS → TRANSFER` barrier plus single-queue submission
-/// order fully order the copy after every prior-submitted draw. `begin_entry_sync`
-/// would block this guest-drain readback behind an unrelated in-flight heavy
-/// draw — the `finish_us` tail. We wait only our own `fence` after submit, and
-/// the slot stays pending for the ring to retire later.
+/// seed, so the `ALL_COMMANDS → TRANSFER` barrier below orders the copy after
+/// every prior-submitted draw. `begin_entry_sync` would block this guest-drain
+/// readback behind an unrelated in-flight heavy draw — the `finish_us` tail. We
+/// wait only our own `fence` after submit, and the slot stays pending for the
+/// ring to retire later.
+///
+/// That sentence used to credit "single-queue submission order" alongside the
+/// barrier, and it was wrong twice over: submission order is not a memory
+/// dependency, and the barrier it named was skipped on the one path where the
+/// image already sat in TRANSFER_SRC_OPTIMAL — which is every readback that
+/// follows a render pass, because that is the layout a pass resolves its
+/// primary to. The barrier is unconditional now.
 #[allow(clippy::too_many_arguments)]
 unsafe fn copy_image_level0_to_host(
     ctx: &context::DeviceContext,
@@ -685,30 +692,50 @@ unsafe fn copy_image_level0_to_host(
                 .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.begin_cb, e)))?;
-    if old_layout != ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-        let barrier = [ash::vk::ImageMemoryBarrier::default()
-            .src_access_mask(src_access)
-            .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
-            .old_layout(old_layout)
-            .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .image(image)
-            .subresource_range(ash::vk::ImageSubresourceRange {
-                aspect_mask: ash::vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            })];
-        ctx.device.cmd_pipeline_barrier(
-            cb,
-            ash::vk::PipelineStageFlags::ALL_COMMANDS,
-            ash::vk::PipelineStageFlags::TRANSFER,
-            ash::vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barrier,
-        );
-    }
+    // Unconditional, and the layout match is exactly why. A barrier is two
+    // things — a layout transition and a dependency — and this rail needs the
+    // second one whether or not it needs the first. Every render pass resolves
+    // its primary attachment to TRANSFER_SRC_OPTIMAL, so the *common* case
+    // reaches here already in the layout the copy wants; gating the barrier on
+    // a transition being required therefore left the most-taken path of the
+    // rail that publishes composited pixels to the guest with no ordering
+    // against the draws that produced them.
+    //
+    // Nothing else supplies it. Queue submission order starts command buffers
+    // in order; it does not finish them in order, and it is not a memory
+    // dependency. A render pass's implicit final subpass dependency carries
+    // `dstStageMask = BOTTOM_OF_PIPE` and `dstAccessMask = 0`, which makes the
+    // colour writes *available* but visible to nothing — a later TRANSFER_READ
+    // still has to ask for them. Without that, the copy can read the resident
+    // before the draw's writes land and publish the pixels from before the
+    // draw: the guest-visible symptom is a composite that is missing what was
+    // just drawn into it and comes back on the next redraw.
+    //
+    // When `old_layout` already is TRANSFER_SRC_OPTIMAL the transition half is
+    // a no-op (`oldLayout == newLayout` is legal) and the barrier is doing only
+    // its other job, which is the job that was missing.
+    let barrier = [ash::vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(ash::vk::AccessFlags::TRANSFER_READ)
+        .old_layout(old_layout)
+        .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .image(image)
+        .subresource_range(ash::vk::ImageSubresourceRange {
+            aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        })];
+    ctx.device.cmd_pipeline_barrier(
+        cb,
+        ash::vk::PipelineStageFlags::ALL_COMMANDS,
+        ash::vk::PipelineStageFlags::TRANSFER,
+        ash::vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &barrier,
+    );
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(ash::vk::ImageSubresourceLayers {
             aspect_mask: ash::vk::ImageAspectFlags::COLOR,

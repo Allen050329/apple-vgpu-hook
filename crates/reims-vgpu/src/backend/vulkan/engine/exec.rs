@@ -2205,8 +2205,30 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     ctx.device.cmd_end_render_pass(cb);
 
-    // Color already TRANSFER_SRC_OPTIMAL from pass final layout.
     if let Some(ref rb) = readback {
+        // The pass resolved the colour attachment to TRANSFER_SRC_OPTIMAL, so
+        // this copy needs no transition — but it does need a dependency, and
+        // the render pass does not give it one. Vulkan's implicit final subpass
+        // dependency carries `dstStageMask = BOTTOM_OF_PIPE` and
+        // `dstAccessMask = 0`: it makes the colour writes available and visible
+        // to nothing. Recording the copy into the same command buffer is not a
+        // dependency either — commands in one buffer are free to overlap.
+        //
+        // Without this the readback can sample the attachment before the draw
+        // it was recorded after has finished writing it, and the bytes handed
+        // back are the ones from before the draw.
+        let flush_writes = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &flush_writes,
+            &[],
+            &[],
+        );
         let region = [vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
