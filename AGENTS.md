@@ -426,6 +426,29 @@ Sweep with the loop above; count boots with `ls -1 vm/disks/run/serial-*.log | w
 timestamp against a commit date (`git log -1 --format=%cd --date=format:'%Y%m%d-%H%M%S' <ref>`), since
 the log name is the run stamp and sorts lexically.
 
+###### Re-swept at 633 boots: still the same 12, and the post-guard arm is 39 of the ~156 it needs
+
+```text
+633 boots        12 panics (1.90 %)      newest panic 20260731-144329
+post-d455c3e     39 boots, 0 panics      expected 0.74      p(0 | rate unchanged) = 0.47
+```
+
+A coin that comes up heads is not evidence the coin is bent. **p = 0.47 means this run is exactly
+what an unfixed device looks like half the time**, and the arithmetic gives the target precisely:
+`log(0.05) / log(1 - 0.0190)` = **156 boots** before a zero clears the 5 % bar. The arm has 39. Quote
+the 39, not the zero.
+
+**A dedicated soak is the wrong way to get the remaining 117, and this section already said so two
+paragraphs up.** One was run anyway — `panic-rate.sh` for 40 boots on a pinned QEMU — and it was
+stopped at 10 in favour of driven boots on HEAD, because the driven boots accumulate *the same panic
+data* (every boot writes `vm/disks/run/serial-*.log`, and the census re-sweeps all of them) while
+also exercising the instruments the session was building. A soak buys one number; a driven boot buys
+that number and a measurement. The 10 boots it did produce are banked and counted above — stopping it
+lost nothing but its future boots.
+
+The pinned-binary trick is still right for anything that must not see a changing tree; it is the
+*dedication* that was wasteful, not the pinning.
+
 ### A panicked boot must not be scored, and "no rounds" does not say it was not
 
 `.agents/repros/icon-boot-ab.sh` retries a boot that panics *before ssh* (exit 126) and does not
