@@ -5019,6 +5019,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // does write these composites — thousands of times a session — and on
         // the epoch alone every one of those writes was invisible.
         //
+        // What boot B's per-round counters rule out, for whoever takes the
+        // remaining half: nothing in `store_routes` separates a corrupt round
+        // from a clean one. Rounds 6 and 8 (corrupt) against 7 and 9 (clean)
+        // ran at 931/854 against 921/839 guest-write refusals, 1338/1305
+        // against 1379/1236 elisions, and matching `draw_partial_clear`,
+        // `draw_partial_load_seeded` and `load_seed_ok` — the counters agree to
+        // within the round-to-round drift. The victim is one whole absent icon
+        // (`blobs=6 intact=6`, never shrunk), so whatever produces it is not
+        // visible in the seed, reuse, or partial-draw populations this census
+        // covers.
+        //
         // Why not the sibling rail's shape — `load_linear_guest_memoized`
         // re-reads the guest's native rows on every call and byte-compares
         // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
