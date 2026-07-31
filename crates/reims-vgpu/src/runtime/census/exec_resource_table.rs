@@ -35,6 +35,35 @@
 //! - `lic_stored` / `lic_unstored` / `stored_lic` / `stored_unlic` — the
 //!   correlation that decides whether `set_host_valid` means "this submission
 //!   writes this resource". See [`note_table`] for what the store side is.
+//!
+//! # What one boot measured
+//!
+//! x86 Ventura guest / Linux Vulkan host, one `--testing` boot driven through
+//! three `icon-composite` rounds under Safari load (all three CLEAN), summed
+//! over its 106 windows:
+//!
+//! ```text
+//! subs 19 219   descs 84 868   no_table 0        every submission carries a table
+//! unresolved 4 411 (5.2 %)     id0 0             the ids are the device's object space
+//! set_h 19 253   clr_h 15 423  clr_g 16  set_g 0
+//! stored_lic 19 135            stored_unlic 0    every store was licensed
+//! tail_nz_descs 0              tail_nz_bytes 0
+//! quads: 0x00000000, 0x00000001, 0x00000100, 0x00000101, 0x00010000
+//! ```
+//!
+//! Three readings, and they are the whole basis for consuming this table:
+//!
+//! 1. **`set_host_valid` marks exactly the resources a submission writes.** Not
+//!    one of 19 135 stores landed on an object the table had not licensed. That
+//!    was an inference from IOAccel resource-list usage before this boot; it is
+//!    now a measurement with zero counter-examples.
+//! 2. **The trailing 16 bytes are dead in this build.** Zero non-zero bytes
+//!    across 84 868 records, so their unrecovered purpose costs nothing to
+//!    ignore here — and a build that starts using them shows up as a non-zero
+//!    count rather than as silence.
+//! 3. **`clear_host_valid` arrives 15 423 times per boot.** That is the guest
+//!    saying "I CPU-wrote this resource", delivered once per write and never
+//!    resent, on a path that used to discard it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
