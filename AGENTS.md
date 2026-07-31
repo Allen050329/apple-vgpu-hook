@@ -237,6 +237,13 @@ not-patched. `shoot()` therefore synthesises `VERDICT=UNSCOREABLE` and the repor
 separately: **an unscoreable capture is neither clean nor patched**, and any of them voids the
 `none` on the line above it.
 
+The same three-way split applies inside the scorer. `PATCHED` needs a *blob* of at least
+`--min-blob`; scattered off-palette pixels over the floor with no blob are `NOISY`. Collapsing those
+into `PATCHED`, which the scorer did at first, scores noise as a finding — injecting mild Gaussian
+noise into an otherwise clean capture produced `bad_frac=0.048 blobs=0` and a `PATCHED` verdict.
+Collapsing them into `CLEAN` instead would score an untrustworthy capture as a pass. Neither is
+available: a wash and a rectangle are different claims about the device, so they get different words.
+
 Two counters in that census were themselves blind until `2327a79`. `*_stamp_outlived` compares a
 window's `armed_stamp_seq` against `DeviceState::completion_stamp_seq`, and only `write_stamp`
 advanced that counter — the root completion stamp, written inline by `drain_main_fifo`, did not. A
