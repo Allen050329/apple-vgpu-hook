@@ -1159,6 +1159,52 @@ than by anything the device did. That is also why it is weak evidence: an instru
 does not move between arms is measuring the page, and a workload that provoked the device would show
 boot-to-boot spread.
 
+#### Traced end to end in one boot: fabrication, drift, and a WebKit tile that never lands
+
+The chain from a fabricated address to a permanently lost tile had been assembled from separate
+sessions and separate surfaces. It is now on one surface, in one control boot (`/tmp/wikictl`,
+guard off), with every step carrying the same backing address `gva0=0xb9d9000`:
+
+```text
+t= 41150  type4 pages sid=62 n=640 gva_hits=640 id_hits=0   gpa0=0x2cd26c000   real walk, empty
+t=104620  type4 pages sid=62 n=640 gva_hits=0   id_hits=640 gpa0=0xb9d9000     FABRICATED (= gva)
+t=120824  mapping_page_drift mid=62 cached=0xb9d9000 live=0x2cd26c000          refused
+t=120824  deferred_flush_lost kind=render 1225x512 reason=mapping_page_drift   tile lost
+t=120931  type4 pages sid=62 n=640 gva_hits=640 id_hits=0   gpa0=0x2cd26c000   real walk, content
+```
+
+Read the third line against the first. **`live` at the drift is byte for byte the address the walk
+returned 80 s earlier**, and the walk returns it again 107 ms later. The surface never moved. What
+drifted was the device's own guess, and the log called it `translation_moved (the guest re-pointed
+this surface and no packet said so)` — a sentence about a guest bug that does not exist. Pre-guard
+sessions logged 7 of 9 drifts this way.
+
+So the mechanism is: a transient walk failure makes the device fabricate GPA = GVA and **cache it**;
+the render targets the fabricated pages; the drift guard later catches the mismatch and correctly
+refuses to write; and `flush_intersecting` has already **taken** the window out of
+`compute_deferred_flush`, so the obligation is gone and nothing re-arms it. The tile's pixels land
+nowhere. On a WebKit tile, painted once and never repainted, that is permanent and pinned to one
+scroll offset — the reported Goal 3 symptom exactly.
+
+The guard closes this path: the arm boot had 0 fabrications, 0 drifts and **0 lost flushes**, against
+the control's 10 fabrications, 2 drifts and 2 losses (one at 1225×512, one at 1877×24).
+
+**Two cautions, and the first one matters more than the trace.**
+
+The pixel scorer saw none of this, and the reason is timing, not invisibility: the loss is at
+t=120824, pass A's last capture is at t≈105500 and pass B's first at t≈128500, so the tile was lost
+**during the reload** and repainted before pass B looked. A scored window has to cover the loss, and
+nothing in the harness currently arranges that.
+
+And the fabrication at t=104620 landed a frame before pass A's last capture, which scored
+`same_frac=1.0000 diff_cells=0` — pixel-perfect. That is worth sitting with: **a fabricated write
+does not necessarily show on screen**, because the compositor can serve the frame from our own
+resident image while the guest's pages are the ones left wrong. It bounds what any screenshot-based
+Goal 3 scorer can ever prove, and it is a reason to weight the fail-log rails over the pixels.
+
+`identity_entry_corrected` is now a distinct decline reason from `translation_moved`, so the two are
+countable apart in any later census.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
