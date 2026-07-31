@@ -861,6 +861,33 @@ fn fence_flush_spec_arms(spec: Option<&str>, rail: FenceFlushRail) -> bool {
 ///
 /// The residual claim is narrow: four boots say the arm boots. They say nothing
 /// about the icon rate, which latches per boot and needs boots to score.
+///
+/// # The icon rate was then scored, and this knob does not move it
+///
+/// Six pairs, order alternating, one binary, identical 300 s pre-drive before
+/// either arm was scored (`.agents/repros/icon-boot-ab.sh`, 2026-07-31):
+///
+/// ```text
+/// arm  clean 4  corrupt 1  unmeasured 1 (guest kernel panic)
+/// ctl  clean 4  corrupt 2  unmeasured 0
+/// ```
+///
+/// One corrupt of five measured against two of six is no difference (Fisher
+/// exact, two-tailed, p ≈ 1.0), and the class **still fires with the generation
+/// on**. So this is not an underpowered look at a real effect: the arm
+/// reproduces the bug.
+///
+/// The mechanism counter agrees, which is what makes this more than a null
+/// verdict. If aliasing drove the latch, corrupt boots should carry more of it.
+/// `gvares_aliased` was 1306, 1127 and 1599 on the three corrupt boots against a
+/// clean range of 993–1718 — means 1344 corrupt against 1414 clean, no
+/// separation, and not even on the high side.
+///
+/// Two allocations sharing one GPU image at a recycled GVA is therefore not what
+/// latches Finder icon corruption per boot. Keying on the page hash is still the
+/// right contract and stays on by default; it is simply not this bug. Both arms
+/// carried the GVA rail's fence binding and neither carried the mapping-keyed
+/// rail's, so the untested candidates are there rather than here.
 pub fn gva_identity_gen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
