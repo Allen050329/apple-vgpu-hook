@@ -33,6 +33,7 @@ fn store_into(
     height: u32,
     bgra: std::sync::Arc<Vec<u8>>,
     generation: u64,
+    map_generation: u32,
 ) {
     if id == 0 || width == 0 || height == 0 || width > MAX_SCANOUT_DIM || height > MAX_SCANOUT_DIM {
         return;
@@ -48,6 +49,7 @@ fn store_into(
     entry.width = width;
     entry.height = height;
     entry.bgra = bgra;
+    entry.map_generation_at_store = map_generation;
 }
 
 fn get_from(
@@ -94,6 +96,7 @@ pub fn store_shared(
     bgra: std::sync::Arc<Vec<u8>>,
 ) {
     let generation = state.next_sampled_content_generation();
+    let map_generation = live_map_generation(state, surface_id);
     store_into(
         &mut state.host_surfaces,
         surface_id,
@@ -101,11 +104,77 @@ pub fn store_shared(
         height,
         bgra,
         generation,
+        map_generation,
     );
+}
+
+/// The mapping incarnation `surface_id` is on right now, or 0 when this crate
+/// holds no mapping under that id.
+///
+/// Zero is "no incarnation to speak of", not "incarnation zero": entries stored
+/// and read while no mapping exists compare 0 against 0 and stay usable, which
+/// keeps the texture_ref and GVA namespaces — and every unit test that stores
+/// into a bare cache — behaving exactly as before.
+fn live_map_generation(state: &DeviceState, surface_id: u32) -> u32 {
+    state
+        .mappings
+        .get(&surface_id)
+        .map_or(0, |m| m.map_generation)
+}
+
+/// Whether a cached surface_id frame was produced from the incarnation the
+/// mapping is on now. Pure question, no counter and no knob.
+///
+/// Kept separate from [`surface_entry_may_serve`] because they are different
+/// questions and an earlier draft here answered them with one function — which
+/// its own test caught, by asserting a re-pointed entry was not current and
+/// getting `true` back, because the knob was off. "These bytes are from the
+/// incarnation in front of us" and "the device is willing to serve them anyway"
+/// must not share a return value.
+fn surface_entry_is_current(state: &DeviceState, surface_id: u32) -> bool {
+    let Some(entry) = state.host_surfaces.get(&surface_id) else {
+        return true;
+    };
+    entry.map_generation_at_store == live_map_generation(state, surface_id)
+}
+
+/// Whether a surface_id lookup may hand back what it found, counting the answer
+/// so a boot carries the rate either way.
+///
+/// Behaviour is deliberately unchanged at this commit. "How often does this
+/// cache serve a frame across a re-point?" has never been measured, and refusing
+/// on a guess is the wrong way round: a withheld Load seed renders the pass onto
+/// a cleared target, which is a compositing layer going solid black, and this
+/// project has already paid a boot for that failure direction (`13ae46d`, 0 of
+/// 14 rounds). So this counts first and `REIMS_VGPU_SURFACE_CACHE_GEN_STRICT=1`
+/// is what acts on it, which keeps an arm and its control one binary apart.
+fn surface_entry_may_serve(state: &DeviceState, surface_id: u32) -> bool {
+    if !state.host_surfaces.contains_key(&surface_id) {
+        return true;
+    }
+    if surface_entry_is_current(state, surface_id) {
+        crate::runtime::drain::note_store_route("surfcache_gen_same");
+        return true;
+    }
+    crate::runtime::drain::note_store_route("surfcache_gen_stale");
+    if let Some(entry) = state.host_surfaces.get(&surface_id) {
+        crate::observe::off(format!(
+            "surface_cache_stale_incarnation mid={surface_id} stored_gen={} live_gen={} {}x{} \
+             (the cached frame was read out of a page list this mapping has since replaced)",
+            entry.map_generation_at_store,
+            live_map_generation(state, surface_id),
+            entry.width,
+            entry.height
+        ));
+    }
+    !crate::observe::surface_cache_gen_strict()
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
 pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
+    if !surface_entry_may_serve(state, surface_id) {
+        return None;
+    }
     get_from(&state.host_surfaces, surface_id, width, height)
 }
 
@@ -207,6 +276,9 @@ pub fn get_shared(
     width: u32,
     height: u32,
 ) -> Option<std::sync::Arc<Vec<u8>>> {
+    if !surface_entry_may_serve(state, surface_id) {
+        return None;
+    }
     let need = get_from(&state.host_surfaces, surface_id, width, height)?.len();
     let e = state.host_surfaces.get(&surface_id)?;
     Some(if e.bgra.len() == need {
@@ -232,6 +304,8 @@ pub fn store_texture(
         height,
         std::sync::Arc::new(bgra),
         generation,
+        // A texture ref is not a mapping id, so there is no incarnation to name.
+        0,
     );
 }
 
@@ -1904,5 +1978,112 @@ mod tests {
             0,
             "a device reset releases the GVA cache's tokens too"
         );
+    }
+}
+
+#[cfg(test)]
+mod incarnation_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+
+    /// The surface_id cache must be able to tell one incarnation of a mapping
+    /// from the next, because nothing else in the invalidation path can.
+    ///
+    /// `invalidate_mapping_pages` is the device's whole response to discovering
+    /// that a page list no longer names its surface: it clears `page_entries`,
+    /// bumps `map_generation`, and retires the contiguous view and the
+    /// guest-write token. It does not touch this cache, and this cache is keyed
+    /// by mapping id alone — so the frame read out of the *old* page list stays
+    /// on offer to the present capture, the sampled path and the type-11 Load
+    /// seed, for as long as the geometry matches. After a re-point the geometry
+    /// usually does match: it is the same window at the same size on new
+    /// backing.
+    ///
+    /// That is the shape of the two symptoms this is being read for — a Finder
+    /// icon that renders correctly for a few frames and then corrupts, and a
+    /// Safari patch that is blank at one scroll position while the rest of the
+    /// page is fine. Both are "correct until something serves the previous
+    /// incarnation".
+    ///
+    /// Behaviour is unchanged at this commit and this test says so on purpose.
+    /// The rate is unmeasured, and the failure direction of refusing is worse
+    /// than the failure direction of serving: a withheld Load seed renders onto
+    /// a cleared target, which is a compositing layer going solid black. The
+    /// identity is captured and counted first; `REIMS_VGPU_SURFACE_CACHE_GEN_STRICT`
+    /// is what acts on it.
+    #[test]
+    fn a_cached_surface_frame_knows_which_incarnation_it_came_from() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mid = 7u32;
+        let (w, h) = (8u32, 4u32);
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![1];
+        }
+        let generation_at_store = state.mappings[&mid].map_generation;
+
+        store(&mut state, mid, w, h, vec![0xa5u8; (w * h * 4) as usize]);
+        assert_eq!(
+            state.host_surfaces[&mid].map_generation_at_store, generation_at_store,
+            "the entry records the incarnation its bytes were read out of"
+        );
+        assert!(
+            surface_entry_is_current(&state, mid),
+            "nothing has moved, so the frame is current"
+        );
+        assert!(get(&state, mid, w, h).is_some());
+
+        // The device discovers the guest re-pointed this surface and does what
+        // it does about it. The cache is not in that path.
+        assert!(state.invalidate_mapping_pages(mid));
+        assert_ne!(
+            state.mappings[&mid].map_generation, generation_at_store,
+            "invalidation bumps the incarnation"
+        );
+        assert_eq!(
+            state.host_surfaces[&mid].map_generation_at_store, generation_at_store,
+            "and leaves the cached frame behind, still keyed by mapping id alone"
+        );
+        assert!(
+            !surface_entry_is_current(&state, mid),
+            "so the frame on offer is the previous incarnation's, and this is \
+             the only thing that can say so"
+        );
+
+        // Unchanged by default: counted, not yet refused.
+        assert!(
+            get(&state, mid, w, h).is_some(),
+            "REIMS_VGPU_SURFACE_CACHE_GEN_STRICT is what turns the refusal on"
+        );
+    }
+
+    /// A namespace with no mapping behind it must not be collateral damage.
+    ///
+    /// `store_texture` keys on a texture object ref and `store_gva` on a guest
+    /// virtual address; neither is a mapping id, so neither has an incarnation
+    /// to compare. Both sides of that comparison are 0, which is why "no
+    /// mapping" had to mean a specific value rather than an `Option` the
+    /// readers would each have to interpret.
+    #[test]
+    fn a_cache_namespace_that_is_not_a_mapping_id_is_never_stale() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let (w, h) = (8u32, 4u32);
+        let texture_ref = 12u32;
+        store_texture(&mut state, texture_ref, w, h, vec![0x3cu8; (w * h * 4) as usize]);
+        assert_eq!(
+            state.host_texture_surfaces[&texture_ref].map_generation_at_store, 0,
+            "a texture ref names no mapping incarnation"
+        );
+        assert!(get_texture(&state, texture_ref, w, h).is_some());
+
+        // And a surface_id entry stored while this crate holds no mapping under
+        // that id — every bare-cache unit test in this crate — stays readable.
+        let orphan = 99u32;
+        store(&mut state, orphan, w, h, vec![0x11u8; (w * h * 4) as usize]);
+        assert!(!state.mappings.contains_key(&orphan));
+        assert!(surface_entry_is_current(&state, orphan));
+        assert!(get(&state, orphan, w, h).is_some());
     }
 }

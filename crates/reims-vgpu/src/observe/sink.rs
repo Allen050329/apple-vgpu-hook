@@ -792,6 +792,26 @@ pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
     fence_flush_spec_arms(spec.as_deref(), rail)
 }
 
+/// Bisection knob (`REIMS_VGPU_SURFACE_CACHE_GEN_STRICT=1`): refuse a
+/// `surface_cache` surface_id entry whose bytes were read out of a page list the
+/// mapping has since replaced.
+///
+/// Off by default, which is the unusual direction for a knob in this crate and
+/// is deliberate. The counters `surfcache_gen_same` / `surfcache_gen_stale` are
+/// emitted whichever way this is set, so the *rate* is measurable before the
+/// behaviour changes — and it has to be, because the failure direction here is
+/// asymmetric. A stale hit shows the previous incarnation's pixels; a refused
+/// hit means a Load seed renders onto a cleared target, which is a compositing
+/// layer going solid black. Turning this on before knowing the rate would trade
+/// a corruption this project can see for a blackout it has already paid a boot
+/// to discover once (`13ae46d`, 0 of 14 rounds).
+pub fn surface_cache_gen_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_SURFACE_CACHE_GEN_STRICT").is_some_and(|v| v == "1")
+    })
+}
+
 /// Bisection knob (`REIMS_VGPU_MAPPING_PAGE_GUARD_OFF=1`): let a deferred
 /// mapping-keyed flush write through a page list a fresh walk says has moved,
 /// the way it did before `mapper::type4_pages_still_ours`.
