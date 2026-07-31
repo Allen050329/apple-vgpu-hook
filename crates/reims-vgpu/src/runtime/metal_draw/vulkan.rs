@@ -4890,16 +4890,47 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `resolve_type11_load_seed` would upload. Load from it and skip the
         // upload.
         //
-        // The epoch is the witness, and it is closed by construction rather
-        // than by a list of writers: `mark_mapping_written` advances it, and
-        // every guest-page writer in this crate already calls that, so a blit,
-        // a compute writeback or a guest CPU write all invalidate the stamp
-        // without knowing this rail exists. The deferred type-11 publish — the
-        // one writer that changes the pixels without touching guest pages —
-        // advances it explicitly. Anything that leaves the answer unknown (no
-        // slot, an evicted or recycled image, a draw since the stamp, a
-        // `map_generation` rewire that renames the identity) reads back `None`
-        // and takes the seed.
+        // The epoch is the witness. `mark_mapping_written` advances it and every
+        // guest-page writer *in this crate* calls it, so a blit or a compute
+        // writeback invalidates the stamp without knowing this rail exists. The
+        // deferred type-11 publish — the one writer that changes the pixels
+        // without touching guest pages — advances it explicitly. Anything that
+        // leaves the answer unknown (no slot, an evicted or recycled image, a
+        // draw since the stamp, a `map_generation` rewire that renames the
+        // identity) reads back `None` and takes the seed.
+        //
+        // # The witness does not cover the guest, and that is the Goal-2 latch
+        //
+        // This comment used to claim the closure included "a guest CPU write".
+        // It does not, and cannot. A type-11 surface's pages are plain guest RAM;
+        // on the x86/KVM pathway the guest writes them with its own CPU and no
+        // device operation is involved, so nothing calls `mark_mapping_written`
+        // and the epoch does not move. Every caller of it is a device-side
+        // writer — `compute_exec`, `mapping_write`, `exec`, `storage_flush` —
+        // and there is no entry for the owner of the pages.
+        //
+        // So the elision can answer "current" for a resident that is stale, the
+        // pass then loads from it, the matching Store publishes it back over the
+        // guest's own bytes, and the epoch still has not moved — which arms the
+        // same wrong answer for the next frame. It is a fixpoint, and it is
+        // exactly the "renders correctly for a few frames then stays corrupted"
+        // report.
+        //
+        // Measured, three 14-round Finder recomposite boots at the same HEAD:
+        //
+        //   elision on              rounds 3,4,5,6 corrupt — held, none recovered
+        //   all reuse rails off     round 4 corrupt, rounds 5-14 clean
+        //   this rail off alone     round 1 corrupt, round 2 clean (recovered)
+        //
+        // Turning this one rail off is enough to restore recovery, and
+        // corruption still occurs without it — so it is not the cause of a bad
+        // frame, it is what makes a bad frame permanent.
+        //
+        // The sibling rail one function over already solves this the sound way:
+        // `load_linear_guest_memoized` re-reads the guest's native rows on every
+        // call and byte-compares before reusing its swizzled `Arc`, precisely
+        // because "a guest write is always observed" cannot be had any other
+        // way. Two rails, the same problem, opposite soundness.
         #[cfg(feature = "backend-vulkan")]
         if !chain_load_from_target {
             if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
