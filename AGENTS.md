@@ -752,6 +752,42 @@ with a short boot. The Goal 3 scorer likewise returned 24/24 CLEAN — the same 
 *before* the change, so it discriminates nothing here and the page needs the harder provocation
 already noted above.
 
+##### 20 ms was two points on one page; on Wikipedia it is 20 seconds, or never
+
+The heading above is kept because the observation under it is real, but **do not generalise it**. It
+rests on two refusals on the flat-colour page, and the `gva0` field added in `e1632f6` makes the
+question answerable properly — a refusal can now be matched to a later resolve by the **backing
+address** it names rather than by a surface id, which recycles across geometries within a boot and
+cannot identify a surface on its own.
+
+Re-asked that way on a control boot whose predrive browses Wikipedia, for each fabricating attach,
+the delay until the *same backing* next resolved with `id_hits=0`:
+
+```text
++247 ms   +1 054 ms   +20 161 ms   +20 320 ms   +20 895 ms   +60 624 ms   +96 087 ms
+and 4 of 11 never resolved at that backing at all
+```
+
+So "the answer was one frame away" is a property of that page, not of the class. Here the backing is
+untranslatable for tens of seconds, and more than a third of the time for the rest of the boot.
+
+Two consequences, and they pull in opposite directions, which is why both belong here.
+
+**It strengthens the guard.** A fabricated address cached for 20–96 s is 20–96 s of writes aimed at
+memory chosen by address rather than ownership, not one frame of it. The window the old path left
+open was far larger than the flat-page measurement suggested.
+
+**It weakens "refusing costs a frame".** It costs whatever that surface's content was worth for tens
+of seconds, or permanently. Re-asking per frame does not recover it, because the answer is not
+arriving next frame. If a Goal 3 patch turns out to be a surface whose backing never resolved, the
+identity guard does **not** fix it — the pixels go nowhere instead of going somewhere wrong, and the
+tile is blank either way. That is the single most important open question about the guard.
+
+Caveat on the method, and it only cuts one way. Matching by `gva0` across 60–96 s cannot distinguish
+"the same surface finally got mapped" from "the guest reused that virtual address for a new
+allocation", so the long delays are an upper bound on how much was recovered. The **4 that never
+resolve** carry no such ambiguity: those fabrications were never corrected.
+
 #### A refusal has three outcomes, and only one of them is a cost
 
 `.agents/repros/type4guess.py` scores a boot's refusals, and collapsing these would lose the claim:
