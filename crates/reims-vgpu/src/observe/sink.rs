@@ -506,13 +506,48 @@ pub fn sampled_cache_disabled() -> bool {
 /// every rail it takes. A census cannot separate "the witness was right" from
 /// "the witness was wrong" — only re-deriving the content can.
 ///
-/// One boot with this set answers whether the class is a stale-reuse bug at all.
-/// If corrupt rounds survive it, all three rails are exonerated together and the
-/// wrong pixels are wrong before any of them is consulted.
-///
 /// This re-uploads a frame per seed and re-swizzles every sampled bind. It is a
 /// diagnostic arm, never a product configuration, and a boot that sets it must
 /// not be read for frame rate.
+///
+/// # What it measured: the class is two defects, not one
+///
+/// Two 14-round Finder recomposite boots, x86 / Vulkan, same HEAD:
+///
+///     reuse ON   rounds 3,4,5,6 corrupt — held, no round recovered
+///     reuse OFF  round 4 corrupt (5 of 7 icons), rounds 5-14 all clean
+///
+/// Corruption **survives** the arm, so none of the three rails causes it: the
+/// wrong pixels are wrong before any witness is consulted, and re-deriving the
+/// content produces the wrong content again. That was the negative result this
+/// knob was built to be able to return.
+///
+/// What it did not predict is the second half. With the rails off the defect
+/// stopped *holding*. Every prior measurement of this class — six rounds of
+/// `icon-recovery.sh` sampled 14 times over 65 s, byte-identical at t=1 s and
+/// t=65 s — established a state that never recovers on its own; here it lasted
+/// one round and the next redraw was clean.
+///
+/// So the user-visible defect is a composition of two:
+///
+/// 1. an intermittent producer of a wrong composite, which this arm does not
+///    touch and which is the thing to find, and
+/// 2. a reuse rail that latches whatever it was handed and never re-derives it,
+///    which is what turns a one-frame glitch into a permanent one.
+///
+/// (2) is worth fixing on its own terms even though (1) is the root cause. A
+/// device whose witnesses can only ever say "unchanged" has no way back from a
+/// bad frame, and "renders correctly for a few frames then stays corrupted" is
+/// exactly what that looks like from the guest.
+///
+/// The family gate has now earned its split: the three rails were bundled to
+/// spend one boot on one bit, and that bit came back as "not the cause, but the
+/// latch". Which of the three latches is the next question, and it is now worth
+/// three boots.
+///
+/// n is small — one corrupt round against four — so the rate comparison is not
+/// the claim. The claim is the qualitative one: with the rails off a corrupt
+/// round was followed by a clean one, which no reuse-on boot has ever produced.
 pub fn content_reuse_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
