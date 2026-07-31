@@ -3045,7 +3045,7 @@ mod tests {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         state.page_shift = PAGE_SHIFT_X86;
-        // Identity-backed surface pages at pfn 0x40 (one 4K page enough for 16×16).
+        // Surface pages at pfn 0x40 (one 4K page is enough for 16×16).
         let page = 0x40u64 << PAGE_SHIFT_X86;
         host.map_range(page, 0x2000, 0);
         // Task directory so object-list GVA reads work.
@@ -3061,6 +3061,11 @@ mod tests {
         let _ = host.write_gpa(dir_gpa, &d);
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
+        // Map the backing GVA page onto the surface pages. The device refuses a
+        // backing it cannot translate rather than reusing the GVA as a GPA, so
+        // the task's page table has to carry this the way a guest's does.
+        st32(&mut d[..4], 0x40);
+        let _ = host.write_gpa(root_gpa + 0x40 * 4, &d[..4]);
         assert!(state.define_task(1, 0x1000, 2));
         assert!(state.set_object_list(1, 0, 8));
         // Type-4 at surface_id=5.
@@ -3213,6 +3218,9 @@ mod tests {
         let _ = host.write_gpa(dir_gpa, &d);
         st32(&mut d[..4], 4);
         let _ = host.write_gpa(root_gpa, &d[..4]);
+        // As above: the backing GVA has to translate, not be assumed identity.
+        st32(&mut d[..4], 0x50);
+        let _ = host.write_gpa(root_gpa + 0x50 * 4, &d[..4]);
         assert!(state.define_task(1, 0x1000, 2));
         assert!(state.set_object_list(1, 0, 8));
         let mut entry = [0u8; 12];

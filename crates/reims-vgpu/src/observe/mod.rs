@@ -61,7 +61,8 @@ pub use sink::{
     content_reuse_disabled, content_summary, fail, fence_flush_disabled, gva_identity_gen_disabled,
     line, mapping_page_guard_disabled, nonzero_stats, off, redirect_logs_for_tests,
     rgba_rgb_stats, sampled_cache_disabled, sampled_resident_gate_disabled, store_defer_disabled,
-    surface_cache_gen_strict, ContentReuseRail, FenceFlushRail, StoreDeferRail,
+    surface_cache_gen_strict, type4_identity_guard_disabled, ContentReuseRail, FenceFlushRail,
+    StoreDeferRail,
 };
 pub(crate) use sink::{draw_log_enabled, elapsed_ms};
 

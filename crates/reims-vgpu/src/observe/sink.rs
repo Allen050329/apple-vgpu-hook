@@ -828,6 +828,27 @@ pub fn mapping_page_guard_disabled() -> bool {
     })
 }
 
+/// Bisection knob (`REIMS_VGPU_TYPE4_IDENTITY_GUARD_OFF=1`): let a type-4
+/// surface whose page-table walk failed be backed by the guest *virtual*
+/// address used as a guest *physical* one, the way it was before the guard.
+///
+/// The old fallback accepted any candidate that `read_gpa` could touch, which
+/// asks "is this RAM" rather than "is this the surface's", so nearly every
+/// failed walk was admitted. It also decided the outcome of the task search in
+/// `resolve_type4_surface_ex`: task 0 is probed first, and a guess made
+/// `apply_type4_backing` return `true` there, so the owning task was never
+/// tried and the fabricated address was cached as the surface's backing.
+///
+/// `type4_identity_pages` is emitted whichever way this is set, so a boot with
+/// the guard on still reports how many pages the old path would have
+/// fabricated. An arm and its control are one binary apart.
+pub fn type4_identity_guard_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_TYPE4_IDENTITY_GUARD_OFF").is_some_and(|v| v == "1")
+    })
+}
+
 /// The parse, split out so it is testable without an environment. Same
 /// unrecognised-token rule as [`store_defer_spec_arms`]: a typo arms nothing.
 fn fence_flush_spec_arms(spec: Option<&str>, rail: FenceFlushRail) -> bool {
