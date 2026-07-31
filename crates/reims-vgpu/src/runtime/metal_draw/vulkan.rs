@@ -3367,6 +3367,38 @@ fn note_gva_backing_verdict(
 ///
 /// The census stays because the partition it prints is cheap and is the
 /// denominator any future claim about this rail needs. It is no longer a lead.
+/// How much surface a taken type-11 seed elision covered, in whole texels.
+///
+/// The elision's witness is unsound — it cannot see a guest CPU write to the
+/// surface's own pages — and the sound repair is the one the sibling linear rail
+/// already uses: re-read the guest's bytes and compare before trusting the
+/// resident. Whether that repair is affordable is entirely a question of how
+/// much memory the elisions actually cover, and the elision *count* cannot
+/// answer it: 8367 elisions a round is either 130 MB of re-reading or 130 KB
+/// depending on a distribution nobody has measured.
+///
+/// So this buckets by extent rather than counting again. A population dominated
+/// by icon-sized attachments can be revalidated for almost nothing; one
+/// dominated by display-sized composites cannot, and would need the repair to
+/// be scoped to the surfaces the guest can actually write.
+///
+/// Buckets are texel counts at the powers that separate the shapes this device
+/// deals in: a 64x64 icon is 4096, a 256x256 thumbnail 65536, a 1920x1080
+/// composite 2073600.
+fn note_type11_elision_extent(w: u32, h: u32) {
+    let texels = (w as u64).saturating_mul(h as u64);
+    crate::runtime::drain::note_store_route(match texels {
+        0..=4_096 => "t11elide_le_64x64",
+        4_097..=65_536 => "t11elide_le_256x256",
+        65_537..=262_144 => "t11elide_le_512x512",
+        262_145..=1_048_576 => "t11elide_le_1024x1024",
+        _ => "t11elide_display",
+    });
+    // The bytes, so the buckets can be priced without assuming a distribution
+    // inside each one. RGBA8 is the seed's own upload format.
+    crate::runtime::drain::note_store_route_n("t11elide_texels", texels);
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
@@ -4948,6 +4980,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("type11_seed_elided");
+                    note_type11_elision_extent(w, h);
                 } else {
                     crate::runtime::drain::note_store_route("type11_seed_uploaded");
                 }
