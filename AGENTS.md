@@ -146,6 +146,32 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+### A live A/B needs one binary per arm
+
+`vm/boot-x86.sh` rebuilds QEMU on every boot, so two boots of "the same" tree are two binaries
+unless the tree is committed and untouched between them. Comparing a boot against a result recorded
+in an earlier session compares the change to the rig's drift as well, and this project has spent
+whole sessions on the difference: five consecutive boots were read as a regression from the change
+under test, and a sixth — the same binary with only that change switched off — showed the same
+defect. It was three commits older, unbooted, and nobody had measured a control.
+
+Measure the control on the binary you are testing. Where a behaviour cannot be switched off at
+runtime, give it a gate first (`REIMS_VGPU_SAMPLED_RESIDENT_GATE_OFF`, `REIMS_VGPU_STORE_DEFER_OFF`,
+`REIMS_VGPU_CONTENT_REUSE_OFF` are all this pattern) — that boot is cheaper than the session lost to
+reading a stale baseline. To attribute a defect to a *commit*, build each arm from its own source
+(`git checkout <ref> -- crates/ vendor/qemu && git submodule update --init vendor/qemu`) and run the
+same harness on each.
+
+### Never delete the live fail log
+
+The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
+unlinks the name and every later line goes to an inode nothing can open, so the boot produces empty
+logs and no census — discovered after a 30-minute 14-round run. Move it instead, before the boot:
+
+```sh
+mv /tmp/reims-vgpu-fail.log /tmp/<arm>/fail-prev.log
+```
+
 ### Vulkan validation layers without root
 
 Sync validation (`SYNC-HAZARD-*`) names a read/write hazard at the command that causes
