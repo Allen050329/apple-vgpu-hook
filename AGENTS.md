@@ -435,10 +435,17 @@ wrong, both looked like results, and the ratio between them was wrong by two ord
 whether the guard was hot or rare.
 
 Sum the key across census lines (`route_sum` in the repro scripts). Use `grep -c` only for **event**
-lines — one line per occurrence, like `mapping_page_drift ` or `deferred_flush_lost` — and note that
-`mapping_page_drift` without the trailing space also matches `reason=mapping_page_drift` on the
-`deferred_flush_lost` line that follows it, so the unanchored count double-counts. Print which
+lines — one line per occurrence, like `mapping_page_drift` or `deferred_flush_lost`. Print which
 convention each number uses (`(sum)` / `(lines)`) so the next reader does not have to re-derive it.
+
+**Anchor event counts at the line start, not with a trailing space.** An earlier revision of this
+section said `mapping_page_drift` "without the trailing space" also matches `reason=mapping_page_drift`
+on the `deferred_flush_lost` line, and prescribed the trailing space as the fix. That remedy does not
+work, and it was still wrong when a scorer written *from this paragraph* used it: the lost line ends
+`… reason=mapping_page_drift t=27804`, so a trailing space matches it too. Every drift is followed by
+its own lost line, so the count comes back **exactly double** and looks entirely plausible. Measured
+on the pre-guard boot: `grep -c 'mapping_page_drift '` returns 18 where `grep -c '^mapping_page_drift '`
+returns 9. Use `^`.
 
 ### Measured: the fence bindings close the Finder icon class
 
