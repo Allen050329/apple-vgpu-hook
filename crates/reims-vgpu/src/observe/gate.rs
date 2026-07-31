@@ -47,6 +47,57 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// [`rust_files`] minus the files that are **entirely** test code.
+///
+/// [`production_source`] strips `mod tests { … }` *blocks*, which is the whole
+/// story for a file that mixes the two. It is no story at all for
+/// `runtime/*/tests.rs`, four of which exist here: each is declared
+/// `#[cfg(test)] mod tests;` by its parent, so nothing inside the file itself
+/// marks it, and every scan that called `production_source` on one was reading
+/// a test fixture as shipped code.
+///
+/// Found by the unbounded-raw-GVA-write gate, which flagged
+/// `runtime/compute_exec/tests.rs` as an unjustified writer on its first run.
+/// The test module is *declared* by the parent, so that is where this looks —
+/// a filename rule would be a guess, and would also miss a test-only module
+/// named anything else.
+fn production_files(root: &Path) -> Vec<PathBuf> {
+    rust_files(root)
+        .into_iter()
+        .filter(|p| !declared_cfg_test(p))
+        .collect()
+}
+
+/// Whether this file's own module declaration in its parent is `#[cfg(test)]`.
+fn declared_cfg_test(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    // `dir/name.rs` is declared by `dir/mod.rs`; `dir/mod.rs` is declared by the
+    // grandparent as `mod dir;`, which is not a case this needs.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(src) = std::fs::read_to_string(parent.join("mod.rs")) else {
+        return false;
+    };
+    let decl = format!("mod {stem};");
+    let mut cfg_test_pending = false;
+    for line in src.lines() {
+        let t = line.trim();
+        if t == decl {
+            return cfg_test_pending;
+        }
+        // Attributes stack, and anything else between resets the run.
+        if t.starts_with("#[") {
+            cfg_test_pending |= t == "#[cfg(test)]";
+        } else if !t.is_empty() && !t.starts_with("//") {
+            cfg_test_pending = false;
+        }
+    }
+    false
+}
+
 /// Repo-relative path with forward slashes, for stable messages.
 fn rel(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
@@ -618,7 +669,7 @@ fn production_source(src: &str) -> String {
 fn declared_slugs() -> Vec<(String, String)> {
     let root = crate_src();
     let mut out = Vec::new();
-    for path in rust_files(&root) {
+    for path in production_files(&root) {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -996,6 +1047,58 @@ fn the_scanner_walks_the_whole_crate() {
     }
 }
 
+/// The production filter must actually drop the test-only files, and must not
+/// drop anything else.
+///
+/// Both directions matter and they fail in opposite ways. If
+/// [`declared_cfg_test`] silently returned `false` — a renamed `mod.rs`, an
+/// attribute written differently — the filter would be vacuous and every gate
+/// would go back to reading `runtime/*/tests.rs` as shipped code, which is the
+/// bug it was added for. If it returned `true` too readily it would hide real
+/// production files from every scan above, which is the direction that reads as
+/// a pass.
+#[test]
+fn the_production_filter_drops_test_only_files_and_nothing_else() {
+    let root = crate_src();
+    let all: Vec<String> = rust_files(&root).iter().map(|p| rel(p, &root)).collect();
+    let production: Vec<String> = production_files(&root)
+        .iter()
+        .map(|p| rel(p, &root))
+        .collect();
+
+    // Eight files in this crate are entirely test code, declared `#[cfg(test)]
+    // mod x;` by their parent. Every one was being read as shipped source by
+    // the three scans above — including this file, which is itself
+    // `#[cfg(test)] mod gate;` and whose tables name the very symbols those
+    // scans forbid.
+    let mut dropped: Vec<&String> = all.iter().filter(|p| !production.contains(p)).collect();
+    dropped.sort();
+    assert_eq!(
+        dropped,
+        [
+            "backend/vulkan/caps/gate.rs",
+            "backend/vulkan/translate/coverage.rs",
+            "backend/vulkan/translate/gate.rs",
+            "observe/gate.rs",
+            "runtime/compute_exec/tests.rs",
+            "runtime/drain/tests.rs",
+            "runtime/icb/tests.rs",
+            "runtime/metal_draw/tests.rs",
+        ]
+        .iter()
+        .collect::<Vec<_>>(),
+        "the set of test-only files changed; a new one must be dropped from the \
+         production scans and a removed one must not be listed here"
+    );
+    // And the production files those live beside are still scanned.
+    for expect in ["runtime/drain/mod.rs", "runtime/mipmap.rs", "observe/mod.rs"] {
+        assert!(
+            production.iter().any(|p| p == expect),
+            "the filter dropped production file {expect}"
+        );
+    }
+}
+
 /// A row exempting a type must name a file that exists and say why. An exemption
 /// pointing at a moved or deleted file excuses nothing and hides the next one.
 #[test]
@@ -1010,6 +1113,109 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
         assert!(
             src.contains(enum_name),
             "{file} no longer defines {enum_name}; drop the exemption"
+        );
+    }
+}
+
+/// Product raw-GVA writes that are deliberately **not** bounded to an armed
+/// page set, each with the authorisation that makes it sound.
+///
+/// `write_task_gva_product_within(.., allowed)` restricts a write to the guest
+/// pages a deferred window was armed on. The bare `write_task_gva_product` has
+/// no such bound, so every use of it needs a different reason to be writing
+/// where it is — and the reason is always the same shape here: the write is
+/// **synchronous with the command that named the address**, so the guest cannot
+/// have freed it in between. A deferred rail cannot say that, which is exactly
+/// why it carries an armed set.
+///
+/// The count is part of the row so this debt cannot grow silently: a new
+/// unbounded write in one of these files fails the test even though the file is
+/// already listed.
+const UNBOUNDED_RAW_GVA_WRITES: &[(&str, usize, &str)] = &[
+    (
+        "runtime/drain/mod.rs",
+        3,
+        "GetComputeInfo and the texture-requirement query write their reply into \
+         the `reply_gva` the request packet itself carries, while that packet is \
+         being executed. There is no interval in which the guest could have \
+         handed the address to something else",
+    ),
+    (
+        "runtime/mipmap.rs",
+        1,
+        "mipmap generation writes rows into the destination texture's own GVA \
+         during the command that asked for them; the texture is live for the \
+         duration of its own command",
+    ),
+    (
+        "runtime/blit_exec.rs",
+        1,
+        "the type-2 staging blit writes destination rows at the GVA the blit \
+         command names, synchronously inside that blit. Every other write on \
+         this rail IS bounded (`_within(.., allowed)`), which is what makes this \
+         one worth naming rather than assuming",
+    ),
+];
+
+/// A raw-GVA write with no armed page set has to be a deliberate, named choice.
+///
+/// This is the write-after-free class's blast radius, so the question "which
+/// writes can reach guest RAM without a page set bounding them?" must have an
+/// answer that survives review. It has been re-derived by hand in at least
+/// three sessions — each time reaching the same two or three sites, each time
+/// from scratch, and one handoff ends with "don't re-chase these", which is not
+/// a mechanism. This is the mechanism.
+///
+/// Bounded writes go through `write_task_gva_product_within` with an `allowed`
+/// set and are not counted here; the bare call is. Adding one fails this test
+/// until it is listed with a reason, and removing one fails it too, so the
+/// table cannot drift out of date in either direction.
+#[test]
+fn every_unbounded_raw_gva_write_is_named_and_justified() {
+    let root = crate_src();
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        // Test modules are stripped: a fixture writing through the product
+        // helper is exercising it, not shipping an unbounded write.
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        let rel_path = rel(&path, &root);
+        for line in text.lines() {
+            // The open paren immediately after the name is what separates the
+            // unbounded call from `write_task_gva_product_within(`, which is a
+            // strict prefix of it and would otherwise be counted as unbounded —
+            // scoring the bounded rail as the hazard.
+            if !line.contains("write_task_gva_product(") {
+                continue;
+            }
+            // Its own definition and the one-line forwarder that supplies
+            // `None` are the implementation, not a caller.
+            if rel_path == "runtime/gva_mem.rs" {
+                continue;
+            }
+            *found.entry(rel_path.clone()).or_default() += 1;
+        }
+    }
+
+    let expected: std::collections::BTreeMap<String, usize> = UNBOUNDED_RAW_GVA_WRITES
+        .iter()
+        .map(|(file, n, _)| ((*file).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "unbounded raw-GVA writes changed. Every one of these can write guest \
+         RAM with no armed page set bounding it, so a new entry needs a stated \
+         authorisation in UNBOUNDED_RAW_GVA_WRITES (and a removed one needs the \
+         row dropped). Bounded writes use write_task_gva_product_within(.., \
+         allowed) and are not counted."
+    );
+    for (file, _, why) in UNBOUNDED_RAW_GVA_WRITES {
+        assert!(!why.is_empty(), "{file}: an unbounded write must say why");
+        assert!(
+            root.join(file).exists(),
+            "{file} no longer exists; drop the row"
         );
     }
 }
@@ -1040,7 +1246,7 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
 fn the_page_drift_witness_is_only_consulted_through_the_policy() {
     let root = crate_src();
     let mut callers = Vec::new();
-    for path in rust_files(&root) {
+    for path in production_files(&root) {
         let src = std::fs::read_to_string(&path).expect("read Rust source");
         let production = production_source(&src);
         let masked = mask_comments_and_literals(&production);
