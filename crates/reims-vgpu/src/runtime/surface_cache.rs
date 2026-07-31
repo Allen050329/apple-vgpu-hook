@@ -680,12 +680,35 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
 /// corrupt rounds                255  346 1445 1571 1639 1674 1752 1757
 /// ```
 ///
-/// Six of eight corrupt rounds sit above every clean round, and round 13 (662,
-/// clean) sits between two neighbours at ~1700 that both corrupted, so it is
-/// not merely round-order drift. Read it as a load proxy and not as a cause:
-/// this counter rises with how hard the guest is rewriting textures *in place*,
-/// and that traffic is what some other address-keyed reader is still
-/// mishandling.
+/// Normalised per 1000 draws (`draw_scissor_full`, since every other draw-path
+/// counter in this census is strictly proportional to round length and none of
+/// them separates anything), it is **bimodal with an empty gap**:
+///
+/// ```text
+/// low  mode  3.1  23.5  32.7  49.6  57.5  68.8   all six CLEAN rounds
+///           28.4  30.4                          + two corrupt rounds (2, 7)
+/// high mode 126.7 134.3 142.1 142.5 145.0 147.3  six CORRUPT rounds, no clean
+/// ```
+///
+/// Nothing lands between 68.8 and 126.7, and no clean round reaches the high
+/// mode. Read it as a load proxy and not as a cause — the rail is fully refused
+/// now, so what this counts is how hard the guest is recycling and rewriting
+/// texture memory *in place*. Above roughly 120 per 1000 draws the round
+/// corrupts every time.
+///
+/// That is the condition under which naming a resource by its address stops
+/// working, and this crate still does exactly that in one place:
+/// `TargetIdentity::Gva` carries `generation: 0` at every construction site, so
+/// the engine's resident registry keys a GVA render target on
+/// `(gva, width, height)` alone and two allocations that reuse one address share
+/// one image. The `Surface` rail does not have this problem because
+/// `surface_identity` keys on `map_generation`. Giving the GVA rail the same
+/// treatment is the open work, and this counter is how to score it.
+///
+/// The two corrupt rounds in the low mode are the reminder that this class has
+/// been two defects since it was first split (see
+/// [`crate::observe::sink::content_reuse_disabled`]): a high-recycling round
+/// corrupts reliably, and something else corrupts occasionally regardless.
 pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &H,
