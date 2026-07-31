@@ -146,6 +146,45 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
 
+### Vulkan validation layers without root
+
+Sync validation (`SYNC-HAZARD-*`) names a read/write hazard at the command that causes
+it. Five such hazards were found and fixed by hand on this rail before anyone tried it;
+every one would have been a single log line. The device creates its instance with no
+layers, so the loader's environment is the whole mechanism — and the layer package does
+not have to be installed system-wide, which is what previously blocked this behind a
+`sudo` password:
+
+```sh
+mkdir -p /tmp/vklayers && cd /tmp/vklayers
+curl -sO https://geo.mirror.pkgbuild.com/extra/os/x86_64/vulkan-validation-layers-<ver>-x86_64.pkg.tar.zst
+tar --use-compress-program=unzstd -xf vulkan-validation-layers-*.pkg.tar.zst
+```
+
+The layer manifest names its library relatively, so the extracted `usr/lib` has to be on
+the loader's search path:
+
+```sh
+export VK_LAYER_PATH=/tmp/vklayers/usr/share/vulkan/explicit_layer.d
+export LD_LIBRARY_PATH=/tmp/vklayers/usr/lib
+export VK_LOADER_LAYERS_ENABLE='*validation*'
+export VK_LAYER_SETTINGS_PATH=/tmp/vklayers/vk_layer_settings.txt
+```
+
+`vk_layer_settings.txt` is where sync validation is turned on and where the output goes
+somewhere a repro can slice:
+
+```text
+khronos_validation.validate_sync = true
+khronos_validation.report_flags = error,warn
+khronos_validation.log_filename = /tmp/reims-vgpu-vkvalidation.log
+khronos_validation.duplicate_message_limit = 3
+```
+
+Confirm the layer actually loaded before believing a clean run — `vulkaninfo --summary`
+must list `VK_LAYER_KHRONOS_validation` under `Instance Layers`. A boot with sync
+validation on is not a frame-rate or timing measurement.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
