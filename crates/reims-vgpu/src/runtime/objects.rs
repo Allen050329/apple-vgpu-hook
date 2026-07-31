@@ -706,6 +706,42 @@ pub fn resolve_type11_ref<M: HostMemory>(
     Some(mapping_id)
 }
 
+/// The detail line a refused page walk reports.
+///
+/// # Why the walk status is on it
+///
+/// [`crate::contract::gva_resolve::ResolveStatus`] distinguishes fifteen checks
+/// in the guest page-table walk and has done since it was written; this site
+/// collapsed all of them into the single word `translate`. Two refusals with
+/// opposite remedies were therefore indistinguishable in the log: a leaf PTE the
+/// guest has not filled in yet (`zero-pfn` — the surface is mid-map, and the
+/// next frame resolves it) and a task root this device could not read at all
+/// (`no-directory`, `root(...)` — the walk is aimed at the wrong table and
+/// waiting will never help).
+///
+/// The distinction had to be reconstructed by hand for a whole A/B's worth of
+/// refusals, by matching each against later attaches of the same surface id and
+/// inferring which it had been. `walk=` states it outright.
+///
+/// Pure and separate from the emit so the composition is testable: the always-on
+/// sink has no in-memory capture, so a test can only reach this line by building
+/// it.
+fn type4_translate_fail_detail(
+    surface_id: u32,
+    task_id: u32,
+    page: u64,
+    page_count: u64,
+    gva: u64,
+    identity_ram: bool,
+    walk: &str,
+) -> String {
+    format!(
+        "type4_backing_fail reason=translate sid={surface_id} task={task_id} \
+         page={page}/{page_count} gva={gva:#x} identity_ram={identity_ram} walk=[{walk}] \
+         (no translation in this task; not substituting the GVA)"
+    )
+}
+
 /// Apply a decoded type-4 surface as page-table backing for `surface_id`.
 ///
 /// `backing_pfn` is a GPU-VA page (same source as type-2/3 textures). Translate
@@ -822,11 +858,14 @@ fn apply_type4_backing<M: HostMemory>(
             note_type4_fail(
                 surface_id,
                 "translate",
-                format!(
-                    "type4_backing_fail reason=translate sid={surface_id} task={task_id} \
-                     page={i}/{page_count} gva={gva:#x} identity_ram={} \
-                     (no translation in this task; not substituting the GVA)",
-                    id_hits > 0
+                type4_translate_fail_detail(
+                    surface_id,
+                    task_id,
+                    i,
+                    page_count,
+                    gva,
+                    id_hits > 0,
+                    &gva_mem::diagnose_task_slot(host, task, task_id, gva, page_shift),
                 ),
             );
             return false;
@@ -901,8 +940,15 @@ fn apply_type4_backing<M: HostMemory>(
         // "first attach" re-fires per recycle (page_entries cleared by the
         // teardown), so on fail() it floods the curated real-error view (~4k
         // lines under a continuously-animating app, burying genuine failures).
+        // `gva0` is what the refusal line above prints as `gva=`, so a refusal
+        // and a later resolve can be matched by the *backing* they name. Matching
+        // them by `sid` alone is unsound: surface ids recycle within a boot and
+        // across geometries — sid 145 was a 15x622 scrollbar at t=332488 and a
+        // 1225x512 tile 2.8 s later — so "the same surface resolved a frame
+        // later" can be a different surface wearing the same id.
+        let gva0 = (surf.backing_pfn as u64) << page_shift;
         crate::observe::off(format!(
-            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} id_hits={id_hits} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
+            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} id_hits={id_hits} gva0={gva0:#x} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
             surf.width,
             surf.height,
             surf.bytes_per_row,
@@ -1704,6 +1750,57 @@ mod tests {
                 .unwrap()
                 .contains(&(sid, "task_inactive")),
             "clear_type4_fail must re-arm so a later failure logs again"
+        );
+    }
+
+    /// A refused walk must say **which** of the walk's checks refused.
+    ///
+    /// The walk distinguishes fifteen refusals and this rail reported one word,
+    /// `translate`, for all of them — so "the guest has not filled in this leaf
+    /// PTE yet" and "this device could not read the task root at all" produced
+    /// identical log lines while wanting opposite responses. Both halves are
+    /// locked here: the walk names its failing check, and the detail line
+    /// carries that name verbatim.
+    ///
+    /// The fixture maps GVA page 0 and nothing else, so the *same* task walks
+    /// clean for one address and refuses for the next. Asserting the clean case
+    /// too is what keeps this from passing vacuously: a fixture in which every
+    /// walk fails would satisfy the refusal assertions on its own.
+    #[test]
+    fn a_refused_type4_walk_names_the_check_that_refused() {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_task_with_list(&mut host, &mut state);
+        let task = state.tasks.get(1).expect("fixture defines task 1");
+
+        // Control: the address the fixture does map walks all the way down.
+        let mapped = gva_mem::diagnose_task_slot(&host, task, 1, 0, PAGE_SHIFT_ARM64E);
+        assert!(
+            mapped.contains("st=ok"),
+            "fixture must be able to translate, got {mapped:?}"
+        );
+
+        // The case the rig produces: a backing whose leaf entry the guest has
+        // not written. Page 1 shares the fixture's root and has no PTE.
+        let gva = 1u64 << PAGE_SHIFT_ARM64E;
+        let walk = gva_mem::diagnose_task_slot(&host, task, 1, gva, PAGE_SHIFT_ARM64E);
+        assert!(
+            walk.contains("st=zero-pfn"),
+            "an unwritten leaf must be reported as zero-pfn, got {walk:?}"
+        );
+        assert!(
+            walk.contains("lvl=") && walk.contains("idx="),
+            "the refusal must name where in the walk it stopped, got {walk:?}"
+        );
+
+        let line = type4_translate_fail_detail(202, 1, 0, 640, gva, true, &walk);
+        assert!(line.contains("reason=translate"), "{line}");
+        assert!(line.contains("sid=202"), "{line}");
+        assert!(line.contains("page=0/640"), "{line}");
+        assert!(line.contains("identity_ram=true"), "{line}");
+        assert!(
+            line.contains(&format!("walk=[{walk}]")),
+            "the refusal must carry the walk diagnosis verbatim, got {line}"
         );
     }
 
