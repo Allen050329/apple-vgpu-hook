@@ -3341,9 +3341,11 @@ fn note_gva_backing_verdict(
 /// corrupt, x86 / Vulkan: `draw_scissor_full` 888 227, `draw_scissor_partial`
 /// 449 708 — and among the partial identities
 ///
-///     target=64x64 scissor=9x29+0+0
-///     target=64x64 scissor=7x9+0+0
-///     target=64x64 scissor=6x8+0+0
+/// ```text
+/// target=64x64 scissor=9x29+0+0
+/// target=64x64 scissor=7x9+0+0
+/// target=64x64 scissor=6x8+0+0
+/// ```
 ///
 /// A draw covering 48 texels of a 4096-texel icon target, anchored at its
 /// top-left corner. That is the broken cell as seen on screen: a small block of
@@ -3391,12 +3393,14 @@ fn note_gva_backing_verdict(
 ///
 /// The same six rounds, scored per round, clean (1-2) against corrupt (3-6):
 ///
-///     lin_rung_guest_blank            0      0      0      0      0      0
-///     lin_rung_blank_with_host_entry  0      0      0      0      0      0
-///     lin_rung_guest_memo         39759  49930  42208  41145  45888  43339
-///     gvac_suspect                   31     55     47     53     57     45
-///     type11_seed_elided           8367   9851   8727   8345   8842   9010
-///     draw_partial_load_from_target 21473 27115  23017  22441  25099  23447
+/// ```text
+/// lin_rung_guest_blank            0      0      0      0      0      0
+/// lin_rung_blank_with_host_entry  0      0      0      0      0      0
+/// lin_rung_guest_memo         39759  49930  42208  41145  45888  43339
+/// gvac_suspect                   31     55     47     53     57     45
+/// type11_seed_elided           8367   9851   8727   8345   8842   9010
+/// draw_partial_load_from_target 21473 27115  23017  22441  25099  23447
+/// ```
 ///
 /// Every counter is proportional to round length; not one separates a corrupt
 /// round from a clean one. `lin_rung_guest_blank` is zero throughout, so on this
@@ -3435,12 +3439,14 @@ fn note_gva_backing_verdict(
 ///
 /// One driven boot, x86 / Vulkan, six Finder recomposites:
 ///
-///     type11_seed_elided      41389      t11elide_le_64x64          5
-///     type11_seed_uploaded      242      t11elide_le_256x256        4
-///                                        t11elide_le_512x512      903
-///                                        t11elide_le_1024x1024  15641
-///                                        t11elide_display       24836
-///     t11elide_texels   59 377 325 642   mean 1 434 616 texels/elision
+/// ```text
+/// type11_seed_elided      41389      t11elide_le_64x64          5
+/// type11_seed_uploaded      242      t11elide_le_256x256        4
+///                                    t11elide_le_512x512      903
+///                                    t11elide_le_1024x1024  15641
+///                                    t11elide_display       24836
+/// t11elide_texels   59 377 325 642   mean 1 434 616 texels/elision
+/// ```
 ///
 /// Two things follow, and they point in opposite directions.
 ///

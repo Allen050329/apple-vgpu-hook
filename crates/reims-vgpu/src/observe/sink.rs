@@ -550,8 +550,10 @@ impl ContentReuseRail {
 ///
 /// Two 14-round Finder recomposite boots, x86 / Vulkan, same HEAD:
 ///
-///     reuse ON   rounds 3,4,5,6 corrupt — held, no round recovered
-///     reuse OFF  round 4 corrupt (5 of 7 icons), rounds 5-14 all clean
+/// ```text
+/// reuse ON   rounds 3,4,5,6 corrupt — held, no round recovered
+/// reuse OFF  round 4 corrupt (5 of 7 icons), rounds 5-14 all clean
+/// ```
 ///
 /// Corruption **survives** the arm, so none of the three rails causes it: the
 /// wrong pixels are wrong before any witness is consulted, and re-deriving the
