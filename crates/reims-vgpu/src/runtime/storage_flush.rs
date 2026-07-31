@@ -917,35 +917,48 @@ fn render_window_identity(
     }
 }
 
-/// Which mapping bytes this window must leave alone: the pages the *guest* wrote
-/// after the Store that armed it.
+/// Report what a landing window is about to overwrite, and preserve none of it.
 ///
 /// A deferred window promises to replay a synchronous Store later, and that is
 /// only a replay while nothing else writes the pages in between. The writeback
 /// covers the whole attachment extent, so a guest CPU store into any page of it
 /// — an inter-buffer damage forward-copy, a CoreGraphics blit into the same
-/// IOSurface — used to be gone the moment this window landed. Nothing else in
-/// the flush can see that: `map_generation` covers a rebind,
-/// `resident_content_epoch` covers a later device draw, and neither is a witness
-/// for the surface's own owner.
+/// IOSurface — is gone the moment this window lands. Nothing else in the flush
+/// can see that: `map_generation` covers a rebind, `resident_content_epoch`
+/// covers a later device draw, and neither is a witness for the surface's own
+/// owner. One 14-round composite boot measured `render_flush_over_guest_write`
+/// at 68 of every 99 `surface_flush`es.
 ///
-/// It is not a rare race. One 14-round composite boot measured
-/// `render_flush_over_guest_write` at 68 of every 99 `surface_flush`es: two
-/// landings in three replaced guest bytes the guest had just written, ~18 300
-/// times in one session, silently.
+/// This rail did preserve those pages, and it must not, because the witness it
+/// would preserve them on cannot answer the question it is being asked.
 ///
-/// Neither whole answer is right. Writing the frame anyway loses the guest's
-/// stores; dropping the window loses the device's whole frame to save the pages
-/// the guest happens to have touched. `HostOps::guest_written_pages` is what
-/// makes the third answer expressible, and this turns its page list into the
-/// byte ranges [`crate::runtime::mapping_write::write_bgra8_skipping`] takes.
+/// `page_gen[p]` is stamped with the generation at the *harvest* that saw page
+/// `p` dirty, not at the write. `reims_vgpu_dirty_harvest` returns early when
+/// nothing has read a generation since the last one, and does not clear the
+/// bitmap when it does, so a guest store can sit unharvested across a Store and
+/// be attributed to the generation of a harvest that ran after it. Every such
+/// page is then "written since the Store" when the device's own render
+/// superseded it, and preserving it withholds the frame from guest memory.
 ///
-/// `None` means the host could not answer — no dirty bitmap, an unarmed token, a
-/// Store that never stamped, a page set too large to enumerate — and the caller
-/// must fall back to the whole-frame write. The verdict is asked first so that
-/// case can still be *reported*: a host that cannot tell which pages moved can
-/// often still tell that some did, and a loss nobody can prevent is still a loss
-/// nobody may hide.
+/// Bisected on the live rail, x86 / Vulkan, four `icon-composite` rounds each,
+/// one binary per arm:
+///
+/// ```text
+/// 22a3346  preserve absent   3 of 4 rounds clean, desktop paints
+/// 8178caa  preserve absent   2 of 4 rounds clean, desktop paints
+/// 13ae46d  preserve present  0 of 14 rounds, screen black, 19 Hz
+/// ```
+///
+/// So the answer this rail reaches for is the right one and the evidence it
+/// would reach for it on is not sound yet. Making it sound is an ordering
+/// problem in the shim — the harvest has to be forced at the Store, and the
+/// bitmap cleared there, so "since" names a real instant — and until it is, a
+/// full-extent landing that reports what it replaced is strictly better than a
+/// partial one that silently withholds the device's frame.
+///
+/// [`crate::runtime::mapping_write::write_bgra8_skipping`] and
+/// `HostOps::guest_written_pages` stay: the sampled ladder's merge uses both,
+/// and it errs the other way — it keeps both halves rather than choosing.
 #[cfg(feature = "backend-vulkan")]
 fn render_flush_guest_written_ranges<M: HostOps>(
     state: &DeviceState,
@@ -956,53 +969,14 @@ fn render_flush_guest_written_ranges<M: HostOps>(
     if mapping_guest_write_verdict(state, host, key.mapping_id) != GuestWriteVerdict::Wrote {
         return Vec::new();
     }
-    let stamped = state
-        .mappings
-        .get(&key.mapping_id)
-        .map(|m| (m.guest_write_token, m.guest_write_gen_at_store));
-    let pages = stamped
-        .and_then(|(token, since)| host.guest_written_pages(token, since))
-        .map(|pages| {
-            crate::runtime::mapper::mapping_offsets_of_pages(state, key.mapping_id, &pages)
-        });
-    match pages {
-        Some(ranges) if !ranges.is_empty() => {
-            crate::runtime::drain::note_store_route("render_flush_preserved_guest_write");
-            ranges
-        }
-        // The set-level witness says the guest wrote and the per-page one names
-        // no page of this surface. Both are true: the token covers the whole
-        // mapping and the write can have landed outside the attachment extent.
-        // Nothing to preserve, and nothing lost.
-        Some(_) => {
-            crate::runtime::drain::note_store_route("render_flush_guest_write_outside");
-            Vec::new()
-        }
-        None => {
-            crate::runtime::drain::note_store_route("render_flush_over_guest_write");
-            crate::observe::fail(format!(
-                "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
-                 (the guest wrote these pages after the Store this window defers, and the \
-                 host cannot say which; the full-extent writeback replaces them)",
-                key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
-            ));
-            Vec::new()
-        }
-    }
-}
-
-/// Whether a landed deferred window may hand the currency stamp back to the
-/// resident its frame came out of.
-///
-/// Only when the write succeeded *and* preserved nothing. A failed write leaves
-/// the pages holding neither frame; a write that preserved guest ranges leaves
-/// them holding the guest's bytes where the resident holds the device's, and
-/// stamping then says that image is the mapping's content to both rails that
-/// would bind a resident in place of a surface — the attachment LOAD elision and
-/// the sampled ladder's resident rung. Each would bind one half.
-#[cfg(feature = "backend-vulkan")]
-fn flush_publishes_the_resident(write_ok: bool, preserved: &[(u64, u64)]) -> bool {
-    write_ok && preserved.is_empty()
+    crate::runtime::drain::note_store_route("render_flush_over_guest_write");
+    crate::observe::fail(format!(
+        "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
+         (the guest wrote pages of this surface after the Store this window defers; \
+         the full-extent writeback replaces them)",
+        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+    ));
+    Vec::new()
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -1144,15 +1118,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // The stamp is refused for a slot that is absent or not content_ready, and a
     // failed write leaves `flushed_from_resident` unused, so both fall back to a
     // seed rather than to a wrong frame.
-    //
-    // And never after a write that preserved guest ranges. The whole argument
-    // above is "the pixels did not change, they are the resident's" — which is
-    // true of a full write and false of this one: the pages the guest owns now
-    // hold the guest's bytes and the resident holds what the device rendered
-    // there instead. Handing the stamp back would say that image IS the
-    // mapping's content, to the LOAD elision and to the sampled ladder's
-    // resident rung, and both would then bind one half of a surface.
-    if flush_publishes_the_resident(ok, &preserve) {
+    if ok {
         if let Some(identity) = flushed_from_resident {
             if let Some(epoch) = state
                 .mappings
@@ -1460,40 +1426,6 @@ pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
 mod tests {
     use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT_X86};
 
-    /// A landed window hands the currency stamp back to the resident its frame
-    /// came out of, on the reasoning that the pages changed but the pixels did
-    /// not — they *are* the resident's, copied out of it one statement earlier.
-    ///
-    /// That reasoning is exactly false for a write that preserved guest ranges.
-    /// There the pages hold the guest's bytes where the resident holds the
-    /// device's, so the two are different pictures and the stamp would tell both
-    /// rails that bind residents in place of surfaces — the attachment LOAD
-    /// elision and the sampled ladder's resident rung — that this image is the
-    /// whole of it.
-    ///
-    /// The first attempt at this disqualified the resident by clearing its
-    /// `content_ready` instead. That resident is also the source every *other*
-    /// pending window on the same identity still has to flush from, and
-    /// withdrawing it mid-drain lost their frames outright: measured as
-    /// `chain_resident_land_fail reason=read_target` and `deferred_flush_lost
-    /// reason=resident_epoch_drift live=None`, both on 1920x1080 scanout
-    /// surfaces, and a black screen. Withholding the stamp disqualifies the
-    /// resident for the readers that must not use it without taking it away from
-    /// the writers that must.
-    #[test]
-    fn a_writeback_that_preserved_guest_bytes_does_not_publish_the_resident() {
-        assert!(super::flush_publishes_the_resident(true, &[]));
-        assert!(
-            !super::flush_publishes_the_resident(true, &[(0, 4096)]),
-            "the pages hold the guest's bytes there; this image is not the mapping's content"
-        );
-        assert!(
-            !super::flush_publishes_the_resident(false, &[]),
-            "a refused write left the pages holding neither frame"
-        );
-        assert!(!super::flush_publishes_the_resident(false, &[(0, 4096)]));
-    }
-
     fn key(mapping_id: u32, lo: u64, hi: u64) -> ComputeStorageResidencyKey {
         ComputeStorageResidencyKey {
             mapping_id,
@@ -1690,17 +1622,23 @@ mod tests {
         );
     }
 
-    /// A window landing over pages the guest wrote preserves exactly those, and
-    /// one landing over untouched pages preserves nothing.
+    /// A window landing over pages the guest wrote preserves nothing and says
+    /// so; one landing over untouched pages preserves nothing and stays quiet.
     ///
-    /// Both halves are the test. A rule that preserves on every flush is not a
-    /// rule — the writeback runs on every landing and the interesting population
-    /// is the subset the guest also wrote — so the untouched arm is what makes
-    /// the preserving arm mean anything. The absence of a
-    /// `deferred_flush_clobber` line is the third: that report is for a host
-    /// that cannot say *which* pages moved, and a host that can must not emit it.
+    /// Both halves are the test. The report has to be keyed on the guest write
+    /// and not on the landing — the writeback runs on every landing and the
+    /// interesting population is the subset the guest also wrote — so the
+    /// untouched arm is what makes the reporting arm mean anything.
+    ///
+    /// This test asserted the opposite of its first half until the rail was
+    /// bisected on live boots: the preserving behaviour turned the screen black
+    /// (0 of 14 rounds, against 3 of 4 and 2 of 4 clean on the two commits
+    /// before it), because `page_gen` is stamped at the harvest and not at the
+    /// write, so a store the device's own render superseded can still be named
+    /// "written since the Store". See
+    /// [`super::render_flush_guest_written_ranges`].
     #[test]
-    fn a_render_window_preserves_exactly_the_pages_the_guest_wrote() {
+    fn a_render_window_landing_over_guest_writes_reports_them_and_preserves_nothing() {
         use crate::runtime::host::{FakeHost, HostOps};
         let page = 1u64 << PAGE_SHIFT_X86;
         for guest_wrote in [false, true] {
@@ -1735,13 +1673,13 @@ mod tests {
                 .filter(|l| l.split_whitespace().next() == Some("deferred_flush_clobber"))
                 .collect();
             assert!(
-                clobbers.is_empty(),
-                "a host that can name the pages must not report an unpreventable loss: {clobbers:?}"
+                preserve.is_empty(),
+                "guest_wrote={guest_wrote}: the landing writes its whole extent, always"
             );
             assert_eq!(
-                preserve.is_empty(),
-                !guest_wrote,
-                "guest_wrote={guest_wrote} must decide whether anything is preserved"
+                clobbers.len(),
+                usize::from(guest_wrote),
+                "guest_wrote={guest_wrote} must decide whether the loss is reported: {clobbers:?}"
             );
         }
     }
