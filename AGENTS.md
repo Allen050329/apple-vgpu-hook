@@ -1754,13 +1754,45 @@ for correctness — stale encodes must not serve. Nothing anywhere walks the map
 address. Note the neighbouring deferred-window map *is* bounded, by `GVA_DEFERRED_WINDOW_CAP`; the
 encode cache never got the equivalent.
 
-The next candidate, and it is unmeasured: evict entries whose recorded `GvaBacking::gpas` no longer
-match a fresh walk of the key. That is the same standard the dead-task rule was reaching for — drop
-only what a lookup could never serve — applied to the backing instead of the task, and it is aimed at
-exactly what a resolution change produces (a freed or re-pointed VA). Measure its yield the way the
-last one was measured, with a probe column, before writing the eviction: walking the first recorded
-GPA of each entry is one host read per entry per census and is enough to tell a moved backing from a
-live one.
+##### Sized: the backing rule reclaims about half, and `unmapped` is the wallpaper
+
+`gva_backing_moved` (`cec389b`) walks the first recorded GPA of each entry and compares it against a
+fresh walk of the key. Third boot, same 60-resize drive:
+
+```text
+                gva   moved   unmapped   valid
+idle             27       2         14      11
+round  5        218      68        135      15
+round 10        272     107        151      14
+round 15        305     149        143      13
+after drive     305     101        194      10
+```
+
+Three things, and the third is the one that decides the implementation.
+
+**The working set is ~13 entries.** It is 11 at idle and still 13 after 60 resolution changes, while
+the map goes to 305. Roughly 95 % of this cache is dead weight, which is the leak restated per-entry
+rather than in bytes.
+
+**`unmapped` must never authorise an eviction, and the idle row proves it.** At idle, before any
+resize, **14 of 27 entries are already unmapped** — this cache is *deliberately* retained across
+Unmap for the wallpaper class, so "the guest unmapped this VA" is the normal state of exactly the
+content the cache exists to keep. A rule that collapsed `moved` and `unmapped` would evict 16 of 27
+entries on an idle desktop and wipe the wallpaper. That is the black-screen regression this document
+already records, reachable in one line of code, and separating the two columns is the only reason it
+is visible here instead of after a boot.
+
+**`moved` is not monotonic, so it is a statement about an instant, not a verdict.** It fell from 149
+to 101 between the last two rows while `unmapped` rose — the guest re-points these addresses
+continuously, and an entry can move away and come back. So an eviction on `moved` can still lose a
+churn-and-return case, which is precisely the case `GvaBacking` was added to serve
+(`gva_backing_separates_a_churned_mapping_from_a_reassigned_address`: a mapping that churned and came
+back reads `Confirmed`). **The `moved` rule is well-sized at ~half the entries and it is NOT
+provably free** — it needs a gated A/B against the wallpaper, not an assumption of safety.
+
+The honest state: the leak is measured, two candidate rules have been sized, one is dead
+(`gva_dead_task=0`) and one is half a fix with a real risk attached. Nothing has been evicted yet, on
+purpose — every step here was cheaper than the boot that would have found the regression.
 
 Not a crash, on this boot: 60 resizes, QEMU alive, 0 guest panics, 0 firmware aborts, 0 losses on
 every rail. 291 MB is not an out-of-memory. The reason this is written up under Goal 4 anyway is that
