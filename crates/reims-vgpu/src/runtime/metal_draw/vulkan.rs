@@ -812,7 +812,7 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
     task_id: u32,
     texture_ref: u32,
 ) -> Option<(u32, u32, u32, SampledSourceRequest)> {
-    use crate::backend::vulkan::engine::{self, TargetIdentity};
+    use crate::backend::vulkan::engine;
     if state.gva_deferred_flush.is_empty() {
         return None;
     }
@@ -857,12 +857,9 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
         };
         return decline(reason, win_geom);
     }
-    let id = TargetIdentity::Gva {
-        gva,
-        width: win_geom.0,
-        height: win_geom.1,
-        generation: 0,
-    };
+    // From the window, not from a walk: this bind must reach the slot the window
+    // pinned, and the address may already belong to something else.
+    let id = crate::runtime::storage_flush::gva_window_identity(gva, win);
     if !engine::resident_content_ready(&id) {
         // The window says guest pages are stale and the resident says it has
         // nothing — the two together mean this sample has no correct source.
@@ -894,7 +891,9 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
-    let (w, h) = *state.mrt_secondary_gvas.get(&gva)?;
+    // Geometry AND generation come from the producer's record, so the key this
+    // bind looks up is the key the MRT draw rendered into by construction.
+    let (w, h, generation) = *state.mrt_secondary_gvas.get(&gva)?;
     // The sampler's descriptor geometry must match the rendered mask exactly.
     if layout.width != w || layout.height != h {
         // The sampled GVA IS a rendered mask, but the sampler's geometry differs
@@ -911,7 +910,7 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
         gva,
         width: w,
         height: h,
-        generation: 0,
+        generation,
     };
     if !engine::resident_content_ready(&id) {
         crate::runtime::census::present_proxy::note_mrt_mask_bind_miss(
@@ -4154,8 +4153,18 @@ fn build_secondary_targets(
             }
         };
         // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
-        // type-11 surface. generation 0 for GVA matches the later sample path
-        // (`try_sample_deferred_gva`) so the resident key is bind-compatible.
+        // type-11 surface.
+        //
+        // A secondary's GVA keeps `generation: 0` — it is not named by its
+        // backing pages the way color0 is. The generation for color0 is the hash
+        // of the pages behind *that* span, and this attachment is a different
+        // address (a secondary equal to the primary is rejected below), so the
+        // primary's value would not describe this allocation; naming this one
+        // would need its own page walk, and this function is handed neither a
+        // `HostOps` to walk with nor the task the walk would run under.
+        // Consumers do not have to know that: `mrt_secondary_gvas` records
+        // whatever generation lands here and `try_sample_mrt_secondary` binds
+        // with the recorded value, so producer and sampler agree either way.
         let identity = if c.target_gva != 0 {
             TargetIdentity::Gva {
                 gva: c.target_gva,
@@ -4366,12 +4375,17 @@ fn prepare_vertex_step_function(
 fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    req: &DrawEncodeRequest,
+    req: &mut DrawEncodeRequest,
     writeback_guest: bool,
 ) -> Result<M2vDrawSpan, DrawError> {
     // Only the final record of a portability render-pass chain reads back CPU
     // pixels; used by the resident-chain rail below (harmless on other paths).
     let _ = &writeback_guest;
+    // Name the color0 GVA target's allocation before anything can render into
+    // it, and once: the pinned Store identity, the cross-pass Load identity and
+    // the deferred window's stored copy are all keyed on this value, and two
+    // walks of one address across a submit are two answers.
+    req.gva_alloc_gen = gva_alloc_generation(state, host, req);
     let pd = load_render_pipeline(state, host, req.task_id, req.pipeline_ref).ok_or({
         DrawError::DrawPreparation(
             crate::backend::vulkan::engine::DrawPreparationDecline::PipelineMissing {
@@ -5286,19 +5300,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         gva: c0.target_gva,
                         width: w,
                         height: h,
-                        generation: 0,
+                        generation: req.gva_alloc_gen,
                     };
                     // A GVA is only a name, and this rail trusts one across
-                    // passes. `TargetIdentity::Gva` carries `generation: 0` at
-                    // every construction site, so the engine registry keys a
-                    // resident on (gva, width, height) alone — and the guest
-                    // recycles addresses hard enough that this crate already
-                    // has a detector for it. The window this Load is about to
-                    // trust was armed against a specific page set; if the
-                    // address now resolves to pages that set never held, the
-                    // resident behind it holds the *previous* allocation's
-                    // pixels and loading them would paint one resource's
-                    // picture as another's prior content.
+                    // passes. `generation` is the hash of the guest pages behind
+                    // the span, so an address handed to a second allocation
+                    // resolves to a different registry key and this Load misses
+                    // rather than reading the first allocation's pixels. That is
+                    // the structural half; the drift check below is the half
+                    // that keeps the *window* honest, because the window is what
+                    // states that guest pages are stale.
+                    //
+                    // The window this Load is about to trust was armed against a
+                    // specific page set; if the address now resolves to pages
+                    // that set never held, the window no longer describes this
+                    // memory and its bytes are not this draw's prior content.
                     //
                     // The flush path has refused exactly this condition since
                     // it was written, to keep a write off somebody else's
@@ -6277,10 +6293,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     gva,
                     width,
                     height,
-                    ..
+                    generation,
                 } = &sec.identity
                 {
-                    state.mrt_secondary_gvas.insert(*gva, (*width, *height));
+                    state
+                        .mrt_secondary_gvas
+                        .insert(*gva, (*width, *height, *generation));
                 }
             }
             resources.secondary_targets = secs;
@@ -6851,13 +6869,106 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
     }
 }
 
+/// Order-independent hash of the guest physical pages behind a GVA span.
+///
+/// The set is the identity, not the sequence: a walk that reports the same pages
+/// in another order must produce the same value, or re-rendering one buffer
+/// would read as a new allocation. `0x9E37_79B9_7F4A_7C15` is the odd 64-bit
+/// golden-ratio constant (2^64 / phi rounded to odd), used here only to spread
+/// page GPAs — which are dense multiples of the page size, so their low bits are
+/// all zero — across the whole word before the XOR fold.
+#[cfg(feature = "backend-vulkan")]
+fn gva_page_set_hash(pages: &std::collections::HashSet<u64>) -> u64 {
+    let mut hash: u64 = 0;
+    for p in pages {
+        hash ^= p.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    hash
+}
+
+/// The page-set hash as a `TargetIdentity::Gva` generation, with the bisection
+/// knob applied. `gate_off` comes from [`crate::observe::gva_identity_gen_disabled`]
+/// in production; it is a parameter so the knob's effect is testable without an
+/// environment, the way `store_defer_spec_arms` splits its parse out.
+#[cfg(feature = "backend-vulkan")]
+fn gva_alloc_gen_from_pages(pages: &std::collections::HashSet<u64>, gate_off: bool) -> u64 {
+    if gate_off {
+        return 0;
+    }
+    gva_page_set_hash(pages)
+}
+
+/// Allocation identity of this draw's color0 GVA render target: the hash of the
+/// guest physical pages its span resolves to right now.
+///
+/// The engine registry keys a `TargetIdentity::Gva` on all four of its fields,
+/// so this is the only field that can separate two guest allocations reusing one
+/// address at one geometry. Identical pages means literally the same guest
+/// memory and sharing the image is correct; different pages means a different
+/// allocation, and sharing would hand the second one the first one's pixels as
+/// its prior content — which is exactly what the cross-pass resident Load in
+/// [`encode_draw_chain`] reads.
+///
+/// Resolved once per draw, before any GPU work, and carried on
+/// [`DrawEncodeRequest::gva_alloc_gen`] so every identity the draw builds agrees.
+/// Returns 0 when color0 is not a GVA target and when the walk does not cover
+/// the whole span: an incomplete walk names no allocation, and a hash of the
+/// pages that happened to resolve would be an identity the guest never had.
+///
+/// A generation that disagrees with the one a resident was created under can
+/// only *miss* the registry lookup, which costs a CPU seed and never produces
+/// wrong pixels. Sharing a slot is the wrong-content direction, so every
+/// ambiguity here resolves toward the miss.
+#[cfg(feature = "backend-vulkan")]
+fn gva_alloc_generation<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+) -> u64 {
+    let Some(c0) = req.colors.first() else {
+        return 0;
+    };
+    if c0.mapping_id != 0 || c0.target_gva == 0 {
+        return 0;
+    }
+    // Same span as the deferred arm walks (`arm_gva_deferred_store`) so the two
+    // describe one region: the guest bytes a Store into this target writes.
+    let span = (c0.row_stride as u64).saturating_mul(c0.height as u64);
+    if span == 0 {
+        return 0;
+    }
+    let mut pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    crate::runtime::gva_mem::visit_task_gva_page_gpas(
+        host,
+        &state.tasks,
+        req.task_id,
+        c0.target_gva,
+        span,
+        state.page_shift,
+        1,
+        &mut |gpa_page| {
+            pages.insert(gpa_page);
+            true
+        },
+    );
+    let expect_pages = ((c0.target_gva % state.page_size()) + span).div_ceil(state.page_size());
+    if (pages.len() as u64) < expect_pages {
+        return 0;
+    }
+    gva_alloc_gen_from_pages(&pages, crate::observe::gva_identity_gen_disabled())
+}
+
 /// Engine-resident identity for a GVA (type-2/3) color0 render target.
 ///
 /// Single source of truth for the resident GVA chain rail: the draw path,
 /// the alias-sample bind, and the abandon-path landing must all agree on the
-/// exact identity or the registry lookups miss. Generation is a constant 0 —
-/// chain records never consult the resident across passes (record 1 always
-/// re-seeds from protocol state), so no cross-pass freshness key is needed.
+/// exact identity or the registry lookups miss.
+///
+/// `generation` is the draw's [`DrawEncodeRequest::gva_alloc_gen`] — the hash of
+/// the guest pages backing the target — because a GVA is only a name and the
+/// guest recycles names. Without it the registry keys this resident on
+/// `(gva, width, height)` alone, and the cross-pass resident Load below hands a
+/// new allocation the previous one's pixels as its prior content.
 #[cfg(feature = "backend-vulkan")]
 pub(crate) fn gva_chain_identity(
     req: &DrawEncodeRequest,
@@ -6878,7 +6989,7 @@ pub(crate) fn gva_chain_identity(
         gva: c0.target_gva,
         width: w,
         height: h,
-        generation: 0,
+        generation: req.gva_alloc_gen,
     })
 }
 
@@ -7404,12 +7515,12 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
         return;
     };
     if old.width == width && old.height == height {
-        let old_identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
-            gva,
-            width,
-            height,
-            generation: 0,
-        };
+        // The identity the OLD window pinned, which is the only slot this unpin
+        // may release: the caller's geometry says the two windows describe one
+        // region, but the resident behind the old one was created under the
+        // generation that window stored, not under whatever the address names
+        // now.
+        let old_identity = crate::runtime::storage_flush::gva_window_identity(gva, old);
         let _ = state.take_gva_deferred_window(gva);
         crate::backend::vulkan::engine::unpin_resident_target(&old_identity);
         crate::observe::line(format!(
@@ -7432,19 +7543,19 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
 ) {
 }
 
-/// Does this GVA render target's engine resident belong to the allocation that
-/// is about to render into it?
-///
-/// `TargetIdentity::Gva` carries `generation: 0` everywhere, so the registry
-/// keys a resident on `(gva, width, height)` and nothing else. Two allocations
-/// that reuse one address at one geometry therefore get **the same GPU image**,
-/// and the second one inherits the first one's pixels as its prior content —
-/// which is what the cross-pass resident Load in `encode_draw_chain` reads.
+/// How often does a GVA render target's address change hands between arms?
 ///
 /// The page list behind the span is the allocation's identity and needs no
 /// heuristic to say so: identical pages means literally the same guest memory,
-/// so sharing an image is correct; different pages means a different
-/// allocation, and sharing is a wrong-content bug. This scores the disagreement.
+/// so sharing an image is correct; different pages means a different allocation
+/// and sharing would be a wrong-content bug. `gva_alloc_generation` puts that
+/// same hash in the resident's registry key, so the two now get separate images;
+/// this counts the arms where that separation is what stands between them.
+///
+/// Deliberately kept independent of the key it scores. It reads its own
+/// `gva_resident_backing` history rather than the identity, because a census
+/// that consults the mechanism it is measuring cannot report the day the
+/// mechanism stops working.
 ///
 /// Free at this call site by construction — `arm_gva_deferred_store` has just
 /// walked the span to build `pages`, so this adds a hash and a map probe rather
@@ -7459,10 +7570,11 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
 /// aliased geometries: 64x64 x227, 1938x42 x32, 675x52 x23, ...
 /// ```
 ///
-/// So the collision is real and common: about one GVA render-target arm in
-/// eighteen binds an engine image that belongs to a *different* guest
-/// allocation, and the geometry that dominates is 64x64 — a folder icon
-/// exactly, the same geometry the Finder icon class corrupts at.
+/// So the address reuse is real and common: about one GVA render-target arm in
+/// eighteen lands at an address a *different* guest allocation held, and the
+/// geometry that dominates is 64x64 — a folder icon exactly, the same geometry
+/// the Finder icon class corrupts at. That boot ran the shared-image key, so
+/// each of those 3 487 arms bound the previous allocation's image.
 ///
 /// **It is nevertheless not sufficient for the visible defect.** That boot
 /// scored 14 of 14 rounds CLEAN with 3 487 aliased arms in it. Binding another
@@ -7489,12 +7601,11 @@ fn note_gva_resident_aliasing(
     height: u32,
     pages: &std::collections::HashSet<u64>,
 ) {
-    // Order-independent so the walk's traversal order cannot register as a
-    // change: the set is the identity, not the sequence.
-    let mut hash: u64 = 0;
-    for p in pages {
-        hash ^= p.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
+    // The same hash `gva_alloc_generation` puts in the registry key, so the
+    // census and the identity cannot disagree about what "same allocation"
+    // means — and unconditional, because a census that the bisection knob could
+    // silence would stop measuring exactly when the control arm needs it.
+    let hash = gva_page_set_hash(pages);
     let prev = state
         .gva_resident_backing
         .insert(gva, (width, height, hash));
@@ -7503,8 +7614,8 @@ fn note_gva_resident_aliasing(
         return;
     };
     if (pw, ph) != (width, height) {
-        // A different geometry is a different registry key, so the two never
-        // share an image and this is not the aliasing case.
+        // A different geometry was always a different registry key, so the two
+        // never shared an image and this is not the address-reuse case.
         crate::runtime::drain::note_store_route("gvares_regeom");
         return;
     }
@@ -7516,7 +7627,7 @@ fn note_gva_resident_aliasing(
     if crate::observe::first_sight("gva_resident_aliased", gva ^ ((width as u64) << 32)) {
         crate::observe::fail(format!(
             "gva_resident_aliased gva={gva:#x} {width}x{height} pages={} \
-             (same registry key, different guest allocation)",
+             (same address and geometry, different guest allocation)",
             pages.len()
         ));
     }
@@ -7567,10 +7678,16 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
         return false;
     }
     note_gva_resident_aliasing(state, gva, c0.width, c0.height, &pages);
-    // Supersede any previous window at this GVA before pinning: same
-    // geometry means the same identity this draw just re-rendered (drop —
-    // the helper's unpin is undone by the pin below); different geometry is
-    // a distinct identity whose resident is intact (land it first).
+    // Supersede any previous window at this GVA before pinning. Same geometry
+    // drops the obligation; different geometry is a distinct identity whose
+    // resident is intact, so it lands first.
+    //
+    // The unpin the helper performs releases the identity the OLD window
+    // pinned, which is not always the one pinned below: a re-render of the same
+    // allocation gives both the same generation and the unpin is undone by the
+    // pin, while an address handed to a second allocation gives two identities
+    // and the first one's slot correctly stops being held for a buffer that no
+    // longer exists there.
     supersede_gva_window(state, host, gva, c0.width, c0.height, "rearm");
     if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
         return false;
@@ -7612,6 +7729,11 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
             armed_seq,
             armed_stamp_seq: state.completion_stamp_seq,
             pages,
+            // The generation the pinned identity above was built with, not a
+            // hash of the `pages` walked here. The two normally agree; when a
+            // remap lands between the draw's walk and this one they do not, and
+            // the value that finds the pinned slot is the one the draw used.
+            alloc_gen: req.gva_alloc_gen,
         },
     );
     crate::observe::line(format!(
@@ -7765,6 +7887,200 @@ mod vulkan_split_tests {
             store_route_count("gvares_aliased"),
             x0 + 1,
             "a different geometry is a different key and must not be scored as aliasing"
+        );
+    }
+
+    /// One guest page-table entry pointing GVA page 1 at `pfn`, on a task the
+    /// GVA walker will accept. Returns the state the walk reads its task from;
+    /// the caller re-points the entry by calling this again on the same host.
+    #[cfg(feature = "backend-vulkan")]
+    fn map_one_gva_page(host: &mut FakeHost, pfn: u32) {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::HostMemory;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        // Directory at pfn 2, its root page table at pfn 3, data pages above.
+        for gpa in [2 * page, 3 * page, 4 * page, 5 * page] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut dir = [0u8; 8];
+        st32(&mut dir[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut dir[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(2 * page, &dir).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, pfn);
+        // Entry index 1 (4 bytes wide) is GVA page 1, i.e. GVA 0x1000.
+        host.write_gpa(3 * page + 4, &pte).unwrap();
+    }
+
+    /// A GVA render target whose color0 span is one guest page at GVA 0x1000.
+    #[cfg(feature = "backend-vulkan")]
+    fn one_page_gva_request() -> DrawEncodeRequest {
+        DrawEncodeRequest {
+            task_id: 1,
+            colors: vec![ColorRtRequest {
+                slot: 0,
+                texture_ref: 7,
+                mapping_id: 0,
+                target_gva: 0x1000,
+                row_stride: 32,
+                width: 8,
+                height: 8,
+                ..Default::default()
+            }],
+            ..DrawEncodeRequest::default()
+        }
+    }
+
+    /// A GVA render target is named by the guest memory behind it, not by its
+    /// address.
+    ///
+    /// The engine registry keys a resident on every field of
+    /// `TargetIdentity::Gva`. With `generation` constant the key was
+    /// `(gva, width, height)`, so a second guest allocation handed the same
+    /// address at the same geometry got **the same GPU image** — and the
+    /// cross-pass resident Load in `encode_draw_chain` then reads the first
+    /// allocation's pixels as the second one's prior content. The guest recycles
+    /// render-target addresses hard enough for that to be ~5.6 % of arms.
+    ///
+    /// Only the generation may separate them: the same address at the same
+    /// geometry backed by the same page must still be one identity, or every
+    /// re-render of a live buffer would mint a slot and lose its content.
+    #[test]
+    fn a_gva_targets_identity_follows_its_guest_pages_not_its_address() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        map_one_gva_page(&mut host, 4);
+        assert!(state.define_task(1, 0x1_0000, 2));
+
+        let mut req = one_page_gva_request();
+        let gen_a = super::gva_alloc_generation(&state, &mut host, &req);
+        assert_ne!(gen_a, 0, "a fully walked GVA span must name its allocation");
+        req.gva_alloc_gen = gen_a;
+        let id_a = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+
+        // The same buffer rendered again: same pages, so the same resident.
+        assert_eq!(
+            super::gva_alloc_generation(&state, &mut host, &req),
+            gen_a,
+            "an unchanged mapping must not mint a second identity"
+        );
+
+        // The guest frees the target and its allocator hands the address to a
+        // different page. Same task, same GVA, same geometry.
+        map_one_gva_page(&mut host, 5);
+        let gen_b = super::gva_alloc_generation(&state, &mut host, &req);
+        assert_ne!(gen_b, gen_a, "different guest pages are a different allocation");
+        req.gva_alloc_gen = gen_b;
+        let id_b = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+
+        assert_ne!(id_a, id_b, "two allocations at one address must not share one image");
+        assert_eq!(
+            (id_a.width(), id_a.height()),
+            (id_b.width(), id_b.height()),
+            "and the generation must be the only thing that separates them"
+        );
+    }
+
+    /// A deferred window binds, flushes and unpins the resident it armed — even
+    /// after the address stops resolving to the pages it was armed on.
+    ///
+    /// The window exists because the guest may reuse the address before the
+    /// flush runs, so the identity has to be rebuilt from the window rather than
+    /// from a fresh walk. A walk taken at flush time names whatever lives there
+    /// now; the registry lookup then misses the slot the window is holding
+    /// pinned, and the deferred frame is lost to a `deferred_flush_lost` instead
+    /// of landing in guest memory.
+    #[test]
+    fn a_deferred_window_rebuilds_the_identity_it_armed_after_the_backing_moves() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        map_one_gva_page(&mut host, 4);
+        assert!(state.define_task(1, 0x1_0000, 2));
+
+        let mut req = one_page_gva_request();
+        req.gva_alloc_gen = super::gva_alloc_generation(&state, &mut host, &req);
+        let armed = super::gva_chain_identity(&req).expect("a GVA color0 has a chain identity");
+        let window = crate::model::GvaDeferredEntry {
+            task_id: req.task_id,
+            texture_ref: 7,
+            producer_object_type: 2,
+            width: 8,
+            height: 8,
+            row_stride: 32,
+            format: 0x46,
+            armed_seq: 1,
+            armed_stamp_seq: 0,
+            pages: std::collections::HashSet::new(),
+            alloc_gen: req.gva_alloc_gen,
+        };
+
+        map_one_gva_page(&mut host, 5);
+        assert_ne!(
+            super::gva_alloc_generation(&state, &mut host, &req),
+            window.alloc_gen,
+            "the fixture must actually move the backing, or this passes for the wrong reason"
+        );
+        assert_eq!(
+            crate::runtime::storage_flush::gva_window_identity(0x1000, &window),
+            armed,
+            "the window must still name the resident it pinned"
+        );
+    }
+
+    /// The set of pages is the identity; the order a walk reports them in is
+    /// not, and one page of difference is a different allocation.
+    ///
+    /// `visit_task_gva_page_gpas` fills a `HashSet`, whose iteration order is
+    /// unspecified and varies with insertion history, so an order-sensitive fold
+    /// would mint a new registry slot for a buffer nothing had touched — every
+    /// re-render would lose its resident content.
+    #[test]
+    fn the_page_set_names_the_allocation_and_its_traversal_order_does_not() {
+        let a: std::collections::HashSet<u64> = [0x4000, 0x5000, 0x6000].into_iter().collect();
+        let a_reordered: std::collections::HashSet<u64> =
+            [0x6000, 0x4000, 0x5000].into_iter().collect();
+        let b: std::collections::HashSet<u64> = [0x4000, 0x5000, 0x7000].into_iter().collect();
+
+        let gen = |pages: &std::collections::HashSet<u64>| super::gva_alloc_gen_from_pages(pages, false);
+        let identity = |generation: u64| crate::backend::vulkan::engine::TargetIdentity::Gva {
+            gva: 0x8000,
+            width: 64,
+            height: 64,
+            generation,
+        };
+
+        assert_eq!(
+            identity(gen(&a)),
+            identity(gen(&a_reordered)),
+            "the same pages in another order are the same allocation"
+        );
+        assert_ne!(
+            identity(gen(&a)),
+            identity(gen(&b)),
+            "one page of difference at one address and geometry is a different allocation"
+        );
+    }
+
+    /// `REIMS_VGPU_GVA_IDENTITY_GEN_OFF=1` restores the shared key.
+    ///
+    /// The rail cannot be A/B'd across two builds — `vm/boot-x86.sh` rebuilds
+    /// QEMU every boot — so the control has to be a runtime gate on the same
+    /// binary. `gva_alloc_generation` is the only producer of the value, and
+    /// every consumer copies it, so a zero here is a zero in every
+    /// `TargetIdentity::Gva` the rail builds.
+    #[test]
+    fn the_identity_generation_knob_restores_the_shared_registry_key() {
+        let pages: std::collections::HashSet<u64> = [0x4000, 0x5000].into_iter().collect();
+        assert_ne!(
+            super::gva_alloc_gen_from_pages(&pages, false),
+            0,
+            "with the gate open a walked span names its allocation"
+        );
+        assert_eq!(
+            super::gva_alloc_gen_from_pages(&pages, true),
+            0,
+            "with the gate closed every GVA resident is keyed on address and geometry alone"
         );
     }
 
@@ -8338,12 +8654,12 @@ mod vulkan_split_tests {
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
-        let req = DrawEncodeRequest {
+        let mut req = DrawEncodeRequest {
             pipeline_ref: 41,
             ..DrawEncodeRequest::default()
         };
 
-        let err = match try_metal2vulkan_draw(&mut state, &mut host, &req, true) {
+        let err = match try_metal2vulkan_draw(&mut state, &mut host, &mut req, true) {
             Err(err) => err,
             Ok(_) => panic!("an empty state cannot resolve pipeline 41"),
         };

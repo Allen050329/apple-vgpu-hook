@@ -328,6 +328,22 @@ pub struct DrawEncodeRequest {
     /// target (no CPU pixels, no guest Store). The exec chain loop arms
     /// `chain_from_resident` for the next record when set.
     pub chain_resident_established: bool,
+    /// Allocation identity of the color0 GVA render target: the
+    /// order-independent hash of the guest physical pages backing
+    /// `row_stride * height` at `colors[0].target_gva`.
+    ///
+    /// Resolved once per draw, before any GPU work, by
+    /// `metal_draw::vulkan::gva_alloc_generation`, and carried here so every
+    /// `TargetIdentity::Gva` this draw builds — the pinned Store identity, the
+    /// cross-pass Load identity, the deferred window's stored copy — agrees on
+    /// one `generation`. Two guest allocations that reuse one address at one
+    /// geometry then get two registry slots instead of one shared GPU image
+    /// whose pixels belong to whichever of them rendered last.
+    ///
+    /// 0 means "no allocation named": color0 is not a GVA target, the span does
+    /// not fully walk, or `REIMS_VGPU_GVA_IDENTITY_GEN_OFF=1`. Vulkan rail only;
+    /// the Metal arm never reads it.
+    pub gva_alloc_gen: u64,
 }
 
 /// Compact command-level MRT census for the always-on draw proxy.

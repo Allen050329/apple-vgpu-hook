@@ -1465,6 +1465,7 @@ fn deferred_gva_sample_eligibility_rules() {
         armed_seq: 0,
         armed_stamp_seq: 0,
         pages: Default::default(),
+        alloc_gen: 0,
     };
     assert!(
         deferred_gva_sample_eligible(&win, 32, 16, 2),

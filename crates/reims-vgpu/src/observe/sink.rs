@@ -753,6 +753,28 @@ pub fn fence_flush_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("REIMS_VGPU_FENCE_FLUSH_OFF").is_some_and(|v| v == "1"))
 }
 
+/// Bisection knob (`REIMS_VGPU_GVA_IDENTITY_GEN_OFF=1`): key a GVA render
+/// target's engine resident on `(gva, width, height)` alone again, the way it
+/// was keyed before `TargetIdentity::Gva::generation` carried the hash of the
+/// guest physical pages behind the span.
+///
+/// One producer reads this — `metal_draw::vulkan::gva_alloc_generation`, which
+/// resolves `DrawEncodeRequest::gva_alloc_gen` once per draw. Every other site
+/// copies that value (the pinned identity, the deferred window's `alloc_gen`,
+/// the MRT secondary map), so a set knob makes every generation 0 and the rail
+/// byte-identical to the shared-image behaviour.
+///
+/// A control for this cannot be recorded on an earlier binary: `vm/boot-x86.sh`
+/// rebuilds QEMU every boot, so a baseline from another tree measures the
+/// rebuild as well as the change. The knob is what makes the arm and its
+/// control one binary apart.
+pub fn gva_identity_gen_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_GVA_IDENTITY_GEN_OFF").is_some_and(|v| v == "1")
+    })
+}
+
 /// The parse, split out so it is testable without an environment. Same
 /// unrecognised-token rule as [`content_reuse_spec_arms`]: a typo arms nothing.
 fn store_defer_spec_arms(spec: Option<&str>, rail: StoreDeferRail) -> bool {

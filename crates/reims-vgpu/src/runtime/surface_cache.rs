@@ -713,13 +713,13 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
 /// corrupts every time.
 ///
 /// That is the condition under which naming a resource by its address stops
-/// working, and this crate still does exactly that in one place:
-/// `TargetIdentity::Gva` carries `generation: 0` at every construction site, so
-/// the engine's resident registry keys a GVA render target on
-/// `(gva, width, height)` alone and two allocations that reuse one address share
-/// one image. The `Surface` rail does not have this problem because
-/// `surface_identity` keys on `map_generation`. Giving the GVA rail the same
-/// treatment is the open work, and this counter is how to score it.
+/// working. The engine's resident registry no longer does: `TargetIdentity::Gva`
+/// carries the hash of the guest pages behind the target as its `generation`
+/// (`metal_draw::vulkan::gva_alloc_generation`), so two allocations reusing one
+/// address at one geometry get two slots rather than one shared image — the same
+/// treatment `surface_identity` gives the `Surface` rail with `map_generation`.
+/// This counter stays as the load proxy: it says how hard the guest is recycling
+/// texture memory, which is the condition, not the mechanism.
 ///
 /// The two corrupt rounds in the low mode are the reminder that this class has
 /// been two defects since it was first split (see

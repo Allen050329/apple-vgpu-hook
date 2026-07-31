@@ -994,7 +994,7 @@ pub enum RenderWindowSource {
 
 /// Everything a later flush needs to land a deferred **GVA render Store**
 /// (type-2/3 color0 with `target_gva != 0`): the engine resident
-/// `TargetIdentity::Gva { gva, width, height, generation: 0 }` holds the
+/// `TargetIdentity::Gva { gva, width, height, generation: alloc_gen }` holds the
 /// authoritative pixels; guest pages + `host_gva_surfaces` are stale until a
 /// flush lands them. One window per `gva` — a newer Store at the same GVA
 /// supersedes (same geometry) or flushes (different geometry) the older one.
@@ -1025,6 +1025,16 @@ pub struct GvaDeferredEntry {
     /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
     /// aliasing these flush first (`storage_flush::flush_intersecting_task_gva`).
     pub pages: std::collections::HashSet<u64>,
+    /// `generation` of the engine resident this window pinned — the page-set
+    /// hash the arming draw resolved (`DrawEncodeRequest::gva_alloc_gen`).
+    ///
+    /// Stored rather than recomputed. The window exists precisely because the
+    /// address may be handed to another allocation before the flush runs, and a
+    /// walk taken then would name *that* allocation: the registry lookup would
+    /// miss the slot this window is holding pinned, and the frame would be lost
+    /// to a `deferred_flush_lost` instead of landing. Every consumer that
+    /// rebuilds the identity from a window reads this field.
+    pub alloc_gen: u64,
 }
 
 impl GvaDeferredEntry {
@@ -1749,14 +1759,18 @@ pub struct DeviceState {
     /// GVA render target → a hash of the guest physical pages its engine
     /// resident was last armed over.
     ///
-    /// `TargetIdentity::Gva` carries `generation: 0` at every construction site,
-    /// so the engine's registry keys a GVA resident on `(gva, width, height)`
-    /// alone and two allocations that reuse one address at one geometry share
-    /// one GPU image. Whether that actually happens is what this measures: the
-    /// page list behind a GVA is the allocation's identity — same pages means
-    /// literally the same memory — so a second arm at the same address and
-    /// geometry with a *different* hash is an aliased reuse, and the image the
-    /// second one gets already holds the first one's pixels.
+    /// The census behind `gvares_*`: how hard the guest recycles a render
+    /// target's address. The page list behind a GVA is the allocation's identity
+    /// — same pages means literally the same memory — so a second arm at the
+    /// same address and geometry with a *different* hash is a second allocation
+    /// at a name the first one still holds.
+    ///
+    /// The same hash is the `generation` of the resident's registry key
+    /// (`TargetIdentity::Gva`), so those arms now get their own GPU image rather
+    /// than inheriting the previous allocation's pixels. This map is what says
+    /// how often that separation is doing work, and it is deliberately
+    /// independent of the key: a census that reads the thing it is scoring
+    /// cannot report the day the two stop agreeing.
     ///
     /// Kept as a hash rather than the page list because this is a census, and
     /// the question is only whether two arms disagree.
@@ -1771,14 +1785,20 @@ pub struct DeviceState {
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
     /// GVAs rendered this guest lifetime as an **MRT secondary attachment**
-    /// (e.g. the vibrancy RG16Float coverage mask) → its (width, height). The
-    /// producer records the identity + geometry here; a later draw sampling a
-    /// type-2/3 texture at the same GVA binds the engine resident directly
-    /// (`TargetIdentity::Gva{gva,w,h,0}`) instead of reading zero. Coherent by
+    /// (e.g. the vibrancy RG16Float coverage mask) → its
+    /// `(width, height, generation)`. The producer records the identity's
+    /// geometry and generation here; a later draw sampling a type-2/3 texture at
+    /// the same GVA rebuilds `TargetIdentity::Gva` from all three and binds the
+    /// engine resident directly instead of reading zero. Coherent by
     /// construction: only GVAs we actively rendered as secondaries are eligible,
-    /// and the geometry must match the sampler's descriptor. Cleared at guest
-    /// reset with the rest of the lifetime state.
-    pub mrt_secondary_gvas: std::collections::HashMap<u64, (u32, u32)>,
+    /// and the geometry must match the sampler's descriptor.
+    ///
+    /// The generation is carried rather than assumed so the sampler's key is the
+    /// producer's key by construction — the two would otherwise have to agree by
+    /// spelling, and a producer that starts naming its allocation would silently
+    /// stop being findable. Cleared at guest reset with the rest of the lifetime
+    /// state.
+    pub mrt_secondary_gvas: std::collections::HashMap<u64, (u32, u32, u64)>,
     /// GVA windows whose task died (`delete_task`) — the GVA walk is gone, so
     /// the runtime lands these **cache-only** (no guest write) and unpins
     /// (`storage_flush::retire_gva_windows`).

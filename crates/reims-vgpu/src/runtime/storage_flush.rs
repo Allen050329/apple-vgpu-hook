@@ -688,6 +688,32 @@ fn note_window_outlived_its_stamp(
     }
 }
 
+/// Engine-resident identity a deferred GVA window is holding pinned.
+///
+/// Rebuilt from the window's own fields — including the
+/// [`crate::model::GvaDeferredEntry::alloc_gen`] the arming draw resolved —
+/// rather than from a fresh page walk. The window exists because the guest may
+/// hand the address to another allocation before the flush runs; a walk taken
+/// now would name that allocation, the registry lookup would miss the slot this
+/// window pinned, and the deferred frame would be lost instead of landing.
+///
+/// Single spelling for every consumer that starts from a window
+/// ([`flush_gva_one`], `metal_draw::vulkan::supersede_gva_window`,
+/// `metal_draw::vulkan::try_sample_deferred_gva`) so the three cannot drift
+/// apart from the producer or from each other.
+#[cfg(feature = "backend-vulkan")]
+pub fn gva_window_identity(
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+) -> crate::backend::vulkan::engine::TargetIdentity {
+    crate::backend::vulkan::engine::TargetIdentity::Gva {
+        gva,
+        width: entry.width,
+        height: entry.height,
+        generation: entry.alloc_gen,
+    }
+}
+
 /// Land a taken deferred GVA render-Store window: engine resident target →
 /// guest pages (when `guest_write` and the span is still map-covered) +
 /// `host_gva_surfaces`/texture encode caches (always). Unpins the resident
@@ -702,14 +728,8 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     guest_write: bool,
     trigger: &str,
 ) -> bool {
-    use crate::backend::vulkan::engine::TargetIdentity;
     let started = std::time::Instant::now();
-    let identity = TargetIdentity::Gva {
-        gva,
-        width: entry.width,
-        height: entry.height,
-        generation: 0,
-    };
+    let identity = gva_window_identity(gva, entry);
     // `into_rgba8` rather than the raw bytes: a GVA resident is RGBA today, so
     // this is a no-op, but the writer below (`write_gva_rgba8`) is declared in
     // semantic RGBA and the readback states its own order. Asserting the order
@@ -2504,6 +2524,7 @@ mod tests {
             armed_seq: 0,
             armed_stamp_seq: 0,
             pages: pages.iter().copied().collect(),
+            alloc_gen: 0,
         }
     }
 
@@ -3216,11 +3237,9 @@ mod tests {
 
     /// The same window, asked by the reader instead of the writer.
     ///
-    /// `TargetIdentity::Gva` carries `generation: 0` at every construction site,
-    /// so the engine registry keys a GVA resident on `(gva, width, height)`
-    /// alone. The cross-pass resident Load in `encode_draw_chain` trusts that
-    /// resident as a draw's *prior content*, gated on a deferred window existing
-    /// at the address with matching geometry — conditions a different allocation
+    /// The cross-pass resident Load in `encode_draw_chain` trusts a GVA resident
+    /// as a draw's *prior content*, gated on a deferred window existing at the
+    /// address with matching geometry — conditions a different allocation
     /// reusing the address satisfies exactly. The flush path had refused that
     /// drift since it was written; the read path did not ask, which left the two
     /// sides of one window disagreeing about whether it still belonged to its
