@@ -325,6 +325,41 @@ stamp and prints the path; read the path out of the boot log. An arm that panick
 — not clean, not corrupt, and not a row to average — and a harness that cannot tell those apart is
 the failure mode the `Retired` directory already cost this project a session to.
 
+### A `store_routes` counter is a sum, and `grep -c` returns the census cadence
+
+Every counter in a `store_routes` line is a running total, re-emitted on each census line. Counting
+those lines with `grep -c mapping_pages_ours` therefore measures *how often the census fired*, not
+the quantity — and it returns a plausible number, which is why it survives review.
+
+Measured: the first run of `.agents/repros/mapping-guard-census.sh` printed `mapping_pages_ours 310`
+and `mapping_pages_drifted 20` for a boot whose true totals were **25 646 and 22**. Both numbers were
+wrong, both looked like results, and the ratio between them was wrong by two orders of magnitude —
+6.1 % refusal instead of 0.086 %. A conclusion drawn from that pair would have been backwards about
+whether the guard was hot or rare.
+
+Sum the key across census lines (`route_sum` in the repro scripts). Use `grep -c` only for **event**
+lines — one line per occurrence, like `mapping_page_drift ` or `deferred_flush_lost` — and note that
+`mapping_page_drift` without the trailing space also matches `reason=mapping_page_drift` on the
+`deferred_flush_lost` line that follows it, so the unanchored count double-counts. Print which
+convention each number uses (`(sum)` / `(lines)`) so the next reader does not have to re-derive it.
+
+### The corruption lands in the page the surface left, not the one it moved to
+
+Worth knowing before writing any repro for the write-after-free class, because it decides which
+address the assertion reads.
+
+When the guest silently re-points a type-4 surface, the device keeps writing to the **old** physical
+pages: `ensure_contig_view` caches a `mach_vm_remap` of the PFNs it walked and returns it again on
+every later call, so the stale view resolves to where the surface *was*. Those are exactly the pages
+the guest freed and handed to something else — which is why the crash census lands in an apfs btree
+node, an ifnet function pointer and a malloc small-zone free list rather than anywhere near a
+surface.
+
+A first draft of `a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone` asserted the
+**new** backing page was untouched. It passed against a deliberately unguarded build, because
+nothing ever writes there. A test for this class must seed the abandoned page with a new owner's
+bytes and assert those survive.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
