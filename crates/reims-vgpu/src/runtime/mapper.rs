@@ -1048,6 +1048,56 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
     for (ptr, len) in state.retired_views.drain(..) {
         host.unmap_pages(ptr, len);
     }
+    // Same shape and the same reason: a guest-write token is host-side state
+    // for a page list that no longer exists, and only the host can free it.
+    for token in state.retired_guest_write_tokens.drain(..) {
+        host.untrack_guest_writes(token);
+    }
+}
+
+/// The live guest-write token for this mapping's current page list, asking the
+/// host for one if the list has none.
+///
+/// Registration is what makes the host observe writes to these pages at all,
+/// so it happens where the device first cares — at the Store that publishes
+/// the surface — rather than at every mapping resolve. A host that cannot
+/// observe guest writes answers `None` here forever, and every consumer reads
+/// that as "assume written".
+///
+/// Reads `page_entries` directly instead of going through
+/// [`mapping_page_gpas`]: the revalidation that function performs is a guest
+/// page-table walk, and the caller has already proved the mapping resolvable
+/// by rendering into it. What matters here is only that the token names the
+/// same page list the surface currently owns, which
+/// [`crate::model::MappingEntry::map_generation`] retirement guarantees.
+pub fn ensure_guest_write_token<H: HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+) -> Option<u64> {
+    let page_shift = state.page_shift;
+    let page_size = state.page_size() as usize;
+    let m = state.mappings.get(&mapping_id)?;
+    if m.guest_write_token != 0 {
+        return Some(m.guest_write_token);
+    }
+    if !m.mapped || m.page_entries.is_empty() {
+        return None;
+    }
+    let gpas: Vec<u64> = m
+        .page_entries
+        .iter()
+        .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift))
+        .collect();
+    // A partial list would have the host watch some of the surface and report
+    // "unwritten" for the rest, which is the one answer that must never be
+    // invented.
+    if gpas.len() != m.page_entries.len() {
+        return None;
+    }
+    let token = host.track_guest_writes(&gpas, page_size)?;
+    state.mappings.get_mut(&mapping_id)?.guest_write_token = token;
+    Some(token)
 }
 
 /// Revalidate + collect page-aligned GPAs for a mapped surface (GVA order).

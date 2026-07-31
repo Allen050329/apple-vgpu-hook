@@ -1125,6 +1125,141 @@ fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     );
 }
 
+/// The guest half of the type-11 seed currency test.
+///
+/// `surface_content_epoch` witnesses only writers inside this crate — every
+/// caller of `mark_mapping_written` is one — and a surface's pages are plain
+/// guest RAM the guest CPU stores into with no device operation at all. Without
+/// this half the elision answers "current" for a resident the guest has since
+/// overwritten, the Store publishes that resident back over the guest's bytes,
+/// and the epoch still has not moved: the fixpoint that turns one bad frame
+/// into a permanently corrupted surface.
+///
+/// Every answer here is "written" except the one case that is provably not.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_guest_write_since_the_store_refuses_the_resident() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::{FakeHost, HostOps};
+
+    let entry_for = |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
+        | PAGE_ENTRY_VALID;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    // Two pages of guest storage, stated as page-table entries the way a
+    // resolved mapping carries them.
+    let gpas = [0x40 * page, 0x91 * page];
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+    }
+
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 7),
+        "no Store has stamped this surface, so nothing vouches for any resident"
+    );
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 999),
+        "a mapping this device does not know cannot be declared unwritten"
+    );
+
+    // The Store's side: register the pages and record the generation.
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+        .expect("FakeHost observes guest writes");
+    let stamped = host.guest_write_gen(token).expect("a live token has one");
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .guest_write_gen_at_store = stamped;
+    assert!(
+        !type11_guest_wrote_since_store(&state, &host, 7),
+        "nothing has written the pages since the Store, so the resident still holds them"
+    );
+
+    // A guest CPU store into one of the surface's pages. No device operation is
+    // involved, which is the whole point: `surface_content_epoch` does not move.
+    let epoch_before = state.mappings[&7].surface_content_epoch;
+    host.guest_wrote_page(gpas[1]);
+    assert_eq!(
+        state.mappings[&7].surface_content_epoch, epoch_before,
+        "the device-side epoch cannot see a guest CPU write — if it could, this \
+         whole rail would be unnecessary"
+    );
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 7),
+        "the hypervisor saw the write, so the resident is stale"
+    );
+
+    // Idempotent: asking again must give the same answer. A consume-on-read
+    // report would tell the first draw of the frame the surface is dirty and
+    // every later draw that it is clean.
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 7),
+        "the refusal must survive being read"
+    );
+
+    // Re-stamping after re-seeding restores reuse, so the rail recovers rather
+    // than latching the other way.
+    let restamped = host.guest_write_gen(token).expect("still live");
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .guest_write_gen_at_store = restamped;
+    assert!(!type11_guest_wrote_since_store(&state, &host, 7));
+
+    // Retiring the page list retires the token with it: a generation recorded
+    // against pages the surface no longer owns vouches for nothing.
+    assert!(state.unmap_surface(7));
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 7),
+        "a surface whose page list is gone has no vouched resident"
+    );
+    crate::runtime::mapper::flush_retired_views(&mut state, &mut host);
+    assert_eq!(
+        host.tracked_guest_write_sets(),
+        0,
+        "the token must reach the host, or every mapping incarnation leaks a set"
+    );
+}
+
+/// A host with no dirty bitmap must lose the elision, not gain a wrong frame.
+///
+/// The conservative default is the whole reason `guest_write_gen` answers an
+/// `Option`: a host that cannot observe guest writes has to be told apart from
+/// one that observed none, and only the second may license a reuse.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_host_that_cannot_observe_guest_writes_never_vouches() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    host.guest_writes_unobservable = true;
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries =
+            vec![((((0x40 * page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
+                | PAGE_ENTRY_VALID];
+    }
+    assert_eq!(
+        crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7),
+        None,
+        "the refusal belongs at registration, not at every read"
+    );
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 7),
+        "with no witness the pages must read as written"
+    );
+}
+
 /// Records 2+ of an armed resident chain bind the attachment alias from
 /// the resident target; unarmed LOAD without a seed stays None (guest
 /// reload would expose pre-pass bytes — existing contract).

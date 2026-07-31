@@ -705,6 +705,28 @@ pub struct MappingEntry {
     /// re-collected the whole page-GPA vector and re-scanned it only to reach
     /// the answer it reached last time.
     pub contig_fragmented_gen: Option<u32>,
+    /// Live [`crate::runtime::host::HostOps::track_guest_writes`] token for the
+    /// page list in [`Self::page_entries`], or 0 when the host cannot observe
+    /// guest writes (or none has been asked for yet).
+    ///
+    /// Retired next to [`Self::contig_ptr`] and for the same reason: both name
+    /// the page list as it stood, so anything that changes the list invalidates
+    /// both. A token that outlived its list would report writes to pages this
+    /// surface no longer owns and miss writes to the ones it does.
+    pub guest_write_token: u64,
+    /// [`crate::runtime::host::HostOps::guest_write_gen`] as it stood when this
+    /// mapping's pixels were last published by a device Store.
+    ///
+    /// The other half of the type-11 seed currency test.
+    /// [`Self::surface_content_epoch`] can only witness writers inside this
+    /// crate — every caller of `mark_mapping_written` is one — and a surface's
+    /// pages are plain guest RAM the guest CPU stores into with no device
+    /// operation at all. This is what sees that store.
+    ///
+    /// 0 means no Store has stamped it, or the host could not answer, and
+    /// never compares equal to a live generation (the host's first readable
+    /// generation is 1).
+    pub guest_write_gen_at_store: u64,
     /// Task id that last owned this surface as a type-4 `OBJECT_TYPE_SURFACE`
     /// object (0 = no non-trivial hint; task 0 is always probed first anyway).
     /// `resolve_type4_surface_ex` probes this task right after task 0 so a
@@ -1622,6 +1644,11 @@ pub struct DeviceState {
     /// these via `HostOps::unmap_pages` after dropping the Metal objects that
     /// alias them (`mapper::flush_retired_views`).
     pub retired_views: Vec<(usize, usize)>,
+    /// Guest-write tokens whose page list is gone, awaiting release through
+    /// `HostOps::untrack_guest_writes`. Drained by
+    /// `mapper::flush_retired_views` alongside `retired_views`, for the same
+    /// reason: both are host-side state this crate cannot free itself.
+    pub retired_guest_write_tokens: Vec<u64>,
     /// Task-GVA HostOps views (zero-copy import substrate). Dropped on
     /// overlapping UnmapMemory/MapMemory2; flushed via `retired_views`.
     pub gva_host_views: Vec<GvaHostView>,
@@ -1782,6 +1809,7 @@ impl DeviceState {
             draining_channel: 0,
             draining_mask: 0,
             retired_views: Vec::new(),
+            retired_guest_write_tokens: Vec::new(),
             retired_linear_residents: Vec::new(),
             linear_deferred_flush: DeferredWindows::new(),
             gva_deferred_flush: DeferredWindows::new(),
@@ -1939,6 +1967,19 @@ impl DeviceState {
         Some(v)
     }
 
+    /// Detach the guest-write token, returning it for release through
+    /// [`crate::runtime::host::HostOps::untrack_guest_writes`].
+    ///
+    /// Called wherever [`Self::take_mapping_view`] is: the token and the view
+    /// both name the page list as it stood, so a change to the list retires
+    /// both. Also clears the Store stamp — a generation recorded against a
+    /// released token cannot vouch for anything, and leaving it would let a
+    /// re-tracked set's first readable generation coincide with it.
+    fn take_guest_write_token(e: &mut MappingEntry) -> u64 {
+        e.guest_write_gen_at_store = 0;
+        std::mem::replace(&mut e.guest_write_token, 0)
+    }
+
     /// Detach every HostOps mapping owned by the current guest lifetime.
     ///
     /// Device reset is a lifetime boundary even when QEMU itself remains alive.
@@ -1946,11 +1987,21 @@ impl DeviceState {
     /// then release them through the bound HostOps implementation.
     pub fn take_all_host_views(&mut self) -> Vec<(usize, usize)> {
         let mut views = std::mem::take(&mut self.retired_views);
+        let mut tokens = std::mem::take(&mut self.retired_guest_write_tokens);
         for mapping in self.mappings.values_mut() {
             if let Some(view) = Self::take_mapping_view(mapping) {
                 views.push(view);
             }
+            let token = Self::take_guest_write_token(mapping);
+            if token != 0 {
+                tokens.push(token);
+            }
         }
+        // Back onto the retired list rather than out through the return value:
+        // the caller's contract is "invalidate backend aliases, then release
+        // views", and a token release is neither. `flush_retired_views` drains
+        // both, and a device reset always runs it.
+        self.retired_guest_write_tokens = tokens;
         views.extend(self.gva_host_views.drain(..).filter_map(|view| {
             (view.ptr != 0 && view.ptr_len != 0).then_some((view.ptr, view.ptr_len))
         }));
@@ -2801,8 +2852,12 @@ impl DeviceState {
         e.condemned_entries = None;
         Self::bump_map_generation(e);
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         had
     }
@@ -2831,8 +2886,12 @@ impl DeviceState {
         e.condemned_entries = Some(std::mem::take(&mut e.page_entries));
         e.page_table_kva = 0;
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         true
     }
@@ -2877,8 +2936,12 @@ impl DeviceState {
         e.height = 0;
         e.format = 0;
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         // Fresh MAP: prior host-cache for this surface_id is stale, and so is
         // any present evidence — the slot may hold a NEW surface.
@@ -2911,8 +2974,12 @@ impl DeviceState {
             e.height = 0;
             e.format = 0;
             let retired = Self::take_mapping_view(e);
+            let retired_token = Self::take_guest_write_token(e);
             if let Some(v) = retired {
                 self.retired_views.push(v);
+            }
+            if retired_token != 0 {
+                self.retired_guest_write_tokens.push(retired_token);
             }
             self.host_surfaces.remove(&mapping_id);
             true
@@ -2955,8 +3022,12 @@ impl DeviceState {
         e.height = 0;
         e.format = 0;
         let retired = Self::take_mapping_view(e);
+        let retired_token = Self::take_guest_write_token(e);
         if let Some(v) = retired {
             self.retired_views.push(v);
+        }
+        if retired_token != 0 {
+            self.retired_guest_write_tokens.push(retired_token);
         }
         // New MappingInternal ⇒ new surface, and the `bump_map_generation`
         // above is what retires the stale present evidence: it is stamped with

@@ -452,7 +452,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                                     c0.format,
                                 );
                             }
-                            stamp_type11_resident(state, req, writeback_guest, epoch);
+                            stamp_type11_resident(state, host, req, writeback_guest, epoch);
                             // `None`, not the frame. This route is reached only
                             // under `writeback_guest`, which `multi_draw_store_plan`
                             // grants solely to the **last** record of a packet — so
@@ -517,7 +517,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                             );
                         }
                         if let Some(epoch) = sync_epoch {
-                            stamp_type11_resident(state, req, writeback_guest, epoch);
+                            stamp_type11_resident(state, host, req, writeback_guest, epoch);
                         }
                         if crate::observe::draw_log_enabled() {
                             // Order-independent: both fields reduce over the three
@@ -4968,38 +4968,46 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // draw since the stamp, a `map_generation` rewire that renames the
         // identity) reads back `None` and takes the seed.
         //
-        // # The witness does not cover the guest, and that is the Goal-2 latch
+        // # The epoch cannot see the guest, so it is only half the test
         //
-        // This comment used to claim the closure included "a guest CPU write".
-        // It does not, and cannot. A type-11 surface's pages are plain guest RAM;
-        // on the x86/KVM pathway the guest writes them with its own CPU and no
-        // device operation is involved, so nothing calls `mark_mapping_written`
-        // and the epoch does not move. Every caller of it is a device-side
-        // writer — `compute_exec`, `mapping_write`, `exec`, `storage_flush` —
-        // and there is no entry for the owner of the pages.
+        // The epoch's closure does *not* include a guest CPU write, and cannot.
+        // A type-11 surface's pages are plain guest RAM; the guest writes them
+        // with its own CPU and no device operation is involved, so nothing calls
+        // `mark_mapping_written` and the epoch does not move. Every caller of it
+        // is a device-side writer — `compute_exec`, `mapping_write`, `exec`,
+        // `storage_flush` — and there is no entry for the owner of the pages.
         //
-        // So the elision can answer "current" for a resident that is stale, the
-        // pass then loads from it, the matching Store publishes it back over the
-        // guest's own bytes, and the epoch still has not moved — which arms the
-        // same wrong answer for the next frame. It is a fixpoint, and it is
+        // On the epoch alone the elision answers "current" for a resident that
+        // is stale, the pass loads from it, the matching Store publishes it back
+        // over the guest's own bytes, and the epoch still has not moved — which
+        // arms the same wrong answer for the next frame. That fixpoint is
         // exactly the "renders correctly for a few frames then stays corrupted"
         // report.
         //
-        // Measured, three 14-round Finder recomposite boots at the same HEAD:
+        // Measured, three 14-round Finder recomposite boots on the epoch-only
+        // rail:
         //
         //   elision on              rounds 3,4,5,6 corrupt — held, none recovered
         //   all reuse rails off     round 4 corrupt, rounds 5-14 clean
         //   this rail off alone     round 1 corrupt, round 2 clean (recovered)
         //
-        // Turning this one rail off is enough to restore recovery, and
-        // corruption still occurs without it — so it is not the cause of a bad
-        // frame, it is what makes a bad frame permanent.
+        // Turning the rail off restored recovery and corruption still occurred
+        // without it, so the elision was never the cause of a bad frame — it was
+        // what made a bad frame permanent. Recovery requires a source of good
+        // pixels that is not the resident, and the seed's only other source is
+        // the surface's own guest pages, so the guest must be writing them.
         //
-        // The sibling rail one function over already solves this the sound way:
-        // `load_linear_guest_memoized` re-reads the guest's native rows on every
-        // call and byte-compares before reusing its swizzled `Arc`, precisely
-        // because "a guest write is always observed" cannot be had any other
-        // way. Two rails, the same problem, opposite soundness.
+        // `type11_guest_wrote_since_store` is the other half: the hypervisor's
+        // dirty bitmap, the one witness for a write this device did not make.
+        // Both halves must agree, and every unknown on either side reads as
+        // "not current".
+        //
+        // Why not the sibling rail's shape — `load_linear_guest_memoized`
+        // re-reads the guest's native rows on every call and byte-compares
+        // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
+        // 41 389 against `type11_seed_uploaded` 242, at a mean 1.43 M texels per
+        // elision, so revalidating by re-reading would move ~237 GB of guest
+        // memory a session. The bitmap answers the same question in a word.
         #[cfg(feature = "backend-vulkan")]
         if !chain_load_from_target {
             if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
@@ -5010,7 +5018,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
                 let resident_epoch =
                     crate::backend::vulkan::engine::resident_content_epoch(&identity);
+                let mapping_id = req.colors.first().map(|c| c.mapping_id).unwrap_or(0);
+                let guest_wrote = type11_guest_wrote_since_store(state, host, mapping_id);
                 if type11_resident_is_current(mapping_epoch, resident_epoch)
+                    && !guest_wrote
                     && !crate::observe::content_reuse_disabled(
                         crate::observe::ContentReuseRail::Type11Seed,
                     )
@@ -5020,6 +5031,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     note_type11_elision_extent(w, h);
                 } else {
                     crate::runtime::drain::note_store_route("type11_seed_uploaded");
+                    // Separated from the epoch's refusal so a boot can say which
+                    // half refused. The two answer different questions and a
+                    // single counter would hide a rail that never fires.
+                    if guest_wrote {
+                        crate::runtime::drain::note_store_route("type11_seed_guest_wrote");
+                    }
                 }
             }
         }
@@ -6076,6 +6093,40 @@ fn type11_load_currency_query(
     Some((identity, mapping_epoch))
 }
 
+/// Has the guest written this surface's pages since the Store that produced
+/// the resident stamped them?
+///
+/// The device-side half of the currency test — the `surface_content_epoch`
+/// comparison one function up — can only witness writers inside this crate.
+/// A type-11 surface's pages are plain guest RAM, and the guest CPU stores
+/// into them with no device operation, so the epoch does not move and the
+/// resident silently stops matching what the seed would upload. This is the
+/// only witness for that, and it is the hypervisor's.
+///
+/// Answers `true` — "written, do not reuse" — for every case that is not a
+/// live token whose current generation equals the one the Store recorded:
+/// a host that cannot observe guest writes, a mapping with no token, a token
+/// released with its page list, and a Store that never stamped. A false
+/// "unwritten" is the one answer that produces a wrong frame; a false
+/// "written" only costs a seed.
+#[cfg(feature = "backend-vulkan")]
+fn type11_guest_wrote_since_store<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> bool {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return true;
+    };
+    if m.guest_write_gen_at_store == 0 || m.guest_write_token == 0 {
+        return true;
+    }
+    match host.guest_write_gen(m.guest_write_token) {
+        Some(gen_) => gen_ != m.guest_write_gen_at_store,
+        None => true,
+    }
+}
+
 /// Whether a resident's stamp still vouches for the mapping's current content.
 ///
 /// The `is_some` guard is the whole function. Both values are `Option`, and
@@ -6097,15 +6148,37 @@ fn type11_resident_is_current(mapping_epoch: Option<u32>, resident_epoch: Option
 /// record never took the resident path, and `stamp_resident_content_epoch`
 /// refuses a slot that was evicted between the draw and here. Both leave the
 /// stamp absent, which costs a seed and never a wrong frame.
+///
+/// Also records the host's guest-write generation for the surface's pages, and
+/// registers them for tracking the first time. That is the half of the currency
+/// test `epoch` cannot cover: every writer that advances `epoch` is inside this
+/// crate, while the pages are plain guest RAM the guest CPU stores into with no
+/// device operation. Registration happens here rather than at mapping resolve
+/// because this is the first moment the device has a host-side copy whose reuse
+/// would depend on the answer.
 #[cfg(feature = "backend-vulkan")]
-fn stamp_type11_resident(
-    state: &DeviceState,
+fn stamp_type11_resident<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
     req: &DrawEncodeRequest,
     writeback_guest: bool,
     epoch: u32,
 ) {
     if let Some(identity) = type11_store_identity(state, req, writeback_guest) {
         crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
+    }
+    let Some(mapping_id) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) else {
+        return;
+    };
+    // `unwrap_or(0)` on both arms deliberately: 0 is the "nothing vouches for
+    // this" value, it is never a live generation (the host's first readable one
+    // is 1), and writing it is what makes a surface whose host cannot answer
+    // fail the currency test instead of passing it by default.
+    let gen_ = crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id)
+        .and_then(|token| host.guest_write_gen(token))
+        .unwrap_or(0);
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_write_gen_at_store = gen_;
     }
 }
 
