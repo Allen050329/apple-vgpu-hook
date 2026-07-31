@@ -371,22 +371,45 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     let _ = state.mark_mapping_written(mapping_id);
     if !skip.is_empty() {
         // A skipping write leaves the guest's pages holding `src` everywhere
-        // except the ranges the guest itself owns, so no host-side copy of `src`
-        // is the mapping's content any more. The two publishes below both assert
-        // that it is, and both would be wrong here in the direction that produces
-        // a frame rather than a cost:
+        // except the ranges the guest itself owns, so the pages are now the only
+        // complete copy of this surface and no host-side copy of `src` is its
+        // content any more. Both of them have to be told so.
         //
-        // - the cache entry would answer the type-11 LOAD seed, which prefers it
-        //   over the surface's own pages, and hand back exactly the bytes the
-        //   guest's stores were preserved *from*;
-        // - the stamp would record this surface as unwritten since a Store,
-        //   which is the fact the elision reads to load from a resident that
-        //   does not have the guest's stores either.
-        //
-        // Dropping the entry makes every reader fall through to the pages, which
-        // are the only thing that holds both halves. `mark_mapping_written` above
-        // has already moved `surface_content_epoch` past any resident stamp.
+        // The byte cache would answer the type-11 LOAD seed, which prefers it
+        // over the surface's own pages, and hand back exactly the bytes the
+        // guest's stores were preserved *from*.
         crate::runtime::surface_cache::forget(state, mapping_id);
+        // The resident `src` was read out of does not have the guest's stores
+        // either, and the sampled ladder binds it in place of the surface. Only
+        // the LOAD elision is covered by the `mark_mapping_written` above, which
+        // moves `surface_content_epoch` past the resident's stamp; the sampled
+        // rung compares no epoch and would bind the half.
+        #[cfg(feature = "backend-vulkan")]
+        {
+            let identity =
+                crate::runtime::present_identity::surface_identity(state, mapping_id, mw, mh);
+            crate::backend::vulkan::engine::retire_resident_content(&identity);
+        }
+        // And now — with nothing host-side left claiming to be the surface — the
+        // guest-write stamp is re-taken, because the device has *adopted* the
+        // guest's stores: they are in the pages it just wrote around.
+        //
+        // Withholding it was the defect this rail shipped with. The stamp is the
+        // `since` every later `guest_written_pages` call is asked against, and
+        // `page_gen` records the harvest that last saw each page written, never
+        // resetting per consumer. So a stamp that does not move makes the skip
+        // set grow monotonically: one full CPU repaint of a window marks every
+        // page of it, and from then on every deferred flush of that surface
+        // skips the entire extent and the device's composite never reaches guest
+        // memory again. Measured live as a desktop that goes black and stays
+        // black, at `render_flush_preserved_guest_write` ~65 a second, on a boot
+        // whose sampled resident rung was gated off — so it was this rail and
+        // not that one.
+        //
+        // It is honest as well as necessary: the stamp says "no host-side copy
+        // is known stale relative to these pages", and after the two retirements
+        // above there is no host-side copy at all.
+        crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
     }
     let mut cache = vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
@@ -1265,11 +1288,9 @@ mod tests {
     /// honoured by one and not the other is a defect that only appears on
     /// whichever guest allocation happens to be scattered.
     ///
-    /// The two publishes at the tail are half the test. After a skipping write
-    /// neither the host cache nor the recorded guest-write generation describes
-    /// the mapping any more: the cache would answer the type-11 LOAD seed with
-    /// the very bytes the guest's stores were preserved from, and a refreshed
-    /// stamp would tell the elision this surface is unwritten since a Store.
+    /// Dropping the host cache at the tail is half the test: it would otherwise
+    /// answer the type-11 LOAD seed with the very bytes the guest's stores were
+    /// preserved from.
     #[test]
     fn a_skipping_writeback_leaves_the_guest_its_own_pages() {
         use crate::model::PAGE_SHIFT_X86;
@@ -1331,11 +1352,87 @@ mod tests {
                 crate::runtime::surface_cache::get(&state, 4, W, H).is_none(),
                 "packed={packed}: the cache must stop answering for a mapping the frame no longer describes"
             );
-            assert_eq!(
-                state.mappings[&4].guest_write_gen_at_store, 0,
-                "packed={packed}: a partial write must not record this surface as unwritten since a Store"
-            );
         }
+    }
+
+    /// A skipping write must re-take the guest-write stamp, or the set of pages
+    /// it skips grows monotonically until it covers the whole surface and the
+    /// device's composite never reaches guest memory again.
+    ///
+    /// `since` for every later `guest_written_pages` call is this stamp, and the
+    /// host's `page_gen` records the harvest that last saw each page written and
+    /// never resets per consumer. So a stamp that does not move keeps naming
+    /// every page the guest has *ever* written since it was taken. One full CPU
+    /// repaint of a window marks all of them, and from then on each deferred
+    /// flush of that surface skips the entire extent.
+    ///
+    /// That is what this rail shipped with, and it is a desktop that goes black
+    /// and stays black — reproduced live at `render_flush_preserved_guest_write`
+    /// ~65 a second on a boot with the sampled resident rung gated off, which is
+    /// what placed it here rather than there.
+    ///
+    /// The stamp is honest because of what runs beside it: the byte cache is
+    /// dropped and the resident's content claim withdrawn, so when it says "no
+    /// host-side copy is known stale relative to these pages" there is no
+    /// host-side copy at all.
+    #[test]
+    fn a_skipping_writeback_re_takes_the_stamp_so_the_skip_set_cannot_only_grow() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        let mut state = DeviceState::new(DeviceId(3), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let base_pfn = 0x40u32;
+        host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+        let entries: Vec<u32> = (0..4)
+            .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        state.map_surface(4);
+        state.attach_mapping_internal(4, 0);
+        let m = state.mappings.get_mut(&4).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = entries;
+        assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+
+        // A Store arms the witness, then the guest paints page 2 of the surface.
+        crate::runtime::mapper::stamp_guest_write_gen(&mut state, &mut host, 4);
+        let token = state.mappings[&4].guest_write_token;
+        assert_ne!(token, 0, "the fake host must be able to watch these pages");
+        host.guest_wrote_page((base_pfn as u64 + 2) << PAGE_SHIFT_X86);
+
+        let stamped_before = state.mappings[&4].guest_write_gen_at_store;
+        assert!(
+            !host
+                .guest_written_pages(token, stamped_before)
+                .unwrap()
+                .is_empty(),
+            "the guest's write must be visible against the stamp the flush would use"
+        );
+
+        let frame = vec![0xAAu8; (W * H * 4) as usize];
+        assert!(write_bgra8_skipping(
+            &mut state,
+            &mut host,
+            4,
+            &frame,
+            W * 4,
+            W,
+            H,
+            &[(2 * PAGE, 3 * PAGE)]
+        ));
+
+        let stamped_after = state.mappings[&4].guest_write_gen_at_store;
+        assert_ne!(
+            stamped_after, 0,
+            "a skipping write that leaves the stamp at 0 makes every later flush skip everything"
+        );
+        assert_eq!(
+            host.guest_written_pages(token, stamped_after),
+            Some(Vec::new()),
+            "the write the device just honoured must not be named again by the next flush"
+        );
     }
 
     #[test]

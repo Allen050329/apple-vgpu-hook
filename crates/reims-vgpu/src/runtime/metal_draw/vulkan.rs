@@ -6603,10 +6603,10 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    // The pages now hold both halves, so this image is one of them and not the
-    // surface. Leaving it `content_ready` would let the very next bind take it
-    // and undo the merge.
-    crate::backend::vulkan::engine::retire_resident_content(identity);
+    // `write_bgra8_skipping` has already retired both host-side copies and
+    // re-taken the guest-write stamp, because those follow from the skipping
+    // write and not from who asked for it. `identity` is the same value it
+    // recomputes; it is a parameter here because the readback needs it.
     crate::runtime::drain::note_store_route("t11sample_resident_merged");
     true
 }
