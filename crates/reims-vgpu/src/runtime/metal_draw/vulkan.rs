@@ -5002,14 +5002,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Both halves must agree, and every unknown on either side reads as
         // "not current".
         //
-        // Measured on the same rig with both halves, one 14-round boot:
+        // Measured on the same rig with both halves, two 14-round boots:
         //
-        //   t11_gw_ref_moved       2 973   guest writes that refused a reuse
-        //   type11_seed_elided    78 441   reuses still taken (94 %)
-        //   type11_seed_uploaded   4 906
-        //   rounds 1-14                    CLEAN, all fourteen distinct
+        //   boot A   14/14 clean          t11_gw_ref_moved 2 973
+        //   boot B   1,2 corrupt 3-5 clean; 6 corrupt 7 clean;
+        //            8 corrupt 9-14 clean      t11_gw_ref_moved 8 887
         //
-        // The 2 973 is the finding, not the round count. The guest CPU really
+        // Boot B is the informative one, and it says exactly what this rail
+        // does and does not fix. Corruption still happens — something writes a
+        // bad composite and that is still unidentified — but **every corrupt
+        // round is followed by a clean one**. On the epoch alone, the same
+        // script at the same HEAD gave rounds 3, 4, 5 and 6 corrupt and *held*,
+        // with none recovering. The latch is gone; its cause is not.
+        //
+        // The 8 887 is the mechanism, not the round count. The guest CPU really
         // does write these composites — thousands of times a session — and on
         // the epoch alone every one of those writes was invisible.
         //
