@@ -3434,11 +3434,25 @@ impl DeviceState {
         let Some(doomed) = self.mappings.get(&mapping_id) else {
             return;
         };
-        let doomed_lists = [
-            doomed.page_entries.as_slice(),
-            doomed.condemned_entries.as_deref().unwrap_or(&[]),
-        ];
-        if doomed_lists.iter().all(|l| l.is_empty()) {
+        let mut going: Vec<u32> = doomed.page_entries.clone();
+        going.extend_from_slice(doomed.condemned_entries.as_deref().unwrap_or(&[]));
+        self.retire_pages_no_live_mapping_holds(&going, Some(mapping_id));
+    }
+
+    /// Retire every page in `going` that no still-live mapping names.
+    ///
+    /// `skip` is the mapping whose own lists are the doomed ones and must not
+    /// therefore count as holding them. Pass `None` when the pages are being
+    /// abandoned by a mapping that is *still live under a new backing* — a
+    /// superseded incarnation — because there the mapping's current
+    /// `page_entries` are the new plan, and a page carried over into it is
+    /// genuinely still a surface's and must be kept out of the retired set.
+    ///
+    /// Other mappings' *condemned* lists count as held, deliberately in the
+    /// conservative direction: a slot awaiting its fingerprint compare may be
+    /// reprieved, and its writes would then be legitimate.
+    pub(crate) fn retire_pages_no_live_mapping_holds(&self, going: &[u32], skip: Option<u32>) {
+        if going.is_empty() {
             return;
         }
         let shift = self.page_shift;
@@ -3451,7 +3465,7 @@ impl DeviceState {
         let mut still_held: std::collections::HashSet<u64> = Default::default();
         let mut walked = 0u64;
         for (&other, m) in self.mappings.iter() {
-            if other == mapping_id {
+            if Some(other) == skip {
                 continue;
             }
             let condemned = m.condemned_entries.as_deref().unwrap_or(&[]);
@@ -3461,14 +3475,13 @@ impl DeviceState {
         }
         // Reported rather than assumed small. This runs on the drain worker,
         // which `drain_duty` already shows at 0.93-0.99, and the alias exclusion
-        // costs one pass over everything currently mapped per Unmap.
+        // costs one pass over everything currently mapped per retire.
         crate::observe::footprint::note_retire_scan(walked);
-        let going: Vec<u64> = doomed_lists
-            .iter()
-            .flat_map(|l| gpas_of(l))
+        let retiring: Vec<u64> = gpas_of(going)
+            .into_iter()
             .filter(|g| !still_held.contains(g))
             .collect();
-        crate::observe::footprint::note_pages_retired(going, self.page_size());
+        crate::observe::footprint::note_pages_retired(retiring, self.page_size());
     }
 
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {

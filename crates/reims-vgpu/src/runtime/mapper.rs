@@ -558,6 +558,9 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // Read before the `get_mut` below takes `state` mutably.
     let page_shift = state.page_shift;
     let mut retired = None;
+    // The superseded incarnation's page list, kept for the write-after-teardown
+    // detector. See the `incarnation_changed` arm below.
+    let mut superseded_pages: Vec<u32> = Vec::new();
     let mut incarnation_changed = false;
     let mut reprieved = false;
     let mut pages_changed = false;
@@ -571,6 +574,11 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         let prev_pages = m.page_entries.len();
         (pages_changed, incarnation_changed, reprieved) =
             plan_adoption_decision(condemned.as_deref(), &m.page_entries, &plan.entries);
+        if incarnation_changed {
+            if let Some(ref c) = condemned {
+                superseded_pages = c.clone();
+            }
+        }
         // New page table ⇒ the contiguous view (and any Metal texture aliasing
         // it) describe the old pages; retire them before adopting the plan.
         if m.contig_ptr != 0 && pages_changed {
@@ -657,6 +665,26 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         // surface: drop the prior incarnation's deferred windows before any
         // access could flush old content through the new pages.
         crate::runtime::storage_flush::drop_windows(state, mapping_id, "incarnation_changed");
+        // And tell the write-after-teardown detector, because this is the most
+        // common way a backing dies and it was invisible to it.
+        //
+        // The other retire point is `unmap_surface`, which needs the guest to
+        // delete a backing TWICE with no resolve between — a rare shape. Here
+        // the device has the same evidence by a different route and it is at
+        // least as strong: the guest deleted the backing, and the re-resolve
+        // came back with a different page list, which is exactly what
+        // `plan_adoption_decision` means by a new incarnation. On one 600 s
+        // driven boot the unmap route ran 10 times; this one is the ordinary
+        // per-surface teardown.
+        //
+        // `skip: None` is load-bearing. This mapping is still live and its
+        // `page_entries` now hold the NEW plan, so leaving it in the live set is
+        // what keeps a page carried over from the old backing into the new one
+        // out of the retired set — it really is still a surface's. Adoption has
+        // already run for the new plan just above, so the two agree either way,
+        // and stating it here means the order is not what makes it correct.
+        let going = std::mem::take(&mut superseded_pages);
+        state.retire_pages_no_live_mapping_holds(&going, None);
     } else if reprieved {
         // Stale trailing delete on a live incarnation — the exact black-band
         // trigger. Only note when content was actually at stake (an armed
@@ -2703,6 +2731,73 @@ mod revalidate_tests {
         // Re-adoption clears it, or the set would only ever grow.
         footprint::note_pages_authorized([gpa], page);
         assert_eq!(footprint::retired_counts().0, 0);
+    }
+
+    /// A superseded incarnation's pages retire, and one carried into the new
+    /// plan does not.
+    ///
+    /// `unmap_surface` needs the guest to delete a backing *twice* with no
+    /// resolve between, which is rare — 10 times in a 600 s driven boot. The
+    /// ordinary teardown is a delete followed by a re-resolve that comes back
+    /// with a different page list, and that was invisible to the detector. The
+    /// evidence there is at least as strong: the guest deleted the backing and
+    /// the device then proved the backing changed.
+    ///
+    /// The carried-over page is the half that can go wrong silently. A new plan
+    /// that keeps some of the old pages must not retire them — they really are
+    /// still a surface's — which is what leaving this mapping in the live set
+    /// buys.
+    #[test]
+    fn a_superseded_incarnation_retires_its_pages_but_not_one_the_new_plan_kept() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let gone = 0x7000_0000u64;
+        let kept = 0x7100_0000u64;
+        let entry =
+            |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+        state.map_surface(70);
+        {
+            let m = state.mappings.get_mut(&70).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![entry(gone), entry(kept)];
+        }
+        // The guest deletes the backing: the list moves to `condemned_entries`.
+        assert!(state.condemn_surface_backing(70));
+        let condemned = state.mappings.get(&70).unwrap().condemned_entries.clone();
+
+        // The re-resolve comes back with a different plan that keeps one page.
+        let plan = vec![entry(kept), entry(0x7200_0000)];
+        let (_, incarnation_changed, _) = plan_adoption_decision(condemned.as_deref(), &[], &plan);
+        assert!(incarnation_changed, "a different plan is a new incarnation");
+        {
+            let m = state.mappings.get_mut(&70).unwrap();
+            m.page_entries = plan;
+            m.condemned_entries = None;
+        }
+
+        state.retire_pages_no_live_mapping_holds(&condemned.unwrap(), None);
+        assert_eq!(
+            footprint::retire_scan_counts().0,
+            1,
+            "the ordinary teardown must reach the detector at all"
+        );
+        assert_eq!(footprint::retired_counts().0, 1, "only the abandoned page");
+
+        footprint::note_written_range(footprint::Rail::Mapping, kept, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            0,
+            "the new plan kept this page, so writing it is ordinary"
+        );
+        footprint::note_written_range(footprint::Rail::Mapping, gone, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            1,
+            "the abandoned page is the finding"
+        );
     }
 
     /// A condemned list on a *surviving* mapping is still-held, so tearing down

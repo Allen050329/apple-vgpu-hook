@@ -204,6 +204,42 @@ meant to kill was never running. The `sweep()` in the repro scripts already writ
 `[q]emu-system-x86_64 -enable-kvm` for exactly this reason — the convention is right, it just has to
 reach the *waiting* code too, which is where a false positive costs an hour instead of a signal.
 
+#### And `pgrep` without `-f` cannot see this process at all, because the name is too long
+
+A different trap in the same tool, and this one reports the VM **dead while it is alive** — the
+direction that makes you kill a healthy run. Linux truncates `comm` to 15 characters and
+`qemu-system-x86_64` is 18, so:
+
+```text
+cat /proc/<pid>/comm                 ->  qemu-system-x86      (truncated)
+pgrep -c  '[q]emu-system-x86_64'     ->  0    exit 1           WRONG, it is running
+pgrep -cf '[q]emu-system-x86_64'     ->  1                     right
+```
+
+Measured by copying `/bin/sleep` to that name and running it, so it is the name length and nothing
+about QEMU. It cost a boot: a mid-drive `pgrep -c` said the VM was gone, the run was killed at 300 s,
+and the next twenty minutes went on diagnosing a crash that had not happened.
+
+**Never ask `pgrep`/`pkill` about this process without `-f`.** Better still, ask QMP: `require_vm`
+in `lib.sh` opens the monitor socket and runs `query-status`, which answers about the VM rather than
+about a process table, and is the check a drive loop should be polling. Note the two halves of that
+are separate bugs — `-f` is needed for correctness and the `[q]` bracket for not matching yourself,
+and this line needs both.
+
+##### The same hour also produced a reboot census that was 96.9 % false
+
+Chasing the phantom crash, "did the guest reboot?" was scored as more than one `Darwin Kernel
+Version` in a serial log. It returned **616 of 636 logs (96.9 %)**, which is not a finding about the
+guest — every healthy boot prints that string exactly twice, once as `version =` in the boot-args
+dump and once as the banner, at lines 112 and 124. A known-good 600 s boot and the "crashed" one
+were byte-identical on both lines.
+
+The rule this rig keeps paying for, once more: **before believing a positive, confirm the detector
+can print the negative.** A signal present in ~100 % of the population is measuring the population,
+not the effect. Reboot detection, if anyone wants it, has to key on something that appears once per
+boot — a run-stamped banner or the QEMU exit itself — not on a string the kernel happens to log
+twice.
+
 ### A scorer written from one report is blind to the rest of the class
 
 `scrollpatch.py` — the Goal 3 gate — flagged a pixel only when it was *bright and unsaturated*, on
