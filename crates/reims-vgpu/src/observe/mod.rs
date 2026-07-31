@@ -59,7 +59,7 @@ pub use emit::{first_sight, state_changed, Emit};
 pub use sink::{
     bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, content_probe_enabled,
     content_reuse_disabled, content_summary, fail, line, nonzero_stats, off,
-    redirect_logs_for_tests, rgba_rgb_stats, sampled_cache_disabled,
+    redirect_logs_for_tests, rgba_rgb_stats, sampled_cache_disabled, ContentReuseRail,
 };
 pub(crate) use sink::{draw_log_enabled, elapsed_ms};
 

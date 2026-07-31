@@ -479,9 +479,45 @@ pub fn sampled_cache_disabled() -> bool {
     })
 }
 
-/// Bisection knob (`REIMS_VGPU_CONTENT_REUSE_OFF=1`): make every rail that
-/// *skips* producing content because it believes the content is already there
-/// produce it anyway.
+/// Which content-reuse rail a call site belongs to, so
+/// [`content_reuse_disabled`] can be armed one rail at a time.
+///
+/// The names are the accepted values of `REIMS_VGPU_CONTENT_REUSE_OFF`, which
+/// also takes `1` or `all` for every rail and a comma-separated list for any
+/// subset. Splitting the family was earned rather than designed in: the bundled
+/// arm returned "not the cause, but the latch", and separating a latch from two
+/// innocents is three boots that only became worth spending once that was known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentReuseRail {
+    /// The type-11 `LOAD` seed elision. The composite rail, and the only one of
+    /// the three that can hold a whole *frame*: a resident that is taken to be
+    /// current is loaded from by every later damage draw, so a bad one is
+    /// preserved rather than replaced for as long as the stamp keeps matching.
+    Type11Seed,
+    /// `linear_sampled_memo_reuse` — a swizzled `Arc` reused when the
+    /// authoritative entry's `(gva, generation, geometry)` is unchanged.
+    LinearSampledMemo,
+    /// The `guest_linear_memo` hit — a swizzled `Arc` reused when a re-read of
+    /// the guest's own native rows byte-compares equal. The most conservative of
+    /// the three: it re-reads guest memory every call and only skips the
+    /// conversion, so it can only be wrong if the guest bytes are wrong.
+    GuestLinearMemo,
+}
+
+impl ContentReuseRail {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Type11Seed => "t11seed",
+            Self::LinearSampledMemo => "linmemo",
+            Self::GuestLinearMemo => "guestmemo",
+        }
+    }
+}
+
+/// Bisection knob (`REIMS_VGPU_CONTENT_REUSE_OFF`): make a rail that *skips*
+/// producing content because it believes the content is already there produce it
+/// anyway. `1`/`all` arms every rail; a comma-separated list of
+/// [`ContentReuseRail`] tokens arms a subset.
 ///
 /// [`sampled_cache_disabled`] bisects one seam — which `VkImage` a bind gets.
 /// This one bisects the seam above it: whether the bytes were recomputed at all.
@@ -548,13 +584,27 @@ pub fn sampled_cache_disabled() -> bool {
 /// n is small — one corrupt round against four — so the rate comparison is not
 /// the claim. The claim is the qualitative one: with the rails off a corrupt
 /// round was followed by a clean one, which no reuse-on boot has ever produced.
-pub fn content_reuse_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| {
+pub fn content_reuse_disabled(rail: ContentReuseRail) -> bool {
+    static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
         std::env::var_os("REIMS_VGPU_CONTENT_REUSE_OFF")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+            .map(|v| v.to_string_lossy().into_owned())
+    });
+    content_reuse_spec_arms(spec.as_deref(), rail)
+}
+
+/// The parse, split out so it is testable without an environment.
+///
+/// An unrecognised token arms nothing rather than everything: a typo in a
+/// diagnostic flag must not silently turn a bisection into an all-rails boot
+/// that then gets read as a per-rail result.
+fn content_reuse_spec_arms(spec: Option<&str>, rail: ContentReuseRail) -> bool {
+    let Some(spec) = spec else {
+        return false;
+    };
+    spec.split(',')
+        .map(str::trim)
+        .any(|t| t == "1" || t == "all" || t == rail.token())
 }
 
 /// Summarise a tightly packed `texel`-byte-per-pixel image so a *wrong* image
@@ -863,6 +913,53 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The bisection spec arms exactly the rails it names.
+    ///
+    /// A per-rail boot is read as "this rail is the latch" or "this rail is
+    /// innocent", and both readings are wrong if the spec silently armed a
+    /// different set than the one on the command line. In particular a typo must
+    /// arm *nothing*: arming everything would turn a bisection boot into the
+    /// all-rails boot whose result is already known, and it would agree with the
+    /// hypothesis under test for the wrong reason.
+    #[test]
+    fn the_content_reuse_spec_arms_exactly_the_rails_it_names() {
+        use ContentReuseRail::*;
+        let all = [Type11Seed, LinearSampledMemo, GuestLinearMemo];
+
+        // Absent: nothing armed. This is every normal boot.
+        for r in all {
+            assert!(!content_reuse_spec_arms(None, r));
+        }
+        // The two whole-family spellings.
+        for spec in ["1", "all"] {
+            for r in all {
+                assert!(content_reuse_spec_arms(Some(spec), r), "{spec} must arm {r:?}");
+            }
+        }
+        // One rail names one rail.
+        assert!(content_reuse_spec_arms(Some("t11seed"), Type11Seed));
+        assert!(!content_reuse_spec_arms(Some("t11seed"), LinearSampledMemo));
+        assert!(!content_reuse_spec_arms(Some("t11seed"), GuestLinearMemo));
+        // Subsets, and whitespace around list entries.
+        assert!(content_reuse_spec_arms(
+            Some("linmemo, guestmemo"),
+            GuestLinearMemo
+        ));
+        assert!(!content_reuse_spec_arms(
+            Some("linmemo, guestmemo"),
+            Type11Seed
+        ));
+        // A typo arms nothing — it must not fall back to the whole family.
+        for spec in ["", "0", "t11", "seed", "yes"] {
+            for r in all {
+                assert!(
+                    !content_reuse_spec_arms(Some(spec), r),
+                    "{spec:?} must not arm {r:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn flood_key_is_the_slug_skipping_the_off_marker() {

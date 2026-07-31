@@ -2655,7 +2655,7 @@ fn linear_sampled_memo_reuse(
     // touch is not possible here. Recency for this memo is instead driven by
     // inserts — each content change re-inserts and warms the entry — which is
     // sufficient for this authoritative-cache-backed reuse fast path.
-    if crate::observe::content_reuse_disabled() {
+    if crate::observe::content_reuse_disabled(crate::observe::ContentReuseRail::LinearSampledMemo) {
         return None;
     }
     let m = state.linear_sampled_memo.peek(&(task_id, texture_ref))?;
@@ -2796,7 +2796,9 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         return None;
     }
     let key = (task_id, gva, w, h, sample_fmt);
-    let hit = (!crate::observe::content_reuse_disabled())
+    let hit = (!crate::observe::content_reuse_disabled(
+        crate::observe::ContentReuseRail::GuestLinearMemo,
+    ))
         .then(|| {
             state
                 .guest_linear_memo
@@ -4909,7 +4911,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let resident_epoch =
                     crate::backend::vulkan::engine::resident_content_epoch(&identity);
                 if type11_resident_is_current(mapping_epoch, resident_epoch)
-                    && !crate::observe::content_reuse_disabled()
+                    && !crate::observe::content_reuse_disabled(
+                        crate::observe::ContentReuseRail::Type11Seed,
+                    )
                 {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("type11_seed_elided");
