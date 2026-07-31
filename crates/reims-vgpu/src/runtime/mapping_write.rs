@@ -120,6 +120,28 @@ fn contig_for_span<H: HostMemory + HostOps>(
 /// carry: which writer was about to use the list. Four rails write through
 /// `page_entries` and they fail for different reasons at different rates, so a
 /// single undifferentiated refusal total would not say which one to read next.
+///
+/// # Measured: this rail carries the traffic and none of the drift
+///
+/// One 300 s crash-hunt boot, x86 / Vulkan: `mapw_pages_vouched` 29 002,
+/// `mapw_pages_refused` **0**, while the deferred flush rail on the same boot
+/// scored `mapping_pages_ours` 25 741 and `mapping_pages_drifted` 9. So these
+/// four writers do more writing than the flush rail does, and on this workload
+/// not one of them found a contradicted list. The guard here is currently inert;
+/// say so rather than counting it as the repair.
+///
+/// The split is not noise, and the reason is structural: a *deferred* frame is
+/// armed at one time and landed at another, and the interval is precisely the
+/// window in which the guest can re-point the surface underneath it. These
+/// writers vouch and write in the same breath, so their window is nearly zero.
+/// **Deferral is the exposure.** That predicts the measurement rather than
+/// explaining it after the fact, and it says where to look next: shortening the
+/// arm-to-land interval should move `mapping_pages_drifted`, and nothing else
+/// here should.
+///
+/// The drift rate is also not stable boot to boot — 22 on the preceding boot, 9
+/// on this one, same workload — so a single boot cannot score it and neither can
+/// a pair.
 fn vouch_for_write<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
