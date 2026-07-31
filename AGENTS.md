@@ -686,6 +686,32 @@ with a short boot. The Goal 3 scorer likewise returned 24/24 CLEAN — the same 
 *before* the change, so it discriminates nothing here and the page needs the harder provocation
 already noted above.
 
+#### A refusal has three outcomes, and only one of them is a cost
+
+`.agents/repros/type4guess.py` scores a boot's refusals, and collapsing these would lose the claim:
+
+- **corrected** — the same surface resolves cleanly within a frame or two. The guess had been
+  standing in for an answer about to arrive.
+- **terminal** — the surface is never resolved again for the rest of the boot. This is what a
+  **teardown** looks like, and it is not a cost. Measured on `20260731-192622`, sids 14, 16 and 17
+  each resolved cleanly many times over the first 40 s and then refused **at the same millisecond**
+  (t=375745) and never came back: the owning address space went away. There the old path would have
+  fabricated an address and written pixels into memory the guest had just freed — which is the
+  write-after-free shape the Goal 1 panic census keeps landing in. Refusing at teardown is the
+  device declining to write into a dead process.
+- **stranded** — the surface does come back, but later than the window, so it was missing for more
+  than a frame. This is the only outcome that is a cost of refusing.
+
+On that boot: **corrected 3, terminal 6, stranded 0**, against `fabricated_attaches` 0 where the
+pre-guard session had 106 (34 407 pages). No surface went missing for longer than a frame.
+
+Two counting traps in the same scorer. `note_type4_fail` **latches on (sid, reason)**, so a surface
+that refuses every frame contributes exactly one log line: the boot logged **9** refusals while the
+census summed **201**. Neither number is wrong and they answer different questions — per-surface
+outcomes key to the logged one, occurrence counts to the census — so print which is which. And the
+`terminal`/`stranded` split cannot be made from the refusal lines alone; it needs the *later*
+attaches for that sid, which is why the scorer reads the whole log rather than grepping.
+
 One instrument correction, because the counter is asymmetric by construction.
 `type4_identity_pages` **cannot be compared across arms**. With the guard off the loop runs to the
 end and it counts every untranslatable page; with the guard on the loop returns at the first one, so
