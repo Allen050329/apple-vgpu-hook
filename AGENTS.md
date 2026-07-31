@@ -1591,10 +1591,38 @@ written. And the scatter form marks **per page, never over a page list's hull**:
 are wherever the guest allocator put them, and a hull would claim the guest's other allocations
 between them, every one of which then reads as a hit for the rest of the boot.
 
-**Not yet read off a live guest.** The instrument landed while a 40-boot panic soak was running on a
-pinned QEMU, so no boot has produced a footprint yet and the density figure above is illustrative,
-not measured. The first driven boot on a tree carrying it should record the real density here —
-that number is what every later hit is weighed against.
+##### First live reading, mid-drive on `blur-provoke.sh`: density 1.05 %, and no white at all
+
+Read off `/tmp/reims-vgpu-fail.log` while the boot was still driving, so the numbers grow; the
+*shapes* are what matter.
+
+```text
+footprint  runs=8760  frames=44120 (172.3 MiB)  dropped=0     density 1.052 % of 16 GiB
+payload    sampled=25529  all_ff=0 (0.00 %)  all_zero=15557 (60.94 %)  ff_bytes=0/837949604
+retire     retired=0  write_after_retire=0  retire_scans=0
+```
+
+**The instrument works end to end.** `dropped=0`, 8 760 runs reassembled from 35-part dumps, and
+`footprint-attribute.py` parsed the live log without modification. Density **1.05 %** is the number
+every later footprint hit is weighed against: an unrelated victim lands inside about **1 time in 95**.
+
+**`all_ff` is 0 in 25 529 samples, and the counter is not dead** — `all_zero` is 15 557 on the same
+samples, which is the positive control the census was built with. So on this workload this device
+wrote **no all-`0xff` payload at all**, over 838 MB of sampled bytes.
+
+**Do not read that as refuting the white-frame hypothesis.** The blur page is saturated colour bands
+under a 12 %-alpha glass; it has no white content, so a device faithfully rendering it *should* never
+produce a white buffer. What the run establishes is narrower and still useful: this workload cannot
+be the one that produces a `0xff` victim, and the census is live and trustworthy. The hypothesis
+needs a workload that actually paints white — a white web page, or Finder, whose icon class is where
+Goal 2 lived. Run that before concluding anything in either direction.
+
+**`retire_scans=0`, so `write_after_retire=0` is UNMEASURED, exactly as this section warned.** The
+retire path never ran: `unmap_surface` was not reached on this workload. That is the "confirm
+`retired=` is non-zero before believing the zero" gate failing on its first outing, and it is a
+finding about the detector rather than about the device — the next session must find out whether the
+guest never Unmaps here, or whether `unmap_surface` is the wrong retire point, before that detector
+means anything.
 
 ##### `write_after_retire` asks the question the drift guard structurally cannot
 
