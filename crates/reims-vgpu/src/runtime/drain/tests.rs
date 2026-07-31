@@ -3008,3 +3008,105 @@ fn a_completion_stamp_drains_the_linear_rail_as_well_as_the_gva_rail() {
         "the stamp counter advances once the guest has been told"
     );
 }
+
+/// The guest's fence lands a type-11 render window's pixels in guest RAM, and
+/// lands them *whole*.
+///
+/// The mapping-keyed rail is inside the fence for a different reason from the
+/// two raw-address rails above. It can refuse a mapping incarnation the guest
+/// replaced (`map_generation`), so free-then-reuse is not its hazard. Its hazard
+/// is that the writeback covers the full attachment extent while the guest holds
+/// the same IOSurface mapped and writes it: one measured boot landed 12 343
+/// windows and reported 8 968 of them as `deferred_flush_clobber`, each one the
+/// device replacing bytes the guest itself had stored after the Store.
+///
+/// So this asserts both halves. The window must not survive the stamp — that is
+/// the ordering — and the guest pages must hold the window's own frame
+/// afterwards, because a rail that satisfied the first by dropping the
+/// obligation would be a silent frame loss and would pass an emptiness check.
+///
+/// Asserted at `write_stamp` rather than on the flush helper for the same reason
+/// the linear test is: the contract belongs to the fence, and a future stamp path
+/// that forgot to drain would pass a helper-level test.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_completion_stamp_lands_a_type11_render_window_in_guest_memory() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::model::{ComputeStorageResidencyKey, DeviceId};
+    use crate::runtime::host::{FakeHost, HostMemory};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = 1usize << PAGE_SHIFT_X86;
+    // A FIFO base page for the stamp write, and a separate page for the surface.
+    let fifo_pfn = 0x40u32;
+    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, page, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    let gpa = 0x4400_0000u64;
+    host.map_range(gpa, page, 0);
+
+    state.map_surface(9);
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.map_generation = 1;
+        m.has_geom = true;
+        m.width = 4;
+        m.height = 4;
+        m.format = crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        m.page_entries =
+            vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    let key = ComputeStorageResidencyKey {
+        mapping_id: 9,
+        map_generation: 1,
+        surface_offset: 0,
+        surface_bpr: 16,
+        span_end: 256,
+        width: 4,
+        height: 4,
+        pixel_format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        texture_ref: 0,
+    };
+    let frame = vec![0xA7u8; 4 * 4 * 4];
+    state.compute_deferred_flush.insert(
+        key,
+        crate::model::DeferredOwner::Render {
+            armed_seq: 1,
+            // Armed at the stamp this fence completes, which is the only case the
+            // rail is *allowed* to defer across; anything later is already late.
+            armed_stamp_seq: 0,
+            source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
+        },
+    );
+
+    write_stamp(&mut state, &mut host, 0, 7);
+
+    assert!(
+        state.compute_deferred_flush.is_empty(),
+        "a mapping-keyed window must not survive the fence that says its work is done"
+    );
+    // The guest side is row-strided at the mapping's own bytes-per-row, so read
+    // it the way the writeback wrote it.
+    let (base_off, bpr, _) = {
+        let m = state.mappings.get(&9).unwrap();
+        crate::runtime::mapping_write::type11_sample_window(
+            m,
+            9,
+            4,
+            4,
+            crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+        )
+        .expect("the mapping has a type-11 sample window")
+    };
+    for y in 0..4u64 {
+        let mut row = [0u8; 4 * 4];
+        host.read_gpa(gpa + base_off + y * bpr as u64, &mut row)
+            .unwrap();
+        assert_eq!(
+            &row[..],
+            &frame[(y as usize) * 16..(y as usize) * 16 + 16],
+            "row {y} must hold the deferred frame: the fence lands the window, it does not drop it"
+        );
+    }
+}

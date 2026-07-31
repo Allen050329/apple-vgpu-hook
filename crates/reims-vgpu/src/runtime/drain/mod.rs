@@ -327,6 +327,15 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // `storage_flush::flush_linear_windows_before_fence`; it arms about once per
     // ten minutes of heavy compositing, so this costs nothing measurable.
     crate::runtime::storage_flush::flush_linear_windows_before_fence(state, host);
+    // The mapping-keyed rails — type-11 render Stores and compute storage — can
+    // refuse a mapping incarnation the guest replaced, so they are not here for
+    // the free-then-reuse hazard the two rails above are. They are here because a
+    // deferred writeback covers the whole attachment extent while the guest writes
+    // the same IOSurface: 8968 of 12343 landings on one measured boot replaced
+    // bytes the guest itself had written after the Store. Landing inside the fence
+    // leaves no interval for that to happen in. See
+    // `storage_flush::flush_mapping_windows_before_fence`.
+    crate::runtime::storage_flush::flush_mapping_windows_before_fence(state, host);
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };

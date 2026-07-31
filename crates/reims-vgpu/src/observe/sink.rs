@@ -740,17 +740,67 @@ pub fn store_defer_disabled(rail: StoreDeferRail) -> bool {
     store_defer_spec_arms(spec.as_deref(), rail)
 }
 
-/// Bisection knob (`REIMS_VGPU_FENCE_FLUSH_OFF=1`): let deferred GVA windows
-/// outlive the completion stamp again, the way they did before
+/// Which deferred rail's fence binding [`fence_flush_disabled`] restores.
+///
+/// The names are the accepted values of `REIMS_VGPU_FENCE_FLUSH_OFF`, which also
+/// takes `1` or `all` for every rail and a comma-separated list for any subset —
+/// same grammar as `REIMS_VGPU_STORE_DEFER_OFF`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FenceFlushRail {
+    /// `storage_flush::flush_gva_windows_before_fence` — the type-2/3 raw-GVA
+    /// render Store rail.
+    Gva,
+    /// `storage_flush::flush_linear_windows_before_fence` — the linear
+    /// compute-storage rail, keyed by a raw task GVA.
+    Linear,
+    /// `storage_flush::flush_mapping_windows_before_fence` — the mapping-keyed
+    /// rails: type-11 render Stores and compute storage.
+    Mapping,
+}
+
+impl FenceFlushRail {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Gva => "gva",
+            Self::Linear => "linear",
+            Self::Mapping => "mapping",
+        }
+    }
+}
+
+/// Bisection knob (`REIMS_VGPU_FENCE_FLUSH_OFF`): let one rail's deferred
+/// windows outlive the completion stamp again, the way they all did before
 /// `storage_flush::flush_gva_windows_before_fence`.
 ///
 /// A control for this cannot be recorded on an earlier binary: `vm/boot-x86.sh`
 /// rebuilds QEMU every boot, and a whole session on this branch went to reading
 /// a baseline taken three commits back as if it were the arm's control. The
 /// knob is what makes the arm and its control one binary apart.
-pub fn fence_flush_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("REIMS_VGPU_FENCE_FLUSH_OFF").is_some_and(|v| v == "1"))
+///
+/// It is per-rail because the rails no longer land together. The GVA and linear
+/// bindings are measured and in place; the mapping binding is the one still
+/// being priced, and an `=1` control that reverted all three would score the
+/// mapping rail's cost against a control that had also given back two repairs
+/// the corruption verdict depends on. `REIMS_VGPU_FENCE_FLUSH_OFF=mapping` is
+/// the control for that measurement; `=1` and `=all` still revert everything,
+/// which is what a from-scratch bisection wants.
+pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
+    static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_FENCE_FLUSH_OFF").map(|v| v.to_string_lossy().into_owned())
+    });
+    fence_flush_spec_arms(spec.as_deref(), rail)
+}
+
+/// The parse, split out so it is testable without an environment. Same
+/// unrecognised-token rule as [`store_defer_spec_arms`]: a typo arms nothing.
+fn fence_flush_spec_arms(spec: Option<&str>, rail: FenceFlushRail) -> bool {
+    let Some(spec) = spec else {
+        return false;
+    };
+    spec.split(',')
+        .map(str::trim)
+        .any(|t| t == "1" || t == "all" || t == rail.token())
 }
 
 /// Bisection knob (`REIMS_VGPU_GVA_IDENTITY_GEN_OFF=1`): key a GVA render
@@ -1192,6 +1242,47 @@ mod tests {
             for r in all {
                 assert!(
                     !store_defer_spec_arms(Some(spec), r),
+                    "{spec:?} must not arm {r:?}"
+                );
+            }
+        }
+    }
+
+    /// The fence knob names one rail at a time, and that is the whole point of
+    /// it: the GVA and linear bindings are already measured and in place, so a
+    /// control that reverted all three would price the mapping rail against a
+    /// control that had also given back two repairs the corruption verdict
+    /// depends on. `=1` and `=all` still revert everything for a from-scratch
+    /// bisection.
+    #[test]
+    fn the_fence_flush_spec_arms_exactly_the_rails_it_names() {
+        use FenceFlushRail::*;
+        let all = [Gva, Linear, Mapping];
+
+        for r in all {
+            assert!(!fence_flush_spec_arms(None, r));
+        }
+        for spec in ["1", "all"] {
+            for r in all {
+                assert!(fence_flush_spec_arms(Some(spec), r), "{spec} must arm {r:?}");
+            }
+        }
+        assert!(fence_flush_spec_arms(Some("mapping"), Mapping));
+        assert!(
+            !fence_flush_spec_arms(Some("mapping"), Gva),
+            "the mapping rail's control must leave the GVA repair in place"
+        );
+        assert!(
+            !fence_flush_spec_arms(Some("mapping"), Linear),
+            "and must leave the linear repair in place"
+        );
+        assert!(fence_flush_spec_arms(Some("gva, linear"), Linear));
+        // `gva` is a token in both knobs' grammars; nothing else crosses over,
+        // and an unrecognised token arms nothing rather than everything.
+        for spec in ["", "0", "t11surface", "render", "surface", "fence"] {
+            for r in all {
+                assert!(
+                    !fence_flush_spec_arms(Some(spec), r),
                     "{spec:?} must not arm {r:?}"
                 );
             }

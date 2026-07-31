@@ -548,14 +548,16 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
 /// What it stops buying is survival across the fence, which was never the
 /// device's to sell.
 ///
-/// `REIMS_VGPU_FENCE_FLUSH_OFF=1` restores the old unbounded behaviour so an
-/// arm and its control can be measured on one binary.
+/// `REIMS_VGPU_FENCE_FLUSH_OFF=gva` (or `=1`/`=all`) restores the old unbounded
+/// behaviour so an arm and its control can be measured on one binary.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
 ) {
-    if state.gva_deferred_flush.is_empty() || crate::observe::fence_flush_disabled() {
+    if state.gva_deferred_flush.is_empty()
+        || crate::observe::fence_flush_disabled(crate::observe::FenceFlushRail::Gva)
+    {
         return;
     }
     // Oldest-first, so windows land in the order they were rendered: a later
@@ -608,14 +610,16 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 /// such claim is made. What it does mean is that the correct behaviour is also
 /// the cheap one, so there is nothing to trade.
 ///
-/// Shares `REIMS_VGPU_FENCE_FLUSH_OFF=1` with the GVA rail: one knob restores the
-/// unbounded behaviour on both, so an arm and its control stay one binary apart.
+/// `REIMS_VGPU_FENCE_FLUSH_OFF=linear` (or `=1`/`=all`) restores the unbounded
+/// behaviour here, so an arm and its control stay one binary apart.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
 ) {
-    if state.linear_deferred_flush.is_empty() || crate::observe::fence_flush_disabled() {
+    if state.linear_deferred_flush.is_empty()
+        || crate::observe::fence_flush_disabled(crate::observe::FenceFlushRail::Linear)
+    {
         return;
     }
     // Snapshot the keys first: `flush_linear_one` disarms its own window and may
@@ -642,6 +646,189 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
     _state: &mut DeviceState,
     _host: &mut M,
 ) {
+}
+
+/// Land every armed mapping-keyed window — type-11 render Stores and compute
+/// storage alike — because the guest is about to be told the work is finished.
+///
+/// This is the last of the four deferred rails to be bound to the fence, and it
+/// is bound for a *different* reason from the other three, which is why it was
+/// measured first rather than assumed.
+///
+/// # The other three rails were bound because they could not name their memory
+///
+/// A `GvaDeferredEntry` and a `ComputeStorageResidencyKey::linear` name a raw
+/// address, so a guest that frees the allocation and reuses the pages leaves the
+/// window pointing at somebody else's memory with nothing to refuse on. That is
+/// not this rail's position: [`flush_render_one`] and [`flush_storage_one`]
+/// compare the mapping's live `map_generation` against `key.map_generation` and
+/// refuse before reading, and `map_generation` moves on exactly the events that
+/// let a guest reuse an IOSurface's storage. [`note_mapping_window_against_fence`]
+/// records that argument in full and still holds.
+///
+/// # This rail is bound because the guest is entitled to the bytes at the fence
+///
+/// A completion stamp is this device's statement that the render is finished. A
+/// guest that has been told so may map the IOSurface and read it — CoreGraphics
+/// reading back a layer, a damage forward-copy from the previous buffer, any
+/// CPU-side compositing step — and it reads *guest RAM*, through its own
+/// mapping, without crossing a single host path this device can intercept.
+/// `flush_intersecting` covers every reader that goes through us and there is no
+/// mechanism that covers the ones that do not.
+///
+/// So a deferred window is a bet that nothing reads those pages before we land
+/// them, and when the bet loses the guest composites the *pre-Store* bytes: a
+/// region of the surface holding whatever was there one frame ago, or nothing at
+/// all. That is a stale rectangle in an otherwise correct frame, and it is
+/// indistinguishable from the corruption classes this device is chasing.
+///
+/// Apple's device does not take that bet and does not need to. Its render target
+/// *is* the guest allocation, so "the render is complete" and "the bytes are in
+/// guest memory" are one event. This is that invariant restated for a rail that
+/// has to copy: the copy happens before the statement, not after it.
+///
+/// # And because it clobbers writes the guest itself made
+///
+/// A deferred window promises to replay a Store later, and that is only a replay
+/// while nothing else writes those pages in between. The guest *is* something
+/// else: it maps the same IOSurface and does inter-buffer damage forward-copies
+/// and CoreGraphics blits into it. The writeback covers the full attachment
+/// extent, so every such guest store inside the deferral interval is gone when
+/// the window lands. One x86/Vulkan boot on the icon workload (Safari + Finder,
+/// 300 s of Mission Control ×41 / Spotlight ×41 / window drags ×82, then four
+/// Finder recomposite rounds) measured that directly:
+///
+/// ```text
+/// surface_resident               49 706
+/// surface_flush                  12 343    windows that landed
+/// render_flush_over_guest_write   8 968    of those, 73 % clobbered guest bytes
+/// rendw_stamp_outlived           12 343    every one landed after the fence
+/// storw_stamp_outlived              101
+/// ```
+///
+/// `deferred_flush_clobber` is 8 975 lines of that boot's fail log — the largest
+/// self-declared loss of guest work anywhere in it.
+///
+/// [`render_flush_guest_written_ranges`] states why the obvious repair —
+/// preserve the pages the guest wrote — is not available: `page_gen[p]` is
+/// stamped at the *harvest* that saw page `p` dirty, not at the write, so the
+/// witness cannot say whether a store happened before or after the Store this
+/// window defers. Preserving on it withheld the device's own frames and turned
+/// the screen black (`13ae46d`, 0 of 14 rounds).
+///
+/// The fence deletes the question rather than answering it. A window that lands
+/// before [`crate::runtime::drain::write_stamp`] covers only the interval a
+/// synchronous Store would itself have covered, so there is no interval left in
+/// which a guest write can be both after the Store and before the writeback.
+/// Nothing has to be preserved because nothing is clobbered.
+///
+/// # What the deferral still buys, and what it stops buying
+///
+/// Everything inside one fence survives: a chain of passes into the same surface
+/// still reuses one resident, and `supersede_covered_render_windows` still drops
+/// a window a later Store in the same submission fully covers. What it stops
+/// buying is survival *across* the fence, and that is where this rail's cost is,
+/// because unlike the linear rail it is not free.
+///
+/// `arm_surface_resident_store` exists to skip the whole-framebuffer GPU→host
+/// readback entirely on the ~86 % of windows nothing ever flushes — `draw_phase`
+/// prices that skip at 565 ms per second of wall clock. Landing every window at
+/// its fence pays a readback for each: `surface_resident 49 706` against
+/// `surface_flush 12 343` bounds it at 4× the current landings. That is the trade
+/// this binding makes, and it is a trade rather than a regression only if the
+/// measurement says so, so it is measured on one binary under
+/// `REIMS_VGPU_FENCE_FLUSH_OFF=mapping` with `present_hz` and `draw_us` read both
+/// ways.
+///
+/// The GVA rail's binding was expected to cost frame rate and paid back instead
+/// (5.9 → 9.5 Hz, `draw_us` 524 ms → 156 ms), because the unbounded rail spent
+/// its time in oldest-first `window_cap` eviction storms holding residents pinned
+/// across hundreds of frames. `evict_render_windows_to_cap` is the same shape and
+/// may go the same way, but that is a prediction and not a reading.
+///
+/// The endgame removes the trade rather than choosing a side of it: a resident
+/// whose image memory *is* the guest pages has nothing to write back, which is
+/// why Apple's device has neither this rail nor this cost. That is a backend
+/// allocation change, not a scheduling one.
+///
+/// # Ordering
+///
+/// Render windows first in arm order, then whatever remains, and both through
+/// [`flush_intersecting`] rather than by taking entries directly. That choke
+/// point runs the fixpoint that drags in every sibling overlapping the same guest
+/// bytes, so windows that overlap land together in one pass whatever order this
+/// loop reaches them in — the ordering here decides only which *disjoint* window
+/// goes first, and disjoint windows cannot overwrite each other.
+///
+/// A window may legitimately survive: `flush_intersecting` holds every window on
+/// a condemned backing so `mapper::resolve` can settle whether the delete named
+/// this incarnation. That hold is the existing contract and the fence does not
+/// override it — such a window is not owed to guest RAM until the resolve says
+/// the memory is still ours.
+///
+/// `REIMS_VGPU_FENCE_FLUSH_OFF=mapping` restores the unbounded behaviour on this
+/// rail *only*. That matters more here than on the other two: the GVA and linear
+/// bindings are already measured and the icon verdict depends on them, so an
+/// `=1` control would price this rail against a control that had also given back
+/// two repairs. `=1`/`=all` still revert every rail, for a bisection that wants
+/// the pre-fence device back.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    if state.compute_deferred_flush.is_empty()
+        || crate::observe::fence_flush_disabled(crate::observe::FenceFlushRail::Mapping)
+    {
+        return;
+    }
+    // Snapshot first: landing one window consumes its overlapping siblings
+    // through the fixpoint, so iterating the live map would borrow it across a
+    // mutation. A key already consumed by an earlier pass is skipped rather than
+    // re-flushed.
+    for key in mapping_windows_fence_order(state) {
+        if !state.compute_deferred_flush.contains_key(&key) {
+            continue;
+        }
+        crate::runtime::drain::note_store_route("mapw_fence_flush");
+        flush_intersecting(state, host, key.mapping_id, key.surface_offset, key.span_end);
+    }
+}
+
+/// Metal-direct builds never arm mapping-keyed windows — nothing to land.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
+/// The order [`flush_mapping_windows_before_fence`] lands windows in: render
+/// windows oldest-first by `armed_seq`, then every other window.
+///
+/// Only the render rail carries an arm sequence, and only the render rail can
+/// hold several live windows on one mapping at once (different planes, different
+/// geometries at the same offset). Compute storage windows are keyed by the
+/// dispatch span that produced them and are appended in key order, which is the
+/// order every other flush trigger has always used.
+#[cfg(feature = "backend-vulkan")]
+fn mapping_windows_fence_order(
+    state: &DeviceState,
+) -> Vec<crate::model::ComputeStorageResidencyKey> {
+    let mut render: Vec<(u64, crate::model::ComputeStorageResidencyKey)> = Vec::new();
+    let mut rest: Vec<crate::model::ComputeStorageResidencyKey> = Vec::new();
+    for (key, owner) in &state.compute_deferred_flush {
+        match owner {
+            crate::model::DeferredOwner::Render { armed_seq, .. } => render.push((*armed_seq, *key)),
+            crate::model::DeferredOwner::Storage { .. } => rest.push(*key),
+        }
+    }
+    render.sort_unstable_by_key(|(seq, _)| *seq);
+    render
+        .into_iter()
+        .map(|(_, key)| key)
+        .chain(rest)
+        .collect()
 }
 
 /// Score a deferred window about to write guest RAM against the guest's fence.
@@ -1193,21 +1380,14 @@ fn flush_one<M: HostMemory + HostOps>(
 /// Score a mapping-keyed deferred window against the guest's fence, exactly as
 /// [`note_window_outlived_its_stamp`] scores the GVA rail.
 ///
-/// This rail is measured before it is changed, because it is not obviously the
-/// same case. `ComputeStorageResidencyKey` carries `map_generation`, so a flush
-/// here can already refuse a mapping incarnation the guest replaced — an
-/// allocation identity the GVA rail simply did not have. Whether that is
-/// *enough* depends on whether a guest can free a type-11 surface's storage and
-/// have it reused without the map generation moving, and that is a question for
-/// a boot rather than for an argument.
-///
 /// Counted at the flush dispatcher rather than at each writer, so the two rails
 /// share one denominator; whether a landing actually reached guest RAM is what
 /// the existing `deferred_flush_*` lines already say.
 ///
-/// # Measured, and the answer is NO — do not apply the GVA repair here
+/// # What this counter did NOT settle, and what did
 ///
-/// One 14-round x86/Vulkan icon boot:
+/// The reading that made this rail worth measuring separately still stands. One
+/// 14-round x86/Vulkan icon boot:
 ///
 /// ```text
 /// rendw_stamp_same    0     rendw_stamp_outlived 1088
@@ -1215,10 +1395,10 @@ fn flush_one<M: HostMemory + HostOps>(
 /// elapsed over 217 latched spans: min 1, p50 66, p90 2551, max 17086
 /// ```
 ///
-/// Read as a counter this looks exactly like the GVA rail's 810-of-810, and
-/// that reading is wrong. **The counter is not the hazard.** Outliving the fence
-/// only corrupts memory if the guest can repurpose that memory without the
-/// device finding out, and on these rails it cannot:
+/// Read as a counter that looks exactly like the GVA rail's 810-of-810, and it
+/// does not mean the same thing. **The counter is not the hazard.** Outliving
+/// the fence corrupts memory only if the guest can repurpose that memory without
+/// the device finding out, and on these rails it cannot:
 ///
 /// - [`flush_render_one`] and [`flush_storage_one`] both compare the mapping's
 ///   live `map_generation` against `key.map_generation` and refuse with
@@ -1237,13 +1417,18 @@ fn flush_one<M: HostMemory + HostOps>(
 /// the wire format, so `deferred_pages_still_ours` was the only guard available
 /// and page identity survives free-then-reuse.
 ///
-/// The repair for the GVA rail is therefore NOT owed here, and applying it would
-/// not be free: landing every armed window at every fence on this rail means CPU
-/// writeback of full-screen 1920x1080 frames that ~98 % of the time nothing ever
-/// reads (see [`crate::model::DeferredOwner::Render`]). These counters stay as
-/// the standing check that the guard above keeps holding — if `map_generation`
-/// ever stops covering a way the guest can reclaim surface storage, this is
-/// where it shows up first.
+/// This rail is nonetheless bound to the fence now
+/// ([`flush_mapping_windows_before_fence`]) — for the *other* hazard, which this
+/// counter cannot see and `render_flush_over_guest_write` can: the guest holds
+/// the same IOSurface mapped and writes it, and a full-extent writeback landing
+/// later replaces what it wrote. 8 968 of 12 343 landings on one measured boot.
+/// The free-then-reuse argument above is untouched by that and is still the
+/// reason this rail needed its own evidence instead of the GVA rail's.
+///
+/// These counters stay as the standing check on the `map_generation` guard, and
+/// as the reading of how much deferral the binding actually removed: with the
+/// fence drain wired, `rendw_stamp_same` should carry the traffic and
+/// `rendw_stamp_outlived` should fall to the windows a condemned backing holds.
 fn note_mapping_window_against_fence(
     state: &DeviceState,
     key: &crate::model::ComputeStorageResidencyKey,
@@ -1349,11 +1534,19 @@ fn render_window_identity(
 /// ```
 ///
 /// So the answer this rail reaches for is the right one and the evidence it
-/// would reach for it on is not sound yet. Making it sound is an ordering
-/// problem in the shim — the harvest has to be forced at the Store, and the
-/// bitmap cleared there, so "since" names a real instant — and until it is, a
-/// full-extent landing that reports what it replaced is strictly better than a
-/// partial one that silently withholds the device's frame.
+/// would reach for it on is not sound. A full-extent landing that reports what
+/// it replaced is strictly better than a partial one that silently withholds the
+/// device's frame.
+///
+/// The ordering repair is what actually removes the loss, and it is upstream of
+/// this question rather than an answer to it:
+/// [`flush_mapping_windows_before_fence`] lands every armed window before the
+/// guest is told the work is done, so the interval in which a guest store can be
+/// both after the Store and before the writeback does not exist. Nothing needs
+/// preserving because nothing is clobbered, and this function becomes the
+/// standing check on that — a `render_flush_over_guest_write` after the binding
+/// names a window that landed outside the fence anyway, which is a defect and
+/// not a cost.
 ///
 /// [`crate::runtime::mapping_write::write_bgra8_skipping`] and
 /// `HostOps::guest_written_pages` stay: the sampled ladder's merge uses both,
