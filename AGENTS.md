@@ -1205,6 +1205,94 @@ Goal 3 scorer can ever prove, and it is a reason to weight the fail-log rails ov
 `identity_entry_corrected` is now a distinct decline reason from `translation_moved`, so the two are
 countable apart in any later census.
 
+#### The Goal 3 loss is now countable, and both controls have been run live
+
+`flush_render_one` refuses on five grounds. The three resident-mismatch ones always carried census
+routes; the two **drift** ones did not, and they are the two that lose a painted tile. They are now
+`rendflush_gen_drift` and `rendflush_page_drift`, so a boot can be scored on the Goal 3 event from
+the per-second census instead of by grepping the fail log — which matters because the fail log is one
+line per occurrence and the census is per-interval, the convention mismatch this document records as
+having produced a 100× error.
+
+Validated in production, one binary apart, both arms driven by `wiki-reload-diff.sh` on the same
+article:
+
+```text
+                  attaches  fabricating  fab pages  rendflush_page_drift  deferred_flush_lost
+arm (guard on)       520          0            0             0                    0
+ctl (guard off)      513          5        1 292             1                    1
+```
+
+The control is the positive control the counter needed: **a counter that has only ever read zero has
+not been shown to work.** It fired once, on the same event the fail log recorded, and the arm read
+zero on a boot with 3 514 `surface_flush`es — so the zero is a measurement and not a dead wire.
+
+The same boot is also the live check on the reattribution above. Its one drift reads
+
+```text
+mapping_page_drift mid=14 page=0/1 gva=0x4130000 cached=Some(68354048) live=Some(14086090752)
+  reason=identity_entry_corrected
+```
+
+and `68354048` is `0x4130000` — the GVA exactly. `translation_moved` did not fire at all on that
+boot. Before this change that line would have read "the guest re-pointed this surface and no packet
+said so".
+
+**Do not read the control's pixel verdicts.** Its reload gate failed (`same_frac=0.7819`, needs 0.90)
+and the harness says so; offset 0 came back `UNSCOREABLE shift=33`, which is the new gate correctly
+measuring a 33-row displacement rather than scoring it as a defect. The census counters come from the
+fail log and are independent of the pixel scoring, so the counter validation stands while the pixel
+arm is void. Keep the two apart.
+
+#### Four boots, two arms, byte-identical pixel scores — this page cannot separate arms
+
+Every offset of every `wiki-reload-diff` run so far scores the same, to four decimals, across four
+boots and two arms:
+
+```text
+same_frac   0.9727  0.9457  0.9772  0.9772  0.9831  0.9707  0.9814  1.0000
+diff_cells      84       -       -       -      52      90      73       0
+votes          280     322     214     233     342     236     297     312
+```
+
+It is not a harness scoring one run twice — the captures differ by 456–2 331 pixels between boots,
+and at offset 0 by 123 058. The 8 px cells and the tolerance quantise that boot-to-boot noise away,
+and what survives is the page's own first-load-versus-reload difference, which is deterministic.
+
+So the honest reading is that **this instrument has no measurable device sensitivity on this page**,
+and running more boots of it will not acquire any. It is a working detector — injected fills from
+0.09 to 0.94 of the viewport are caught — pointed at a workload that does not produce the defect.
+Goal 3 needs a different provocation, not a larger n. `blur-provoke.sh` (window capture with a
+backdrop blur, the frame from the user's own crash report) is the untried candidate, and the crash
+report says that is the churn that provokes.
+
+#### Audited: `flush_intersecting` is the only place a live surface's obligation is dropped
+
+A delegated enumeration of every product mutation of `compute_deferred_flush`, `gva_deferred_flush`,
+`linear_deferred_flush` and `deferred_alias_pages` (16 sites; 11 test-only sites excluded) proposed
+two further loss sites. **Both are wrong, and the way they are wrong is worth keeping.**
+
+`retire_linear_residents` (`storage_flush.rs:1371`) drops a linear window without flushing it. That
+is task teardown: the GPU VA maps are gone, and writing guest pages from there is precisely the
+write-after-free class this project exists to fix. It is also not silent — it emits
+`linear_deferred_dropped reason=retired`. This is the `terminal` outcome, which the type-4 section
+above already argues is a cost of nothing.
+
+The claimed contrast — "GVA windows *are* flushed at task teardown, so the linear rail is
+inconsistent" — is a misreading of one argument. `retire_gva_windows` calls
+`flush_gva_one(state, host, *gva, entry, false, "task_retired")`, and that fifth parameter is
+`guest_write`. With it `false` the guest write never happens; the call materialises into the cache
+only. **Both rails decline to write guest pages at teardown.** The audit read the call site and not
+its argument, and it overrode an explicit comment stating the rule.
+
+Net completeness result, which is the useful part: **`flush_intersecting` remains the only site where
+a still-live surface's obligation is taken and its pixels lost.** Everything else is teardown
+(deliberate and reported) or supersede by a newer window covering the same bytes.
+
+The general lesson, since it will recur: an enumeration is cheap to delegate and its *classifications*
+are not trustworthy without reading the arguments at each call site. Take the site list; re-derive the
+verdicts.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
