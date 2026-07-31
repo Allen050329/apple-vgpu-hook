@@ -1859,6 +1859,23 @@ pub struct DeviceState {
     pub host_gva_surfaces: BTreeMap<u64, HostSurface>,
     /// Monotonic recency counter behind [`HostSurface::last_touch`].
     pub gva_touch_seq: u64,
+    /// Running sum of `host_gva_surfaces[*].bgra.len()`, so the byte cap can be
+    /// tested without an O(n) pass over the map on every store.
+    ///
+    /// The same running total [`crate::model::LruBytesMemo`] keeps, for the same
+    /// reason: enforcement runs on the store path, which is the draw path, and
+    /// re-summing a map the cap allows to hold thousands of small entries would
+    /// put that walk in front of every encode.
+    ///
+    /// Maintained at exactly the two sites that change a byte count —
+    /// `store_gva_owned` and `evict_gva`; the other `get_mut` reachers touch
+    /// backing, tokens and recency, never `bgra`. Because a running total is a
+    /// second source of truth, the per-second census recomputes the real sum it
+    /// was already computing for `gva_bytes` and reports the difference as
+    /// `gva_cap_drift`: a nonzero value means a new mutation site was added
+    /// without updating this, which is a bug that would otherwise be invisible
+    /// until the cap silently stopped bounding anything.
+    pub gva_cache_bytes: usize,
     /// The bound [`crate::runtime::surface_cache::enforce_gva_cache_cap`]
     /// holds [`Self::host_gva_surfaces`] to, always
     /// [`GVA_ENCODE_CACHE_BYTE_CAP`] in production.
@@ -2158,6 +2175,7 @@ impl DeviceState {
             host_texture_surfaces: BTreeMap::new(),
             host_gva_surfaces: BTreeMap::new(),
             gva_touch_seq: 0,
+            gva_cache_bytes: 0,
             gva_cache_byte_cap: GVA_ENCODE_CACHE_BYTE_CAP,
             gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),

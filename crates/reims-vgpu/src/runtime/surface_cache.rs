@@ -692,7 +692,14 @@ pub fn store_gva_owned(
     entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
+    // One of the two sites that change this map's byte total; see
+    // [`DeviceState::gva_cache_bytes`]. The replaced entry's bytes are
+    // reclaimed before the new ones are charged, so a store at an existing key
+    // nets to the difference instead of double-counting. Applied to the device
+    // below, once this borrow of the entry has ended.
+    let reclaimed = entry.bgra.len();
     entry.bgra = std::sync::Arc::new(bgra);
+    let charged = entry.bgra.len();
     entry.producer_object_type = object_type;
     // These bytes came from *this* backing, so it replaces whatever the
     // previous store recorded — including a `None` that says the walk could
@@ -719,6 +726,7 @@ pub fn store_gva_owned(
         // against the surviving token immediately after this returns, which is
         // the only moment a baseline may be latched: the bytes are in hand.
         entry.guest_write_gen_at_store = 0;
+        charge_gva_cache_bytes(state, reclaimed, charged);
         enforce_gva_cache_cap(state);
         return;
     }
@@ -735,7 +743,20 @@ pub fn store_gva_owned(
         // has no host. `flush_retired_views` drains the list.
         state.retired_guest_write_tokens.push(stale);
     }
+    charge_gva_cache_bytes(state, reclaimed, charged);
     enforce_gva_cache_cap(state);
+}
+
+/// Move [`DeviceState::gva_cache_bytes`] by one entry's replacement.
+///
+/// Reclaim before charge so the running total never transiently exceeds the
+/// real one, and saturating so a bookkeeping slip can only under-report — an
+/// over-report would make the cap evict content it never needed to.
+fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: usize) {
+    state.gva_cache_bytes = state
+        .gva_cache_bytes
+        .saturating_sub(reclaimed)
+        .saturating_add(charged);
 }
 
 /// Hold [`DeviceState::host_gva_surfaces`] at or under
@@ -766,15 +787,11 @@ pub fn enforce_gva_cache_cap(state: &mut DeviceState) {
     }
     let cap = state.gva_cache_byte_cap;
     let low_water = cap - cap / 8;
-    let bytes = |state: &DeviceState| -> usize {
-        state
-            .host_gva_surfaces
-            .values()
-            .map(|e| e.bgra.len())
-            .sum::<usize>()
-    };
-    let mut live = bytes(state);
-    if live <= low_water {
+    // The running total, not a fresh sum: this runs on the store path, which is
+    // the draw path. See [`DeviceState::gva_cache_bytes`] — the census
+    // recomputes the real figure once a second and reports any divergence, so
+    // trusting it here is checked rather than assumed.
+    if state.gva_cache_bytes <= low_water {
         return;
     }
     // Coldest first. This only runs at the cap boundary, never on the steady
@@ -787,16 +804,17 @@ pub fn enforce_gva_cache_cap(state: &mut DeviceState) {
         .collect();
     by_touch.sort_unstable();
     for (_, gva) in by_touch {
-        if live <= low_water {
+        // `evict_gva` maintains the running total, so this reads the live
+        // figure each round rather than tracking a second copy of it.
+        if state.gva_cache_bytes <= low_water {
             break;
         }
         let Some(e) = state.host_gva_surfaces.get(&gva) else {
             continue;
         };
-        let (freed, width, height) = (e.bgra.len(), e.width, e.height);
+        let (width, height) = (e.width, e.height);
         state.gva_eviction_witness.note_evicted(gva, width, height);
         evict_gva(state, gva);
-        live = live.saturating_sub(freed);
     }
 }
 
@@ -1256,6 +1274,9 @@ pub fn evict_gva(state: &mut DeviceState, gva: u64) {
     // longer has an owner here; dropping the entry without retiring it would
     // leak one tracking set per deleted texture VA.
     if let Some(entry) = state.host_gva_surfaces.remove(&gva) {
+        // The other site that changes this map's byte total; see
+        // [`DeviceState::gva_cache_bytes`].
+        state.gva_cache_bytes = state.gva_cache_bytes.saturating_sub(entry.bgra.len());
         if entry.guest_write_token != 0 {
             state
                 .retired_guest_write_tokens
@@ -1481,6 +1502,11 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     // sum any of it.
     let (cap_evicted, cap_wanted, cap_forgotten) = state.gva_eviction_witness.counts();
     let cap_off = crate::observe::gva_cache_cap_disabled() as u8;
+    // The running total the cap actually tests against, minus the real sum this
+    // census just computed for `gva_bytes`. Always 0; anything else means a
+    // mutation site changed `bgra` without telling `gva_cache_bytes`, and the
+    // cap is bounding a number that has stopped describing the map.
+    let cap_drift = state.gva_cache_bytes as i64 - gva.bytes as i64;
     crate::observe::off(format!(
         "host_cache_levels (levels, not per-interval) total_bytes={total} peak_bytes={peak} \
          surfaces={} surface_bytes={} surface_largest={} \
@@ -1489,7 +1515,7 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          gva_backing_bytes={backing_bytes} \
          gva_backing_moved={moved} gva_backing_unmapped={unmapped} \
          gva_backing_checked={checked} \
-         gva_cap_off={cap_off} gva_cap_bytes={} \
+         gva_cap_off={cap_off} gva_cap_bytes={} gva_cap_drift={cap_drift} \
          gva_cap_evicted={cap_evicted} gva_cap_wanted={cap_wanted} \
          gva_cap_forgotten={cap_forgotten} \
          linear={} linear_bytes={} linear_largest={}",
@@ -3104,6 +3130,62 @@ mod cap_tests {
             0,
             "uncounted, and `forgotten` is the flag that keeps that honest"
         );
+    }
+
+    /// The cap tests a running total, so that total has to equal the map.
+    ///
+    /// A second source of truth is exactly how a bound silently stops bounding:
+    /// under-count and the cap never fires, over-count and it evicts content it
+    /// never needed to. This drives the three transitions that can break it —
+    /// a fresh key, a replace at an existing key (which must net to the
+    /// difference, not double-charge), and an eviction — and holds the total to
+    /// the real sum at every step. `gva_cap_drift` is the same check, live.
+    #[test]
+    fn the_running_byte_total_equals_the_map_after_every_transition() {
+        let truth = |state: &DeviceState| -> usize {
+            state.host_gva_surfaces.values().map(|e| e.bgra.len()).sum()
+        };
+        let mut state = state_capped(usize::MAX);
+        assert_eq!(state.gva_cache_bytes, 0);
+
+        // Fresh keys.
+        for i in 0..8u64 {
+            store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
+            assert_eq!(state.gva_cache_bytes, truth(&state), "after insert {i}");
+        }
+        assert_eq!(state.gva_cache_bytes, 8 * FRAME_BYTES);
+
+        // Replace at an existing key, same size: the total must not move.
+        store_frame(&mut state, 0x1000, 0xFF);
+        assert_eq!(state.gva_cache_bytes, 8 * FRAME_BYTES, "replace double-charged");
+        assert_eq!(state.gva_cache_bytes, truth(&state));
+
+        // Replace at an existing key with a *different* geometry: the old bytes
+        // are reclaimed and the new ones charged.
+        let (w2, h2) = (W * 2, H);
+        store_gva_owned(
+            &mut state,
+            0x1000,
+            w2,
+            h2,
+            vec![0x5A; (w2 * h2 * 4) as usize],
+            0,
+            None,
+        );
+        assert_eq!(state.gva_cache_bytes, truth(&state), "geometry change");
+
+        // Eviction.
+        evict_gva(&mut state, 0x1000);
+        assert_eq!(state.gva_cache_bytes, truth(&state), "after evict");
+        assert_eq!(state.gva_cache_bytes, 7 * FRAME_BYTES);
+
+        // And after the cap itself has run a batch of evictions.
+        state.gva_cache_byte_cap = 4 * FRAME_BYTES;
+        for i in 0..64u64 {
+            store_frame(&mut state, 0x400_0000 + i * 0x1000, i as u8);
+            assert_eq!(state.gva_cache_bytes, truth(&state), "under the cap, round {i}");
+        }
+        assert!(state.gva_eviction_witness.evicted > 0, "the cap must have run");
     }
 
     use std::sync::atomic::Ordering::Relaxed;
