@@ -1320,6 +1320,41 @@ Goal 3 needs a different provocation, not a larger n. `blur-provoke.sh` (window 
 backdrop blur, the frame from the user's own crash report) is the untried candidate, and the crash
 report says that is the churn that provokes.
 
+##### The two instruments now meet, and the price is the animation
+
+`.agents/repros/blur-reload-diff.sh` is that combination: a backdrop-blur document scored by
+`reload-diff.py`. It works because that scorer needs **no palette** — a patch is a localized
+disagreement between two renders of one offset, which is the user's description restated — so the
+intermediate colours that make blur unscoreable by `scrollpatch.py` are irrelevant to it.
+
+`wiki-reload-diff.sh` is reused unchanged as the scoring half, via a new `ANCHORS_SRC` env var that
+makes `discover_anchors` read a locally generated page instead of `curl`ing one. `curl` cannot fetch
+a `file://` URL that exists only in the guest, and hard-coding the anchor names in the caller would
+let a generator change silently reduce a run to fewer offsets than it reports — the failure the
+network path already avoids by reading the live article rather than guessing its section names.
+
+**State the price when quoting any result from it.** `blur-provoke.sh`'s page carries a `.spin`
+element animating forever, which is what makes it churn hardest at rest. That animation makes the
+page unscoreable here by construction: pass A and pass B would differ everywhere and every offset
+would return `CHURN`, which is not a finding. The anchored page drops it, so **it is a weaker
+provocation and must not be described as the same workload.** What remains is real —
+`backdrop-filter` still routes through `filter_backdrop`/`capture_backdrop`, and each anchor
+navigation re-blurs the newly exposed bands — but at capture time the page is at rest, which is
+exactly why it can be scored at all.
+
+So a `none` from this harness means "the strongest provocation that is also scoreable did not produce
+it", not "Goal 3 is absent". The run prints `type4guess.py` and footprint counters beside the pixel
+verdicts for that reason: **a run whose type-4 counters are all zero provoked nothing and has no
+opinion about the page.** Check those before reading the verdict line.
+
+Two page-design traps that are not obvious and are already handled, so a future edit does not
+reintroduce them. The per-band filler text must **differ per band**: `reload-diff.py`'s alignment
+gate votes with rows whose sampled signature is *rare*, and a page of interchangeable rows starves
+that vote into `no_alignment` — unscoreable, on a page that rendered perfectly. And the bands need
+fine detail at all: a blurred flat colour is still flat, and the scorer calls a uniform region
+"blank", so a page of uniform bands would make every cell look like a lost tile to the very rule that
+detects one.
+
 #### Measured on the provoking workload: 65 141 render flushes, none refused
 
 The Wikipedia page cannot separate arms, so the Goal 3 loss rail was re-measured on
