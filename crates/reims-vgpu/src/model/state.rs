@@ -3410,12 +3410,18 @@ impl DeviceState {
                 .collect()
         };
         let mut still_held: std::collections::HashSet<u64> = Default::default();
+        let mut walked = 0u64;
         for (&other, m) in self.mappings.iter() {
             if other == mapping_id {
                 continue;
             }
+            walked += m.page_entries.len() as u64;
             still_held.extend(gpas_of(&m.page_entries));
         }
+        // Reported rather than assumed small. This runs on the drain worker,
+        // which `drain_duty` already shows at 0.93-0.99, and the alias exclusion
+        // costs one pass over everything currently mapped per Unmap.
+        crate::observe::footprint::note_retire_scan(walked);
         let going: Vec<u64> = gpas_of(&doomed.page_entries)
             .into_iter()
             .filter(|g| !still_held.contains(g))

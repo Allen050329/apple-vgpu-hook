@@ -237,6 +237,17 @@ struct Retired {
     frames: AtomicU64,
     /// Writes that landed in a retired frame. The finding.
     hits: AtomicU64,
+    /// Retire events, and the total pages walked to answer them.
+    ///
+    /// Excluding an aliased page needs the *other* live mappings' lists, so a
+    /// retire costs one pass over everything currently mapped. That runs on the
+    /// drain worker, which `drain_duty` already shows at 0.93-0.99, and this
+    /// project's standing rule is not to add work there on the assumption it is
+    /// small. These two say how much it actually is: `scan_pages / scans` is the
+    /// per-Unmap cost and `scans` is the rate. If the product turns out to
+    /// matter, it is measured before it is optimised rather than after.
+    scans: AtomicU64,
+    scan_pages: AtomicU64,
 }
 
 static RETIRED: std::sync::LazyLock<Retired> = std::sync::LazyLock::new(|| {
@@ -246,8 +257,18 @@ static RETIRED: std::sync::LazyLock<Retired> = std::sync::LazyLock::new(|| {
         bits: bits.into_boxed_slice(),
         frames: AtomicU64::new(0),
         hits: AtomicU64::new(0),
+        scans: AtomicU64::new(0),
+        scan_pages: AtomicU64::new(0),
     }
 });
+
+/// One Unmap's retire scan: how many pages it had to walk to exclude aliases.
+pub fn note_retire_scan(pages_walked: u64) {
+    RETIRED.scans.fetch_add(1, Ordering::Relaxed);
+    RETIRED
+        .scan_pages
+        .fetch_add(pages_walked, Ordering::Relaxed);
+}
 
 fn retired_word(frame: u64) -> Option<(&'static AtomicU64, u64)> {
     if frame >= MAX_FRAME {
@@ -299,6 +320,14 @@ pub fn retired_counts() -> (u64, u64) {
     (
         RETIRED.frames.load(Ordering::Relaxed),
         RETIRED.hits.load(Ordering::Relaxed),
+    )
+}
+
+/// `(retire scans, pages walked by them)`.
+pub fn retire_scan_counts() -> (u64, u64) {
+    (
+        RETIRED.scans.load(Ordering::Relaxed),
+        RETIRED.scan_pages.load(Ordering::Relaxed),
     )
 }
 
@@ -442,12 +471,14 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     // frame count beside them and unlike `store_routes`. Summing them across
     // census lines multiplies by the cadence — the 100x error AGENTS.md records.
     let (retired_frames, retired_hits) = retired_counts();
+    let (retire_scans, retire_scan_pages) = retire_scan_counts();
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
          all_ff={all_ff} all_zero={all_zero} samp_bytes={bytes_sampled} \
          ff_bytes={bytes_all_ff} retired={retired_frames} \
-         write_after_retire={retired_hits} (levels, not per-interval)"
+         write_after_retire={retired_hits} retire_scans={retire_scans} \
+         retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
     )];
 
     let last_ms = fp.last_dump_ms.load(Ordering::Relaxed);
@@ -497,6 +528,8 @@ pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     }
     RETIRED.frames.store(0, Ordering::Relaxed);
     RETIRED.hits.store(0, Ordering::Relaxed);
+    RETIRED.scans.store(0, Ordering::Relaxed);
+    RETIRED.scan_pages.store(0, Ordering::Relaxed);
     for cell in [
         &PAYLOAD.calls,
         &PAYLOAD.sampled,
