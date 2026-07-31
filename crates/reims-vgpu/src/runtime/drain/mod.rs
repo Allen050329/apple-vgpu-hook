@@ -3323,6 +3323,54 @@ pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
 static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> =
     std::sync::Mutex::new(None);
 
+/// # This census cannot find the Finder icon defect, and that is now measured
+///
+/// Several sessions have concluded "no counter separates a corrupt icon round
+/// from a clean one" by printing six or eight hand-picked columns. That is a
+/// statement about the columns someone thought to print, not about the census.
+/// It has now been asked of the whole census at once.
+///
+/// Three 14-round `icon-composite.sh` boots, x86 / Vulkan, pooled: **42 scored
+/// rounds, 9 corrupt, 33 clean**. Every counter in this map present in at least
+/// 80% of rounds was normalised per 1000 `draw_scissor_full` — round length
+/// varies ~40% on this rig and almost every draw-path counter is proportional
+/// to it — and ranked by AUC, the probability that a random corrupt round
+/// scores above a random clean one. The best column in the entire census:
+///
+/// ```text
+/// AUC 0.75  surface_flush             permutation p = 0.021 raw
+/// AUC 0.73  load_seed_ok                            p = 0.914 Bonferroni
+/// AUC 0.72  type11_seed_uploaded      (43 columns tested)
+/// AUC 0.72  type11_seed_guest_wrote
+/// AUC 0.71  t11_gw_ref_moved
+/// ```
+///
+/// Corrected for having looked at 43 columns, nothing is distinguishable from
+/// noise. The leaders are also largely one quantity wearing different names — a
+/// type-11 seed upload is a `load_seed_ok_mapping` — so they are one weak
+/// signal, not five.
+///
+/// The reason is structural rather than a gap to be filled by adding counters.
+/// A round runs ~11 000 draws and the defect is **one** icon: a single
+/// operation going wrong is a ~1e-4 perturbation of any population, which no
+/// aggregate can resolve. Adding a counter to this map cannot change that, and
+/// a session that adds one and reads it per round is repeating a measurement
+/// that has now been shown to have no power.
+///
+/// What would have power is a *screen-to-resource join*: name the 64x64 target
+/// backing the cell that is blank in the capture, then dump that one target's
+/// history. [`crate::observe::content_summary`] is the existing half of it — a
+/// correct icon carries hundreds of distinct texels and a blank one collapses
+/// to one — and the missing half is the mapping from a screen rectangle to a
+/// target identity.
+///
+/// Settled by the same three boots, so nobody re-runs it: the Vulkan
+/// synchronization repairs are not the producer either. Corruption rates were
+/// 3/14 before them, 4/14 after the first, 2/14 after all five. The hazards
+/// they closed were real undefined behaviour and those fixes stand on that
+/// ground alone — see
+/// [`crate::backend::vulkan::engine::exec::resident_read_source_scope`] — but
+/// they do not move this class.
 pub fn note_store_route(route: &'static str) {
     note_store_route_n(route, 1);
 }

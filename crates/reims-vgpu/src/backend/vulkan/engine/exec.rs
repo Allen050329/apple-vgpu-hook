@@ -2518,6 +2518,28 @@ fn color_range() -> vk::ImageSubresourceRange {
 /// (`TRANSFER_WRITE`). Naming all three costs nothing a reader can measure and
 /// removes the need for every call site to know which one produced the pixels
 /// it is about to copy.
+///
+/// # What the repairs in this family did and did not fix
+///
+/// They were found while looking for the Finder icon defect, and they are not
+/// it. Three 14-round `icon-composite.sh` boots, x86 / Vulkan: **3/14 corrupt
+/// rounds before any of them, 4/14 after the first, 2/14 after all five.** No
+/// effect at this n, and none claimed.
+///
+/// They stand on their own ground instead. Every one closed a read or write of
+/// a registry-resident image that took no dependency on the work that last
+/// touched it, which is undefined behaviour whatever it does to an icon, and
+/// the shared shape of the mistake is worth remembering because it looked
+/// correct five times in a row: **a barrier was skipped whenever the image was
+/// already in the layout the operation wanted.** A barrier is a layout
+/// transition *and* a dependency, and for a resident — which by design outlives
+/// the draw, with no fence between consecutive users — the layout is the half
+/// that is usually already right and the dependency is the half that is always
+/// needed.
+///
+/// The pooled census that scored those boots, and why no counter in it can
+/// resolve this class, is recorded on
+/// [`crate::runtime::drain::note_store_route`].
 pub(super) fn resident_read_source_scope() -> (vk::PipelineStageFlags, vk::AccessFlags) {
     (
         vk::PipelineStageFlags::ALL_COMMANDS,
