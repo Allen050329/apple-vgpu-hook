@@ -7449,6 +7449,38 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
 /// Free at this call site by construction — `arm_gva_deferred_store` has just
 /// walked the span to build `pages`, so this adds a hash and a map probe rather
 /// than a page walk.
+///
+/// # Measured: it happens, at 5.6 % of arms, and it is not the icon rate
+///
+/// One driven 14-round x86/Vulkan boot:
+///
+/// ```text
+/// gvares_same_alloc 59 138   gvares_aliased 3 487   gvares_regeom 3 112
+/// aliased geometries: 64x64 x227, 1938x42 x32, 675x52 x23, ...
+/// ```
+///
+/// So the collision is real and common: about one GVA render-target arm in
+/// eighteen binds an engine image that belongs to a *different* guest
+/// allocation, and the geometry that dominates is 64x64 — a folder icon
+/// exactly, the same geometry the Finder icon class corrupts at.
+///
+/// **It is nevertheless not sufficient for the visible defect.** That boot
+/// scored 14 of 14 rounds CLEAN with 3 487 aliased arms in it. Binding another
+/// allocation's image is a contract violation on its own terms and worth
+/// removing, but no claim that removing it fixes the icon rate is supported by
+/// this measurement.
+///
+/// The same boot also broke the gate it was run under. `b820520` had found that
+/// driving the VM for 600 s before the icon harness produced 14 of 14 corrupt,
+/// and offered that as a repro; this boot did exactly that and produced 14 of 14
+/// clean. Pooled over five 14-round boots on this branch's fixed binary the
+/// picture is 0, 0, 0, 14, 0 corrupt — **all-or-nothing per boot**, never
+/// mixed. Whatever decides it latches once per boot and then holds for every
+/// round, which is why single-boot round counts have been so misleading here and
+/// why 8-of-14 and 1-of-14 boots were recorded on one binary earlier.
+///
+/// Scoring anything on this class therefore needs boots, not rounds. A change
+/// that is measured on one boot has measured the latch, not the change.
 #[cfg(feature = "backend-vulkan")]
 fn note_gva_resident_aliasing(
     state: &mut DeviceState,
