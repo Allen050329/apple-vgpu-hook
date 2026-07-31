@@ -2290,12 +2290,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         }
                     }
                 }
-                // Per-op echo of a routine lifecycle op — the always-on rate is
-                // the `teardown_churn ... replace=` window summary
-                // (lifecycle_churn). Keep the per-op detail (inv/condemn split)
-                // gated so it does not flood the always-on sink; the
-                // `draw_log_enabled()` guard also skips the format alloc on a
-                // healthy boot (mirrors the DeleteIOSurfaceBacking2 site above).
+                // Per-op echo of a routine lifecycle op. Keep the per-op detail
+                // (inv/condemn split) gated so it does not flood the always-on
+                // sink; the `draw_log_enabled()` guard also skips the format
+                // alloc on a healthy boot (mirrors the DeleteIOSurfaceBacking2
+                // site above).
                 if crate::observe::draw_log_enabled() {
                     crate::observe::line(format!(
                         "map_family op=ReplacePhysical ch={channel_id} task={task_id} object={object_id} plen={plen} inv_pages={n_inv} condemned={n_cond}"

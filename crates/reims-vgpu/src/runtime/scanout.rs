@@ -460,7 +460,7 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             // (nothing below consumes the stats), so gate the whole block behind
             // REIMS_VGPU_DRAW_LOG: a normal boot pays neither the scan nor the flood.
             // The always-on present rate/occupancy signal lives in the
-            // present_proxy summary + `present_import`.
+            // `present_proxy` summary.
             if crate::observe::draw_log_enabled() {
                 let (nz, maxb, rgb_nz, max_rgb, px0) =
                     crate::observe::bgra_present_stats(&state.present.frame_bgra);

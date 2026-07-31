@@ -618,7 +618,7 @@ pub(crate) const REGISTRY_CAP: usize = 320;
 /// **Wall-clock, not publish-count:** the drain clock is fed from the poll
 /// heartbeat (`device_poll`, ~244 Hz), which ticks even when the guest stops
 /// compositing and issuing present publishes. A publish-count clock froze on a
-/// static page (measured `present_import used_hz=0`), so a burst's ~260 stale
+/// static page — measured at zero publishes per second — so a burst's ~260 stale
 /// residents (~516 MiB) never aged out and VRAM never returned to the ~1005 MiB
 /// idle baseline. Real time keeps advancing regardless of guest activity.
 const IDLE_TARGET_AGE_MS: u64 = 2000;

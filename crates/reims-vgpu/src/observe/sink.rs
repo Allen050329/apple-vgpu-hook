@@ -181,7 +181,7 @@ fn emit(sink: Sink, msg: &str) {
 /// `log_flood_detected` line per window per runaway prefix, so a regression that
 /// reintroduces a flood is named on the very boot it lands instead of silently
 /// drowning real failures. Legitimate always-on lines are self-clocked windowed
-/// summaries (`teardown_churn`, `present_import`) well under the threshold.
+/// summaries (`drain_duty`, `store_routes`) well under the threshold.
 const FLOOD_WINDOW_MS: u128 = 1000;
 const FLOOD_THRESHOLD_PER_WINDOW: u64 = 1000;
 

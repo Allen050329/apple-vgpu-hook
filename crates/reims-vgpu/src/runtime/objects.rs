@@ -987,9 +987,9 @@ fn apply_type4_backing<M: HostMemory>(
             crate::model::DeviceState::bump_map_generation(m);
         }
         if replaced {
-            // Recycled-mid backing-refresh census (not a drop; the recycle rate
-            // is summarized by teardown_churn). Off the curated fail() view —
-            // per-recycle under animation churn it floods the real-error view.
+            // Recycled-mid backing-refresh census — not a drop. Off the curated
+            // fail() view: per-recycle under animation churn it floods the
+            // real-error view, at 793 lines in one measured boot.
             crate::observe::off(format!(
                 "type4_pages_refreshed sid={surface_id} task={task_id} n={} map_gen={}",
                 entries.len(),

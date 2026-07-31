@@ -1080,8 +1080,8 @@ pub fn device_poll(id: u64) -> bool {
         .store(device.state.display.online_acked, Ordering::Release);
     // Census both source polls and the independently time-gated VBL rate.
     // Drive the resident idle-drain off the poll heartbeat, which ticks even when
-    // the guest stops compositing (a static page → `present_import used_hz=0` →
-    // no publishes). A publish-clocked drain froze there, pinning a burst's ~260
+    // the guest stops compositing (a static page means no publishes at all).
+    // A publish-clocked drain froze there, pinning a burst's ~260
     // stale residents (~516 MiB) for the guest lifetime; the wall clock keeps
     // advancing and returns VRAM to baseline. The presented target is kept alive
     // by identity so it is never reclaimed from under the display. The engine
