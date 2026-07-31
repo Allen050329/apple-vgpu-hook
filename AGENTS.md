@@ -875,26 +875,43 @@ So `mapping_gpa_span` alone identifies the defect: a `src=type4` span whose `hi 
 is a translation. Note also where the fabricated spans land — 0x18bda000–0x20dda000, **415–549 MiB**
 — which is low guest RAM, where the kernel's own allocations live.
 
-#### Fabrication is a late-session phenomenon, and a fresh-boot harness cannot see it
+#### Fabrication tracks the page, not the clock — the flat-colour page barely provokes it
 
-The single most important fact for anyone pointing a pixel scorer at this class. Fabrication
-timestamps, both control boots of the run above, in ms since the device's first log line:
+This section first read the data below as "fabrication is a late-session phenomenon" and concluded a
+harness must drive for eight minutes to see it. The next boot falsified that in twenty seconds, and
+the corrected reading is more useful than the original.
+
+Fabrication timestamps, in ms since the device's first log line. The first two boots drive
+`scroll-patch.sh`'s **generated flat-colour page**; the third is a Wikipedia browse:
 
 ```text
-ctl-1   419 686  421 800  434 641  494 616  527 811  554 685  614 648  633 659
-ctl-2   402 295  459 571  489 797  508 285  508 320  568 190  589 265  628 321  629 455
+flat page   ctl-1   419 686  421 800  434 641  494 616  527 811  554 685  614 648  633 659
+flat page   ctl-2   402 295  459 571  489 797  508 285  508 320  568 190  589 265  628 321  629 455
+wikipedia           20 714  102 541  143 594  190 270  224 730  269 402  285 290  …
 ```
 
-**Nothing before 402 s.** `scroll-patch.sh` opens its page as soon as ssh answers and defaults
-`PREDRIVE_SECS=0`, so all three of its recorded `none` results scored the first minutes of a boot —
-a stretch in which this class has never once been observed. That is the likeliest reading of those
-nulls, and it is a harness fault of the same family as the ones above: the harness could not reach
-the state, and reported that as a clean page. Any run meant to see this class must drive past the
-earliest observed fabrication first; `.agents/repros/g3-fabrication-ab.sh` sets `PREDRIVE_SECS=480`
-for that reason and says so in situ.
+**Nothing before 402 s on the flat page; the first fabrication on Wikipedia is at 20.7 s.** So the
+variable is the workload, not elapsed session time, and the earlier "accumulated churn" guess was
+guessing at a pattern that was not there. Two boots of one page cannot tell a property of the class
+from a property of the page — and this document already says a single workload cannot, in the
+sentence about a scorer written from one report.
 
-Why it is late is not established. Accumulated address-space churn is the obvious guess and it is
-only a guess — nobody has varied session length as an independent variable.
+The corrected reading matters for what to point a pixel scorer at. The generated page is six flat
+colours in promoted layers, which is what makes it *scoreable* by palette — and it is a weak
+provocation, producing a handful of long-lived tiles. Wikipedia produces a stream of short-lived
+surfaces at many geometries: the seven above are 62×52, 1225×512, 193×864, 1225×512, 64×64, 16×16
+and 1225×512, so the class is **not** confined to the WebKit tile strip that the first A/B's control
+made it look like. Wikipedia is also where the user reported the defect.
+
+That leaves the harness with a real tension rather than a fix: the page that provokes the class is
+the page whose palette cannot be scored, and the page that can be scored barely provokes it.
+`.agents/repros/g3-fabrication-ab.sh` splits the difference by browsing Wikipedia for
+`PREDRIVE_SECS` first and then scoring the flat page, so one boot carries both. Whether a
+provocation in the predrive produces a patch on a *different* page afterwards is exactly the thing
+that run is testing, and it is not obviously true.
+
+`scroll-patch.sh`'s three recorded `none` results are still unexplained by anything measured. "It
+never reached the state" is now only one candidate and no longer the leading one.
 
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
