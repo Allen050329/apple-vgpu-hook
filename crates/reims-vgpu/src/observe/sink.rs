@@ -768,6 +768,34 @@ pub fn fence_flush_disabled() -> bool {
 /// rebuilds QEMU every boot, so a baseline from another tree measures the
 /// rebuild as well as the change. The knob is what makes the arm and its
 /// control one binary apart.
+///
+/// # UNRESOLVED: the arm did not reach a desktop and the control did
+///
+/// First boot of the generation (x86/Vulkan, one binary, both arms):
+///
+/// ```text
+/// arm      (knob unset)  QEMU up 11:49:50, guest kernel booted 12:42:58.
+///                        53 minutes with ONLY `host_window_cadence` in the
+///                        fail log — not one guest GPU command — and a macOS
+///                        restart screen on the host window. It came up only
+///                        after a host-side click, and ran normally after that.
+/// control  (knob set)    guest answered ssh 33 s after launch, GPU traffic
+///                        flowing (`linux_m2v_async`, `compute_linux`, `type4`),
+///                        desktop and Dock painted correctly.
+/// ```
+///
+/// One boot per arm, so this is not yet a verdict — but it is the shape that
+/// `13ae46d` turned the screen black with, and the next session must re-run
+/// both arms BEFORE trusting the generation. If the arm hangs again, the
+/// default must flip to off (or the change be reverted) until the mechanism is
+/// understood: a guest that never attaches its GPU driver is worse than any
+/// aliased image.
+///
+/// What makes it puzzling, and what to check first: the arm produced *zero*
+/// guest GPU commands, so the hang happened before this code could run on any
+/// draw. That points away from the generation itself and toward the boot
+/// sequence — a plain early-boot hang unrelated to the change is entirely
+/// possible, and one boot cannot tell the two apart.
 pub fn gva_identity_gen_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {
