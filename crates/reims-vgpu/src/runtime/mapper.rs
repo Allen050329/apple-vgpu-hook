@@ -1112,22 +1112,41 @@ pub fn type4_pages_still_ours<H: HostMemory>(
     for (i, &entry) in m.page_entries.iter().enumerate() {
         let gva = ((walk.backing_pfn as u64) + i as u64) << page_shift;
         let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
-        // Identity fallback matches the walk that produced the entry
-        // (`resolve_type4_surface_ex`): a page the table cannot translate was
-        // adopted at its own GVA when that address was readable RAM, so the
-        // repeat has to accept the same answer or it would call every such
-        // entry drifted.
-        let live = match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
-            Some(gpa) => Some(gpa & !(page_size - 1)),
-            None => Some(gva & !(page_size - 1)),
-        };
-        if cached != live {
+        let walked = crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift);
+        let Some(live) = walked.map(|gpa| gpa & !(page_size - 1)) else {
+            // No translation now. This used to answer the failed walk with the
+            // GVA, to match the identity fallback that produced the entry, and
+            // that mirror had to go with it: `apply_type4_backing` no longer
+            // adopts a page at its own GVA, so the only entry this could still
+            // accept is one the control arm made.
+            //
+            // The distinction is not cosmetic. Reporting the substitute as
+            // `live` made a walk that FAILED indistinguishable from one that
+            // succeeded and disagreed, so every such page was written up as
+            // `translation_moved` — "the guest re-pointed this surface" — when
+            // nothing had moved and the device simply could not translate it.
+            // Both outcomes refuse the write; only one of them is about the
+            // guest.
+            if crate::observe::type4_identity_guard_disabled() && cached == Some(gva) {
+                continue;
+            }
             crate::observe::fail(format!(
                 "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
-                 cached={cached:?} live={live:?} reason=translation_moved \
-                 (the guest re-pointed this surface and no packet said so)",
+                 cached={cached:?} live=None reason=no_translation \
+                 (this task cannot translate the page the entry was walked from)",
                 walk.task_id,
                 m.page_entries.len()
+            ));
+            return false;
+        };
+        if cached != Some(live) {
+            crate::observe::fail(format!(
+                "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
+                 cached={cached:?} live={:?} reason=translation_moved \
+                 (the guest re-pointed this surface and no packet said so)",
+                walk.task_id,
+                m.page_entries.len(),
+                Some(live)
             ));
             return false;
         }
@@ -2447,6 +2466,83 @@ mod tests {
         assert!(
             super::type4_pages_still_ours(&state, &host, 6),
             "the translation is back where the list says it is"
+        );
+    }
+
+    /// A page the task cannot translate at all is a different finding from one
+    /// that translates somewhere new, and the witness has to say which.
+    ///
+    /// The failed walk used to be answered with the GVA, to match the identity
+    /// fallback that built such entries. Both outcomes refuse the write, so the
+    /// substitution cost nothing in safety — it cost the diagnosis. Every page
+    /// whose walk failed was written up as `translation_moved`, "the guest
+    /// re-pointed this surface and no packet said so", when the guest had done
+    /// nothing at all.
+    #[test]
+    fn a_page_the_task_cannot_translate_is_not_reported_as_a_move() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        crate::observe::redirect_logs_for_tests();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![
+                (((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+        assert!(super::type4_pages_still_ours(&state, &host, 6));
+
+        // The translation goes away rather than moving: the PTE is cleared, so
+        // the walk fails outright.
+        let at = std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .len();
+        st32(&mut pte, 0);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert!(
+            !super::type4_pages_still_ours(&state, &host, 6),
+            "a page the table cannot translate must not vouch for a write"
+        );
+        let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
+        let fresh: Vec<&str> = body[at.min(body.len())..]
+            .lines()
+            .filter(|l| l.starts_with("mapping_page_drift "))
+            .collect();
+        assert!(
+            fresh.iter().any(|l| l.contains("reason=no_translation")),
+            "the refusal must name the failed walk, got: {fresh:?}"
+        );
+        assert!(
+            !fresh.iter().any(|l| l.contains("reason=translation_moved")),
+            "nothing moved — blaming the guest here is the bug: {fresh:?}"
         );
     }
 

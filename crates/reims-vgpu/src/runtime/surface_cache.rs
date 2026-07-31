@@ -784,6 +784,24 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
     if backing.gpas.is_empty() {
         return;
     }
+    // `task_gva_page_gpas_dense` keeps one slot per page and writes `0` where a
+    // page did not resolve, because its other caller compares whole lists as a
+    // mapping identity and holes have to keep their positions. A hole is not an
+    // address, so it must not be armed: `track_guest_writes` would watch guest
+    // page 0 on this surface's behalf, and page 0 is busy, so the witness would
+    // report writes that are nothing to do with these pixels.
+    //
+    // Dropping the holes and arming the rest is the other option and is worse.
+    // This witness is asked whether the guest wrote a surface, and a partial
+    // watch can only answer "clean" about a page it never watched — a false
+    // clean is what lets the device reuse content the guest has replaced. An
+    // unarmed witness says "unknown", which every reader already handles,
+    // because the host shim maps token 0 to `None` during its own startup
+    // window.
+    if backing.gpas.contains(&0) {
+        crate::runtime::drain::note_store_route("gvac_gw_hole_unarmed");
+        return;
+    }
     let gpas = backing.gpas.clone();
     let Some(token) = host.track_guest_writes(&gpas, page_size) else {
         return;
@@ -2027,6 +2045,76 @@ mod tests {
 
         // An address with no entry at all is not a silent pass either.
         assert!(gva_guest_wrote_since_store(&st, &host, 0xdead_0000));
+    }
+
+    /// A hole in the page list is not an address, so it must not be watched.
+    ///
+    /// `task_gva_page_gpas_dense` writes `0` where a page did not resolve,
+    /// because its other caller compares whole lists as a mapping identity and
+    /// the holes have to keep their positions. Arming that list registers guest
+    /// page 0 on this surface's behalf, and page 0 is busy, so the witness would
+    /// answer with traffic that has nothing to do with these pixels.
+    ///
+    /// Dropping the holes and arming the rest is the tempting alternative and is
+    /// the worse one: a partial watch can only ever answer "clean" about a page
+    /// it never watched, and a false clean is what lets the device keep content
+    /// the guest has already replaced. Unarmed reads as written, which costs a
+    /// re-read and never a wrong picture.
+    #[test]
+    fn a_backing_with_a_hole_is_not_armed() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let root_gpa = setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        let gva = page;
+        // 64x192 BGRA8 spans three pages, so there is a middle one to punch out.
+        let (w, h) = (64u32, 192u32);
+
+        let whole = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
+        assert!(whole.gpas.iter().all(|&g| g != 0), "fixture starts complete");
+        store_gva_owned(
+            &mut st,
+            gva,
+            w,
+            h,
+            vec![0xA5u8; (w * h * 4) as usize],
+            0,
+            Some(whole),
+        );
+        arm_gva_guest_write_witness(&mut st, &mut host, gva);
+        // Assert the entry's token, not the host's live-set count: a superseded
+        // set stays live until `flush_retired_views` drains it, so the count
+        // cannot distinguish "armed again" from "the old one is still around".
+        assert_ne!(
+            st.host_gva_surfaces.get(&gva).map(|e| e.guest_write_token),
+            Some(0),
+            "a complete page list is the case that must still arm"
+        );
+
+        // Punch the middle page out and re-store: the list keeps its length and
+        // carries a hole where the page was.
+        repoint_pte(&mut host, root_gpa, 2, 0);
+        let holed = gva_backing(&st, &host, 1, gva, w, h).expect("walk still names the span");
+        assert_eq!(holed.gpas[1], 0, "the hole sits where the page is");
+        store_gva_owned(
+            &mut st,
+            gva,
+            w,
+            h,
+            vec![0x5Au8; (w * h * 4) as usize],
+            0,
+            Some(holed),
+        );
+        arm_gva_guest_write_witness(&mut st, &mut host, gva);
+        assert_eq!(
+            st.host_gva_surfaces.get(&gva).map(|e| e.guest_write_token),
+            Some(0),
+            "the holed list must leave the entry unarmed, not watch guest page 0"
+        );
+        assert!(
+            gva_guest_wrote_since_store(&st, &host, gva),
+            "an unarmed entry reads as written"
+        );
     }
 
     /// Dropping an entry drops its host-side tracking set with it.
