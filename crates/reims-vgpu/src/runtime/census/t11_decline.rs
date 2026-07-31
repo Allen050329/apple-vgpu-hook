@@ -5,8 +5,7 @@
 //! zero-copy guest gather (`t11_zc`), exactly one reason gated it out. Under
 //! video playback `t11_guest` is the dominant remaining CPU copy (hundreds of
 //! MB/session), so knowing *why* zero-copy declined names the next lever
-//! precisely — a below-floor span wants a floor rethink, a resident-gated skip
-//! wants a zero-copy retry after a failed resident sample, a stride/format
+//! precisely — a below-floor span wants a floor rethink, a stride/format
 //! decline wants a format extension. This counts each decline by reason so one
 //! boot log turns the lead into a fact.
 //!
@@ -17,14 +16,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Why a type-11 sampled bind declined the zero-copy guest gather and fell to
-/// the CPU byte loader. One variant per distinct early-out in the rail plus the
-/// call-site resident gate.
+/// the CPU byte loader. One variant per distinct early-out in the rail.
+///
+/// There is no call-site gate to name any more: the gather is attempted for
+/// every bind that reaches the guest-pages rung, because reaching it already
+/// means no host-side copy served the bind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reason {
-    /// A ready resident target was authoritative, so the zero-copy gather is
-    /// never attempted (gated on `!resident_ready`); the resident sample itself
-    /// failed and the bind fell through to the CPU load.
-    ResidentGated,
     /// Mapping absent, unmapped, or carries no page entries.
     Unmapped,
     /// Pixel format is not one of the byte-identical zero-copy formats
@@ -46,26 +44,24 @@ pub enum Reason {
     ImportFail,
 }
 
-const N: usize = 9;
+const N: usize = 8;
 
 impl Reason {
     const fn idx(self) -> usize {
         match self {
-            Reason::ResidentGated => 0,
-            Reason::Unmapped => 1,
-            Reason::BadFormat => 2,
-            Reason::NoWindow => 3,
-            Reason::Stride => 4,
-            Reason::BelowFloor => 5,
-            Reason::UnstableMap => 6,
-            Reason::Coverage => 7,
-            Reason::ImportFail => 8,
+            Reason::Unmapped => 0,
+            Reason::BadFormat => 1,
+            Reason::NoWindow => 2,
+            Reason::Stride => 3,
+            Reason::BelowFloor => 4,
+            Reason::UnstableMap => 5,
+            Reason::Coverage => 6,
+            Reason::ImportFail => 7,
         }
     }
 }
 
 const NAMES: [&str; N] = [
-    "resident_gated",
     "unmapped",
     "bad_format",
     "no_window",
@@ -126,7 +122,7 @@ mod tests {
     fn note_accumulates_per_reason_and_line_names_every_reason() {
         let (before, before_total) = snapshot();
         note(Reason::BelowFloor, 243_000);
-        note(Reason::ResidentGated, 0);
+        note(Reason::Unmapped, 0);
         let (after, after_total) = snapshot();
         assert_eq!(after_total - before_total, 2);
         let bf = Reason::BelowFloor.idx();

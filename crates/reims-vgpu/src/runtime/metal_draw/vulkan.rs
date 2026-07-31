@@ -1073,67 +1073,74 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     }
                 };
 
+                // What the hypervisor can say about the guest's own stores into
+                // this surface since the Store that produced our copies of it.
+                // Asked once here and used by every rung below, because every
+                // rung below either serves a host-side copy — whose currency
+                // this is the only witness for — or reads the pages and does
+                // not care. The host-cache rung used to ask it privately; the
+                // resident rung above it asked nothing at all.
+                let guest_write = mapping_guest_write_verdict(state, host, mid);
+                let guest_replaced = guest_replaced_host_copies(guest_write);
+
                 // A ready resident target is authoritative after a product
-                // Store, exactly as it is for a subsequent attachment Load.
-                // Bind it directly before touching full-frame CPU mirrors.
+                // Store — but only while nothing has replaced the bytes it is a
+                // copy of. A type-11 surface's pages are plain guest RAM and the
+                // guest CPU stores into them with no device operation, so a
+                // resident produced for one tenant of the surface keeps claiming
+                // to hold its pixels after the guest has painted different ones
+                // there. This is the same question `type11_guest_wrote_since_store`
+                // asks before the attachment LOAD elision reuses a resident, and
+                // the same one the host-cache rung below asks before serving its
+                // copy. This rung asked neither, and it is the largest of the
+                // three: one 14-round Finder boot measured 92 730 binds here
+                // against the cache rung's 14 396.
+                //
+                // It also sits *above* both rungs that read the guest's own
+                // pages, so a stale bind here is never corrected by anything
+                // below it — the wrong image is held for as long as the guest
+                // keeps re-binding the same surface, which is what "renders
+                // correctly for a few frames then stays corrupted" looks like
+                // from inside the guest.
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
-                    {
-                        note_type11_sample_rung(state, host, "t11rung_resident", mid);
+                    if !guest_replaced {
+                        note_type11_sample_rung("t11rung_resident", guest_write);
                         return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
+                    }
+                    note_type11_sample_rung("t11rung_resident_refused", guest_write);
+                    // A resident that stops matching its surface is a real
+                    // correction, not routine control flow: without this line a
+                    // boot cannot tell "the guest never rewrites its sampled
+                    // surfaces" from "the witness is never armed". Latched per
+                    // mapping so a surface the guest repaints every frame stays
+                    // at one line.
+                    if crate::observe::first_sight("sampled_resident_stale", u64::from(mid)) {
+                        crate::observe::off(format!(
+                            "sampled_resident_stale mid={mid} {w}x{h} \
+                             (guest wrote the pages this resident copies; reading them instead)"
+                        ));
                     }
                 }
 
-                // 1) Host cache. Taken unconditionally: a ready resident already
-                // returned above, so this line is reached only with
-                // `resident_ready == false` and there is nothing for the cache
-                // bytes to lose to.
-                //
-                // What stood here was `let (nz,_,_) = rgba_rgb_stats(&rgba); if
-                // nz > 0 || !resident_ready`, i.e. an O(w*h) count of non-black
-                // pixels — 2 073 600 per bind at 1080p, on a path the census
-                // measures at ~29k resident samples a session — feeding a
-                // decision about *which image gets bound*. Two things were wrong
-                // with it and they compound: `runtime/census/README.md` forbids
-                // exactly this ("a proxy that changes behaviour has stopped
-                // being a proxy and become a content heuristic"), and an
-                // all-black frame is a legal frame, so the test mistook a
-                // correct black surface for an empty one.
-                //
-                // The disjunct also could not change the outcome. `!resident_ready`
-                // is true here on both backends — under `backend-vulkan` because
-                // the `if resident_ready` above returns, and under `backend-metal`
-                // because `resident_ready` is bound to `false` outright — so the
-                // condition was already unconditionally true and the scan's
-                // result was discarded. The identical gate on the guest-pages
-                // branch below had already been worked out and removed for this
-                // reason; its comment says so. This one kept paying for the scan.
-                // ...but only while the hypervisor has not seen the guest
-                // rewrite the pages these bytes are a copy of. This rung sits
-                // above both rungs that read the guest's own pages, so a stale
-                // hit here is never corrected by anything below it; falling
+                // 1) Host cache — the other host-side copy of these pages, and
+                // so gated on exactly the same witness as the resident above.
+                // It sits above both rungs that read the guest's own pages, so a
+                // stale hit is never corrected by anything below it; falling
                 // through costs a re-read and reaches content that is
                 // authoritative by construction.
                 //
-                // Only `Wrote` refuses. The census says the pooled answer is
-                // 14 092 `no_stamp` against 304 `wrote` — and `no_stamp` means
-                // "nobody asked the host to watch these pages", which is a
-                // statement about this device's arming, not about the guest.
-                // Refusing on it would turn 98 % of the rung off and re-read a
-                // surface per bind on the strength of a rail that was never
-                // armed. The arming gap is the follow-up; serving bytes the
-                // host has *watched the guest replace* is the part that is
-                // wrong today.
-                let host_cache_is_current = !matches!(
-                    mapping_guest_write_verdict(state, host, mid),
-                    GuestWriteVerdict::Wrote
-                );
-                if let Some(bgra) = host_cache_is_current
+                // No content scan gates this. What stood here counted non-black
+                // pixels (2 073 600 per bind at 1080p) and let the count decide
+                // which image got bound — `runtime/census/README.md` forbids
+                // exactly that, and an all-black frame is a legal frame, so the
+                // test mistook a correct black surface for an empty one.
+                if let Some(bgra) = (!guest_replaced)
                     .then(|| crate::runtime::surface_cache::get(state, mid, w, h))
                     .flatten()
                 {
                     let rgba = std::sync::Arc::new(swap_rb_channels(bgra));
-                    note_type11_sample_rung(state, host, "t11rung_host_cache", mid);
+                    note_type11_sample_rung("t11rung_host_cache", guest_write);
                     return Some((
                         w,
                         h,
@@ -1142,38 +1149,32 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     ));
                 }
 
-                // 2) Guest pages. When no resident is authoritative the guest
-                // bytes are taken unconditionally (no nz promotion check), so
-                // the zero-copy gather can bind them without CPU bytes; with a
-                // ready resident the CPU load below keeps the empty→resident
-                // promotion (needs the nz stat).
+                // 2) Guest pages, which are what the surface *is*. Reached only
+                // when no host-side copy served the bind — no resident, or one
+                // the guest has written over — so the gather always runs and the
+                // guest bytes are taken unconditionally.
                 // Why the zero-copy gather declined this bind — recorded on the
                 // CPU t11_guest load below so a boot names the dominant lever
-                // (below_floor / resident_gated / stride / …). ResidentGated
-                // covers the case a ready resident pre-empts the gather (the
-                // gather is only attempted when `!resident_ready`).
-                #[allow(unused_mut)]
-                let mut t11_zc_decline = t11_decline::Reason::ResidentGated;
+                // (below_floor / stride / coverage / …).
                 #[cfg(feature = "backend-vulkan")]
-                if !resident_ready {
-                    match try_type11_sample_zero_copy(state, host, mid, w, h) {
-                        Ok(src) => {
-                            note_type11_sample_rung(state, host, "t11rung_zero_copy", mid);
-                            return Some((w, h, mid, src));
-                        }
-                        Err(reason) => t11_zc_decline = reason,
+                let t11_zc_decline = match try_type11_sample_zero_copy(state, host, mid, w, h) {
+                    Ok(src) => {
+                        note_type11_sample_rung("t11rung_zero_copy", guest_write);
+                        return Some((w, h, mid, src));
                     }
-                }
-                // This path is reached only with `resident_ready == false` (a
-                // ready resident binds its target and returns above),
-                // so the guest bytes are taken unconditionally — the historical
-                // `nz > 0 || !resident_ready` promotion gate is always true here.
+                    Err(reason) => Some(reason),
+                };
+                // No gather on the Metal path, so there is no decline to name.
+                #[cfg(not(feature = "backend-vulkan"))]
+                let t11_zc_decline: Option<t11_decline::Reason> = None;
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
-                    t11_decline::note(t11_zc_decline, rgba.len());
-                    note_type11_sample_rung(state, host, "t11rung_guest_memo", mid);
+                    if let Some(reason) = t11_zc_decline {
+                        t11_decline::note(reason, rgba.len());
+                    }
+                    note_type11_sample_rung("t11rung_guest_memo", guest_write);
                     return Some((
                         w,
                         h,
@@ -1189,7 +1190,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // (mid, geometry) so a steady repeat stays at one line.
                     use std::collections::HashSet;
                     use std::sync::Mutex;
-                    note_type11_sample_rung(state, host, "t11rung_miss", mid);
+                    note_type11_sample_rung("t11rung_miss", guest_write);
                     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
                     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.get_or_insert_with(HashSet::new).insert((mid, w, h)) {
@@ -6408,66 +6409,81 @@ fn type11_guest_wrote_since_store<M: HostOps>(
     }
 }
 
-/// Census only: which rung of the type-4 sampled ladder served this bind, and —
-/// for the one rung that serves a host-side *copy* of guest memory — whether
-/// the hypervisor would say those bytes are still the guest's.
+/// Whether the hypervisor has watched the guest replace the pages that every
+/// host-side copy of a type-4 surface is a copy of.
+///
+/// The one predicate both copy-serving rungs of [`resolve_sampled_source`] ask
+/// — the GPU resident and the host byte cache — so neither can end up weaker
+/// than the other. They were not always the same: the cache asked, and the
+/// resident, at six times the traffic and sitting above it in the ladder,
+/// asked nothing.
+///
+/// Only `Wrote` refuses. `no_stamp` says "nobody asked the host to watch these
+/// pages", which is a statement about this device's arming and not about the
+/// guest; on the boot that first measured the ladder it was 14 092 of 14 396
+/// cache binds, so refusing on it would turn the rung off on the strength of a
+/// rail that was never armed. Closing that arming gap is what makes this
+/// predicate stronger — widening it here would only make it wrong more often.
+fn guest_replaced_host_copies(verdict: GuestWriteVerdict) -> bool {
+    matches!(verdict, GuestWriteVerdict::Wrote)
+}
+
+/// Census only: which rung of the type-4 sampled ladder served this bind, and,
+/// for the rungs that serve a host-side *copy* of guest memory, what the
+/// hypervisor said about those bytes when the rung was chosen.
 ///
 /// The ladder in [`resolve_sampled_source`] had no counters at all, which is
 /// why the GVA cache's identical defect had to be found through a probe-gated
-/// byte compare instead of read off a boot. `t11rung_host_cache` is the rung
-/// that matters here: it serves `surface_cache::get`, a host copy of type-4
-/// surface pages taken at some earlier device Store, and it sits *above* both
-/// rungs that read the guest's own pages — so a stale hit is not corrected by
-/// anything below it.
+/// byte compare instead of read off a boot.
+///
+/// `t11rung_resident_refused` counts binds where a ready resident existed and
+/// [`guest_replaced_host_copies`] sent the bind to the guest's pages instead.
+/// It is the direct measure of how much wrong content that rung used to serve.
 ///
 /// # What it measured on its first boot
 ///
-/// One 14-round Finder recomposite boot under load, x86 / Vulkan:
+/// One 14-round Finder recomposite boot under load, x86 / Vulkan, before the
+/// resident rung was gated:
 ///
 /// ```text
-/// t11rung_resident    92730
+/// t11rung_resident    92730     (no currency test at all)
 /// t11rung_host_cache  14396     gw_clean 0  gw_no_stamp 14092  gw_wrote 304
 /// t11rung_zero_copy    4977
 /// t11rung_guest_memo     51
 /// t11rung_miss            0
 /// ```
 ///
-/// `gw_clean` is **zero**. Every one of 14 396 binds served a host-side copy of
-/// type-4 surface pages that the hypervisor could not vouch for — 14 092 of
-/// them because the mapping was never armed with a guest-write token at all,
-/// and 304 because the guest had demonstrably rewritten the pages since the
-/// Store. This is the same defect the GVA encode cache carried, on the surface
-/// rail, at roughly thirty times the traffic, and it is worse here for a
-/// structural reason: this rung sits *above* `t11rung_zero_copy` and
-/// `t11rung_guest_memo`, both of which read the guest's own pages, so a stale
-/// hit is never corrected by anything below it. The comment that used to sit on
-/// that rung said it was taken unconditionally because "there is nothing for the
-/// cache bytes to lose to". There is: the guest's pages.
-///
-/// `t11rung_host_cache_gw_*` remains a **reading, not a gate**. `no_stamp` says
-/// "nobody asked the host to watch these pages", which is not the same finding
-/// as "the guest wrote them", and a refusal keyed on the pooled answer would
-/// turn 98 % of this rung off on the strength of a rail that was never armed.
-#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
-fn note_type11_sample_rung<M: HostOps>(
-    state: &DeviceState,
-    host: &M,
-    rung: &'static str,
-    mapping_id: u32,
-) {
+/// `gw_clean` is **zero**. Every one of 14 396 cache binds served bytes the
+/// hypervisor could not vouch for — 14 092 because the mapping was never armed
+/// with a guest-write token, and 304 because the guest had demonstrably
+/// rewritten the pages since the Store. The resident rung above it, at 6.4
+/// times the traffic, had no column at all because it asked no question.
+fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     crate::runtime::drain::note_store_route(rung);
-    if rung != "t11rung_host_cache" {
-        return;
+    if let Some(gw) = sample_rung_gw_route(rung, guest_write) {
+        crate::runtime::drain::note_store_route(gw);
     }
-    crate::runtime::drain::note_store_route(match mapping_guest_write_verdict(
-        state, host, mapping_id,
-    ) {
-        GuestWriteVerdict::Clean => "t11rung_host_cache_gw_clean",
-        GuestWriteVerdict::NoMapping => "t11rung_host_cache_gw_no_mapping",
-        GuestWriteVerdict::NoStamp => "t11rung_host_cache_gw_no_stamp",
-        GuestWriteVerdict::Wrote => "t11rung_host_cache_gw_wrote",
-        GuestWriteVerdict::Unreadable => "t11rung_host_cache_gw_unreadable",
-    });
+}
+
+/// The census column for a rung's guest-write verdict, or `None` for a rung the
+/// verdict says nothing about.
+fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
+    Some(match (rung, guest_write) {
+        ("t11rung_resident", GuestWriteVerdict::Clean) => "t11rung_resident_gw_clean",
+        ("t11rung_resident", GuestWriteVerdict::NoMapping) => "t11rung_resident_gw_no_mapping",
+        ("t11rung_resident", GuestWriteVerdict::NoStamp) => "t11rung_resident_gw_no_stamp",
+        ("t11rung_resident", GuestWriteVerdict::Unreadable) => "t11rung_resident_gw_unreadable",
+        ("t11rung_host_cache", GuestWriteVerdict::Clean) => "t11rung_host_cache_gw_clean",
+        ("t11rung_host_cache", GuestWriteVerdict::NoMapping) => "t11rung_host_cache_gw_no_mapping",
+        ("t11rung_host_cache", GuestWriteVerdict::NoStamp) => "t11rung_host_cache_gw_no_stamp",
+        ("t11rung_host_cache", GuestWriteVerdict::Unreadable) => {
+            "t11rung_host_cache_gw_unreadable"
+        }
+        // `Wrote` on a copy-serving rung cannot happen — it is what refuses
+        // them — and the rungs that read the guest's own pages do not care what
+        // the guest wrote, because they read exactly that.
+        _ => return None,
+    })
 }
 
 /// Whether a resident's stamp still vouches for the mapping's current content.
@@ -7290,6 +7306,81 @@ mod vulkan_split_tests {
         assert!(!type11_resident_is_current(None, None));
         assert!(!type11_resident_is_current(None, Some(0)));
         assert!(!type11_resident_is_current(Some(7), None));
+    }
+
+    /// A sampled bind may only be served from a host-side copy of a type-4
+    /// surface while the hypervisor has not watched the guest replace the pages
+    /// that copy was taken from — and the GPU resident is bound by that rule
+    /// exactly as the byte cache is.
+    ///
+    /// The two rungs were not equal. `t11rung_host_cache` asked
+    /// `mapping_guest_write_verdict` before serving; `t11rung_resident`, which
+    /// sits above it in the ladder and took 92 730 binds to the cache's 14 396
+    /// on the boot that first measured them, asked nothing and returned
+    /// `SampledSourceRequest::Target` unconditionally. A type-11 surface's pages
+    /// are plain guest RAM: the guest CPU repaints them with no device
+    /// operation, so a resident produced for one tenant of a pooled IOSurface
+    /// keeps claiming to hold its pixels after a different tenant has been
+    /// painted there. Nothing below the rung could correct it, because both
+    /// rungs that read the guest's own pages sit underneath — which is why the
+    /// wrong image was *held* rather than replaced on the next redraw.
+    ///
+    /// Both directions are asserted deliberately. Refusing more than `Wrote`
+    /// would be just as wrong: `NoStamp` means this device never armed the
+    /// witness, and turning the rung off on that answer would send binds to the
+    /// guest's pages for surfaces whose content the deferred writeback rail has
+    /// not landed there yet.
+    #[test]
+    fn a_watched_guest_write_refuses_every_host_side_copy_of_a_surface() {
+        assert!(
+            guest_replaced_host_copies(GuestWriteVerdict::Wrote),
+            "a resident whose pages the host watched the guest rewrite is not the surface"
+        );
+        for verdict in [
+            GuestWriteVerdict::Clean,
+            GuestWriteVerdict::NoMapping,
+            GuestWriteVerdict::NoStamp,
+            GuestWriteVerdict::Unreadable,
+        ] {
+            assert!(
+                !guest_replaced_host_copies(verdict),
+                "{verdict:?} is not evidence of a guest write and must not refuse a copy"
+            );
+        }
+    }
+
+    /// Every rung of the sampled ladder that serves a host-side copy reports the
+    /// verdict it was chosen under, so a boot can tell "the guest never rewrites
+    /// its sampled surfaces" from "the witness was never armed". A rung with no
+    /// column is a rung that asked no question, which is what the resident rung
+    /// was.
+    #[test]
+    fn both_copy_serving_rungs_report_the_verdict_they_were_chosen_under() {
+        for rung in ["t11rung_resident", "t11rung_host_cache"] {
+            for (verdict, suffix) in [
+                (GuestWriteVerdict::Clean, "clean"),
+                (GuestWriteVerdict::NoMapping, "no_mapping"),
+                (GuestWriteVerdict::NoStamp, "no_stamp"),
+                (GuestWriteVerdict::Unreadable, "unreadable"),
+            ] {
+                assert_eq!(
+                    sample_rung_gw_route(rung, verdict),
+                    Some(format!("{rung}_gw_{suffix}").as_str()),
+                    "sampled ladder lost the {rung} {suffix} column"
+                );
+            }
+            assert_eq!(
+                sample_rung_gw_route(rung, GuestWriteVerdict::Wrote),
+                None,
+                "{rung} cannot serve a bind the guest wrote over, so it has no column for it"
+            );
+        }
+        // A rung that reads the guest's own pages is not a copy and takes no
+        // verdict column.
+        assert_eq!(
+            sample_rung_gw_route("t11rung_zero_copy", GuestWriteVerdict::NoStamp),
+            None
+        );
     }
 
     /// Epoch 0 is a legal mapping value — "nothing published since attach" —
