@@ -3018,10 +3018,31 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// The reason for reporting rather than refusing was that nothing established
 /// what should be drawn when the host copy is gone. Here the host copy is *not*
 /// gone — it is in the cache, for this span — and the pages that read zero are
-/// the pageable alias the guest never writes. What is still missing before this
-/// may serve the host entry is a witness that the entry is current: the GVA
-/// cache's own is `gvac_gw_no_entry` 611 against `gvac_hit` 3 in the same
-/// window, so it is not armed for these spans either.
+/// the pageable alias the guest never writes.
+///
+/// `gvac_gw_no_entry` 611 against `gvac_hit` 3 in that window is NOT an arming
+/// gap, which is what it looks like next to the type-4 rail's. The GVA cache's
+/// witness is armed wherever an entry is made (`surface_cache::
+/// mirror_linear_color_cache` calls `arm_gva_guest_write_witness`), and
+/// `gvac_gw_no_entry` counts lookups that found *no cache entry at all*. So the
+/// span an icon samples is usually not cached, and the two binds that were are
+/// the interesting population. `gvac_gw_wrote` was 9 in the same window: the
+/// rung is also being bypassed for spans it holds, on a witness whose
+/// `page_gen` is stamped at the harvest rather than at the write — the same
+/// unsoundness that made the deferred rail's preserve withhold frames.
+///
+/// ## The rate is not improved, and one 14-round boot cannot say it is
+///
+/// Two more 14-round boots on the same binary as the run above: 8 of 14 corrupt
+/// and 2 of 14 corrupt. Across all three, 11 of 42 rounds, against 9 of 42 on
+/// the three recorded `22a3346` boots. **No change in the icon rate has been
+/// demonstrated by any of this branch's work.** What has changed is that the
+/// desktop paints at all, and that the corrupt cell is now blank rather than
+/// holding another element's pixels.
+///
+/// Round-to-round clustering is severe enough that a single 14-round boot is
+/// not a rate. The 1-of-14 boot and the 8-of-14 boot differ only in that the
+/// second harness ran on a VM already driven for 28 minutes.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
