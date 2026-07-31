@@ -18,6 +18,7 @@ use crate::runtime::decode::fifo::{
     CHILD_EXEC_INDIRECT_HEADER_LEN, CHILD_EXEC_INDIRECT_RESOURCE_COUNT,
     CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN, CHILD_EXEC_INDIRECT_TASK_ID,
 };
+use crate::runtime::decode::fifo::{decode_exec_resource_table, ExecResourceDesc};
 use crate::runtime::decode::render::{
     self, decode_color_attachment, decode_depth_attachment, decode_stencil_attachment,
     ColorAttachment, DepthAttachment, Kind as RenderKind, Stage, StencilAttachment,
@@ -265,6 +266,18 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    // The guest declares, per resource this submission touches, who owns the
+    // authoritative bytes afterwards. `need` above already proved the table fits,
+    // so a refusal here means the header and the decoder disagree about the
+    // layout — which is a fail line, never a silent empty table.
+    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|| {
+        crate::observe::fail(format!(
+            "exec_res_table decode_fail task={task_id} res={resource_count} plen={}",
+            payload.len()
+        ));
+        Vec::new()
+    });
+
     let n_cb = (cmdbuf_count as usize).min(MAX_CMDBUFS);
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
@@ -326,8 +339,42 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
         finish_stream(state, host, task_id, &mut out, &acc);
     }
+    census_resource_table(state, task_id, &resource_descs, &out);
     out.total_us = elapsed_us(exec_started);
     out
+}
+
+/// Feed one submission's resource table to the per-window census, together with
+/// the objects its decoded streams stored into.
+///
+/// Runs after the streams so the store side is complete. A submission that
+/// returned early — no command buffers, or translation still cold — is not
+/// counted; the cold one is retried and counted on the attempt that executes.
+fn census_resource_table(
+    state: &DeviceState,
+    task_id: u32,
+    descs: &[ExecResourceDesc],
+    out: &ExecResult,
+) {
+    // Both namespaces, because the table's id space is not proven to be either:
+    // a color target is named by texture ref, and the mapping id it resolves to
+    // is what `CmdInvalidateResources` records name.
+    let mut stored: Vec<u32> = Vec::with_capacity(out.color_targets.len() * 2);
+    for &texture_ref in &out.color_targets {
+        if !stored.contains(&texture_ref) {
+            stored.push(texture_ref);
+        }
+        if let Some(&mid) = state.texture_to_mapping.get(&(task_id, texture_ref)) {
+            if !stored.contains(&mid) {
+                stored.push(mid);
+            }
+        }
+    }
+    crate::runtime::census::exec_resource_table::note_table(descs, &stored, |id| {
+        state.mappings.contains_key(&id)
+            || state.objects.contains(&(task_id, id))
+            || state.texture_to_mapping.contains_key(&(task_id, id))
+    });
 }
 
 fn elapsed_us(started: std::time::Instant) -> u64 {
@@ -2179,6 +2226,83 @@ mod tests {
         );
         assert_eq!(r.streams_loaded, 0);
         assert!(!r.saw_draw);
+    }
+
+    /// The resource table the guest puts between the header and the command
+    /// buffers must be decoded and censused on the live exec path.
+    ///
+    /// Without the census wiring this passes vacuously on any payload, so the
+    /// test asserts the *content* of the drained line: the table's two records
+    /// and their quads have to survive from wire bytes to window. The submission
+    /// loads no stream — a gva no page table backs — because the census sits
+    /// after the stream loop and must be reached whether or not work executed.
+    #[test]
+    fn an_exec_submission_censuses_its_resource_table() {
+        use crate::runtime::decode::fifo::{
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+        };
+        let _ = crate::runtime::census::exec_resource_table::take_window();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+
+        const N_RES: u32 = 2;
+        let table_len = N_RES as usize * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + table_len
+                + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+        st32(
+            &mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..],
+            N_RES,
+        );
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+        for (i, (id, flags)) in [(0x40u32, 0x0000_0001u32), (0x41, 0x0000_0100)]
+            .into_iter()
+            .enumerate()
+        {
+            let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + i * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+            st32(
+                &mut payload[off + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+                id,
+            );
+            st32(
+                &mut payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+                flags,
+            );
+        }
+        let cb = CHILD_EXEC_INDIRECT_HEADER_LEN as usize + table_len;
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+            0xdead_0000,
+        );
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+            64,
+        );
+
+        let r = process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(r.task_id, 3);
+        assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
+
+        let line = crate::runtime::census::exec_resource_table::take_window()
+            .expect("the exec path must census its resource table");
+        assert!(line.contains(" subs=1 "), "{line}");
+        assert!(line.contains(" descs=2 "), "{line}");
+        assert!(line.contains(" ids=2 "), "{line}");
+        assert!(line.contains(" clr_h=1 "), "{line}");
+        assert!(line.contains(" set_h=1 "), "{line}");
+        assert!(
+            line.contains(" quads=[0x00000001:1,0x00000100:1]"),
+            "{line}"
+        );
+        // Neither id is a live object in this state, so both are unresolvable —
+        // and the census has to say so rather than count them as known.
+        assert!(line.contains(" unresolved=2 "), "{line}");
     }
 
     /// One segment header whose declared length runs `overshoot` bytes past the

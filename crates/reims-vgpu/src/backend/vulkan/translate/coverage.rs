@@ -873,6 +873,12 @@ const FIFO_RESOURCE_COMMANDS: &[FieldCoverage] = decoded_fields! {
         "fifo::SynchronizeResourcesCommand.count",
         "fifo::SynchronizeResourcesCommand.object_ids",
     ];
+    declined "exec_res_table" at "runtime/census/exec_resource_table.rs:note_table" => [
+        "fifo::ExecResourceDesc.object_id",
+        "fifo::ExecResourceDesc.flags",
+        "fifo::ExecResourceDesc.ops",
+        "fifo::ExecResourceDesc.tail",
+    ];
 };
 
 /// Full render command stream state, beyond the fixed-function request fields
@@ -1162,6 +1168,7 @@ pub const MANIFEST: &[DescriptorFamily] = &[
             "fifo::InvalidateResourceRecord",
             "fifo::InvalidateResourcesCommand",
             "fifo::SynchronizeResourcesCommand",
+            "fifo::ExecResourceDesc",
         ],
         fields: FIFO_RESOURCE_COMMANDS,
     },
@@ -1624,8 +1631,8 @@ mod tests {
         );
         assert_eq!(
             (structs.len(), actual_enums.len()),
-            (43, 21),
-            "the public decode type census moved; keep the 43-struct field \
+            (44, 21),
+            "the public decode type census moved; keep the 44-struct field \
              manifest and 21-enum inventory exhaustive, then update this pin"
         );
     }
@@ -1888,10 +1895,15 @@ mod tests {
         }
         assert_eq!(
             (honored, declined, dropped, absent),
+            // Moved 2026-08-01: the four `ExecResourceDesc` fields entered the
+            // manifest as Declined, so `declined` rose by four. They are the
+            // EXEC_INDIRECT2 resource table, decoded and reported per drain
+            // window as `exec_res_table` but not yet consumed.
+            //
             // Moved 2026-07-30: `colorAttachments[n].writeMask` went
             // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
             // rose by one. It is on the wire after all, as tag 0x09.
-            (251, 60, 23, 24),
+            (251, 64, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

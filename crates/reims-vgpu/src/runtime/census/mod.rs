@@ -28,6 +28,13 @@
 //! | [`srgb_census`] | which rails drop the sRGB transfer function |
 //! | [`view_swizzle_census`] | type-8 view swizzles dropped, or served by rewriting texels on the CPU |
 //! | [`t11_decline`] | why the type-11 sampled rail declined its zero-copy gather, by reason |
+//! | [`exec_resource_table`] | what the guest declares about each resource an `EXEC_INDIRECT2` submission touches |
+//!
+//! [`exec_resource_table`] is the one entry here that reports guest *input*
+//! rather than a device decline, and it qualifies on the same test: the loss is
+//! otherwise invisible. The guest's statement that it CPU-wrote a resource is
+//! delivered once, inside a table this device stepped over unread, so no counter
+//! could separate "the guest never said" from "we discarded what it said".
 //!
 //! # Adding one
 //!
@@ -38,6 +45,7 @@
 //! exactly that test more often than they have been added; run it before writing
 //! the next one.
 
+pub mod exec_resource_table;
 pub mod present_proxy;
 pub mod srgb_census;
 pub mod t11_decline;
