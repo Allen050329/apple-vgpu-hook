@@ -746,6 +746,35 @@ Note the census undercounts. The `type4 pages` line is emitted only when `page_e
 (`first_attach`, `objects.rs:820-825`), so an attach over a still-populated list guesses silently.
 34 407 is a **lower bound**.
 
+#### Answered: the walk fails because the guest's level-2 directory entry is zero
+
+The `walk=[...]` field added in `e1632f6` answered this on its first boot, and the answer is the same
+for every refusal on it. Eleven refusals over 1 112 attaches, x86/Vulkan, Safari on Wikipedia:
+
+```text
+walk=[tid=0 act=1 dir=0x3cc9e8 root=0x3cc527 depth=3 st=zero-pfn pte=0x0 lvl=2 idx=973]
+walk=[tid=0 act=1 dir=0x3cc9e8 root=0x3cc527 depth=3 st=zero-pfn pte=0x0 lvl=2 idx=667]
+…  11 of 11 identical but for idx
+```
+
+Every field except the index is constant, and each rules something out:
+
+- `tid=0 act=1` with the same `dir`/`root` as every *successful* walk on the boot — so it is not the
+  wrong task, and not a task whose page table had gone away. The task-search story stays dead.
+- `root` read cleanly and `depth=3` decoded — so it is not a malformed or unreadable directory.
+- `pte=0x0` exactly, not garbage — so it is not corruption, a torn read, or a stale mapping.
+- **`lvl=2`, not the leaf.** The walk stops at the page *directory*. A zero entry there means the
+  guest has not mapped **the whole region**, not one page of a surface.
+
+So the device asked for a translation of an address range the guest had not mapped at all, and the
+old path answered that by using the virtual address as a physical one. "The device answered before
+the guest was ready" is now measured rather than inferred, and it is coarser than it looked: the
+absence is a directory entry, so the surface's entire backing is missing at once — which is exactly
+why every fabricating attach in the A/B had `gva_hits=0` rather than a few unfaulted pages.
+
+This is what the single word `translate` was hiding. Fifteen distinct refusal slugs existed the whole
+time and the one that fires is `zero-pfn` at level 2, every time.
+
 #### Measured: the guess was standing in for an answer 20 ms away
 
 The guard landed in `d455c3e`; `REIMS_VGPU_TYPE4_IDENTITY_GUARD_OFF=1` restores the substitution.
