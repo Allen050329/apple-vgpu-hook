@@ -6116,14 +6116,27 @@ fn type11_guest_wrote_since_store<M: HostOps>(
     mapping_id: u32,
 ) -> bool {
     let Some(m) = state.mappings.get(&mapping_id) else {
+        crate::runtime::drain::note_store_route("t11_gw_ref_no_mapping");
         return true;
     };
     if m.guest_write_gen_at_store == 0 || m.guest_write_token == 0 {
+        // No Store has stamped this surface against a live token. Counted
+        // apart from a real write: "the rail never got started" and "the guest
+        // writes this surface every frame" are the same refusal here and
+        // completely different findings.
+        crate::runtime::drain::note_store_route("t11_gw_ref_no_stamp");
         return true;
     }
     match host.guest_write_gen(m.guest_write_token) {
-        Some(gen_) => gen_ != m.guest_write_gen_at_store,
-        None => true,
+        Some(gen_) if gen_ == m.guest_write_gen_at_store => false,
+        Some(_) => {
+            crate::runtime::drain::note_store_route("t11_gw_ref_moved");
+            true
+        }
+        None => {
+            crate::runtime::drain::note_store_route("t11_gw_ref_unreadable");
+            true
+        }
     }
 }
 
@@ -6167,16 +6180,54 @@ fn stamp_type11_resident<M: HostMemory + HostOps>(
     if let Some(identity) = type11_store_identity(state, req, writeback_guest) {
         crate::backend::vulkan::engine::stamp_resident_content_epoch(&identity, epoch);
     }
-    let Some(mapping_id) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) else {
-        return;
+    if let Some(mapping_id) = req.colors.first().map(|c| c.mapping_id).filter(|m| *m != 0) {
+        stamp_mapping_guest_write_gen(state, host, mapping_id);
+    }
+}
+
+/// Record the host's guest-write generation for a mapping whose pixels a Store
+/// has just published, registering its pages for tracking the first time.
+///
+/// Called from every rail that publishes a type-11 surface, next to that rail's
+/// `surface_content_epoch` stamp. The two are halves of one witness — the epoch
+/// covers writers inside this crate, this covers the guest CPU — and a rail that
+/// wrote only the epoch would let the elision vouch for a resident on evidence
+/// that cannot see the surface's owner. The resident-store rail did exactly that
+/// and it was the whole of the rail's traffic: one boot measured
+/// `surface_resident` ~210/s against zero calls through the readback rails.
+///
+/// 0 is written for every unknown, and it is never a live generation (the host's
+/// first readable one is 1), so a surface whose host cannot answer fails the
+/// currency test instead of passing it by default.
+#[cfg(feature = "backend-vulkan")]
+fn stamp_mapping_guest_write_gen<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    let gen_ = match crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id) {
+        None => {
+            // The host cannot watch these pages: no dirty bitmap, or the mapping
+            // has no page list to name. Counted, because a rail whose
+            // registration silently never happens is indistinguishable from a
+            // guest that writes every frame, and the two want opposite fixes.
+            crate::runtime::drain::note_store_route("t11_gw_untracked");
+            0
+        }
+        Some(token) => match host.guest_write_gen(token) {
+            // The host has the pages but cannot vouch for them yet: its report
+            // only becomes a fact about the guest once logging has been on for a
+            // full interval.
+            None => {
+                crate::runtime::drain::note_store_route("t11_gw_unarmed");
+                0
+            }
+            Some(gen_) => {
+                crate::runtime::drain::note_store_route("t11_gw_armed");
+                gen_
+            }
+        },
     };
-    // `unwrap_or(0)` on both arms deliberately: 0 is the "nothing vouches for
-    // this" value, it is never a live generation (the host's first readable one
-    // is 1), and writing it is what makes a surface whose host cannot answer
-    // fail the currency test instead of passing it by default.
-    let gen_ = crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id)
-        .and_then(|token| host.guest_write_gen(token))
-        .unwrap_or(0);
     if let Some(m) = state.mappings.get_mut(&mapping_id) {
         m.guest_write_gen_at_store = gen_;
     }
@@ -6465,6 +6516,11 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
         .fail_once(u64::from(mapping_id));
         return None;
     }
+    // The guest half of the same witness, written here rather than by the
+    // caller because this rail returns straight out of `encode_draw` — it never
+    // reaches `stamp_type11_resident`, and it is where nearly all type-11
+    // Stores go.
+    stamp_mapping_guest_write_gen(state, host, mapping_id);
     Some(finish_surface_deferred_window(
         state,
         req,
