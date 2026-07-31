@@ -1384,13 +1384,55 @@ it is the first time the `refused = 0` figure has meant anything.
 Boot health: 1 286 attaches, 0 guest panics, 0 fabricated attaches, 0 drift, 0 lost flushes; 4 type-4
 refusals (3 corrected, 1 terminal, **0 stranded**).
 
-Three limits, and the first is the one to respect. **`Unwitnessed` has no live positive control** —
-it read 0 across 105 000 writes, and this document's own rule is that a counter which has only ever
-read zero has not been shown to work. What stands in for it is a unit test that drives all four
-states and asserts each slug, so it is not a dead wire; it is not the same as having seen one fire on
-the rig. Second, one boot, one workload. Third, this says **nothing about the raw-address rails**
-(`flush_gva_one`, `flush_linear_one`), which name guest addresses with no mapping incarnation and are
-guarded by `deferred_pages_still_ours` and the fence ordering instead.
+Two limits, and the first is the one to respect. **`Unwitnessed` has no live positive control** — it
+read 0 across 105 000 writes, and this document's own rule is that a counter which has only ever read
+zero has not been shown to work. What stands in for it is a unit test that drives every state and
+asserts each slug, so it is not a dead wire; it is not the same as having seen one fire on the rig.
+Second, one boot, one workload.
+
+##### The raw-address rail too, and its blind exit was an empty iterator
+
+The paragraph above originally excluded the raw-address rails — `flush_gva_one`, `flush_linear_one`,
+guarded by `deferred_pages_still_ours` rather than by the mapping witness. Same lens, and that guard
+has the same blind spot in **three** places rather than one:
+
+```text
+span == 0 || armed.is_empty()            -> nothing was recorded to compare against
+live.iter().all(|p| armed.contains(p))   -> `all` over an EMPTY `live` is TRUE
+```
+
+The second is the one worth knowing, because it is the same conflation arrived at by a completely
+different route: not an early return, but a **vacuously true iterator**. A window whose walk resolves
+no page at all returns "still ours" through the identical branch a fully verified window returns
+through. It is harmless — `write_gva_rgba8` resolves its destination per row from that same walk, so
+no row lands either — and it is indistinguishable in the census from the guard having compared every
+page and agreed.
+
+Split (`defw_pages_verified` / `defw_unwit_no_armed` / `defw_unwit_no_live` / `defw_pages_drifted`)
+and measured on a second 420 s `blur-provoke.sh` boot, 412 intervals:
+
+```text
+                       verified   unwitnessed   refused
+direct writers           53 721             0         0
+deferred flush           49 720             0         0
+raw-address windows      70 311             0         0     <- the busiest of the three
+```
+
+**173 752 guarded writes across all three rails, every one of them re-walked and agreed, none
+unwitnessed and none drifted.** Boot health: 1 241 attaches, 0 guest panics, 0 fabricated attaches,
+0 lost flushes, 1 type-4 refusal (corrected, 0 stranded).
+
+That is the completeness statement for the device's guest-write guards on the provoking workload,
+and it is worth stating what it does and does not close. It closes "is the guard armed?" — which was
+genuinely open, and which the `refused = 0` figure could not answer for either rail. It does **not**
+close the crash class: a guard that verifies the destination is still the surface's says nothing
+about the panics that predate it, and the post-guard panic denominator is still ~150 boots against
+the 20 it has.
+
+One fixture note, since it will recur. The first draft of the `defw_unwit_no_live` test picked a GVA
+far past the root page's extent, and the walk **resolved** it — reading whatever GPA follows the root
+page — so the test failed on the negative it was asserting. Use an index inside the root page whose
+PTE was never written. "Far away" is not "unmapped".
 
 Note also what this retires: the recurring suspicion that `ensure_contig_view` hands back a stale
 `mach_vm_remap` after a silent re-point. It does not. `resolve_mapping_backing` retires the view and
