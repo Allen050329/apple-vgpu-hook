@@ -717,26 +717,32 @@ pub(crate) unsafe fn execute_compute_inner(
             // exit so the storage-acquire's captured initial_layout (and the
             // storage pre-dispatch barrier, which syncs on TRANSFER when that
             // layout is TRANSFER_SRC_OPTIMAL) remains truthful.
-            if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                let to_src = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(
-                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                    )
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .old_layout(src_layout)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .image(src_image)
-                    .subresource_range(range)];
-                ctx.device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &to_src,
-                );
-            }
+            // Unconditional, and the scope comes from `resident_read_source_scope`
+            // rather than from `src_layout`. A resident a draw just produced
+            // already sits in TRANSFER_SRC_OPTIMAL — that is the layout a render
+            // pass resolves its primary to — so gating on a transition being
+            // needed skipped the dependency on exactly the content worth
+            // copying. The old source mask compounded it: it named
+            // SHADER_WRITE | TRANSFER_WRITE but not COLOR_ATTACHMENT_WRITE, so
+            // even when it did fire it did not drain the draw that wrote the
+            // pixels this copy is about to read.
+            let (src_stage, src_access) = super::exec::resident_read_source_scope();
+            let to_src = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(src_layout)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(src_image)
+                .subresource_range(range)];
+            ctx.device.cmd_pipeline_barrier(
+                cb,
+                src_stage,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_src,
+            );
             if let Some(hop) = &prepared.reinterpret {
                 // Byte-reinterpret: image→buffer→image. The tight buffer holds
                 // the identical byte stream under both formats (equal row

@@ -1792,10 +1792,15 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     } else if let Some((seed_image, seed_layout)) = seed_from_resolved {
         // GPU present-boundary seed: resident front frame → draw target copy,
-        // then the pass runs with LOAD. Same target-side transitions as the
-        // CPU seed branch; the source transitions from its tracked layout.
-        if seed_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-            let (src_stage, src_access) = layout_source_scope(seed_layout)?;
+        // then the pass runs with LOAD.
+        //
+        // Unconditional: the source is a resident that a draw just produced, so
+        // it is normally already in TRANSFER_SRC_OPTIMAL and gating on a
+        // transition being needed skipped the dependency on exactly the frames
+        // worth copying. See `resident_read_source_scope` for why the scope
+        // cannot come from the tracked layout.
+        {
+            let (src_stage, src_access) = resident_read_source_scope();
             let barrier = [vk::ImageMemoryBarrier::default()
                 .src_access_mask(src_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -2495,6 +2500,33 @@ fn color_range() -> vk::ImageSubresourceRange {
 /// pixels survive to the next one. No fence stands between one draw's use of it
 /// and the next, which is exactly what makes it useful — and exactly why this
 /// barrier, alone among the four, has to state what it is waiting for.
+/// Source scope for a transfer that *reads* a registry-resident image — a seed
+/// copy, a readback, a present blit, a copy-on-sample.
+///
+/// Always `ALL_COMMANDS` against the union of writes a resident can carry, and
+/// deliberately not [`layout_source_scope`], because **the tracked layout names
+/// where the image is, not what last touched it**. A render pass moves its
+/// primary attachment to `TRANSFER_SRC_OPTIMAL` through `finalLayout` without
+/// any transfer ever having run, so a resident sitting in that layout was in
+/// fact last written by a colour attachment write. Deriving the scope from the
+/// layout would make the copy wait for transfer reads and leave the colour
+/// writes free to race it — which is the same stale-frame failure as skipping
+/// the barrier outright, only harder to see.
+///
+/// The three writers a resident can have are a draw (`COLOR_ATTACHMENT_WRITE`),
+/// a compute dispatch (`SHADER_WRITE`), and a seed or blit
+/// (`TRANSFER_WRITE`). Naming all three costs nothing a reader can measure and
+/// removes the need for every call site to know which one produced the pixels
+/// it is about to copy.
+pub(super) fn resident_read_source_scope() -> (vk::PipelineStageFlags, vk::AccessFlags) {
+    (
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | vk::AccessFlags::SHADER_WRITE
+            | vk::AccessFlags::TRANSFER_WRITE,
+    )
+}
+
 fn target_write_source_scope(
     snapshotted: bool,
     tracked: vk::ImageLayout,
@@ -2677,6 +2709,44 @@ mod tests {
             .expect("an untouched target is not a tracking bug");
         assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
         assert_eq!(access, vk::AccessFlags::empty());
+    }
+
+    /// Reading a resident must drain every kind of writer a resident can have,
+    /// not just the one the reader happens to expect. The compute copy-on-sample
+    /// named `SHADER_WRITE | TRANSFER_WRITE` and omitted `COLOR_ATTACHMENT_WRITE`,
+    /// so it did not wait for the draw that produced the pixels it copied — a
+    /// barrier that fires and still lets the race through.
+    #[test]
+    fn reading_a_resident_drains_every_writer_it_can_have() {
+        let (stage, access) = resident_read_source_scope();
+        assert_eq!(stage, vk::PipelineStageFlags::ALL_COMMANDS);
+        for (writer, flag) in [
+            ("a draw", vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            ("a compute dispatch", vk::AccessFlags::SHADER_WRITE),
+            ("a seed or blit", vk::AccessFlags::TRANSFER_WRITE),
+        ] {
+            assert!(
+                access.contains(flag),
+                "{writer} can write a resident, so a read of one must drain {flag:?}"
+            );
+        }
+    }
+
+    /// The scope for reading a resident must NOT be derived from its tracked
+    /// layout. A render pass moves its primary to `TRANSFER_SRC_OPTIMAL` via
+    /// `finalLayout` without any transfer running, so that layout's own scope
+    /// names a transfer read while the actual last writer was a colour write.
+    #[test]
+    fn the_tracked_layout_scope_is_too_narrow_to_read_a_resident_with() {
+        let (_, from_layout) = layout_source_scope(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .expect("TRANSFER_SRC_OPTIMAL is a tracked layout");
+        assert!(
+            !from_layout.contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            "if this ever drains colour writes, the reason resident_read_source_scope \
+             exists has changed and its callers should be revisited"
+        );
+        let (_, for_read) = resident_read_source_scope();
+        assert!(for_read.contains(vk::AccessFlags::COLOR_ATTACHMENT_WRITE));
     }
 
     /// A layout the tracker should never hold is a bug in the tracker. It must
