@@ -792,6 +792,48 @@ pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
     fence_flush_spec_arms(spec.as_deref(), rail)
 }
 
+/// Bisection knob (`REIMS_VGPU_RESOURCE_VALIDITY_OFF`): let a deferred window
+/// survive the guest's statement that it CPU-wrote the resource, the way every
+/// window did while the `EXEC_INDIRECT2` resource table went unread.
+///
+/// `1`/`all` arms both producers; `exec` and `inv` arm one each — the exec table
+/// and `CmdInvalidateResources` deliver different quads at different rates, so
+/// an `=1` arm that reverted both would score one producer against a control
+/// that had also given back the other.
+///
+/// It gates exactly one action: dropping the pending windows of a mapping whose
+/// `clear_host_valid` just arrived. The `content_generation` bump and the
+/// recorded validity state stay on either way — the bump is what the invalidate
+/// producer has always done, and the state is inert bookkeeping. Narrowing the
+/// knob to the one action is what makes the arm and its control differ in the
+/// one thing being measured.
+///
+/// `validity_windows_dropped` is counted whichever way this is set, on purpose:
+/// a control boot reports the same number the armed boot acts on, so the two
+/// differ only in whether those windows landed. An arm and its control are one
+/// binary apart.
+pub fn resource_validity_disabled(site: &str) -> bool {
+    static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_RESOURCE_VALIDITY_OFF")
+            .map(|v| v.to_string_lossy().into_owned())
+    });
+    resource_validity_spec_arms(spec.as_deref(), site)
+}
+
+/// The parse, split out so it is testable without an environment. An
+/// unrecognised token arms nothing rather than everything, for the same reason
+/// [`content_reuse_spec_arms`] does: a typo must not silently turn a one-rail
+/// bisection into an all-rails boot that then gets read as a per-rail result.
+fn resource_validity_spec_arms(spec: Option<&str>, site: &str) -> bool {
+    let Some(spec) = spec else {
+        return false;
+    };
+    spec.split(',')
+        .map(str::trim)
+        .any(|t| t == "1" || t == "all" || t == site)
+}
+
 /// Bisection knob (`REIMS_VGPU_SURFACE_CACHE_GEN_STRICT=1`): refuse a
 /// `surface_cache` surface_id entry whose bytes were read out of a page list the
 /// mapping has since replaced.
@@ -1327,6 +1369,26 @@ mod tests {
                     "{spec:?} must not arm {r:?}"
                 );
             }
+        }
+    }
+
+    /// The validity knob has to arm one producer at a time, because the two
+    /// deliver different quads at different rates and a bundled arm cannot
+    /// attribute a change to either.
+    #[test]
+    fn the_resource_validity_spec_arms_exactly_the_producer_it_names() {
+        assert!(!resource_validity_spec_arms(None, "exec"));
+        for spec in ["1", "all"] {
+            assert!(resource_validity_spec_arms(Some(spec), "exec"));
+            assert!(resource_validity_spec_arms(Some(spec), "inv"));
+        }
+        assert!(resource_validity_spec_arms(Some("exec"), "exec"));
+        assert!(!resource_validity_spec_arms(Some("exec"), "inv"));
+        assert!(resource_validity_spec_arms(Some("inv, exec"), "inv"));
+        // A typo arms nothing — never the whole family.
+        for spec in ["", "0", "table", "yes"] {
+            assert!(!resource_validity_spec_arms(Some(spec), "exec"));
+            assert!(!resource_validity_spec_arms(Some(spec), "inv"));
         }
     }
 

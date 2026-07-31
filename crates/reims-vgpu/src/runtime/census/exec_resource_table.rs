@@ -21,11 +21,13 @@
 //! - `subs` / `no_table` / `descs` / `max` — is the table populated in live
 //!   traffic at all, and how wide does it get. A boot where `descs` stays 0 says
 //!   the wire layout assumption is wrong and nothing downstream should be built.
-//! - `ids` / `id0` / `unresolved` — is the id space the one the device already
-//!   knows. `writeInvalidates` skips entries whose resource is null or whose id
-//!   is 0, so any `id0` here is a layout surprise. A high `unresolved` rate means
-//!   these are not mapping/texture ids and the table cannot be matched to device
-//!   state by id.
+//! - `ids` / `id0` / `unresolved` / `as_map` / `as_tex` / `as_obj` — is the id
+//!   space the one the device already knows, and which registry answers. The
+//!   three `as_*` counts overlap by construction (one id can be all three);
+//!   they exist because the consumer has to pick a registry to key on, and
+//!   "94.8 % resolve somewhere" does not say which. `writeInvalidates` skips
+//!   entries whose resource is null or whose id is 0, so any `id0` here is a
+//!   layout surprise.
 //! - `clr_h` / `set_h` / `clr_g` / `set_g` and the quad histogram — which of the
 //!   four ops the guest actually uses, rather than the single hardcoded quad the
 //!   `pageBacking` producer emits.
@@ -93,8 +95,12 @@ struct Window {
     ids_over: u64,
     /// Records naming object id 0, which `writeInvalidates` should never emit.
     id_zero: u64,
-    /// Records whose object id the device could not resolve to a live object.
+    /// Records whose object id no registry answered for.
     unresolved: u64,
+    /// Which registry answered, counted independently — an id can be in several.
+    as_mapping: u64,
+    as_texture: u64,
+    as_object: u64,
     clear_host: u64,
     set_host: u64,
     clear_guest: u64,
@@ -115,11 +121,31 @@ struct Window {
 
 static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 
+/// Which of the device's registries answer for one table object id.
+///
+/// Independent flags rather than a first-match verdict: the consumer of the
+/// table has to pick one registry to key its state on, and a single "resolved"
+/// bit cannot say which one that should be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdKind {
+    /// A live entry in `DeviceState::mappings`.
+    pub mapping: bool,
+    /// Has a `texture_to_mapping` entry under the submission's task.
+    pub texture: bool,
+    /// A live object ref under the submission's task.
+    pub object: bool,
+}
+
+impl IdKind {
+    pub fn any(self) -> bool {
+        self.mapping || self.texture || self.object
+    }
+}
+
 /// Record one submission's decoded resource table.
 ///
-/// `known` answers whether an object id resolves to something the device holds,
-/// which only the caller can decide — the census must not reach into device
-/// state.
+/// `resolve` answers which registries hold an object id, which only the caller
+/// can decide — the census must not reach into device state.
 ///
 /// `stored` is the set of object ids the submission's decoded command streams
 /// actually stored into, used to test the inference that `set_host_valid` marks
@@ -127,9 +153,9 @@ static WINDOW: Mutex<Option<Window>> = Mutex::new(None);
 /// mapping ids they resolve to, because the table's id namespace is not proven
 /// identical to either: over-counting a match is the conservative direction for
 /// a correlation whose interesting reading is a systematic *mismatch*.
-pub fn note_table<F>(descs: &[ExecResourceDesc], stored: &[u32], mut known: F)
+pub fn note_table<F>(descs: &[ExecResourceDesc], stored: &[u32], mut resolve: F)
 where
-    F: FnMut(u32) -> bool,
+    F: FnMut(u32) -> IdKind,
 {
     let Ok(mut guard) = WINDOW.lock() else {
         return;
@@ -150,7 +176,11 @@ where
         } else if !w.ids.contains(&d.object_id) {
             w.ids_over += 1;
         }
-        if !known(d.object_id) {
+        let kind = resolve(d.object_id);
+        w.as_mapping += u64::from(kind.mapping);
+        w.as_texture += u64::from(kind.texture);
+        w.as_object += u64::from(kind.object);
+        if !kind.any() {
             w.unresolved += 1;
         }
         w.clear_host += u64::from(d.ops.clear_host_valid != 0);
@@ -201,7 +231,8 @@ fn format_line(w: &Window) -> String {
     use std::fmt::Write as _;
     let mut line = format!(
         "exec_res_table subs={} no_table={} descs={} max={} ids={} ids_over={} id0={} \
-         unresolved={} clr_h={} set_h={} clr_g={} set_g={} tail_nz_descs={} tail_nz_bytes={} \
+         unresolved={} as_map={} as_tex={} as_obj={} \
+         clr_h={} set_h={} clr_g={} set_g={} tail_nz_descs={} tail_nz_bytes={} \
          lic_stored={} lic_unstored={} stored_lic={} stored_unlic={}",
         w.subs,
         w.no_table,
@@ -211,6 +242,9 @@ fn format_line(w: &Window) -> String {
         w.ids_over,
         w.id_zero,
         w.unresolved,
+        w.as_mapping,
+        w.as_texture,
+        w.as_object,
         w.clear_host,
         w.set_host,
         w.clear_guest,
@@ -262,7 +296,11 @@ mod tests {
                 desc(0, 0x0000_0100, [0u8; 16]),
             ],
             &[0x11, 0x12],
-            |id| id != 0x11,
+            |id| IdKind {
+                mapping: id == 0x10,
+                texture: id == 0,
+                object: false,
+            },
         );
         let line = take_window().expect("one submission landed");
         assert!(line.starts_with("exec_res_table subs=1 "), "{line}");
@@ -273,6 +311,9 @@ mod tests {
         assert!(line.contains(" ids=3 "), "{line}");
         assert!(line.contains(" id0=1 "), "{line}");
         assert!(line.contains(" unresolved=1 "), "{line}");
+        assert!(line.contains(" as_map=1 "), "{line}");
+        assert!(line.contains(" as_tex=1 "), "{line}");
+        assert!(line.contains(" as_obj=0 "), "{line}");
         assert!(line.contains(" clr_h=1 "), "{line}");
         assert!(line.contains(" set_h=2 "), "{line}");
         assert!(line.contains(" clr_g=0 "), "{line}");
@@ -294,7 +335,7 @@ mod tests {
     #[test]
     fn window_resets_on_drain() {
         let _ = take_window();
-        note_table(&[desc(1, 0, [0u8; 16])], &[], |_| true);
+        note_table(&[desc(1, 0, [0u8; 16])], &[], |_| IdKind::default());
         assert!(take_window().is_some());
         assert!(take_window().is_none());
     }
@@ -305,7 +346,7 @@ mod tests {
     #[test]
     fn an_empty_table_still_counts_the_submission() {
         let _ = take_window();
-        note_table(&[], &[], |_| true);
+        note_table(&[], &[], |_| IdKind::default());
         let line = take_window().expect("line");
         assert!(line.contains("subs=1 no_table=1 descs=0 "), "{line}");
     }
@@ -317,7 +358,7 @@ mod tests {
         let descs: Vec<_> = (0..(QUAD_HISTOGRAM_MAX as u32 + 5))
             .map(|i| desc(i + 1, i + 1, [0u8; 16]))
             .collect();
-        note_table(&descs, &[], |_| true);
+        note_table(&descs, &[], |_| IdKind::default());
         let line = take_window().expect("line");
         assert!(line.contains(" quad_other=5"), "{line}");
         assert_eq!(

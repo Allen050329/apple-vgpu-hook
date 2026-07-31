@@ -334,6 +334,13 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         return out;
     }
 
+    // Before any of this submission's work runs. Each record states what was
+    // true of its resource *before* the submission, so a pending window holding
+    // pixels the guest has since overwritten has to go now — landing it later
+    // would replace the guest's own bytes with a frame the guest has declared
+    // stale.
+    consume_resource_table(state, task_id, &resource_descs);
+
     for stream in streams {
         let mut acc = StreamAccum::default();
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
@@ -342,6 +349,31 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     census_resource_table(state, task_id, &resource_descs, &out);
     out.total_us = elapsed_us(exec_started);
     out
+}
+
+/// Apply every record of one submission's resource table.
+///
+/// The table is the guest's own statement about who owns each resource's
+/// authoritative bytes, and `clear_host_valid` is its consume-once notification
+/// that it CPU-wrote one — delivered here and nowhere else. The refusal to
+/// resolve a record is fail-visible rather than silent, because a record the
+/// device cannot apply is guest authorisation it is about to ignore.
+fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
+    use crate::runtime::resource_validity::{apply, ValiditySite};
+    let mut missed = 0u32;
+    for d in descs {
+        let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
+        if outcome.missed {
+            missed = missed.saturating_add(1);
+        }
+    }
+    if missed > 0 {
+        // Rate-summarised on the same per-second window as the census, because
+        // ~5 % of records name resources this device holds no mapping for and a
+        // per-record line would bury the fail view. The census reports the same
+        // population by registry (`unresolved` / `as_map` / `as_tex` / `as_obj`).
+        crate::runtime::drain::note_store_route_n("validity_miss_exec", missed as u64);
+    }
 }
 
 /// Feed one submission's resource table to the per-window census, together with
@@ -371,9 +403,11 @@ fn census_resource_table(
         }
     }
     crate::runtime::census::exec_resource_table::note_table(descs, &stored, |id| {
-        state.mappings.contains_key(&id)
-            || state.objects.contains(&(task_id, id))
-            || state.texture_to_mapping.contains_key(&(task_id, id))
+        crate::runtime::census::exec_resource_table::IdKind {
+            mapping: state.mappings.contains_key(&id),
+            texture: state.texture_to_mapping.contains_key(&(task_id, id)),
+            object: state.objects.contains(&(task_id, id)),
+        }
     });
 }
 
@@ -2303,6 +2337,158 @@ mod tests {
         // Neither id is a live object in this state, so both are unresolvable —
         // and the census has to say so rather than count them as known.
         assert!(line.contains(" unresolved=2 "), "{line}");
+    }
+
+    /// A submission whose table says the guest CPU-wrote a resource must not
+    /// leave that resource's deferred window armed.
+    ///
+    /// The window holds pixels the device rendered *before* the guest's write.
+    /// Landing it afterwards replaces the guest's own bytes with a frame the
+    /// guest has just declared stale — a full-extent clobber that no timing rail
+    /// can prevent, because the question is not when the window lands but
+    /// whether it may land at all.
+    #[test]
+    fn a_submission_that_says_the_guest_wrote_a_resource_drops_its_pending_window() {
+        use crate::runtime::decode::fifo::{
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+        };
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
+        const MAPPING: u32 = 0x40;
+        state.mappings.entry(MAPPING).or_default().mapped = true;
+        let key = crate::model::ComputeStorageResidencyKey {
+            mapping_id: MAPPING,
+            map_generation: 0,
+            surface_offset: 0,
+            surface_bpr: 64 * 4,
+            span_end: 64 * 64 * 4,
+            width: 64,
+            height: 64,
+            pixel_format: 0x50,
+            texture_ref: 0,
+        };
+        state.compute_deferred_flush.insert(
+            key,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    64 * 64
+                        * 4
+                ])),
+            },
+        );
+        assert_eq!(state.deferred_flush_window_count(MAPPING), 1);
+        let gen_before = state.mappings[&MAPPING].content_generation;
+
+        // One resource record: clear_host_valid, no command buffers to run.
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+                + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+        st32(&mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..], 1);
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+        let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+            MAPPING,
+        );
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+            0x0000_0001,
+        );
+        let cb = res + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+            0xdead_0000,
+        );
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+            64,
+        );
+
+        process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(
+            state.deferred_flush_window_count(MAPPING),
+            0,
+            "the guest said its own bytes are newer than ours; the window must go"
+        );
+        assert_eq!(
+            state.mappings[&MAPPING].content_generation,
+            gen_before + 1,
+            "the next read must re-take the guest pages"
+        );
+        let validity = state.mappings[&MAPPING].validity;
+        assert!(validity.host_stated && !validity.host_valid);
+    }
+
+    /// The mirror of the case above: a licence to write is not a reason to throw
+    /// away the frame the device already produced.
+    #[test]
+    fn a_submission_that_only_licenses_a_resource_keeps_its_pending_window() {
+        use crate::runtime::decode::fifo::{
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+        };
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        assert!(state.define_task(3, 0x1_0000, 2));
+        const MAPPING: u32 = 0x41;
+        state.mappings.entry(MAPPING).or_default().mapped = true;
+        state.compute_deferred_flush.insert(
+            crate::model::ComputeStorageResidencyKey {
+                mapping_id: MAPPING,
+                map_generation: 0,
+                surface_offset: 0,
+                surface_bpr: 64 * 4,
+                span_end: 64 * 64 * 4,
+                width: 64,
+                height: 64,
+                pixel_format: 0x50,
+                texture_ref: 0,
+            },
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    64 * 64
+                        * 4
+                ])),
+            },
+        );
+
+        let mut payload = vec![
+            0u8;
+            CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+                + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize
+                + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+        st32(&mut payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..], 1);
+        st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+        let res = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
+            MAPPING,
+        );
+        st32(
+            &mut payload[res + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+            0x0000_0100,
+        );
+        let cb = res + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        st64(
+            &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+            64,
+        );
+
+        process_exec_indirect2(&mut state, &mut host, &payload);
+        assert_eq!(state.deferred_flush_window_count(MAPPING), 1);
+        assert!(state.mappings[&MAPPING].validity.host_valid);
     }
 
     /// One segment header whose declared length runs `overshoot` bytes past the

@@ -873,10 +873,17 @@ const FIFO_RESOURCE_COMMANDS: &[FieldCoverage] = decoded_fields! {
         "fifo::SynchronizeResourcesCommand.count",
         "fifo::SynchronizeResourcesCommand.object_ids",
     ];
-    declined "exec_res_table" at "runtime/census/exec_resource_table.rs:note_table" => [
+    honored "runtime/exec.rs:consume_resource_table" => [
         "fifo::ExecResourceDesc.object_id",
-        "fifo::ExecResourceDesc.flags",
         "fifo::ExecResourceDesc.ops",
+    ];
+    declined "exec_res_table" at "runtime/census/exec_resource_table.rs:note_table" => [
+        // The raw dword the quad decodes from. `ops` is what the consumer acts
+        // on; this is kept for the census histogram, the way the sibling
+        // `InvalidateResourceRecord` keeps both.
+        "fifo::ExecResourceDesc.flags",
+        // Zero across 84 868 records on the Ventura 13.7.8 x86 build. Counted
+        // rather than dropped so a build that populates them is visible.
         "fifo::ExecResourceDesc.tail",
     ];
 };
@@ -1896,14 +1903,15 @@ mod tests {
         assert_eq!(
             (honored, declined, dropped, absent),
             // Moved 2026-08-01: the four `ExecResourceDesc` fields entered the
-            // manifest as Declined, so `declined` rose by four. They are the
-            // EXEC_INDIRECT2 resource table, decoded and reported per drain
-            // window as `exec_res_table` but not yet consumed.
+            // manifest — the EXEC_INDIRECT2 resource table, which the device
+            // used to step over unread. `object_id` and `ops` are Honored by
+            // `consume_resource_table`; `flags` and `tail` are Declined, carried
+            // only by the `exec_res_table` census.
             //
             // Moved 2026-07-30: `colorAttachments[n].writeMask` went
             // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
             // rose by one. It is on the wire after all, as tag 0x09.
-            (251, 64, 23, 24),
+            (253, 62, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

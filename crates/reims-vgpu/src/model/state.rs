@@ -659,6 +659,26 @@ pub struct Type4Walk {
     pub map_generation: u32,
 }
 
+/// Who owns a resource's authoritative bytes, as the guest last stated it.
+///
+/// Both halves start `false` because nothing has been said yet, and "nothing has
+/// been said" is a third state that neither `true` nor `false` can carry on its
+/// own: a resource the guest has never named in a validity quad must not be
+/// treated as having been declared stale on either side. `host_stated` and
+/// `guest_stated` record whether the corresponding bit is a statement or a
+/// default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResourceValidity {
+    /// The device's copy holds the authoritative bytes.
+    pub host_valid: bool,
+    /// The guest's own pages hold the authoritative bytes.
+    pub guest_valid: bool,
+    /// The guest has set or cleared `host_valid` at least once.
+    pub host_stated: bool,
+    /// The guest has set or cleared `guest_valid` at least once.
+    pub guest_stated: bool,
+}
+
 /// IOSurface mapper registry entry keyed by mapping_id.
 #[derive(Clone, Debug, Default)]
 pub struct MappingEntry {
@@ -668,6 +688,13 @@ pub struct MappingEntry {
     pub height: u32,
     pub format: u16,
     pub content_generation: u32,
+    /// What the guest has said about who owns this resource's authoritative
+    /// bytes, driven by the two producers of the validity quad: the per-resource
+    /// table in every `EXEC_INDIRECT2` payload, and `CmdInvalidateResources`.
+    ///
+    /// The host framework carries the matching pair as `PGResource._hostValid` /
+    /// `._guestValid`, set through `setIsHostValid:` / `setIsGuestValid:`.
+    pub validity: ResourceValidity,
     /// Epoch of this mapping's *surface content* in the sense a type-11 render
     /// LOAD needs: it advances whenever the pixels that Load would seed from
     /// could have changed, wherever they live.
@@ -3169,6 +3196,19 @@ impl DeviceState {
         self.compute_storage_residency.retain(|key, _| {
             key.mapping_id != mapping_id || key.span_end <= lo || key.surface_offset >= hi
         });
+    }
+
+    /// How many deferred windows this mapping currently owes.
+    ///
+    /// Read before a drop so the drop can be counted: `drop_windows` reports
+    /// each window it takes on the fail path but returns nothing, and a rail
+    /// that needs to know whether it dropped anything must not re-derive the
+    /// answer from the log.
+    pub fn deferred_flush_window_count(&self, mapping_id: u32) -> u32 {
+        self.compute_deferred_flush
+            .keys()
+            .filter(|key| key.mapping_id == mapping_id)
+            .count() as u32
     }
 
     /// Remove one deferred window by exact key, pruning the alias index with it.

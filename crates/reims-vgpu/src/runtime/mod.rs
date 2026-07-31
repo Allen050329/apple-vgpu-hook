@@ -51,6 +51,8 @@ pub mod plan;
 /// The resident identity a type-11 guest surface renders into.
 #[cfg(feature = "backend-vulkan")]
 pub mod present_identity;
+/// The guest's per-resource validity quad, from both of its producers.
+pub mod resource_validity;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
 /// SPIR-V set-0 binding relocation for metal2vulkan + internal Vulkan engine (Linux).

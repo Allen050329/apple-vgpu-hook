@@ -2305,43 +2305,53 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // RE: {task_id, count} + count×{object_id, 4×u8 validity ops}.
                 // Ops (PVG host layout): clr_host, set_host, clr_guest, set_guest.
                 // Pageon hardcodes LE 01 00 00 01 = clr hostValid + set guestValid.
-                // Product: clear_host_valid → bump content_generation (re-read pages).
+                //
+                // The same four bytes the EXEC_INDIRECT2 resource table carries,
+                // through the same consumer: this producer's records are 8 bytes
+                // and that one's are 24, but the quad is one contract and must
+                // not acquire two meanings.
                 use crate::runtime::decode::fifo::{
                     decode_invalidate_resources, CHILD_INVALIDATE_PAGEON_FLAGS,
                 };
+                use crate::runtime::resource_validity::{apply, ValiditySite};
                 match decode_invalidate_resources(&packet.payload) {
                     Some(cmd) => {
                         let mut bumped = 0u32;
                         let mut miss = 0u32;
-                        let mut skipped_no_clr_host = 0u32;
+                        let mut windows_dropped = 0u32;
                         for rec in &cmd.records {
-                            // Only clr hostValid means host-side content is stale.
-                            if rec.ops.clear_host_valid == 0 {
-                                skipped_no_clr_host = skipped_no_clr_host.saturating_add(1);
-                                continue;
-                            }
-                            if let Some(m) = state.mappings.get_mut(&rec.object_id) {
-                                m.content_generation = m.content_generation.saturating_add(1);
-                                bumped = bumped.saturating_add(1);
-                            } else {
+                            let outcome = apply(
+                                state,
+                                cmd.task_id,
+                                rec.object_id,
+                                rec.ops,
+                                ValiditySite::InvalidateResources,
+                            );
+                            bumped = bumped.saturating_add(outcome.bumped);
+                            windows_dropped =
+                                windows_dropped.saturating_add(outcome.windows_dropped);
+                            if outcome.missed {
                                 miss = miss.saturating_add(1);
                             }
+                        }
+                        if miss > 0 {
+                            note_store_route_n("validity_miss_inv", miss as u64);
                         }
                         let rec0 = cmd.records.first();
                         let oid = rec0.map(|r| r.object_id).unwrap_or(0);
                         let flags = rec0.map(|r| r.flags).unwrap_or(0);
                         let ops = rec0.map(|r| r.ops).unwrap_or_default();
                         let pageon = flags == CHILD_INVALIDATE_PAGEON_FLAGS;
-                        // ~11k/boot of routine guest cache-coherence ops — the
-                        // always-on rate is the `teardown_churn ... invalidate=`
-                        // window summary (lifecycle_churn). Gate the per-op decode
-                        // detail (bumped/miss/clr_h/set_h) so it does not bury the
-                        // curated fail view; the `decode_fail` and `inv_multi`
-                        // paths below stay fail-visible. The guard also skips the
-                        // format alloc on a healthy boot.
+                        // ~11k/boot of routine guest cache-coherence ops. The
+                        // always-on rate is the `validity_*` family in the
+                        // per-second `store_routes` line; gate the per-op decode
+                        // detail so it does not bury the curated fail view. The
+                        // `decode_fail` and `inv_multi` paths below stay
+                        // fail-visible, and the guard also skips the format alloc
+                        // on a healthy boot.
                         if crate::observe::draw_log_enabled() {
                             crate::observe::line(format!(
-                            "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss} skip_no_clr_h={skipped_no_clr_host}",
+                            "map_family op=InvalidateResources opcode={:#x} ch={channel_id} plen={plen} task={} count={} oid={oid:#x} flags={flags:#x} clr_h={} set_h={} clr_g={} set_g={} pageon={pageon} bumped={bumped} miss={miss} windows_dropped={windows_dropped}",
                             packet.opcode,
                             cmd.task_id,
                             cmd.count,

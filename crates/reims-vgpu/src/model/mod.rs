@@ -18,7 +18,8 @@ pub use state::{
     GVA_EVICTION_WITNESS_KEYS,
     IosfcRegs, LinearDeferredEntry, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow,
     MrtSecondaryRecord, PacketFault, PaintSrc,
-    PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
+    PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity, StampSlot,
+    SurfaceWriteKind,
     TaskEntry, TaskMapSpan, Type4Walk, WriteGate,
 };
 
