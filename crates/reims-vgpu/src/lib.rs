@@ -1007,7 +1007,7 @@ pub fn device_drain(id: u64) -> bool {
     runtime::drain::note_drain_tranche(drain_us, publish_started.elapsed().as_micros() as u64);
     // Same one-second cadence, so the cache trend lines up row-for-row with
     // `store_routes` and `drain_duty`. Measure-only; see `note_cache_levels`.
-    runtime::surface_cache::note_cache_levels(&device.state);
+    runtime::surface_cache::note_cache_levels(&device.state, &host);
     // The present-completion ack, re-homed off the QEMU paint — ONLY while the
     // host window is the display. With the window live no per-present
     // `ScanoutUpdate` is enqueued, so `device_scanout_copy` — the only other

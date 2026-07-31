@@ -1271,11 +1271,75 @@ pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64, u64) {
     (dead_task, no_backing, backing_bytes)
 }
 
+/// GVA-keyed entries whose key no longer translates to the backing the pixels
+/// were produced from. Returns `(moved, unmapped, checked)`.
+///
+/// The successor probe to [`gva_cache_staleness`], which measured that **every**
+/// accumulated entry belongs to a live task — so task death cannot be the
+/// eviction rule, and the question moves to the backing itself.
+///
+/// A `GVA` is only a name for whatever the owning task's page table points it at
+/// now. `GvaBacking::gpas` records what it pointed at when the pixels were
+/// stored, and `get_gva_with_gen` serves on `(gva, exact geometry)` — so an entry
+/// whose key now walks somewhere else is one no correct lookup can use: the
+/// name has been handed to a different allocation. That is the same "drop only
+/// what could never be served" standard the dead-task rule was reaching for,
+/// applied where the evidence says to look.
+///
+/// - **`moved`** — the key translates, to a different page than recorded. The
+///   guest reused the address.
+/// - **`unmapped`** — the key does not translate at all. Counted apart because
+///   the two are different guest actions and, more importantly, because a
+///   transient walk failure looks exactly like this: `d455c3e`'s whole finding
+///   was that the device answers before the guest has finished mapping, so a
+///   *failure to translate* must never on its own authorise dropping content.
+///   Only `moved` carries positive evidence that the address belongs to someone
+///   else now.
+/// - **`checked`** — entries with a usable backing and a live task, i.e. the
+///   denominator. Without it a reader cannot tell "nothing moved" from "nothing
+///   was examined", which is the failure direction that reads as a clean result.
+///
+/// Cost is one page-table walk per entry per census interval — the **first**
+/// recorded page only, not the whole list. A whole-list walk of a 4K entry is
+/// ~2 025 walks and this runs on the drain thread; the first page is enough to
+/// tell a reused address from a retained one, and this is a measurement rather
+/// than the authorisation for a write.
+///
+/// Measure-only. Nothing may evict on this yet: it exists to size the rule
+/// before the rule is written.
+pub fn gva_backing_moved<H: HostMemory>(state: &DeviceState, host: &H) -> (u64, u64, u64) {
+    let page_shift = state.page_shift;
+    let page_mask = !((1u64 << page_shift) - 1);
+    let (mut moved, mut unmapped, mut checked) = (0, 0, 0);
+    for (&gva, entry) in &state.host_gva_surfaces {
+        let Some(backing) = entry.backing.as_ref() else {
+            continue;
+        };
+        let Some(&recorded) = backing.gpas.first() else {
+            continue;
+        };
+        let Some(task) = state
+            .tasks
+            .get(backing.task_id as usize)
+            .filter(|t| t.active)
+        else {
+            continue;
+        };
+        checked += 1;
+        match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
+            None => unmapped += 1,
+            Some(live) if (live & page_mask) != (recorded & page_mask) => moved += 1,
+            Some(_) => {}
+        }
+    }
+    (moved, unmapped, checked)
+}
+
 /// Emit [`cache_levels`] at most once per census interval.
 ///
 /// Shares the one-second cadence the drain census already runs on, so a boot's
 /// cache trend lines up row-for-row with `store_routes` and `drain_duty`.
-pub fn note_cache_levels(state: &DeviceState) {
+pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -1297,12 +1361,15 @@ pub fn note_cache_levels(state: &DeviceState) {
         return;
     }
     let (dead_task, no_backing, backing_bytes) = gva_cache_staleness(state);
+    let (moved, unmapped, checked) = gva_backing_moved(state, host);
     crate::observe::off(format!(
         "host_cache_levels (levels, not per-interval) total_bytes={total} peak_bytes={peak} \
          surfaces={} surface_bytes={} surface_largest={} \
          gva={} gva_bytes={} gva_largest={} \
          gva_dead_task={dead_task} gva_no_backing={no_backing} \
          gva_backing_bytes={backing_bytes} \
+         gva_backing_moved={moved} gva_backing_unmapped={unmapped} \
+         gva_backing_checked={checked} \
          linear={} linear_bytes={} linear_largest={}",
         surfaces.entries,
         surfaces.bytes,
@@ -1322,6 +1389,56 @@ mod tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// The probe has to separate a reassigned address from one that merely
+    /// failed to walk, because only the first is evidence the entry is dead.
+    ///
+    /// `d455c3e`'s finding was that this device routinely asks before the guest
+    /// has finished mapping, so a failure to translate is a transient state and
+    /// not a licence to drop content — collapsing `unmapped` into `moved` would
+    /// build an eviction rule on exactly that mistake.
+    #[test]
+    fn the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one() {
+        use crate::model::GvaBacking;
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let root_gpa = setup_depth1_task(&mut host, &mut st);
+
+        // Three entries at GVAs 1, 2 and 3 pages in, each recording the page its
+        // own PTE currently names (PT_BASE + i, i.e. 5, 6, 7).
+        for i in 1..=3u32 {
+            let gva = (i as u64) << PAGE_SHIFT_ARM64E;
+            store_gva(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4]);
+            st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
+                task_id: 1,
+                span: 1 << PAGE_SHIFT_ARM64E,
+                gpas: vec![((4 + i) as u64) << PAGE_SHIFT_ARM64E],
+            });
+        }
+
+        // Nothing touched yet: every backing still agrees with the page table.
+        assert_eq!(gva_backing_moved(&st, &host), (0, 0, 3));
+
+        // The guest hands GVA page 2 to a different allocation.
+        repoint_pte(&mut host, root_gpa, 2, 12);
+        assert_eq!(
+            gva_backing_moved(&st, &host),
+            (1, 0, 3),
+            "a re-pointed PTE is a moved backing"
+        );
+
+        // And drops GVA page 3 entirely (PTE 0 = not present).
+        repoint_pte(&mut host, root_gpa, 3, 0);
+        let (moved, unmapped, checked) = gva_backing_moved(&st, &host);
+        assert_eq!(
+            (moved, unmapped),
+            (1, 1),
+            "unmapped must not be folded into moved"
+        );
+        // The denominator must stay honest, or "nothing moved" and "nothing was
+        // examined" become the same reading.
+        assert_eq!(checked, 3);
+    }
 
     /// The staleness split has to distinguish "provably unservable" from
     /// "cannot tell", because only the first is safe to evict from a cache that
