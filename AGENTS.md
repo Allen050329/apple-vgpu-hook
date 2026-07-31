@@ -1420,6 +1420,41 @@ project is chartered to fix. Check `*/ips/` in every run directory before conclu
 nothing — and note that `/tmp/ch2/ips/` contains a zero-byte file named `Retired`, which is the
 `ls -1` subdirectory trap this document describes elsewhere, frozen in place.
 
+### Goal 4: the staging row-copy is bounded by its caller, not by the copy
+
+Recorded as a **negative** result, because it was written down as a lead and reads like a live bug.
+
+There are two unsafe row-by-row copies into the present staging image, and neither has a bounds check
+at the copy site:
+
+```text
+backend/vulkan/engine/window_present.rs:1113   dst = mapped + offset + y * row_pitch
+host_window/present.rs:1804                    dst = mapped + offset + y * row_pitch
+```
+
+Both are nonetheless bounded, by two upstream conditions that have to be read together:
+
+- **The source length is validated.** The engine rail filters on `cpu_frame_complete` at
+  `window_present.rs:865` — a real production call site, not only the five unit tests around it. The
+  host-window rail does the same check inline in `prepare_frame`
+  (`if f.bgra.len() < f.width * f.height * 4` → `BlitSource::Slate`), with the reasoning stated: a
+  short buffer is a torn frame, and a slate beats blitting uninitialised memory.
+- **The destination is forced to the frame's geometry.** Both rails call `ensure_staging(width,
+  height)` first, and it destroys and recreates the image whenever `s.width`/`s.height` differ. So by
+  the time the copy runs, `y < height == staging.height`, and `row_pitch >= width * 4` holds by the
+  Vulkan linear-image contract.
+
+So a resize cannot make the copy write past the mapped region, and a stale short buffer cannot make
+it read past the source. "`y * staging.row_pitch` has no bounds check against the mapped region" is
+true of the line and false of the path.
+
+This does not clear Goal 4 — the reported symptoms are a wallpaper that stops working at 4K and a
+crash after a couple of resizes, and neither has been reproduced or measured yet. It closes one
+candidate mechanism so the next session does not re-chase it. The other standing lead is unexamined:
+`host_surfaces` has `remove()` at `surface_cache.rs:257` and `:1156`, so an earlier claim of "no
+eviction path" is overstated, but there is **no size cap**, and a 4K surface is ~4x the bytes of a
+1080p one.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
