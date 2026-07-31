@@ -719,6 +719,47 @@ it counts at most one per refused attach and merely tracks `type4_translate_refu
 this boot). The pre-guard boot's guessing attaches averaged 325 pages each, so the guarded number
 understates the fabrication it prevents by about that factor.
 
+### The user's crash report is a corrupt malloc free list under a backdrop blur
+
+`~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
+stack from the bottom up, because the top of it is not the bug:
+
+```text
+ 5  small_free_list_remove_ptr_no_clear + 1017     <- malloc finds its free list corrupt
+ 4  malloc_zone_error                              <- and aborts
+ 9  _objc_rootAllocWithZone
+10  AppleParavirtGPUMetal                          <- the allocation that discovered it
+11  CA::OGL::MetalContext::start_render_encoder
+19  CA::OGL::Context::blur_surface
+20  CA::OGL::GaussianBlurFilter::render
+22  CA::OGL::filter_backdrop
+23  CA::OGL::capture_backdrop
+```
+
+`EXC_CRASH (SIGABRT)`, `abort() called`. This is **not** a fault in the paravirt driver: malloc's
+small-zone free list was *already* corrupt, and the driver's next allocation is merely what walked
+into it. The guest kernel panic census in this document already contains "a malloc small-zone free
+list" and a `kalloc` poison report reading `val:0xffffffffffffffff`; this is the userspace member of
+that same family, and it is the shape a stray write of opaque white BGRA leaves.
+
+The frame it happened under is the actionable part. **Backdrop blur** allocates a chain of
+short-lived intermediate surfaces every frame — downsample, blur, composite — which is precisely the
+condition that makes the device resolve a type-4 surface before the guest has finished mapping its
+backing, and therefore the condition under which the pre-guard device fabricated a GPA from a GVA.
+
+**State this as a consistency, not an attribution.** Three things line up — a corrupt heap free list,
+a workload that maximises transient surface churn, and a device path that answered that churn with an
+invented address — and none of them is a measurement of this crash. Nobody has tied a specific
+guessed entry to this abort, and the report predates the guard.
+
+It does dictate the next repro, though, and that is the point of writing it down. `scroll-patch.sh`
+uses flat colour bands, which produce a handful of long-lived tiles and barely exercise the race;
+`.agents/repros/blur-provoke.sh` is the opposite by construction — `backdrop-filter: blur()` plus
+promoted layers — and scores the same `type4guess.py` counters so the two pages can be compared.
+Note that page **cannot** be scored by `scrollpatch.py`: blur produces intermediate colours by
+construction, so the flat-palette rule that makes that scorer sound does not hold, and pointing it
+there would score correct rendering as a defect.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
