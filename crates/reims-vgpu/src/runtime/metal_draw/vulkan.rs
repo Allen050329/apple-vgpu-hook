@@ -1087,15 +1087,21 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // stage costs a page-list walk and is paid on the minority of
                 // binds the first stage flags.
                 let guest_write = mapping_guest_write_verdict(state, host, mid);
-                let guest_replaced = guest_wrote_allocation(guest_write) && {
-                    let site = guest_write_site(state, host, mid, w, h);
+                let site = guest_wrote_allocation(guest_write)
+                    .then(|| guest_write_site(state, host, mid, w, h));
+                if let Some(site) = site.as_ref() {
                     crate::runtime::drain::note_store_route(match site {
-                        GuestWriteSite::Pixels => "t11sample_gw_wrote_pixels",
+                        GuestWriteSite::Pixels(_) => "t11sample_gw_wrote_pixels",
                         GuestWriteSite::Elsewhere => "t11sample_gw_wrote_elsewhere",
                         GuestWriteSite::Unknown => "t11sample_gw_wrote_unknown",
                     });
-                    !matches!(site, GuestWriteSite::Elsewhere)
+                }
+                let guest_owned = match site.as_ref() {
+                    Some(GuestWriteSite::Pixels(ranges)) => Some(ranges.as_slice()),
+                    _ => None,
                 };
+                let guest_replaced =
+                    !matches!(site, None | Some(GuestWriteSite::Elsewhere));
 
                 // A ready resident target is authoritative after a product
                 // Store — but only while nothing has replaced the bytes it is a
@@ -1116,6 +1122,12 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // keeps re-binding the same surface, which is what "renders
                 // correctly for a few frames then stays corrupted" looks like
                 // from inside the guest.
+                //
+                // Refusing is not enough on its own, because neither copy is the
+                // surface once both sides have written it. The refusal merges
+                // them into the guest's pages first — see
+                // [`merge_guest_writes_into_pages`] — and every rung below then
+                // reads a surface that holds both halves.
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
                     if !guest_replaced {
@@ -1123,6 +1135,26 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                         return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
                     }
                     note_type11_sample_rung("t11rung_resident_refused", guest_write);
+                    match guest_owned {
+                        Some(ranges) => {
+                            merge_guest_writes_into_pages(
+                                state,
+                                host,
+                                mid,
+                                w,
+                                h,
+                                &resident_id,
+                                ranges,
+                            );
+                        }
+                        // `Unknown`: the host named no pages, so there is no
+                        // list to preserve and no merge to make. The rungs below
+                        // read whatever the guest's pages hold, which is the only
+                        // source not known to be stale.
+                        None => crate::runtime::drain::note_store_route(
+                            "t11sample_resident_unmergeable",
+                        ),
+                    }
                     // A resident that stops matching its surface is a real
                     // correction, not routine control flow: without this line a
                     // boot cannot tell "the guest never rewrites its sampled
@@ -6442,15 +6474,17 @@ fn guest_wrote_allocation(verdict: GuestWriteVerdict) -> bool {
 
 /// Where the guest's writes since the stamping Store landed, relative to the
 /// pixel window a sampled bind reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum GuestWriteSite {
-    /// At least one written page overlaps the sampled window. Every host-side
-    /// copy of it is out of date.
-    Pixels,
+    /// At least one written page overlaps the sampled window, so every
+    /// host-side copy of it is out of date. Carries the mapping-offset ranges
+    /// the guest owns, which is exactly the `skip` list the merge needs.
+    Pixels(Vec<(u64, u64)>),
     /// The guest wrote the allocation but not the bytes this bind samples.
     Elsewhere,
     /// The host could not name the written pages, or the window is unknown.
-    /// Indistinguishable from [`Self::Pixels`] to a caller that must be right.
+    /// Indistinguishable from [`Self::Pixels`] to a caller that must be right,
+    /// but it cannot be merged either — there is no page list to preserve.
     Unknown,
 }
 
@@ -6504,10 +6538,77 @@ fn guest_write_site<M: HostOps>(
         return GuestWriteSite::Unknown;
     }
     if ranges_touch_window(&ranges, base_off, span_end) {
-        GuestWriteSite::Pixels
+        GuestWriteSite::Pixels(ranges)
     } else {
         GuestWriteSite::Elsewhere
     }
+}
+
+/// Put both halves of a surface the guest wrote under a live resident into the
+/// guest's own pages, and withdraw the resident's claim to be the surface.
+///
+/// This is the answer the ladder was missing. Neither copy is the surface on its
+/// own: the resident holds what the GPU rendered, the pages hold what the guest
+/// CPU painted since, and picking either one loses the other's work. Refusing
+/// the resident and reading the pages — which is what the gate did on its own —
+/// produced a black desktop at 17 Hz, because the skip-readback Store rail
+/// leaves a composite's pixels GPU-side on purpose and the pages it read had
+/// never been written.
+///
+/// So: read the resident out, land it in every page the guest did *not* write
+/// (`write_bgra8_skipping`, the same per-page rule the deferred writeback
+/// follows), and retire the resident. The pages then hold the merge, and they
+/// are what every rung below reads. The next Store into this surface makes a
+/// fresh resident and stamps it, so this is paid once per burst of guest writes
+/// and not once per bind.
+///
+/// Returns whether the merge landed. On `false` the caller has a surface whose
+/// halves are still split and must say so rather than bind either one.
+#[cfg(feature = "backend-vulkan")]
+fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+    identity: &crate::backend::vulkan::engine::TargetIdentity,
+    guest_owned: &[(u64, u64)],
+) -> bool {
+    let readback = match crate::backend::vulkan::engine::read_target(identity) {
+        Ok(rb) => rb,
+        Err(e) => {
+            crate::observe::fail(format!(
+                "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=readback err={e:?}"
+            ));
+            return false;
+        }
+    };
+    let bgra = readback.into_bgra8();
+    let stride = width.saturating_mul(RGBA8_BPP);
+    if !mapping_write::write_bgra8_skipping(
+        state,
+        host,
+        mapping_id,
+        &bgra,
+        stride,
+        width,
+        height,
+        guest_owned,
+    ) {
+        crate::observe::fail(format!(
+            "sampled_resident_merge_fail mid={mapping_id} {width}x{height} stage=writeback \
+             runs={} bytes={}",
+            guest_owned.len(),
+            bgra.len()
+        ));
+        return false;
+    }
+    // The pages now hold both halves, so this image is one of them and not the
+    // surface. Leaving it `content_ready` would let the very next bind take it
+    // and undo the merge.
+    crate::backend::vulkan::engine::retire_resident_content(identity);
+    crate::runtime::drain::note_store_route("t11sample_resident_merged");
+    true
 }
 
 /// Whether any written mapping-offset range overlaps `[base_off, span_end)`.
