@@ -358,11 +358,18 @@ stamp and prints the path; read the path out of the boot log. An arm that panick
 — not clean, not corrupt, and not a row to average — and a harness that cannot tell those apart is
 the failure mode the `Retired` directory already cost this project a session to.
 
-### A `store_routes` counter is a sum, and `grep -c` returns the census cadence
+### A `store_routes` counter is a per-interval count, and `grep -c` returns the census cadence
 
-Every counter in a `store_routes` line is a running total, re-emitted on each census line. Counting
-those lines with `grep -c mapping_pages_ours` therefore measures *how often the census fired*, not
-the quantity — and it returns a plausible number, which is why it survives review.
+Every counter in a `store_routes` line is the count **for that census interval**, not a running
+total: the boot's figure is the sum of the key across every census line. Counting those lines with
+`grep -c mapping_pages_ours` therefore measures *how often the census fired*, not the quantity — and
+it returns a plausible number, which is why it survives review.
+
+An earlier revision of this section called the counters running totals while still prescribing the
+sum, which is the remedy for the opposite convention. Taking the last line instead — the reading a
+running total would demand — under-reports by the census cadence, about **100×** on a 2 900 s boot.
+The values settle it directly: `rendw_stamp_outlived` on one control boot reads
+`10 3 4 9 2 23 32 53 107 95 99 89 …` and ends at `83`. A running total cannot decrease.
 
 Measured: the first run of `.agents/repros/mapping-guard-census.sh` printed `mapping_pages_ours 310`
 and `mapping_pages_drifted 20` for a boot whose true totals were **25 646 and 22**. Both numbers were
@@ -388,9 +395,30 @@ ctl  (REIMS_VGPU_FENCE_FLUSH_OFF=all) 4 corrupt / 8 boots    5 corrupt / 32 roun
                        Fisher two-tailed  p = 0.077 (boots)  p = 0.053 (rounds)
 ```
 
-The control's validity gate is independent of its icon score and it passed hard: with the knob set,
-`rendw_stamp_outlived` runs 1 000–1 700 per round, and every arm boot measured scores **0** across
-~51 000 stores. The knob took; the control is a control.
+The control's validity gate is independent of its icon score and it passed hard. Stated properly —
+summed per boot, per rail, over the four interleaved pairs of the replicate:
+
+```text
+                  gvaw          linw          rendw            storw
+arm  p1..p4    0 / 3 823     0 /    9      0 / 21 300       0 / 43
+               0 / 5 547     0 /    9      0 / 22 266       0 / 43
+               0 / 4 987     0 /  104      0 / 23 661       0 / 91
+               0 / 5 558     0 /   84      0 / 20 760       0 / 91
+ctl  p1..p4    5 / 5         6 /    6  9 236 / 9 236       22 / 22
+               3 / 3         6 /    6  7 454 / 7 454       22 / 22
+               1 / 1        47 /   47  9 869 / 9 869       25 / 25
+               2 / 2        36 /   36  8 918 / 8 918       25 / 25
+```
+
+That is a completeness statement about **Goal 1**, not just a knob check, and it is stronger than
+"the knob took". On the default binary **every one of ~88 000 render-window stores landed inside its
+fence, on all four rails, in every boot**; with `REIMS_VGPU_FENCE_FLUSH_OFF=all` the `same` column is
+**0 everywhere** — not one store lands inside its fence. The bindings are not a partial improvement
+on some rails; they are the entire difference between "always" and "never", and no rail is missing
+one.
+
+(The earlier figure here, "1 000–1 700 per round", was the census cadence times the interval count —
+the arithmetic the section above this one now warns about. The per-boot totals are the row above.)
 
 Three cautions that belong with the number:
 
