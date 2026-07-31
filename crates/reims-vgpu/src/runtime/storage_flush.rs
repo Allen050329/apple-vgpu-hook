@@ -1490,18 +1490,57 @@ fn note_mapping_window_against_fence(
 /// counters are emitted either way, so the knob measures the guard's *cost*
 /// while the counters measure its *rate* — a boot with the guard off still says
 /// how many writes it would have refused.
+/// # Drift is a question, not a verdict
+///
+/// A walk that disagrees with the list says the list is not current. It does not
+/// say the surface is gone, and refusing there would be this device guessing in
+/// the safe direction — which on this rail means withholding a frame, and a
+/// withheld full-screen frame is a black screen (`13ae46d`, measured). So the
+/// drift path makes the device *find out* instead: `resolve_type4_surface`
+/// re-runs the object search and re-walks, which is the same thing that would
+/// have happened at the next type-4 command, only now.
+///
+/// The resolve settles it two ways and both are already-tested behaviour:
+///
+/// - The list comes back identical. `map_generation` does not move, the walk now
+///   agrees, and the write proceeds — the cached list was merely stale in the
+///   device's hands, not wrong about the surface.
+/// - The list comes back different. The adoption bumps `map_generation`, and the
+///   caller's own `key.map_generation` check — re-taken below — refuses this
+///   window, because it was armed against the previous incarnation. Its frame is
+///   correctly lost rather than written into the new one's pages.
+///
+/// Only a mapping that still disagrees after a forced re-resolve is refused
+/// here, and that is a mapping whose backing this device genuinely cannot name.
 #[cfg(feature = "backend-vulkan")]
 fn mapping_pages_still_ours<M: HostMemory + HostOps>(
-    state: &DeviceState,
-    host: &M,
-    mapping_id: u32,
+    state: &mut DeviceState,
+    host: &mut M,
+    key: &crate::model::ComputeStorageResidencyKey,
 ) -> bool {
-    if crate::runtime::mapper::type4_pages_still_ours(state, host, mapping_id) {
+    if crate::runtime::mapper::type4_pages_still_ours(state, host, key.mapping_id) {
         crate::runtime::drain::note_store_route("mapping_pages_ours");
         return true;
     }
     crate::runtime::drain::note_store_route("mapping_pages_drifted");
-    !crate::observe::mapping_page_guard_disabled()
+    if crate::observe::mapping_page_guard_disabled() {
+        return true;
+    }
+    crate::runtime::objects::resolve_type4_surface(state, &*host, key.mapping_id);
+    let current = state
+        .mappings
+        .get(&key.mapping_id)
+        .map(|m| m.map_generation);
+    if current != Some(key.map_generation) {
+        crate::runtime::drain::note_store_route("mapping_pages_reresolved_moved");
+        return false;
+    }
+    if !crate::runtime::mapper::type4_pages_still_ours(state, host, key.mapping_id) {
+        crate::runtime::drain::note_store_route("mapping_pages_unresolvable");
+        return false;
+    }
+    crate::runtime::drain::note_store_route("mapping_pages_reresolved_same");
+    true
 }
 
 /// Land a deferred **type-11 render Store**: perform the CPU writeback into the
@@ -1655,7 +1694,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // `map_generation` is the guest's *declared* incarnation, and a type-4
     // surface can be re-pointed with nothing declared at all. See
     // `mapping_pages_still_ours`.
-    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+    if !mapping_pages_still_ours(state, host, key) {
         release_window_pin_for_key(key, source);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=mapping_page_drift",
@@ -1860,7 +1899,7 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+    if !mapping_pages_still_ours(state, host, key) {
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=mapping_page_drift",
@@ -2373,11 +2412,16 @@ mod tests {
     /// writing then lands that other layer's pixels in these pages, which is the
     /// black/torn-layer class rather than a merely stale frame.
     ///
-    /// No engine is initialized here, so `resident_content_epoch` answers `None`
-    /// for the reconstructed identity, which is the same reading an evicted slot
-    /// produces and the one this arm must fail closed on. The assertion that
-    /// matters is the *guest memory*: a decline that still wrote would pass a
-    /// log-only check.
+    /// No engine is initialized here, so the registry has no slot at the
+    /// reconstructed identity at all, and the refusal this asserts is therefore
+    /// `resident_absent` rather than `resident_epoch_cleared`. Those two used to
+    /// be one `reason=resident_epoch_drift` with `live=None`, and separating
+    /// them is what `engine::ResidentContent` exists for: an un-stamped slot is
+    /// expected traffic, a missing one cannot happen to a pinned identity and
+    /// means the arm and the flush name the target differently.
+    ///
+    /// The assertion that matters either way is the *guest memory*: a decline
+    /// that still wrote would pass a log-only check.
     #[test]
     fn a_resident_window_that_cannot_be_vouched_for_declines_without_writing() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -2419,9 +2463,10 @@ mod tests {
         let line = cap.one("deferred_flush_lost");
         assert!(
             line.contains("kind=render")
-                && line.contains("reason=resident_epoch_drift")
+                && line.contains("reason=resident_absent")
                 && line.contains("want=7"),
-            "the epoch witness must be the stated refusal, with the value it wanted: {line}"
+            "the epoch witness must be the stated refusal, naming which kind of \
+             absence it was and the value it wanted: {line}"
         );
         let mut after = [0u8; 256];
         host.read_gpa(gpa, &mut after).unwrap();
