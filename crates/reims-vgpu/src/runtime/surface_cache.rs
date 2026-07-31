@@ -746,6 +746,38 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
 /// on this class, and it is the first quantity here that can say so. A boot that
 /// never enters the high mode cannot confirm or refute a fix for the reliable
 /// defect, and two of the three boots taken this session did not.
+///
+/// # RETRACTED: this counter does not predict the icon class
+///
+/// The model above was built on two boots and a third refutes it. Three
+/// 14-round boots on one binary, after the GVA rail was bounded by the fence:
+///
+/// ```text
+/// boot          gvac_gw_wrote/1000 draws   rounds corrupt
+/// icon-fence            42.4                    0 of 14
+/// icon-fence2           79.5                    0 of 14
+/// hi-mode              109.9 -> see below       0 of 14   (clean arm)
+/// hi-mode2              74.5                   14 of 14
+/// ```
+///
+/// The all-corrupt boot has a **lower** normalised count than the all-clean one
+/// it is paired against (74.5 against 109.9), and neither reaches the ~127 the
+/// model calls the corrupting threshold. So the bimodal split does not survive
+/// contact with a third and fourth boot, and no conclusion above that rests on
+/// "this boot was in the low mode" should be trusted — including the caution
+/// that a low-mode boot cannot score a fix. It cannot, but not for this reason.
+///
+/// What DOES separate those two boots is not instantaneous load at all: the
+/// corrupt one had been driven for 600 s (Mission Control, Spotlight, window
+/// drags) before the icon harness started, and the clean one was fresh. The
+/// class tracks accumulated session history. The counters that move with it are
+/// remap counters — `gvac_suspect` 15.8x, `gvac_moved` 10.5x, and `rmemo_stale`
+/// 0 -> 19, the last of which had never been observed at all (previously zero
+/// over 1 639 738 verified hits) and means the guest re-pointed a GPU-mapped
+/// range with no notification arriving first.
+///
+/// That is a regime where naming a resource by its address stops working, which
+/// is what the paragraph above this section already said the open work was.
 pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &H,
