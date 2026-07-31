@@ -15,7 +15,8 @@ pub use state::{
     FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
     GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView, HostLinearTexture,
     HostSurface,
-    IosfcRegs, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow, PacketFault, PaintSrc,
+    IosfcRegs, LinearDeferredEntry, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow,
+    PacketFault, PaintSrc,
     PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
     TaskEntry, TaskMapSpan, WriteGate,
 };

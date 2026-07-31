@@ -224,9 +224,11 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
                         hits.push(mid);
                     }
                 }
-                for (key, (generation, pages)) in linear_index.iter() {
-                    if pages.contains(&gpa_page) && !linear_hits.iter().any(|(k, _)| k == key) {
-                        linear_hits.push((*key, *generation));
+                for (key, entry) in linear_index.iter() {
+                    if entry.pages.contains(&gpa_page)
+                        && !linear_hits.iter().any(|(k, _)| k == key)
+                    {
+                        linear_hits.push((*key, entry.generation));
                     }
                 }
                 for (&window_gva, entry) in gva_index.iter() {
@@ -344,8 +346,8 @@ pub fn flush_mapping_for_guest_read<M: HostMemory + HostOps>(
                 let hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = state
                     .linear_deferred_flush
                     .iter()
-                    .filter(|(_, (_, window_pages))| !window_pages.is_disjoint(&pages))
-                    .map(|(key, (generation, _))| (*key, *generation))
+                    .filter(|(_, entry)| !entry.pages.is_disjoint(&pages))
+                    .map(|(key, entry)| (*key, entry.generation))
                     .collect();
                 for (key, generation) in hits {
                     ok &= flush_linear_one(state, host, &key, generation);
@@ -688,6 +690,51 @@ fn note_window_outlived_its_stamp(
     }
 }
 
+/// Score a deferred **linear compute-storage** landing against the guest's fence.
+///
+/// [`note_window_outlived_its_stamp`] is the same reading for the GVA render
+/// rail, and the hazard is identical because the identity is identical: a
+/// `ComputeStorageResidencyKey::linear` names a task and an address
+/// (`mapping_id` 0, `map_generation` carrying the task id), so nothing the guest
+/// does to reclaim the memory reaches this rail as a notification.
+///
+/// That distinction is why `6bc2220` cleared the other two deferred rails and
+/// cannot clear this one. `flush_render_one` and `flush_storage_one` refuse on
+/// `map_generation` drift, and `map_generation` moves on exactly the events that
+/// let a guest reuse an IOSurface's storage. This rail has no such generation to
+/// compare — [`deferred_pages_still_ours`] is its only guard, and free-then-reuse
+/// inside one process preserves the translation the guard reads.
+///
+/// The rail's own flush already records what that costs when it goes wrong:
+/// a `pmap_page_protect` kernel panic and userspace SIGSEGVs inside libmalloc's
+/// page bookkeeping. What was missing is how often the landing is late at all,
+/// which is what `linw_stamp_same` against `linw_stamp_outlived` says.
+#[cfg(feature = "backend-vulkan")]
+fn note_linear_window_outlived_its_stamp(
+    state: &DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+    window: &crate::model::LinearDeferredEntry,
+) {
+    let elapsed = state
+        .completion_stamp_seq
+        .wrapping_sub(window.armed_stamp_seq);
+    if elapsed == 0 {
+        crate::runtime::drain::note_store_route("linw_stamp_same");
+        return;
+    }
+    crate::runtime::drain::note_store_route("linw_stamp_outlived");
+    if crate::observe::first_sight(
+        "linear_window_outlived_stamp",
+        key.surface_offset ^ ((key.width as u64) << 32) ^ key.height as u64,
+    ) {
+        crate::observe::fail(format!(
+            "linear_window_outlived_stamp task={} ref={} gva={:#x} {}x{} stamps={elapsed} \
+             (guest was fenced before these bytes were written)",
+            key.map_generation, key.texture_ref, key.surface_offset, key.width, key.height
+        ));
+    }
+}
+
 /// Engine-resident identity a deferred GVA window is holding pinned.
 ///
 /// Rebuilt from the window's own fields — including the
@@ -883,10 +930,14 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
     generation: u32,
 ) -> bool {
-    let armed_pages = state.disarm_linear_deferred_window(key);
+    let window = state.disarm_linear_deferred_window(key);
+    let armed_pages = window.as_ref().map(|w| w.pages.clone());
     let task_id = key.map_generation;
     let texture_ref = key.texture_ref;
     let started = std::time::Instant::now();
+    if let Some(window) = window.as_ref() {
+        note_linear_window_outlived_its_stamp(state, key, window);
+    }
     let (bytes, texel) =
         match crate::backend::vulkan::engine::read_resident_storage(key, generation) {
             Ok(v) => v,
@@ -2539,8 +2590,8 @@ mod tests {
         for pages in state.deferred_alias_pages.values() {
             live.extend(pages.iter().copied());
         }
-        for (_, pages) in state.linear_deferred_flush.values() {
-            live.extend(pages.iter().copied());
+        for entry in state.linear_deferred_flush.values() {
+            live.extend(entry.pages.iter().copied());
         }
         for entry in state.gva_deferred_flush.values() {
             live.extend(entry.pages.iter().copied());
@@ -2619,7 +2670,9 @@ mod tests {
         assert_index_matches_windows(&state, &seen);
         // Disarm both remaining windows: index empties.
         assert_eq!(
-            state.disarm_linear_deferred_window(&lin),
+            state
+                .disarm_linear_deferred_window(&lin)
+                .map(|window| window.pages),
             Some([p(0xF)].into_iter().collect()),
             "disarm returns the pages the window was armed against"
         );
@@ -2628,6 +2681,40 @@ mod tests {
             assert!(!state.deferred_pages_intersect(&[page]));
         }
         assert_index_matches_windows(&state, &seen);
+    }
+
+    /// A linear compute-storage window records the fence it was armed under, and
+    /// a re-arm records the fence it was re-armed under.
+    ///
+    /// This rail writes a raw task GVA with no mapping incarnation to name, so
+    /// the only thing that can say a landing is late is the stamp counter at arm
+    /// time. Without it every linear landing is unscoreable, which is the state
+    /// `6bc2220` left it in while clearing the two rails that *do* carry an
+    /// allocation identity.
+    #[test]
+    fn a_linear_window_records_the_fence_it_was_armed_under() {
+        use crate::model::{ComputeStorageResidencyKey, DeviceState, PAGE_SHIFT_X86};
+        let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+        let p = |pfn: u64| pfn << PAGE_SHIFT_X86;
+        let key = ComputeStorageResidencyKey::linear(1, 7, 0x4000, 256, 0x1000, 64, 64, 0x46);
+
+        state.completion_stamp_seq = 41;
+        state.arm_linear_deferred_window(key, 1, [p(0xA)].into_iter().collect());
+        assert_eq!(
+            state.linear_deferred_flush.get(&key).unwrap().armed_stamp_seq,
+            41,
+            "the window must carry the fence it was armed under"
+        );
+
+        // The guest is fenced twice, then the same key re-arms: the window is a
+        // NEW obligation and must be scored against the new fence, not the one
+        // its predecessor was armed under.
+        state.completion_stamp_seq = 43;
+        state.arm_linear_deferred_window(key, 2, [p(0xB)].into_iter().collect());
+        let window = state.disarm_linear_deferred_window(&key).unwrap();
+        assert_eq!(window.armed_stamp_seq, 43, "a re-arm re-stamps the window");
+        assert_eq!(window.generation, 2);
+        assert_eq!(window.pages, [p(0xB)].into_iter().collect());
     }
 
     /// A raw task-GVA span aliasing a deferred GVA render-Store window's

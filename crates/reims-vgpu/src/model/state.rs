@@ -1037,6 +1037,41 @@ pub struct GvaDeferredEntry {
     pub alloc_gen: u64,
 }
 
+/// Everything a later flush needs to land a deferred **linear compute-storage
+/// Store** (`ComputeStorageResidencyKey::linear` — a raw task GVA, `mapping_id`
+/// 0). The engine resident holds the authoritative pixels;
+/// `storage_flush::flush_linear_one` lands them into guest pages and
+/// `host_linear_textures`.
+///
+/// This window names an *address under a task*, exactly like
+/// [`GvaDeferredEntry`], and for the same reason: a type-2/3 linear texture has
+/// no mapping incarnation to name and the wire format carries no lifecycle
+/// notify for one. The mapping-keyed rails
+/// (`storage_flush::flush_render_one`/`flush_storage_one`) can refuse on
+/// `map_generation` drift because the guest must MAP/UNMAP/ReplacePhysical to
+/// reclaim an IOSurface's storage; nothing of the sort exists here, which is why
+/// this entry carries the same fence stamp the GVA rail carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinearDeferredEntry {
+    /// Engine resident generation the window pinned — `read_resident_storage`'s
+    /// second argument, and the only thing that distinguishes two residents at
+    /// one key.
+    pub generation: u32,
+    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
+    ///
+    /// Same hazard, same reading as [`GvaDeferredEntry::armed_stamp_seq`]: after
+    /// the stamp the guest may free this texture's memory and its own allocator
+    /// may hand those pages to anything without touching a page table, so
+    /// `storage_flush::deferred_pages_still_ours` still passes and the flush
+    /// writes a compute-storage image over whatever moved in.
+    pub armed_stamp_seq: u64,
+    /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
+    /// aliasing these flush first
+    /// (`storage_flush::flush_intersecting_task_gva`), and the writer's own walk
+    /// is bounded to them.
+    pub pages: std::collections::HashSet<u64>,
+}
+
 impl GvaDeferredEntry {
     /// Guest byte span the flush writes: `row_stride * height`.
     pub fn span(&self) -> u64 {
@@ -1747,8 +1782,7 @@ pub struct DeviceState {
     /// resident into the cache entry and guest pages first
     /// (`storage_flush::flush_intersecting_task_gva`). Cache-only-shaped
     /// windows never enter — their sync path never wrote guest pages either.
-    pub linear_deferred_flush:
-        DeferredWindows<ComputeStorageResidencyKey, (u32, std::collections::HashSet<u64>)>,
+    pub linear_deferred_flush: DeferredWindows<ComputeStorageResidencyKey, LinearDeferredEntry>,
     /// Deferred GVA render-Store windows (type-2/3 color0, `target_gva != 0`)
     /// whose guest bytes + `host_gva_surfaces` encode the superseded sync path
     /// WOULD have written. The engine resident `TargetIdentity::Gva` is the
@@ -1963,13 +1997,13 @@ impl DeviceState {
         s = s
             .wrapping_mul(P)
             .wrapping_add(self.linear_deferred_flush.len() as u64);
-        for (key, (generation, pages)) in &self.linear_deferred_flush {
+        for (key, entry) in &self.linear_deferred_flush {
             s = s
                 .wrapping_mul(P)
                 .wrapping_add(key.texture_ref as u64)
                 .wrapping_add((key.map_generation as u64) << 12)
-                .wrapping_add((*generation as u64) << 28)
-                .wrapping_add((pages.len() as u64) << 44);
+                .wrapping_add((entry.generation as u64) << 28)
+                .wrapping_add((entry.pages.len() as u64) << 44);
         }
         s = s
             .wrapping_mul(P)
@@ -2036,34 +2070,42 @@ impl DeviceState {
         generation: u32,
         pages: std::collections::HashSet<u64>,
     ) {
-        if let Some((_, old)) = self.linear_deferred_flush.get(&key) {
-            let old = old.clone();
+        if let Some(old) = self.linear_deferred_flush.get(&key) {
+            let old = old.pages.clone();
             self.deferred_ref_sub_pages(&old);
         }
         self.deferred_ref_add_pages(&pages);
-        self.linear_deferred_flush
-            .0
-            .insert(key, (generation, pages));
+        let armed_stamp_seq = self.completion_stamp_seq;
+        self.linear_deferred_flush.0.insert(
+            key,
+            LinearDeferredEntry {
+                generation,
+                armed_stamp_seq,
+                pages,
+            },
+        );
     }
 
     /// Disarm a linear compute-storage deferred window, keeping the union index
     /// in sync.
     ///
-    /// Returns the page set the window was armed against, so a caller about to
-    /// write those guest pages can check they still belong to this window (see
-    /// `runtime::storage_flush::deferred_pages_still_ours`). This used to return
-    /// a bare `bool` and drop the pages on the floor, which left the flush with
-    /// no way to tell that the guest had re-pointed the span since defer time —
-    /// the same hazard the GVA rail already guards. `Some` still means "an entry
-    /// was present", so the presence test is unchanged for callers that only
-    /// want that.
+    /// Returns the whole window, so a caller about to write those guest pages
+    /// can check they still belong to this window (see
+    /// `runtime::storage_flush::deferred_pages_still_ours`) and can score the
+    /// landing against the fence the window was armed under
+    /// ([`LinearDeferredEntry::armed_stamp_seq`]). This used to return a bare
+    /// `bool` and drop the pages on the floor, which left the flush with no way
+    /// to tell that the guest had re-pointed the span since defer time — the
+    /// same hazard the GVA rail already guards. `Some` still means "an entry was
+    /// present", so the presence test is unchanged for callers that only want
+    /// that.
     pub fn disarm_linear_deferred_window(
         &mut self,
         key: &ComputeStorageResidencyKey,
-    ) -> Option<std::collections::HashSet<u64>> {
-        let (_, pages) = self.linear_deferred_flush.0.remove(key)?;
-        self.deferred_ref_sub_pages(&pages);
-        Some(pages)
+    ) -> Option<LinearDeferredEntry> {
+        let entry = self.linear_deferred_flush.0.remove(key)?;
+        self.deferred_ref_sub_pages(&entry.pages);
+        Some(entry)
     }
 
     /// Detach `e`'s contiguous view for later unmap (page table changed).
