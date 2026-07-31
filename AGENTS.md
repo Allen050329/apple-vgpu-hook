@@ -1455,6 +1455,25 @@ candidate mechanism so the next session does not re-chase it. The other standing
 eviction path" is overstated, but there is **no size cap**, and a 4K surface is ~4x the bytes of a
 1080p one.
 
+#### The resize direction is guest-to-host, which is why there is no repro yet
+
+Worth knowing before anyone tries to build one. **The guest drives the geometry and the host window
+follows**, not the other way round: the guest presents at a new size, `guest_resize_request`
+(`host_window/present.rs:151`) notices the incoming geometry differs from both the last observed one
+and the window's, and asks for a matching native resize, held as a `PendingGuestResize` until a
+`Resized` event confirms it (bounded by `GUEST_RESIZE_WARN_AFTER`, after which it drops
+fail-visibly and presents letterboxed). The native-resize half is `#[cfg(target_os = "macos")]`.
+
+So resizing the *host* window is not a way to drive this, and there is no QMP or device-side knob
+either — the resolution has to be changed **inside the guest**. That is the whole reason no Goal 4
+repro exists: macOS ships no built-in CLI for display mode, `osascript` is TCC-rejected on this rig
+(recorded above), and the Displays pane needs GUI automation. `displayplacer` (Homebrew) is the
+obvious candidate and the guest does have network, but nothing has tried it.
+
+Do not start Goal 4 by reading present code. Start by getting the guest to change resolution at all,
+and confirm the rig can observe the change — a repro that cannot reach the state reports a clean
+device, which is the failure this document already paid three `none` results for.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
