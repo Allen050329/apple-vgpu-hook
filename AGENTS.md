@@ -826,6 +826,37 @@ Two things this does **not** say. It is not a crash-rate measurement — four bo
 a 2 000-attach boot expects well under one, so these counts are consistent with the fix and equally
 consistent with short boots. **Quote the fabrication columns, not the drift columns.**
 
+#### Exactly two things populate `page_entries`, and both are now sound
+
+A completeness claim, of the kind this document says needs an audit rather than an assertion.
+`page_entries` is the address list every mapping-keyed reader and writer resolves through, so "the
+device cannot aim a write at an address it did not earn" is a statement about its writers. Grepping
+every assignment, clear, push and extend of the field across the crate and excluding test modules
+leaves **two** product sites:
+
+- `runtime/objects.rs`, in `apply_type4_backing` — per-page walks of the owning task's page table.
+  A failed walk used to be answered with the GVA; since `d455c3e` it refuses, and since the
+  `walk=[...]` field it names which of the walk's fifteen checks refused.
+- `runtime/mapper.rs:633`, `m.page_entries = plan.entries` — the guest's **own** IOSurface page
+  table, reached through `contract::iosurface_pages::build_table_plan`.
+
+The second one had never been audited and it holds up. It takes the table pointer from
+`MappingInternal` fields 0x48/0x50, requires each to be a kernel VA *before* dereferencing and the
+value read back to be a kernel VA *again*, tries both candidates, and returns `Err(Status::…)` with
+a distinct slug for every failure — `iosurface_page_table_pointer_48_invalid`,
+`…_50_read`, `iosurface_page_table_candidate_missing`, `…_failure_unattributed`. There is no branch
+that invents an entry, substitutes one address space for another, or admits a value because it
+happens to be backed by RAM. The addresses are the guest's own declaration, not this device's guess.
+
+Everything else that touches the field is in a `mod tests`, and `model/state.rs` only ever `clear()`s
+it. So the class the identity guard closed had exactly one other place it could have been hiding, and
+it is not hiding there.
+
+**Scope this claim precisely.** It is about `page_entries` and therefore about the mapping-keyed
+rails. The raw-address rails (`flush_gva_one`, `flush_linear_one`) name guest addresses with no
+mapping incarnation and are guarded by `deferred_pages_still_ours` and the fence ordering instead;
+this audit says nothing about them.
+
 #### A fabricated backing is contiguous, and a real one is not
 
 Worth knowing because it makes every archived log re-readable without new instrumentation. The
