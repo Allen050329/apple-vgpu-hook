@@ -213,6 +213,91 @@ pub fn note_written_pages<I: IntoIterator<Item = u64>>(gpas: I, page_size: u64) 
     }
 }
 
+/// One in this many guest writes is scanned for its payload shape.
+///
+/// Sampled rather than exhaustive because the scan is over the whole payload —
+/// framebuffer-sized on the store rails, at the 28-111 stores/s `store_routes`
+/// measures, on a drain worker `drain_duty` already shows at duty 0.93-0.99.
+/// A deterministic counter rather than a random draw so two boots of the same
+/// workload sample the same writes.
+const PAYLOAD_SAMPLE_EVERY: u64 = 64;
+
+struct PayloadCensus {
+    calls: AtomicU64,
+    sampled: AtomicU64,
+    all_ff: AtomicU64,
+    all_zero: AtomicU64,
+    bytes_sampled: AtomicU64,
+    bytes_all_ff: AtomicU64,
+}
+
+static PAYLOAD: PayloadCensus = PayloadCensus {
+    calls: AtomicU64::new(0),
+    sampled: AtomicU64::new(0),
+    all_ff: AtomicU64::new(0),
+    all_zero: AtomicU64::new(0),
+    bytes_sampled: AtomicU64::new(0),
+    bytes_all_ff: AtomicU64::new(0),
+};
+
+/// Record the *shape* of a guest write's payload, sampled.
+///
+/// # The assumption this exists to test
+///
+/// The panic census in `AGENTS.md` finds its victims filled with
+/// `0xffffffffffffffff`, and the standing reading is that this is "almost
+/// certainly a legitimate white frame landing at the wrong address — the defect
+/// is *where*, not *what*, so do not go looking for a source of white".
+///
+/// That is a reasonable inference and it has never been measured. It is also
+/// load-bearing: if this device writes all-`0xff` payloads constantly — a white
+/// browser page is exactly that — then the payload tells a reader nothing, and
+/// a victim full of `0xff` is no more likely to be ours than any other. If it
+/// almost never does, the payload is a far sharper discriminator than the
+/// footprint alone, which is only as strong as its density.
+///
+/// Both answers are worth having and neither is available today, so this counts
+/// rather than concluding. `all_zero` is the control on the counter itself: a
+/// scanner that reported everything as uniform would show both climbing
+/// together, and a freshly allocated surface really is zero-filled, so the two
+/// populations are known to be distinct in the guest.
+///
+/// The scan short-circuits on the first byte that differs, so a photograph costs
+/// one comparison and only a genuinely uniform buffer pays for its length.
+pub fn note_written_payload(buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
+    let n = PAYLOAD.calls.fetch_add(1, Ordering::Relaxed);
+    if !n.is_multiple_of(PAYLOAD_SAMPLE_EVERY) {
+        return;
+    }
+    PAYLOAD.sampled.fetch_add(1, Ordering::Relaxed);
+    PAYLOAD
+        .bytes_sampled
+        .fetch_add(buf.len() as u64, Ordering::Relaxed);
+    if buf.iter().all(|&b| b == 0xFF) {
+        PAYLOAD.all_ff.fetch_add(1, Ordering::Relaxed);
+        PAYLOAD
+            .bytes_all_ff
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+    } else if buf.iter().all(|&b| b == 0x00) {
+        PAYLOAD.all_zero.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(calls, sampled, all_ff, all_zero, bytes_sampled, bytes_all_ff)`.
+pub fn payload_counts() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        PAYLOAD.calls.load(Ordering::Relaxed),
+        PAYLOAD.sampled.load(Ordering::Relaxed),
+        PAYLOAD.all_ff.load(Ordering::Relaxed),
+        PAYLOAD.all_zero.load(Ordering::Relaxed),
+        PAYLOAD.bytes_sampled.load(Ordering::Relaxed),
+        PAYLOAD.bytes_all_ff.load(Ordering::Relaxed),
+    )
+}
+
 /// Whether this device has written the frame containing `gpa` at any point in
 /// this boot. The scorer's question, exposed so a test can ask it directly.
 pub fn wrote_gpa(gpa: u64) -> bool {
@@ -237,9 +322,15 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let fp = &*FOOTPRINT;
     let (pages, dropped) = counts();
     let kib = (pages << FRAME_SHIFT) / 1024;
+    let (calls, sampled, all_ff, all_zero, bytes_sampled, bytes_all_ff) = payload_counts();
+    // Levels, not per-interval: these are running totals for the boot, like the
+    // frame count beside them and unlike `store_routes`. Summing them across
+    // census lines multiplies by the cadence — the 100x error AGENTS.md records.
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
-         frame_shift={FRAME_SHIFT}"
+         frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
+         all_ff={all_ff} all_zero={all_zero} samp_bytes={bytes_sampled} \
+         ff_bytes={bytes_all_ff} (levels, not per-interval)"
     )];
 
     let last_ms = fp.last_dump_ms.load(Ordering::Relaxed);
@@ -284,6 +375,16 @@ static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     let g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     FOOTPRINT.reset();
+    for cell in [
+        &PAYLOAD.calls,
+        &PAYLOAD.sampled,
+        &PAYLOAD.all_ff,
+        &PAYLOAD.all_zero,
+        &PAYLOAD.bytes_sampled,
+        &PAYLOAD.bytes_all_ff,
+    ] {
+        cell.store(0, Ordering::Relaxed);
+    }
     g
 }
 
@@ -396,6 +497,51 @@ mod tests {
         // at the end of the word rather than shifting past it.
         note_written_range(32 << FRAME_SHIFT, 32 << FRAME_SHIFT);
         assert_eq!(FOOTPRINT.runs(), vec![(32, 63)]);
+    }
+
+    #[test]
+    fn the_payload_census_separates_uniform_white_from_uniform_black_and_from_content() {
+        let _g = fresh();
+        // The sampler takes call 0 and then every 64th, so drive it in blocks of
+        // PAYLOAD_SAMPLE_EVERY and assert on what it sampled, not on what it saw.
+        let white = vec![0xFFu8; 4096];
+        let black = vec![0x00u8; 4096];
+        let mut content = vec![0xFFu8; 4096];
+        content[4095] = 0xFE; // uniform but for one byte: not white
+        for buf in [&white, &black, &content] {
+            for _ in 0..PAYLOAD_SAMPLE_EVERY {
+                note_written_payload(buf);
+            }
+        }
+        let (calls, sampled, all_ff, all_zero, samp_bytes, ff_bytes) = payload_counts();
+        assert_eq!(calls, 3 * PAYLOAD_SAMPLE_EVERY);
+        assert_eq!(sampled, 3, "one sample per block of {PAYLOAD_SAMPLE_EVERY}");
+        assert_eq!((all_ff, all_zero), (1, 1));
+        assert_eq!(samp_bytes, 3 * 4096);
+        assert_eq!(ff_bytes, 4096, "only the white buffer's bytes");
+    }
+
+    #[test]
+    fn a_payload_one_byte_short_of_white_is_not_white() {
+        let _g = fresh();
+        // The discriminator is worth nothing if it rounds. A frame the guest
+        // will read as white-but-for-a-pixel is not the all-0xff fill the panic
+        // census reports, and counting it as one would inflate the very number
+        // this census exists to decide a hypothesis on.
+        let mut nearly = vec![0xFFu8; 1024];
+        nearly[0] = 0xFE;
+        note_written_payload(&nearly);
+        assert_eq!(payload_counts().2, 0);
+    }
+
+    #[test]
+    fn an_empty_payload_is_not_counted_as_uniform() {
+        let _g = fresh();
+        // `[].iter().all(..)` is vacuously true for both tests, so an empty
+        // buffer would score as white AND as black at once.
+        note_written_payload(&[]);
+        let (calls, sampled, all_ff, all_zero, _, _) = payload_counts();
+        assert_eq!((calls, sampled, all_ff, all_zero), (0, 0, 0, 0));
     }
 
     #[test]

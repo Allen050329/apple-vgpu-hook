@@ -1902,6 +1902,9 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
         ));
         return false;
     }
+    // Sampled payload shape, taken once for the call rather than per run, so a
+    // fragmented write and a packed one of the same bytes count the same.
+    crate::observe::footprint::note_written_payload(buf);
     // Fast path: one packed view covering the write.
     let need_end = off.saturating_add(buf.len() as u64);
     if let Some((ptr, len)) = ensure_contig_view(state, host, mapping_id) {
