@@ -537,11 +537,43 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
 /// process preserves the translation exactly. That is why the guard landed and
 /// the WindowServer `small_free_list_remove_ptr_no_clear` aborts continued.
 ///
-/// Reported and not refused, for now: refusing every window that outlived its
-/// stamp is the whole deferral rail, and nothing here has yet measured how much
-/// of it that is. The counters carry their own denominator — `gvaw_stamp_same`
-/// against `gvaw_stamp_outlived` in the per-second `store_routes` line — so the
-/// next boot prices the repair instead of guessing at it.
+/// The counters carry their own denominator — `gvaw_stamp_same` against
+/// `gvaw_stamp_outlived` in the per-second `store_routes` line.
+///
+/// # Measured, and it is not a tail
+///
+/// One x86/Vulkan boot driving the workload the user's report names (Safari on
+/// three compositing-heavy pages, Finder windows, then 600 s of Mission Control
+/// ×71, Spotlight ×71 and window drags ×142 — every one of them a window-list
+/// capture compositing a backdrop blur, which is the frame the report crashed
+/// in):
+///
+/// ```text
+/// gvaw_stamp_same       0
+/// gvaw_stamp_outlived 810
+/// ```
+///
+/// **Zero.** Not a minority, not a tail: every deferred GVA window that wrote
+/// guest RAM on that boot wrote it after the guest had been fenced. The elapsed
+/// stamp counts say how far after — over 227 latched spans, median 133 fences,
+/// p90 1 099, max 1 601. The guest was told this work had finished 133 times
+/// over before the device put the bytes in its memory.
+///
+/// The trigger breakdown says why: 215 of 227 land under `window_cap`, the
+/// oldest-first eviction that runs when `GVA_DEFERRED_WINDOW_CAP` is reached. So
+/// the rail's normal exit is not a flush anything asked for; it is a window
+/// sitting until the cap pushes it out, hundreds of fences past the point the
+/// guest was free to reclaim it.
+///
+/// And the geometry names the second defect as well as the first. The largest
+/// single population is **64x64, 65 of 227** — a folder icon exactly, the same
+/// geometry the surviving Finder icon class corrupts at. The icons that come out
+/// wrong are the windows written into guest memory long after the guest was told
+/// they were done.
+///
+/// No userspace crash fired during those 600 s, so this boot does not by itself
+/// convict the rail of the WindowServer abort. What it establishes is that the
+/// hazard is not rare, not a corner, and not something a page-set guard can see.
 #[cfg(feature = "backend-vulkan")]
 fn note_window_outlived_its_stamp(
     state: &DeviceState,
