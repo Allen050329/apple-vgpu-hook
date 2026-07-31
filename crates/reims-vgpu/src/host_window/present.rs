@@ -48,9 +48,10 @@ use crate::runtime::host::HostAction;
 const ENGINE_WINDOW_REDRAW_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
-/// apply within single-digit milliseconds; one second means AppKit refused or
-/// clamped the size and the window is presenting letterboxed instead.
-#[cfg(target_os = "macos")]
+/// apply within single-digit milliseconds; one second means the window system
+/// refused or clamped the size and the window is presenting letterboxed
+/// instead. A tiling or fullscreen Wayland/X11 compositor refuses by policy, so
+/// on those hosts this alarm is the expected steady state rather than a fault.
 const GUEST_RESIZE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Window creation parameters.
@@ -143,11 +144,45 @@ fn needs_engine_present(
     redraw_required || presented != incoming
 }
 
+/// The absolute pointer event a window position becomes: `(x, y, width,
+/// height)` for [`HostAction::input_pointer_move`], whose consumer scales `x`
+/// against `width` (`min_in = 0`, `max_in = dim`).
+///
+/// Both presenters aspect-fit the guest frame into the drawable, so a window
+/// position is proportional to a guest position only *inside* the viewport — in
+/// a letterbox bar it is not over the guest surface at all. Reporting raw
+/// window coordinates therefore offsets and rescales every event by the bar
+/// size, which is the regression [`super::viewport`]'s module docs record as
+/// rolled back. It survived on non-macOS hosts because this mapping was
+/// `cfg`-gated to macOS while the presenter's `aspect_fit` never was, so the
+/// two halves of "presentation and pointer move as one unit" were compiled for
+/// different platforms.
+///
+/// Before the first guest frame there is no guest extent to map into, so the
+/// full-window space is forwarded unchanged.
+fn pointer_report(
+    position: (f64, f64),
+    window: (u32, u32),
+    guest: Option<(u32, u32)>,
+) -> (u32, u32, u32, u32) {
+    match guest {
+        Some(guest) => {
+            let (x, y) = super::viewport::pointer_to_guest(position, window, guest);
+            (x, y, guest.0, guest.1)
+        }
+        None => (
+            position.0.max(0.0) as u32,
+            position.1.max(0.0) as u32,
+            window.0,
+            window.1,
+        ),
+    }
+}
+
 /// Whether a newly observed guest frame geometry should request a native
 /// content resize: only on a geometry change, and only when the window does
 /// not already match. User-driven host resizing stays untouched until the
 /// guest picks another mode.
-#[cfg(target_os = "macos")]
 fn guest_resize_request(
     observed: Option<(u32, u32)>,
     incoming: (u32, u32),
@@ -162,7 +197,6 @@ fn guest_resize_request(
 /// would stay on screen that long); the hold is bounded by
 /// [`GUEST_RESIZE_WARN_AFTER`], after which the request is dropped with a
 /// fail-visible line and presentation resumes letterboxed.
-#[cfg(target_os = "macos")]
 struct PendingGuestResize {
     target: (u32, u32),
     requested_at: std::time::Instant,
@@ -483,9 +517,7 @@ pub fn run(
         next_engine_redraw: std::time::Instant::now(),
         last_engine_seq: None,
         engine_redraw_required: true,
-        #[cfg(target_os = "macos")]
         guest_extent: None,
-        #[cfg(target_os = "macos")]
         pending_guest_resize: None,
     };
     event_loop
@@ -647,11 +679,9 @@ struct App {
     /// Last guest DisplaySwap geometry the window observed. Drives the
     /// once-per-mode-change native resize request and the pointer-to-guest
     /// viewport transform ([`super::viewport`]).
-    #[cfg(target_os = "macos")]
     guest_extent: Option<(u32, u32)>,
     /// Outstanding guest-driven native resize, kept only for the fail-visible
     /// `native_resize_not_applied` alarm — never a presentation gate.
-    #[cfg(target_os = "macos")]
     pending_guest_resize: Option<PendingGuestResize>,
 }
 
@@ -771,7 +801,6 @@ impl ApplicationHandler for App {
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.engine_attached {
                     crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
-                    #[cfg(target_os = "macos")]
                     self.note_guest_resize_applied(applied);
                 } else {
                     #[cfg(not(target_os = "macos"))]
@@ -861,7 +890,6 @@ impl ApplicationHandler for App {
                 self.next_engine_redraw,
             ));
         }
-        #[cfg(target_os = "macos")]
         if let Some(window) = self.window.as_ref() {
             if let Some(pending) = self.pending_guest_resize.as_ref() {
                 if pending.requested_at.elapsed() >= GUEST_RESIZE_WARN_AFTER {
@@ -912,28 +940,16 @@ impl App {
             .unwrap_or((self.config.width, self.config.height))
     }
 
-    /// Emit an absolute pointer move. On macOS with a known guest geometry the
+    /// Emit an absolute pointer move. Once a guest geometry is known the
     /// position maps through the presenter's aspect-fit viewport into guest
     /// pixels, so display placement and pointer translation move as one unit;
-    /// otherwise the full-window coordinate space is forwarded unchanged.
+    /// before the first frame the full-window space is forwarded unchanged.
+    /// See [`pointer_report`], which holds the decision and its tests.
     fn pointer_move(&mut self, position: (f64, f64)) {
-        let (w, h) = self.surface_dims();
-        #[cfg(target_os = "macos")]
-        if let Some(guest) = self.guest_extent {
-            let mapped = super::viewport::pointer_to_guest(position, (w, h), guest);
-            self.cursor = mapped;
-            (self.on_input)(HostAction::input_pointer_move(
-                mapped.0, mapped.1, guest.0, guest.1,
-            ));
-            return;
-        }
-        self.cursor = (position.0.max(0.0) as u32, position.1.max(0.0) as u32);
-        (self.on_input)(HostAction::input_pointer_move(
-            self.cursor.0,
-            self.cursor.1,
-            w,
-            h,
-        ));
+        let (x, y, width, height) =
+            pointer_report(position, self.surface_dims(), self.guest_extent);
+        self.cursor = (x, y);
+        (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
     }
 
     fn draw(&mut self) {
@@ -976,9 +992,7 @@ impl App {
 
     fn draw_engine_window(&mut self) {
         let frame = self.frames.lock().ok().and_then(|guard| guard.clone());
-        #[cfg(target_os = "macos")]
         self.request_guest_geometry(frame.as_deref());
-        #[cfg(target_os = "macos")]
         if self.pending_guest_resize.is_some() {
             // A guest mode change is being applied to the native window
             // (normally single-digit milliseconds; bounded by the 1 s alarm).
@@ -1055,7 +1069,13 @@ impl App {
     /// compositor resident — never a content heuristic. Presentation does not
     /// wait: until the resize applies, frames letterbox into the current
     /// drawable and pointer input maps through the same viewport.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Called only from [`Self::draw_engine_window`], which is the presenter
+    /// that aspect-fits. The window's own `VkState` fallback stretches to fill
+    /// instead, and leaves `guest_extent` `None` so [`pointer_report`] forwards
+    /// full-window coordinates — the mapping that rail's blit actually implies.
+    /// Calling this from that rail would pair a viewport-mapped pointer with a
+    /// stretched picture, which is the same split this fixes, mirrored.
     fn request_guest_geometry(&mut self, frame: Option<&Frame>) {
         let Some(frame) = frame else { return };
         let incoming = (frame.width.max(1), frame.height.max(1));
@@ -1093,7 +1113,6 @@ impl App {
 
     /// Clear the outstanding guest resize once the window system confirms the
     /// exact target geometry (via `Resized` or a synchronous apply).
-    #[cfg(target_os = "macos")]
     fn note_guest_resize_applied(&mut self, applied: (u32, u32)) {
         if self
             .pending_guest_resize
@@ -2165,7 +2184,6 @@ mod tests {
         assert!(needs_staging_upload(Some(7), 8));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn engine_present_gate_submits_new_frames_and_forced_redraws_only() {
         assert!(needs_engine_present(None, true, None));
@@ -2174,7 +2192,6 @@ mod tests {
         assert!(needs_engine_present(Some(7), true, Some(7)));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn guest_geometry_change_requests_one_matching_native_resize() {
         // First frame at the window's own size: no request.
@@ -2197,6 +2214,60 @@ mod tests {
             (1440, 1080),
             (1440, 1080)
         ));
+    }
+
+    /// The presenter's `aspect_fit` is not platform-gated, so the pointer
+    /// mapping must not be either. Before the fix this branch was
+    /// `#[cfg(target_os = "macos")]` while the letterbox that makes it
+    /// necessary was compiled everywhere, so on x86/Linux every click landed
+    /// offset by the bar and scaled by the wrong ratio.
+    #[test]
+    fn a_letterboxed_pointer_maps_through_the_viewport_not_the_window() {
+        // 4:3 guest in a 16:9 window: 240 px pillarbox bars either side.
+        let guest = (1440, 1080);
+        let window = (1920, 1080);
+
+        // The viewport's left edge is guest x=0 — not window x=0.
+        assert_eq!(pointer_report((240.0, 0.0), window, Some(guest)), (0, 0, 1440, 1080));
+        // Window centre is guest centre.
+        assert_eq!(
+            pointer_report((960.0, 540.0), window, Some(guest)),
+            (720, 540, 1440, 1080)
+        );
+
+        // The regression this guards: reporting raw window coordinates against
+        // the window extent. At the viewport's left edge that said "x=240 of
+        // 1920" where the truth is "x=0 of 1440" — a 240 px error, and the
+        // reported extent was the window's, so the consumer rescaled it too.
+        let raw = (240u32, 0u32, window.0, window.1);
+        assert_ne!(pointer_report((240.0, 0.0), window, Some(guest)), raw);
+    }
+
+    /// No guest frame yet ⇒ no viewport to map through, and the window's own
+    /// `VkState` fallback stretches rather than letterboxing. Both are the
+    /// full-window identity, which is what keeps that rail's pointer and its
+    /// blit in agreement.
+    #[test]
+    fn without_a_guest_extent_the_full_window_space_is_forwarded() {
+        assert_eq!(
+            pointer_report((100.0, 200.0), (1920, 1080), None),
+            (100, 200, 1920, 1080)
+        );
+        // Negative positions (pointer dragged off the window) clamp to origin.
+        assert_eq!(
+            pointer_report((-5.0, -1.0), (1920, 1080), None),
+            (0, 0, 1920, 1080)
+        );
+    }
+
+    /// A guest and window of the same aspect have no bars, so the mapping is a
+    /// pure scale — the 4K-into-1080p-window case the x86 rig actually runs.
+    #[test]
+    fn a_matching_aspect_scales_without_offsetting() {
+        assert_eq!(
+            pointer_report((960.0, 540.0), (1920, 1080), Some((3840, 2160))),
+            (1920, 1080, 3840, 2160)
+        );
     }
 
     #[test]
