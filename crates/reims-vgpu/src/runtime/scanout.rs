@@ -593,7 +593,10 @@ pub fn paint_efi_console<M: HostMemory>(
     if fb == 0 {
         return false;
     }
-    // Use programmed EFI dims when they match the surface request, else skip.
+    // The console is only ever the mode this device advertised: EFI_MODE_COUNT
+    // is 1, so a request for any other geometry is not this framebuffer and the
+    // caller must fall back. Note these are the ADVERTISED dims, not programmed
+    // ones — the stride below is the only part the guest gets to set.
     let efi_w = EFI_BOOT_WIDTH;
     let efi_h = EFI_BOOT_HEIGHT;
     if width != efi_w || height != efi_h {

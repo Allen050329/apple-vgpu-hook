@@ -46,7 +46,22 @@ pub const IOSFC_REG_DESC_TABLE: u64 = 0x1010;
 pub const IOSFC_REG_PRODUCER: u64 = 0x1018;
 pub const IOSFC_REG_CONSUMER: u64 = 0x1020;
 
+/// The single EFI mode this device **advertises**, not a dimension observed in
+/// a guest.
+///
+/// It is reported to the firmware through `GFX_REG_EFI_MODE_SIZE` as
+/// `(width << EFI_MODE_WIDTH_SHIFT) | height`, with [`EFI_MODE_COUNT`] of 1, so
+/// the pre-boot console geometry is this device's own declaration and the guest
+/// has no other mode to select. Comparing a request against it — as
+/// `scanout::paint_efi_console` does — is checking the contract this device
+/// published, not special-casing a pixel size.
+///
+/// Recorded because the absence of this note actively misled a reader: a review
+/// pass scored the `width != EFI_BOOT_WIDTH` check as a high-confidence
+/// "special-cased for an observed pixel dimension" violation. The value is a
+/// choice, which is fine; a choice with no stated basis is what reads as a guess.
 pub const EFI_BOOT_WIDTH: u32 = 1920;
+/// Height of the advertised EFI mode. See [`EFI_BOOT_WIDTH`].
 pub const EFI_BOOT_HEIGHT: u32 = 1080;
 pub const EFI_MODE_WIDTH_SHIFT: u32 = 16;
 pub const EFI_MODE_COUNT: u32 = 1;

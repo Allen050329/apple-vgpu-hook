@@ -1418,6 +1418,13 @@ pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
     PagesVerdict::Drifted
 }
 
+/// Report a page-table revalidation that took at least a millisecond.
+///
+/// A pure observability gate — nothing branches on it, so the value costs
+/// nothing but log volume if it is wrong in either direction. One millisecond
+/// is the frame budget's own scale: at 60 Hz a frame is 16.7 ms, so a single
+/// revalidation spending 6 % of it is worth a line, and anything shorter is
+/// noise against a rail that runs per surface per frame.
 const REVALIDATE_SLOW_US: u64 = 1_000;
 
 #[inline]
@@ -2136,6 +2143,11 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
     true
 }
 
+/// Report a per-run host-pointer import that took at least a millisecond.
+///
+/// Same gate and same basis as [`REVALIDATE_SLOW_US`]: observability only, and
+/// one millisecond is 6 % of a 60 Hz frame. Deliberately the same number as its
+/// peer so the two rails' slow lines are comparable without a conversion.
 const MAPPING_RUN_IMPORT_SLOW_US: u64 = 1_000;
 
 #[inline]
