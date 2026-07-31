@@ -479,7 +479,13 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     what: &str,
     outcome: &str,
 ) -> bool {
+    // Same accounting the mapping rail carries: this function has three ways to
+    // return `true` and only one of them checked anything, so a boot reporting
+    // no drift on this rail could not say whether the guard had passed or had
+    // nothing to pass on. Counted, never gated — every write that landed before
+    // still lands.
     if span == 0 || armed.is_empty() {
+        crate::runtime::drain::note_store_route("defw_unwit_no_armed");
         return true;
     }
     let mut live = std::collections::HashSet::new();
@@ -512,8 +518,20 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     // The strictly-shorter arm returned "still ours" for that case, which is the
     // one arrangement of this range that corrupts another owner's memory.
     if live.iter().all(|p| armed.contains(p)) {
+        // `all` over an EMPTY set is true, and that is not a verification: it
+        // means the walk resolved no page of this window at all, so there was
+        // nothing to compare against `armed`. Harmless — `write_gva_rgba8`
+        // resolves per row from the same walk, so no row lands either — but it
+        // must not be counted as the guard having agreed, which is exactly the
+        // conflation that made the mapping rail's `refused = 0` unreadable.
+        crate::runtime::drain::note_store_route(if live.is_empty() {
+            "defw_unwit_no_live"
+        } else {
+            "defw_pages_verified"
+        });
         return true;
     }
+    crate::runtime::drain::note_store_route("defw_pages_drifted");
     crate::observe::fail(format!(
         "deferred_window_page_drift gva={gva:#x} task={task_id} {what} \
          armed_pages={} live_pages={} moved={} foreign={} {outcome}",
@@ -4145,6 +4163,61 @@ mod tests {
             drift_lines(at),
             1,
             "a linear window whose pages moved must report"
+        );
+
+        // A walk that resolves NOTHING also returns "still ours", because
+        // `all` over an empty set is true — and that is not the guard agreeing,
+        // it is the guard having nothing to compare. Counted apart, or this
+        // rail's "no drift" reads as a verification it never made.
+        use crate::runtime::drain::store_route_count;
+        let verified_before = store_route_count("defw_pages_verified");
+        let unwit_before = store_route_count("defw_unwit_no_live");
+        let at = mark();
+        assert!(
+            super::deferred_pages_still_ours(
+                &state,
+                &host,
+                1,
+                // Page index 3: inside the root page, but its PTE was never
+                // written, so it is zero and translates to nothing. An index
+                // past the root page's own extent would instead read whatever
+                // GPA follows it, which is a different (and resolvable) thing.
+                3 * page,
+                span,
+                &[data1].into_iter().collect(),
+                "8x8 trigger=linear_flush ref=5",
+                "guest=refused",
+            ),
+            "an unresolvable window is not drift — no row can land through it"
+        );
+        assert_eq!(drift_lines(at), 0, "and it is not reported as drift");
+        assert_eq!(
+            store_route_count("defw_unwit_no_live"),
+            unwit_before + 1,
+            "it must be counted as unwitnessed"
+        );
+        assert_eq!(
+            store_route_count("defw_pages_verified"),
+            verified_before,
+            "and must NOT be counted as a verification"
+        );
+
+        // An empty armed set is the other unchecked exit, and it is its own slug
+        // because it is a different gap.
+        let no_armed_before = store_route_count("defw_unwit_no_armed");
+        assert!(super::deferred_pages_still_ours(
+            &state,
+            &host,
+            1,
+            offset,
+            span,
+            &std::collections::HashSet::new(),
+            "8x8 trigger=linear_flush ref=5",
+            "guest=refused",
+        ));
+        assert_eq!(
+            store_route_count("defw_unwit_no_armed"),
+            no_armed_before + 1
         );
     }
 
