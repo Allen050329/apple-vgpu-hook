@@ -2451,15 +2451,31 @@ impl DeviceState {
         }
     }
 
-    /// Deferred GVA render-Store windows lose their GVA walk with the task
-    /// (walks try `task_id` then `task_id >> 1`) — hand them to the runtime
-    /// for a cache-only landing (`storage_flush::retire_gva_windows`); never
-    /// write guest pages from teardown.
+    /// Deferred GVA render-Store windows lose their GVA walk with the task —
+    /// hand them to the runtime for a cache-only landing
+    /// (`storage_flush::retire_gva_windows`); never write guest pages from
+    /// teardown.
+    ///
+    /// Only this task's windows. Both sides of the comparison are slot ids:
+    /// `GvaDeferredEntry::task_id` is the word `task_slot::resolve_task_word`
+    /// accepted, and `DeleteTask` (`0x20`) carries a slot id too — its words
+    /// include `5`, `11` and `13`, odd and greater than one, which the
+    /// `DefineTask2` doubled space (`0x1`, then strictly even) does not contain,
+    /// and all 968 deletes measured across the boots on disk report `ok=1`
+    /// against a live slot.
+    ///
+    /// So a `task_id >> 1` arm here matched no window this task owns and did
+    /// match every window owned by slots `2 * task_id` and `2 * task_id + 1`.
+    /// Slots run densely from 0 out of [`MAX_TASKS`] = 256, and boots use ids
+    /// well past 14, so those are live tasks: deleting task 5 retired tasks 10
+    /// and 11's pending frames. Cache-only landing writes no guest pages, so the
+    /// effect was a live task silently losing rendered pixels out of guest RAM
+    /// and the guest compositing whatever those pages held before.
     fn retire_task_gva_windows(&mut self, task_id: u32) {
         let doomed: Vec<u64> = self
             .gva_deferred_flush
             .iter()
-            .filter(|(_, e)| e.task_id == task_id || e.task_id >> 1 == task_id)
+            .filter(|(_, e)| e.task_id == task_id)
             .map(|(&gva, _)| gva)
             .collect();
         for gva in doomed {

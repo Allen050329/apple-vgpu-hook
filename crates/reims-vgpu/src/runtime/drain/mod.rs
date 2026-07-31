@@ -2175,9 +2175,18 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         .gva_deferred_flush
                         .iter()
                         .filter(|(&wgva, e)| {
-                            (e.task_id == task_id
-                                || e.task_id == task_id >> 1
-                                || e.task_id >> 1 == task_id)
+                            // This task's windows only. A GVA means nothing
+                            // outside the address space that named it, so the
+                            // overlap test is an overlap only once the task
+                            // matches — and both sides are slot ids
+                            // (`task_slot::resolve_task_word` on one, the
+                            // unshifted `MapMemory2`/`UnmapMemory` word on the
+                            // other). The `>> 1` arms this replaces also matched
+                            // slots `task_id / 2`, `2 * task_id` and
+                            // `2 * task_id + 1`: live, unrelated tasks whose
+                            // pending frames were then landed cache-only and so
+                            // never reached guest RAM.
+                            e.task_id == task_id
                                 && wgva < hi
                                 && gva < wgva.saturating_add(e.span())
                         })
