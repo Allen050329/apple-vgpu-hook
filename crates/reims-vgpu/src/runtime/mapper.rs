@@ -1873,7 +1873,11 @@ pub(crate) fn note_mapping_write_footprint(
         let lo = off.max(page_lo);
         let hi = end.min(page_lo.saturating_add(page_size));
         if lo < hi {
-            crate::observe::footprint::note_written_range(gpa + (lo - page_lo), hi - lo);
+            crate::observe::footprint::note_written_range(
+                crate::observe::footprint::Rail::Mapping,
+                gpa + (lo - page_lo),
+                hi - lo,
+            );
         }
     }
 }
@@ -1998,6 +2002,7 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
         // `[off, end)` because the runs are what is contiguous; the mapping's
         // list between them is not.
         crate::observe::footprint::note_written_range(
+            crate::observe::footprint::Rail::Mapping,
             run_gpas[0].saturating_add(host_off as u64),
             n as u64,
         );
@@ -2628,7 +2633,7 @@ mod revalidate_tests {
         );
 
         // The survivor writes its own page: not a finding.
-        footprint::note_written_range(shared, 16);
+        footprint::note_written_range(footprint::Rail::Mapping, shared, 16);
         assert_eq!(
             footprint::retired_counts().1,
             0,
@@ -2636,7 +2641,7 @@ mod revalidate_tests {
         );
 
         // The page nobody holds any more: the finding.
-        footprint::note_written_range(only_mine, 16);
+        footprint::note_written_range(footprint::Rail::Mapping, only_mine, 16);
         assert_eq!(footprint::retired_counts().1, 1);
     }
 
@@ -2688,7 +2693,7 @@ mod revalidate_tests {
         );
         assert_eq!(footprint::retired_counts().0, 1, "the condemned page retires");
 
-        footprint::note_written_range(gpa, 16);
+        footprint::note_written_range(footprint::Rail::Mapping, gpa, 16);
         assert_eq!(
             footprint::retired_counts().1,
             1,

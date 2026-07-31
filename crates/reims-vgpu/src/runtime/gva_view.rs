@@ -729,6 +729,7 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     //
     // The span is contiguous in guest-physical space: `runs != 1` returned above.
     crate::observe::footprint::note_written_range(
+        crate::observe::footprint::Rail::RawGva,
         gpas[0].saturating_add(off as u64),
         length,
     );
@@ -844,6 +845,7 @@ fn write_span_multi<H: HostMemory + HostOps>(
         // the `n` bytes at `run_gpas[0] + host_off` in guest-physical space —
         // the exact destination, not the run's hull.
         crate::observe::footprint::note_written_range(
+            crate::observe::footprint::Rail::RawGva,
             run_gpas[0].saturating_add(host_off as u64),
             n as u64,
         );

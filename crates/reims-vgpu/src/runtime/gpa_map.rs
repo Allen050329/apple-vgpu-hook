@@ -56,7 +56,11 @@ pub fn write_bytes<H: HostMemory + HostOps>(
     }
     // After the copy, not before: the footprint is the set of frames this
     // device *wrote*, and every refusal above returns without writing one.
-    crate::observe::footprint::note_written_range(gpa, buf.len() as u64);
+    crate::observe::footprint::note_written_range(
+        crate::observe::footprint::Rail::Gpa,
+        gpa,
+        buf.len() as u64,
+    );
     host.unmap_pages(ptr, total);
     Ok(())
 }
