@@ -2876,7 +2876,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     }
     host_cache_store_gva_layer(
         &mut state,
-        &crate::runtime::host::FakeHost::new(),
+        &mut crate::runtime::host::FakeHost::new(),
         0,
         tex_ref,
         OBJECT_TYPE_TEXTURE,
@@ -2969,6 +2969,14 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
 
     let texel_gva = 1u64 << PAGE_SHIFT_ARM64E;
     let bgra = [40u8, 20, 10, 255].repeat((w * h) as usize);
+    // Stored the way both product stores do it: with the pages the bytes were
+    // read from recorded, and the host asked to watch them. An entry stored
+    // without either is unwitnessable, and the sample path below refuses it
+    // rather than serving bytes it cannot vouch for — so a fixture that skipped
+    // this would be testing the fall-through, not the cache rung it names.
+    let backing =
+        crate::runtime::surface_cache::gva_backing(&state, &host, 1, texel_gva, w, h)
+            .expect("texel walk resolves");
     crate::runtime::surface_cache::store_gva_owned(
         &mut state,
         texel_gva,
@@ -2976,8 +2984,9 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
         h,
         bgra,
         OBJECT_TYPE_TEXTURE,
-        None,
+        Some(backing),
     );
+    crate::runtime::surface_cache::arm_gva_guest_write_witness(&mut state, &mut host, texel_gva);
 
     let le_entry = objects::lookup_list_entry(&state, &host, 1, tex_ref)
         .expect("object-list entry must resolve");

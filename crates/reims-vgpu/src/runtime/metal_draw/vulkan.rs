@@ -2966,6 +2966,24 @@ fn note_guest_rung_blank(
 ///
 /// Gated on `REIMS_VGPU_CONTENT_PROBE=1`: it re-reads and re-converts the whole
 /// texture on every sampled bind that hits this rung.
+///
+/// **Run, and the answer was total.** x86/Vulkan, ten Finder recomposites under
+/// load: in every per-second window this fired, `gvac_content_differ` equalled
+/// `gvac_content_checked` — *every* audited serve of this rail handed the draw
+/// bytes the guest's own pages no longer held. The victims are 64x64
+/// `producer=2` entries, which is icon geometry and the icon resource class.
+/// The direction varies and both directions are wrong: some entries hold
+/// content while the guest pages have gone to zero, and at least one during a
+/// corrupt round held 12 253 differing bytes against a guest buffer that was
+/// full of real content (`ref=410 gva=0xbff000 64x64 guest_zero_tail=1040`).
+///
+/// The same boot exonerates the engine's own claim-based rail with a real
+/// denominator: `sampled_identity_audit checked=8192 mismatched=0`. The
+/// staleness is upstream of the engine, in this cache.
+///
+/// [`crate::runtime::surface_cache::gva_guest_wrote_since_store`] is the
+/// repair. This probe stays because it is the only thing that can *prove* the
+/// repair holds — it compares bytes, where the witness compares generations.
 #[allow(
     clippy::too_many_arguments,
     reason = "the audit line carries the identity of the entry it scored"
@@ -3064,7 +3082,19 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
             w,
             h,
         );
-    if let Some((bgra, host_gen, producer_type)) = gva_names_these_pages
+    // ...and does it still hold what the guest has at them? The verdict above
+    // answers only the first question. Both must hold: an entry can name
+    // exactly the right pages and still be a picture the guest replaced with a
+    // CPU store, which produces no notify for the walk to see. When the host
+    // has observed a write, the entry is stale and the reader falls through to
+    // the guest's own pages below (`lin_rung_gva_bypassed`), which are
+    // authoritative. The retained-wallpaper case this cache exists for is
+    // untouched: a mapping that churns and comes back without a guest write
+    // reads the same generation and still serves.
+    let gva_content_is_current =
+        !crate::runtime::surface_cache::gva_guest_wrote_since_store(state, host, gva);
+    if let Some((bgra, host_gen, producer_type)) = (gva_names_these_pages
+        && gva_content_is_current)
         .then(|| crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h))
         .flatten()
     {
@@ -3227,9 +3257,24 @@ fn sync_store_allowed_pages<M: HostMemory>(
 /// carried zero `deferred_window_page_drift` refusals and zero
 /// `linear_sample_miss` declines, so neither the guest-memory bounds nor a
 /// declining loader is starving them — whatever serves those icons believes it
-/// succeeded. The shape on screen is a fragment roughly a quarter of the icon's
-/// width at full height, which is a geometry defect rather than a stale-bytes
-/// one.
+/// succeeded.
+///
+/// **The "geometry defect" that used to close this comment was wrong, and the
+/// magnification that suggested it is why the rule against eyeballing one
+/// exists.** Enumerating the colours over a broken cell says something else
+/// entirely: the cell holds a small *greyscale* mark and nothing else — in one
+/// captured round a clearly legible 11x11 magnifying glass sitting where the
+/// Pictures folder belongs, in another a 7x18 black bar, in a third nothing at
+/// all — while every other icon in the same window and every text label,
+/// including the broken cell's own, renders perfectly. A cell is not losing a
+/// layer or being drawn at the wrong size. It is being served **another
+/// resource's picture** at the same geometry.
+///
+/// That is what this verdict cannot catch and was never able to: it asks
+/// whether the GVA still *names* these pages, and the answer is yes right up
+/// until the guest CPU rewrites them in place. See
+/// [`crate::runtime::surface_cache::gva_guest_wrote_since_store`], which asks
+/// the other half.
 #[must_use]
 fn note_gva_backing_verdict(
     verdict: crate::runtime::surface_cache::BackingVerdict,
@@ -3605,14 +3650,15 @@ fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bo
 ///
 /// `task_id` is the task whose page table gives the GVA meaning; the store
 /// records the pages it resolves to so a later sample can tell whether the
-/// address still names this allocation.
+/// address still names this allocation, and asks the host to watch them so a
+/// later sample can also tell whether the guest has since rewritten it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the cache identity mirrors the object, GVA, texture geometry, and guest backing"
 )]
-pub(crate) fn host_cache_store_gva_layer<M: HostMemory>(
+pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
-    host: &M,
+    host: &mut M,
     task_id: u32,
     texture_ref: u32,
     object_type: u8,
@@ -3652,6 +3698,7 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory>(
             object_type,
             backing,
         );
+        crate::runtime::surface_cache::arm_gva_guest_write_witness(state, host, gva);
     }
 }
 

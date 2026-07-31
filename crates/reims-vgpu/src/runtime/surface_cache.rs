@@ -453,9 +453,9 @@ pub fn linear_mirrorable(pixel_format: u16) -> bool {
     clippy::too_many_arguments,
     reason = "the mirrored identity is the object, GVA, format, geometry, and guest backing"
 )]
-pub fn mirror_linear_color_cache<M: HostMemory>(
+pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
-    host: &M,
+    host: &mut M,
     task_id: u32,
     texture_ref: u32,
     gva: u64,
@@ -490,6 +490,7 @@ pub fn mirror_linear_color_cache<M: HostMemory>(
     store_texture(state, texture_ref, width, height, bgra.clone());
     let backing = gva_backing(state, host, task_id, gva, width, height);
     store_gva_owned(state, gva, width, height, bgra, 0, backing);
+    arm_gva_guest_write_witness(state, host, gva);
 }
 
 /// Type-2/3 encode cache by target GVA.
@@ -581,6 +582,109 @@ pub fn store_gva_owned(
     // vouch for pixels it did not produce.
     entry.backing = backing;
     entry.backing_suspect = false;
+    // The old token was taken for the old page list, so it goes with it. This
+    // runs in the *store*, not in the arming helper, because disarming is the
+    // half that must never be forgotten: an entry left holding a token for
+    // someone else's pages would report "unwritten" for pages it no longer
+    // owns. Re-arming is the caller's option (and only a performance one —
+    // see [`arm_gva_guest_write_witness`]); disarming is not.
+    let stale = std::mem::replace(&mut entry.guest_write_token, 0);
+    entry.guest_write_gen_at_store = 0;
+    if stale != 0 {
+        // Only the host can free host-side tracking state, and this function
+        // has no host. `flush_retired_views` drains the list.
+        state.retired_guest_write_tokens.push(stale);
+    }
+}
+
+/// Ask the host to watch the guest pages a freshly stored GVA entry was
+/// produced from, and record the generation those bytes are current as of.
+///
+/// Called by the stores that have a host to ask. Split from
+/// [`store_gva_owned`] rather than folded into it because the two halves have
+/// opposite failure directions: a store that fails to *disarm* serves a stale
+/// picture, while a store that fails to *arm* only makes the next read fall
+/// through to the guest's own pages. The dangerous half is unconditional and
+/// host-free; this one is best-effort.
+///
+/// A host with no dirty bitmap answers `None` from `track_guest_writes` and the
+/// entry stays unarmed forever, which every reader takes as "assume written".
+pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    gva: u64,
+) {
+    let page_size = state.page_size() as usize;
+    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+        return;
+    };
+    // Already armed for this page list: `store_gva_owned` clears the token
+    // whenever it replaces the backing, so a live token is by construction a
+    // token for the pages the current bytes were produced from.
+    if entry.guest_write_token != 0 {
+        return;
+    }
+    let Some(backing) = entry.backing.as_ref() else {
+        return;
+    };
+    if backing.gpas.is_empty() {
+        return;
+    }
+    let gpas = backing.gpas.clone();
+    let Some(token) = host.track_guest_writes(&gpas, page_size) else {
+        return;
+    };
+    // Read the generation *after* registration, so the recorded value is one
+    // the host could actually have produced for this token.
+    let gen_at_store = host.guest_write_gen(token).unwrap_or(0);
+    let Some(entry) = state.host_gva_surfaces.get_mut(&gva) else {
+        // The entry vanished between the borrow above and here (no path does
+        // this today, but the token is real either way and must not leak).
+        state.retired_guest_write_tokens.push(token);
+        return;
+    };
+    entry.guest_write_token = token;
+    entry.guest_write_gen_at_store = gen_at_store;
+}
+
+/// Has the guest CPU written this entry's pages since its bytes were stored?
+///
+/// `true` is the answer for every way the question cannot be settled — no
+/// entry, no token, a host that cannot observe guest writes — because the only
+/// safe default for a cache of somebody else's memory is that it is stale. The
+/// caller falls through to the guest's own pages, which are authoritative by
+/// construction.
+///
+/// Each refusal is counted apart from the others: "this rail was never armed"
+/// and "the guest rewrites this texture every frame" are the same fall-through
+/// and completely different findings.
+pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
+    state: &DeviceState,
+    host: &H,
+    gva: u64,
+) -> bool {
+    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+        crate::runtime::drain::note_store_route("gvac_gw_no_entry");
+        return true;
+    };
+    if entry.guest_write_token == 0 {
+        crate::runtime::drain::note_store_route("gvac_gw_unarmed");
+        return true;
+    }
+    match host.guest_write_gen(entry.guest_write_token) {
+        Some(gen_) if gen_ == entry.guest_write_gen_at_store => {
+            crate::runtime::drain::note_store_route("gvac_gw_clean");
+            false
+        }
+        Some(_) => {
+            crate::runtime::drain::note_store_route("gvac_gw_wrote");
+            true
+        }
+        None => {
+            crate::runtime::drain::note_store_route("gvac_gw_unreadable");
+            true
+        }
+    }
 }
 
 /// Whether a GVA-keyed entry's recorded backing is still what the GVA names.
@@ -746,7 +850,16 @@ pub fn get_gva_with_owner(
 
 /// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
-    state.host_gva_surfaces.remove(&gva);
+    // The entry's guest-write token is host-side state for a page list that no
+    // longer has an owner here; dropping the entry without retiring it would
+    // leak one tracking set per deleted texture VA.
+    if let Some(entry) = state.host_gva_surfaces.remove(&gva) {
+        if entry.guest_write_token != 0 {
+            state
+                .retired_guest_write_tokens
+                .push(entry.guest_write_token);
+        }
+    }
 }
 
 /// Drop host-cache entry (unmap / delete surface).
@@ -1464,5 +1577,212 @@ mod tests {
         assert_eq!(holed.gpas.len(), 3, "one slot per page, holes included");
         assert_eq!(holed.gpas[1], 0, "the hole sits where the page is");
         assert_ne!(holed.gpas, full.gpas);
+    }
+
+    /// Store a 64x64 BGRA8 entry at `gva` with its backing walked and its
+    /// guest-write witness armed — the shape both product stores produce.
+    fn store_armed(st: &mut DeviceState, host: &mut FakeHost, gva: u64, fill: u8) -> u64 {
+        let (w, h) = (64u32, 64u32);
+        let backing = gva_backing(st, host, 1, gva, w, h).expect("walk resolves");
+        let gpa = backing.gpas[0];
+        store_gva_owned(
+            st,
+            gva,
+            w,
+            h,
+            vec![fill; (w * h * 4) as usize],
+            0,
+            Some(backing),
+        );
+        arm_gva_guest_write_witness(st, host, gva);
+        gpa
+    }
+
+    /// The verdict this cache had could not see a guest CPU write, and that is
+    /// the one way it goes wrong that nothing else catches.
+    ///
+    /// `backing_suspect` is driven by the Unmap/Map notify: it answers whether
+    /// this GVA still *names* these pages. A guest CPU store into pages that
+    /// never moved issues no notify, touches no device operation, and moves no
+    /// generation on this side — so the entry passes `Unchanged` and keeps
+    /// serving an icon the guest has already replaced. Measured live at 64x64
+    /// with the content probe on: every audited serve of this rail disagreed
+    /// with the guest's own pages (`gvac_content_differ` == `gvac_content_checked`).
+    ///
+    /// The hypervisor's dirty bitmap is the only witness that can see it, and
+    /// asking it is what this test asserts.
+    #[test]
+    fn a_guest_cpu_write_invalidates_a_gva_entry_no_notify_can_see() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_depth1_task(&mut host, &mut st);
+        let gva = 1u64 << PAGE_SHIFT_ARM64E;
+        let gpa = store_armed(&mut st, &mut host, gva, 0xA5);
+
+        // Nothing has touched the pages: the entry is current and serves.
+        assert!(
+            !gva_guest_wrote_since_store(&st, &host, gva),
+            "a freshly stored entry whose pages nobody wrote is current"
+        );
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Unchanged,
+            "no notify has touched the span"
+        );
+
+        // The guest CPU rewrites the texture in place. No notify, no remap, no
+        // device operation — the backing verdict cannot move, and does not.
+        host.guest_wrote_page(gpa);
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Unchanged,
+            "the pages did not move, so the backing verdict still says they did not"
+        );
+        assert!(
+            gva_guest_wrote_since_store(&st, &host, gva),
+            "the host observed the write, so the cached bytes are stale"
+        );
+
+        // Storing the guest's new bytes re-arms against the same pages and the
+        // entry is current again — the rail recovers rather than latching off.
+        store_armed(&mut st, &mut host, gva, 0x5A);
+        assert!(
+            !gva_guest_wrote_since_store(&st, &host, gva),
+            "a store after the write re-arms the witness"
+        );
+    }
+
+    /// The case this cache exists for must survive the new refusal.
+    ///
+    /// A mapping that churns and comes back — Unmap then Map2 restoring the
+    /// same PFNs — is the retained-wallpaper class. The pixels are still this
+    /// allocation's pixels, and nothing wrote them, so the entry must still
+    /// serve. A witness that refused here would black out the wallpaper to fix
+    /// an icon.
+    #[test]
+    fn a_mapping_that_churned_without_a_guest_write_still_serves() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        let gva = page;
+        store_armed(&mut st, &mut host, gva, 0xA5);
+
+        assert_eq!(mark_gva_backing_suspect(&mut st, 1, gva, page), 1);
+        assert_eq!(
+            revalidate_gva_backing(&mut st, &host, 1, gva),
+            BackingVerdict::Confirmed,
+            "the same pages came back"
+        );
+        assert!(
+            !gva_guest_wrote_since_store(&st, &host, gva),
+            "a remap is not a write; the retained encode is still the guest's picture"
+        );
+    }
+
+    /// A token watches a page list, so it must not outlive the list it was
+    /// taken for.
+    ///
+    /// `store_gva_owned` replaces `backing` unconditionally, and the token has
+    /// to go with it: carried forward, it would report "unwritten" about pages
+    /// this entry no longer claims — an entry vouching for itself with somebody
+    /// else's witness. Disarming lives in the store for exactly this reason,
+    /// while arming is the caller's option.
+    #[test]
+    fn replacing_the_backing_retires_the_token_taken_for_the_old_pages() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let root_gpa = setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        let gva = page;
+        let first_gpa = store_armed(&mut st, &mut host, gva, 0xA5);
+        assert_eq!(host.tracked_guest_write_sets(), 1);
+
+        // The guest points the address at a different allocation and the next
+        // store records the new pages.
+        repoint_pte(&mut host, root_gpa, 1, 12);
+        let second_gpa = store_armed(&mut st, &mut host, gva, 0x5A);
+        assert_ne!(first_gpa, second_gpa, "the address names different pages now");
+
+        // A write to the *old* pages says nothing about this entry.
+        host.guest_wrote_page(first_gpa);
+        assert!(
+            !gva_guest_wrote_since_store(&st, &host, gva),
+            "the old page list is not this entry's page list"
+        );
+        // A write to the pages it actually holds does.
+        host.guest_wrote_page(second_gpa);
+        assert!(gva_guest_wrote_since_store(&st, &host, gva));
+
+        // And the first token is released rather than leaked.
+        crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
+        assert_eq!(
+            host.tracked_guest_write_sets(),
+            1,
+            "one live set for the current page list, the superseded one released"
+        );
+    }
+
+    /// Every way the question cannot be settled reads as "written".
+    ///
+    /// An entry stored without a resolvable backing has no page list to watch,
+    /// and a host with no dirty bitmap has nothing to watch it with. Both leave
+    /// the entry unarmed, and an unarmed entry must fall through to the guest's
+    /// own pages — forgetting to arm costs a re-read, never a wrong picture.
+    #[test]
+    fn an_unarmed_gva_entry_is_read_as_written() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        setup_depth1_task(&mut host, &mut st);
+        let gva = 1u64 << PAGE_SHIFT_ARM64E;
+
+        // No backing recorded: nothing to register.
+        store_gva(&mut st, gva, 64, 64, vec![0xA5u8; 64 * 64 * 4]);
+        arm_gva_guest_write_witness(&mut st, &mut host, gva);
+        assert_eq!(host.tracked_guest_write_sets(), 0);
+        assert!(gva_guest_wrote_since_store(&st, &host, gva));
+
+        // A host that cannot observe guest writes answers `None` forever.
+        let mut blind = FakeHost::new();
+        blind.guest_writes_unobservable = true;
+        let mut st2 = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_depth1_task(&mut blind, &mut st2);
+        store_armed(&mut st2, &mut blind, gva, 0xA5);
+        assert_eq!(blind.tracked_guest_write_sets(), 0);
+        assert!(
+            gva_guest_wrote_since_store(&st2, &blind, gva),
+            "an incapable host leaves every entry unwitnessed, so every entry is stale"
+        );
+
+        // An address with no entry at all is not a silent pass either.
+        assert!(gva_guest_wrote_since_store(&st, &host, 0xdead_0000));
+    }
+
+    /// Dropping an entry drops its host-side tracking set with it.
+    ///
+    /// `evict_gva` runs on every deferred GVA render Store arm and the reset
+    /// path walks the whole map, so a token left behind on either would leak
+    /// one hypervisor tracking set per cached texture VA per device lifetime.
+    #[test]
+    fn evict_and_reset_release_gva_write_tokens() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        store_armed(&mut st, &mut host, page, 0xA5);
+        store_armed(&mut st, &mut host, 2 * page, 0xA5);
+        assert_eq!(host.tracked_guest_write_sets(), 2);
+
+        evict_gva(&mut st, page);
+        crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
+        assert_eq!(host.tracked_guest_write_sets(), 1, "the evicted entry's set");
+
+        let _ = st.take_all_host_views();
+        crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
+        assert_eq!(
+            host.tracked_guest_write_sets(),
+            0,
+            "a device reset releases the GVA cache's tokens too"
+        );
     }
 }
