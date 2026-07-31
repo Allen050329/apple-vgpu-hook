@@ -1490,35 +1490,36 @@ fn note_mapping_window_against_fence(
 /// counters are emitted either way, so the knob measures the guard's *cost*
 /// while the counters measure its *rate* — a boot with the guard off still says
 /// how many writes it would have refused.
-/// # Drift is a question, not a verdict
+/// # Drift refuses this write and stops the list being believed again
 ///
-/// A walk that disagrees with the list says the list is not current. It does not
-/// say the surface is gone, and refusing there would be this device guessing in
-/// the safe direction — which on this rail means withholding a frame, and a
-/// withheld full-screen frame is a black screen (`13ae46d`, measured). So the
-/// drift path makes the device *find out* instead: `resolve_type4_surface`
-/// re-runs the object search and re-walks, which is the same thing that would
-/// have happened at the next type-4 command, only now.
+/// Refusing the one window is not enough. The list is what every later reader
+/// and writer of this mapping resolves through, so leaving it in place means the
+/// next flush asks the same question and the next present serves pixels read
+/// through the same wrong pages. `invalidate_mapping_pages` clears it and bumps
+/// `map_generation`, which retires the contiguous view and the guest-write token
+/// with it, and every window still armed against the old incarnation then
+/// refuses on the `map_generation` check it already has.
 ///
-/// The resolve settles it two ways and both are already-tested behaviour:
+/// Self-healing rather than terminal: the next type-4 bind re-resolves the
+/// surface from the object list and adopts a fresh plan, which is the path that
+/// would have discovered this eventually anyway. An actively-drawn surface
+/// recovers on its next bind; an idle one stays unresolvable, which is the
+/// correct state for a mapping this device can no longer name.
 ///
-/// - The list comes back identical. `map_generation` does not move, the walk now
-///   agrees, and the write proceeds — the cached list was merely stale in the
-///   device's hands, not wrong about the surface.
-/// - The list comes back different. The adoption bumps `map_generation`, and the
-///   caller's own `key.map_generation` check — re-taken below — refuses this
-///   window, because it was armed against the previous incarnation. Its frame is
-///   correctly lost rather than written into the new one's pages.
-///
-/// Only a mapping that still disagrees after a forced re-resolve is refused
-/// here, and that is a mapping whose backing this device genuinely cannot name.
+/// Deliberately NOT a forced `resolve_type4_surface` here. That would be the
+/// more informative answer — it re-runs the object search and could say whether
+/// the surface merely moved or is gone — but it goes through `map_surface`,
+/// which clears `has_geom`, the geometry and `surface_content_epoch` before the
+/// adoption restores them. Running that from inside a flush puts a mapping
+/// through a destructive half-state while a writeback is in progress, to answer
+/// a question the next bind answers for free.
 #[cfg(feature = "backend-vulkan")]
 fn mapping_pages_still_ours<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
-    key: &crate::model::ComputeStorageResidencyKey,
+    mapping_id: u32,
 ) -> bool {
-    if crate::runtime::mapper::type4_pages_still_ours(state, host, key.mapping_id) {
+    if crate::runtime::mapper::type4_pages_still_ours(state, host, mapping_id) {
         crate::runtime::drain::note_store_route("mapping_pages_ours");
         return true;
     }
@@ -1526,21 +1527,8 @@ fn mapping_pages_still_ours<M: HostMemory + HostOps>(
     if crate::observe::mapping_page_guard_disabled() {
         return true;
     }
-    crate::runtime::objects::resolve_type4_surface(state, &*host, key.mapping_id);
-    let current = state
-        .mappings
-        .get(&key.mapping_id)
-        .map(|m| m.map_generation);
-    if current != Some(key.map_generation) {
-        crate::runtime::drain::note_store_route("mapping_pages_reresolved_moved");
-        return false;
-    }
-    if !crate::runtime::mapper::type4_pages_still_ours(state, host, key.mapping_id) {
-        crate::runtime::drain::note_store_route("mapping_pages_unresolvable");
-        return false;
-    }
-    crate::runtime::drain::note_store_route("mapping_pages_reresolved_same");
-    true
+    state.invalidate_mapping_pages(mapping_id);
+    false
 }
 
 /// Land a deferred **type-11 render Store**: perform the CPU writeback into the
@@ -1694,7 +1682,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // `map_generation` is the guest's *declared* incarnation, and a type-4
     // surface can be re-pointed with nothing declared at all. See
     // `mapping_pages_still_ours`.
-    if !mapping_pages_still_ours(state, host, key) {
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
         release_window_pin_for_key(key, source);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=mapping_page_drift",
@@ -1899,7 +1887,7 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         ));
         return false;
     }
-    if !mapping_pages_still_ours(state, host, key) {
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=mapping_page_drift",
