@@ -3395,11 +3395,50 @@ impl DeviceState {
     ///
     /// Frames another live mapping still names are excluded: two mappings can
     /// alias the same guest pages, and the survivor's writes are not a defect.
+    ///
+    /// # The condemned list is part of the doomed set, and reading only
+    /// `page_entries` made this dead code
+    ///
+    /// Both routes into [`Self::unmap_surface`] from a guest teardown arrive
+    /// with `page_entries` already **empty**, because the list was moved into
+    /// `condemned_entries` by the step before:
+    ///
+    /// - `DeleteIOSurfaceBacking2` first calls [`Self::condemn_surface_backing`],
+    ///   which does exactly that move. A second delete with no resolve between
+    ///   then takes the `mapping_backing_condemned` branch to `unmap_surface` —
+    ///   where the only list is the condemned one.
+    /// - The same delete falls through to `unmap_surface` directly when
+    ///   `condemn_surface_backing` returns `false`, and it returns `false`
+    ///   *precisely when* `page_entries` is empty.
+    /// - [`Self::map_surface`] moves the list the same way, so a fresh MAP
+    ///   followed by an Unmap is the third case.
+    ///
+    /// So an `is_empty()` bail on `page_entries` alone could never retire a page
+    /// on the delete path. Measured: a 600 s driven boot reported
+    /// `retire_scans=0`, which made its `write_after_retire=0` UNMEASURED rather
+    /// than clean — the failure direction this project's rules call out, a
+    /// detector reading zero because it never ran.
+    ///
+    /// Retiring the condemned list *here* is not the same as retiring at
+    /// condemn time, which would be wrong for the reason above: at condemn the
+    /// reprieve can still hand the list straight back. By the time this runs the
+    /// guest has said the backing is gone and no resolve has re-adopted it —
+    /// `resolve_mapping_backing` takes `condemned_entries` and calls
+    /// `note_pages_authorized` on whatever it adopts, so a reprieved list is
+    /// un-retired through the ordinary adoption path before it can be written.
+    ///
+    /// Other mappings' condemned lists count as still-held for the same reason,
+    /// in the conservative direction: a slot awaiting its fingerprint compare
+    /// may be reprieved, and its writes would then be legitimate.
     fn note_mapping_pages_retired(&self, mapping_id: u32) {
         let Some(doomed) = self.mappings.get(&mapping_id) else {
             return;
         };
-        if doomed.page_entries.is_empty() {
+        let doomed_lists = [
+            doomed.page_entries.as_slice(),
+            doomed.condemned_entries.as_deref().unwrap_or(&[]),
+        ];
+        if doomed_lists.iter().all(|l| l.is_empty()) {
             return;
         }
         let shift = self.page_shift;
@@ -3415,15 +3454,18 @@ impl DeviceState {
             if other == mapping_id {
                 continue;
             }
-            walked += m.page_entries.len() as u64;
+            let condemned = m.condemned_entries.as_deref().unwrap_or(&[]);
+            walked += (m.page_entries.len() + condemned.len()) as u64;
             still_held.extend(gpas_of(&m.page_entries));
+            still_held.extend(gpas_of(condemned));
         }
         // Reported rather than assumed small. This runs on the drain worker,
         // which `drain_duty` already shows at 0.93-0.99, and the alias exclusion
         // costs one pass over everything currently mapped per Unmap.
         crate::observe::footprint::note_retire_scan(walked);
-        let going: Vec<u64> = gpas_of(&doomed.page_entries)
-            .into_iter()
+        let going: Vec<u64> = doomed_lists
+            .iter()
+            .flat_map(|l| gpas_of(l))
             .filter(|g| !still_held.contains(g))
             .collect();
         crate::observe::footprint::note_pages_retired(going, self.page_size());
