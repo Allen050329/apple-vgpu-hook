@@ -579,6 +579,81 @@ A first draft of `a_repointed_surface_refuses_the_write_and_leaves_the_new_owner
 nothing ever writes there. A test for this class must seed the abandoned page with a new owner's
 bytes and assert those survive.
 
+### When the page walk fails the device guesses GPA == GVA, and that guess is 2.8 % of pages
+
+`apply_type4_backing` translates each of a surface's backing pages through the owning task's page
+tables. When `translate_task_gva` returns `None` it does **not** refuse — `objects.rs:780-789` uses
+the guest *virtual* address as if it were a guest *physical* address, gated only on
+`host.read_gpa(candidate, …).is_ok()`:
+
+```rust
+None => {
+    let candidate = gva;
+    let mut probe = [0u8; 1];
+    if host.read_gpa(candidate, &mut probe).is_ok() { id_hits += 1; Some(candidate) } else { None }
+}
+```
+
+That probe asks "is this address backed by RAM", not "is this address this surface's". Essentially
+all of low guest RAM answers yes, so the gate admits nearly every failed walk. The fabricated PFN
+then lands in `m.page_entries`, which is the address list **every** later reader and writer resolves
+through — `mapping_write`, `blit_exec`, the deferred flush, and `ensure_contig_view`'s `map_pages`
+DMA window.
+
+Measured on one ~42 min Safari session (boot `20260731-181529`), summing the `type4 pages … gva_hits=
+… id_hits=…` line:
+
+```text
+attaches reporting              11 561
+pages resolved by a real walk    1 174 789
+pages resolved by the guess         34 407   (2.845 % of pages, ~134 MiB of write targets)
+attaches with >= 1 guessed page        106   (0.92 %)
+  of those, guessed EVERY page         105
+```
+
+Read the last row first: this is not scattered pages that happened not to be faulted in. **105 of
+106 failures are whole-surface**, on `task=0` — the same task id that resolves 11 455 attaches
+cleanly. So the walk fails for a surface entirely, for a bounded stretch of time, and the device
+fills the whole page list with virtual addresses.
+
+The guess does not stay contained, and the drift guard is what exposes it. Of the 9
+`mapping_page_drift` events that boot, **7 had `cached` numerically equal to `gva`** — they were
+guesses, not translations:
+
+```text
+mid= 59 gva=0xbb07000 cached=0xbb07000 live=0x301fc1000   <- identity
+mid= 16 gva=0xa69e000 cached=0xa69e000 live=0x4347fd000   <- identity
+mid= 34 gva=0x59d4000 cached=0x281b77000 live=0x267995000 <- a real translation that moved
+```
+
+So the log line those events print — `reason=translation_moved (the guest re-pointed this surface
+and no packet said so)` — **is wrong for most of them.** The guest re-pointed nothing. The device
+never had a translation; it had a guess, and the live walk later produced the real answer. That the
+live column holds a plausible high address is the proof the pages *are* walkable — just not at the
+instant the device gave up and guessed.
+
+Two consequences, and keep them separate because only the first is measured here.
+
+**Measured — it loses guest work (Goal 3).** A guessed entry is contradicted on the next drift check,
+`mapping_pages_verdict` returns `Drifted`, `flush_render_one` refuses, and the pixels are dropped as
+`deferred_flush_lost … reason=mapping_page_drift`. Six of the nine losses that boot were at
+`1225x512` — a WebKit tile strip, not a display-sized surface. A compositor surface that is redrawn
+every frame survives a dropped writeback; **a WebKit tile is painted once and never repainted**, so
+the drop is permanent and pinned to that scroll offset. That is the Goal 3 symptom exactly.
+
+**Hypothesis, not yet demonstrated — it is a candidate for the crash class (Goal 1).** The guessed
+GPAs are low RAM (0x8101000, 0xa69e000, 0xbb07000 — 135-196 MiB), which is where the guest kernel's
+own allocations live, and the payload is opaque white BGRA. The panic census in this document lands
+in an apfs btree node, an ifnet function pointer and a HID heap element with `val:0xffffffffffffffff`
+— unrelated subsystems, filled with 0xFF. That is what writing pixels to a virtual-address-as-
+physical would produce. **This is a coincidence of shape, not an attribution**: nobody has shown a
+specific panic arising from a specific guessed entry, and the drift guard catches guesses on the
+paths that consult it. Do not write it up as the cause until an arm measures it.
+
+Note the census undercounts. The `type4 pages` line is emitted only when `page_entries` is empty
+(`first_attach`, `objects.rs:820-825`), so an attach over a still-populated list guesses silently.
+34 407 is a **lower bound**.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
