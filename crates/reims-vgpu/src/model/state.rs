@@ -1228,6 +1228,15 @@ pub struct HostSurface {
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
+    /// Recency stamp for the GVA cache's byte cap
+    /// ([`GVA_ENCODE_CACHE_BYTE_CAP`]), from
+    /// [`DeviceState::next_gva_touch`]. Bumped on store **and on every
+    /// confirmed hit**, which is the half that matters: a wallpaper plane is
+    /// stored once and sampled forever, so a stamp advanced only by stores
+    /// would make the most-wanted entry in the map look like the coldest.
+    /// Unused (and left at 0) by the surface_id and texture_ref caches, which
+    /// have no cap.
+    pub last_touch: u64,
     /// Guest pages these bytes were produced from, for GVA-keyed entries.
     /// `None` on the surface_id/texture_ref caches (their key is not a guest
     /// virtual address) and on any GVA store whose walk did not resolve.
@@ -1531,6 +1540,132 @@ pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
 /// entry count — 4K frames are ~33 MiB each, so a byte cap is the honest bound.
 pub const LINEAR_SAMPLED_MEMO_BYTE_CAP: usize = 128 << 20;
 
+/// Byte cap for the GVA-keyed type-2/3 encode cache
+/// ([`DeviceState::host_gva_surfaces`]). Same basis and same value as
+/// [`LINEAR_SAMPLED_MEMO_BYTE_CAP`], which bounds the sibling cache holding the
+/// same class of content.
+///
+/// A byte cap rather than an entry count for the reason that constant already
+/// states, measured here directly: one 60-resize boot read `gva_largest =
+/// 33 423 360` — a 3840x2176x4 frame, the 4K geometry with its height padded to
+/// a multiple of 64 — while the map's 305 entries totalled 291 MB. Entry count
+/// cannot tell those apart; the same 305 entries would be ~10 GB if every one
+/// had been 4K.
+///
+/// # Why this cache needs a cap at all
+///
+/// It is keyed by guest **virtual** address and the store does
+/// `.entry(gva).or_default()`, so a new geometry at the same GVA replaces and
+/// costs nothing — growth is entirely from *new* GVAs. Every resolution change
+/// has the guest allocate its surfaces at fresh addresses, and until this cap
+/// nothing anywhere dropped the abandoned ones. Measured over 60 guest-driven
+/// resolution changes: 26 entries to 354, **strictly monotonic across all 27
+/// census samples**, never once decreasing, while the set of entries a lookup
+/// could still be served from stayed at ~13.
+///
+/// # Why LRU, and not a staleness rule
+///
+/// The two staleness rules this cache offers both fail, and the measurements
+/// that killed them are worth keeping next to the constant:
+///
+/// - **Dead-task eviction** reclaims nothing. `gva_dead_task` read **0 of 331**
+///   accumulated entries — the compositor survives every resize and simply
+///   allocates new addresses, so every abandoned entry belongs to a task that
+///   is still alive.
+/// - **Evicting what no longer translates would black out the wallpaper.** This
+///   cache is deliberately retained across Unmap (see
+///   [`crate::runtime::surface_cache::note_unmap_retain_gva`]), so "the guest
+///   unmapped this VA" is the *normal* state of exactly the content the cache
+///   exists to hold: at idle, before any resize, 14 of 27 entries were already
+///   unmapped.
+///
+/// Recency is neither. It is a resource bound, and its safety property is the
+/// one those rules lack: [`crate::model::LruBytesMemo`]'s header already names
+/// this exact case — an entry read every frame but never rewritten (a wallpaper
+/// plane) is touched on every hit, so it is the *hottest* thing in the map and
+/// can never be the victim. Eviction reaches only entries nothing has looked at.
+pub const GVA_ENCODE_CACHE_BYTE_CAP: usize = 128 << 20;
+
+/// How many evicted keys [`GvaEvictionWitness`] remembers.
+///
+/// A diagnostic ring, so the bound is a choice about how much history to keep,
+/// not a device contract. Sized above the ~305 evictions a 4-minute 60-resize
+/// drive produces so that run is covered exactly; a longer boot overflows it,
+/// and the overflow is *reported* (`forgotten`) rather than silently dropping
+/// the count, because an under-reported harm figure is the failure direction
+/// that reads as a pass.
+pub const GVA_EVICTION_WITNESS_KEYS: usize = 4096;
+
+/// Did evicting for the byte cap cost a lookup that would otherwise have hit?
+///
+/// The cap is the first rule that ever removes a live task's content from
+/// [`DeviceState::host_gva_surfaces`], so its cost must be countable rather
+/// than argued. This remembers the exact `(gva, width, height)` of each evicted
+/// entry and counts the later lookups that missed on one — a miss on a key the
+/// cap dropped is precisely the harm, and nothing else is.
+///
+/// Read `wanted` only together with `evicted`: zero harm and zero evictions is
+/// a cap that never engaged, not a cap that engaged safely, and the two must
+/// not be confused.
+#[derive(Debug, Default)]
+pub struct GvaEvictionWitness {
+    /// Evicted identities still remembered, for the miss test.
+    keys: std::collections::BTreeSet<(u64, u32, u32)>,
+    /// Same identities in eviction order, so the ring drops the oldest.
+    order: std::collections::VecDeque<(u64, u32, u32)>,
+    /// Entries the byte cap has evicted. The denominator.
+    pub evicted: u64,
+    /// Lookups that missed on an identity the cap had evicted. The harm.
+    pub wanted: std::sync::atomic::AtomicU64,
+    /// Identities dropped from the ring before they could be tested. Each one
+    /// is a lookup `wanted` can no longer notice, so a nonzero value makes
+    /// `wanted` a lower bound.
+    pub forgotten: u64,
+}
+
+impl GvaEvictionWitness {
+    /// Record that the cap evicted this identity.
+    pub fn note_evicted(&mut self, gva: u64, width: u32, height: u32) {
+        self.evicted += 1;
+        let key = (gva, width, height);
+        if self.keys.insert(key) {
+            self.order.push_back(key);
+        }
+        while self.order.len() > GVA_EVICTION_WITNESS_KEYS {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+                self.forgotten += 1;
+            }
+        }
+    }
+
+    /// A lookup missed. Count it if the cap is why. Takes `&self` because every
+    /// GVA-cache read path holds a shared borrow of the device state.
+    pub fn note_miss(&self, gva: u64, width: u32, height: u32) {
+        if self.keys.contains(&(gva, width, height)) {
+            self.wanted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A store re-populated this identity, so a later miss on it is no longer
+    /// attributable to the cap.
+    pub fn note_restored(&mut self, gva: u64, width: u32, height: u32) {
+        if self.keys.remove(&(gva, width, height)) {
+            self.order.retain(|k| *k != (gva, width, height));
+        }
+    }
+
+    /// `(evicted, wanted, forgotten)` for the census line.
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.evicted,
+            self.wanted.load(std::sync::atomic::Ordering::Relaxed),
+            self.forgotten,
+        )
+    }
+}
+
 /// See [`DeviceState::linear_sampled_memo`].
 #[derive(Clone, Debug)]
 pub struct LinearSampledMemo {
@@ -1717,7 +1852,24 @@ pub struct DeviceState {
     pub host_texture_surfaces: BTreeMap<u32, HostSurface>,
     /// Same type-2/3 encode content keyed by target GVA — survives texture_ref
     /// rebinding / small-atlas overwrite of the ref slot.
+    ///
+    /// Bounded by [`GVA_ENCODE_CACHE_BYTE_CAP`] with least-recently-*used*
+    /// eviction; see that constant for why recency and not staleness. Growth is
+    /// entirely from new GVAs — a store at an existing key replaces in place.
     pub host_gva_surfaces: BTreeMap<u64, HostSurface>,
+    /// Monotonic recency counter behind [`HostSurface::last_touch`].
+    pub gva_touch_seq: u64,
+    /// The bound [`crate::runtime::surface_cache::enforce_gva_cache_cap`]
+    /// holds [`Self::host_gva_surfaces`] to, always
+    /// [`GVA_ENCODE_CACHE_BYTE_CAP`] in production.
+    ///
+    /// A field rather than the constant read directly so the eviction policy is
+    /// testable: at 128 MiB a test that wanted to cross the cap would have to
+    /// allocate 128 MiB of pixels, so the policy would go untested and only the
+    /// arithmetic around it would not. Nothing in the device writes this.
+    pub gva_cache_byte_cap: usize,
+    /// What [`GVA_ENCODE_CACHE_BYTE_CAP`] cost, measured rather than assumed.
+    pub gva_eviction_witness: GvaEvictionWitness,
     /// Raw compute encode for type-2/3 textures. Retained across GVA unmap;
     /// evicted on task/object lifetime end or descriptor mismatch.
     pub host_linear_textures: BTreeMap<(u32, u32), HostLinearTexture>,
@@ -2005,6 +2157,9 @@ impl DeviceState {
             host_surfaces: BTreeMap::new(),
             host_texture_surfaces: BTreeMap::new(),
             host_gva_surfaces: BTreeMap::new(),
+            gva_touch_seq: 0,
+            gva_cache_byte_cap: GVA_ENCODE_CACHE_BYTE_CAP,
+            gva_eviction_witness: GvaEvictionWitness::default(),
             host_linear_textures: BTreeMap::new(),
             compute_storage_residency: BTreeMap::new(),
             compute_deferred_flush: BTreeMap::new(),
@@ -3362,6 +3517,18 @@ impl DeviceState {
             self.sampled_content_gen = 1;
         }
         self.sampled_content_gen
+    }
+
+    /// Issue the next recency stamp for [`HostSurface::last_touch`].
+    ///
+    /// Strictly increasing, so the smallest stamp in
+    /// [`Self::host_gva_surfaces`] is always the coldest entry and the byte cap
+    /// needs no other ordering. Saturating rather than wrapping: a wrap would
+    /// make one ancient entry look like the newest and pin it forever, and at
+    /// one stamp per lookup `u64::MAX` is not reachable by any real session.
+    pub fn next_gva_touch(&mut self) -> u64 {
+        self.gva_touch_seq = self.gva_touch_seq.saturating_add(1);
+        self.gva_touch_seq
     }
 
     /// Bump content generation after a write into the mapping (0 never skips).

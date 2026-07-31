@@ -3314,8 +3314,14 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     // reads the same generation and still serves.
     let gva_content_is_current =
         !crate::runtime::surface_cache::gva_guest_wrote_since_store(state, host, gva);
-    if let Some((bgra, host_gen, producer_type)) = (gva_names_these_pages
-        && gva_content_is_current)
+    let serves = gva_names_these_pages && gva_content_is_current;
+    if serves {
+        // Recency for the encode cache's byte cap, charged on the confirmed
+        // serve. A wallpaper plane is stored once and sampled from here every
+        // frame, so this is what keeps it out of reach of the cap.
+        crate::runtime::surface_cache::touch_gva(state, gva, w, h);
+    }
+    if let Some((bgra, host_gen, producer_type)) = serves
         .then(|| crate::runtime::surface_cache::get_gva_with_owner(state, gva, w, h))
         .flatten()
     {
@@ -5579,6 +5585,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                         w,
                                         h,
                                     );
+                            if names_these_pages {
+                                // Recency for the encode cache's byte cap; a
+                                // Load seed served from here is a use.
+                                crate::runtime::surface_cache::touch_gva(
+                                    state,
+                                    c0.target_gva,
+                                    w,
+                                    h,
+                                );
+                            }
                             names_these_pages
                                 .then(|| {
                                     crate::runtime::surface_cache::get_gva(

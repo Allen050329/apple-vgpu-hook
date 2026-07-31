@@ -58,8 +58,9 @@ pub use emit::{first_sight, state_changed, Emit};
 // for readers who want the machinery.
 pub use sink::{
     bgra_present_stats, bgra_present_stats_scalar, bgra_rgb_stats, content_probe_enabled,
-    content_reuse_disabled, content_summary, fail, fence_flush_disabled, gva_identity_gen_disabled,
-    line, mapping_page_guard_disabled, nonzero_stats, off, redirect_logs_for_tests,
+    content_reuse_disabled, content_summary, fail, fence_flush_disabled, gva_cache_cap_disabled,
+    gva_identity_gen_disabled, line, mapping_page_guard_disabled, nonzero_stats, off,
+    redirect_logs_for_tests,
     rgba_rgb_stats, sampled_cache_disabled, sampled_resident_gate_disabled, store_defer_disabled,
     surface_cache_gen_strict, type4_identity_guard_disabled, ContentReuseRail, FenceFlushRail,
     StoreDeferRail,

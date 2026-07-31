@@ -679,7 +679,16 @@ pub fn store_gva_owned(
         return;
     }
     let generation = state.next_sampled_content_generation();
+    // A store re-populates the identity, so any miss the byte cap could have
+    // been charged for it is now a different question. Retiring the witness key
+    // here keeps `gva_cap_wanted` a count of lookups the cap actually cost,
+    // rather than one that keeps accruing against content that came back.
+    state
+        .gva_eviction_witness
+        .note_restored(gva, width, height);
+    let touch = state.next_gva_touch();
     let entry = state.host_gva_surfaces.entry(gva).or_default();
+    entry.last_touch = touch;
     entry.host_gen = generation;
     entry.width = width;
     entry.height = height;
@@ -710,6 +719,7 @@ pub fn store_gva_owned(
         // against the surviving token immediately after this returns, which is
         // the only moment a baseline may be latched: the bytes are in hand.
         entry.guest_write_gen_at_store = 0;
+        enforce_gva_cache_cap(state);
         return;
     }
     // Any other change retires the token, including a `None` that says the walk
@@ -724,6 +734,69 @@ pub fn store_gva_owned(
         // Only the host can free host-side tracking state, and this function
         // has no host. `flush_retired_views` drains the list.
         state.retired_guest_write_tokens.push(stale);
+    }
+    enforce_gva_cache_cap(state);
+}
+
+/// Hold [`DeviceState::host_gva_surfaces`] at or under
+/// [`GVA_ENCODE_CACHE_BYTE_CAP`], evicting the least-recently-**used** entries
+/// first.
+///
+/// Runs from [`store_gva_owned`], which is the map's only insert path, so the
+/// bound is enforced exactly where it can be crossed. Two things it deliberately
+/// does not do:
+///
+/// - **It never bulk-clears.** Draining to a 7/8 low-water mark, the same shape
+///   [`crate::model::LruBytesMemo`] uses, means a steady insert stream evicts in
+///   occasional batches with headroom instead of one-for-one at the boundary,
+///   and a cap crossing never dumps the hot set — the re-encode cliff that
+///   pattern exists to avoid.
+/// - **It never evicts a GVA that still owes a deferred writeback.** A window in
+///   `gva_deferred_flush` names this address and its flush reads this entry;
+///   dropping it would turn a memory bound into lost guest pixels, which is the
+///   Goal 3 loss class. That is a correctness exclusion, not a heuristic — the
+///   obligation is recorded, not guessed.
+///
+/// An entry larger than the whole cap is admitted alone rather than rejected,
+/// matching the sibling memo: refusing to cache a surface because it is big is
+/// how a 4K wallpaper stops being cached at all.
+pub fn enforce_gva_cache_cap(state: &mut DeviceState) {
+    if crate::observe::gva_cache_cap_disabled() {
+        return;
+    }
+    let cap = state.gva_cache_byte_cap;
+    let low_water = cap - cap / 8;
+    let bytes = |state: &DeviceState| -> usize {
+        state
+            .host_gva_surfaces
+            .values()
+            .map(|e| e.bgra.len())
+            .sum::<usize>()
+    };
+    let mut live = bytes(state);
+    if live <= low_water {
+        return;
+    }
+    // Coldest first. This only runs at the cap boundary, never on the steady
+    // store path, so one ordered pass over the keys is acceptable.
+    let mut by_touch: Vec<(u64, u64)> = state
+        .host_gva_surfaces
+        .iter()
+        .filter(|(gva, _)| !state.gva_deferred_flush.contains_key(gva))
+        .map(|(&gva, e)| (e.last_touch, gva))
+        .collect();
+    by_touch.sort_unstable();
+    for (_, gva) in by_touch {
+        if live <= low_water {
+            break;
+        }
+        let Some(e) = state.host_gva_surfaces.get(&gva) else {
+            continue;
+        };
+        let (freed, width, height) = (e.bgra.len(), e.width, e.height);
+        state.gva_eviction_witness.note_evicted(gva, width, height);
+        evict_gva(state, gva);
+        live = live.saturating_sub(freed);
     }
 }
 
@@ -1082,6 +1155,64 @@ pub fn mark_gva_backing_suspect(
     n
 }
 
+/// The one selection rule every GVA-cache read goes through: exact key, exact
+/// geometry, enough bytes for it. Returns the entry and the byte length a
+/// serve would hand out.
+///
+/// Pure — it does **not** charge the byte cap's harm witness. Probes that ask
+/// "would this hit" ([`has_gva`], [`touch_gva`]) go through here directly, so
+/// only a read that actually wanted the pixels is counted as harm; charging
+/// here instead would count two or three times for one frame's single logical
+/// lookup and make the figure uninterpretable.
+fn lookup_gva(
+    state: &DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+) -> Option<(&crate::model::HostSurface, usize)> {
+    let need = (height as usize)
+        .saturating_mul(width as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    let e = state.host_gva_surfaces.get(&gva)?;
+    (e.width == width && e.height == height && !e.bgra.is_empty() && e.bgra.len() >= need)
+        .then_some((e, need))
+}
+
+/// [`lookup_gva`] for the paths that want the bytes, charging a miss to the
+/// byte cap when the cap is what removed this exact identity.
+///
+/// A key that was never cached, or whose geometry never matched, is an ordinary
+/// miss and is not counted — see [`crate::model::GvaEvictionWitness`].
+fn read_gva(
+    state: &DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+) -> Option<(&crate::model::HostSurface, usize)> {
+    let hit = lookup_gva(state, gva, width, height);
+    if hit.is_none() {
+        state.gva_eviction_witness.note_miss(gva, width, height);
+    }
+    hit
+}
+
+/// Mark a GVA entry most-recently-used, so the byte cap's eviction reaches only
+/// entries nothing is reading.
+///
+/// Call on a **confirmed serve**, not on an attempted one: this is the half of
+/// the recency signal that keeps a stored-once-sampled-forever entry (the
+/// retained wallpaper class) alive, and charging recency for lookups that were
+/// then refused would keep entries warm that nothing can actually use.
+pub fn touch_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32) {
+    if lookup_gva(state, gva, width, height).is_none() {
+        return;
+    }
+    let stamp = state.next_gva_touch();
+    if let Some(e) = state.host_gva_surfaces.get_mut(&gva) {
+        e.last_touch = stamp;
+    }
+}
+
 pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option<&[u8]> {
     get_gva_with_gen(state, gva, width, height).map(|(bgra, _)| bgra)
 }
@@ -1091,7 +1222,7 @@ pub fn get_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> Option
 /// Lets a caller that needs `&mut DeviceState` (backing revalidation) find out
 /// first whether there is anything to revalidate.
 pub fn has_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> bool {
-    get_gva_with_gen(state, gva, width, height).is_some()
+    lookup_gva(state, gva, width, height).is_some()
 }
 
 /// Borrow a GVA encode plus its producer generation.
@@ -1104,16 +1235,7 @@ pub fn get_gva_with_gen(
     width: u32,
     height: u32,
 ) -> Option<(&[u8], u64)> {
-    let e = state.host_gva_surfaces.get(&gva)?;
-    if e.width != width || e.height != height || e.bgra.is_empty() {
-        return None;
-    }
-    let need = (height as usize)
-        .saturating_mul(width as usize)
-        .saturating_mul(RGBA8_BPP as usize);
-    if e.bgra.len() < need {
-        return None;
-    }
+    let (e, need) = read_gva(state, gva, width, height)?;
     Some((&e.bgra[..need], e.host_gen))
 }
 
@@ -1124,16 +1246,7 @@ pub fn get_gva_with_owner(
     width: u32,
     height: u32,
 ) -> Option<(&[u8], u64, u8)> {
-    let e = state.host_gva_surfaces.get(&gva)?;
-    if e.width != width || e.height != height || e.bgra.is_empty() {
-        return None;
-    }
-    let need = (height as usize)
-        .saturating_mul(width as usize)
-        .saturating_mul(RGBA8_BPP as usize);
-    if e.bgra.len() < need {
-        return None;
-    }
+    let (e, need) = read_gva(state, gva, width, height)?;
     Some((&e.bgra[..need], e.host_gen, e.producer_object_type))
 }
 
@@ -1362,6 +1475,12 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     }
     let (dead_task, no_backing, backing_bytes) = gva_cache_staleness(state);
     let (moved, unmapped, checked) = gva_backing_moved(state, host);
+    // `gva_cap_*` are the only running totals on this line — the eviction
+    // witness accumulates for the life of the device, where every other field
+    // here is a level. Take the last line for all of them either way; do not
+    // sum any of it.
+    let (cap_evicted, cap_wanted, cap_forgotten) = state.gva_eviction_witness.counts();
+    let cap_off = crate::observe::gva_cache_cap_disabled() as u8;
     crate::observe::off(format!(
         "host_cache_levels (levels, not per-interval) total_bytes={total} peak_bytes={peak} \
          surfaces={} surface_bytes={} surface_largest={} \
@@ -1370,6 +1489,9 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          gva_backing_bytes={backing_bytes} \
          gva_backing_moved={moved} gva_backing_unmapped={unmapped} \
          gva_backing_checked={checked} \
+         gva_cap_off={cap_off} gva_cap_bytes={} \
+         gva_cap_evicted={cap_evicted} gva_cap_wanted={cap_wanted} \
+         gva_cap_forgotten={cap_forgotten} \
          linear={} linear_bytes={} linear_largest={}",
         surfaces.entries,
         surfaces.bytes,
@@ -1377,6 +1499,7 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
         gva.entries,
         gva.bytes,
         gva.largest,
+        state.gva_cache_byte_cap,
         linear.entries,
         linear.bytes,
         linear.largest,
@@ -2680,4 +2803,308 @@ mod arming_window_tests {
             "a witness that only ever says clean is worse than one that never does"
         );
     }
+}
+
+/// The GVA encode cache's byte cap: what it bounds, what it refuses to touch,
+/// and what it costs.
+///
+/// Every test here sets [`DeviceState::gva_cache_byte_cap`] to a size a test can
+/// allocate. The policy under test is identical at 128 MiB; only the arithmetic
+/// scales.
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use crate::model::{DeviceId, GvaDeferredEntry, PAGE_SHIFT_X86};
+
+    /// One 16x16 BGRA frame — 1 024 bytes, so a cap in the tens of KiB holds a
+    /// countable number of them.
+    const W: u32 = 16;
+    const H: u32 = 16;
+    const FRAME_BYTES: usize = (W * H * 4) as usize;
+
+    fn state_capped(cap: usize) -> DeviceState {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.gva_cache_byte_cap = cap;
+        state
+    }
+
+    fn store_frame(state: &mut DeviceState, gva: u64, fill: u8) {
+        store_gva_owned(state, gva, W, H, vec![fill; FRAME_BYTES], 0, None);
+    }
+
+    fn deferred_entry() -> GvaDeferredEntry {
+        GvaDeferredEntry {
+            task_id: 0,
+            texture_ref: 0,
+            producer_object_type: 0,
+            width: W,
+            height: H,
+            row_stride: W * 4,
+            format: 0,
+            armed_seq: 1,
+            armed_stamp_seq: 0,
+            pages: std::collections::HashSet::new(),
+            alloc_gen: 1,
+        }
+    }
+
+    /// The leak, and the bound.
+    ///
+    /// This map is keyed by guest *virtual* address and a store at an existing
+    /// key replaces in place, so growth comes entirely from new GVAs — which is
+    /// exactly what a resolution change produces. Measured on the rig, 60
+    /// guest-driven mode changes took it from 26 entries to 354 without it ever
+    /// decreasing once. Here that shape is reproduced with 400 distinct
+    /// addresses: uncapped it holds all 400, capped it holds what the cap
+    /// allows and no more.
+    #[test]
+    fn the_byte_cap_bounds_a_map_whose_keys_never_repeat() {
+        let uncapped = {
+            let mut state = state_capped(usize::MAX);
+            for i in 0..400u64 {
+                store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
+            }
+            state.host_gva_surfaces.len()
+        };
+        assert_eq!(
+            uncapped, 400,
+            "control: without a cap every abandoned address is kept forever"
+        );
+
+        let cap = 64 * FRAME_BYTES;
+        let mut state = state_capped(cap);
+        for i in 0..400u64 {
+            store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
+        }
+        let bytes: usize = state.host_gva_surfaces.values().map(|e| e.bgra.len()).sum();
+        assert!(
+            bytes <= cap,
+            "capped map holds {bytes} bytes against a {cap}-byte cap"
+        );
+        assert!(
+            state.host_gva_surfaces.len() < 400,
+            "the cap must actually have evicted something"
+        );
+        assert!(
+            state.gva_eviction_witness.evicted > 0,
+            "and it must say so: an eviction count of zero is a cap that never engaged"
+        );
+    }
+
+    /// The wallpaper property, and the whole reason this is recency and not
+    /// staleness.
+    ///
+    /// A wallpaper plane is stored **once** and sampled every frame thereafter.
+    /// A rule keyed on stores would see the most-wanted entry in the map as its
+    /// coldest; a rule keyed on translation would evict it too, because this
+    /// cache is deliberately retained across Unmap, so "does not translate" is
+    /// that entry's normal state. Touch-on-read is what makes it the hottest
+    /// thing here instead.
+    #[test]
+    fn an_entry_read_every_frame_but_never_rewritten_survives_the_cap() {
+        let cap = 16 * FRAME_BYTES;
+        let mut state = state_capped(cap);
+        let wallpaper = 0x9_0000u64;
+        store_frame(&mut state, wallpaper, 0xAB);
+
+        for i in 0..400u64 {
+            // Sampled every frame, never rewritten — the read is the only thing
+            // keeping it alive.
+            assert!(
+                get_gva(&state, wallpaper, W, H).is_some(),
+                "wallpaper evicted at round {i}"
+            );
+            touch_gva(&mut state, wallpaper, W, H);
+            store_frame(&mut state, 0x100_0000 + i * 0x1000, i as u8);
+        }
+
+        let served = get_gva(&state, wallpaper, W, H).expect("wallpaper survives the whole stream");
+        assert!(
+            served.iter().all(|&b| b == 0xAB),
+            "and it is still its own pixels, not a neighbour's"
+        );
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            0,
+            "no lookup was ever charged to the cap"
+        );
+    }
+
+    /// Without the touch, the same entry is evicted — so the assertion above is
+    /// testing the touch and not merely a map that happens to be small.
+    ///
+    /// The two tests are a matched pair on one binary: identical cap, identical
+    /// insert stream, and the only difference is whether the read path reports
+    /// the use.
+    #[test]
+    fn the_same_entry_is_evicted_when_nothing_reports_reading_it() {
+        let cap = 16 * FRAME_BYTES;
+        let mut state = state_capped(cap);
+        let wallpaper = 0x9_0000u64;
+        store_frame(&mut state, wallpaper, 0xAB);
+        for i in 0..400u64 {
+            store_frame(&mut state, 0x100_0000 + i * 0x1000, i as u8);
+        }
+        assert!(
+            get_gva(&state, wallpaper, W, H).is_none(),
+            "an entry nothing reports using is exactly what the cap is for"
+        );
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            1,
+            "and the lookup that then wanted it is charged to the cap, not written off"
+        );
+    }
+
+    /// A memory bound must never become a pixel loss.
+    ///
+    /// A window in `gva_deferred_flush` names this address and its flush reads
+    /// this entry, so evicting it would drop guest pixels that were promised —
+    /// the Goal 3 loss class. The exclusion is on a recorded obligation, not on
+    /// a guess about what the guest still wants.
+    #[test]
+    fn an_address_that_still_owes_a_deferred_writeback_is_never_evicted() {
+        let cap = 8 * FRAME_BYTES;
+        let mut state = state_capped(cap);
+        let owed = 0x7_0000u64;
+        store_frame(&mut state, owed, 0xCD);
+        state.arm_gva_deferred_window(owed, deferred_entry());
+
+        // Never touched again, so recency alone would have evicted it long ago.
+        for i in 0..400u64 {
+            store_frame(&mut state, 0x200_0000 + i * 0x1000, i as u8);
+        }
+        assert!(
+            state.host_gva_surfaces.contains_key(&owed),
+            "the obligation outranks the bound"
+        );
+        let served = get_gva(&state, owed, W, H).expect("still servable");
+        assert!(served.iter().all(|&b| b == 0xCD));
+    }
+
+    /// The harm witness must charge the cap for its own misses and nothing
+    /// else, or the number cannot be read.
+    ///
+    /// An address that was never cached misses for the ordinary reason, and a
+    /// cached address asked for at a geometry it never held is not a cap
+    /// casualty either. Only a lookup that would have hit, for an identity the
+    /// cap removed, is the cost of capping.
+    #[test]
+    fn the_witness_charges_the_cap_only_for_misses_the_cap_caused() {
+        let mut state = state_capped(2 * FRAME_BYTES);
+        let victim = 0x5_0000u64;
+        store_frame(&mut state, victim, 0x11);
+        for i in 0..64u64 {
+            store_frame(&mut state, 0x300_0000 + i * 0x1000, i as u8);
+        }
+        assert!(state.gva_eviction_witness.evicted > 0);
+        assert!(!state.host_gva_surfaces.contains_key(&victim));
+
+        // Never cached at all.
+        assert!(get_gva(&state, 0xdead_0000, W, H).is_none());
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            0,
+            "an address this cache never held is an ordinary miss"
+        );
+
+        // Evicted, but asked for at a geometry it never had.
+        assert!(get_gva(&state, victim, W * 2, H).is_none());
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            0,
+            "the cap did not remove *that* identity"
+        );
+
+        // The real thing.
+        assert!(get_gva(&state, victim, W, H).is_none());
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            1,
+            "a lookup that would have hit but for the cap is the cost of capping"
+        );
+    }
+
+    /// A probe is not a read, or one frame's single logical lookup would be
+    /// counted two or three times.
+    ///
+    /// The sampled path asks [`has_gva`] first (so it can decide whether there
+    /// is anything to revalidate) and only then reads. Charging the witness in
+    /// the shared selection rule would score that frame twice and make the
+    /// figure uninterpretable — inflated toward reporting harm, which is the
+    /// direction that wastes a session rather than hiding a bug, but wrong.
+    #[test]
+    fn asking_whether_an_entry_exists_is_not_charged_as_harm() {
+        let mut state = state_capped(2 * FRAME_BYTES);
+        let victim = 0x5_0000u64;
+        store_frame(&mut state, victim, 0x11);
+        for i in 0..64u64 {
+            store_frame(&mut state, 0x300_0000 + i * 0x1000, i as u8);
+        }
+        assert!(!has_gva(&state, victim, W, H));
+        touch_gva(&mut state, victim, W, H);
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            0,
+            "probes do not read the pixels, so they are not denied any"
+        );
+        assert!(get_gva(&state, victim, W, H).is_none());
+        assert_eq!(state.gva_eviction_witness.wanted.load(Relaxed), 1);
+    }
+
+    /// Once the content is back, later misses are a different question.
+    ///
+    /// Otherwise the witness keeps charging the cap for an identity that has
+    /// been re-stored since, and `gva_cap_wanted` drifts upward for reasons
+    /// that have nothing to do with the bound.
+    #[test]
+    fn a_store_that_brings_an_evicted_identity_back_stops_charging_the_cap() {
+        let mut state = state_capped(2 * FRAME_BYTES);
+        let victim = 0x5_0000u64;
+        store_frame(&mut state, victim, 0x11);
+        for i in 0..64u64 {
+            store_frame(&mut state, 0x300_0000 + i * 0x1000, i as u8);
+        }
+        assert!(!state.host_gva_surfaces.contains_key(&victim));
+
+        store_frame(&mut state, victim, 0x22);
+        assert!(get_gva(&state, victim, W, H).is_some());
+        // Evict it again by store pressure, but this time the witness has
+        // forgotten it, so the miss below is not the cap's to answer for.
+        state.gva_eviction_witness = crate::model::GvaEvictionWitness::default();
+        assert!(get_gva(&state, 0x5_1000, W, H).is_none());
+        assert_eq!(state.gva_eviction_witness.wanted.load(Relaxed), 0);
+    }
+
+    /// The ring bound must under-report visibly, never silently.
+    ///
+    /// It remembers a fixed number of evicted identities, so a long boot
+    /// evicts more than it can hold. That makes `wanted` a lower bound, and a
+    /// reader has to be able to tell — `forgotten` is what says so.
+    #[test]
+    fn forgetting_an_evicted_key_is_reported_rather_than_swallowed() {
+        let mut state = state_capped(2 * FRAME_BYTES);
+        let overflow_by = 64u64;
+        let n = crate::model::GVA_EVICTION_WITNESS_KEYS as u64 + overflow_by;
+        for i in 0..n {
+            store_frame(&mut state, 0x1000 + i * 0x1000, i as u8);
+        }
+        let (evicted, _, forgotten) = state.gva_eviction_witness.counts();
+        assert!(evicted > crate::model::GVA_EVICTION_WITNESS_KEYS as u64);
+        assert!(
+            forgotten > 0,
+            "the ring overflowed and the census must be able to say so"
+        );
+
+        // The very first address evicted is the one the ring dropped, so a
+        // lookup for it is uncounted — which is the point of `forgotten`.
+        assert!(get_gva(&state, 0x1000, W, H).is_none());
+        assert_eq!(
+            state.gva_eviction_witness.wanted.load(Relaxed),
+            0,
+            "uncounted, and `forgotten` is the flag that keeps that honest"
+        );
+    }
+
+    use std::sync::atomic::Ordering::Relaxed;
 }

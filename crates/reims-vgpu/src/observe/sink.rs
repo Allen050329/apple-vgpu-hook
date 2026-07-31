@@ -859,6 +859,25 @@ pub fn type4_identity_guard_disabled() -> bool {
     })
 }
 
+/// Bisection knob (`REIMS_VGPU_GVA_CACHE_CAP_OFF=1`): let the GVA-keyed encode
+/// cache grow without bound again, the way it did before
+/// [`crate::model::GVA_ENCODE_CACHE_BYTE_CAP`].
+///
+/// The control arm for the cap, and it is the arm that carries the leak:
+/// measured over 60 guest-driven resolution changes, `host_gva_surfaces` went
+/// from 26 entries to 354 — strictly monotonic, never decreasing once — while
+/// the entries a lookup could still be served from stayed at ~13.
+///
+/// Score the two arms on `host_cache_levels`: with the cap on, `gva_bytes` must
+/// stay at or under the cap and `gva_cap_wanted` — lookups that missed on an
+/// identity the cap evicted — is the harm. Read that figure only alongside
+/// `gva_cap_evicted`: zero harm with zero evictions is a cap that never
+/// engaged, which is not the same claim as a cap that engaged safely.
+pub fn gva_cache_cap_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("REIMS_VGPU_GVA_CACHE_CAP_OFF").is_some_and(|v| v == "1"))
+}
+
 /// The parse, split out so it is testable without an environment. Same
 /// unrecognised-token rule as [`store_defer_spec_arms`]: a typo arms nothing.
 fn fence_flush_spec_arms(spec: Option<&str>, rail: FenceFlushRail) -> bool {

@@ -3931,6 +3931,12 @@ fn seed_color_load<M: HostMemory + HostOps>(
     // recycling. Fall back to the type-2/3 texture namespace, never the
     // unrelated type-4 surface_id namespace. Guest memory is last.
     if width > 0 && height > 0 {
+        if target_gva != 0 {
+            // Recency for the encode cache's byte cap; a Load seed served from
+            // here is a use, and this is the read path that keeps a
+            // stored-once-sampled-forever entry warm.
+            crate::runtime::surface_cache::touch_gva(state, target_gva, width, height);
+        }
         let cached = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else {
