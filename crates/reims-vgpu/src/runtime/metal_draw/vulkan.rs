@@ -7465,6 +7465,7 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
             row_stride: c0.row_stride,
             format: c0.format,
             armed_seq,
+            armed_stamp_seq: state.completion_stamp_seq,
             pages,
         },
     );

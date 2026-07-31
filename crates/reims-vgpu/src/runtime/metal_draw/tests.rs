@@ -1463,6 +1463,7 @@ fn deferred_gva_sample_eligibility_rules() {
         row_stride: 128,
         format: MTL_FORMAT_BGRA8_UNORM,
         armed_seq: 0,
+        armed_stamp_seq: 0,
         pages: Default::default(),
     };
     assert!(

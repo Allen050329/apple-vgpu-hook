@@ -984,6 +984,16 @@ pub struct GvaDeferredEntry {
     pub format: u16,
     /// Arm order for oldest-first flush when the window cap is hit.
     pub armed_seq: u64,
+    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
+    ///
+    /// The window's `pages` guard asks whether the GVA still resolves to the
+    /// pages it was armed on. That question is blind to the hazard this field
+    /// names: a guest that frees the render target and lets its own allocator
+    /// hand the same pages to something else keeps the translation identical, so
+    /// the guard passes and the flush writes pixels over whatever moved in. The
+    /// guest is entitled to do that from the moment it is stamped, so a landing
+    /// whose stamp counter has moved is a write the guest never agreed to.
+    pub armed_stamp_seq: u64,
     /// Defer-time physical page GPAs of the guest window — raw task-GVA reads
     /// aliasing these flush first (`storage_flush::flush_intersecting_task_gva`).
     pub pages: std::collections::HashSet<u64>,
@@ -1708,6 +1718,15 @@ pub struct DeviceState {
     pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
+    /// Completion stamps written to the guest this device lifetime.
+    ///
+    /// A stamp is the guest's fence: [`crate::runtime::drain::write_stamp`] puts
+    /// the value in the FIFO page and raises the GPU IRQ, and from that instant
+    /// the guest is entitled to treat the work as finished and reclaim anything
+    /// it allocated for it. Counting stamps gives every deferred window an
+    /// answer to the one question its page-set guard cannot ask: was the guest
+    /// told this render was done before we wrote its bytes?
+    pub completion_stamp_seq: u64,
     /// GVAs rendered this guest lifetime as an **MRT secondary attachment**
     /// (e.g. the vibrancy RG16Float coverage mask) → its (width, height). The
     /// producer records the identity + geometry here; a later draw sampling a
@@ -1843,6 +1862,7 @@ impl DeviceState {
             gva_deferred_flush: DeferredWindows::new(),
             mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,
+            completion_stamp_seq: 0,
             retired_gva_windows: Vec::new(),
             linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),

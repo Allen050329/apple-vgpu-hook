@@ -320,6 +320,11 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
     let page_size = state.page_size() as usize;
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
+        // The guest's fence has moved. Everything it allocated for the work this
+        // stamp completes may be freed from here on, so any deferred window
+        // still holding bytes for guest RAM is now writing behind the guest's
+        // back — see `GvaDeferredEntry::armed_stamp_seq`.
+        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
         state
             .gfx
             .interrupt_status_gpu
@@ -3433,6 +3438,22 @@ pub fn note_store_route_us(name: &'static str, us: u64) {
             .entry(name)
             .or_default() += us;
     }
+}
+
+/// Read one route's count out of the live window, for tests that assert a
+/// census fired rather than trusting that it was wired up.
+///
+/// A counter nobody reads back is a counter that can be deleted, mistyped, or
+/// placed on the wrong side of an early return without any test noticing — and
+/// several of this crate's readings have turned on exactly which side of a
+/// branch a `note_store_route` sat on.
+#[cfg(test)]
+pub(crate) fn store_route_count(route: &str) -> u64 {
+    STORE_ROUTES
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(route).copied()))
+        .unwrap_or(0)
 }
 
 /// Drain and format the window's route counts, or `None` if none were taken.

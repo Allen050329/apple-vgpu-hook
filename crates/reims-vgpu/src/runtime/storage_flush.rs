@@ -523,6 +523,56 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     false
 }
 
+/// Score a deferred window about to write guest RAM against the guest's fence.
+///
+/// [`crate::runtime::drain::write_stamp`] is the only thing this device says to
+/// the guest about whether work is finished. Once it has moved, the guest is
+/// entitled to free everything it allocated for that work — and the guest's own
+/// allocator is then free to hand those pages to anything, without touching a
+/// page table. So a window armed at stamp N and landed at stamp N+k, k > 0, is a
+/// write to memory the guest was told it could reclaim k fences ago.
+///
+/// [`deferred_pages_still_ours`] cannot see this. It asks whether the GVA still
+/// resolves to the pages the window was armed on, and free-then-reuse inside one
+/// process preserves the translation exactly. That is why the guard landed and
+/// the WindowServer `small_free_list_remove_ptr_no_clear` aborts continued.
+///
+/// Reported and not refused, for now: refusing every window that outlived its
+/// stamp is the whole deferral rail, and nothing here has yet measured how much
+/// of it that is. The counters carry their own denominator — `gvaw_stamp_same`
+/// against `gvaw_stamp_outlived` in the per-second `store_routes` line — so the
+/// next boot prices the repair instead of guessing at it.
+#[cfg(feature = "backend-vulkan")]
+fn note_window_outlived_its_stamp(
+    state: &DeviceState,
+    gva: u64,
+    entry: &crate::model::GvaDeferredEntry,
+    trigger: &str,
+) {
+    let elapsed = state
+        .completion_stamp_seq
+        .wrapping_sub(entry.armed_stamp_seq);
+    if elapsed == 0 {
+        crate::runtime::drain::note_store_route("gvaw_stamp_same");
+        return;
+    }
+    crate::runtime::drain::note_store_route("gvaw_stamp_outlived");
+    // Identity, latched per span+trigger: the count says how often, and this
+    // says which windows and which door they came through. A rail that only
+    // ever outlives its stamp under one trigger is a different repair from one
+    // that does it everywhere.
+    if crate::observe::first_sight(
+        "gva_window_outlived_stamp",
+        gva ^ ((entry.width as u64) << 32) ^ entry.height as u64,
+    ) {
+        crate::observe::fail(format!(
+            "gva_window_outlived_stamp gva={gva:#x} task={} {}x{} trigger={trigger} \
+             stamps={elapsed} (guest was fenced before these bytes were written)",
+            entry.task_id, entry.width, entry.height
+        ));
+    }
+}
+
 /// Land a taken deferred GVA render-Store window: engine resident target →
 /// guest pages (when `guest_write` and the span is still map-covered) +
 /// `host_gva_surfaces`/texture encode caches (always). Unpins the resident
@@ -576,6 +626,9 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             entry.span(),
             "gva_deferred_flush",
         );
+    }
+    if guest_write {
+        note_window_outlived_its_stamp(state, gva, entry, trigger);
     }
     if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger, "guest=refused") {
         // The window's pages moved under us. Cache-only: see
@@ -2239,6 +2292,7 @@ mod tests {
             row_stride: w * 4,
             format: 0x46,
             armed_seq: 0,
+            armed_stamp_seq: 0,
             pages: pages.iter().copied().collect(),
         }
     }
@@ -2690,6 +2744,57 @@ mod tests {
     /// claims. Logging drift while still writing is exactly what this used to
     /// do, and the guest heap corruption that allowed — WindowServer aborting in
     /// `small_free_list_remove_ptr_no_clear` — is why it decides now.
+    /// The guest's fence is the only thing that separates a deferred write from
+    /// a write into somebody else's allocation, and the page-set guard cannot
+    /// see it: free-then-reuse inside one process leaves the translation
+    /// identical, so `deferred_pages_still_ours` says yes to exactly the window
+    /// that corrupts the guest heap.
+    ///
+    /// Both directions are asserted. A census that fires on every landing is as
+    /// useless as one that never fires — the whole point is that it separates
+    /// the windows landed inside their own fence from the ones that outlived it.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_window_landed_after_its_fence_is_counted_apart_from_one_landed_inside_it() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+        // Negative control: armed and landed under the same stamp. The guest
+        // has not been told this render finished, so it cannot have freed the
+        // target, and the write is the one the Store promised.
+        let mut inside = gva_entry(1, 4, 4, &[]);
+        inside.armed_stamp_seq = state.completion_stamp_seq;
+        let same_before = store_route_count("gvaw_stamp_same");
+        let outlived_before = store_route_count("gvaw_stamp_outlived");
+        super::note_window_outlived_its_stamp(&state, 0x1000, &inside, "rearm");
+        assert_eq!(
+            store_route_count("gvaw_stamp_same"),
+            same_before + 1,
+            "a window landed inside its own fence is the safe case and must be counted as one"
+        );
+        assert_eq!(
+            store_route_count("gvaw_stamp_outlived"),
+            outlived_before,
+            "a guard that fires on every landing cannot price the repair"
+        );
+
+        // Positive control: the same window, landed after the guest was fenced.
+        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(3);
+        let same_before = store_route_count("gvaw_stamp_same");
+        super::note_window_outlived_its_stamp(&state, 0x1000, &inside, "gva_alias");
+        assert_eq!(
+            store_route_count("gvaw_stamp_outlived"),
+            outlived_before + 1,
+            "a window whose stamp moved before it landed writes memory the guest was \
+             told it could reclaim, and that is the class the page-set guard is blind to"
+        );
+        assert_eq!(
+            store_route_count("gvaw_stamp_same"),
+            same_before,
+            "the two outcomes must not both be counted for one landing"
+        );
+    }
+
     #[test]
     fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
         use crate::contract::endian::st32;
