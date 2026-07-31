@@ -204,6 +204,10 @@ never edited in place — made by converting `OpenCore.qcow2` to raw, `mcopy`-in
 the ESP at partition offset `0x100000`, converting back, and reflinking `macos.img`/`OVMF_VARS.fd`
 from the previous snapshot.
 
+After: **30 boots, 0 aborts**. Thirty boots at the old rate would be expected to show 1.4, so the
+count alone is only suggestive (p ≈ 0.24 under the old rate); what carries it is the mechanism and
+the arithmetic — 12 bad slides of 256 predicts 4.69 %, and 24 of 513 measured 4.68 %.
+
 `vm/boot-x86.sh` now watches the serial log for `#[EB|STOP]` / `Boot failed - Aborted` and exits
 **125** within ~30 s instead of sitting out `TESTING_TIMEOUT`. Treat 125 as "retry the boot"; no
 measurement from such a boot is about this device. `.agents/repros/boot-abort-rate.sh` turns it into
