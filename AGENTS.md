@@ -1622,6 +1622,112 @@ has found. Drive the guest with `.agents/repros/guest-display-mode.m` (compiled 
 prints the mode that actually took, because a mode change that silently does not apply is the failure
 direction that reads as a pass).
 
+### "No qemu process" means "not started yet" for the first few minutes of a boot
+
+`vm/boot-x86.sh` **rebuilds QEMU before it launches it**, so there is a multi-minute window at the
+head of every boot in which no `qemu-system-x86_64` exists and the boot is perfectly healthy. A wait
+loop written the obvious way:
+
+```sh
+until ssh …; do pgrep -f '[q]emu-system-x86_64' >/dev/null || { echo "QEMU GONE"; exit 1; }; sleep 10; done
+```
+
+fires its bail-out on the first poll, every time, and reports a dead VM for a boot that goes on to
+run fine. Measured: it declared `QEMU GONE` while the guest was in OpenCore and the serial log was
+still growing.
+
+It is the same shape as the `Retired` trap — **a check whose negative is indistinguishable from its
+positive** — with the sign flipped: here the harness reports failure where there is none, which is
+the cheaper direction but still costs a diagnosis. Either poll for the *success* condition alone with
+a bounded attempt count, or latch "qemu was seen alive" before treating its absence as death.
+
+### `host_cache_levels` is a level, and `store_routes` is a rate
+
+The two census lines in this device now use **opposite conventions**, so read the line's own text
+before doing arithmetic on it. `store_routes` fields are counts for one interval and must be summed
+across lines; `host_cache_levels` fields are the size *right now* and must not be. Summing a steady
+cache across a 2 900 s boot multiplies it by the census cadence and reports a leak that is not there
+— the same shape of error, in the other direction, as the one that produced `mapping_pages_ours 310`
+for a true 25 646.
+
+The line labels itself `(levels, not per-interval)` for exactly this reason. It carries per-cache
+`entries` / `bytes` / `largest`, plus a device-global `peak_bytes`:
+
+- **`largest`** separates "many small surfaces" from "a few 4K ones". A 4K entry is ~4x a 1080p one,
+  so entry *count* alone cannot tell a benign map from an expensive one.
+- **`peak_bytes`** is there because the last line cannot show a transient spike, and a spike is what
+  a resolution change produces — every geometry change orphans the previous geometry's entries until
+  something replaces or evicts them.
+
+`bytes` sums `Arc<Vec<u8>>` lengths and a deferred render window can share an entry's allocation, so
+it is the size of the pixels *reachable through the cache*, not memory additional to the windows.
+Do not add it to a window figure and call the total resident.
+
+Do not measure this class from QEMU's RSS. The first attempt did and read **9.15 GB** — a number
+dominated by however much of the 16 GB guest RAM the guest had touched, which moves for reasons that
+have nothing to do with these maps.
+
+#### Measured on the first boot that read it: `host_gva_surfaces` does not stop growing
+
+x86/Vulkan, 60 guest-driven resolution changes cycling 3840x2160 / 1440x1080 / 1280x1024 /
+1920x1080. Sampled every twelfth census line:
+
+```text
+   t_ms  total_MB   surf    gva   lin
+  33551      83.2     14     26     6      <- idle 1080p desktop
+  70084     151.7     11     63    39
+  94485     293.4     11    152    52
+ 131151     191.2     13    223    51
+ 168164     228.3     13    269    51
+ 205210     358.0     16    312    50
+ 242023     284.0     15    330    50
+ 266627     291.0     11    354    51      <- drive ends
+ 278645     291.0     11    354    51      <- steady after
+```
+
+Read the three caches separately, because only one of them is the finding.
+
+**`surf` and `lin` are bounded.** `host_surfaces` sits at 11-16 for the whole boot and
+`host_linear_textures` rises once to ~51 and stays. Both churn and neither accumulates.
+
+**`gva` is strictly monotonic — 26 to 354, and it never decreases once, in any of the 27 census
+lines.** That is not churn with a high water mark; it is a map with no eviction on this workload,
+growing about 5.5 entries per resolution change and holding them. `total_bytes` is noisier than the
+count because entry sizes differ (`surface_largest` reads exactly 8 294 400 = 1920x1080x4), but it
+went from 75 MB to 291 MB with a `peak_bytes` of 440 MB, and it flatlines the moment the drive stops
+— so the growth tracks the resizes, not the clock.
+
+The mechanism follows from the key. `host_gva_surfaces` is a `BTreeMap<u64, HostSurface>` keyed by
+guest **virtual** address, and a store does `.entry(gva).or_default()` — so a *new geometry at the
+same GVA replaces* an entry and costs nothing. Growth is therefore entirely from **new GVAs**: each
+mode change has the guest allocate its surfaces somewhere new, and every address it abandons keeps
+its entry forever.
+
+The retention is deliberate and is the thing to be careful of. `GvaHostView`'s doc records that this
+cache is "retained across Unmap (wallpaper class)" — the guest unmaps the wallpaper surface and
+samples it again later, so an eviction on Unmap would wipe content that is still wanted. **Do not
+"fix" this by dropping entries on Unmap.** This document already records a preserving variant of a
+neighbouring rail that scored 0 of 14 rounds clean with the screen black at 19 Hz; the same class of
+regression is available here.
+
+What makes an eviction rule defensible is that it must only drop entries a lookup could never serve.
+`get_gva_with_gen` serves on **(gva, exact width, exact height)**, and `GvaBacking` records the
+`task_id` whose page table produced the pixels — an entry whose task is gone can never be matched
+again, because the GVA is only a name in that page table. That is the candidate, and it is
+**unverified**: nobody has shown that the 328 accumulated entries belong to dead tasks, and on this
+workload WindowServer plausibly survives every resize, in which case task-death eviction reclaims
+nothing and the rule has to key on something else.
+
+So: the leak is measured, the mechanism is understood, and **the fix is not chosen yet.** Whatever it
+is, gate it and A/B it on this counter — `host_cache_levels` is now the instrument for exactly that,
+and the 60-resize drive above is a repro that moves it by 4x in four minutes.
+
+Not a crash, on this boot: 60 resizes, QEMU alive, 0 guest panics, 0 firmware aborts, 0 losses on
+every rail. 291 MB is not an out-of-memory. The reason this is written up under Goal 4 anyway is that
+"after a couple resizes the whole thing just crashing" wants an unbounded resource, and this is the
+first one anyone has found — but a session long enough to make 291 MB into an OOM has not been run,
+so **the link to the reported crash is a hypothesis and not a measurement.**
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
