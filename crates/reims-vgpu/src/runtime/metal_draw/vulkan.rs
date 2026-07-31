@@ -2982,8 +2982,46 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// So the icon that renders as a small block of content in an otherwise empty
 /// square is NOT a sample that came back empty. Its sample returns content. The
 /// emptiness around it is therefore produced after the sample -- by what the
-/// draw covers, not by what it reads -- which is where to look next, and which
-/// is also the shape of the Safari scroll-buffer patch.
+/// draw covers, not by what it reads.
+///
+/// ## That reading no longer holds. The counter is not zero.
+///
+/// A 14-round boot of the same harness, x86/Vulkan, after the sampled type-4
+/// ladder's resident rung stopped binding GPU copies the guest had overwritten
+/// and the deferred rail stopped withholding landings:
+///
+/// ```text
+/// 13 of 14 rounds clean; the one corrupt round is TWO adjacent icon cells,
+/// completely empty -- not a wrong glyph, not a shrunken one.
+///
+/// corrupt round   lin_rung_guest_blank 399   lin_rung_blank_with_host_entry 1
+/// clean round     lin_rung_guest_blank ~400  lin_rung_blank_with_host_entry 0
+/// whole boot                                 lin_rung_blank_with_host_entry 2
+///
+/// lin_rung_blank_with_host_entry rung=guest_memo task=1 ref=238
+///   gva=0xacb000 64x64 bytes=16384
+/// ```
+///
+/// `64x64`, 16 384 bytes: a folder icon exactly, at the geometry the earlier
+/// boot found none of. The class the older measurement described — the icon that
+/// keeps a *block of content* in an empty square — is the one that is gone. What
+/// is left is a whole cell that is blank, and for at least one of them the
+/// sample really did come back zero while this device held a host copy of the
+/// same span.
+///
+/// The two are not the same defect and the older evidence does not speak to the
+/// one that is left. `lin_rung_blank_with_host_entry` is also the only class
+/// that separates the corrupt round from the clean ones in that boot's fail
+/// channel, alongside one `deferred_flush_lost` and two
+/// `deferred_window_page_drift`.
+///
+/// The reason for reporting rather than refusing was that nothing established
+/// what should be drawn when the host copy is gone. Here the host copy is *not*
+/// gone — it is in the cache, for this span — and the pages that read zero are
+/// the pageable alias the guest never writes. What is still missing before this
+/// may serve the host entry is a witness that the entry is current: the GVA
+/// cache's own is `gvac_gw_no_entry` 611 against `gvac_hit` 3 in the same
+/// window, so it is not armed for these spans either.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
