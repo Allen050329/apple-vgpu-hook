@@ -1536,6 +1536,92 @@ x86 does exercise and which did not fail here. Do not read 22 clean resizes as "
 read them as "the x86 arm does not carry it", and note that the user's own crash report is macOS
 13.7.8 on `iMac19,1`, which is the x86 guest.
 
+##### The macOS gate was incidental, and lifting it made the rail testable here
+
+Superseded in part by `a6fff65`: nothing in that machinery is AppKit-specific. `request_inner_size`
+is cross-platform winit, `Resized` was already handled on both rails, and the two tests covering this
+code (`engine_present_gate_*`, `guest_geometry_change_*`) were themselves `#[cfg(target_os =
+"macos")]` — so they had never run on the rig the feature matrix actually exercises. Un-gated, the
+window follows the guest on Linux and **the swapchain recreation, the `PendingGuestResize` hold and
+the `GUEST_RESIZE_WARN_AFTER` path all execute on x86 for the first time.**
+
+The gate had been hiding a live defect on the *other* side of the same invariant. `viewport.rs` says
+presentation and pointer translation must move as one unit, and records the rolled-back experiment
+that broke it. The engine presenter's `aspect_fit`
+(`backend/vulkan/engine/window_present.rs:940`) carries **no `cfg` at all** and its own comment
+asserts "the window input path maps pointer positions through this same transform" — while that path
+was macOS-only. So on Linux the presenter letterboxed and the pointer reported raw window
+coordinates against the window extent, and the consumer scales `x` against the reported `width`
+(`runtime/input.rs`: "min_in = 0, max_in = dim"), so both the offset and the ratio were wrong.
+
+Not hypothetical: **the guest offers 1440x1080 and 1280x1024**, so a 4:3 mode in a 16:9 window
+pillarboxes 240 px either side and the viewport's left edge reported as `x=240 of 1920` where the
+truth is `x=0 of 1440`. Anyone reaching for the mouse on this rig was hitting it.
+
+The window's own `VkState` fallback **stretches** to fill rather than aspect-fitting, and is not
+driven by `draw_engine_window`, so it leaves `guest_extent` `None` and keeps full-window mapping —
+which is the transform its blit actually implies. That agreement was accidental; it is now stated at
+`request_guest_geometry`. Do not "fix" that rail by calling `request_guest_geometry` from it without
+also making it aspect-fit, or you pair a viewport-mapped pointer with a stretched picture — the same
+split, mirrored.
+
+##### An adjusted resize is an answer, and 75 % of them read as refusals
+
+The first Linux boot of that rail immediately found the next one (`94e44d3`).
+`note_guest_resize_applied` cleared the pending request only on a **byte-exact** match, and this
+host does not answer exactly:
+
+```text
+requested 1920x1080 -> 1921x1079      requested 3840x2160 -> 3840x2160
+requested 1440x1080 -> 1440x1079      requested 1280x1024 -> 1281x1024
+```
+
+Never more than a pixel, never in a fixed direction. Over 53 resizes: 13 exact, **40 logged
+`native_resize_not_applied`** — a fail-visible line saying the resize had not happened, about a
+window that had resized. And because `draw_engine_window` returns early while a request is
+outstanding, each of those 40 **held all presentation for the full second** the alarm takes. Three
+quarters of guest mode changes froze the display for a second and then claimed refusal. The hold's
+comment ("normally single-digit milliseconds") was a macOS observation generalised to a rail that had
+never run anywhere else.
+
+Any `Resized` now settles the hold (`status=applied` exact, `status=adjusted` otherwise). The alarm
+keeps the case it was written for: a window system that ignores the request emits no `Resized` at
+all, so nothing settles it. **A compositor is free to adjust a request; only silence is a refusal.**
+
+Verified live, two boots one binary apart, same 12-cycle drive:
+
+```text
+                             requested  applied  adjusted  native_resize_not_applied
+ctl (exact match only)          53         13        —              40
+arm (any Resized settles)       49         12       37               0
+```
+
+Every false failure is gone and reappears as `adjusted` at the same ~75 % rate, so the counter did
+not merely stop counting — the outcome was reclassified, and each of those no longer stalls a second
+of presentation. The request totals differ (49 vs 53) only because the control boot had four
+exploratory mode sets before its cycles; they are not matched arms and the ratio is the comparable
+quantity, not the count.
+
+##### Measured: 53 resizes with the machinery live, and Goal 4 still does not reproduce on x86
+
+One boot, x86/Vulkan, guest macOS 13.7.8, 12 full cycles across 3840x2160 / 1440x1080 / 1920x1080 /
+1280x1024 — with the window genuinely resizing and the swapchain genuinely being recreated, which the
+22-resize run above could not do:
+
+```text
+resizes 53      qemu alive      guest panics 0      firmware aborts 0
+deferred_flush_lost 0   mapping_page_drift 0   rendflush_page_drift 0
+rendflush_gen_drift 0   staging_failed 0       no_source 0
+```
+
+The 4K desktop screenshots correctly, wallpaper intact, full-frame with no letterbox. So **neither
+Goal 4 symptom reproduces on x86/Linux even now that the resize machinery executes on it.** That
+strengthens the arm64/macOS-only reading rather than settling it, and it is still one boot: a crash
+"after a couple resizes" that survives 53 is either not on this pathway or needs a provocation nobody
+has found. Drive the guest with `.agents/repros/guest-display-mode.m` (compiled in the guest; it
+prints the mode that actually took, because a mode change that silently does not apply is the failure
+direction that reads as a pass).
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
