@@ -3110,3 +3110,103 @@ fn a_completion_stamp_lands_a_type11_render_window_in_guest_memory() {
         );
     }
 }
+
+/// The **root** completion stamp is a fence too, and the deferred rails have to
+/// land at it.
+///
+/// `write_stamp` writes the child stamp slots and drains every rail first. The
+/// root stamp does not go through it: `drain_main_fifo` writes slot 0 itself, and
+/// that slot is what a root packet's submitter waits on. A rail bound only to
+/// `write_stamp` is therefore not bound at all on the highest-traffic completion
+/// path in the device — the guest is told the work finished, is free to release
+/// the render target, and its allocator may hand those pages to a kalloc element
+/// or another process's heap before the window lands. That is the write-after-free
+/// the guest's own poison check reports as `element modified after free
+/// (val:0xffffffffffffffff)`: a window's worth of opaque white pixels landing in
+/// memory that stopped being a render target.
+///
+/// The counter matters as much as the flush. `armed_stamp_seq` is compared
+/// against `completion_stamp_seq`, and only `write_stamp` used to move it, so a
+/// window that sat through hundreds of root completions scored as punctual — the
+/// measurement that reports this rail healthy and the repair that would have
+/// bound it shared one blind spot. Asserting the counter here is what stops a
+/// future flush-only fix from being unmeasurable.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn the_root_completion_stamp_lands_the_deferred_rails_and_moves_the_counter() {
+    use crate::model::{DeviceId, GvaDeferredEntry};
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page_size = 1usize << PAGE_SHIFT_X86;
+
+    // Slot 0 lives at the FIFO base page; the ring starts one page further in, so
+    // the stamp write and the packet read do not alias.
+    let fifo_pfn = 0x40u32;
+    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
+    host.map_range(fifo_gpa, 3 * page_size, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+    state.gfx.fifo_start = page_size as u32;
+    state.gfx.fifo_length = 2 * page_size as u32;
+
+    // One minimal root packet: header only, no stamps, carrying the completion
+    // value the guest will read out of slot 0.
+    const ROOT_STAMP: u32 = 0x1234_5678;
+    let mut packet = [0u8; PACKET_HEADER_LEN as usize];
+    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_STAMP_COUNT..], 0);
+    st32(&mut packet[PACKET_TOTAL_SIZE..], PACKET_HEADER_LEN);
+    st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
+    gpa_map::write_bytes(
+        &mut host,
+        fifo_gpa + page_size as u64,
+        &packet,
+        page_size,
+    )
+    .expect("seed the root ring");
+    state
+        .gfx
+        .fifo_read
+        .store(0, std::sync::atomic::Ordering::Release);
+    state.gfx.fifo_written = PACKET_HEADER_LEN;
+
+    // A window owed to guest RAM, armed before the completion the guest waits on.
+    state.arm_gva_deferred_window(
+        0x5000,
+        GvaDeferredEntry {
+            task_id: 3,
+            texture_ref: 11,
+            producer_object_type: 0,
+            width: 8,
+            height: 8,
+            row_stride: 32,
+            format: 0x50,
+            armed_seq: 1,
+            armed_stamp_seq: 0,
+            pages: [0x9000u64].into_iter().collect(),
+            alloc_gen: 0,
+        },
+    );
+    assert!(!state.gva_deferred_flush.is_empty());
+
+    drain_main_fifo(&mut state, &mut host);
+
+    let mut slot0 = [0u8; 4];
+    crate::runtime::host::HostMemory::read_gpa(&host, fifo_gpa, &mut slot0)
+        .expect("root stamp slot");
+    assert_eq!(
+        ld32(&slot0),
+        ROOT_STAMP,
+        "the packet must actually have completed, or the test proves nothing"
+    );
+    assert!(
+        state.gva_deferred_flush.is_empty(),
+        "a deferred window must not survive the root completion stamp"
+    );
+    assert_eq!(
+        state.completion_stamp_seq, 1,
+        "the root stamp is a fence, so it must advance the counter every rail's \
+         armed_stamp_seq is measured against"
+    );
+}

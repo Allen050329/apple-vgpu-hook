@@ -803,6 +803,40 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
 ) {
 }
 
+/// Land every deferred rail. Call this immediately before any word that tells the
+/// guest work has finished.
+///
+/// There is more than one such word. The child stamp slots go through
+/// [`crate::runtime::drain::write_stamp`], but the *root* completion stamp is
+/// written straight into slot 0 by the main FIFO drain, and it is the one the
+/// guest's root packets wait on. A rail bound only to the child path is not bound:
+/// the guest may free a render target the moment the root stamp moves, and its
+/// allocator may hand those pages to anything — a kalloc element, another
+/// process's heap — which no later check can tell from the target they used to be.
+///
+/// So the binding belongs to "the guest is about to be told", not to one of the
+/// two writers that tell it. Every caller of this function is such a site, and a
+/// new completion word is a new caller.
+///
+/// Each rail early-returns when nothing is armed, so the common case — a root
+/// packet completing with no deferred window outstanding — costs three map
+/// emptiness checks.
+pub fn flush_all_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    // The two address-named rails carry the free-then-reuse hazard: they name raw
+    // guest addresses with no mapping incarnation to refuse on, so nothing but
+    // this ordering keeps them off memory the guest has reclaimed.
+    flush_gva_windows_before_fence(state, host);
+    flush_linear_windows_before_fence(state, host);
+    // The mapping-keyed rails can refuse a replaced incarnation, so they are here
+    // for the other hazard: a deferred writeback covers the whole attachment
+    // extent while the guest writes the same IOSurface, and landing inside the
+    // fence leaves no interval for that to happen in.
+    flush_mapping_windows_before_fence(state, host);
+}
+
 /// The order [`flush_mapping_windows_before_fence`] lands windows in: render
 /// windows oldest-first by `armed_seq`, then every other window.
 ///
