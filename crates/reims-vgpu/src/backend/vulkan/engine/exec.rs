@@ -1735,23 +1735,12 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
-        let (src_stage, src_access, old_layout) = if target_snapshotted {
-            (
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )
-        } else {
-            (
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::empty(),
-                vk::ImageLayout::UNDEFINED,
-            )
-        };
+        let (src_stage, src_access) =
+            seed_target_source_scope(target_snapshotted, target_old_layout)?;
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(old_layout)
+            .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
             .subresource_range(color_range())];
@@ -1824,23 +1813,12 @@ pub(crate) unsafe fn execute_draw_inner(
                 &barrier,
             );
         }
-        let (dst_stage, dst_access, dst_old_layout) = if target_snapshotted {
-            (
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::TRANSFER_READ,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            )
-        } else {
-            (
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::AccessFlags::empty(),
-                vk::ImageLayout::UNDEFINED,
-            )
-        };
+        let (dst_stage, dst_access) =
+            seed_target_source_scope(target_snapshotted, target_old_layout)?;
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(dst_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(dst_old_layout)
+            .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(target_image)
             .subresource_range(color_range())];
@@ -2426,6 +2404,75 @@ fn color_range() -> vk::ImageSubresourceRange {
     }
 }
 
+/// First synchronization scope for the barrier that puts a draw's own colour
+/// target into `TRANSFER_DST_OPTIMAL` so a full-target seed can be copied over
+/// it.
+///
+/// The seed covers every texel of the attachment, so the *contents* are
+/// discardable and the barrier keeps `oldLayout = UNDEFINED` — there is no
+/// reason to pay a driver decompress preserving pixels the very next command
+/// overwrites. What is not discardable is the ordering: the copy must not
+/// overtake whatever last touched this image.
+///
+/// A resident target carries its tracked layout across draws. The primary
+/// attachment resolves to `TRANSFER_SRC_OPTIMAL` at the end of every render
+/// pass, and a draw that sampled it leaves it `SHADER_READ_ONLY_OPTIMAL` — both
+/// are *reads*, and a `TRANSFER_WRITE` that starts before they finish is a
+/// write-after-read hazard on the exact pixels the reader is consuming.
+///
+/// Naming `TOP_OF_PIPE`/no access here, as this did, makes the barrier a bare
+/// layout transition with no execution dependency at all. Nothing else supplies
+/// one: a seeded draw never joins an open batch (`joins` requires
+/// `LoadFromTarget` and no seed), so it opens its own command buffer, and the
+/// flush of the previous batch only *submits* it. Queue submission order starts
+/// command buffers in order; it does not finish them in order. So the seed of
+/// frame N+1 could land in an icon that frame N's window pass was still
+/// sampling — one composite reading a half-replaced texture, which is a defect
+/// no population counter can see and that grows more likely exactly as queue
+/// occupancy rises under load.
+///
+/// `snapshotted` is this draw's own snapshot copy of the target, taken after
+/// the tracked layout was read, so it names the newer access and wins.
+/// `UNDEFINED` is a fresh registry slot or a pooled target that nothing has
+/// touched, and is the one case with genuinely nothing to wait for. Any other
+/// layout is a tracking bug and declines by name rather than silently becoming
+/// "no dependency".
+///
+/// # Why the same barrier shape is right elsewhere and wrong here
+///
+/// `upload_buffer_to_sampled_image`, the snapshot copy, and the compute storage
+/// upload all open with `UNDEFINED`/`TOP_OF_PIPE` and no source scope, and all
+/// three are correct. They write **pool-owned transient** images from
+/// `acquire_sampled` / `acquire_storage_image`, and a slot only re-enters those
+/// free lists through `drain_cleanup`, which `retire_slot` reaches only after
+/// `wait_for_fences` on the submission that last used it. A pooled image
+/// therefore cannot be handed out while any GPU work still reads it, so there
+/// is nothing for a source scope to name.
+///
+/// The registry-resident target is the exception, and by design: it is keyed by
+/// [`super::types::TargetIdentity`] and deliberately outlives the draw so its
+/// pixels survive to the next one. No fence stands between one draw's use of it
+/// and the next, which is exactly what makes it useful — and exactly why this
+/// barrier, alone among the four, has to state what it is waiting for.
+fn seed_target_source_scope(
+    snapshotted: bool,
+    tracked: vk::ImageLayout,
+) -> Result<(vk::PipelineStageFlags, vk::AccessFlags), DrawError> {
+    if snapshotted {
+        return Ok((
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_READ,
+        ));
+    }
+    if tracked == vk::ImageLayout::UNDEFINED {
+        return Ok((
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::empty(),
+        ));
+    }
+    layout_source_scope(tracked)
+}
+
 fn layout_source_scope(
     layout: vk::ImageLayout,
 ) -> Result<(vk::PipelineStageFlags, vk::AccessFlags), DrawError> {
@@ -2506,6 +2553,76 @@ mod tests {
         };
         assert_eq!(decline.slug(), "vk_draw_exec_unsupported_tracked_layout");
         assert_eq!(decline.fields(), vec![("layout", "UNDEFINED".into())]);
+    }
+
+    /// A resident target that a previous draw *sampled* is tracked
+    /// `SHADER_READ_ONLY_OPTIMAL`. Seeding it is a write over pixels a reader
+    /// may still be consuming, so the barrier's first scope has to name that
+    /// reader. `TOP_OF_PIPE`/no-access — which is what a bare `UNDEFINED`
+    /// source scope produces — orders nothing at all.
+    #[test]
+    fn seeding_a_sampled_target_waits_for_the_sampler() {
+        let (stage, access) =
+            seed_target_source_scope(false, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .expect("tracked layout is supported");
+        assert!(
+            stage.contains(vk::PipelineStageFlags::FRAGMENT_SHADER),
+            "seed copy must be ordered after the sampling fragment shader, got {stage:?}"
+        );
+        assert!(!stage.contains(vk::PipelineStageFlags::TOP_OF_PIPE));
+        assert_eq!(access, vk::AccessFlags::SHADER_READ);
+    }
+
+    /// Every render pass resolves its primary attachment to
+    /// `TRANSFER_SRC_OPTIMAL`, so this is the layout a resident target carries
+    /// between one draw and the next. A readback or present copy reads it there.
+    #[test]
+    fn seeding_a_drawn_target_waits_for_the_transfer_read() {
+        let (stage, access) =
+            seed_target_source_scope(false, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .expect("tracked layout is supported");
+        assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
+    }
+
+    /// A fresh registry slot and every pooled target track `UNDEFINED`. Nothing
+    /// has touched the image, so there is genuinely nothing to wait for — this
+    /// is the one case the old unconditional `TOP_OF_PIPE` got right.
+    #[test]
+    fn seeding_an_untouched_target_waits_for_nothing() {
+        let (stage, access) = seed_target_source_scope(false, vk::ImageLayout::UNDEFINED)
+            .expect("an untouched target is not a tracking bug");
+        assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+        assert_eq!(access, vk::AccessFlags::empty());
+    }
+
+    /// This draw's own snapshot is taken after the tracked layout is read, so
+    /// it names the newer access and outranks it.
+    #[test]
+    fn a_snapshotted_target_waits_for_its_own_snapshot() {
+        for tracked in [
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ] {
+            let (stage, access) =
+                seed_target_source_scope(true, tracked).expect("snapshot needs no tracked layout");
+            assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
+            assert_eq!(access, vk::AccessFlags::TRANSFER_READ);
+        }
+    }
+
+    /// A layout the tracker should never hold is a bug in the tracker. It must
+    /// arrive by name rather than degrade into "no dependency", which is the
+    /// failure this whole helper exists to stop being silent.
+    #[test]
+    fn an_untracked_seed_target_layout_declines_by_name() {
+        let decline = match seed_target_source_scope(false, vk::ImageLayout::PRESENT_SRC_KHR) {
+            Err(DrawError::DrawExecution(decline)) => decline,
+            Err(other) => panic!("expected typed draw execution decline, got {other}"),
+            Ok(_) => panic!("expected unsupported tracked layout"),
+        };
+        assert_eq!(decline.slug(), "vk_draw_exec_unsupported_tracked_layout");
     }
 
     #[test]
