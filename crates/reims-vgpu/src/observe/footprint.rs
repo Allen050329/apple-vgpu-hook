@@ -128,15 +128,35 @@ impl Footprint {
         if let Some((rword, rbit)) = retired_word(frame) {
             if rword.load(Ordering::Relaxed) & rbit != 0 {
                 RETIRED.hits.fetch_add(1, Ordering::Relaxed);
-                // Latched per frame: a rail writing a whole surface into retired
-                // pages would emit thousands of identical lines and the flood
-                // detector would then suppress the census with it.
-                if crate::observe::first_sight("write_after_retire", frame) {
+                // Latched per frame AND capped in total. Per-frame alone is not
+                // enough: a rail writing a whole 1080p surface into retired
+                // pages has ~2 000 distinct frames to report, all of them the
+                // same finding, and both the log and `first_sight`'s own set
+                // would grow with the defect rather than with the information.
+                //
+                // The cap is on the *lines*, never on the counting — the census
+                // keeps every hit — and the boundary line says the suppression
+                // happened, because a log that quietly stopped reporting would
+                // understate a defect exactly when it is worst.
+                let logged = RETIRED.logged.fetch_add(1, Ordering::Relaxed);
+                if logged < MAX_RETIRE_LINES {
+                    if crate::observe::first_sight("write_after_retire", frame) {
+                        crate::observe::fail(format!(
+                            "write_after_retire frame={frame:#x} gpa={:#x} \
+                             (the guest said these pages stopped being a \
+                             surface's, and no mapping has adopted them since)",
+                            frame << FRAME_SHIFT
+                        ));
+                    } else {
+                        // A repeat of a frame already reported is not a new
+                        // line, so it must not spend one of the budget.
+                        RETIRED.logged.fetch_sub(1, Ordering::Relaxed);
+                    }
+                } else if logged == MAX_RETIRE_LINES {
                     crate::observe::fail(format!(
-                        "write_after_retire frame={frame:#x} gpa={:#x} \
-                         (the guest said these pages stopped being a surface's, \
-                         and no mapping has adopted them since)",
-                        frame << FRAME_SHIFT
+                        "write_after_retire suppressed after {MAX_RETIRE_LINES} \
+                         distinct frames; the count continues in \
+                         guest_write_footprint write_after_retire="
                     ));
                 }
             }
@@ -248,6 +268,9 @@ struct Retired {
     /// matter, it is measured before it is optimised rather than after.
     scans: AtomicU64,
     scan_pages: AtomicU64,
+    /// Distinct frames already reported by a fail line. See the cap at the
+    /// emission site.
+    logged: AtomicU64,
 }
 
 static RETIRED: std::sync::LazyLock<Retired> = std::sync::LazyLock::new(|| {
@@ -259,8 +282,19 @@ static RETIRED: std::sync::LazyLock<Retired> = std::sync::LazyLock::new(|| {
         hits: AtomicU64::new(0),
         scans: AtomicU64::new(0),
         scan_pages: AtomicU64::new(0),
+        logged: AtomicU64::new(0),
     }
 });
+
+/// Distinct `write_after_retire` frames that get their own fail line before the
+/// rest are suppressed.
+///
+/// This detector has never fired outside a unit test, so it is landing without a
+/// live upper bound on how often it *could* fire. Sixty-four lines is enough to
+/// see the shape of a real finding — which surfaces, which addresses — and few
+/// enough that a detector that turns out to be wrong cannot take the log, the
+/// census or `first_sight`'s set down with it.
+const MAX_RETIRE_LINES: u64 = 64;
 
 /// One Unmap's retire scan: how many pages it had to walk to exclude aliases.
 pub fn note_retire_scan(pages_walked: u64) {
@@ -530,6 +564,7 @@ pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     RETIRED.hits.store(0, Ordering::Relaxed);
     RETIRED.scans.store(0, Ordering::Relaxed);
     RETIRED.scan_pages.store(0, Ordering::Relaxed);
+    RETIRED.logged.store(0, Ordering::Relaxed);
     for cell in [
         &PAYLOAD.calls,
         &PAYLOAD.sampled,
@@ -719,6 +754,51 @@ mod tests {
         assert_eq!(retired_counts().0, 0);
         note_written_range(0x8000, 0x10);
         assert_eq!(retired_counts().1, 1, "no new hit after adoption");
+    }
+
+    #[test]
+    fn the_line_cap_bounds_the_log_without_bounding_the_count() {
+        let _g = fresh();
+        // A rail writing a whole 1080p surface into retired pages has ~2 000
+        // distinct frames to report and every one is the same finding. This
+        // detector has never fired on a live boot, so it lands without any
+        // measured upper bound on how often it *could* — and an unverified
+        // detector that can take the log down with it is worse than none.
+        let n = MAX_RETIRE_LINES + 500;
+        let frames: Vec<u64> = (0..n).map(|i| (i + 0x1_0000) << FRAME_SHIFT).collect();
+        note_pages_retired(frames.iter().copied(), 1 << FRAME_SHIFT);
+        for &gpa in &frames {
+            note_written_range(gpa, 8);
+        }
+        assert_eq!(
+            retired_counts().1,
+            n,
+            "every hit is counted; the cap is on lines, never on the census"
+        );
+        assert!(
+            RETIRED.logged.load(Ordering::Relaxed) > MAX_RETIRE_LINES,
+            "the counter must pass the cap so the boundary line fires exactly once"
+        );
+    }
+
+    #[test]
+    fn a_repeat_hit_on_a_reported_frame_does_not_spend_a_line_of_the_budget() {
+        let _g = fresh();
+        // Rewriting one retired frame every frame of a boot is one finding, not
+        // thousands. If a repeat consumed budget, a single stuck surface would
+        // exhaust the cap and suppress every *other* frame's line — losing the
+        // spread, which is the part of this class that has always been the
+        // diagnosis.
+        note_pages_retired([0x30000u64], 1 << FRAME_SHIFT);
+        for _ in 0..(MAX_RETIRE_LINES * 4) {
+            note_written_range(0x30000, 8);
+        }
+        assert_eq!(
+            RETIRED.logged.load(Ordering::Relaxed),
+            1,
+            "one distinct frame, one line spent"
+        );
+        assert_eq!(retired_counts().1, MAX_RETIRE_LINES * 4);
     }
 
     #[test]
