@@ -343,6 +343,49 @@ lines — one line per occurrence, like `mapping_page_drift ` or `deferred_flush
 `deferred_flush_lost` line that follows it, so the unanchored count double-counts. Print which
 convention each number uses (`(sum)` / `(lines)`) so the next reader does not have to re-derive it.
 
+### Measured: the fence bindings close the Finder icon class
+
+The first A/B on this rig to separate the icon class, and the first done properly one-binary-apart.
+Both arms built from `fbf7bd9`, nothing in `crates/` touched between them, `icon-composite.sh` with
+4 rounds per boot, 8 boots per arm.
+
+```text
+arm  (default)                       0 corrupt / 8 boots    0 corrupt / 32 rounds
+ctl  (REIMS_VGPU_FENCE_FLUSH_OFF=all) 4 corrupt / 8 boots    5 corrupt / 32 rounds
+                       Fisher two-tailed  p = 0.077 (boots)  p = 0.053 (rounds)
+```
+
+The control's validity gate is independent of its icon score and it passed hard: with the knob set,
+`rendw_stamp_outlived` runs 1 000–1 700 per round, and every arm boot measured scores **0** across
+~51 000 stores. The knob took; the control is a control.
+
+Three cautions that belong with the number:
+
+- **p is 0.05–0.08.** The direction is clean and the pre-registered threshold was met, but this is one
+  experiment at the edge. A replicate is the cheap way to settle it.
+- **The design was blocked in time** — 8 arm boots, then 8 control boots — so the arm is confounded
+  with the hour it ran in. Interleave the next one.
+- **Nothing in the census sees this class.** 71 counters, compared per round across 5 corrupt and 27
+  clean rounds on identical binaries: **not one separates them**, and the knob's own counter shows no
+  dose-response (corrupt rounds average *fewer* outlived windows, 125.6 vs 131.1 per 1000 draws; boot
+  6 corrupted with 20x fewer outlived windows than any other boot). So do not go looking for the
+  mechanism in `store_routes` — it is not in there. The fence changes *when* a write lands, and
+  nothing counts lateness per surface.
+
+Also unexplained, and recorded so a bigger sample can confirm or kill it: all 5 corrupt rounds were
+round 2 or 3 of 4, never round 1 and never round 4 (p ≈ 0.03 under uniform). `icon-recovery.sh`
+already found this class self-heals in ~10 s, so capture timing within a boot may matter as much as
+device state.
+
+**What this does not say.** It does not identify *which* fence commit closed the class.
+`REIMS_VGPU_FENCE_FLUSH_OFF=all` reverts the whole group. The prime suspect is `2327a79` (the root
+completion stamp was a fence nothing was bound to), because it landed at 15:26 *during* the
+2026-07-31 `icon-ab2` run that scored 3 corrupt of 11 — which is also why that run's 27 % is not a
+usable baseline: `vm/boot-x86.sh` rebuilds from the working tree, so its rounds were built from
+several different binaries as the session edited `crates/`. To attribute it, build each arm from its
+own source (`git checkout 7763f2f -- crates/ vendor/qemu`, the commit before `2327a79`) and run the
+same harness.
+
 ### `grep -c` prints a count and exits 1, so `|| echo 0` emits two lines
 
 `n=$(grep -c foo file || echo 0)` is the natural way to write "count, defaulting to zero", and it is
