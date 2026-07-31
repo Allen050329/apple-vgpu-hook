@@ -624,6 +624,39 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 /// No userspace crash fired during those 600 s, so this boot does not by itself
 /// convict the rail of the WindowServer abort. What it establishes is that the
 /// hazard is not rare, not a corner, and not something a page-set guard can see.
+///
+/// # After the repair, on the same harness
+///
+/// [`flush_gva_windows_before_fence`] inverts it completely:
+///
+/// ```text
+///                      before repair   after repair
+/// gvaw_stamp_same                  0         54 932
+/// gvaw_stamp_outlived            810              0
+/// ```
+///
+/// Every landing is now inside the fence that completes it, and
+/// `gvaw_fence_flush` equals `gva_deferred` exactly — every window armed is a
+/// window landed at the next stamp, which is the whole of the deferral the
+/// contract permits.
+///
+/// The cost was expected to be a frame-rate loss and was the opposite. Same
+/// harness, same 600 s drive, mean over ~510 one-second windows:
+///
+/// ```text
+///                 before repair   after repair
+/// present_hz                5.9            9.5
+/// draw_us              523 895        156 294
+/// ```
+///
+/// Two boots are not a benchmark and load varies, but the direction is not
+/// subtle and it has a mechanism: 215 of 227 landings used to come out under
+/// `window_cap`, so the old rail spent its time in oldest-first eviction storms
+/// while holding residents pinned across hundreds of frames. Landing at the
+/// fence keeps the window set nearly empty and the pin churn with it.
+///
+/// The crash itself is still unscored. `.agents/repros/crash-hunt.sh` has never
+/// fired the abort in either arm, so it gates the census and not the class.
 #[cfg(feature = "backend-vulkan")]
 fn note_window_outlived_its_stamp(
     state: &DeviceState,
