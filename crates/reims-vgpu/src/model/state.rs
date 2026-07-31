@@ -1721,14 +1721,6 @@ pub struct DeviceState {
     /// the runtime lands these **cache-only** (no guest write) and unpins
     /// (`storage_flush::retire_gva_windows`).
     pub retired_gva_windows: Vec<(u64, GvaDeferredEntry)>,
-    /// Mappings presented (CmdDisplaySwap capture) since our last LOAD draw
-    /// into them. The present declares the guest pages the finished frame and
-    /// the guest may CPU-write them afterwards (inter-buffer damage
-    /// forward-copy — no device command, no 0x35), so the first LOAD draw
-    /// after a mapping's own present seeds from guest pages instead of
-    /// chaining the resident (dual-mid strobe class). Consumed at the type-11
-    /// Load seed decision (`metal_draw::resolve_type11_load_choice`).
-    pub presented_needs_guest_seed: std::collections::BTreeSet<u32>,
     /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
     pub tranche: MemoCounters,
     /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
@@ -1859,7 +1851,6 @@ impl DeviceState {
             type5_view_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),
             type11_memo_scratch: Vec::new(),
-            presented_needs_guest_seed: std::collections::BTreeSet::new(),
             gva_host_views: Vec::new(),
             tranche: MemoCounters::default(),
             guest_run_memo: std::collections::VecDeque::new(),
@@ -2188,16 +2179,6 @@ impl DeviceState {
         // Same rule for the presented-seq witness: a recycled id must not
         // compare its first present against a predecessor's seq.
         self.present.presented_dense_seq.remove(&mapping_id);
-        // Prune the present-boundary seed flag too. It marks "this mid was just
-        // presented, so its next LOAD re-seeds from the front" — a per-lifetime
-        // signal that MUST NOT survive a teardown. Left stale, a recycled
-        // mapping_id (a new, logically-unrelated surface reusing this id after
-        // DeleteIOSurfaceBacking2) would have its FIRST LOAD draw consume this
-        // flag, take the present-boundary seed path, and bleed the CURRENT
-        // retained front frame (a different surface's pixels at +0x188) over its
-        // own ready resident — the "background/window content doesn't clear
-        // cleanly" residue class.
-        self.presented_needs_guest_seed.remove(&mapping_id);
     }
 
     /// Last write class for present keep-prior decisions.

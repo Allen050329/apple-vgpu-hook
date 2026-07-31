@@ -221,9 +221,6 @@ pub fn capture_present_frame(
         state.present.frame_valid = true;
         // First host paint after a present blits +0x188 (mirror the full path).
         state.present.frame_encode_pending = true;
-        // The present declares this mapping's pages the finished frame; the first
-        // LOAD draw after must re-seed from guest pages (dual-mid strobe class).
-        state.presented_needs_guest_seed.insert(mapping_id);
         state.present.light_captures = state.present.light_captures.wrapping_add(1);
         maybe_log_capture_sampling(state);
         return true;
@@ -351,11 +348,6 @@ pub fn capture_present_frame(
     state.present.frame_height = height;
     state.present.frame_generation = generation;
     state.present.frame_valid = true;
-    // The present declares this mapping's guest pages the finished frame; the
-    // guest may CPU-write them next (inter-buffer damage forward-copy). The
-    // first LOAD draw after this present must re-seed from guest pages
-    // instead of chaining the resident (dual-mid strobe class).
-    state.presented_needs_guest_seed.insert(mapping_id);
     // Force the next host paint to blit +0x188. Early pre-boundary paints may
     // have latched painted_mapping/generation (live type-11 paint_mapping or
     // paint_efi) to the same mid+gen; with encode_pending=false that made
@@ -2281,41 +2273,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Regression: the present-boundary seed flag `presented_needs_guest_seed`
-    /// (inserted on every capture) MUST be pruned when a mapping is torn down, so
-    /// a recycled mapping_id (a new, unrelated surface reusing the id after
-    /// DeleteIOSurfaceBacking2) does not have its FIRST LOAD draw consume a stale
-    /// flag and bleed the current retained front frame over its own resident —
-    /// the "background does not clear cleanly" residue class. Both teardown
-    /// hooks (`unmap_surface`, `condemn_surface_backing`) route through
-    /// `forget_compositor_mapping`.
-    #[test]
-    fn present_boundary_seed_flag_is_pruned_on_teardown() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let (torn, kept) = (5u32, 6u32);
-        // Both mids were presented (flag set), as a capture would.
-        state.presented_needs_guest_seed.insert(torn);
-        state.presented_needs_guest_seed.insert(kept);
-
-        // Tearing down `torn` prunes only its flag.
-        state.unmap_surface(torn);
-        assert!(
-            !state.presented_needs_guest_seed.contains(&torn),
-            "teardown must prune the present-boundary seed flag (stale-recycle bleed)"
-        );
-        assert!(
-            state.presented_needs_guest_seed.contains(&kept),
-            "an unrelated mid's flag must be untouched"
-        );
-
-        // The condemn (DeleteIOSurfaceBacking2) path prunes it too.
-        state.condemn_surface_backing(kept);
-        assert!(
-            !state.presented_needs_guest_seed.contains(&kept),
-            "condemn_surface_backing must also prune the present-boundary seed flag"
-        );
     }
 
     /// The display transaction names one surface, and that surface alone is the
