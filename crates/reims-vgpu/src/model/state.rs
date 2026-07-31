@@ -1746,6 +1746,21 @@ pub struct DeviceState {
     pub gva_deferred_flush: DeferredWindows<u64, GvaDeferredEntry>,
     /// Monotonic arm counter for [`Self::gva_deferred_flush`] oldest-first cap.
     pub gva_deferred_seq: u64,
+    /// GVA render target → a hash of the guest physical pages its engine
+    /// resident was last armed over.
+    ///
+    /// `TargetIdentity::Gva` carries `generation: 0` at every construction site,
+    /// so the engine's registry keys a GVA resident on `(gva, width, height)`
+    /// alone and two allocations that reuse one address at one geometry share
+    /// one GPU image. Whether that actually happens is what this measures: the
+    /// page list behind a GVA is the allocation's identity — same pages means
+    /// literally the same memory — so a second arm at the same address and
+    /// geometry with a *different* hash is an aliased reuse, and the image the
+    /// second one gets already holds the first one's pixels.
+    ///
+    /// Kept as a hash rather than the page list because this is a census, and
+    /// the question is only whether two arms disagree.
+    pub gva_resident_backing: std::collections::BTreeMap<u64, (u32, u32, u64)>,
     /// Completion stamps written to the guest this device lifetime.
     ///
     /// A stamp is the guest's fence: [`crate::runtime::drain::write_stamp`] puts
@@ -1891,6 +1906,7 @@ impl DeviceState {
             mrt_secondary_gvas: std::collections::HashMap::new(),
             gva_deferred_seq: 0,
             completion_stamp_seq: 0,
+            gva_resident_backing: std::collections::BTreeMap::new(),
             retired_gva_windows: Vec::new(),
             linear_sampled_memo: LruBytesMemo::new(LINEAR_SAMPLED_MEMO_BYTE_CAP),
             guest_linear_memo: LruBytesMemo::new(GUEST_LINEAR_MEMO_BYTE_CAP),

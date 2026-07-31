@@ -7432,6 +7432,64 @@ pub(crate) fn supersede_gva_window<M: HostMemory + HostOps>(
 ) {
 }
 
+/// Does this GVA render target's engine resident belong to the allocation that
+/// is about to render into it?
+///
+/// `TargetIdentity::Gva` carries `generation: 0` everywhere, so the registry
+/// keys a resident on `(gva, width, height)` and nothing else. Two allocations
+/// that reuse one address at one geometry therefore get **the same GPU image**,
+/// and the second one inherits the first one's pixels as its prior content —
+/// which is what the cross-pass resident Load in `encode_draw_chain` reads.
+///
+/// The page list behind the span is the allocation's identity and needs no
+/// heuristic to say so: identical pages means literally the same guest memory,
+/// so sharing an image is correct; different pages means a different
+/// allocation, and sharing is a wrong-content bug. This scores the disagreement.
+///
+/// Free at this call site by construction — `arm_gva_deferred_store` has just
+/// walked the span to build `pages`, so this adds a hash and a map probe rather
+/// than a page walk.
+#[cfg(feature = "backend-vulkan")]
+fn note_gva_resident_aliasing(
+    state: &mut DeviceState,
+    gva: u64,
+    width: u32,
+    height: u32,
+    pages: &std::collections::HashSet<u64>,
+) {
+    // Order-independent so the walk's traversal order cannot register as a
+    // change: the set is the identity, not the sequence.
+    let mut hash: u64 = 0;
+    for p in pages {
+        hash ^= p.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let prev = state
+        .gva_resident_backing
+        .insert(gva, (width, height, hash));
+    let Some((pw, ph, phash)) = prev else {
+        crate::runtime::drain::note_store_route("gvares_first");
+        return;
+    };
+    if (pw, ph) != (width, height) {
+        // A different geometry is a different registry key, so the two never
+        // share an image and this is not the aliasing case.
+        crate::runtime::drain::note_store_route("gvares_regeom");
+        return;
+    }
+    if phash == hash {
+        crate::runtime::drain::note_store_route("gvares_same_alloc");
+        return;
+    }
+    crate::runtime::drain::note_store_route("gvares_aliased");
+    if crate::observe::first_sight("gva_resident_aliased", gva ^ ((width as u64) << 32)) {
+        crate::observe::fail(format!(
+            "gva_resident_aliased gva={gva:#x} {width}x{height} pages={} \
+             (same registry key, different guest allocation)",
+            pages.len()
+        ));
+    }
+}
+
 /// Arm the deferred-writeback window for a GVA render Store that just
 /// executed into the registry resident (`M2vDrawSpan::ResidentGvaStore`).
 ///
@@ -7476,6 +7534,7 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     if (pages.len() as u64) < expect_pages {
         return false;
     }
+    note_gva_resident_aliasing(state, gva, c0.width, c0.height, &pages);
     // Supersede any previous window at this GVA before pinning: same
     // geometry means the same identity this draw just re-rendered (drop —
     // the helper's unpin is undone by the pin below); different geometry is
@@ -7626,6 +7685,57 @@ mod vulkan_split_tests {
     /// memory instead of seeding. That is the black-layer class, arrived at
     /// from a new direction: a whole compositing layer renders as a sharp
     /// axis-aligned rectangle of garbage or black.
+    /// The registry key for a GVA resident is `(gva, width, height)`, so the
+    /// only thing that can tell two allocations at one address apart is the
+    /// guest memory behind them. The census has to separate three cases that
+    /// look identical from the address alone, and must not call a re-render of
+    /// the same buffer an aliased reuse — that would report the common case as
+    /// the defect and make the counter useless.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_second_arm_is_aliased_only_when_the_guest_pages_changed() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let a: std::collections::HashSet<u64> = [0x1000, 0x2000, 0x3000].into_iter().collect();
+        // Same pages, different traversal order: the set is the identity.
+        let a_reordered: std::collections::HashSet<u64> =
+            [0x3000, 0x1000, 0x2000].into_iter().collect();
+        let b: std::collections::HashSet<u64> = [0x1000, 0x2000, 0x9000].into_iter().collect();
+
+        let (f0, s0, x0) = (
+            store_route_count("gvares_first"),
+            store_route_count("gvares_same_alloc"),
+            store_route_count("gvares_aliased"),
+        );
+
+        super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &a);
+        assert_eq!(store_route_count("gvares_first"), f0 + 1, "nothing to compare against yet");
+
+        super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &a_reordered);
+        assert_eq!(
+            (store_route_count("gvares_same_alloc"), store_route_count("gvares_aliased")),
+            (s0 + 1, x0),
+            "the same buffer re-rendered shares its image correctly, and walk order is not a change"
+        );
+
+        super::note_gva_resident_aliasing(&mut state, 0x8000, 64, 64, &b);
+        assert_eq!(
+            store_route_count("gvares_aliased"),
+            x0 + 1,
+            "different guest pages at the same address and geometry is a different \
+             allocation inheriting the previous one's image"
+        );
+
+        // A geometry change makes a different registry key, so the two residents
+        // are distinct and nothing is inherited.
+        super::note_gva_resident_aliasing(&mut state, 0x8000, 32, 32, &a);
+        assert_eq!(
+            store_route_count("gvares_aliased"),
+            x0 + 1,
+            "a different geometry is a different key and must not be scored as aliasing"
+        );
+    }
+
     #[test]
     fn an_unstamped_resident_never_matches_a_mapping_with_no_epoch() {
         assert!(!type11_resident_is_current(None, None));

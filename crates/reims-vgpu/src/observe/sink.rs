@@ -750,9 +750,7 @@ pub fn store_defer_disabled(rail: StoreDeferRail) -> bool {
 /// knob is what makes the arm and its control one binary apart.
 pub fn fence_flush_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| {
-        std::env::var_os("REIMS_VGPU_FENCE_FLUSH_OFF").is_some_and(|v| v == "1")
-    })
+    *OFF.get_or_init(|| std::env::var_os("REIMS_VGPU_FENCE_FLUSH_OFF").is_some_and(|v| v == "1"))
 }
 
 /// The parse, split out so it is testable without an environment. Same
