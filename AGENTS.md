@@ -612,6 +612,32 @@ to find, and the gate printed `panics=0 aborts=0`, which is exactly what a healt
 `2>/dev/null` that keeps the output tidy is also what hides the `No such file` that would have said
 so. A gate over a path that might not exist must fail on the *path*, not on the count.
 
+#### The same trap without `-c`: one census key is a suffix of another
+
+`grep -o KEY=[0-9]*` over a scorer's own output row is the natural way to pull a field back out of
+it, and it silently returns **two** values whenever one key ends with another. The census rows here
+carry both `attaches=` and `fabricated_attaches=`, so
+
+```sh
+attaches=$(printf '%s' "$row" | grep -o 'attaches=[0-9]*' | cut -d= -f2)   # -> "2346\n20"
+```
+
+produces a two-line string, exactly like the `|| echo 0` case above, and it then flows into a numeric
+comparison and a `printf`. It ran for two boots of `g3-fabrication-ab.sh` before anyone looked at the
+row closely enough to notice it had wrapped:
+
+```text
+ctl-1 OK attaches=2346
+20 stores=18839 fabricated_attaches=20 …
+```
+
+The row still says `OK`, still carries every other field, and the stray line reads as a formatting
+quirk rather than as a variable holding two numbers. Anchor the key at a word start —
+`grep -oE '(^| )attaches=[0-9]+'` — and check a pulled field by printing it in brackets
+(`attaches=[2346]`) the first time the extractor is written. `stores=` is a suffix of `min_stores=`
+for the same reason, and any new counter can create the collision later without touching the
+extractor.
+
 ### A test double more generous than the host cannot fail the way production does
 
 `FakeHost` armed a `track_guest_writes` set at generation 1 the instant it was tracked, and returned
