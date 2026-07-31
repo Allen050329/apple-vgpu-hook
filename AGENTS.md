@@ -1538,6 +1538,45 @@ pinned QEMU, so no boot has produced a footprint yet and the density figure abov
 not measured. The first driven boot on a tree carrying it should record the real density here —
 that number is what every later hit is weighed against.
 
+##### `write_after_retire` asks the question the drift guard structurally cannot
+
+Every guard in the sections above asks the **guest's page table** whether a mapping's cached list
+still resolves the same way. That is the right question and it has a blind spot shaped exactly like
+the crash class: a surface the guest has destroyed keeps its translations for as long as the address
+space lives, so the walk agrees, `mapping_pages_verdict` returns `Ours`, and the write lands in
+memory the guest has already handed to something else. Nothing in the page table changed, so nothing
+in that family of checks can see it.
+
+`observe::footprint`'s retired set asks a different question, out of this device's own bookkeeping:
+the guest *told* us, in a packet, that those pages stopped being a surface's. A write into one
+afterwards is write-after-teardown. It is reported as `retired=` and `write_after_retire=` on the
+census line and as a per-frame-latched `write_after_retire` fail line.
+
+**The reason to care about this one specifically is the denominator.** The panic rate is ~2 %, so a
+defect that only manifests as a panic needs ~150 boots per arm before a zero means anything — the
+soak this document keeps prescribing. This detector fires on the boot the write happens in. It turns
+a 150-boot question into a one-boot question, for the subset of the class it can see.
+
+Two ways it could have been useless, both closed, and both are the shape of thing to check before
+trusting any new detector here:
+
+- **Aliases.** Mappings genuinely name the same guest pages, so retiring on the dying mapping's list
+  alone would mark pages a live surface writes every frame, and the counter would read in the
+  thousands on a healthy boot. Frames any other live mapping still names are excluded at retire time.
+- **A set that only grows.** The guest recycles physical pages between surfaces constantly. Without
+  un-retiring at adoption, every one of those ordinary reuses reads as a defect. Both adoption points
+  (`mapper::resolve_mapping_backing`, `objects::apply_type4_backing`) clear the frames they take.
+
+**Only the guest's Unmap retires.** The device's own invalidations — a failed resolve, a condemned
+list awaiting its fingerprint compare — are this device deciding it no longer trusts a list, not the
+guest saying the memory is no longer a surface's, and the reprieve path can hand the same list
+straight back. A detector whose first finding is its own bookkeeping gets switched off before it ever
+reports a real one.
+
+**It has never fired outside a unit test.** By this document's own rule that is not yet a counter
+shown to work. The first driven boot must confirm `retired=` is non-zero — that the retire path runs
+at all — before any zero in `write_after_retire` is read as good news.
+
 ##### The completeness gate keyed on one source of the pointer, and missed the largest rail
 
 Worth reading before writing any gate of this shape, because it was green and wrong for one commit
