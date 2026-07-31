@@ -5002,6 +5002,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // Both halves must agree, and every unknown on either side reads as
         // "not current".
         //
+        // Measured on the same rig with both halves, one 14-round boot:
+        //
+        //   t11_gw_ref_moved       2 973   guest writes that refused a reuse
+        //   type11_seed_elided    78 441   reuses still taken (94 %)
+        //   type11_seed_uploaded   4 906
+        //   rounds 1-14                    CLEAN, all fourteen distinct
+        //
+        // The 2 973 is the finding, not the round count. The guest CPU really
+        // does write these composites — thousands of times a session — and on
+        // the epoch alone every one of those writes was invisible.
+        //
         // Why not the sibling rail's shape — `load_linear_guest_memoized`
         // re-reads the guest's native rows on every call and byte-compares
         // before reusing its `Arc`. Priced on one boot: `type11_seed_elided`
