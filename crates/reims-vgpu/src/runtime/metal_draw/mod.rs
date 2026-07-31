@@ -34,6 +34,7 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
+use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 

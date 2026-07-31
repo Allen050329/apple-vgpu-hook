@@ -1179,6 +1179,60 @@ pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
     }
 }
 
+/// What the hypervisor's dirty bitmap can say about a type-4 surface's pages
+/// since the Store that stamped them.
+///
+/// Every variant but [`Self::Clean`] means "assume written". They are kept
+/// apart because "this rail never got started" and "the guest rewrites this
+/// surface every frame" are the same refusal and completely different findings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuestWriteVerdict {
+    /// The host has observed no write to these pages since the stamp.
+    Clean,
+    /// No mapping under this id.
+    NoMapping,
+    /// No Store has stamped this surface against a live token for its
+    /// *current* page list.
+    NoStamp,
+    /// The host observed a write.
+    Wrote,
+    /// The host cannot answer for this token.
+    Unreadable,
+}
+
+/// The verdict itself, with no counters attached.
+///
+/// Split from the type-11 LOAD gate's `type11_guest_wrote_since_store` so more
+/// than one rail can ask
+/// the same question and report it under its own names. A shared counter would
+/// pool two rails' refusals into one number, and the number would then be
+/// unreadable for either.
+pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> GuestWriteVerdict {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return GuestWriteVerdict::NoMapping;
+    };
+    if m.guest_write_gen_at_store == 0
+        || m.guest_write_token == 0
+        // A token built for a different page list watches pages this surface
+        // may no longer own, so its generation is not a statement about the
+        // pages the resident would be reused for. Checked here and not only in
+        // `ensure_guest_write_token` because a LOAD can arrive between the list
+        // changing and the next Store rebuilding the token.
+        || m.guest_write_token_gen != m.map_generation
+    {
+        return GuestWriteVerdict::NoStamp;
+    }
+    match host.guest_write_gen(m.guest_write_token) {
+        Some(gen_) if gen_ == m.guest_write_gen_at_store => GuestWriteVerdict::Clean,
+        Some(_) => GuestWriteVerdict::Wrote,
+        None => GuestWriteVerdict::Unreadable,
+    }
+}
+
 /// Revalidate + collect page-aligned GPAs for a mapped surface (GVA order).
 ///
 /// Fails closed on empty / invalid entries and known transport/control-page

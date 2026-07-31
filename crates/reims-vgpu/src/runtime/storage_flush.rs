@@ -917,6 +917,48 @@ fn render_window_identity(
     }
 }
 
+/// Say so when landing a deferred render window overwrites guest bytes the
+/// *guest* wrote after the Store that armed it.
+///
+/// A deferred window promises to replay a synchronous Store later, and that is
+/// only a replay while nothing else writes the pages in between. `write_bgra8`
+/// writes the whole attachment extent, so a guest CPU store into any page of it
+/// — an inter-buffer damage forward-copy, a CoreGraphics blit into the same
+/// IOSurface — is gone the moment this window lands. Nothing else in the flush
+/// can see that: `map_generation` covers a rebind, `resident_content_epoch`
+/// covers a later device draw, and neither is a witness for the surface's owner.
+///
+/// This is a report, not a gate. The window still lands, because dropping it
+/// would lose the Store's whole frame to save the pages the guest happens to
+/// have touched, and the flush has no per-page account of which those are. What
+/// changes is that the loss is named rather than silent — the case is real
+/// traffic (`t11_gw_ref_moved`, thousands per session on the composite rail) and
+/// "Never Fail Silently" makes an unreported loss of guest work the defect
+/// whether or not the fix lands with it.
+///
+/// Only [`GuestWriteVerdict::Wrote`] counts. The other refusals mean "assume
+/// written" for a *reuse* decision, where the safe answer is to re-derive; here
+/// the question is whether a write actually happened, and answering "yes" for a
+/// surface whose token was never armed would report a loss that did not occur.
+#[cfg(feature = "backend-vulkan")]
+fn note_render_flush_over_guest_write<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    key: &crate::model::ComputeStorageResidencyKey,
+) {
+    use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
+    if mapping_guest_write_verdict(state, host, key.mapping_id) != GuestWriteVerdict::Wrote {
+        return;
+    }
+    crate::runtime::drain::note_store_route("render_flush_over_guest_write");
+    crate::observe::fail(format!(
+        "deferred_flush_clobber kind=render mapping={} {}x{} fmt={:#x} gen={} \
+         (the guest wrote these pages after the Store this window defers; \
+         the full-extent writeback replaces them)",
+        key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+    ));
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1020,6 +1062,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
         }
     };
     let bgra: &[u8] = frame.as_ref();
+    note_render_flush_over_guest_write(state, host, key);
     let ok = crate::runtime::mapping_write::write_bgra8(
         state,
         host,
@@ -1556,6 +1599,55 @@ mod tests {
             state.compute_deferred_flush.is_empty(),
             "the trigger must consume the window it took"
         );
+    }
+
+    /// Landing a window over pages the guest wrote after the Store reports the
+    /// loss, and landing one over untouched pages says nothing.
+    ///
+    /// Both halves are the test. A witness that fires on every flush is not a
+    /// witness — `write_bgra8` runs on every landing and the interesting
+    /// population is the subset the guest also wrote — so the clean arm is what
+    /// makes the reporting arm mean anything.
+    #[test]
+    fn landing_a_render_window_over_a_guest_write_reports_the_loss() {
+        use crate::runtime::host::{FakeHost, HostOps};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        for guest_wrote in [false, true] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            let token = host
+                .track_guest_writes(&[page], 1usize << PAGE_SHIFT_X86)
+                .unwrap();
+            let stamped = host.guest_write_gen(token).unwrap();
+            let m = state.mappings.entry(9).or_default();
+            m.mapped = true;
+            m.map_generation = 1;
+            m.guest_write_token = token;
+            m.guest_write_token_gen = 1;
+            m.guest_write_gen_at_store = stamped;
+            if guest_wrote {
+                host.guest_wrote_page(page);
+            }
+            let cap = crate::observe::FailCapture::start();
+            super::note_render_flush_over_guest_write(&state, &host, &key(9, 0, 256));
+            let clobbers: Vec<String> = cap
+                .lines()
+                .into_iter()
+                .filter(|l| l.split_whitespace().next() == Some("deferred_flush_clobber"))
+                .collect();
+            assert_eq!(
+                clobbers.len(),
+                usize::from(guest_wrote),
+                "guest_wrote={guest_wrote} must decide the report: {clobbers:?}"
+            );
+            if guest_wrote {
+                assert!(
+                    clobbers[0].contains("kind=render") && clobbers[0].contains("mapping=9"),
+                    "the report must name the rail and the surface: {}",
+                    clobbers[0]
+                );
+            }
+        }
     }
 
     /// A `Resident` window whose resident no longer vouches for the frame

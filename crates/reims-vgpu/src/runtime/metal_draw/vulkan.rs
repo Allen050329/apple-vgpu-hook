@@ -5058,7 +5058,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
         #[cfg(feature = "backend-vulkan")]
         let gpu_only_content_allowed =
-            crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
+            crate::backend::vulkan::engine::deferred_gpu_only_content_allowed()
+                && !crate::observe::store_defer_disabled(crate::observe::StoreDeferRail::Gva);
         // Records 2+ of a resident render-pass chain load the prior record's
         // content directly from the engine target (no CPU seed, no re-upload).
         #[cfg(feature = "backend-vulkan")]
@@ -6407,59 +6408,6 @@ fn type11_guest_wrote_since_store<M: HostOps>(
     }
 }
 
-/// What the hypervisor's dirty bitmap can say about a type-4 surface's pages
-/// since the Store that stamped them.
-///
-/// Every variant but [`Self::Clean`] means "assume written". They are kept
-/// apart because "this rail never got started" and "the guest rewrites this
-/// surface every frame" are the same refusal and completely different findings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GuestWriteVerdict {
-    /// The host has observed no write to these pages since the stamp.
-    Clean,
-    /// No mapping under this id.
-    NoMapping,
-    /// No Store has stamped this surface against a live token for its
-    /// *current* page list.
-    NoStamp,
-    /// The host observed a write.
-    Wrote,
-    /// The host cannot answer for this token.
-    Unreadable,
-}
-
-/// The verdict itself, with no counters attached.
-///
-/// Split from [`type11_guest_wrote_since_store`] so more than one rail can ask
-/// the same question and report it under its own names. A shared counter would
-/// pool two rails' refusals into one number, and the number would then be
-/// unreadable for either.
-fn mapping_guest_write_verdict<M: HostOps>(
-    state: &DeviceState,
-    host: &M,
-    mapping_id: u32,
-) -> GuestWriteVerdict {
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return GuestWriteVerdict::NoMapping;
-    };
-    if m.guest_write_gen_at_store == 0
-        || m.guest_write_token == 0
-        // A token built for a different page list watches pages this surface
-        // may no longer own, so its generation is not a statement about the
-        // pages the resident would be reused for. Checked here and not only in
-        // `ensure_guest_write_token` because a LOAD can arrive between the list
-        // changing and the next Store rebuilding the token.
-        || m.guest_write_token_gen != m.map_generation
-    {
-        return GuestWriteVerdict::NoStamp;
-    }
-    match host.guest_write_gen(m.guest_write_token) {
-        Some(gen_) if gen_ == m.guest_write_gen_at_store => GuestWriteVerdict::Clean,
-        Some(_) => GuestWriteVerdict::Wrote,
-        None => GuestWriteVerdict::Unreadable,
-    }
-}
-
 /// Census only: which rung of the type-4 sampled ladder served this bind, and —
 /// for the one rung that serves a host-side *copy* of guest memory — whether
 /// the hypervisor would say those bytes are still the guest's.
@@ -6660,7 +6608,7 @@ fn surface_store_defer_eligible(
     if c0.mapping_id == 0 {
         return None;
     }
-    if !crate::backend::vulkan::engine::deferred_gpu_only_content_allowed() {
+    if !deferred_gpu_only_content_allowed_for_surface() {
         return None;
     }
     let (w, h) = if req.width > 0 && req.height > 0 {
@@ -7001,10 +6949,11 @@ fn finish_surface_deferred_window(
 
 /// Whether the type-11 writeback may be deferred at all. Same engine-level
 /// gate the GVA rail asks, so one switch turns every deferred-writeback rail
-/// off together.
+/// off together, plus the per-rail bisection knob.
 #[cfg(feature = "backend-vulkan")]
 fn deferred_gpu_only_content_allowed_for_surface() -> bool {
     crate::backend::vulkan::engine::deferred_gpu_only_content_allowed()
+        && !crate::observe::store_defer_disabled(crate::observe::StoreDeferRail::Type11Surface)
 }
 
 /// Live [`crate::model::DeferredOwner::Render`] windows, for the population cap.

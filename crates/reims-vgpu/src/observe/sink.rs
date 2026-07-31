@@ -555,10 +555,27 @@ impl ContentReuseRail {
 /// reuse OFF  round 4 corrupt (5 of 7 icons), rounds 5-14 all clean
 /// ```
 ///
-/// Corruption **survives** the arm, so none of the three rails causes it: the
-/// wrong pixels are wrong before any witness is consulted, and re-deriving the
-/// content produces the wrong content again. That was the negative result this
-/// knob was built to be able to return.
+/// Corruption **survives** the arm. That was read as "none of the three rails
+/// causes it: the wrong pixels are wrong before any witness is consulted, and
+/// re-deriving the content produces the wrong content again".
+///
+/// **That reading is confounded for the `t11seed` rail, and only for it.** With
+/// the elision off, the LOAD falls back to `resolve_type11_load_seed`. Its first
+/// rung is the host cache, which the skip-readback Store rail *cedes*; its
+/// second reads the mapping's guest pages through `paint_mapping`, which lands
+/// every intersecting deferred window before reading. The window it lands is the
+/// one that surface's last Store armed, and that window's frame is the same
+/// resident the elision would have loaded from. So "re-derived" here means the
+/// resident's bytes copied into guest memory and read back: the arm changes the
+/// transport and not the pixels, for the ~86 % of composite Stores that arm a
+/// window at all. A rail that hands over the same bytes either way cannot be
+/// cleared by an arm that only changes which way.
+///
+/// [`store_defer_disabled`] is the switch that separates them, because with the
+/// writeback synchronous no window exists for the seed's read to land.
+///
+/// The other two rails (`linmemo`, `guestmemo`) are not affected by this: their
+/// sources are guest linear memory, not a deferred surface window.
 ///
 /// What it did not predict is the second half. With the rails off the defect
 /// stopped *holding*. Every prior measurement of this class — six rounds of
@@ -601,6 +618,76 @@ pub fn content_reuse_disabled(rail: ContentReuseRail) -> bool {
 /// diagnostic flag must not silently turn a bisection into an all-rails boot
 /// that then gets read as a per-rail result.
 fn content_reuse_spec_arms(spec: Option<&str>, rail: ContentReuseRail) -> bool {
+    let Some(spec) = spec else {
+        return false;
+    };
+    spec.split(',')
+        .map(str::trim)
+        .any(|t| t == "1" || t == "all" || t == rail.token())
+}
+
+/// Which deferred-writeback rail a call site belongs to, so
+/// [`store_defer_disabled`] can be armed one rail at a time.
+///
+/// The names are the accepted values of `REIMS_VGPU_STORE_DEFER_OFF`, which also
+/// takes `1` or `all` for every rail and a comma-separated list for any subset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreDeferRail {
+    /// The type-11 composite Store: both the readback-then-defer window and the
+    /// skip-readback resident window.
+    Type11Surface,
+    /// The type-2/3 GVA render Store's deferred window.
+    Gva,
+}
+
+impl StoreDeferRail {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Type11Surface => "t11surface",
+            Self::Gva => "gva",
+        }
+    }
+}
+
+/// Bisection knob (`REIMS_VGPU_STORE_DEFER_OFF`): make a Store write the guest's
+/// pages before it returns instead of arming a window that writes them on
+/// demand. `1`/`all` arms every rail; a comma-separated list of
+/// [`StoreDeferRail`] tokens arms a subset.
+///
+/// # Why this is a different seam from [`content_reuse_disabled`]
+///
+/// [`content_reuse_disabled`] bisects "were the bytes recomputed at all". It
+/// cannot bisect the deferred Store, and the reason is worth stating because its
+/// own negative result depends on it: with the type-11 seed elision off, the
+/// LOAD falls back to `resolve_type11_load_seed`, whose first rung is the host
+/// cache — which the skip-readback rail has *ceded* — and whose second rung
+/// reads the mapping's own guest pages through `paint_mapping`, which lands
+/// every intersecting deferred window first. The window it lands is the one this
+/// surface's last Store armed, and its frame is that Store's resident. So the
+/// "re-derived" seed is the same resident's bytes, laundered through guest
+/// memory. Turning the elision off changes the transport and not the pixels
+/// whenever a window is armed, which is ~86 % of composite Stores.
+///
+/// This knob is the switch that actually separates them. With it on, the Store's
+/// pixels are in the mapping's guest pages when the Store returns, no window
+/// exists for a later reader to land, and a seed read of those pages is
+/// independent of the resident.
+///
+/// It is a diagnostic arm, never a product configuration: it restores a whole
+/// framebuffer GPU→CPU readback plus a per-row scatter into guest pages on every
+/// composite Store, priced at 565 ms per second of wall clock on the x86/Vulkan
+/// rail. A boot that sets it must not be read for frame rate.
+pub fn store_defer_disabled(rail: StoreDeferRail) -> bool {
+    static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_STORE_DEFER_OFF").map(|v| v.to_string_lossy().into_owned())
+    });
+    store_defer_spec_arms(spec.as_deref(), rail)
+}
+
+/// The parse, split out so it is testable without an environment. Same
+/// unrecognised-token rule as [`content_reuse_spec_arms`]: a typo arms nothing.
+fn store_defer_spec_arms(spec: Option<&str>, rail: StoreDeferRail) -> bool {
     let Some(spec) = spec else {
         return false;
     };
@@ -957,6 +1044,37 @@ mod tests {
             for r in all {
                 assert!(
                     !content_reuse_spec_arms(Some(spec), r),
+                    "{spec:?} must not arm {r:?}"
+                );
+            }
+        }
+    }
+
+    /// Same contract as the reuse spec, on the rail set that bisects the
+    /// deferred writeback. Kept as its own test rather than folded into the one
+    /// above because the two knobs answer different questions and a shared
+    /// helper would let one family's tokens arm the other's rails.
+    #[test]
+    fn the_store_defer_spec_arms_exactly_the_rails_it_names() {
+        use StoreDeferRail::*;
+        let all = [Type11Surface, Gva];
+
+        for r in all {
+            assert!(!store_defer_spec_arms(None, r));
+        }
+        for spec in ["1", "all"] {
+            for r in all {
+                assert!(store_defer_spec_arms(Some(spec), r), "{spec} must arm {r:?}");
+            }
+        }
+        assert!(store_defer_spec_arms(Some("t11surface"), Type11Surface));
+        assert!(!store_defer_spec_arms(Some("t11surface"), Gva));
+        assert!(store_defer_spec_arms(Some("gva, t11surface"), Gva));
+        // The other knob's tokens name no rail here.
+        for spec in ["", "0", "t11seed", "linmemo", "surface", "defer"] {
+            for r in all {
+                assert!(
+                    !store_defer_spec_arms(Some(spec), r),
                     "{spec:?} must not arm {r:?}"
                 );
             }
