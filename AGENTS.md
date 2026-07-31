@@ -1766,6 +1766,42 @@ Adding a second instrument over rails a gate already closed does not inherit tha
 frequent than a frame, so sampling it would spend the 1-in-64 budget on writes that cannot carry a
 256-byte run.
 
+###### Measured: this device does write long `0xff` runs, and only when the guest paints white
+
+The question the payload census was built for, asked directly and answered. `.agents/repros/
+white-payload.sh` drives **two pages in one boot** on the same binary — 300 s of a dark page with no
+white anywhere, then 300 s of an overwhelmingly white page with chrome and text on it. The counters
+are levels, so the difference between the phases is content-attributable, and a census that reported
+the same number for both would be measuring something other than what the guest painted.
+
+```text
+                sampled     ff_run    rate       ff_run_max     all_ff
+dark phase       15 928          2    0.013 %          285           0
+white-only       20 690        256    1.238 %        4 961           0
+                                        ~99x
+```
+
+Three statements, and the third is the one that closes an old question.
+
+**`all_ff` stayed 0 through all 36 618 samples while `ff_run` reached 258.** That is the blindness
+argued for in the section above, demonstrated rather than reasoned: the strict predicate reported
+"this device produced no all-`0xff` payload" on a boot where it produced 258 of them. Any earlier
+`all_ff=0` reading is void, not merely weak.
+
+**The counter tracks the content, by a factor of ~99.** It is not firing on everything, and it is not
+dead: the dark page produces 2 in 15 928 and the white page 256 in 20 690, on one binary, minutes
+apart. `ff_run_max=4961` is comfortably longer than either `kalloc` element in the panic census, so
+runs of the size that could have produced those reports are demonstrably written.
+
+**So "do not go looking for a source of white" is right, and now measured rather than assumed.** This
+device writes white when the guest paints white, which is exactly what a faithful device should do.
+The `0xff` in the panic census is consistent with this device's own payload, and the defect is
+*where* those bytes land, not *what* they are. Note the scale, though: at 0.70 % of sampled writes
+over the whole boot, a `0xff` victim sharpens a footprint hit by ~142x on top of a 3.7 % density —
+roughly 3 790:1 against coincidence, **if** the two are independent, which nobody has shown.
+
+Boot health: 0 guest panics, 0 firmware aborts, `dropped=0`, density 3.744 %.
+
 ##### `write_after_retire` asks the question the drift guard structurally cannot
 
 Every guard in the sections above asks the **guest's page table** whether a mapping's cached list
@@ -1801,9 +1837,26 @@ guest saying the memory is no longer a surface's, and the reprieve path can hand
 straight back. A detector whose first finding is its own bookkeeping gets switched off before it ever
 reports a real one.
 
-**It has never fired outside a unit test.** By this document's own rule that is not yet a counter
-shown to work. The first driven boot must confirm `retired=` is non-zero — that the retire path runs
-at all — before any zero in `write_after_retire` is read as good news.
+**It has now fired on the rig, and the same asymmetry applies to the detection side.** First live
+outing after `80f385e` made the retire path reachable, on a `white-payload.sh` boot:
+
+```text
+retired=3278   write_after_retire=12432   retire_scans=10   scan_pages=747512
+                                          …and exactly ONE fail line
+```
+
+`retire_scans=10` clears the gate the paragraph above demanded — the path runs. But **12 432 hits
+against one distinct frame is not the shape of a mis-aimed render**; it is a page the guest recycled
+being written over and over. The paragraph below argues the raw rails cannot be *retired* because
+they have no un-retire event. That argument applies unchanged to a raw rail **writing** into a frame
+some mapping retired: nothing announces the page's return to service, so ordinary recycling scores a
+hit by construction, for the rest of the boot. The detection side had inherited the blind spot the
+retire side was carefully kept out of.
+
+`9edd6fd` splits the counter by `Rail::{Mapping,RawGva,Gpa}` and gives only the mapping rail a fail
+line. **Read `war_mapping` and nothing else as a finding**; `war_rawgva` is the blind spot's own
+number and is expected to be large. A boot before that split reports `UNATTRIBUTED`, which is what
+the 12 432 above is — do not quote it as evidence in either direction.
 
 **Do not extend it to task teardown, and here is the wall you will hit.** The obvious next step is to
 retire a dying task's GVA-window pages in `retire_task_gva_windows` / `define_task`, which would put
