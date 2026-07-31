@@ -1266,6 +1266,38 @@ Goal 3 needs a different provocation, not a larger n. `blur-provoke.sh` (window 
 backdrop blur, the frame from the user's own crash report) is the untried candidate, and the crash
 report says that is the churn that provokes.
 
+#### Measured on the provoking workload: 65 141 render flushes, none refused
+
+The Wikipedia page cannot separate arms, so the Goal 3 loss rail was re-measured on
+`blur-provoke.sh` — the backdrop-blur-under-window-capture page built from the frame the user's own
+crash report names, which is the heaviest surface churn this rig can produce. Shipped configuration
+(guard on), 600 s driven, x86/Vulkan, 579 census intervals:
+
+```text
+attaches 1 571      stores 65 172      guest_panics 0
+type-4 refusals 6:  corrected 2   terminal 4   stranded 0
+fabricated_attaches 0             fabricated_pages 0
+
+surface_flush              65 141     <- attempts
+  rendflush_gen_drift           0
+  rendflush_page_drift          0
+  rendflush_resident_absent     0
+  rendflush_epoch_cleared       0
+  rendflush_epoch_drift         0
+deferred_flush_lost               0     mapping_page_drift 0
+```
+
+`surface_flush` is incremented at the top of `flush_render_one`, **before** every refusal branch, so
+it is the denominator and the five `rendflush_*` counters are the numerator. The claim this supports
+is therefore a completeness one, not a rate: **every one of 65 141 render-window flush attempts
+landed, and not one was refused on any of the five grounds.** Zero of the type-4 refusals stranded a
+surface — 2 were corrected within a frame and 4 were teardown.
+
+Scope it precisely. This is one boot, one workload, the mapping-keyed render rail, and it says
+nothing about the raw-address rails or about a rate for anything that did not happen. What it does
+retire is the idea that the Goal 3 loss path is still open on the shipped binary under the strongest
+provocation available: it is not firing at all, on the workload most likely to fire it.
+
 #### Audited: `flush_intersecting` is the only place a live surface's obligation is dropped
 
 A delegated enumeration of every product mutation of `compute_deferred_flush`, `gva_deferred_flush`,
