@@ -2655,6 +2655,9 @@ fn linear_sampled_memo_reuse(
     // touch is not possible here. Recency for this memo is instead driven by
     // inserts — each content change re-inserts and warms the entry — which is
     // sufficient for this authoritative-cache-backed reuse fast path.
+    if crate::observe::content_reuse_disabled() {
+        return None;
+    }
     let m = state.linear_sampled_memo.peek(&(task_id, texture_ref))?;
     (m.gva == gva && m.host_gen == host_gen && m.width == width && m.height == height)
         .then(|| m.rgba.clone())
@@ -2793,12 +2796,16 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         return None;
     }
     let key = (task_id, gva, w, h, sample_fmt);
-    let hit = state
-        .guest_linear_memo
-        .get_touch(&key)
-        // Vec equality is length + byte memcmp with early exit on change.
-        .filter(|m| m.native == scratch)
-        .map(|m| (m.rgba.clone(), m.generation, m.bgra8));
+    let hit = (!crate::observe::content_reuse_disabled())
+        .then(|| {
+            state
+                .guest_linear_memo
+                .get_touch(&key)
+                // Vec equality is length + byte memcmp with early exit on change.
+                .filter(|m| m.native == scratch)
+                .map(|m| (m.rgba.clone(), m.generation, m.bgra8))
+        })
+        .flatten();
     if let Some((rgba, generation, bgra8)) = hit {
         let fmt = if bgra8 {
             TexelLayout::Bgra8
@@ -4901,7 +4908,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
                 let resident_epoch =
                     crate::backend::vulkan::engine::resident_content_epoch(&identity);
-                if type11_resident_is_current(mapping_epoch, resident_epoch) {
+                if type11_resident_is_current(mapping_epoch, resident_epoch)
+                    && !crate::observe::content_reuse_disabled()
+                {
                     chain_load_from_target = true;
                     crate::runtime::drain::note_store_route("type11_seed_elided");
                 } else {

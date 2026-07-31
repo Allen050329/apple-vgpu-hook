@@ -479,6 +479,49 @@ pub fn sampled_cache_disabled() -> bool {
     })
 }
 
+/// Bisection knob (`REIMS_VGPU_CONTENT_REUSE_OFF=1`): make every rail that
+/// *skips* producing content because it believes the content is already there
+/// produce it anyway.
+///
+/// [`sampled_cache_disabled`] bisects one seam — which `VkImage` a bind gets.
+/// This one bisects the seam above it: whether the bytes were recomputed at all.
+/// The two are different questions and the first cannot answer the second, which
+/// is why a boot with the sampled cache off still produced corrupt rounds.
+///
+/// The rails it covers all share one shape — a witness says "nothing has changed
+/// since we last produced this", so the production is skipped:
+///
+/// - the type-11 `LOAD` seed elision, where a resident stamped with the
+///   mapping's current `surface_content_epoch` is taken to already hold the
+///   bytes the seed would upload (`type11_seed_elided`, ~8400 per recomposite
+///   round — by far the largest of them),
+/// - the linear sampled memo, which reuses a swizzled `Arc` when the
+///   authoritative entry's `(gva, generation, geometry)` is unchanged,
+/// - the guest linear memo, which reuses one when a re-read of the guest's own
+///   native rows byte-compares equal.
+///
+/// Any of those serving a stale answer produces exactly the Goal-2 signature: a
+/// wrong picture that is *held*, because the same witness keeps saying nothing
+/// changed, and no counter anomaly, because the elision counts as success on
+/// every rail it takes. A census cannot separate "the witness was right" from
+/// "the witness was wrong" — only re-deriving the content can.
+///
+/// One boot with this set answers whether the class is a stale-reuse bug at all.
+/// If corrupt rounds survive it, all three rails are exonerated together and the
+/// wrong pixels are wrong before any of them is consulted.
+///
+/// This re-uploads a frame per seed and re-swizzles every sampled bind. It is a
+/// diagnostic arm, never a product configuration, and a boot that sets it must
+/// not be read for frame rate.
+pub fn content_reuse_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_CONTENT_REUSE_OFF")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Summarise a tightly packed `texel`-byte-per-pixel image so a *wrong* image
 /// identifies itself in the log without a screen-to-mapping join.
 ///
@@ -554,7 +597,11 @@ pub fn content_summary(buf: &[u8], texel: u32, width: u32, height: u32) -> Strin
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join("");
-    let capped = if distinct.len() >= DISTINCT_CAP { "+" } else { "" };
+    let capped = if distinct.len() >= DISTINCT_CAP {
+        "+"
+    } else {
+        ""
+    };
     format!(
         "texels={texels} stride={stride} sampled={sampled} distinct={}{capped} nz={nz} quad={}/{}/{}/{} px0={px0} hash={hash:016x}",
         distinct.len(),
@@ -776,7 +823,6 @@ pub fn rgba_rgb_stats(rgba: &[u8]) -> (usize, u8, [u8; 4]) {
     (rgb_nz, max_rgb, px0)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,7 +893,6 @@ mod tests {
         // The dispatched entry must equal the scalar reference on this arch too.
         assert_eq!(fused, bgra_present_stats_scalar(&frame));
     }
-
 
     #[test]
     fn bgra_present_stats_byte_exact_with_sse2() {
@@ -959,7 +1004,10 @@ mod tests {
             .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8, 0xff])
             .collect();
         let g = content_summary(&image, 4, 66, 66);
-        assert!(g.contains(" distinct=64+ "), "an image is many colours: {g}");
+        assert!(
+            g.contains(" distinct=64+ "),
+            "an image is many colours: {g}"
+        );
         assert_ne!(
             s.split(" hash=").nth(1),
             g.split(" hash=").nth(1),
