@@ -162,6 +162,20 @@ reading a stale baseline. To attribute a defect to a *commit*, build each arm fr
 (`git checkout <ref> -- crates/ vendor/qemu && git submodule update --init vendor/qemu`) and run the
 same harness on each.
 
+### The rig is untracked, so its bugs are invisible to review
+
+`.agents/` and `kb/` are gitignored. Nothing in them appears in a diff and `git add -A` silently
+skips them, so a commit body that describes a repro fix describes something a later reader cannot
+find. Put durable rig rules here instead, and treat a harness like product code: it needs its own
+controls, because a broken harness fails in the direction that looks like success.
+
+Worked example, found by reading a null result twice. `crash-hunt.sh` snapshotted the guest's crash
+reports with `ls -1` over two directories, which also prints their headers and any *subdirectory* —
+and `/Library/Logs/DiagnosticReports` contains one called `Retired`. Every run therefore reported
+exactly one "new crash report" named `Retired` whether or not anything had crashed, so both arms of
+an A/B scored one hit when the true count in both was zero. **A harness whose null result looks like
+a hit cannot score an arm.** Before believing a repro, confirm you have seen it print the negative.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
