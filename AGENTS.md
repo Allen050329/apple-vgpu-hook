@@ -237,6 +237,31 @@ not-patched. `shoot()` therefore synthesises `VERDICT=UNSCOREABLE` and the repor
 separately: **an unscoreable capture is neither clean nor patched**, and any of them voids the
 `none` on the line above it.
 
+### Drive the guest with arrow keys, never the mouse wheel
+
+The wheel wedges, and it wedges silently. Measured on the x86 rig against a page 42 bands (~17 000 px)
+tall, with the top verified by the generator's colour swatch being on screen:
+
+```text
+wheel up 40   moved_frac 0.98   0.39   0.0000  0.0000  0.0000  0.0000  0.0000  0.0000
+key down x20  moved_frac 0.61   0.83   0.77    0.81    0.97    0.99
+```
+
+After roughly 80 synthetic ticks the page stops at a position **byte-identical to what cmd-Down
+reaches**, so the obvious reading — "it hit the bottom" — is what the evidence looks like and is
+wrong. Ruled out separately: a modal dialog over the page (reproduced with the screen clear), page
+zoom (reproduced after cmd-0), and the document being short (42 `class=band` divs in the file the
+guest received).
+
+The wheel carries a second trap on top of that one. macOS ships **natural scrolling**, which inverts
+it: `wheel down` asks the content to move *up*, which at the top of a document is a no-op. Three runs
+of `scroll-patch.sh` sent 480 `wheel down` ticks into the top of the page and captured the same frame
+twelve times.
+
+Arrow keys have neither problem and are what the guest should be driven with. Note that `cmd-up` is
+not a QMP key name — `send-key` answers `Parameter 'data' does not accept value 'cmd-up'` — the
+spelling is `meta_l+up`, and a calibration that used the wrong one failed into its fallback silently.
+
 ### The harness never scrolled, and three `none` results say nothing
 
 Worse than the blind scorer, found by re-scoring the archived captures of those same three runs. The
