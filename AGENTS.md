@@ -1065,6 +1065,100 @@ actually scrolled), and after the reload the first capture must **agree** with p
 reload happened and re-registered at the top). A run failing either states so instead of reporting a
 clean page.
 
+##### The capture is a whole desktop, and four fifths of it cannot scroll
+
+The third gate was the broken one, and it was broken twice over. Both defects come from the same
+unexamined assumption: that the capture is *the page*. It is not — it is the entire macOS desktop,
+with wallpaper, Dock, menu bar, Safari's own chrome, the Wikipedia sidebar and the reader-settings
+panel all in frame. Measured on a real control capture, the article column is `view=384,136
+464x424` on a 1280x719 frame: **21 % of the picture**. Everything else is furniture that no scroll
+can move.
+
+**The gate was the same quantity as the score.** `reload-diff.py` called a pair comparable when
+`same_frac >= --min-same` (0.90) and unscoreable below it. But a defect *lowers* agreement, so a
+large enough defect trips the mismatch gate and is reported as `UNSCOREABLE` — which reads as "not a
+finding". Injecting a solid white rectangle into a real capture pair from `/tmp/wikictl` and
+sweeping its size:
+
+```text
+area_frac 0.008  CHURN                 (below --min-blob; correctly not a finding)
+area_frac 0.018  PATCHED           <-- sensitivity window opens
+area_frac 0.100  PATCHED           <-- and closes
+area_frac 0.130  UNSCOREABLE offset_mismatch same_frac=0.8692
+area_frac 0.399  UNSCOREABLE offset_mismatch same_frac=0.6849
+```
+
+Those fractions are of the *whole capture*, so the ceiling was reached by a loss covering roughly
+**half the visible article column**. And no threshold would have fixed it: real anchor-mismatched
+pairs measure `same_frac` 0.75–0.80 while injected patches measure 0.87 down to 0.68. **The two
+populations overlap**, so the number cannot separate them at any setting.
+
+(State the tile size carefully. A 1225×512 WebKit tile is 627 200 px, but that is the guest
+*surface*; its footprint on screen is bounded by the article column. A first draft of this section
+called it "0.68 of the frame" by confusing the two.)
+
+**The replacement gate asks about alignment, not agreement**, and it must be measured *inside the
+scrolling column* — a first cut that voted over the whole frame returned `shift=0` for **every**
+mismatched pair, because the wallpaper, Dock and chrome genuinely are at zero displacement and they
+outvote the content. One such pair then scored `PATCHED`: a false finding on two captures that were
+simply at different places in the document.
+
+So the scorer now takes `--viewport-from`, a capture from the same pass at a different offset, and
+scores only what moved between them. That definition needs no knowledge of the page, the browser or
+the window layout. Inside it, rows whose sampled signature is *rare* vote for their displacement in
+the other capture. The mechanism is the point: **a blank patch does not vote wrong, it does not vote
+at all** — uniform rows share a signature with hundreds of others, so they are discarded as
+non-distinctive, and the patch removes its band from the gate instead of corrupting it.
+
+Validated in both directions on real captures, which is the discipline this rig keeps re-learning —
+a gate is not trustworthy until it has printed both the negative and the positive:
+
+```text
+8 of 8  same-anchor pairs       scoreable, shift=0, margin 15-300x over runner-up (needs 2x)
+7 of 7  different-anchor pairs  UNSCOREABLE — none scored as a finding (all 7 scored CHURN or
+                                PATCHED under the old whole-frame gate)
+injected fill, share of viewport:
+  0.09 .. 0.94                  PATCHED, for white, black AND page-background
+  1.00                          UNSCOREABLE no_alignment — honest: with the whole column blank
+                                there is nothing left to place the offset with
+```
+
+Restricting to the viewport also made `same_frac` informative as a *reported* quantity: same-anchor
+pairs measure 0.97–1.00 and different-anchor pairs 0.14–0.34, where whole-frame they were 0.97 and
+0.75–0.80. It is still not the gate, and must not become one.
+
+##### Measured: fabrication did not produce a visible patch in either arm
+
+One pair of boots, x86/Vulkan, Safari on the same Wikipedia article, 8 anchors scored twice each,
+re-scored **uniformly with the fixed instrument afterwards** (the rows the harness wrote live came
+from the blind scorer and are void):
+
+```text
+                 attaches  fabricating attaches  fabricated pages  PATCHED offsets
+ctl (guard off)     541             10                 3 535            0 of 8
+arm (guard on)      543              0 (41 refusals)       0            0 of 8
+```
+
+The control's provocation was **inside** the scored window, which is the check `g3-fabrication-ab.sh`
+failed: six of its ten fabrications land at t = 48.3–104.6 s against a pass-A capture window of
+t ≈ 49.5–105.5 s, four of them on 1225×512 WebKit tile strips and one on the 1240×622 Safari content
+surface. So this is not the disjoint-provocation trap — the fabrication hit the right surface class
+at the right time, and no patch appeared.
+
+**Read this as a result about fabrication, not as a clean bill for Goal 3.** It says the identity
+guard's class is not sufficient to produce the reported patch on this workload. It does not say the
+patch does not exist, and one boot per arm cannot carry a rate.
+
+One caution for whoever reads the two reports side by side. The per-offset `same_frac` and
+`diff_cells` come out **identical between the two boots** (0.9727, 0.9457, 0.9772, 0.9772, 0.9831,
+0.9707, 0.9814, 1.0000), which looks exactly like a harness scoring one run twice. It is not: the
+captures differ by 123 058 pixels at offset 0 and the scorer's own vote count differs (280 vs 270),
+so it is demonstrably reading different files. The agreement is itself the finding — **the A-to-B
+difference on this page is page-deterministic**, driven by first-load-versus-reload layout rather
+than by anything the device did. That is also why it is weak evidence: an instrument whose output
+does not move between arms is measuring the page, and a workload that provoked the device would show
+boot-to-boot spread.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
