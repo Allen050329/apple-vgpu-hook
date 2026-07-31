@@ -1227,6 +1227,70 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     );
 }
 
+/// The verdict must keep its refusals apart, because two rails now report it.
+///
+/// [`type11_guest_wrote_since_store`] collapses everything that is not `Clean`
+/// to `true`, which is the right answer for a gate and the wrong one for a
+/// census: "this rail was never stamped" and "the guest rewrites this surface
+/// every frame" produce the same refusal and mean opposite things. The sampled
+/// ladder's `t11rung_host_cache_gw_*` counters exist to tell them apart, so a
+/// verdict that pooled them would make that reading a lie.
+#[test]
+fn the_guest_write_verdict_separates_its_refusals() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::{FakeHost, HostOps};
+
+    let entry_for = |gpa: u64| {
+        (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    let gpas = [0x40 * page, 0x91 * page];
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = gpas.iter().map(|g| entry_for(*g)).collect();
+    }
+
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &host, 999),
+        GuestWriteVerdict::NoMapping
+    );
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &host, 7),
+        GuestWriteVerdict::NoStamp,
+        "registered pages but no Store stamp is its own finding"
+    );
+
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+        .expect("FakeHost observes guest writes");
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &host, 7),
+        GuestWriteVerdict::Clean
+    );
+
+    host.guest_wrote_page(gpas[0]);
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &host, 7),
+        GuestWriteVerdict::Wrote,
+        "a real guest write must not be reported as a missing stamp"
+    );
+
+    // A host that cannot answer for the token is neither clean nor a write.
+    let blind = FakeHost::new();
+    assert_eq!(
+        mapping_guest_write_verdict(&state, &blind, 7),
+        GuestWriteVerdict::Unreadable,
+        "an unknown token is an unreadable answer, not an observed write"
+    );
+}
+
 /// A page list replaced in place must not leave the token vouching for it.
 ///
 /// The lifecycle mutators retire the token eagerly, but they are not the only

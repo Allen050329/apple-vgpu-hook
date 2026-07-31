@@ -658,6 +658,34 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
 /// Each refusal is counted apart from the others: "this rail was never armed"
 /// and "the guest rewrites this texture every frame" are the same fall-through
 /// and completely different findings.
+///
+/// # What it measured, including what it did not fix
+///
+/// One 14-round Finder recomposite boot under load, x86 / Vulkan:
+/// **`gvac_gw_clean` is zero.** Not small — zero, across every window of the
+/// whole boot, against `gvac_gw_wrote` running 26-1757 per round. Every entry
+/// this cache still held had been rewritten by the guest since it was stored.
+/// That is independent confirmation of the probe's byte compare
+/// (`gvac_content_differ` == `gvac_content_checked`) from a different
+/// instrument on a different boot: the rail was serving a stale picture
+/// essentially every time it served at all.
+///
+/// **It did not close the icon class.** Seven of fourteen rounds still
+/// corrupted, so the wrong pixels were not coming from here, or not only from
+/// here. What the counter did buy is the first quantity that separates a
+/// corrupt round from a clean one, after a session of counters that could not:
+///
+/// ```text
+/// clean rounds    gvac_gw_wrote  26  279  306  486  634  662
+/// corrupt rounds                255  346 1445 1571 1639 1674 1752 1757
+/// ```
+///
+/// Six of eight corrupt rounds sit above every clean round, and round 13 (662,
+/// clean) sits between two neighbours at ~1700 that both corrupted, so it is
+/// not merely round-order drift. Read it as a load proxy and not as a cause:
+/// this counter rises with how hard the guest is rewriting textures *in place*,
+/// and that traffic is what some other address-keyed reader is still
+/// mishandling.
 pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &H,

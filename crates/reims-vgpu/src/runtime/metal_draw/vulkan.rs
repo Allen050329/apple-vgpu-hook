@@ -1079,6 +1079,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
                     {
+                        note_type11_sample_rung(state, host, "t11rung_resident", mid);
                         return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
                     }
                 }
@@ -1108,15 +1109,13 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // branch below had already been worked out and removed for this
                 // reason; its comment says so. This one kept paying for the scan.
                 if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
+                    let rgba = std::sync::Arc::new(swap_rb_channels(bgra));
+                    note_type11_sample_rung(state, host, "t11rung_host_cache", mid);
                     return Some((
                         w,
                         h,
                         mid,
-                        SampledSourceRequest::Bytes(
-                            std::sync::Arc::new(swap_rb_channels(bgra)),
-                            None,
-                            TexelLayout::Rgba8,
-                        ),
+                        SampledSourceRequest::Bytes(rgba, None, TexelLayout::Rgba8),
                     ));
                 }
 
@@ -1135,7 +1134,10 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 #[cfg(feature = "backend-vulkan")]
                 if !resident_ready {
                     match try_type11_sample_zero_copy(state, host, mid, w, h) {
-                        Ok(src) => return Some((w, h, mid, src)),
+                        Ok(src) => {
+                            note_type11_sample_rung(state, host, "t11rung_zero_copy", mid);
+                            return Some((w, h, mid, src));
+                        }
                         Err(reason) => t11_zc_decline = reason,
                     }
                 }
@@ -1148,6 +1150,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
                     t11_decline::note(t11_zc_decline, rgba.len());
+                    note_type11_sample_rung(state, host, "t11rung_guest_memo", mid);
                     return Some((
                         w,
                         h,
@@ -1163,6 +1166,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     // (mid, geometry) so a steady repeat stays at one line.
                     use std::collections::HashSet;
                     use std::sync::Mutex;
+                    note_type11_sample_rung(state, host, "t11rung_miss", mid);
                     static SEEN: Mutex<Option<HashSet<(u32, u32, u32)>>> = Mutex::new(None);
                     let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.get_or_insert_with(HashSet::new).insert((mid, w, h)) {
@@ -6212,9 +6216,61 @@ fn type11_guest_wrote_since_store<M: HostOps>(
     host: &M,
     mapping_id: u32,
 ) -> bool {
+    match mapping_guest_write_verdict(state, host, mapping_id) {
+        GuestWriteVerdict::Clean => false,
+        GuestWriteVerdict::NoMapping => {
+            crate::runtime::drain::note_store_route("t11_gw_ref_no_mapping");
+            true
+        }
+        GuestWriteVerdict::NoStamp => {
+            crate::runtime::drain::note_store_route("t11_gw_ref_no_stamp");
+            true
+        }
+        GuestWriteVerdict::Wrote => {
+            crate::runtime::drain::note_store_route("t11_gw_ref_moved");
+            true
+        }
+        GuestWriteVerdict::Unreadable => {
+            crate::runtime::drain::note_store_route("t11_gw_ref_unreadable");
+            true
+        }
+    }
+}
+
+/// What the hypervisor's dirty bitmap can say about a type-4 surface's pages
+/// since the Store that stamped them.
+///
+/// Every variant but [`Self::Clean`] means "assume written". They are kept
+/// apart because "this rail never got started" and "the guest rewrites this
+/// surface every frame" are the same refusal and completely different findings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestWriteVerdict {
+    /// The host has observed no write to these pages since the stamp.
+    Clean,
+    /// No mapping under this id.
+    NoMapping,
+    /// No Store has stamped this surface against a live token for its
+    /// *current* page list.
+    NoStamp,
+    /// The host observed a write.
+    Wrote,
+    /// The host cannot answer for this token.
+    Unreadable,
+}
+
+/// The verdict itself, with no counters attached.
+///
+/// Split from [`type11_guest_wrote_since_store`] so more than one rail can ask
+/// the same question and report it under its own names. A shared counter would
+/// pool two rails' refusals into one number, and the number would then be
+/// unreadable for either.
+fn mapping_guest_write_verdict<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> GuestWriteVerdict {
     let Some(m) = state.mappings.get(&mapping_id) else {
-        crate::runtime::drain::note_store_route("t11_gw_ref_no_mapping");
-        return true;
+        return GuestWriteVerdict::NoMapping;
     };
     if m.guest_write_gen_at_store == 0
         || m.guest_write_token == 0
@@ -6225,24 +6281,52 @@ fn type11_guest_wrote_since_store<M: HostOps>(
         // changing and the next Store rebuilding the token.
         || m.guest_write_token_gen != m.map_generation
     {
-        // No Store has stamped this surface against a live token for its
-        // current pages. Counted apart from a real write: "the rail never got
-        // started" and "the guest writes this surface every frame" are the same
-        // refusal here and completely different findings.
-        crate::runtime::drain::note_store_route("t11_gw_ref_no_stamp");
-        return true;
+        return GuestWriteVerdict::NoStamp;
     }
     match host.guest_write_gen(m.guest_write_token) {
-        Some(gen_) if gen_ == m.guest_write_gen_at_store => false,
-        Some(_) => {
-            crate::runtime::drain::note_store_route("t11_gw_ref_moved");
-            true
-        }
-        None => {
-            crate::runtime::drain::note_store_route("t11_gw_ref_unreadable");
-            true
-        }
+        Some(gen_) if gen_ == m.guest_write_gen_at_store => GuestWriteVerdict::Clean,
+        Some(_) => GuestWriteVerdict::Wrote,
+        None => GuestWriteVerdict::Unreadable,
     }
+}
+
+/// Census only: which rung of the type-4 sampled ladder served this bind, and —
+/// for the one rung that serves a host-side *copy* of guest memory — whether
+/// the hypervisor would say those bytes are still the guest's.
+///
+/// The ladder in [`resolve_sampled_source`] had no counters at all, which is
+/// why the GVA cache's identical defect had to be found through a probe-gated
+/// byte compare instead of read off a boot. `t11rung_host_cache` is the rung
+/// that matters here: it serves `surface_cache::get`, a host copy of type-4
+/// surface pages taken at some earlier device Store, and it sits *above* both
+/// rungs that read the guest's own pages — so a stale hit is not corrected by
+/// anything below it.
+///
+/// `t11rung_host_cache_gw_*` is a **reading, not a gate**. The gate would be
+/// the same one-line refusal the GVA cache now carries, and it is deliberately
+/// not applied until this census says the rung carries traffic and how much of
+/// it the witness would refuse. Turning an unmeasured rail off is how a fix
+/// gets credited with a change it did not make.
+#[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
+fn note_type11_sample_rung<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    rung: &'static str,
+    mapping_id: u32,
+) {
+    crate::runtime::drain::note_store_route(rung);
+    if rung != "t11rung_host_cache" {
+        return;
+    }
+    crate::runtime::drain::note_store_route(match mapping_guest_write_verdict(
+        state, host, mapping_id,
+    ) {
+        GuestWriteVerdict::Clean => "t11rung_host_cache_gw_clean",
+        GuestWriteVerdict::NoMapping => "t11rung_host_cache_gw_no_mapping",
+        GuestWriteVerdict::NoStamp => "t11rung_host_cache_gw_no_stamp",
+        GuestWriteVerdict::Wrote => "t11rung_host_cache_gw_wrote",
+        GuestWriteVerdict::Unreadable => "t11rung_host_cache_gw_unreadable",
+    });
 }
 
 /// Whether a resident's stamp still vouches for the mapping's current content.
