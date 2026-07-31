@@ -3043,6 +3043,35 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// Round-to-round clustering is severe enough that a single 14-round boot is
 /// not a rate. The 1-of-14 boot and the 8-of-14 boot differ only in that the
 /// second harness ran on a VM already driven for 28 minutes.
+///
+/// ## After the deferred rail was bounded by the guest's fence
+///
+/// `storage_flush::flush_gva_windows_before_fence` stopped the GVA rail writing
+/// guest RAM after the guest had been told the render finished. One 14-round
+/// boot on that binary, fresh VM, same harness:
+///
+/// ```text
+/// 14 of 14 rounds CLEAN
+/// lin_rung_blank_with_host_entry 0   (2-3 per boot before)
+/// gvaw_stamp_outlived            0   (810 before)
+/// ```
+///
+/// That is the first all-clean boot this harness has recorded, and the counter
+/// this section was written to chase went to zero with it. The mechanism is
+/// direct: a sampled linear load whose GVA cache is bypassed falls through to
+/// the guest's own pages, and those pages used to be stale for as long as the
+/// deferred window sat unlanded — median 133 fences. They are now current at
+/// every fence, so the fall-through reads the render instead of what was there
+/// before it.
+///
+/// **This does not establish a rate, and the load proxy says why.**
+/// `gva_guest_wrote_since_store`'s `gvac_gw_wrote` normalises to 42.4 per 1000
+/// `draw_scissor_full` on this boot, against a corrupting threshold of ~127. So
+/// every round of it was in the LOW mode, where the pooled base rate is 3 of 22
+/// rounds corrupt — 14 %, giving a ~12 % chance of seeing 14 clean rounds with
+/// no change at all. The boot is consistent with the repair and also consistent
+/// with a quiet boot. It cannot confirm or refute the high-mode defect because
+/// it never entered the high mode, which is exactly the trap recorded above.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
