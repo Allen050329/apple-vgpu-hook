@@ -749,10 +749,16 @@ into it. The guest kernel panic census in this document already contains "a mall
 list" and a `kalloc` poison report reading `val:0xffffffffffffffff`; this is the userspace member of
 that same family, and it is the shape a stray write of opaque white BGRA leaves.
 
-The frame it happened under is the actionable part. **Backdrop blur** allocates a chain of
-short-lived intermediate surfaces every frame — downsample, blur, composite — which is precisely the
-condition that makes the device resolve a type-4 surface before the guest has finished mapping its
-backing, and therefore the condition under which the pre-guard device fabricated a GPA from a GVA.
+The frame it happened under is the actionable part, and an earlier revision of this section named it
+too broadly. It is not "blur on screen": the crashing thread is **`ws_main_thread`**, not the render
+server, and the blur chain is nested inside a **window capture to an IOSurface** —
+`_XHWCaptureWindowListToIOSurface` → `WSCaptureCreateIOSurfaceMachPortForWindowList` →
+`CaptureSurfaceMetal::Populate`, with `capture_backdrop` / `filter_backdrop` under that. Capture
+allocates a fresh destination IOSurface per request and blur allocates a chain of short-lived
+intermediates inside it, so the provocation is *capture of a blurred window*, which churns far harder
+than either alone. That churn is precisely the condition that makes the device resolve a type-4
+surface before the guest has finished mapping its backing, and therefore the condition under which
+the pre-guard device fabricated a GPA from a GVA.
 
 **State this as a consistency, not an attribution.** Three things line up — a corrupt heap free list,
 a workload that maximises transient surface churn, and a device path that answered that churn with an
@@ -766,6 +772,54 @@ promoted layers — and scores the same `type4guess.py` counters so the two page
 Note that page **cannot** be scored by `scrollpatch.py`: blur produces intermediate colours by
 construction, so the flat-palette rule that makes that scorer sound does not hold, and pointing it
 there would score correct rendering as a defect.
+
+#### This rig has already reproduced the user's crash, and a second report carries the payload
+
+Two guest crash reports were captured by earlier repro runs and left unread in their output
+directories. Both are `iMac19,1` / macOS 13.7.8 (22H730) — the user's exact environment, so the
+comparison is not confounded by build. Neither had ever been opened.
+
+`/tmp/ch1/ips/WindowServer-2026-07-30-221616.ips` is **the user's failure, on our hardware**:
+`EXC_CRASH (SIGABRT)`, `abort() called`, 57 s uptime, the same detector at the same offset
+(`small_free_list_remove_ptr_no_clear + 1017` → `malloc_zone_error + 183` → `abort + 123`). Two
+differences carry information rather than noise:
+
+- It is found from the opposite end. The user's report walks into the corrupt free list while
+  **allocating** (`small_malloc_from_free_list`); this one while **freeing**
+  (`free_small` ← `CA::Render::Image::~Image` ← `CA::Render::Context::delete_object`).
+- **There is no paravirt frame on the stack at all**, and it is the render-server thread, not
+  `ws_main_thread`. The block being freed is a plain `CA::Render::Image` pixel buffer.
+
+That second point is the one to keep. The user's report alone is consistent with a bug *inside* the
+driver's own allocations, because the driver is on the stack. This one hits the same free list from a
+destructor that never touches the GPU, which means the corrupting write is not on the path that
+discovers it.
+
+`/tmp/icon-ab2/r5-ctl/drive/ips/Safari-2026-07-31-153215.ips` is a different signature with the same
+cause, and it is the first time this project has recovered the **payload value** in userspace.
+`EXC_BAD_ACCESS (SIGSEGV)`, `KERN_INVALID_ADDRESS at 0x18`, on the main thread inside
+`objc_msgSend` ← `-[__NSDictionaryM objectForKey:]` ← CFPreferences ←
+`+[AppController shouldPersistPrivateWindows]`. **`rdi = 0xffffffffffffffff`** — at `objc_msgSend`
+entry RDI is the receiver, and `rsi` holds a plausible shared-cache selector pointer, so the frame is
+at ABI entry state and the receiver really was an all-ones word. The `0x18` fault address is derived,
+not the corrupt value: an all-ones pointer is read as a tagged pointer, resolves to a nil class, and
+the class-cache load at `class+0x18` faults. `cr2=0x18 trap=0xe err=0x4` all agree.
+
+So the corruption is a **bulk 0xFF overwrite selected by address, not by ownership**, and the victim
+is whatever the allocator happened to place there — here a preferences dictionary in a *non-graphics*
+subsystem of a *user* process. That is the same `val:0xffffffffffffffff` the kernel panic census
+records and the same shape as the `airportd` indirect call through a 0xFF pointer, and it says the
+class is not confined to WindowServer. No thread in either report is executing GPU or IOSurface code.
+
+**Cautions.** The Safari report was captured during the control arm of an unrelated A/B, so a guard
+was disabled — but it is `n = 1` and unpaired, and nothing here is an A/B result. The 0xFF value is a
+shape match to the stray-write hypothesis, not an attribution to any specific fabricated address.
+
+The operational lesson is separate from the diagnosis: **repro runs collect `.ips` files and nobody
+reads them.** Two reports sat on disk for a day, one of them a reproduction of the exact crash the
+project is chartered to fix. Check `*/ips/` in every run directory before concluding a run found
+nothing — and note that `/tmp/ch2/ips/` contains a zero-byte file named `Retired`, which is the
+`ls -1` subdirectory trap this document describes elsewhere, frozen in place.
 
 ### Never delete the live fail log
 
