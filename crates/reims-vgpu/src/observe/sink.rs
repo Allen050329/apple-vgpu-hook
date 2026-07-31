@@ -792,6 +792,22 @@ pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
     fence_flush_spec_arms(spec.as_deref(), rail)
 }
 
+/// Bisection knob (`REIMS_VGPU_MAPPING_PAGE_GUARD_OFF=1`): let a deferred
+/// mapping-keyed flush write through a page list a fresh walk says has moved,
+/// the way it did before `mapper::type4_pages_still_ours`.
+///
+/// The counters `mapping_pages_ours` / `mapping_pages_drifted` are emitted
+/// whichever way this is set, on purpose: with the guard off a boot still
+/// reports how many writes it would have refused, so the knob measures the
+/// guard's cost in lost frames rather than hiding its rate. An arm and its
+/// control are one binary apart.
+pub fn mapping_page_guard_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_MAPPING_PAGE_GUARD_OFF").is_some_and(|v| v == "1")
+    })
+}
+
 /// The parse, split out so it is testable without an environment. Same
 /// unrecognised-token rule as [`store_defer_spec_arms`]: a typo arms nothing.
 fn fence_flush_spec_arms(spec: Option<&str>, rail: FenceFlushRail) -> bool {

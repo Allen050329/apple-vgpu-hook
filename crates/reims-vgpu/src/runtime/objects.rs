@@ -939,6 +939,16 @@ fn apply_type4_backing<M: HostMemory>(
         m.mapped = true;
         m.page_table_kva = 0;
         m.device_desc = device_desc;
+        // Latched with the list rather than near it: this records the walk that
+        // produced the entries above, so a later reader can repeat that walk —
+        // and find out whether the entries still name the guest's memory —
+        // without repeating the object search that found the surface. Written at
+        // the assignment so the two cannot be updated independently.
+        m.type4_walk = Some(crate::model::Type4Walk {
+            task_id,
+            backing_pfn: surf.backing_pfn,
+            map_generation: m.map_generation,
+        });
         // Contiguous view must be rebuilt.
         if m.contig_ptr != 0 {
             state.retired_views.push((m.contig_ptr, m.contig_len));

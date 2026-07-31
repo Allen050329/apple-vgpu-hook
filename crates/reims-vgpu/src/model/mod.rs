@@ -18,7 +18,7 @@ pub use state::{
     IosfcRegs, LinearDeferredEntry, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow,
     MrtSecondaryRecord, PacketFault, PaintSrc,
     PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
-    TaskEntry, TaskMapSpan, WriteGate,
+    TaskEntry, TaskMapSpan, Type4Walk, WriteGate,
 };
 
 use crate::backend::Backend;

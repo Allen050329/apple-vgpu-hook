@@ -1464,6 +1464,46 @@ fn note_mapping_window_against_fence(
     }
 }
 
+/// Whether the mapping's cached page list still names the guest memory it was
+/// walked from, counted so a boot carries the rate and gated so an arm and its
+/// control stay one binary apart.
+///
+/// The check is [`crate::runtime::mapper::type4_pages_still_ours`]; this is the
+/// deferred rails' use of it, and it is the missing half of a guarantee the
+/// raw-GVA rails already have. `gva_view::write_span` re-walks the task page
+/// table at write time and fails closed, stating outright that a write through a
+/// cached view "lands in whatever now owns those host pages (guest heap
+/// corruption: the 2026-07-19 WindowServer SIGSEGV class)". The mapping-keyed
+/// rails write through `MappingEntry::page_entries`, which for a type-4 surface
+/// nothing re-walks between the resolve that filled it and the flush that uses
+/// it.
+///
+/// That is the shape of every crash this device is chasing. The user's report is
+/// WindowServer aborting inside `small_free_list_remove_ptr_no_clear` under an
+/// allocation made by `AppleParavirtGPUMetal`, and the guest kernel's own poison
+/// check found freed elements "filled with 0xFF from offset 0" — opaque white
+/// pixels in memory the guest had already reclaimed. The twelve guest panics on
+/// disk hit apfs, airportd, tccd, a HID driver and WindowServer, which is not a
+/// bug in one path but a device writing where it no longer has title.
+///
+/// `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF=1` restores the unguarded write. The
+/// counters are emitted either way, so the knob measures the guard's *cost*
+/// while the counters measure its *rate* — a boot with the guard off still says
+/// how many writes it would have refused.
+#[cfg(feature = "backend-vulkan")]
+fn mapping_pages_still_ours<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+) -> bool {
+    if crate::runtime::mapper::type4_pages_still_ours(state, host, mapping_id) {
+        crate::runtime::drain::note_store_route("mapping_pages_ours");
+        return true;
+    }
+    crate::runtime::drain::note_store_route("mapping_pages_drifted");
+    !crate::observe::mapping_page_guard_disabled()
+}
+
 /// Land a deferred **type-11 render Store**: perform the CPU writeback into the
 /// mapping's guest pages that the Store itself skipped.
 ///
@@ -1608,6 +1648,17 @@ fn flush_render_one<M: HostMemory + HostOps>(
         release_window_pin_for_key(key, source);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
+    // `map_generation` is the guest's *declared* incarnation, and a type-4
+    // surface can be re-pointed with nothing declared at all. See
+    // `mapping_pages_still_ours`.
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+        release_window_pin_for_key(key, source);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=mapping_page_drift",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;
@@ -1805,6 +1856,14 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         crate::backend::vulkan::engine::unpin_resident_storage(key);
         crate::observe::fail(format!(
             "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=map_generation_drift current={current:?}",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
+    if !mapping_pages_still_ours(state, host, key.mapping_id) {
+        crate::backend::vulkan::engine::unpin_resident_storage(key);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} content_gen={generation} reason=mapping_page_drift",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
         ));
         return false;

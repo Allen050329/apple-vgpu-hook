@@ -1034,6 +1034,107 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
     }
 }
 
+/// Whether a mapping's cached page list still names the guest memory it was
+/// walked from, re-derived rather than remembered.
+///
+/// # Why the existing revalidation cannot answer this
+///
+/// [`revalidate_mapping_reason`] re-resolves a mapping *only* when
+/// `mapping_internal != 0`. A type-4 surface has no MappingInternal, so that
+/// function reaches its final `match` with `resolve_ran == false` and returns
+/// `None` — "resolvable" — on the strength of `mapped && !page_entries
+/// .is_empty()` alone. The list is accepted because it is non-empty, not
+/// because anything checked it. Its own doc records the scale: 2 280 render
+/// windows in one boot were armed on mappings with `mapping_internal == 0`.
+///
+/// Nothing on the wire closes that gap. When the guest re-points a type-4
+/// surface's backing in its own page table there is no packet, so
+/// `map_generation` does not move and the cached entries stay trusted until the
+/// next type-4 command happens to re-resolve — which for an idle surface may be
+/// never. `resolve_type4_surface_ex` knows this and checks for it, but only
+/// there, and only on the first and last entry:
+///
+/// ```text
+/// type4_pages_stale sid=49 task=0 n=256 gpa0=0x2e8cf6000 (task PT translation moved; rebuilding)
+/// ```
+///
+/// That line is from a live boot. The translations do move.
+///
+/// # What this checks
+///
+/// Every page, not two. [`crate::model::Type4Walk`] latched the task and GPU-VA
+/// base the entries were walked from, so the walk repeats with no object search:
+/// page `i` is `(backing_pfn + i) << page_shift` translated through that task.
+/// Any page that translates differently — or no longer translates at all — means
+/// the list in hand names memory that is no longer the surface's.
+///
+/// Returns `true` when there is nothing to check (`type4_walk` absent, or
+/// latched at a superseded `map_generation`), because this is a *specific*
+/// witness and not a general one; a caller must not read `true` as "these pages
+/// were verified".
+///
+/// The peer for the raw-GVA rails is
+/// [`crate::runtime::storage_flush::deferred_pages_still_ours`], which asks the
+/// same question about a window's armed page set. This one asks it about a
+/// mapping's list, which is what the mapping-keyed rails write through.
+pub fn type4_pages_still_ours<H: HostMemory>(
+    state: &DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> bool {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return true;
+    };
+    let Some(walk) = m.type4_walk else {
+        return true;
+    };
+    if walk.map_generation != m.map_generation || m.page_entries.is_empty() {
+        return true;
+    }
+    let page_shift = state.page_shift;
+    let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
+    let Some(task) = state
+        .tasks
+        .get(walk.task_id as usize)
+        .filter(|t| t.active)
+    else {
+        // The task that owned the translation is gone. Its page table is gone
+        // with it, so the cached GPAs are unbacked by anything this device can
+        // still read — which is exactly the state a write must not proceed in.
+        crate::observe::fail(format!(
+            "mapping_page_drift mid={mapping_id} task={} reason=task_inactive pages={} \
+             (the page table these entries were walked from no longer exists)",
+            walk.task_id,
+            m.page_entries.len()
+        ));
+        return false;
+    };
+    for (i, &entry) in m.page_entries.iter().enumerate() {
+        let gva = ((walk.backing_pfn as u64) + i as u64) << page_shift;
+        let cached = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift);
+        // Identity fallback matches the walk that produced the entry
+        // (`resolve_type4_surface_ex`): a page the table cannot translate was
+        // adopted at its own GVA when that address was readable RAM, so the
+        // repeat has to accept the same answer or it would call every such
+        // entry drifted.
+        let live = match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
+            Some(gpa) => Some(gpa & !(page_size - 1)),
+            None => Some(gva & !(page_size - 1)),
+        };
+        if cached != live {
+            crate::observe::fail(format!(
+                "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
+                 cached={cached:?} live={live:?} reason=translation_moved \
+                 (the guest re-pointed this surface and no packet said so)",
+                walk.task_id,
+                m.page_entries.len()
+            ));
+            return false;
+        }
+    }
+    true
+}
+
 const REVALIDATE_SLOW_US: u64 = 1_000;
 
 #[inline]
@@ -2072,6 +2173,115 @@ mod revalidate_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A type-4 surface can be re-pointed by the guest with no packet at all,
+    /// and this is the only thing that can see it.
+    ///
+    /// The gap is precise. `revalidate_mapping_reason` re-resolves only when
+    /// `mapping_internal != 0`; a type-4 surface has none, so that function
+    /// falls through to `mapped && !page_entries.is_empty()` and answers
+    /// "resolvable" without checking anything. The guest then re-points the
+    /// backing in its own page table — no MapMemory2, no UnmapMemory, no
+    /// ReplacePhysical, so `map_generation` does not move — and the cached list
+    /// stays trusted. Every deferred flush after that writes a framebuffer into
+    /// whatever now owns those pages.
+    ///
+    /// The fixture is exactly that sequence: adopt a list walked through a live
+    /// task page table, rewire the PTE behind the device's back, and require the
+    /// answer to flip. The final assertion is the one that keeps the check
+    /// honest — restore the PTE and it must go back to `true`, because a witness
+    /// that always says "drifted" would pass the first half and refuse every
+    /// legitimate write in production.
+    #[test]
+    fn type4_pages_still_ours_sees_a_rewire_no_packet_announced() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        let data1 = 10u64 << PAGE_SHIFT_X86;
+        for gpa in [dir_gpa, root_gpa, data0, data1] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        // GVA page 0 of the task translates to `data0`.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries =
+                vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+        assert!(
+            super::type4_pages_still_ours(&state, &host, 6),
+            "the list was just walked from this page table"
+        );
+
+        // The guest re-points the backing. Nothing on the wire says so, and
+        // `map_generation` is untouched — which is the whole defect.
+        let generation_before = state.mappings.get(&6).unwrap().map_generation;
+        st32(&mut pte, (data1 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert_eq!(
+            state.mappings.get(&6).unwrap().map_generation,
+            generation_before,
+            "no packet arrived, so nothing bumped the incarnation"
+        );
+        assert!(
+            !super::type4_pages_still_ours(&state, &host, 6),
+            "a fresh walk names a different page, and a writeback through the \
+             cached one lands in whatever the guest gave it to"
+        );
+
+        // A latch from a superseded incarnation is not evidence about the list
+        // in hand, so it must not be read as drift.
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            let mut walk = m.type4_walk.unwrap();
+            walk.map_generation = m.map_generation.wrapping_sub(1);
+            m.type4_walk = Some(walk);
+        }
+        assert!(
+            super::type4_pages_still_ours(&state, &host, 6),
+            "a stale latch says nothing about the current list and must not refuse"
+        );
+
+        // And the check must be able to say yes: put the translation back and
+        // the same list is legitimate again. A witness that only ever refuses
+        // would pass the assertion above and lose every frame in production.
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            let mut walk = m.type4_walk.unwrap();
+            walk.map_generation = m.map_generation;
+            m.type4_walk = Some(walk);
+        }
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert!(
+            super::type4_pages_still_ours(&state, &host, 6),
+            "the translation is back where the list says it is"
+        );
+    }
 
     /// The dirty bitmap answers in guest physical pages and a writeback lays
     /// bytes out in mapping offsets; this is the only place the two meet, so it

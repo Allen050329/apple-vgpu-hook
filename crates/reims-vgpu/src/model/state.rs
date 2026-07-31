@@ -631,6 +631,34 @@ pub struct MapperCapture {
     pub mapping_internal: u64,
 }
 
+/// The guest page table and GPU-VA base a mapping's [`MappingEntry::
+/// page_entries`] were walked from, when the list came from a type-4 surface
+/// plan.
+///
+/// Latched at the one site that assigns those entries so the two cannot drift
+/// apart. It exists so a later reader can *repeat* the walk without repeating
+/// the search: `resolve_type4_surface_ex` finds the surface object by probing up
+/// to 256 task object lists, and that cost is why the page list is cached rather
+/// than re-derived. The walk itself is cheap — one page-table translation per
+/// page — and it is the only thing that can say whether the cached list still
+/// names the guest's memory.
+/// It carries the [`MappingEntry::map_generation`] it was latched at, and a
+/// reader must check that before trusting it. Six sites clear or replace
+/// `page_entries` and every one of them bumps the generation, so a carried-over
+/// walk is unusable by construction rather than by every future writer
+/// remembering to retire a second field — the same rule
+/// [`MappingEntry::guest_write_token_gen`] states for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Type4Walk {
+    /// Task whose page table translated the backing pages.
+    pub task_id: u32,
+    /// `getGPUVirtualAddress() >> page_shift` of the surface backing — page `i`
+    /// of the list is `(backing_pfn + i) << page_shift` in that task.
+    pub backing_pfn: u32,
+    /// `map_generation` of the list this walk produced.
+    pub map_generation: u32,
+}
+
 /// IOSurface mapper registry entry keyed by mapping_id.
 #[derive(Clone, Debug, Default)]
 pub struct MappingEntry {
@@ -748,6 +776,15 @@ pub struct MappingEntry {
     /// task slots. Purely a search-order hint — a stale/wrong value only costs
     /// one extra probe before the full-table fallback re-finds the owner.
     pub owner_task_hint: u32,
+    /// How [`Self::page_entries`] were derived, when they came from a type-4
+    /// surface plan — see [`Type4Walk`]. `None` for every other source, and for
+    /// a mapping whose list has been invalidated.
+    ///
+    /// Distinct from [`Self::owner_task_hint`], which is a *search* hint and is
+    /// allowed to be wrong. This is a statement about the list that is in the
+    /// entry right now: repeat this walk and you must get these entries back, or
+    /// the guest has moved the surface underneath us without saying so.
+    pub type4_walk: Option<Type4Walk>,
 }
 
 /// Exact protocol-backed compute storage-image view eligible for residency.
