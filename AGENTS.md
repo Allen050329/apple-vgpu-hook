@@ -244,6 +244,52 @@ exits **126** — distinct from 125 (firmware abort) and 124 (wedge). Sweep the 
 for f in vm/disks/run/serial-*.log; do grep -l 'Debugger called: <panic>' "$f"; done
 ```
 
+#### The panicking process is the finding, and it is almost never WindowServer
+
+Re-swept at 552 boots: **12 panics, 2.2 %**. Print the panicking task with each, because the spread
+is the diagnosis:
+
+| panicking task | site |
+|---|---|
+| WindowServer | `IOAccelSegmentResourceList::prepare` ← `AppleParavirtSegmentResourceList::prepare` ← `IOAccelCommandQueue::processSegment`, page fault at CR2 `0x16f` |
+| WindowServer | `IOSurfaceClient::~IOSurfaceClient` ← `IOSurfaceRootUserClient::release_surface` |
+| WindowServer | `"hitting assertion" @AppleParavirtPageTable.cpp:200` |
+| `airportd` | `Kernel trap at 0xffffffffffffffff` — an indirect call through a pointer overwritten with 0xFF |
+| `tccd` | apfs `obj_get` ← `btree_node_get_internal` |
+| `followupd`, `com.apple.AppleUserHIDDrivers` | `kalloc` poison: element modified after free, `val:0xffffffffffffffff` |
+| `Safari`, `ReportCrash` (×2) | `pmap_page_protect`, non-sleepable RW lock |
+
+A bug in one device path panics in that path. **These land in an apfs btree node, a network
+interface's function pointer, a HID driver's heap element and a security daemon** — subsystems this
+device never touches. That is not a logic error with a backtrace worth reading; it is a device
+writing where it no longer holds title, hitting whatever the guest allocator happened to put there.
+Read the *distribution*, not the individual trace.
+
+The `0xFF` recurs across all of them and is the same write seen from different victims: opaque white
+BGRA pixels. It is almost certainly a legitimate white frame landing at the wrong address — the
+defect is *where*, not *what*, so do not go looking for a source of white.
+
+Panics still fire on binaries carrying the fence repairs (three on 2026-07-31 alone, one of them
+14:43 on a tree with all three raw-address rails bound). A fence binding orders a write against the
+guest's completion stamp; it does not make the destination address correct. The address is
+`mapper::type4_pages_still_ours`'s question.
+
+At 2.2 % an A/B needs ~150 boots per arm and is not affordable. Let panics accumulate as a side
+effect of every boot and re-sweep the census instead.
+
+### A panicked boot must not be scored, and "no rounds" does not say it was not
+
+`.agents/repros/icon-boot-ab.sh` retries a boot that panics *before ssh* (exit 126) and does not
+score it. A boot that panics **during the drive** reaches the scoring branch instead, and that
+branch decides between `PANIC` and `NO_ROUNDS` by taking the newest `vm/disks/run/serial-*.log` and
+grepping it. On 2026-07-31 that arm scored `NO_ROUNDS` for a boot whose serial log plainly carried
+`Debugger called: <panic>` — the mtime ordering did not name the boot that had just run.
+
+Do not identify a boot's evidence by mtime. `vm/boot-x86.sh` names the serial log with the run
+stamp and prints the path; read the path out of the boot log. An arm that panicked is **unmeasured**
+— not clean, not corrupt, and not a row to average — and a harness that cannot tell those apart is
+the failure mode the `Retired` directory already cost this project a session to.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
