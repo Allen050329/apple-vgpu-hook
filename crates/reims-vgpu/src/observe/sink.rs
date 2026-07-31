@@ -479,6 +479,31 @@ pub fn sampled_cache_disabled() -> bool {
     })
 }
 
+/// Bisection knob (`REIMS_VGPU_SAMPLED_RESIDENT_GATE_OFF=1`): let the sampled
+/// type-4 ladder's resident rung bind a ready resident with no currency test,
+/// which is what it did before the guest-write gate and the merge behind it.
+///
+/// The rung serves a GPU image in place of a surface's guest pages. Whether that
+/// image is still the surface is a question about the *guest*, and the only
+/// arm that can answer it is one where the device stops asking: a boot with this
+/// set reproduces the ungated behaviour exactly, on the same binary, so the
+/// difference between the two boots is the gate and nothing else.
+///
+/// It exists because the alternative was comparing against a remembered
+/// baseline from an earlier session and an earlier build. A device that can only
+/// be A/B'd across rebuilds cannot separate its own change from the rig's drift.
+///
+/// A diagnostic arm, never a product configuration: with it set the device
+/// knowingly binds content the hypervisor has watched the guest replace.
+pub fn sampled_resident_gate_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var_os("REIMS_VGPU_SAMPLED_RESIDENT_GATE_OFF")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Which content-reuse rail a call site belongs to, so
 /// [`content_reuse_disabled`] can be armed one rail at a time.
 ///

@@ -1130,7 +1130,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // reads a surface that holds both halves.
                 #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
-                    if !guest_replaced {
+                    if !guest_replaced || crate::observe::sampled_resident_gate_disabled() {
                         note_type11_sample_rung("t11rung_resident", guest_write);
                         return Some((w, h, mid, SampledSourceRequest::Target(resident_id)));
                     }
