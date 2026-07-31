@@ -194,6 +194,16 @@ and the harness recorded it as `NO_ROUNDS` — indistinguishable in the verdict 
 simply scored nothing. **A panicked arm is unmeasured, and it is also a result; a harness that cannot
 tell those apart loses both.**
 
+Bracket a character in every `pgrep -f` / `pkill -f` pattern, not just the ones that kill. The pattern
+you search for is itself in the command line of the shell doing the searching, so `pgrep -f
+icon-boot-ab` matches that shell. Both failure modes bite, and neither announces itself: a wait loop
+written `until ! pgrep -f icon-boot-ab; do sleep 10; done` never exits, because it always finds
+itself, and a run that had actually finished 20 minutes earlier still looks live; and `pkill -f
+qemu-system-x86_64` kills the shell that ran it, so the sweep reports failure while the thing it
+meant to kill was never running. The `sweep()` in the repro scripts already writes
+`[q]emu-system-x86_64 -enable-kvm` for exactly this reason — the convention is right, it just has to
+reach the *waiting* code too, which is where a false positive costs an hour instead of a signal.
+
 Two counters in that census were themselves blind until `2327a79`. `*_stamp_outlived` compares a
 window's `armed_stamp_seq` against `DeviceState::completion_stamp_seq`, and only `write_stamp`
 advanced that counter — the root completion stamp, written inline by `drain_main_fifo`, did not. A
