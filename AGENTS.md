@@ -1577,6 +1577,20 @@ reports a real one.
 shown to work. The first driven boot must confirm `retired=` is non-zero — that the retire path runs
 at all — before any zero in `write_after_retire` is read as good news.
 
+**Do not extend it to task teardown, and here is the wall you will hit.** The obvious next step is to
+retire a dying task's GVA-window pages in `retire_task_gva_windows` / `define_task`, which would put
+the raw-address rails under the same detector. It is not sound, for a structural reason rather than
+an implementation one: the detector needs an **un-retire event**, and the raw-address rails have
+none. A mapping announces adoption, so a recycled page is put back in service by a packet the device
+sees. A raw-GVA write resolves its destination through the page table at write time and announces
+nothing, so once a task's GPAs are retired there is no event that could clear them — and the guest
+reuses those physical pages for other tasks' surfaces within seconds. Every such ordinary reuse would
+then score as write-after-teardown, accumulating for the rest of the boot. Using the write's own
+resolution as the un-retire event is circular: it clears the bit it is being tested against.
+
+So the mapping rail is the only sound scope for this today. Extending it needs an adoption signal for
+the raw rails first, not a wider retire.
+
 ##### The completeness gate keyed on one source of the pointer, and missed the largest rail
 
 Worth reading before writing any gate of this shape, because it was green and wrong for one commit
