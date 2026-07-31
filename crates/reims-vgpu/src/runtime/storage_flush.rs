@@ -3009,20 +3009,34 @@ mod tests {
                 ])),
             },
         );
-        // The guest licensed this resource, then said it wrote it itself.
+        // The device published this surface's pixels, and the guest then claimed
+        // a CPU write to it — so the guest's bytes are the newer ones.
+        state.note_surface_content_published(9);
         apply(
             &mut state,
             0,
             9,
             crate::runtime::decode::fifo::InvalidateValidityOps {
-                clear_host_valid: 0,
-                set_host_valid: 1,
+                clear_host_valid: 1,
+                set_host_valid: 0,
                 clear_guest_valid: 0,
                 set_guest_valid: 0,
             },
             ValiditySite::ExecTable,
         );
-        state.mappings.get_mut(&9).unwrap().validity.host_valid = false;
+        // The claim also drops the window, which is the repair upstream of this
+        // gate; re-arm it so the gate itself is what this exercises.
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    4096
+                ])),
+            },
+        );
 
         let cap = crate::observe::FailCapture::start();
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);

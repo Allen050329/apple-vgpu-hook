@@ -659,14 +659,33 @@ pub struct Type4Walk {
     pub map_generation: u32,
 }
 
-/// Who owns a resource's authoritative bytes, as the guest last stated it.
+/// Who owns a resource's authoritative bytes, as the guest last stated it and as
+/// the device last produced them.
 ///
-/// Both halves start `false` because nothing has been said yet, and "nothing has
+/// The bools start `false` because nothing has been said yet, and "nothing has
 /// been said" is a third state that neither `true` nor `false` can carry on its
 /// own: a resource the guest has never named in a validity quad must not be
 /// treated as having been declared stale on either side. `host_stated` and
 /// `guest_stated` record whether the corresponding bit is a statement or a
 /// default.
+///
+/// # Why the two sequence numbers, and not just `host_valid`
+///
+/// `host_valid` alone is a latch, and a latch is wrong here. The guest's
+/// `clear_host_valid` says "my CPU write is newer than your last frame **as of
+/// this submission**". It is not a standing property of the resource: the moment
+/// the device renders into that surface again, the device's frame is the newer
+/// one, and a writeback that reads a latched `host_valid == false` would refuse
+/// to deliver it — forever, since nothing in the protocol re-affirms a resource
+/// the guest is no longer writing.
+///
+/// One measured boot showed exactly that: 2 415 refused writebacks concentrated
+/// on three surfaces (1 800 on one 1240x400 layer, 502 on the 1920x1080 root),
+/// which is one `clear_host_valid` each latching every later frame away.
+///
+/// So the comparison is a happens-before between the guest's last claim and the
+/// device's last publish, both stamped from [`DeviceState::next_validity_seq`].
+/// Causal, not a heuristic: whoever wrote last owns the bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceValidity {
     /// The device's copy holds the authoritative bytes.
@@ -677,6 +696,13 @@ pub struct ResourceValidity {
     pub host_stated: bool,
     /// The guest has set or cleared `guest_valid` at least once.
     pub guest_stated: bool,
+    /// Sequence at the guest's last `clear_host_valid` for this resource.
+    /// Zero means the guest has never claimed a CPU write to it.
+    pub host_cleared_seq: u64,
+    /// Sequence at the device's last publication of newer pixels for this
+    /// resource — a deferred Store's content publish, or a write of its guest
+    /// pages.
+    pub host_published_seq: u64,
 }
 
 /// IOSurface mapper registry entry keyed by mapping_id.
@@ -1886,6 +1912,9 @@ pub struct DeviceState {
     pub host_gva_surfaces: BTreeMap<u64, HostSurface>,
     /// Monotonic recency counter behind [`HostSurface::last_touch`].
     pub gva_touch_seq: u64,
+    /// Monotonic ordering counter behind [`ResourceValidity::host_cleared_seq`]
+    /// and `host_published_seq`. See [`Self::next_validity_seq`].
+    pub validity_seq: u64,
     /// Running sum of `host_gva_surfaces[*].bgra.len()`, so the byte cap can be
     /// tested without an O(n) pass over the map on every store.
     ///
@@ -2202,6 +2231,7 @@ impl DeviceState {
             host_texture_surfaces: BTreeMap::new(),
             host_gva_surfaces: BTreeMap::new(),
             gva_touch_seq: 0,
+            validity_seq: 0,
             gva_cache_bytes: 0,
             gva_cache_byte_cap: GVA_ENCODE_CACHE_BYTE_CAP,
             gva_eviction_witness: GvaEvictionWitness::default(),
@@ -3700,6 +3730,7 @@ impl DeviceState {
     /// this crate's guest-page writers keeps that epoch closed for free — the
     /// completeness property the type-11 `LoadFromTarget` gate rests on.
     pub fn mark_mapping_written(&mut self, mapping_id: u32) -> u32 {
+        let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
@@ -3708,7 +3739,20 @@ impl DeviceState {
             m.content_generation = 1;
         }
         m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        m.validity.host_published_seq = seq;
         m.content_generation
+    }
+
+    /// Next value of the device-wide ordering counter behind
+    /// [`ResourceValidity::host_cleared_seq`] / `host_published_seq`.
+    ///
+    /// One counter for both sides on purpose: the only question either stamp is
+    /// ever asked is which of the two happened last, and two counters cannot
+    /// answer that. Starts at 1 so a stamp is always distinguishable from the
+    /// `0` default that means "this never happened".
+    pub fn next_validity_seq(&mut self) -> u64 {
+        self.validity_seq = self.validity_seq.saturating_add(1);
+        self.validity_seq
     }
 
     /// Advance [`MappingEntry::surface_content_epoch`] for a publish that
@@ -3718,10 +3762,14 @@ impl DeviceState {
     /// resident that holds those pixels in the same breath; the two must not be
     /// separable, or the stamp records a currency that already moved.
     pub fn note_surface_content_published(&mut self, mapping_id: u32) -> u32 {
+        let seq = self.next_validity_seq();
         let Some(m) = self.mappings.get_mut(&mapping_id) else {
             return 0;
         };
         m.surface_content_epoch = Self::next_epoch(m.surface_content_epoch);
+        // The pixels this publishes are newer than anything the guest claimed
+        // before now, which is what a deferred writeback later has to know.
+        m.validity.host_published_seq = seq;
         m.surface_content_epoch
     }
 
