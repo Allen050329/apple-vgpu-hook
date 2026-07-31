@@ -1080,8 +1080,22 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // this is the only witness for — or reads the pages and does
                 // not care. The host-cache rung used to ask it privately; the
                 // resident rung above it asked nothing at all.
+                //
+                // Two stages: the token's generation says whether the guest
+                // wrote the *allocation*, and only when it did is the page list
+                // enumerated to say whether it wrote the *pixels*. The second
+                // stage costs a page-list walk and is paid on the minority of
+                // binds the first stage flags.
                 let guest_write = mapping_guest_write_verdict(state, host, mid);
-                let guest_replaced = guest_replaced_host_copies(guest_write);
+                let guest_replaced = guest_wrote_allocation(guest_write) && {
+                    let site = guest_write_site(state, host, mid, w, h);
+                    crate::runtime::drain::note_store_route(match site {
+                        GuestWriteSite::Pixels => "t11sample_gw_wrote_pixels",
+                        GuestWriteSite::Elsewhere => "t11sample_gw_wrote_elsewhere",
+                        GuestWriteSite::Unknown => "t11sample_gw_wrote_unknown",
+                    });
+                    !matches!(site, GuestWriteSite::Elsewhere)
+                };
 
                 // A ready resident target is authoritative after a product
                 // Store — but only while nothing has replaced the bytes it is a
@@ -1118,7 +1132,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     if crate::observe::first_sight("sampled_resident_stale", u64::from(mid)) {
                         crate::observe::off(format!(
                             "sampled_resident_stale mid={mid} {w}x{h} \
-                             (guest wrote the pages this resident copies; reading them instead)"
+                             (guest wrote pages inside the sampled window; reading them instead)"
                         ));
                     }
                 }
@@ -6409,23 +6423,101 @@ fn type11_guest_wrote_since_store<M: HostOps>(
     }
 }
 
-/// Whether the hypervisor has watched the guest replace the pages that every
-/// host-side copy of a type-4 surface is a copy of.
+/// Whether the hypervisor watched the guest write anywhere in the allocation a
+/// type-4 surface's host-side copies were taken from.
 ///
-/// The one predicate both copy-serving rungs of [`resolve_sampled_source`] ask
-/// — the GPU resident and the host byte cache — so neither can end up weaker
-/// than the other. They were not always the same: the cache asked, and the
-/// resident, at six times the traffic and sitting above it in the ladder,
-/// asked nothing.
+/// The first of two stages, and the coarse one: the tracking token covers the
+/// mapping's whole page list and its generation moves for a write to any page
+/// in it, so this answers about the *allocation*, not about the pixels a bind
+/// would read. [`guest_write_site`] is what narrows it.
 ///
-/// Only `Wrote` refuses. `no_stamp` says "nobody asked the host to watch these
-/// pages", which is a statement about this device's arming and not about the
-/// guest; on the boot that first measured the ladder it was 14 092 of 14 396
+/// Only `Wrote` is evidence. `no_stamp` says "nobody asked the host to watch
+/// these pages", which is a statement about this device's arming and not about
+/// the guest; on the boot that first measured the ladder it was 14 092 of 14 396
 /// cache binds, so refusing on it would turn the rung off on the strength of a
-/// rail that was never armed. Closing that arming gap is what makes this
-/// predicate stronger — widening it here would only make it wrong more often.
-fn guest_replaced_host_copies(verdict: GuestWriteVerdict) -> bool {
+/// rail that was never armed.
+fn guest_wrote_allocation(verdict: GuestWriteVerdict) -> bool {
     matches!(verdict, GuestWriteVerdict::Wrote)
+}
+
+/// Where the guest's writes since the stamping Store landed, relative to the
+/// pixel window a sampled bind reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestWriteSite {
+    /// At least one written page overlaps the sampled window. Every host-side
+    /// copy of it is out of date.
+    Pixels,
+    /// The guest wrote the allocation but not the bytes this bind samples.
+    Elsewhere,
+    /// The host could not name the written pages, or the window is unknown.
+    /// Indistinguishable from [`Self::Pixels`] to a caller that must be right.
+    Unknown,
+}
+
+/// Narrow a `Wrote` verdict to the pixel window, so a write that misses it does
+/// not discard a resident that is still exactly the surface.
+///
+/// The tracking token is per *page list*, and a type-4 allocation is more than
+/// its sampled plane: `type11_sample_window` reports a `base_off` precisely
+/// because the pixels do not start at offset 0, and an allocation can carry a
+/// second plane and end padding past `span_end`. A guest store into any of that
+/// moves the set-wide generation. Refusing on it discarded whole 1920x1080
+/// compositor scanouts whose pixels the GPU had rendered and nothing had
+/// touched — measured live as a black desktop at 17 Hz, against 120 Hz and a
+/// painted one on the same boot script with the rung ungated.
+///
+/// Fails closed. Everything the host cannot answer exactly — no token, no
+/// enumerable page list, no resolvable sample window, or written GPAs this
+/// mapping does not own — is [`GuestWriteSite::Unknown`], which the caller
+/// treats as [`GuestWriteSite::Pixels`]. Serving a stale copy is a wrong frame
+/// that is then held; re-reading the guest's pages costs a copy.
+fn guest_write_site<M: HostOps>(
+    state: &DeviceState,
+    host: &M,
+    mapping_id: u32,
+    width: u32,
+    height: u32,
+) -> GuestWriteSite {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return GuestWriteSite::Unknown;
+    };
+    let format = if m.format != 0 {
+        m.format
+    } else {
+        pixel_format::MTL_FORMAT_BGRA8_UNORM
+    };
+    let Some((base_off, _bpr, span_end)) =
+        crate::runtime::mapping_write::type11_sample_window(m, mapping_id, width, height, format)
+    else {
+        return GuestWriteSite::Unknown;
+    };
+    let Some(pages) = host.guest_written_pages(m.guest_write_token, m.guest_write_gen_at_store)
+    else {
+        return GuestWriteSite::Unknown;
+    };
+    let ranges = mapper::mapping_offsets_of_pages(state, mapping_id, &pages);
+    if ranges.is_empty() {
+        // The set-wide generation moved, so some page of this list was written,
+        // yet none of them mapped back to an offset. That is a disagreement
+        // between the token and the page list this call resolved against, not a
+        // finding about the guest.
+        return GuestWriteSite::Unknown;
+    }
+    if ranges_touch_window(&ranges, base_off, span_end) {
+        GuestWriteSite::Pixels
+    } else {
+        GuestWriteSite::Elsewhere
+    }
+}
+
+/// Whether any written mapping-offset range overlaps `[base_off, span_end)`.
+///
+/// Half-open on both sides: a range that abuts the window without entering it
+/// is the padding page after the last row, not the last row.
+fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> bool {
+    ranges
+        .iter()
+        .any(|&(lo, hi)| lo < span_end && hi > base_off)
 }
 
 /// Census only: which rung of the type-4 sampled ladder served this bind, and,
@@ -6473,15 +6565,18 @@ fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'
         ("t11rung_resident", GuestWriteVerdict::NoMapping) => "t11rung_resident_gw_no_mapping",
         ("t11rung_resident", GuestWriteVerdict::NoStamp) => "t11rung_resident_gw_no_stamp",
         ("t11rung_resident", GuestWriteVerdict::Unreadable) => "t11rung_resident_gw_unreadable",
+        // Served under a `Wrote` verdict, so the write missed the sampled window
+        // — `guest_write_site` said `Elsewhere` or the bind would have refused.
+        ("t11rung_resident", GuestWriteVerdict::Wrote) => "t11rung_resident_gw_wrote_elsewhere",
         ("t11rung_host_cache", GuestWriteVerdict::Clean) => "t11rung_host_cache_gw_clean",
         ("t11rung_host_cache", GuestWriteVerdict::NoMapping) => "t11rung_host_cache_gw_no_mapping",
         ("t11rung_host_cache", GuestWriteVerdict::NoStamp) => "t11rung_host_cache_gw_no_stamp",
         ("t11rung_host_cache", GuestWriteVerdict::Unreadable) => {
             "t11rung_host_cache_gw_unreadable"
         }
-        // `Wrote` on a copy-serving rung cannot happen — it is what refuses
-        // them — and the rungs that read the guest's own pages do not care what
-        // the guest wrote, because they read exactly that.
+        ("t11rung_host_cache", GuestWriteVerdict::Wrote) => "t11rung_host_cache_gw_wrote_elsewhere",
+        // The rungs that read the guest's own pages do not care what the guest
+        // wrote, because they read exactly that.
         _ => return None,
     })
 }
@@ -7333,7 +7428,7 @@ mod vulkan_split_tests {
     #[test]
     fn a_watched_guest_write_refuses_every_host_side_copy_of_a_surface() {
         assert!(
-            guest_replaced_host_copies(GuestWriteVerdict::Wrote),
+            guest_wrote_allocation(GuestWriteVerdict::Wrote),
             "a resident whose pages the host watched the guest rewrite is not the surface"
         );
         for verdict in [
@@ -7343,10 +7438,44 @@ mod vulkan_split_tests {
             GuestWriteVerdict::Unreadable,
         ] {
             assert!(
-                !guest_replaced_host_copies(verdict),
+                !guest_wrote_allocation(verdict),
                 "{verdict:?} is not evidence of a guest write and must not refuse a copy"
             );
         }
+    }
+
+    /// The second stage, which is what keeps the first from being ruinous. A
+    /// type-4 allocation is bigger than the plane a bind samples — pixels start
+    /// at `base_off` and padding follows `span_end` — and the tracking token's
+    /// generation moves for a write to any page of it. Refusing on that alone
+    /// discarded whole 1920x1080 compositor scanouts the GPU had rendered and
+    /// the guest had never touched the pixels of: measured live as a black
+    /// desktop at 17 Hz.
+    ///
+    /// Fails closed in both unknown directions, because the caller cannot
+    /// distinguish "no answer" from "written" without being wrong on frames.
+    #[test]
+    fn a_guest_write_outside_the_sampled_window_keeps_the_resident() {
+        // A 1920x1080 BGRA8 plane one page into its allocation.
+        const BASE: u64 = 4096;
+        const END: u64 = BASE + 1920 * 1080 * 4;
+        // The header page before the plane is not the pixels.
+        assert!(!ranges_touch_window(&[(0, 4096)], BASE, END));
+        // Nor is padding after it.
+        assert!(!ranges_touch_window(&[(END + 4096, END + 8192)], BASE, END));
+        // Abutting the end exactly is still outside — both bounds half-open.
+        assert!(!ranges_touch_window(&[(END, END + 4096)], BASE, END));
+        // One page anywhere inside the plane is the whole finding.
+        assert!(ranges_touch_window(&[(4_198_400, 4_202_496)], BASE, END));
+        // A range straddling the plane's first byte counts.
+        assert!(ranges_touch_window(&[(0, 8192)], BASE, END));
+        // Outside ranges do not mask an inside one.
+        assert!(ranges_touch_window(
+            &[(0, 4096), (4_198_400, 4_202_496), (END, END + 4096)],
+            BASE,
+            END
+        ));
+        assert!(!ranges_touch_window(&[], BASE, END));
     }
 
     /// Every rung of the sampled ladder that serves a host-side copy reports the
@@ -7371,8 +7500,8 @@ mod vulkan_split_tests {
             }
             assert_eq!(
                 sample_rung_gw_route(rung, GuestWriteVerdict::Wrote),
-                None,
-                "{rung} cannot serve a bind the guest wrote over, so it has no column for it"
+                Some(format!("{rung}_gw_wrote_elsewhere").as_str()),
+                "a bind served under Wrote is one whose write missed the sampled window"
             );
         }
         // A rung that reads the guest's own pages is not a copy and takes no
