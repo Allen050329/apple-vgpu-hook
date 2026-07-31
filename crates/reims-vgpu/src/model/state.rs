@@ -2471,6 +2471,16 @@ impl DeviceState {
     /// and 11's pending frames. Cache-only landing writes no guest pages, so the
     /// effect was a live task silently losing rendered pixels out of guest RAM
     /// and the guest compositing whatever those pages held before.
+    ///
+    /// Do not widen this back for symmetry with
+    /// [`crate::runtime::gva_view::task_matches`], which deliberately keeps an
+    /// aliased arm at its own overlap-retire site. The two are not the same
+    /// shape, and copying that pattern here without the asymmetry is how this
+    /// arrived. A *view* is a cached translation, so retiring one that did not
+    /// need retiring costs a re-walk and nothing else. A *window* is pixels this
+    /// device owes guest RAM, and retiring one lands it cache-only — the bytes
+    /// never reach the guest and nothing re-derives them. Widening is
+    /// conservative for the first and lossy for the second.
     fn retire_task_gva_windows(&mut self, task_id: u32) {
         let doomed: Vec<u64> = self
             .gva_deferred_flush
