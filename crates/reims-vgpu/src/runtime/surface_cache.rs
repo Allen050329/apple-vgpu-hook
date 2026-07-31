@@ -1156,12 +1156,150 @@ pub fn evict(state: &mut DeviceState, surface_id: u32) {
     state.host_surfaces.remove(&surface_id);
 }
 
+/// Entry count and resident bytes of one host-side pixel cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheLevel {
+    pub entries: u64,
+    pub bytes: u64,
+    /// Bytes held by the single largest entry — the figure that separates "many
+    /// small surfaces" from "a few 4K ones", which cost ~4x a 1080p entry each.
+    pub largest: u64,
+}
+
+impl CacheLevel {
+    fn of<'a, K: 'a, V: 'a>(
+        map: &'a std::collections::BTreeMap<K, V>,
+        len: impl Fn(&V) -> usize,
+    ) -> Self {
+        let mut level = Self {
+            entries: map.len() as u64,
+            ..Self::default()
+        };
+        for value in map.values() {
+            let bytes = len(value) as u64;
+            level.bytes += bytes;
+            level.largest = level.largest.max(bytes);
+        }
+        level
+    }
+}
+
+/// Resident size of every host-side pixel cache, right now.
+///
+/// # These are LEVELS, not per-interval counts
+///
+/// The opposite convention from `store_routes`, whose every field is a count for
+/// one census interval and must be summed across lines. Summing these instead
+/// would multiply a steady cache by the census cadence and report a leak that is
+/// not there. **Take the last line for the current size, and `peak_bytes` for the
+/// high-water mark**; the trend across lines is the thing to read.
+///
+/// `peak_bytes` is carried because a single last line cannot show a transient
+/// spike, and a spike is what a resolution change produces: every geometry
+/// change orphans the previous geometry's entries until something replaces or
+/// evicts them.
+///
+/// # Why this exists
+///
+/// None of these maps has a size cap, and until now none had a counter either,
+/// so "the host caches grow without bound" was neither refuted nor measurable —
+/// `host_surfaces` alone is keyed by surface id with `remove()` on unmap/delete
+/// and no bound on how many live ids there may be. This is the proxy for that
+/// class, added before any attempt to cap it, because a cap chosen without a
+/// measurement is a magic number.
+///
+/// Measure-only. Nothing may read this back to decide what to cache or evict:
+/// that would make a resource gauge into a content heuristic.
+///
+/// `bytes` sums `Arc<Vec<u8>>` lengths, and a deferred render window can share
+/// an entry's allocation rather than copying it — so a cache figure is the size
+/// of the pixels reachable through the cache, not memory additional to the
+/// windows.
+pub fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
+    (
+        CacheLevel::of(&state.host_surfaces, |e| e.bgra.len()),
+        CacheLevel::of(&state.host_gva_surfaces, |e| e.bgra.len()),
+        CacheLevel::of(&state.host_linear_textures, |e| e.bytes.len()),
+    )
+}
+
+/// Emit [`cache_levels`] at most once per census interval.
+///
+/// Shares the one-second cadence the drain census already runs on, so a boot's
+/// cache trend lines up row-for-row with `store_routes` and `drain_duty`.
+pub fn note_cache_levels(state: &DeviceState) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    let (surfaces, gva, linear) = cache_levels(state);
+    let total = surfaces.bytes + gva.bytes + linear.bytes;
+    let peak = PEAK_BYTES.fetch_max(total, Ordering::Relaxed).max(total);
+
+    let now = crate::observe::elapsed_ms() as u64;
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1000 {
+        return;
+    }
+    // Losing the race only costs a skipped interval, never a double line.
+    if LAST_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::observe::off(format!(
+        "host_cache_levels (levels, not per-interval) total_bytes={total} peak_bytes={peak} \
+         surfaces={} surface_bytes={} surface_largest={} \
+         gva={} gva_bytes={} gva_largest={} \
+         linear={} linear_bytes={} linear_largest={}",
+        surfaces.entries,
+        surfaces.bytes,
+        surfaces.largest,
+        gva.entries,
+        gva.bytes,
+        gva.largest,
+        linear.entries,
+        linear.bytes,
+        linear.largest,
+    ));
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// The gauge has to separate the two shapes a growing cache can take, or it
+    /// cannot tell "many small surfaces" from "a few 4K ones" — which is the
+    /// distinction the no-size-cap question turns on, since a 4K entry is ~4x a
+    /// 1080p one.
+    #[test]
+    fn the_cache_gauge_reports_count_bytes_and_the_largest_entry() {
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        assert_eq!(cache_levels(&st).0, CacheLevel::default(), "empty is zero");
+
+        // Two small entries and one large: 4x4 and 2x2 at RGBA8, then 8x8.
+        store(&mut st, 1, 4, 4, vec![0u8; 4 * 4 * 4]);
+        store(&mut st, 2, 2, 2, vec![0u8; 2 * 2 * 4]);
+        store(&mut st, 3, 8, 8, vec![0u8; 8 * 8 * 4]);
+
+        let (surfaces, _, _) = cache_levels(&st);
+        assert_eq!(surfaces.entries, 3);
+        assert_eq!(surfaces.bytes, (4 * 4 + 2 * 2 + 8 * 8) * 4);
+        // Not the sum and not the newest — the largest single entry.
+        assert_eq!(surfaces.largest, 8 * 8 * 4);
+
+        // Eviction is visible, which is what makes an unbounded map detectable:
+        // a gauge that only ever rose could not tell growth from churn.
+        evict(&mut st, 3);
+        let (after, _, _) = cache_levels(&st);
+        assert_eq!(after.entries, 2);
+        assert_eq!(after.bytes, (4 * 4 + 2 * 2) * 4);
+        assert_eq!(after.largest, 4 * 4 * 4);
+    }
 
     /// A generation must name one content for the life of the device, and the
     /// hard case is the one that shipped broken: the entry is *destroyed* in
