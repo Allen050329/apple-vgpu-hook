@@ -630,6 +630,17 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
                 ));
             }
         }
+        // Adoption is the other half of the write-after-teardown detector: these
+        // pages are a surface's again, so a write into them is ordinary. Without
+        // this the retired set would only ever grow, and since the guest recycles
+        // physical pages between surfaces constantly it would end up flagging
+        // every one of those perfectly ordinary reuses.
+        crate::observe::footprint::note_pages_authorized(
+            plan.entries
+                .iter()
+                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, page_shift)),
+            crate::contract::iosurface_pages::page_size_of(page_shift),
+        );
         m.page_entries = plan.entries;
         m.page_table_kva = plan.page_table_kva;
         m.mapping_internal = internal;
@@ -2575,6 +2586,58 @@ mod revalidate_tests {
             (2, 0),
             "two frames total, not the span between them"
         );
+    }
+
+    /// Unmapping one of two mappings that name the same guest pages must not
+    /// make the survivor's writes look like write-after-teardown.
+    ///
+    /// This is the false positive that decides whether the detector is usable
+    /// at all. Mappings genuinely alias — planes of one surface, a slot the
+    /// guest re-presents under a second id — so a retire that walked only the
+    /// dying mapping's list would mark pages a live surface is still writing
+    /// every frame, and `write_after_retire` would read in the thousands on a
+    /// healthy boot. A detector whose first finding is its own bookkeeping gets
+    /// switched off before it ever reports a real one.
+    #[test]
+    fn unmapping_one_of_two_mappings_that_alias_does_not_retire_the_survivors_pages() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let shared = 0x6000_0000u64;
+        let only_mine = 0x6000_0000u64 + page;
+        let entry = |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+
+        for mid in [20u32, 21] {
+            state.map_surface(mid);
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries = if mid == 20 {
+                vec![entry(shared), entry(only_mine)]
+            } else {
+                vec![entry(shared)]
+            };
+        }
+
+        assert!(state.unmap_surface(20));
+        assert_eq!(
+            footprint::retired_counts().0,
+            1,
+            "only the page mapping 20 held alone"
+        );
+
+        // The survivor writes its own page: not a finding.
+        footprint::note_written_range(shared, 16);
+        assert_eq!(
+            footprint::retired_counts().1,
+            0,
+            "mapping 21 still names this page, so writing it is ordinary"
+        );
+
+        // The page nobody holds any more: the finding.
+        footprint::note_written_range(only_mine, 16);
+        assert_eq!(footprint::retired_counts().1, 1);
     }
 
     /// The same claim for the contiguous-view fast path, which is the one

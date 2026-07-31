@@ -122,6 +122,25 @@ impl Footprint {
         if prev & bit == 0 {
             self.pages.fetch_add(1, Ordering::Relaxed);
         }
+        // Every guest write in the device funnels through here, which is what
+        // makes this the right place for the check: a rail cannot reach guest
+        // RAM without being asked whether the frame is still a surface's.
+        if let Some((rword, rbit)) = retired_word(frame) {
+            if rword.load(Ordering::Relaxed) & rbit != 0 {
+                RETIRED.hits.fetch_add(1, Ordering::Relaxed);
+                // Latched per frame: a rail writing a whole surface into retired
+                // pages would emit thousands of identical lines and the flood
+                // detector would then suppress the census with it.
+                if crate::observe::first_sight("write_after_retire", frame) {
+                    crate::observe::fail(format!(
+                        "write_after_retire frame={frame:#x} gpa={:#x} \
+                         (the guest said these pages stopped being a surface's, \
+                         and no mapping has adopted them since)",
+                        frame << FRAME_SHIFT
+                    ));
+                }
+            }
+        }
     }
 
     fn get(&self, frame: u64) -> bool {
@@ -186,6 +205,102 @@ impl Footprint {
 }
 
 static FOOTPRINT: std::sync::LazyLock<Footprint> = std::sync::LazyLock::new(Footprint::new);
+
+/// Frames this device has been told are no longer any surface's, and has not
+/// since been told are a surface's again.
+///
+/// # Why this is not the drift guard again
+///
+/// The page-drift witness asks the *guest's page table* whether a mapping's
+/// cached list still resolves the same way. That is the right question and it
+/// has a blind spot with exactly the shape of the crash class: a surface the
+/// guest has destroyed can keep its translations for as long as the address
+/// space lives, so the walk agrees, the guard passes, and a write lands in
+/// memory the guest handed to something else. `mapping_pages_verdict` cannot see
+/// that, because nothing in the page table changed.
+///
+/// This asks a different question, out of this device's own bookkeeping: the
+/// guest *told* us those pages stopped being a surface's, in a packet. A write
+/// to one of them afterwards is write-after-teardown, and it is detectable on a
+/// live boot with no panic, no guest crash and no post-mortem — which is what
+/// every other instrument here has needed.
+///
+/// # Aliases are the false positive to avoid
+///
+/// Two mappings can name the same guest pages, so tearing one down does not
+/// retire pages the other still holds. Frames still in any live mapping's list
+/// are excluded at retire time; marking them would report the survivor's own
+/// legitimate writes as a defect, and a detector whose first finding is noise
+/// gets switched off.
+struct Retired {
+    bits: Box<[AtomicU64]>,
+    frames: AtomicU64,
+    /// Writes that landed in a retired frame. The finding.
+    hits: AtomicU64,
+}
+
+static RETIRED: std::sync::LazyLock<Retired> = std::sync::LazyLock::new(|| {
+    let mut bits = Vec::with_capacity(WORDS);
+    bits.resize_with(WORDS, || AtomicU64::new(0));
+    Retired {
+        bits: bits.into_boxed_slice(),
+        frames: AtomicU64::new(0),
+        hits: AtomicU64::new(0),
+    }
+});
+
+fn retired_word(frame: u64) -> Option<(&'static AtomicU64, u64)> {
+    if frame >= MAX_FRAME {
+        return None;
+    }
+    Some((&RETIRED.bits[(frame / 64) as usize], 1u64 << (frame % 64)))
+}
+
+/// The guest said these pages stopped being a surface's. Call with the pages a
+/// mapping is losing, already filtered to those no live mapping still holds.
+pub fn note_pages_retired<I: IntoIterator<Item = u64>>(gpas: I, page_size: u64) {
+    let step = page_size.max(1 << FRAME_SHIFT);
+    for gpa in gpas {
+        let first = gpa >> FRAME_SHIFT;
+        let last = gpa.saturating_add(step - 1) >> FRAME_SHIFT;
+        for frame in first..=last {
+            if let Some((word, bit)) = retired_word(frame) {
+                if word.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                    RETIRED.frames.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// A mapping adopted these pages, so they are a surface's again.
+///
+/// Un-retiring on adoption is what keeps this from decaying into "every frame
+/// the boot ever used": the guest recycles physical pages between surfaces
+/// constantly, and a set that only ever grew would flag every one of those
+/// perfectly ordinary reuses.
+pub fn note_pages_authorized<I: IntoIterator<Item = u64>>(gpas: I, page_size: u64) {
+    let step = page_size.max(1 << FRAME_SHIFT);
+    for gpa in gpas {
+        let first = gpa >> FRAME_SHIFT;
+        let last = gpa.saturating_add(step - 1) >> FRAME_SHIFT;
+        for frame in first..=last {
+            if let Some((word, bit)) = retired_word(frame) {
+                if word.fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
+                    RETIRED.frames.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// `(frames currently retired, writes that landed in one)`.
+pub fn retired_counts() -> (u64, u64) {
+    (
+        RETIRED.frames.load(Ordering::Relaxed),
+        RETIRED.hits.load(Ordering::Relaxed),
+    )
+}
 
 /// Record that `len` bytes starting at guest-physical `gpa` were written.
 ///
@@ -326,11 +441,13 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     // Levels, not per-interval: these are running totals for the boot, like the
     // frame count beside them and unlike `store_routes`. Summing them across
     // census lines multiplies by the cadence — the 100x error AGENTS.md records.
+    let (retired_frames, retired_hits) = retired_counts();
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
          all_ff={all_ff} all_zero={all_zero} samp_bytes={bytes_sampled} \
-         ff_bytes={bytes_all_ff} (levels, not per-interval)"
+         ff_bytes={bytes_all_ff} retired={retired_frames} \
+         write_after_retire={retired_hits} (levels, not per-interval)"
     )];
 
     let last_ms = fp.last_dump_ms.load(Ordering::Relaxed);
@@ -375,6 +492,11 @@ static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     let g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     FOOTPRINT.reset();
+    for cell in RETIRED.bits.iter() {
+        cell.store(0, Ordering::Relaxed);
+    }
+    RETIRED.frames.store(0, Ordering::Relaxed);
+    RETIRED.hits.store(0, Ordering::Relaxed);
     for cell in [
         &PAYLOAD.calls,
         &PAYLOAD.sampled,
@@ -542,6 +664,53 @@ mod tests {
         note_written_payload(&[]);
         let (calls, sampled, all_ff, all_zero, _, _) = payload_counts();
         assert_eq!((calls, sampled, all_ff, all_zero), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_write_into_a_retired_frame_is_counted_and_adoption_stops_it() {
+        let _g = fresh();
+        note_pages_retired([0x8000u64], 0x1000);
+        assert_eq!(retired_counts(), (1, 0));
+
+        // A write elsewhere is not a finding.
+        note_written_range(0x9000, 0x1000);
+        assert_eq!(retired_counts().1, 0);
+
+        note_written_range(0x8000, 0x10);
+        assert_eq!(retired_counts().1, 1, "the write into it is the finding");
+
+        // Adoption puts the frame back in service. Without this the set only
+        // grows, and the guest recycles physical pages between surfaces
+        // constantly, so every ordinary reuse would read as a defect.
+        note_pages_authorized([0x8000u64], 0x1000);
+        assert_eq!(retired_counts().0, 0);
+        note_written_range(0x8000, 0x10);
+        assert_eq!(retired_counts().1, 1, "no new hit after adoption");
+    }
+
+    #[test]
+    fn retiring_a_frame_twice_counts_it_once_and_adopting_an_unretired_one_is_a_no_op() {
+        let _g = fresh();
+        // Both directions of the counter have to be idempotent, or the level
+        // drifts against the bits and `retired=` on the census stops meaning
+        // "frames currently retired".
+        note_pages_retired([0x2000u64, 0x2000], 0x1000);
+        assert_eq!(retired_counts().0, 1);
+        note_pages_authorized([0x7000u64], 0x1000);
+        assert_eq!(retired_counts().0, 1, "adopting a live frame changes nothing");
+        note_pages_authorized([0x2000u64, 0x2000], 0x1000);
+        assert_eq!(retired_counts().0, 0);
+    }
+
+    #[test]
+    fn a_guest_page_larger_than_a_frame_retires_all_of_its_frames() {
+        let _g = fresh();
+        // arm64. Retiring only the first frame of a 16 KiB page would leave
+        // three quarters of every torn-down surface undetectable.
+        note_pages_retired([0x4000u64], 1 << 14);
+        assert_eq!(retired_counts().0, 4);
+        note_written_range(0x4000 + 3 * 0x1000, 4);
+        assert_eq!(retired_counts().1, 1);
     }
 
     #[test]

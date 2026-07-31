@@ -3381,11 +3381,55 @@ impl DeviceState {
         true
     }
 
+    /// Tell [`crate::observe::footprint`] that a mapping's pages have stopped
+    /// being a surface's, so a later write into them is reportable.
+    ///
+    /// Only the guest's own Unmap calls this. The device's internal
+    /// invalidations — a resolve that failed, a condemned list awaiting a
+    /// fingerprint compare — are *this device* deciding it no longer trusts a
+    /// list, not the guest saying the memory is no longer a surface's, and the
+    /// reprieve path can hand the same list straight back. Retiring on those
+    /// would flag the reprieve's own legitimate writes, and a detector whose
+    /// first finding is its own bookkeeping gets switched off before it ever
+    /// reports a real one.
+    ///
+    /// Frames another live mapping still names are excluded: two mappings can
+    /// alias the same guest pages, and the survivor's writes are not a defect.
+    fn note_mapping_pages_retired(&self, mapping_id: u32) {
+        let Some(doomed) = self.mappings.get(&mapping_id) else {
+            return;
+        };
+        if doomed.page_entries.is_empty() {
+            return;
+        }
+        let shift = self.page_shift;
+        let gpas_of = |entries: &[u32]| -> Vec<u64> {
+            entries
+                .iter()
+                .filter_map(|&e| crate::contract::iosurface_pages::entry_gpa_shift(e, shift))
+                .collect()
+        };
+        let mut still_held: std::collections::HashSet<u64> = Default::default();
+        for (&other, m) in self.mappings.iter() {
+            if other == mapping_id {
+                continue;
+            }
+            still_held.extend(gpas_of(&m.page_entries));
+        }
+        let going: Vec<u64> = gpas_of(&doomed.page_entries)
+            .into_iter()
+            .filter(|g| !still_held.contains(g))
+            .collect();
+        crate::observe::footprint::note_pages_retired(going, self.page_size());
+    }
+
     pub fn unmap_surface(&mut self, mapping_id: u32) -> bool {
         if mapping_id as usize >= MAX_MAPPINGS {
             StateMutationDecline::UnmapSurfaceIdRange { mapping_id }.emit(u64::from(mapping_id));
             return false;
         }
+        // Before the list is cleared, while the pages are still nameable.
+        self.note_mapping_pages_retired(mapping_id);
         self.forget_compositor_mapping(mapping_id);
         if let Some(e) = self.mappings.get_mut(&mapping_id) {
             e.mapped = false;
