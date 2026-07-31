@@ -449,6 +449,17 @@ lost nothing but its future boots.
 The pinned-binary trick is still right for anything that must not see a changing tree; it is the
 *dedication* that was wasteful, not the pinning.
 
+####### Re-swept at 635 boots: 41 of the ~158 the arm needs
+
+```text
+635 boots        12 panics (1.89 %)      newest panic still 20260731-144329
+post-d455c3e     41 boots, 0 panics      expected 0.77      p(0 | rate unchanged) = 0.46
+```
+
+Two driven boots' worth of progress, which is what an accumulating census looks like and is the
+point of not dedicating the rig to it. The target moves with the rate:
+`log(0.05) / log(1 - 0.0189)` = **158**. Quote the 41.
+
 ### A panicked boot must not be scored, and "no rounds" does not say it was not
 
 `.agents/repros/icon-boot-ab.sh` retries a boot that panics *before ssh* (exit 126) and does not
@@ -1623,6 +1634,74 @@ retire path never ran: `unmap_surface` was not reached on this workload. That is
 finding about the detector rather than about the device — the next session must find out whether the
 guest never Unmaps here, or whether `unmap_surface` is the wrong retire point, before that detector
 means anything.
+
+###### Completed, and both readings above needed correcting
+
+The boot finished at 600 s. `retire_scans=0` held to the end, and the two other numbers moved enough
+that the mid-drive figures must not be quoted:
+
+```text
+footprint  runs=28960  frames=173034 (675.9 MiB)  dropped=0     density 4.125 % of 16 GiB
+payload    writes=11643167  sampled=181925  all_ff=0  all_zero=114064 (62.70 %)
+attaches 1567   stores 66182   panics 0   fabricated 0   stranded 0
+```
+
+**Density is 4.125 %, not 1.05 %** — an unrelated victim lands inside about **1 time in 24**. A
+mid-drive density is a floor, and the set only grows, so read one as a lower bound on how weak a
+later hit will be.
+
+**The `retire_scans=0` was structural, not a property of the workload.** `note_mapping_pages_retired`
+bailed on an empty `page_entries`, and every route into `unmap_surface` from a guest teardown arrives
+with that list *already empty*, because the step before moved it into `condemned_entries`:
+`DeleteIOSurfaceBacking2` calls `condemn_surface_backing` first (which does exactly that move), the
+second delete then reaches `unmap_surface` through the `mapping_backing_condemned` branch, and the
+fall-through branch is reached only *because* `condemn_surface_backing` returned false — which it
+does precisely when the list was already empty. `map_surface` moves it the same way. So the detector
+could never fire on the delete path in any boot. Fixed in `80f385e` by retiring the condemned list
+too, which is sound *there* and would not be at condemn time: at condemn the reprieve can still hand
+the list back, and `resolve_mapping_backing` un-retires through `note_pages_authorized` when it does.
+
+Writing the alias control for that fix found a second defect in the same function: a **surviving**
+mapping's condemned list was not counted as still-held, so tearing down a mapping that aliased it
+retired pages the survivor may yet be reprieved onto. That is a false positive out of the device's
+own bookkeeping — the thing that gets a detector switched off before it reports a real finding.
+
+**`all_ff=0` cannot carry the claim it was written up with, and the largest rail was not in the
+census.** Both are recorded in the section below; do not cite the paragraph above it.
+
+##### `all_ff` is blind to a white page, and the census was missing the rail that paints
+
+Two defects, either of which alone voids the reading "this device produced no all-`0xff` payload".
+
+**The predicate does not describe the question.** `all_ff` requires the **whole** buffer uniform, and
+these rails hand over whole frames and whole source images. A white browser page has a menu bar, a
+scrollbar and text on it, so a device faithfully rendering megabytes of white still scores
+`all_ff=0`. The panic census implies something narrower and answerable: its two `kalloc` poison
+reports found a whole freed element filled with `0xff` **from offset 0**, at `sz:256` and `sz:6144`,
+so a write that could have produced the smaller of them put at least **256 consecutive `0xff` bytes**
+into guest RAM. That element size is the basis for `FF_RUN_MIN`; it is not a threshold fitted to an
+observation. `ff_run` / `ff_run_max` count it and are the columns to read. `all_ff` stays so the
+already-recorded boots remain comparable.
+
+The scan probes every 256th byte and expands only on a hit — any run of 256 consecutive bytes
+contains a multiple of 256, so nothing long enough to matter hides between probes, and a photograph
+costs `len/256` loads.
+
+**`runtime/mapping_write.rs` fed the census nothing at all.** It is the largest guest-write rail in
+the device and it reaches `mapper::write_mapping_bytes` not at all — it takes a pointer from
+`contig_for_write` and pokes rows into it. This is the **identical shape** to the footprint gap
+`2df845f` fixed, one instrument later: that gate closed the *footprint* over these rails and says
+nothing about the *payload*. `metal_draw/mod.rs` and `compute_exec/mod.rs` were missing for a related
+reason — they write rows through a `FreshSpan`, and `map_fresh_span_within` resolves a span without
+ever seeing a buffer, so it can mark on their behalf but cannot sample on their behalf.
+
+The general rule, since this is twice: **a completeness gate covers one instrument, not one rail.**
+Adding a second instrument over rails a gate already closed does not inherit that closure.
+`every_guest_ram_writer_is_classified_for_the_payload_census` derives its writer set from
+`MAP_PAGES_SITES` so the two tables cannot drift, and demands a verdict with a reason for each.
+`gpa_map.rs` is the one deliberate `Skipped`: tens of bytes per control-plane write, far more
+frequent than a frame, so sampling it would spend the 1-in-64 budget on writes that cannot carry a
+256-byte run.
 
 ##### `write_after_retire` asks the question the drift guard structurally cannot
 
