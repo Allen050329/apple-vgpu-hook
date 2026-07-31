@@ -1722,6 +1722,19 @@ fn flush_render_one<M: HostMemory + HostOps>(
         // lifetime. That is the "~260 stale residents (~516 MiB)" shape, and this
         // drift is not rare: one in 85 s on a driven boot.
         release_window_pin_for_key(key, source);
+        // Counted, not just logged. The three resident-mismatch refusals below
+        // have carried census routes since they were split apart; these two
+        // drift refusals did not, and they are the ones that lose a painted
+        // tile. `flush_intersecting` has already TAKEN this window out of
+        // `compute_deferred_flush`, and `flush_mapping_windows_before_fence`
+        // returns `()`, so the fence advances and nothing re-arms the
+        // obligation: the pixels land nowhere, permanently.
+        //
+        // That is the Goal 3 event, and until now a census could not count it.
+        // `mapping_pages_drifted` is not a substitute — it is incremented inside
+        // `mapping_pages_still_ours`, which several callers reach, so it counts
+        // refusals rather than lost tiles.
+        crate::runtime::drain::note_store_route("rendflush_gen_drift");
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=map_generation_drift current={current:?}",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
@@ -1733,6 +1746,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // `mapping_pages_still_ours`.
     if !mapping_pages_still_ours(state, host, key.mapping_id) {
         release_window_pin_for_key(key, source);
+        crate::runtime::drain::note_store_route("rendflush_page_drift");
         crate::observe::fail(format!(
             "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} reason=mapping_page_drift",
             key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
@@ -2355,6 +2369,9 @@ mod tests {
         state
             .compute_deferred_flush
             .insert(key(9, 0, 256), render_owner(1));
+        // Route counts are process-global and this suite runs serially, so take
+        // a baseline rather than assuming this is the first window to drift.
+        let before_gen_drift = crate::runtime::drain::store_route_count("rendflush_gen_drift");
         let cap = crate::observe::FailCapture::start();
         assert!(
             !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
@@ -2372,6 +2389,20 @@ mod tests {
         assert!(
             state.compute_deferred_flush.is_empty(),
             "the trigger must consume the window it took"
+        );
+        // A lost tile has to be countable, not just loggable. The window is gone
+        // from `compute_deferred_flush` (asserted just above) and nothing
+        // re-arms it, so this is a permanent loss of painted pixels — the Goal 3
+        // event — and a census that cannot count it cannot score an arm against
+        // it.
+        //
+        // `mapping_pages_drifted` is not a substitute: it is incremented inside
+        // `mapping_pages_still_ours`, which more than one caller reaches, so it
+        // counts refusals rather than lost tiles.
+        assert_eq!(
+            crate::runtime::drain::store_route_count("rendflush_gen_drift"),
+            before_gen_drift + 1,
+            "the generation-drift loss must be counted on the store-route census"
         );
     }
 
