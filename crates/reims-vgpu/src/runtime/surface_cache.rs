@@ -131,6 +131,25 @@ fn live_map_generation(state: &DeviceState, surface_id: u32) -> u32 {
 /// getting `true` back, because the knob was off. "These bytes are from the
 /// incarnation in front of us" and "the device is willing to serve them anyway"
 /// must not share a return value.
+///
+/// # Measured: this never fires, and the reason generalises
+///
+/// One 300 s crash-hunt boot, x86 / Vulkan: `surfcache_gen_same` 16 186,
+/// `surfcache_gen_stale` **0**. The cache does not serve a frame across a
+/// re-point on this workload, so it is not the mechanism behind the Finder icon
+/// corruption or the Safari scroll patch. Kept anyway — the identity is real, it
+/// costs a `u32` and a compare, and its absence is exactly what let the question
+/// go unasked — but not counted as a repair.
+///
+/// The reason is arithmetic and it rules out a whole family of hypotheses.
+/// `map_generation` moves 9-22 times in a 300 s boot while these rails do 25 000
+/// to 51 000 operations in the same window, so *any* defect of the form "the
+/// incarnation changed underneath a cached thing" is a ~0.04 % event. The icon
+/// and patch symptoms are ones a user sees constantly. A rare mechanism cannot
+/// explain a common symptom, and three separate cached-thing-outlives-its-
+/// incarnation hypotheses have now measured zero or near zero on this rail
+/// (`mapw_pages_refused`, `surface_resident_identity_split`, this). Look for
+/// something that fires at content cadence instead.
 fn surface_entry_is_current(state: &DeviceState, surface_id: u32) -> bool {
     let Some(entry) = state.host_surfaces.get(&surface_id) else {
         return true;
