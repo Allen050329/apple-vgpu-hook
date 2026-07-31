@@ -30,6 +30,11 @@ use std::slice;
 
 /// Bump when breaking the C shim contract.
 ///
+/// v13 adds `guest_written_pages` on [`ReimsVgpuHostOps`]: the per-page form of
+/// v12's generation. A whole-set generation is enough to decide whether to reuse
+/// a host-side copy, and not enough to decide what to write back — a deferred
+/// writeback that discards its frame because one page moved loses the Store, and
+/// one that writes the whole frame anyway loses the guest's own store.
 /// v12 adds the guest-write tracking triple on [`ReimsVgpuHostOps`]:
 /// `track_guest_writes`, `untrack_guest_writes`, `guest_write_gen`. A surface's
 /// pages are plain guest RAM and the guest CPU stores into them with no device
@@ -46,7 +51,7 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 12;
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 13;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {

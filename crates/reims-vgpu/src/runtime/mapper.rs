@@ -1233,6 +1233,54 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     }
 }
 
+/// Mapping byte ranges covering the pages of `mapping_id` whose GPAs appear in
+/// `written`, ascending and merged.
+///
+/// The dirty bitmap answers in guest *physical* pages; a writeback lays bytes
+/// out in the mapping's own offset space. This is the one place the two meet,
+/// and it goes through `page_entries` — the same list the tracking token was
+/// built from — so page `i` of the surface is offset `i * page_size` by
+/// construction rather than by an address arithmetic that could drift from it.
+///
+/// A GPA the mapping does not hold is ignored: a token is per page list, but a
+/// caller may hand back an answer taken before a rebind, and inventing an offset
+/// for a page this surface does not own would exclude bytes at random.
+///
+/// Adjacent pages merge, so a guest that rewrites a whole surface produces one
+/// range rather than thousands.
+pub fn mapping_offsets_of_pages(
+    state: &DeviceState,
+    mapping_id: u32,
+    written: &[u64],
+) -> Vec<(u64, u64)> {
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return Vec::new();
+    };
+    if written.is_empty() {
+        return Vec::new();
+    }
+    let page_shift = state.page_shift;
+    let page_size = 1u64 << page_shift;
+    let mut sorted: Vec<u64> = written.to_vec();
+    sorted.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (i, &entry) in m.page_entries.iter().enumerate() {
+        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+            continue;
+        };
+        if sorted.binary_search(&gpa).is_err() {
+            continue;
+        }
+        let lo = (i as u64).saturating_mul(page_size);
+        let hi = lo.saturating_add(page_size);
+        match out.last_mut() {
+            Some(last) if last.1 == lo => last.1 = hi,
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
 /// Revalidate + collect page-aligned GPAs for a mapped surface (GVA order).
 ///
 /// Fails closed on empty / invalid entries and known transport/control-page
@@ -2024,6 +2072,51 @@ mod revalidate_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The dirty bitmap answers in guest physical pages and a writeback lays
+    /// bytes out in mapping offsets; this is the only place the two meet, so it
+    /// is tested against a page list that is deliberately not in address order.
+    ///
+    /// A GPA the mapping does not hold contributes nothing. A token is per page
+    /// list, but an answer can be taken across a rebind, and inventing an offset
+    /// for a page this surface does not own would exclude bytes at random.
+    #[test]
+    fn mapping_offsets_of_pages_maps_guest_pages_to_surface_offsets() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(6);
+        // Surface pages 0..4 live at PFNs 0x50, 0x53, 0x51, 0x52 — out of
+        // address order, which is what makes the index the answer and not the
+        // address.
+        let pfns = [0x50u32, 0x53, 0x51, 0x52];
+        state.mappings.get_mut(&6).unwrap().page_entries = pfns
+            .iter()
+            .map(|p| (p << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+            .collect();
+        let gpa = |pfn: u32| (pfn as u64) << PAGE_SHIFT_X86;
+
+        assert_eq!(mapping_offsets_of_pages(&state, 6, &[]), vec![]);
+        // Surface page 1 is the highest GPA of the four.
+        assert_eq!(
+            mapping_offsets_of_pages(&state, 6, &[gpa(0x53)]),
+            vec![(PAGE, 2 * PAGE)]
+        );
+        // Adjacent surface pages merge even though their GPAs are not adjacent.
+        assert_eq!(
+            mapping_offsets_of_pages(&state, 6, &[gpa(0x51), gpa(0x52)]),
+            vec![(2 * PAGE, 4 * PAGE)]
+        );
+        // Non-adjacent stay apart, and a page this surface does not own is
+        // ignored rather than placed somewhere.
+        assert_eq!(
+            mapping_offsets_of_pages(&state, 6, &[gpa(0x50), gpa(0x52), gpa(0x99)]),
+            vec![(0, PAGE), (3 * PAGE, 4 * PAGE)]
+        );
+        assert_eq!(mapping_offsets_of_pages(&state, 7, &[gpa(0x50)]), vec![]);
+    }
 
     use super::*;
     use crate::contract::endian::st32;

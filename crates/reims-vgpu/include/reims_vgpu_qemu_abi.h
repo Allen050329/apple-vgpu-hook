@@ -21,7 +21,11 @@
 extern "C" {
 #endif
 
-/* v12: ReimsVgpuHostOps.track_guest_writes / untrack_guest_writes /
+/* v13: ReimsVgpuHostOps.guest_written_pages — the per-page form of v12's
+ *      generation. The generation says a surface's pages moved; this says
+ *      which, which is what a deferred writeback needs in order to land its
+ *      frame without replacing the guest's own stores.
+ * v12: ReimsVgpuHostOps.track_guest_writes / untrack_guest_writes /
  *      guest_write_gen — the hypervisor dirty bitmap, the only witness for a
  *      write to a surface's guest pages that no device operation made. Every
  *      host-side copy of those pages is stale the instant the guest CPU stores
@@ -43,7 +47,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 12u
+#define REIMS_VGPU_QEMU_ABI_VERSION 13u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -180,6 +184,28 @@ typedef struct ReimsVgpuHostOps {
                                    size_t page_size);
     void (*untrack_guest_writes)(void *ctx, uint64_t token);
     uint64_t (*guest_write_gen)(void *ctx, uint64_t token);
+    /*
+     * Which pages of the set were written, not just whether any were.
+     *
+     * Fills `out` with the page-aligned GPAs of `token`'s set whose most recent
+     * observed write is newer than `since_gen` — a value the caller previously
+     * read from guest_write_gen and recorded next to a host-side copy — and
+     * returns how many. Safe from any thread.
+     *
+     * Returns -1 for every case where the answer is not knowable and the caller
+     * must assume the whole set was written: an unknown token, a token whose
+     * generation is still unreadable, a `since_gen` of 0, or more written pages
+     * than `max` can hold. A truncated list would say "these pages and no
+     * others", which turns a conservative caller into a wrong one.
+     *
+     * A whole-set generation is enough to decide whether to *reuse* a copy. It
+     * is not enough to decide what to *write back*: a writeback that discards
+     * its whole frame because one page moved loses the Store, and one that
+     * writes the whole frame anyway loses the guest's own store. This is the
+     * call that lets a writeback do neither.
+     */
+    int64_t (*guest_written_pages)(void *ctx, uint64_t token, uint64_t since_gen,
+                                   uint64_t *out, size_t max);
 } ReimsVgpuHostOps;
 
 /* Default guest page size for arm64e / vmapple (create may override). */

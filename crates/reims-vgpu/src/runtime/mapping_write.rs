@@ -143,6 +143,48 @@ fn rect_extent_end(
         .saturating_add(rb as u64)
 }
 
+/// Mapping byte ranges a writeback must leave alone, ascending and disjoint.
+///
+/// Offsets are from the mapping's page 0, the same space `base_off`/`span_end`
+/// are in, so a caller holding guest *page* addresses converts once with
+/// [`crate::runtime::mapper::mapping_offsets_of_pages`] and everything below
+/// stays in one coordinate system.
+pub type SkipRanges<'a> = &'a [(u64, u64)];
+
+/// The sub-ranges of `[start, end)` that are not covered by `skip`.
+///
+/// `skip` is ascending and disjoint, so one forward walk answers it. Kept
+/// separate from the two writers below because they lay their bytes out
+/// differently — one pokes a host view in place, the other stages a frame and
+/// hands runs to the mapper — and the only thing they must agree on is *which
+/// bytes are excluded*. Two open-coded walks would be two chances to disagree.
+fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
+    if skip.is_empty() {
+        return if start < end { vec![(start, end)] } else { vec![] };
+    }
+    let mut out = Vec::new();
+    let mut cur = start;
+    for &(s, e) in skip {
+        if e <= cur {
+            continue;
+        }
+        if s >= end {
+            break;
+        }
+        if s > cur {
+            out.push((cur, s.min(end)));
+        }
+        cur = cur.max(e);
+        if cur >= end {
+            return out;
+        }
+    }
+    if cur < end {
+        out.push((cur, end));
+    }
+    out
+}
+
 /// Write a tight BGRA8 image into the mapping's guest pages.
 ///
 /// Packed contig HostOps view when possible; else multi-import maximal packed
@@ -158,6 +200,35 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
     src_stride: u32,
     width: u32,
     height: u32,
+) -> bool {
+    write_bgra8_skipping(state, host, mapping_id, src, src_stride, width, height, &[])
+}
+
+/// [`write_bgra8`], leaving `skip` untouched.
+///
+/// A deferred writeback holds a frame the device rendered and lands it in the
+/// guest's pages later. If the guest CPU wrote some of those pages in between,
+/// writing the whole frame loses the guest's stores and dropping the frame loses
+/// the device's; `skip` is how the caller expresses the third answer, one page
+/// at a time, from the hypervisor's own per-page report.
+///
+/// Everything else is unchanged, deliberately — including the cache refresh and
+/// the epoch bump at the tail. The frame *is* what the device rendered, and the
+/// host-side copies of it stay that; what `skip` decides is only which of those
+/// bytes the guest's own memory is allowed to keep instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
 ) -> bool {
     if width == 0
         || height == 0
@@ -233,9 +304,18 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
                 let n = src_row_len.min(row.len());
                 row[..n].copy_from_slice(&src_row[..n]);
             }
-            let dst = unsafe { base.add((y as usize).saturating_mul(bpr)) };
-            unsafe {
-                std::ptr::copy_nonoverlapping(row.as_ptr(), dst, tight);
+            // The row's destination in mapping-offset space, so the skip list —
+            // which is in that space — is subtracted before any pointer exists.
+            let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
+            for (lo, hi) in unskipped(row_off, row_off.saturating_add(tight as u64), skip) {
+                let within = (lo - row_off) as usize;
+                let len = (hi - lo) as usize;
+                let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
+                // SAFETY: `within + len <= tight`, and the view covers span_end
+                // which is at or past this row's last byte.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(row.as_ptr().add(within), dst, len);
+                }
             }
         }
     } else {
@@ -275,12 +355,40 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
             }
             frame[dst_off..dst_off + tight].copy_from_slice(&row[..tight]);
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame) {
-            return false;
+        // One call per surviving run rather than one for the whole frame: the
+        // mapper writes the bytes it is handed, so a skipped page has to be
+        // absent from the slice rather than masked inside it.
+        for (lo, hi) in unskipped(base_off, base_off.saturating_add(frame.len() as u64), skip) {
+            let within = (lo - base_off) as usize;
+            let len = (hi - lo) as usize;
+            if !mapper::write_mapping_bytes(state, host, mapping_id, lo, &frame[within..within + len])
+            {
+                return false;
+            }
         }
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
+    if !skip.is_empty() {
+        // A skipping write leaves the guest's pages holding `src` everywhere
+        // except the ranges the guest itself owns, so no host-side copy of `src`
+        // is the mapping's content any more. The two publishes below both assert
+        // that it is, and both would be wrong here in the direction that produces
+        // a frame rather than a cost:
+        //
+        // - the cache entry would answer the type-11 LOAD seed, which prefers it
+        //   over the surface's own pages, and hand back exactly the bytes the
+        //   guest's stores were preserved *from*;
+        // - the stamp would record this surface as unwritten since a Store,
+        //   which is the fact the elision reads to load from a resident that
+        //   does not have the guest's stores either.
+        //
+        // Dropping the entry makes every reader fall through to the pages, which
+        // are the only thing that holds both halves. `mark_mapping_written` above
+        // has already moved `surface_content_epoch` past any resident stamp.
+        crate::runtime::surface_cache::forget(state, mapping_id);
+        return true;
+    }
     let mut cache = vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
     let row_src = width.saturating_mul(RGBA8_BPP) as usize;
     for y in 0..mh as usize {
@@ -1124,6 +1232,111 @@ mod tests {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     use crate::runtime::host::FakeHost;
+
+    /// The gap walk is what both writeback paths subtract their skipped ranges
+    /// with, so it is tested on its own: an off-by-one here is a row of pixels
+    /// written into a page the guest owns, or a row of the guest's own bytes
+    /// overwritten, and neither is visible in a frame until much later.
+    #[test]
+    fn unskipped_returns_exactly_the_bytes_no_range_covers() {
+        assert_eq!(unskipped(0, 10, &[]), vec![(0, 10)]);
+        assert_eq!(unskipped(10, 10, &[]), vec![]);
+        // Interior, leading, trailing, and total cover.
+        assert_eq!(unskipped(0, 10, &[(4, 6)]), vec![(0, 4), (6, 10)]);
+        assert_eq!(unskipped(0, 10, &[(0, 4)]), vec![(4, 10)]);
+        assert_eq!(unskipped(0, 10, &[(6, 10)]), vec![(0, 6)]);
+        assert_eq!(unskipped(0, 10, &[(0, 10)]), vec![]);
+        // Ranges outside the window contribute nothing, on either side.
+        assert_eq!(unskipped(10, 20, &[(0, 5), (30, 40)]), vec![(10, 20)]);
+        // Partial overlap at both ends, and several ranges in one window.
+        assert_eq!(
+            unskipped(10, 30, &[(5, 12), (16, 18), (28, 35)]),
+            vec![(12, 16), (18, 28)]
+        );
+    }
+
+    /// A writeback told to skip a page leaves that page exactly as the guest
+    /// left it, writes every other page, and stops claiming the frame is the
+    /// mapping's content.
+    ///
+    /// Both storage shapes are exercised, because they place bytes by different
+    /// means — the packed one pokes a host view through a raw pointer, the
+    /// fragmented one stages a frame and hands runs to the mapper — and a skip
+    /// honoured by one and not the other is a defect that only appears on
+    /// whichever guest allocation happens to be scattered.
+    ///
+    /// The two publishes at the tail are half the test. After a skipping write
+    /// neither the host cache nor the recorded guest-write generation describes
+    /// the mapping any more: the cache would answer the type-11 LOAD seed with
+    /// the very bytes the guest's stores were preserved from, and a refreshed
+    /// stamp would tell the elision this surface is unwritten since a Store.
+    #[test]
+    fn a_skipping_writeback_leaves_the_guest_its_own_pages() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        // 64x64 BGRA8 is 256 bytes a row, 16 KiB in four x86 pages.
+        const W: u32 = 64;
+        const H: u32 = 64;
+
+        for packed in [true, false] {
+            let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+            let mut host = FakeHost::new();
+            host.strict_linux_map = !packed;
+            let base_pfn = 0x40u32;
+            host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0x55);
+            // Reversed page order is a fragmented list to `map_pages`; the same
+            // four pages either way, so the guest bytes are comparable.
+            let order: Vec<u32> = if packed {
+                (0..4).collect()
+            } else {
+                vec![3, 2, 1, 0]
+            };
+            let entries: Vec<u32> = order
+                .iter()
+                .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                .collect();
+            state.map_surface(4);
+            state.attach_mapping_internal(4, 0);
+            let m = state.mappings.get_mut(&4).unwrap();
+            m.mapping_internal = 1;
+            m.page_entries = entries;
+            assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
+            crate::runtime::surface_cache::store(&mut state, 4, W, H, vec![0u8; (W * H * 4) as usize]);
+
+            let frame = vec![0xAAu8; (W * H * 4) as usize];
+            // Page 2 of the surface, in mapping-offset space.
+            let skip = [(2 * PAGE, 3 * PAGE)];
+            assert!(write_bgra8_skipping(
+                &mut state,
+                &mut host,
+                4,
+                &frame,
+                W * 4,
+                W,
+                H,
+                &skip
+            ));
+
+            for page in 0..4u64 {
+                let gpa = (base_pfn as u64 + order[page as usize] as u64) << PAGE_SHIFT_X86;
+                let mut got = [0u8; 8];
+                host.read_gpa(gpa, &mut got).unwrap();
+                let want = if page == 2 { 0x55 } else { 0xAA };
+                assert!(
+                    got.iter().all(|b| *b == want),
+                    "packed={packed} surface page {page} must read {want:#x}, got {got:?}"
+                );
+            }
+            assert!(
+                crate::runtime::surface_cache::get(&state, 4, W, H).is_none(),
+                "packed={packed}: the cache must stop answering for a mapping the frame no longer describes"
+            );
+            assert_eq!(
+                state.mappings[&4].guest_write_gen_at_store, 0,
+                "packed={packed}: a partial write must not record this surface as unwritten since a Store"
+            );
+        }
+    }
 
     #[test]
     fn write_bumps_generation() {

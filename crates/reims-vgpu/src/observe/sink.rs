@@ -677,6 +677,36 @@ impl StoreDeferRail {
 /// framebuffer GPU→CPU readback plus a per-row scatter into guest pages on every
 /// composite Store, priced at 565 ms per second of wall clock on the x86/Vulkan
 /// rail. A boot that sets it must not be read for frame rate.
+///
+/// # What it measured: the deferral is not the icon producer
+///
+/// Two 14-round Finder recomposite boots under load, x86 / Vulkan, same HEAD:
+///
+/// ```text
+/// deferral on    3/14 corrupt   surface_flush 99, render_flush_over_guest_write 68
+/// deferral off   7/14 corrupt   no windows armed at all (t11_keep_gpu_only_denied 293/round)
+/// ```
+///
+/// With the rail off there is no window for a seed's guest-page read to land, so
+/// the seed really is independent of the resident — the confound above is gone —
+/// and the class still reproduces, at no lower a rate. The deferred type-11
+/// writeback does not produce the wrong composite. (The off arm ran on a session
+/// that had already survived an aborted round, so its *higher* rate is not a
+/// claim; the claim is only that corruption survives the arm.)
+///
+/// What the same pair did establish is the size of a different defect. Two of
+/// every three window landings were replacing guest bytes the guest itself had
+/// written since the Store — ~18 300 in one session, silently. That is what
+/// `render_flush_guest_written_ranges` now preserves, and it is a correctness
+/// fix on its own terms rather than a fix for this class.
+///
+/// For whoever takes the next step: the corrupt cell is *not* blank and never
+/// was. Read the crops. One control round put the Finder toolbar's sidebar
+/// toggle and a chevron where the Desktop folder icon belongs; an off-arm round
+/// put a narrow dark strip where Downloads belongs. Another UI element's pixels
+/// arrive at the icon's destination, which makes this a question about which
+/// source a sampled bind resolves to, not about whether a draw or a writeback
+/// was lost.
 pub fn store_defer_disabled(rail: StoreDeferRail) -> bool {
     static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {

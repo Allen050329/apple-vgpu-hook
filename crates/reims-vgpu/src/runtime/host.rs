@@ -416,6 +416,27 @@ pub trait HostOps {
     fn guest_write_gen(&self, _token: u64) -> Option<u64> {
         None
     }
+
+    /// Which pages of `token`'s set the host has observed written since
+    /// `since_gen`, in ascending GPA order.
+    ///
+    /// [`HostOps::guest_write_gen`] answers "did anything in this surface move",
+    /// which is the whole question for a reader deciding whether to reuse a
+    /// host-side copy: one moved page is enough to make the copy wrong. It is
+    /// *not* the whole question for a writer. A deferred writeback holds a frame
+    /// the device rendered and has to put it in the guest's pages later; if the
+    /// guest wrote some of those pages in between, writing the whole frame loses
+    /// the guest's stores and dropping the frame loses the device's. Neither is
+    /// correct, and the difference between them is exactly this list.
+    ///
+    /// `None` means the host cannot answer — no dirty bitmap, an unknown or
+    /// unarmed token, a `since_gen` of 0, or more written pages than it will
+    /// enumerate — and every caller must read it as "assume the whole set was
+    /// written". A short list would claim the unlisted pages are the guest's
+    /// own, which is the one answer that produces a wrong frame.
+    fn guest_written_pages(&self, _token: u64, _since_gen: u64) -> Option<Vec<u64>> {
+        None
+    }
 }
 
 /// Arm64e guest page size (16 KiB). FakeHost / map_pages test fixture only —
@@ -524,6 +545,11 @@ struct GuestWriteSet {
     pages: Vec<u64>,
     page_size: usize,
     gen_: u64,
+    /// Parallel to `pages`: the generation at which each page was last observed
+    /// written, 0 for never. Mirrors the shim's own per-page stamp, so a test
+    /// exercises the same shape the product answers from rather than a
+    /// simplification of it.
+    page_gen: Vec<u64>,
 }
 
 /// A guest page-table edit that fires from inside a device guest read.
@@ -617,8 +643,9 @@ impl FakeHost {
                 continue;
             }
             let base = gpa & !(set.page_size as u64 - 1);
-            if set.pages.binary_search(&base).is_ok() {
+            if let Ok(i) = set.pages.binary_search(&base) {
                 set.gen_ = set.gen_.wrapping_add(1);
+                set.page_gen[i] = set.gen_;
             }
         }
     }
@@ -944,6 +971,7 @@ impl HostOps for FakeHost {
         pages.dedup();
         self.guest_write_token_seq = self.guest_write_token_seq.wrapping_add(1);
         let token = self.guest_write_token_seq;
+        let page_gen = vec![0u64; pages.len()];
         self.guest_write_sets.insert(
             token,
             GuestWriteSet {
@@ -952,6 +980,7 @@ impl HostOps for FakeHost {
                 // Starts at 1, not 0: a caller that recorded "no token" as 0
                 // must not read back a matching generation from a live set.
                 gen_: 1,
+                page_gen,
             },
         );
         Some(token)
@@ -963,6 +992,21 @@ impl HostOps for FakeHost {
 
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
         self.guest_write_sets.get(&token).map(|s| s.gen_)
+    }
+
+    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        if since_gen == 0 {
+            return None;
+        }
+        let set = self.guest_write_sets.get(&token)?;
+        Some(
+            set.pages
+                .iter()
+                .zip(set.page_gen.iter())
+                .filter(|(_, g)| **g > since_gen)
+                .map(|(p, _)| *p)
+                .collect(),
+        )
     }
 
     /// Contiguous host view; `page_size` is the guest page size from the device.
@@ -1210,6 +1254,40 @@ mod tests {
         h.guest_wrote_page(7 * p);
         assert_eq!(h.guest_write_gen(a), Some(a1));
         assert_ne!(h.guest_write_gen(b), Some(b0));
+    }
+
+    /// The per-page report names the pages that moved and no others, and it
+    /// answers relative to the generation the caller recorded rather than to
+    /// "since some time".
+    ///
+    /// The `since_gen == 0` arm is the one that has to be `None` rather than
+    /// "nothing written": 0 is what a caller records when it never got a
+    /// readable generation, and answering it with an empty list would tell a
+    /// writeback that every page is its own to overwrite.
+    #[test]
+    fn guest_written_pages_names_which_pages_moved_since_a_recorded_generation() {
+        let mut h = FakeHost::new();
+        let p = GUEST_PAGE_SIZE as u64;
+        let t = h
+            .track_guest_writes(&[4 * p, 7 * p, 9 * p], GUEST_PAGE_SIZE)
+            .unwrap();
+        let g0 = h.guest_write_gen(t).unwrap();
+        assert_eq!(h.guest_written_pages(t, g0), Some(vec![]));
+
+        h.guest_wrote_page(7 * p + 3);
+        assert_eq!(h.guest_written_pages(t, g0), Some(vec![7 * p]));
+        let g1 = h.guest_write_gen(t).unwrap();
+
+        h.guest_wrote_page(4 * p);
+        // Ascending, and the page that moved before `g1` is not in `g1`'s answer.
+        assert_eq!(h.guest_written_pages(t, g0), Some(vec![4 * p, 7 * p]));
+        assert_eq!(h.guest_written_pages(t, g1), Some(vec![4 * p]));
+
+        // Untracked page, unknown token, and a caller with nothing recorded.
+        h.guest_wrote_page(11 * p);
+        assert_eq!(h.guest_written_pages(t, g1), Some(vec![4 * p]));
+        assert_eq!(h.guest_written_pages(t + 99, g1), None);
+        assert_eq!(h.guest_written_pages(t, 0), None);
     }
 
     /// Releasing a token frees the set and makes the generation unreadable —

@@ -153,6 +153,22 @@ pub fn cede_surface_to_resident(
     true
 }
 
+/// Drop this mapping's cache entry outright.
+///
+/// Distinct from [`cede_surface_to_resident`], and the difference is which
+/// source the reader is being sent to. A cession says "the engine resident holds
+/// this frame"; this says "nothing host-side does — read the surface's own
+/// pages". It is what a writeback that deliberately left some of the guest's own
+/// bytes in place has to do, because after one of those neither the cache nor the
+/// resident holds the mapping's content: they hold the frame the device rendered,
+/// and the pages hold that frame with the guest's stores still in it.
+///
+/// Removes rather than emptying, so [`surface_ceded_to_resident`] does not read
+/// the result as a cession and report a decline that names the wrong source.
+pub fn forget(state: &mut DeviceState, surface_id: u32) {
+    state.host_surfaces.remove(&surface_id);
+}
+
 /// Whether this mapping's cache entry is the ceded shell
 /// [`cede_surface_to_resident`] leaves behind: present at exactly this geometry
 /// and carrying no bytes.

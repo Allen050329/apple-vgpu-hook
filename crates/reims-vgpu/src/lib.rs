@@ -1452,6 +1452,7 @@ mod tests {
             track_guest_writes: None,
             untrack_guest_writes: None,
             guest_write_gen: None,
+            guest_written_pages: None,
             is_ram_gpa: None,
             notify_actions: None,
         }

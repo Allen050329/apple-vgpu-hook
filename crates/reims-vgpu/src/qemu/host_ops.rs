@@ -86,6 +86,19 @@ pub struct ReimsVgpuHostOps {
     /// was written; 0 for an unknown or not-yet-armed token. Safe from any
     /// thread.
     pub guest_write_gen: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
+    /// Page-aligned GPAs of the token's set written since `since_gen`, into
+    /// `out`, returning how many — or -1 for every case where the answer is not
+    /// knowable and the caller must assume the whole set was written. Safe from
+    /// any thread.
+    pub guest_written_pages: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            token: u64,
+            since_gen: u64,
+            out: *mut u64,
+            max: usize,
+        ) -> i64,
+    >,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -570,6 +583,32 @@ impl HostOps for QemuHost<'_> {
         // resident nothing has ever validated.
         (gen_ != 0).then_some(gen_)
     }
+
+    fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
+        if token == 0 || since_gen == 0 {
+            return None;
+        }
+        let f = self.ops.guest_written_pages?;
+        // The shim refuses rather than truncating, so the buffer has to be able
+        // to hold a whole surface's page list. A display-sized BGRA8 surface is
+        // ~2 000 x86 pages; the cap is a few times that so a larger one still
+        // gets an exact answer, and a set beyond it declines into "assume the
+        // whole surface was written" rather than into a short list.
+        const MAX_PAGES: usize = 16 * 1024;
+        let mut out = vec![0u64; MAX_PAGES];
+        // SAFETY: QEMU owns ctx; `out` is writable for MAX_PAGES u64s for the
+        // duration of the call, and the shim writes at most `max` of them.
+        let n = unsafe { f(self.ops.ctx, token, since_gen, out.as_mut_ptr(), MAX_PAGES) };
+        if n < 0 {
+            return None;
+        }
+        let n = usize::try_from(n).ok()?;
+        if n > MAX_PAGES {
+            return None;
+        }
+        out.truncate(n);
+        Some(out)
+    }
 }
 
 /// Host used when no QEMU ops table is bound (unit tests / headless create).
@@ -667,6 +706,7 @@ mod tests {
             track_guest_writes: None,
             untrack_guest_writes: None,
             guest_write_gen: None,
+            guest_written_pages: None,
             is_ram_gpa: None,
             notify_actions: None,
         }
