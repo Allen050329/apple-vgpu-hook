@@ -928,28 +928,6 @@ impl ResourcePools {
         }
     }
 
-    /// Retire a resident's claim to hold its mapping's content.
-    ///
-    /// The image keeps its pixels — the caller has just read them out — but they
-    /// are no longer what the surface *contains*, because the guest wrote part
-    /// of it and the merge of the two halves landed in the guest's own pages.
-    /// Every reader of `content_ready` is asking "may I use this instead of the
-    /// surface", and until a draw stores into this image again the answer is no.
-    ///
-    /// The inverse of [`Self::registry_mark_ready`], and deliberately not an
-    /// eviction: the slot, its image and its pin count survive, so a deferred
-    /// window still holding it is not orphaned.
-    pub(crate) fn registry_retire_content(&mut self, identity: &TargetIdentity) -> bool {
-        match self.registry.get_mut(identity) {
-            Some(slot) => {
-                slot.content_ready = false;
-                slot.content_epoch = None;
-                true
-            }
-            None => false,
-        }
-    }
-
     pub(crate) fn registry_set_layout(
         &mut self,
         identity: &TargetIdentity,
@@ -1061,45 +1039,6 @@ mod pin_count_tests {
             pools.registry.get(&id).unwrap().content_epoch,
             None,
             "the MRT-secondary ready arm must invalidate identically"
-        );
-    }
-
-    /// The merge that follows a guest write under a live resident reads the
-    /// image out, lands it in the pages the guest did not write, and then has to
-    /// stop the next bind taking the image again — otherwise the bind undoes the
-    /// merge it just paid for, and the surface is back to holding one half.
-    ///
-    /// Retiring is not eviction. The slot, its image and its pin count survive:
-    /// a deferred window still holding this resident must not be orphaned by a
-    /// sampled bind's repair.
-    #[test]
-    fn a_retired_resident_stops_standing_in_for_its_surface_but_keeps_its_pins() {
-        let mut pools = ResourcePools::new();
-        let id = pinned_identity();
-
-        assert!(
-            !pools.registry_retire_content(&id),
-            "an absent identity cannot be retired, and the caller must not read that as done"
-        );
-
-        pools.registry.insert(id.clone(), dummy_slot(true));
-        assert!(pools.registry_stamp_content_epoch(&id, 3));
-        assert!(pools.pin_resident_target(&id, true));
-
-        assert!(pools.registry_retire_content(&id));
-        let slot = pools.registry.get(&id).unwrap();
-        assert!(
-            !slot.content_ready,
-            "a retired resident must not be bound in place of its surface"
-        );
-        assert_eq!(
-            slot.content_epoch, None,
-            "the stamp claimed these pixels were the mapping's content; they are one half of it"
-        );
-        assert_eq!(slot.pin_count, 1, "a deferred window's pin must survive");
-        assert!(
-            !pools.registry_stamp_content_epoch(&id, 4),
-            "a retired resident cannot be re-vouched for without a draw storing into it"
         );
     }
 

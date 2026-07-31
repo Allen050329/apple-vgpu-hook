@@ -1062,10 +1062,40 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 #[cfg(feature = "backend-vulkan")]
                 let resident_id =
                     crate::runtime::present_identity::surface_identity(state, mid, w, h);
+                // Ready AND stamped as this mapping's content at its current
+                // epoch. `content_ready` alone says only that some draw stored
+                // into the image; it says nothing about whether anything has
+                // rewritten the surface since. The attachment LOAD elision has
+                // always compared the epoch pair before reusing a resident
+                // (`type11_resident_is_current`); this rung, which binds the
+                // same residents in place of the same surfaces, compared
+                // nothing. Every in-crate writer of a type-11 surface's pages
+                // goes through `mark_mapping_written`, so the mapping epoch is
+                // the total witness for them — including the skipping writeback,
+                // whose whole point is that the pages end up holding bytes the
+                // resident does not.
                 let resident_ready = {
                     #[cfg(feature = "backend-vulkan")]
                     {
-                        crate::backend::vulkan::engine::resident_content_ready(&resident_id)
+                        crate::backend::vulkan::engine::resident_content_ready(&resident_id) && {
+                            let current = type11_resident_is_current(
+                                Some(m.surface_content_epoch),
+                                crate::backend::vulkan::engine::resident_content_epoch(
+                                    &resident_id,
+                                ),
+                            );
+                            if !current {
+                                // How much of this rung the epoch pair costs. It
+                                // is the fast path — 92 730 binds on one boot —
+                                // and a stamp the Store rails fail to hand back
+                                // is indistinguishable here from a surface the
+                                // device really did rewrite.
+                                crate::runtime::drain::note_store_route(
+                                    "t11rung_resident_epoch_stale",
+                                );
+                            }
+                            current
+                        }
                     }
                     #[cfg(not(feature = "backend-vulkan"))]
                     {

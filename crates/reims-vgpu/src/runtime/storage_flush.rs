@@ -991,6 +991,20 @@ fn render_flush_guest_written_ranges<M: HostOps>(
     }
 }
 
+/// Whether a landed deferred window may hand the currency stamp back to the
+/// resident its frame came out of.
+///
+/// Only when the write succeeded *and* preserved nothing. A failed write leaves
+/// the pages holding neither frame; a write that preserved guest ranges leaves
+/// them holding the guest's bytes where the resident holds the device's, and
+/// stamping then says that image is the mapping's content to both rails that
+/// would bind a resident in place of a surface — the attachment LOAD elision and
+/// the sampled ladder's resident rung. Each would bind one half.
+#[cfg(feature = "backend-vulkan")]
+fn flush_publishes_the_resident(write_ok: bool, preserved: &[(u64, u64)]) -> bool {
+    write_ok && preserved.is_empty()
+}
+
 #[cfg(feature = "backend-vulkan")]
 fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1130,7 +1144,15 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // The stamp is refused for a slot that is absent or not content_ready, and a
     // failed write leaves `flushed_from_resident` unused, so both fall back to a
     // seed rather than to a wrong frame.
-    if ok {
+    //
+    // And never after a write that preserved guest ranges. The whole argument
+    // above is "the pixels did not change, they are the resident's" — which is
+    // true of a full write and false of this one: the pages the guest owns now
+    // hold the guest's bytes and the resident holds what the device rendered
+    // there instead. Handing the stamp back would say that image IS the
+    // mapping's content, to the LOAD elision and to the sampled ladder's
+    // resident rung, and both would then bind one half of a surface.
+    if flush_publishes_the_resident(ok, &preserve) {
         if let Some(identity) = flushed_from_resident {
             if let Some(epoch) = state
                 .mappings
@@ -1437,6 +1459,40 @@ pub(crate) fn owner_slug(owner: &crate::model::DeferredOwner) -> &'static str {
 #[cfg(test)]
 mod tests {
     use crate::model::{ComputeStorageResidencyKey, DeviceId, DeviceState, PAGE_SHIFT_X86};
+
+    /// A landed window hands the currency stamp back to the resident its frame
+    /// came out of, on the reasoning that the pages changed but the pixels did
+    /// not — they *are* the resident's, copied out of it one statement earlier.
+    ///
+    /// That reasoning is exactly false for a write that preserved guest ranges.
+    /// There the pages hold the guest's bytes where the resident holds the
+    /// device's, so the two are different pictures and the stamp would tell both
+    /// rails that bind residents in place of surfaces — the attachment LOAD
+    /// elision and the sampled ladder's resident rung — that this image is the
+    /// whole of it.
+    ///
+    /// The first attempt at this disqualified the resident by clearing its
+    /// `content_ready` instead. That resident is also the source every *other*
+    /// pending window on the same identity still has to flush from, and
+    /// withdrawing it mid-drain lost their frames outright: measured as
+    /// `chain_resident_land_fail reason=read_target` and `deferred_flush_lost
+    /// reason=resident_epoch_drift live=None`, both on 1920x1080 scanout
+    /// surfaces, and a black screen. Withholding the stamp disqualifies the
+    /// resident for the readers that must not use it without taking it away from
+    /// the writers that must.
+    #[test]
+    fn a_writeback_that_preserved_guest_bytes_does_not_publish_the_resident() {
+        assert!(super::flush_publishes_the_resident(true, &[]));
+        assert!(
+            !super::flush_publishes_the_resident(true, &[(0, 4096)]),
+            "the pages hold the guest's bytes there; this image is not the mapping's content"
+        );
+        assert!(
+            !super::flush_publishes_the_resident(false, &[]),
+            "a refused write left the pages holding neither frame"
+        );
+        assert!(!super::flush_publishes_the_resident(false, &[(0, 4096)]));
+    }
 
     fn key(mapping_id: u32, lo: u64, hi: u64) -> ComputeStorageResidencyKey {
         ComputeStorageResidencyKey {

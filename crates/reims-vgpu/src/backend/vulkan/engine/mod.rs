@@ -416,18 +416,6 @@ pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bo
     guard.pools.registry_stamp_content_epoch(identity, epoch)
 }
 
-/// Withdraw a resident's claim to hold its mapping's content.
-///
-/// For the caller that has just read this image out and merged it into the
-/// guest's own pages under the guest's newer stores: the pixels here are now one
-/// half of a surface, and the pages are the whole of it. Returns false when the
-/// identity is absent, which the caller must treat as "the resident may still be
-/// bound" rather than ignore.
-pub fn retire_resident_content(identity: &TargetIdentity) -> bool {
-    let mut guard = lock_engine();
-    guard.pools.registry_retire_content(identity)
-}
-
 /// Whether this backend may leave guest-visible content only in GPU-resident
 /// engine state.
 ///

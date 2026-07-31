@@ -380,19 +380,23 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         // guest's stores were preserved *from*.
         crate::runtime::surface_cache::forget(state, mapping_id);
         // The resident `src` was read out of does not have the guest's stores
-        // either, and the sampled ladder binds it in place of the surface. Only
-        // the LOAD elision is covered by the `mark_mapping_written` above, which
-        // moves `surface_content_epoch` past the resident's stamp; the sampled
-        // rung compares no epoch and would bind the half.
-        #[cfg(feature = "backend-vulkan")]
-        {
-            let identity =
-                crate::runtime::present_identity::surface_identity(state, mapping_id, mw, mh);
-            crate::backend::vulkan::engine::retire_resident_content(&identity);
-        }
-        // And now — with nothing host-side left claiming to be the surface — the
-        // guest-write stamp is re-taken, because the device has *adopted* the
-        // guest's stores: they are in the pages it just wrote around.
+        // either, but it is NOT retired here: it is also the source other
+        // deferred windows on the same identity are still going to flush from,
+        // and withdrawing its content mid-drain loses their frames outright
+        // (`chain_resident_land_fail reason=read_target`, `deferred_flush_lost
+        // reason=resident_epoch_drift live=None`, both on 1920x1080 scanout
+        // surfaces — measured, and a black screen).
+        //
+        // What disqualifies it instead is the `mark_mapping_written` above,
+        // which advances `surface_content_epoch` past the resident's stamp. Both
+        // rails that would bind a resident in place of this surface compare that
+        // pair — the attachment LOAD elision always did, and the sampled ladder's
+        // resident rung now does too. The caller that produced `src` must
+        // therefore not hand the stamp back after a skipping write; see
+        // `storage_flush::flush_render_one`.
+        //
+        // The guest-write stamp is re-taken, because the device has *adopted*
+        // the guest's stores: they are in the pages it just wrote around.
         //
         // Withholding it was the defect this rail shipped with. The stamp is the
         // `since` every later `guest_written_pages` call is asked against, and
