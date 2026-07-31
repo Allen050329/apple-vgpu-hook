@@ -204,6 +204,39 @@ meant to kill was never running. The `sweep()` in the repro scripts already writ
 `[q]emu-system-x86_64 -enable-kvm` for exactly this reason — the convention is right, it just has to
 reach the *waiting* code too, which is where a false positive costs an hour instead of a signal.
 
+### A scorer written from one report is blind to the rest of the class
+
+`scrollpatch.py` — the Goal 3 gate — flagged a pixel only when it was *bright and unsaturated*, on
+the stated grounds that "the observed defect paints white". That is a rule about one user report, not
+about the bug class, and it made the instrument blind to the two likelier shapes of the same loss: a
+tile whose content never landed is **transparent**, so the capture shows the page background
+(`#101040`, dark); and a freshly allocated surface that was never written is **zero-filled**, so it
+shows black. Both are the defect. Neither is white.
+
+The harness ran three times and scored `none` three times. Measured by injecting each fill into a
+synthetic control and re-scoring: the old rule called **three of four injected patches CLEAN** —
+background, black, and a missing cell layer — and caught only literal white. So those three null
+results were never evidence about the device.
+
+Scoring is now against the page's *palette*: a pixel is a defect when it is not one of the colours
+the page is made of, whatever it is instead. The palette is **measured from the control capture**,
+not read from the generator's CSS, because Safari renders through the display colour profile and
+`#c02020` in the stylesheet is not `(0xc0,0x20,0x20)` in the framebuffer — comparing against the
+declared value needs a tolerance wide enough to swallow real defects.
+
+That moves the whole verdict onto the control, so the control needs its own gates, and they are the
+usual asymmetry: the page must be reachable in few flat colours and those must cover ≥ 98 % of the
+non-chrome control (a photograph or a desktop capture fails this), **and** neither the page
+background nor the band fill may appear in it. The cells cover the viewport, so a control showing
+either is *itself* patched — and admitting that colour to the palette would score every later capture
+carrying the same patch as CLEAN. That is the one failure direction that reads as a pass, so it
+aborts.
+
+An abort prints no `VERDICT=` line, and `case "$line" in *VERDICT=PATCHED*)` reads an empty line as
+not-patched. `shoot()` therefore synthesises `VERDICT=UNSCOREABLE` and the report lists those
+separately: **an unscoreable capture is neither clean nor patched**, and any of them voids the
+`none` on the line above it.
+
 Two counters in that census were themselves blind until `2327a79`. `*_stamp_outlived` compares a
 window's `armed_stamp_seq` against `DeviceState::completion_stamp_seq`, and only `write_stamp`
 advanced that counter — the root completion stamp, written inline by `drain_main_fifo`, did not. A
