@@ -2406,6 +2406,83 @@ mod tests {
         );
     }
 
+    /// The other drift refusal, and the one a live boot actually takes.
+    ///
+    /// `map_generation` drift is the guest's *declared* rebind; page drift is a
+    /// type-4 surface re-pointed with nothing declared, which is the shape
+    /// traced end to end on a control boot — a 1225x512 WebKit tile whose
+    /// backing was fabricated at its own GVA, then refused when the live walk
+    /// disagreed. Both refusals are correct and both lose the tile, so both have
+    /// to be countable apart; testing only the sibling would leave the branch a
+    /// live boot exercises uncovered.
+    #[test]
+    fn a_render_window_over_repointed_pages_is_refused_and_counted() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::Type4Walk;
+        use crate::runtime::host::{FakeHost, HostMemory};
+
+        const BACKING_PFN: u32 = 9;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        // Depth-1 table: the live translation of GVA page 9 is `data0`.
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa + u64::from(BACKING_PFN) * 4, &pte)
+            .unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        {
+            let m = state.mappings.entry(9).or_default();
+            m.mapped = true;
+            // The generation still matches the window's, so this test cannot
+            // pass through the sibling's branch: the only thing wrong is where
+            // the cached entry points.
+            m.map_generation = 1;
+            m.page_entries = vec![(0x77u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: BACKING_PFN,
+                map_generation: 1,
+            });
+        }
+        state
+            .compute_deferred_flush
+            .insert(key(9, 0, 256), render_owner(1));
+        let before = crate::runtime::drain::store_route_count("rendflush_page_drift");
+        let cap = crate::observe::FailCapture::start();
+        assert!(
+            !super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX),
+            "a window whose pages moved must report the loss"
+        );
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("kind=render") && line.contains("reason=mapping_page_drift"),
+            "the re-pointed pages must be the stated refusal, not the generation: {line}"
+        );
+        assert!(
+            state.compute_deferred_flush.is_empty(),
+            "the trigger consumes the window it took, so the obligation is gone"
+        );
+        assert_eq!(
+            crate::runtime::drain::store_route_count("rendflush_page_drift"),
+            before + 1,
+            "the page-drift loss must be counted on the store-route census"
+        );
+    }
+
     /// A window landing over pages the guest wrote preserves nothing and says
     /// so; one landing over untouched pages preserves nothing and stays quiet.
     ///
