@@ -539,36 +539,49 @@ can be both after the Store and before the writeback does not exist", so that "a
 `render_flush_over_guest_write` after the binding names a window that landed outside the fence
 anyway, which is a defect and not a cost."
 
-One 600 s driven x86/Vulkan boot on the shipped default binary (`/tmp/type4ab/arm-1`, summed per the
-per-interval rule) falsifies the second half of that:
+One boot of the four falsifies the second half of that, and the other three are the reason this
+section is worth reading. All four are 600 s driven x86/Vulkan boots from the same A/B, same
+workload, counters summed per the per-interval rule:
 
 ```text
-surface_resident                35 115
-surface_flush                   35 115     every armed window landed
-rendw_stamp_outlived                 0     none of them outlived its fence
-rendw_stamp_same                35 115
-render_flush_over_guest_write      679     1.9 % still wrote over guest bytes
+                    surface_flush   rendw_stamp_outlived   render_flush_over_guest_write
+arm-1                      35 115                      0                             679
+arm-2                      41 014                      0                               0
+ctl-1                      41 105                      0                               0
+ctl-2                      37 551                      0                               0
 ```
 
-Both columns are as strong as they look — **zero** windows landed late, and **679** of them replaced
-bytes the guest had written since the Store. The inference joining them is what is wrong: the guest
-does not need to be told the render is finished before it may write to an IOSurface it owns, so
-CoreGraphics blits and inter-buffer damage forward-copies land in the Store→fence interval whether or
-not the window is punctual. The interval is short, not absent. The doc comment should be read as a
-statement of intent, not as an invariant the census confirms.
+**`rendw_stamp_outlived` is 0 in every boot and `render_flush_over_guest_write` is 679 in one of
+them, so the two cannot be the same event.** That is the whole refutation and it does not need a
+rate. The joining inference is what fails: the guest does not need to be told the render is finished
+before it may write to an IOSurface it owns, so CoreGraphics blits and inter-buffer damage
+forward-copies land in the Store→fence interval whether or not the window is punctual. The interval
+is short, not absent. Read the doc comment as intent, not as an invariant the census confirms.
 
-Two reasons to trust the 679 rather than suspect the instrument. The verdict comes from
+**Do not quote 679 as a rate.** An earlier revision of this section did — it called the clobber "1.9 %
+of windows" from that single boot, and three further boots on the same binary and workload scored
+**zero**. The instrument was not asleep in them: `t11_gw_armed` is 69 532–70 779 across all four and
+`t11rung_resident_gw_clean` 124 910–143 569, so the witness was armed and answering in every boot and
+answered `Wrote` in only one.
+
+Nor is it a burst. Binned by 30 s, arm-1's clobbers run 29–54 per bin continuously from t ≈ 110 s to
+the end of the boot, so that boot entered a state at two minutes in and stayed there while three
+others never entered it at all. 541 of the 679 are on five 1920×1080 compositor mappings, which is
+what a guest doing sustained CPU compositing into the surfaces we also render into would look like.
+The most likely reading is a **workload difference between sessions**, not a device state — but
+nobody has varied it deliberately, so that is a hypothesis.
+
+Two reasons the instrument itself is not the suspect. The verdict comes from
 `host.guest_write_gen(token)` — QEMU's own dirty generation for the tracked page set — so it does not
 share a code path with the fence machinery it is being compared against, which is the failure mode
 this document warns about elsewhere. And it is a three-way verdict: `NoStamp` and `Unreadable` are
 counted separately, so `Wrote` requires a real baseline generation and a real differing one.
 
-What it does **not** yet establish is harm. The clobbers concentrate on surfaces that are redrawn
-every frame — 541 of 679 on five 1920×1080 compositor mappings — where a replaced guest write
-self-heals on the next frame. The tail is the interesting part (1240×702 Safari content, 15×622
-scrollbars), and nobody has tied a single clobber to a visible artefact. Treat this as the leading
-**Goal 3** mechanism by rate — 679 per boot against `mapping_page_drift`'s 1 — and not as a
-demonstrated loss.
+Harm is **not** established. The concentration on surfaces redrawn every frame is exactly where a
+replaced guest write self-heals; the interesting tail (1240×702 Safari content, 15×622 scrollbars) is
+small, and nobody has tied a single clobber to a visible artefact. What the four-boot spread does say
+is that any A/B scoring this counter needs **many boots per arm**: an arm of three boots could score
+0 and mean nothing.
 
 Do not "fix" it by preserving the guest's pages without a control. The same function records a
 bisect where a preserving variant scored **0 of 14 rounds clean with the screen black at 19 Hz**,
