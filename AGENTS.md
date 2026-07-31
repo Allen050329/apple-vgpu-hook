@@ -1722,6 +1722,46 @@ So: the leak is measured, the mechanism is understood, and **the fix is not chos
 is, gate it and A/B it on this counter — `host_cache_levels` is now the instrument for exactly that,
 and the 60-resize drive above is a repro that moves it by 4x in four minutes.
 
+##### Killed by measurement: the entries are not dead-task entries
+
+The task-death candidate above was the obvious rule and it is **wrong**, which is why
+`gva_cache_staleness` was written before the patch rather than after. A second boot, same 60-resize
+drive, reading the new columns:
+
+```text
+round  0 (idle)   gva= 28   gva_dead_task=0   gva_no_backing=0
+round  5          gva=227   gva_dead_task=0   gva_no_backing=0
+round 10          gva=293   gva_dead_task=0   gva_no_backing=0
+round 15          gva=331   gva_dead_task=0   gva_no_backing=0
+```
+
+**Every one of the 331 accumulated entries is backed by a task that is still active, and not one is
+unbacked.** Task-death eviction would have reclaimed exactly nothing while reading like a fix. The
+compositor survives every resolution change and simply keeps allocating new virtual addresses; the
+abandoned ones are live-task entries that nothing will ever ask for again.
+
+Two facts from the same boot worth carrying:
+
+- `gva_largest` is **33 423 360 = 3840 x 2176 x 4** — a 4K entry with its height padded to a multiple
+  of 64, so it costs **4x** the 8 294 400 of a 1080p one. Entry *count* alone understates what a
+  4K-heavy session holds, which is why the gauge reports `largest`.
+- `gva_backing_bytes` reached 305 952 — the page lists are ~0.2 % of the pixel bytes, so they are
+  real but not where the memory is. Do not spend a rule on them.
+
+There is also **no memory-reclaim eviction path at all**: `evict_gva` has exactly one product caller
+(`metal_draw/vulkan.rs`, on the deferred-Store re-arm), and it evicts *the same key* being replaced,
+for correctness — stale encodes must not serve. Nothing anywhere walks the map to drop an abandoned
+address. Note the neighbouring deferred-window map *is* bounded, by `GVA_DEFERRED_WINDOW_CAP`; the
+encode cache never got the equivalent.
+
+The next candidate, and it is unmeasured: evict entries whose recorded `GvaBacking::gpas` no longer
+match a fresh walk of the key. That is the same standard the dead-task rule was reaching for — drop
+only what a lookup could never serve — applied to the backing instead of the task, and it is aimed at
+exactly what a resolution change produces (a freed or re-pointed VA). Measure its yield the way the
+last one was measured, with a probe column, before writing the eviction: walking the first recorded
+GPA of each entry is one host read per entry per census and is enough to tell a moved backing from a
+live one.
+
 Not a crash, on this boot: 60 resizes, QEMU alive, 0 guest panics, 0 firmware aborts, 0 losses on
 every rail. 291 MB is not an out-of-memory. The reason this is written up under Goal 4 anyway is that
 "after a couple resizes the whole thing just crashing" wants an unbounded resource, and this is the
