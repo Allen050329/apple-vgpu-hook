@@ -1398,7 +1398,7 @@ pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64, u64) {
             continue;
         };
         backing_bytes += (backing.gpas.len() * std::mem::size_of::<u64>()) as u64;
-        // Same liveness test `type4_pages_still_ours` applies before trusting a
+        // Same liveness test `type4_pages_witness` applies before trusting a
         // walk: present in the table AND flagged active.
         let live = state
             .tasks

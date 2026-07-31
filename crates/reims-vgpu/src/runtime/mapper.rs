@@ -1077,19 +1077,56 @@ pub fn revalidate_mapping_reason<H: HostMemory + HostOps>(
 /// [`crate::runtime::storage_flush::deferred_pages_still_ours`], which asks the
 /// same question about a window's armed page set. This one asks it about a
 /// mapping's list, which is what the mapping-keyed rails write through.
-pub fn type4_pages_still_ours<H: HostMemory>(
+/// Which of the two `true`s a bare "are these pages still ours" bool would
+/// have returned.
+///
+/// That function's contract says a caller must not read `true` as "these pages
+/// were verified", because four of its five exits check nothing at all. Every
+/// caller then collapsed both meanings into [`PagesVerdict::Ours`], and the
+/// counters built on it — `mapw_pages_vouched` 29 002 against
+/// `mapw_pages_refused` **0** on one boot — cannot say whether that zero is a
+/// guard that passed or a guard that was never armed. Those are opposite claims
+/// about the write-after-free class and the census reported them identically.
+///
+/// This is the denominator, and it is measure-only: [`Unwitnessed`] still
+/// yields a token and still lets the write through, exactly as before. Nothing
+/// here changes policy; it changes what the boot can say about it.
+///
+/// [`Unwitnessed`]: Type4Witness::Unwitnessed
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Type4Witness {
+    /// Every page of the cached list was re-walked and agreed. The only exit
+    /// that is evidence the list still names the surface's memory.
+    Verified,
+    /// Nothing was checked. Carries which of the four states it was, because
+    /// they are not one outcome: a surface that never latched a walk is a
+    /// different gap from one whose walk was superseded.
+    Unwitnessed(&'static str),
+    /// The re-walk disagreed, or the owning task is gone.
+    Drifted,
+}
+
+/// Re-walk a mapping's cached page list, reporting which exit it took.
+pub fn type4_pages_witness<H: HostMemory>(
     state: &DeviceState,
     host: &H,
     mapping_id: u32,
-) -> bool {
+) -> Type4Witness {
     let Some(m) = state.mappings.get(&mapping_id) else {
-        return true;
+        return Type4Witness::Unwitnessed("no_mapping");
     };
     let Some(walk) = m.type4_walk else {
-        return true;
+        // No type-4 walk was ever latched for this mapping, so this witness has
+        // never had anything to say about it. The type-11 rail lives here.
+        return Type4Witness::Unwitnessed("no_walk");
     };
-    if walk.map_generation != m.map_generation || m.page_entries.is_empty() {
-        return true;
+    if walk.map_generation != m.map_generation {
+        // The list has been replaced since the walk was latched. The new list
+        // may be perfectly good — it simply has no witness of its own yet.
+        return Type4Witness::Unwitnessed("walk_superseded");
+    }
+    if m.page_entries.is_empty() {
+        return Type4Witness::Unwitnessed("no_pages");
     }
     let page_shift = state.page_shift;
     let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
@@ -1107,7 +1144,7 @@ pub fn type4_pages_still_ours<H: HostMemory>(
             walk.task_id,
             m.page_entries.len()
         ));
-        return false;
+        return Type4Witness::Drifted;
     };
     for (i, &entry) in m.page_entries.iter().enumerate() {
         let gva = ((walk.backing_pfn as u64) + i as u64) << page_shift;
@@ -1137,7 +1174,7 @@ pub fn type4_pages_still_ours<H: HostMemory>(
                 walk.task_id,
                 m.page_entries.len()
             ));
-            return false;
+            return Type4Witness::Drifted;
         };
         if cached != Some(live) {
             // Which of the two disagreements this is decides who is at fault, and
@@ -1183,10 +1220,10 @@ pub fn type4_pages_still_ours<H: HostMemory>(
                 m.page_entries.len(),
                 Some(live)
             ));
-            return false;
+            return Type4Witness::Drifted;
         }
     }
-    true
+    Type4Witness::Verified
 }
 
 /// Proof that a mapping's cached page list named the guest memory it was walked
@@ -1195,7 +1232,7 @@ pub fn type4_pages_still_ours<H: HostMemory>(
 ///
 /// # Why a token and not a call
 ///
-/// [`type4_pages_still_ours`] existed for a release with exactly one caller —
+/// [`type4_pages_witness`] existed for a release with exactly one caller —
 /// [`crate::runtime::storage_flush::flush_render_one`] — while every other write
 /// through `MappingEntry::page_entries` went unchecked. That is not an oversight
 /// that a second call site fixes: the check has to be *reachable only through*
@@ -1251,7 +1288,7 @@ impl PagesVouched {
 /// the next type-4 bind re-resolves the surface from the object list.
 ///
 /// Returning a token when there is nothing to check is deliberate and is why
-/// [`type4_pages_still_ours`] documents `true` as "nothing to check" rather than
+/// [`type4_pages_witness`] reports "nothing to check" separately rather than
 /// "verified": a mapping with no [`crate::model::Type4Walk`] latch has a page
 /// list this witness cannot speak about, and refusing every write to it would
 /// blank surfaces the device has no evidence against.
@@ -1296,8 +1333,16 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
 /// instruments.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PagesVerdict {
-    /// The re-walk agreed with the cached list, or there was nothing to check.
+    /// The re-walk agreed with the cached list, every page of it.
     Ours,
+    /// Nothing was checked; the payload is which of the four states it was, per
+    /// [`Type4Witness::Unwitnessed`]. **The write proceeds exactly as it does
+    /// for [`Self::Ours`]** — this variant changes no policy. It exists because
+    /// `Ours` used to mean both "verified" and "unverifiable", so a boot
+    /// reporting `mapw_pages_refused = 0` could not say whether its guard had
+    /// passed or had simply never been armed, and those are opposite claims
+    /// about the write-after-free class.
+    Unwitnessed(&'static str),
     /// The re-walk disagreed, but `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF` is set, so
     /// the write proceeds anyway and the list is left alone. This is the control
     /// arm: same binary, unguarded behaviour, counters still emitted.
@@ -1320,8 +1365,12 @@ pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> PagesVerdict {
-    if type4_pages_still_ours(state, host, mapping_id) {
-        return PagesVerdict::Ours;
+    match type4_pages_witness(state, host, mapping_id) {
+        Type4Witness::Verified => return PagesVerdict::Ours,
+        // Same policy as `Verified` — the write goes through — and a different
+        // counter, because only one of the two is evidence.
+        Type4Witness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
+        Type4Witness::Drifted => {}
     }
     if crate::observe::mapping_page_guard_disabled() {
         return PagesVerdict::DriftedButGated;
@@ -2414,7 +2463,7 @@ mod tests {
     /// that always says "drifted" would pass the first half and refuse every
     /// legitimate write in production.
     #[test]
-    fn type4_pages_still_ours_sees_a_rewire_no_packet_announced() {
+    fn the_page_witness_sees_a_rewire_no_packet_announced() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
         use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
@@ -2454,7 +2503,7 @@ mod tests {
             });
         }
         assert!(
-            super::type4_pages_still_ours(&state, &host, 6),
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Verified,
             "the list was just walked from this page table"
         );
 
@@ -2469,7 +2518,7 @@ mod tests {
             "no packet arrived, so nothing bumped the incarnation"
         );
         assert!(
-            !super::type4_pages_still_ours(&state, &host, 6),
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
             "a fresh walk names a different page, and a writeback through the \
              cached one lands in whatever the guest gave it to"
         );
@@ -2483,8 +2532,10 @@ mod tests {
             m.type4_walk = Some(walk);
         }
         assert!(
-            super::type4_pages_still_ours(&state, &host, 6),
-            "a stale latch says nothing about the current list and must not refuse"
+            super::type4_pages_witness(&state, &host, 6)
+                == super::Type4Witness::Unwitnessed("walk_superseded"),
+            "a stale latch says nothing about the current list — it must not refuse, \
+             and it must not be counted as a verification either"
         );
 
         // And the check must be able to say yes: put the translation back and
@@ -2499,8 +2550,72 @@ mod tests {
         st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
         host.write_gpa(root_gpa, &pte).unwrap();
         assert!(
-            super::type4_pages_still_ours(&state, &host, 6),
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Verified,
             "the translation is back where the list says it is"
+        );
+    }
+
+    /// "Nothing to check" must not be reported as "checked and fine".
+    ///
+    /// Four of this witness's exits check no pages at all, and every caller used
+    /// to collapse them into the same `PagesVerdict::Ours` a full clean re-walk
+    /// produces. The counters built on that cannot distinguish a guard that
+    /// passed from one that was never armed — opposite claims about the
+    /// write-after-free class — and one boot reported `mapw_pages_vouched`
+    /// 29 002 against `mapw_pages_refused` 0 without being able to say which it
+    /// meant.
+    ///
+    /// This pins the split, and pins that it is measurement only: an
+    /// `Unwitnessed` verdict still issues a `PagesVouched` token, so the write
+    /// proceeds exactly as before.
+    #[test]
+    fn a_mapping_with_nothing_to_check_is_not_counted_as_verified() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::model::{DeviceId, PAGE_SHIFT_X86};
+        use crate::runtime::host::FakeHost;
+
+        let host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.map_surface(6);
+        {
+            let m = state.mappings.get_mut(&6).unwrap();
+            m.mapped = true;
+            m.page_entries = vec![(4u32 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            // No `type4_walk`: nothing ever latched a walk for this mapping.
+            m.type4_walk = None;
+        }
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Unwitnessed("no_walk"),
+            "a list nothing walked is unwitnessed, not verified"
+        );
+
+        // An empty list and an absent mapping are their own states, because a
+        // single slug would make four different gaps look like one.
+        state.mappings.get_mut(&6).unwrap().page_entries.clear();
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 6),
+            super::Type4Witness::Unwitnessed("no_walk"),
+        );
+        assert_eq!(
+            super::type4_pages_witness(&state, &host, 999),
+            super::Type4Witness::Unwitnessed("no_mapping"),
+        );
+
+        // Policy is unchanged: the verdict still hands back a token, so the
+        // writers this gates still write. Only the counter differs.
+        let mut state = state;
+        let verdict = super::mapping_pages_verdict(&mut state, &host, 6);
+        assert!(
+            matches!(verdict, super::PagesVerdict::Unwitnessed(_)),
+            "got {verdict:?}"
+        );
+        let (verdict, token) = super::vouch_mapping_pages_verdict(&mut state, &host, 6);
+        assert!(matches!(verdict, super::PagesVerdict::Unwitnessed(_)));
+        assert!(
+            token.is_some(),
+            "an unwitnessed list still writes — this split is a measurement, \
+             not a new refusal"
         );
     }
 
@@ -2553,7 +2668,7 @@ mod tests {
                 map_generation: m.map_generation,
             });
         }
-        assert!(super::type4_pages_still_ours(&state, &host, 6));
+        assert!(super::type4_pages_witness(&state, &host, 6) != super::Type4Witness::Drifted);
 
         // The translation goes away rather than moving: the PTE is cleared, so
         // the walk fails outright.
@@ -2563,7 +2678,7 @@ mod tests {
         st32(&mut pte, 0);
         host.write_gpa(root_gpa, &pte).unwrap();
         assert!(
-            !super::type4_pages_still_ours(&state, &host, 6),
+            super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
             "a page the table cannot translate must not vouch for a write"
         );
         let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
@@ -2645,7 +2760,7 @@ mod tests {
                 .unwrap_or_default()
                 .len();
             assert!(
-                !super::type4_pages_still_ours(&state, &host, 6),
+                super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
                 "an entry that disagrees with the live walk must refuse"
             );
             let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();

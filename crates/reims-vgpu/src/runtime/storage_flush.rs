@@ -1502,7 +1502,7 @@ fn note_mapping_window_against_fence(
 /// walked from, counted so a boot carries the rate and gated so an arm and its
 /// control stay one binary apart.
 ///
-/// The check is [`crate::runtime::mapper::type4_pages_still_ours`]; this is the
+/// The check is [`crate::runtime::mapper::type4_pages_witness`]; this is the
 /// deferred rails' use of it, and it is the missing half of a guarantee the
 /// raw-GVA rails already have. `gva_view::write_span` re-walks the task page
 /// table at write time and fails closed, stating outright that a write through a
@@ -1557,6 +1557,14 @@ fn mapping_pages_still_ours<M: HostMemory + HostOps>(
     match crate::runtime::mapper::mapping_pages_verdict(state, host, mapping_id) {
         PagesVerdict::Ours => {
             crate::runtime::drain::note_store_route("mapping_pages_ours");
+            true
+        }
+        // Lands exactly as `Ours` does; counted apart because it is not the
+        // same claim. `mapping_pages_ours` used to include every flush this
+        // witness had nothing to say about, so the ratio it appeared to give
+        // against `mapping_pages_drifted` was not the guard's hit rate.
+        PagesVerdict::Unwitnessed(_) => {
+            crate::runtime::drain::note_store_route("mapping_pages_unwitnessed");
             true
         }
         // Counted before the knob is consulted, so a control boot still reports

@@ -153,6 +153,20 @@ fn vouch_for_write<M: HostMemory + HostOps>(
         mapper::PagesVerdict::Ours => {
             crate::runtime::drain::note_store_route("mapw_pages_vouched");
         }
+        // The write proceeds exactly as for `Ours`; only the counter differs.
+        // `mapw_pages_vouched` used to carry both, so its companion zero
+        // (`mapw_pages_refused`) could not distinguish a guard that passed from
+        // one that was never armed. Read the two together: `vouched` is the
+        // guard's coverage and `unwitnessed` is the hole in it.
+        mapper::PagesVerdict::Unwitnessed(why) => {
+            crate::runtime::drain::note_store_route("mapw_pages_unwitnessed");
+            crate::runtime::drain::note_store_route(match why {
+                "no_walk" => "mapw_unwit_no_walk",
+                "walk_superseded" => "mapw_unwit_superseded",
+                "no_pages" => "mapw_unwit_no_pages",
+                _ => "mapw_unwit_no_mapping",
+            });
+        }
         // Counted whether or not the knob let the write through, so a control
         // boot still reports how many writes it would have refused. The knob
         // prices the guard in lost frames; the counter prices the defect.
@@ -1664,7 +1678,7 @@ mod tests {
     /// away, and this asserts it in the currency of the bug: the bytes of the
     /// page the surface moved to.
     ///
-    /// `type4_pages_still_ours` shipped with exactly one caller — the deferred
+    /// The page-drift witness shipped with exactly one caller — the deferred
     /// render flush — so this rail, which writes a full frame of pixels through
     /// `MappingEntry::page_entries`, was unguarded. The crash reports are the
     /// receipt: WindowServer aborting in `small_free_list_remove_ptr_no_clear`,

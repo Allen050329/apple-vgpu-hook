@@ -814,7 +814,7 @@ pub fn surface_cache_gen_strict() -> bool {
 
 /// Bisection knob (`REIMS_VGPU_MAPPING_PAGE_GUARD_OFF=1`): let a deferred
 /// mapping-keyed flush write through a page list a fresh walk says has moved,
-/// the way it did before `mapper::type4_pages_still_ours`.
+/// the way it did before `mapper::type4_pages_witness`.
 ///
 /// The counters `mapping_pages_ours` / `mapping_pages_drifted` are emitted
 /// whichever way this is set, on purpose: with the guard off a boot still

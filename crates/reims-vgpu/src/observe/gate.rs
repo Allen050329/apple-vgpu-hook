@@ -1017,8 +1017,9 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
 /// The page-drift witness has exactly one production caller, so the policy and
 /// its control knob cannot be bypassed by adding a rail.
 ///
-/// `mapper::type4_pages_still_ours` answers *whether* a mapping's cached page
-/// list still names the guest memory it was walked from.
+/// `mapper::type4_pages_witness` answers *whether* a mapping's cached page
+/// list still names the guest memory it was walked from — and, since it reports
+/// `Unwitnessed` apart from `Verified`, whether it was in a position to know.
 /// `mapper::mapping_pages_verdict` decides what the device does about the
 /// answer: count it, consult `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF`, and — when it
 /// refuses — invalidate the list rather than skip one write. Those are separable
@@ -1045,11 +1046,11 @@ fn the_page_drift_witness_is_only_consulted_through_the_policy() {
         let masked = mask_comments_and_literals(&production);
         let text: String = masked.iter().copied().map(char::from).collect();
         for (index, line) in text.lines().enumerate() {
-            if !line.contains("type4_pages_still_ours") {
+            if !line.contains("type4_pages_witness") {
                 continue;
             }
             // Its own definition, and the one function allowed to ask it.
-            if line.contains("pub fn type4_pages_still_ours") {
+            if line.contains("pub fn type4_pages_witness") {
                 continue;
             }
             callers.push(format!("{}:{}", rel(&path, &root), index + 1));
