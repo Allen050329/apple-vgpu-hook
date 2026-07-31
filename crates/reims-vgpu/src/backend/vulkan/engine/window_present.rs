@@ -1412,27 +1412,48 @@ fn window_cadence_line(
     )
 }
 
+/// Order the present blit's read of a guest-content source after every draw
+/// that produced it, and put it in `TRANSFER_SRC_OPTIMAL` if it is not there.
+///
+/// Unconditional, and the layout match is the reason rather than an exemption.
+/// A barrier is a layout transition *and* a dependency; a resident that a
+/// render pass just finished writing is already in `TRANSFER_SRC_OPTIMAL`,
+/// because that is the layout the pass resolves its primary attachment to. So
+/// gating on "a transition is needed" skipped the dependency on precisely the
+/// frames that had just been drawn — the direct-present path, reading a target
+/// whose draw may not have landed.
+///
+/// Nothing else orders it. The present records into its own command buffer and
+/// submits it separately; queue submission order starts command buffers in
+/// order but does not finish them in order, and is not a memory dependency. A
+/// render pass's implicit final subpass dependency ends at
+/// `dstStageMask = BOTTOM_OF_PIPE` with `dstAccessMask = 0`, so the colour
+/// writes are available and visible to nothing.
+///
+/// The failure this produces is not wrong pixels but a stale frame: the blit
+/// copies the resident as it stood before the draw, and the screen shows a
+/// composite missing what was just rendered into it until some later redraw
+/// publishes it. When the transition half is a no-op the barrier still does
+/// this job, which is the one that was missing.
 unsafe fn transition_source(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
     old_layout: vk::ImageLayout,
 ) {
-    if old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-        image_barrier(
-            device,
-            cmd,
-            image,
-            old_layout,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                | vk::AccessFlags::SHADER_WRITE
-                | vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::TRANSFER,
-        );
-    }
+    image_barrier(
+        device,
+        cmd,
+        image,
+        old_layout,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            | vk::AccessFlags::SHADER_WRITE
+            | vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::TRANSFER_READ,
+        vk::PipelineStageFlags::ALL_COMMANDS,
+        vk::PipelineStageFlags::TRANSFER,
+    );
 }
 
 #[allow(
