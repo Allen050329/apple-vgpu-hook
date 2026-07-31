@@ -709,6 +709,27 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
 /// been two defects since it was first split (see
 /// [`crate::observe::sink::content_reuse_disabled`]): a high-recycling round
 /// corrupts reliably, and something else corrupts occasionally regardless.
+///
+/// # Cross-validated on a second boot, and it earns its keep by refusing credit
+///
+/// The next 14-round boot scored **1 corrupt of 14**, against 7 of 14 on the
+/// one above, with a fix landed in between. Read as a rate that would have been
+/// a result. Scored against this counter it is not: *every round of that boot
+/// was in the low mode* (peak 74.4, against a corrupting threshold of ~127), so
+/// the model predicted no high-mode corruption and there was none. The
+/// improvement is the load, not the change.
+///
+/// Pooled over both boots the split holds:
+///
+/// ```text
+/// high mode  6 rounds   6 corrupt   100 %
+/// low  mode 22 rounds   3 corrupt    14 %
+/// ```
+///
+/// This is why the raw corrupt-round count must not be used to score a change
+/// on this class, and it is the first quantity here that can say so. A boot that
+/// never enters the high mode cannot confirm or refute a fix for the reliable
+/// defect, and two of the three boots taken this session did not.
 pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
     state: &DeviceState,
     host: &H,

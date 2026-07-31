@@ -5023,6 +5023,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // pages. The read path did not ask, which left the two
                     // sides of one window disagreeing about whether it still
                     // belongs to its address. Same question, same helper.
+                    //
+                    // **Measured, and it never fires.** One 14-round Finder
+                    // recomposite boot: `gva_xpass_load_same_alloc` 3142,
+                    // `gva_xpass_load_realloc` **0**. So a deferred GVA window
+                    // whose address has been handed to another allocation is
+                    // not something this rail actually sees, and closing the
+                    // asymmetry changed no frame. It stays because the two
+                    // sides of one window disagreeing is a defect whether or
+                    // not the guest currently exercises it, and because a zero
+                    // with a denominator is the only way to say so.
                     let window_is_still_ours = state
                         .gva_deferred_flush
                         .get(&c0.target_gva)
@@ -6352,11 +6362,34 @@ fn mapping_guest_write_verdict<M: HostOps>(
 /// rungs that read the guest's own pages — so a stale hit is not corrected by
 /// anything below it.
 ///
-/// `t11rung_host_cache_gw_*` is a **reading, not a gate**. The gate would be
-/// the same one-line refusal the GVA cache now carries, and it is deliberately
-/// not applied until this census says the rung carries traffic and how much of
-/// it the witness would refuse. Turning an unmeasured rail off is how a fix
-/// gets credited with a change it did not make.
+/// # What it measured on its first boot
+///
+/// One 14-round Finder recomposite boot under load, x86 / Vulkan:
+///
+/// ```text
+/// t11rung_resident    92730
+/// t11rung_host_cache  14396     gw_clean 0  gw_no_stamp 14092  gw_wrote 304
+/// t11rung_zero_copy    4977
+/// t11rung_guest_memo     51
+/// t11rung_miss            0
+/// ```
+///
+/// `gw_clean` is **zero**. Every one of 14 396 binds served a host-side copy of
+/// type-4 surface pages that the hypervisor could not vouch for — 14 092 of
+/// them because the mapping was never armed with a guest-write token at all,
+/// and 304 because the guest had demonstrably rewritten the pages since the
+/// Store. This is the same defect the GVA encode cache carried, on the surface
+/// rail, at roughly thirty times the traffic, and it is worse here for a
+/// structural reason: this rung sits *above* `t11rung_zero_copy` and
+/// `t11rung_guest_memo`, both of which read the guest's own pages, so a stale
+/// hit is never corrected by anything below it. The comment that used to sit on
+/// that rung said it was taken unconditionally because "there is nothing for the
+/// cache bytes to lose to". There is: the guest's pages.
+///
+/// `t11rung_host_cache_gw_*` remains a **reading, not a gate**. `no_stamp` says
+/// "nobody asked the host to watch these pages", which is not the same finding
+/// as "the guest wrote them", and a refusal keyed on the pooled answer would
+/// turn 98 % of this rung off on the strength of a rail that was never armed.
 #[cfg_attr(not(feature = "backend-vulkan"), allow(dead_code))]
 fn note_type11_sample_rung<M: HostOps>(
     state: &DeviceState,
