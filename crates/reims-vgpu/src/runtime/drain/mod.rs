@@ -3371,6 +3371,30 @@ static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static
 /// ground alone — see
 /// [`crate::backend::vulkan::engine::exec::resident_read_source_scope`] — but
 /// they do not move this class.
+///
+/// # A scoring flaw that inverts verdicts, recorded here because the harness is not tracked
+///
+/// The repro scripts live under `.agents/`, which is gitignored, so a fix made
+/// there does not survive to the next session and this warning would vanish
+/// with it.
+///
+/// `iconscore.py` scores a capture by counting blue blobs in a horizontal band
+/// and comparing the count to `--expect`. Its own description defines the
+/// population as "blue blobs of near-identical area", but it only ever policed
+/// the *small* side of that (a `shrunk` class). On 2026-07-31 an unrelated blue
+/// object of area 3247, against an icon median of 1235, entered the band and
+/// was counted toward `expect`. That **inverted the verdict of all fourteen
+/// rounds of a probe boot**: a round showing all seven icons counted 8 and read
+/// CORRUPT, and a round genuinely missing one counted 7 and read CLEAN.
+///
+/// It was caught only by re-deriving each round's verdict from the *positions*
+/// of the blobs rather than their number. Any conclusion of the form "n corrupt
+/// rounds out of m" is worth exactly as much as the assumption that nothing
+/// else blue and icon-sized was on screen, and that assumption is not
+/// self-checking. A symmetric `outsized` exclusion, reported on the output line
+/// rather than applied silently, is the fix; if the harness in front of you
+/// does not print `outsized=` when something is excluded, it predates this and
+/// its verdicts should be re-derived positionally before they are believed.
 pub fn note_store_route(route: &'static str) {
     note_store_route_n(route, 1);
 }

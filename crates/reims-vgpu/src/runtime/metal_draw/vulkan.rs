@@ -4772,6 +4772,39 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // cannot produce, because one wrong icon among
                             // ~11 000 draws a round is invisible to any
                             // population count.
+                            //
+                            // # What it answered: the icon is not blank when it
+                            // is sampled
+                            //
+                            // One 14-round probe boot, x86 / Vulkan, 3 rounds
+                            // with a genuinely missing icon (victims at two
+                            // different cells). Per round, the 64x64 resident
+                            // binds and their `distinct` values:
+                            //
+                            // ```text
+                            // corrupt  d<=2: 1, 2, 1   of 12, 14, 16 binds
+                            // clean    d<=2: 0 .. 3    of  9 .. 15 binds
+                            // ```
+                            //
+                            // The corrupt rounds sit inside the clean range on
+                            // both counts, and one clean round had *no* flat
+                            // 64x64 bind at all while every corrupt round had
+                            // one. So the compositor is not sampling a blank
+                            // icon: at bind time the icon textures carry their
+                            // content, in corrupt rounds as much as in clean
+                            // ones.
+                            //
+                            // That moves the defect downstream of the sample.
+                            // The pixels exist and are correct when they are
+                            // bound; they do not reach the screen. The label
+                            // beside the missing icon always renders, and in
+                            // this compositor the label is a separate layer
+                            // from the icon image, so "one draw of the two was
+                            // lost" is consistent with everything seen. The
+                            // failure channel is silent across those rounds,
+                            // which — if a draw really is being lost — is a
+                            // "Never Fail Silently" violation and the next
+                            // thing worth hunting.
                             #[cfg(feature = "backend-vulkan")]
                             SampledSourceRequest::Target(identity) => {
                                 match crate::backend::vulkan::engine::read_target(identity) {
