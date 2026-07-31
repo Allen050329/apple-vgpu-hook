@@ -678,6 +678,36 @@ sentinel values, rate limits — not just its happy answer. `guest_write_startup
 `finish_guest_write_arming` are that, kept opt-in so turning them on is a deliberate statement by the
 rail under test rather than a silent change to a hundred unrelated assertions.
 
+### A source gate that strips `mod tests {}` still reads eight whole test files as shipped code
+
+`observe/gate.rs` scans the crate's own source to answer questions no runtime test can — "which
+writes can reach guest RAM with no page set bounding them?", "does every caller of the witness go
+through the policy?". Every one of those scans first calls `production_source`, which strips
+`#[cfg(test)] mod tests { … }` **blocks** so a fixture exercising a product helper is not scored as a
+shipping use of it.
+
+That is the wrong half of the problem. A test module can also be a **file**, declared
+`#[cfg(test)] mod tests;` and living in `tests.rs` next door, and `production_source` sees that file
+as an ordinary module with no `#[cfg(test)]` anywhere in it. Eight files in this crate are declared
+that way today, and they are not all obviously test files by name:
+
+```text
+runtime/drain/tests.rs   runtime/compute_exec/tests.rs   runtime/metal_draw/tests.rs
+runtime/icb/tests.rs     backend/vulkan/caps/gate.rs     backend/vulkan/translate/gate.rs
+backend/vulkan/translate/coverage.rs                     observe/gate.rs
+```
+
+The last one is the gate file itself, so every source scan was reading its own scanning code as
+product. All three scans were affected and none of them was wrong *yet* — which is the point: the
+gate would have started lying the first time a fixture in one of those files called the pattern being
+counted, and it would have lied in the direction of a larger, more alarming count that a reader would
+then chase.
+
+`production_files` is the fix — enumerate the files a `#[cfg(test)] mod x;` declaration names and drop
+them before scanning — and it has a test asserting the **exact** dropped set in both directions, so
+neither adding a test file nor promoting one to product can move the denominator silently. A source
+gate needs the same treatment as a harness: it fails in the direction that looks like a finding.
+
 ### The corruption lands in the page the surface left, not the one it moved to
 
 Worth knowing before writing any repro for the write-after-free class, because it decides which
@@ -1734,6 +1764,32 @@ It is the same shape as the `Retired` trap — **a check whose negative is indis
 positive** — with the sign flipped: here the harness reports failure where there is none, which is
 the cheaper direction but still costs a diagnosis. Either poll for the *success* condition alone with
 a bounded attempt count, or latch "qemu was seen alive" before treating its absence as death.
+
+### An abandoned boot keeps port 2222, and the next run scores the guest it left behind
+
+The mirror of the section above, and far more expensive, because this one reads as a *pass*.
+
+Every repro here reaches the guest through `hostfwd=tcp::2222-:22` and waits for ssh to answer.
+Interrupting a driver script in the foreground does not take its VM with it: `boot-x86.sh` is
+`nohup`'d, so QEMU survives, keeps the guest running, and keeps listening on 2222. The next run then
+gets ssh on its **first** poll — it prints `guest is up after 0s`, which is not a plausible boot time
+and is exactly what a healthy fast start would look like at a glance — and proceeds to drive and
+score **the previous run's guest**, on the previous run's binary, with the new arm's name on the row.
+
+That is worse than a wedge. A wedge produces no data; this produces a full, well-formed row that
+attributes one binary's behaviour to another. Everything downstream of it is arm-swapped, and nothing
+in the output says so.
+
+Before launching any boot, sweep and check the port:
+
+```sh
+pkill -9 -f '[q]emu-system-x86_64 -enable-kvm'; pkill -9 -f '[b]oot-x86.sh'
+ss -ltn | grep :2222 && echo "STALE GUEST — do not launch"
+```
+
+Bracket a character in those patterns for the reason the `pgrep` section above gives, and treat
+`guest is up after 0s` as a harness fault rather than good luck: the boot script rebuilds QEMU first,
+so the floor on an honest boot is minutes, not seconds.
 
 ### `host_cache_levels` is a level, and `store_routes` is a rate
 
