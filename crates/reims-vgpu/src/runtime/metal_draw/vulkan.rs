@@ -3144,6 +3144,19 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::drain::note_store_route("lin_rung_gva_bypassed");
+    // This rung validates `texture_ref` + geometry and **not** the GVA, so on
+    // paper it can serve one resource's pixels under another's ref after the
+    // guest rebinds a ref to a different descriptor at the same size. It reads
+    // as the most dangerous cache in the sampled ladder, and it is not, because
+    // it is never taken: `lin_rung_gva_bypassed` and `lin_rung_guest_memo` are
+    // *equal* in every per-second window of two full 14-round boots (441/441,
+    // 684/684, 2318/2318, …), which means every bypass falls straight past this
+    // rung to the guest's own pages. `lin_rung_texref` has never appeared in a
+    // census line.
+    //
+    // Left in place rather than deleted: a rung with zero traffic is not a rung
+    // that cannot be reached, and its counter is what says so. Do not spend a
+    // session on it without first showing `lin_rung_texref` is nonzero.
     if let Some(bgra) = crate::runtime::surface_cache::get_texture(state, texture_ref, w, h) {
         crate::runtime::drain::note_store_route("lin_rung_texref");
         let rgba = swap_rb_channels(bgra);
@@ -4993,8 +5006,45 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         height: h,
                         generation: 0,
                     };
+                    // A GVA is only a name, and this rail trusts one across
+                    // passes. `TargetIdentity::Gva` carries `generation: 0` at
+                    // every construction site, so the engine registry keys a
+                    // resident on (gva, width, height) alone — and the guest
+                    // recycles addresses hard enough that this crate already
+                    // has a detector for it. The window this Load is about to
+                    // trust was armed against a specific page set; if the
+                    // address now resolves to pages that set never held, the
+                    // resident behind it holds the *previous* allocation's
+                    // pixels and loading them would paint one resource's
+                    // picture as another's prior content.
+                    //
+                    // The flush path has refused exactly this condition since
+                    // it was written, to keep a write off somebody else's
+                    // pages. The read path did not ask, which left the two
+                    // sides of one window disagreeing about whether it still
+                    // belongs to its address. Same question, same helper.
+                    let window_is_still_ours = state
+                        .gva_deferred_flush
+                        .get(&c0.target_gva)
+                        .cloned()
+                        .is_some_and(|entry| {
+                            crate::runtime::storage_flush::window_pages_still_ours(
+                                state,
+                                host,
+                                c0.target_gva,
+                                &entry,
+                                "xpass_load",
+                                "resident=refused",
+                            )
+                        });
+                    crate::runtime::drain::note_store_route(if window_is_still_ours {
+                        "gva_xpass_load_same_alloc"
+                    } else {
+                        "gva_xpass_load_realloc"
+                    });
                     if will_target_registry
                         && entry_geom == Some((w, h))
+                        && window_is_still_ours
                         && crate::backend::vulkan::engine::resident_content_ready(&identity)
                     {
                         chain_load_from_target = true;

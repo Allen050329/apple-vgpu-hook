@@ -425,12 +425,13 @@ pub fn flush_gva_exact<M: HostMemory + HostOps>(
 /// content either way — `host_cache_store_gva_layer` runs unconditionally — so
 /// nothing renderable is lost by refusing.
 #[cfg(feature = "backend-vulkan")]
-fn window_pages_still_ours<M: HostMemory + HostOps>(
+pub(crate) fn window_pages_still_ours<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     gva: u64,
     entry: &crate::model::GvaDeferredEntry,
     trigger: &str,
+    outcome: &str,
 ) -> bool {
     deferred_pages_still_ours(
         state,
@@ -440,6 +441,7 @@ fn window_pages_still_ours<M: HostMemory + HostOps>(
         entry.span(),
         &entry.pages,
         &format!("{}x{} trigger={trigger}", entry.width, entry.height),
+        outcome,
     )
 }
 
@@ -452,9 +454,20 @@ fn window_pages_still_ours<M: HostMemory + HostOps>(
 /// hazard with no check at all while the GVA rail had one, purely because the
 /// check lived inside the GVA-shaped function.
 ///
-/// Returns `true` when the window may still be written to guest RAM.
+/// Returns `true` when the window still names the pages it was armed on.
+///
+/// `outcome` names what the caller gives up when this answers `false`, because
+/// the question has two consumers that lose different things. A flush asks it
+/// to keep a write off somebody else's pages (`guest=refused`). The cross-pass
+/// resident Load asks it to keep somebody else's pixels from being loaded as
+/// this draw's own prior content (`resident=refused`) — the same drift, read
+/// from the other side. One hardcoded outcome word would make one line a lie.
 #[cfg(feature = "backend-vulkan")]
-fn deferred_pages_still_ours<M: HostMemory + HostOps>(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drift question names the window, its armed pages, and what the caller loses"
+)]
+pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
@@ -462,6 +475,7 @@ fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     span: u64,
     armed: &std::collections::HashSet<u64>,
     what: &str,
+    outcome: &str,
 ) -> bool {
     if span == 0 || armed.is_empty() {
         return true;
@@ -500,7 +514,7 @@ fn deferred_pages_still_ours<M: HostMemory + HostOps>(
     }
     crate::observe::fail(format!(
         "deferred_window_page_drift gva={gva:#x} task={task_id} {what} \
-         armed_pages={} live_pages={} moved={} foreign={} guest=refused",
+         armed_pages={} live_pages={} moved={} foreign={} {outcome}",
         armed.len(),
         live.len(),
         armed.difference(&live).count(),
@@ -563,7 +577,7 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
             "gva_deferred_flush",
         );
     }
-    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger) {
+    if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger, "guest=refused") {
         // The window's pages moved under us. Cache-only: see
         // `window_pages_still_ours` for why writing here lands in another
         // owner's memory. This is the REPORT — it walks every page of the window
@@ -738,6 +752,7 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
                 "{}x{} trigger=linear_flush ref={texture_ref}",
                 key.width, key.height
             ),
+            "guest=refused",
         ),
         None => true,
     };
@@ -2595,6 +2610,7 @@ mod tests {
                 0,
                 &gva_entry(1, 4, 4, &[data0]),
                 "gva_alias",
+                "guest=refused",
             ),
             "an unmoved window must stay writable — a guard that refuses every \
              flush means the guest never sees a Store"
@@ -2614,6 +2630,7 @@ mod tests {
                 0,
                 &gva_entry(1, 4, 4, &[9 * page]),
                 "gva_alias",
+                "guest=refused",
             ),
             "a window whose pages moved must be refused, not merely reported"
         );
@@ -2638,6 +2655,7 @@ mod tests {
                 0,
                 &gva_entry(1, 4, 4, &[7 * page, 8 * page]),
                 "clear_store",
+                "guest=refused",
             ),
             "a short walk that resolves a page the window was never armed on is \
              not a teardown — it is a write into another owner's pages"
@@ -2660,11 +2678,115 @@ mod tests {
                 0,
                 &gva_entry(1, 4, 4, &[data0, 8 * page]),
                 "clear_store",
+                "guest=refused",
             ),
             "a walk that came back short but entirely inside the armed pages is \
              the teardown case, and its rows land in this window's own memory"
         );
         assert_eq!(drift_lines(at), 0, "a subset walk must stay quiet");
+    }
+
+    /// The same window, asked by the reader instead of the writer.
+    ///
+    /// `TargetIdentity::Gva` carries `generation: 0` at every construction site,
+    /// so the engine registry keys a GVA resident on `(gva, width, height)`
+    /// alone. The cross-pass resident Load in `encode_draw_chain` trusts that
+    /// resident as a draw's *prior content*, gated on a deferred window existing
+    /// at the address with matching geometry — conditions a different allocation
+    /// reusing the address satisfies exactly. The flush path had refused that
+    /// drift since it was written; the read path did not ask, which left the two
+    /// sides of one window disagreeing about whether it still belonged to its
+    /// name.
+    ///
+    /// What this pins is that the reader gets the same verdict *and its own
+    /// outcome word*. A drift line is the only record either consumer leaves,
+    /// and `guest=refused` on a line emitted by a Load would say guest memory
+    /// was protected when what was actually refused was a stale picture.
+    #[test]
+    fn the_resident_load_reader_gets_the_same_drift_verdict_under_its_own_name() {
+        use crate::contract::endian::st32;
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::runtime::host::{FakeHost, HostMemory};
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let (dir_gpa, root_gpa, data0) = (2 * page, 3 * page, 4 * page);
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+
+        crate::observe::redirect_logs_for_tests();
+        let tail = |from: usize| -> String {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .get(from..)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.starts_with("deferred_window_page_drift "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mark = || {
+            std::fs::read_to_string(crate::observe::fail_log_path())
+                .unwrap_or_default()
+                .len()
+        };
+
+        // The address still names the pages the window was armed on, so the
+        // resident behind it is this allocation's own prior frame and the Load
+        // may take it. Refusing here would cost a seed on every chained pass.
+        let at = mark();
+        assert!(
+            super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[data0]),
+                "xpass_load",
+                "resident=refused",
+            ),
+            "an unmoved window's resident is the draw's own prior content"
+        );
+        assert_eq!(tail(at), "", "an unmoved window must be quiet on both sides");
+
+        // The guest handed this address to a different allocation. The resident
+        // still exists, still has the geometry, and still reports content_ready
+        // — every gate the Load had before this check. It holds the previous
+        // allocation's pixels.
+        let at = mark();
+        assert!(
+            !super::window_pages_still_ours(
+                &state,
+                &host,
+                0,
+                &gva_entry(1, 4, 4, &[9 * page]),
+                "xpass_load",
+                "resident=refused",
+            ),
+            "a reallocated address must not load the previous owner's pixels as \
+             this draw's prior content"
+        );
+        let line = tail(at);
+        assert!(
+            line.contains("trigger=xpass_load"),
+            "the line must name the reader that asked: {line}"
+        );
+        assert!(
+            line.contains("resident=refused"),
+            "the reader refuses a resident, not a guest write: {line}"
+        );
+        assert!(
+            !line.contains("guest=refused"),
+            "a Load must not claim it protected guest memory: {line}"
+        );
     }
 
     /// The linear compute-storage rail gets the same drift decision as the GVA
@@ -2732,6 +2854,7 @@ mod tests {
                 span,
                 &[data1].into_iter().collect(),
                 "8x8 trigger=linear_flush ref=5",
+                "guest=refused",
             ),
             "an unmoved linear window must stay writable — a guard that refuses \
              every flush means the guest never sees a compute Store"
@@ -2754,6 +2877,7 @@ mod tests {
                 span,
                 &[9 * page].into_iter().collect(),
                 "8x8 trigger=linear_flush ref=5",
+                "guest=refused",
             ),
             "a linear window whose pages moved must be refused — and a zero-length \
              walk from misreading span_end as an end address would permit it"
