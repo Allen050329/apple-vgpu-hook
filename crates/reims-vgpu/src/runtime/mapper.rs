@@ -1121,6 +1121,64 @@ pub fn ensure_guest_write_token<H: HostOps>(
     Some(token)
 }
 
+/// Record the host's guest-write generation for a mapping whose pixels a Store
+/// has just published, registering its pages for tracking the first time.
+///
+/// Called from every rail that publishes a type-11 surface: the Vulkan Store
+/// rails next to their `surface_content_epoch` stamp, and the CPU writer in
+/// [`crate::runtime::mapping_write`] next to the host-cache store it makes
+/// authoritative. Lives here rather than in the Vulkan draw path because
+/// `mapping_write` is backend-agnostic and the witness is not a backend concern.
+///
+/// Historically only the Vulkan Store rails armed it, which is why the type-4
+/// sampled ladder's first census read `t11rung_host_cache_gw_no_stamp` 14 092
+/// against `gw_clean` 0: the copy that rung serves is written here, and nothing
+/// here had ever asked the host to watch the pages it is a copy of.
+///
+/// Next to that rail's
+/// `surface_content_epoch` stamp. The two are halves of one witness — the epoch
+/// covers writers inside this crate, this covers the guest CPU — and a rail that
+/// wrote only the epoch would let the elision vouch for a resident on evidence
+/// that cannot see the surface's owner. The resident-store rail did exactly that
+/// and it was the whole of the rail's traffic: one boot measured
+/// `surface_resident` ~210/s against zero calls through the readback rails.
+///
+/// 0 is written for every unknown, and it is never a live generation (the host's
+/// first readable one is 1), so a surface whose host cannot answer fails the
+/// currency test instead of passing it by default.
+pub fn stamp_guest_write_gen<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+) {
+    let gen_ = match crate::runtime::mapper::ensure_guest_write_token(state, host, mapping_id) {
+        None => {
+            // The host cannot watch these pages: no dirty bitmap, or the mapping
+            // has no page list to name. Counted, because a rail whose
+            // registration silently never happens is indistinguishable from a
+            // guest that writes every frame, and the two want opposite fixes.
+            crate::runtime::drain::note_store_route("t11_gw_untracked");
+            0
+        }
+        Some(token) => match host.guest_write_gen(token) {
+            // The host has the pages but cannot vouch for them yet: its report
+            // only becomes a fact about the guest once logging has been on for a
+            // full interval.
+            None => {
+                crate::runtime::drain::note_store_route("t11_gw_unarmed");
+                0
+            }
+            Some(gen_) => {
+                crate::runtime::drain::note_store_route("t11_gw_armed");
+                gen_
+            }
+        },
+    };
+    if let Some(m) = state.mappings.get_mut(&mapping_id) {
+        m.guest_write_gen_at_store = gen_;
+    }
+}
+
 /// Revalidate + collect page-aligned GPAs for a mapped surface (GVA order).
 ///
 /// Fails closed on empty / invalid entries and known transport/control-page

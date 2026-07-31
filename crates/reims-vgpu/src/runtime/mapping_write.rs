@@ -291,6 +291,14 @@ pub fn write_bgra8<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    // This write just made the host copy and the guest pages agree, so it is the
+    // moment the copy's currency can be pinned. Nothing else arms this mapping:
+    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
+    // copy that rung serves is written here. Unstamped, the reader cannot tell a
+    // surface the guest has rewritten from one it has not, and must assume the
+    // worst on every bind.
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -456,6 +464,14 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    // This write just made the host copy and the guest pages agree, so it is the
+    // moment the copy's currency can be pinned. Nothing else arms this mapping:
+    // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against
+    // `gw_clean` 0 because only the Vulkan Store rails ever stamped, and the
+    // copy that rung serves is written here. Unstamped, the reader cannot tell a
+    // surface the guest has rewritten from one it has not, and must assume the
+    // worst on every bind.
+    crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
     true
 }
 
@@ -1127,6 +1143,60 @@ mod tests {
         // 2x2 BGRA, stride 8
         assert!(write_bgra8(&mut state, &mut host, 3, &src, 8, 2, 2));
         assert_eq!(state.mappings.get(&3).unwrap().content_generation, 1);
+    }
+
+    /// The write that makes the host copy authoritative must also arm the
+    /// witness for it.
+    ///
+    /// This function writes the guest pages and then stores the host render
+    /// cache, so at this instant the two agree — the one moment the copy's
+    /// currency can be pinned. Nothing else armed it: the type-4 sampled
+    /// ladder's first census read `t11rung_host_cache_gw_no_stamp` 14 092
+    /// against `gw_clean` 0, because only the Vulkan Store rails ever stamped
+    /// while the copy that rung serves is written here. Unstamped, the reader
+    /// cannot tell a surface the guest has rewritten from one it has not, and
+    /// has to assume the worst on every bind.
+    #[test]
+    fn a_host_cache_write_arms_the_guest_write_witness_for_the_copy() {
+        use crate::runtime::host::HostOps;
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let pfn = 0x30u32;
+        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
+        host.map_range(gpa, 0x4000, 0);
+        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        state.map_surface(11);
+        state.attach_mapping_internal(11, 0);
+        let m = state.mappings.get_mut(&11).unwrap();
+        m.mapping_internal = 1;
+        m.page_entries = vec![entry];
+        assert!(state.set_mapping_geom(11, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+
+        assert_eq!(
+            state.mappings[&11].guest_write_token, 0,
+            "nothing has armed this mapping yet"
+        );
+        let src = [0x11u8, 0x22, 0x33, 0x44, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(write_bgra8(&mut state, &mut host, 11, &src, 8, 2, 2));
+
+        let token = state.mappings[&11].guest_write_token;
+        assert_ne!(token, 0, "the store must register the pages it copied");
+        assert_eq!(
+            host.guest_write_gen(token),
+            Some(state.mappings[&11].guest_write_gen_at_store),
+            "the recorded generation must be the one the copy is current as of"
+        );
+
+        // A guest CPU store into the surface, with no device operation: the
+        // recorded generation no longer matches, which is exactly what the
+        // sampled ladder reads to refuse the copy.
+        host.guest_wrote_page(gpa);
+        assert_ne!(
+            host.guest_write_gen(token),
+            Some(state.mappings[&11].guest_write_gen_at_store),
+            "a guest write must move the host's generation away from the stamp"
+        );
     }
 
     /// A guest write drops only the storage-residency mirror windows it
