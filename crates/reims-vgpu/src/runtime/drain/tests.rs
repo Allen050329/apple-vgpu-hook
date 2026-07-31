@@ -2941,3 +2941,70 @@ fn a_dmabuf_carried_present_is_unsampled_not_black() {
         PresentContentVerdict::Content
     );
 }
+
+/// The guest's fence drains BOTH raw-address deferred rails, not just the GVA
+/// render one.
+///
+/// `write_stamp` is this device's only statement that work is finished, and from
+/// the instant it lands the guest may free everything it allocated for that work.
+/// `flush_gva_windows_before_fence` put the GVA render rail inside that
+/// boundary; the linear compute-storage rail names a raw task GVA too
+/// (`ComputeStorageResidencyKey::linear` — `mapping_id` 0, task id parked in
+/// `map_generation`), so it has no mapping incarnation to refuse on and belongs
+/// inside the same boundary. Measured at one landing per ten minutes and 1 019
+/// fences late, so the ordering costs nothing and the window is real.
+///
+/// Asserted at `write_stamp` rather than on the flush helper because the
+/// contract is about the fence, not about a function: a future stamp path that
+/// forgets to drain would pass a helper-level test.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_completion_stamp_drains_the_linear_rail_as_well_as_the_gva_rail() {
+    use crate::model::{ComputeStorageResidencyKey, DeviceId, GvaDeferredEntry};
+    use crate::runtime::host::FakeHost;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    // A FIFO base page the stamp write can land in; without it `write_stamp`
+    // returns before doing anything and the test would pass vacuously.
+    let fifo_pfn = 0x40u32;
+    host.map_range((fifo_pfn as u64) << PAGE_SHIFT_X86, 0x1000, 0);
+    state.gfx.fifo_base_page = fifo_pfn;
+
+    let page = 0x9000u64;
+    state.arm_gva_deferred_window(
+        0x5000,
+        GvaDeferredEntry {
+            task_id: 3,
+            texture_ref: 11,
+            producer_object_type: 0,
+            width: 8,
+            height: 8,
+            row_stride: 32,
+            format: 0x50,
+            armed_seq: 1,
+            armed_stamp_seq: 0,
+            pages: [page].into_iter().collect(),
+            alloc_gen: 0,
+        },
+    );
+    let lin = ComputeStorageResidencyKey::linear(3, 52, 0x39f000, 512, 0x1000, 128, 135, 0x46);
+    state.arm_linear_deferred_window(lin, 1, [page + 0x1000].into_iter().collect());
+    assert!(!state.gva_deferred_flush.is_empty());
+    assert!(!state.linear_deferred_flush.is_empty());
+
+    write_stamp(&mut state, &mut host, 0, 7);
+
+    assert!(
+        state.gva_deferred_flush.is_empty(),
+        "the GVA rail must not survive the fence"
+    );
+    assert!(
+        state.linear_deferred_flush.is_empty(),
+        "the linear rail writes a raw task GVA too and must not survive the fence"
+    );
+    assert_eq!(
+        state.completion_stamp_seq, 1,
+        "the stamp counter advances once the guest has been told"
+    );
+}

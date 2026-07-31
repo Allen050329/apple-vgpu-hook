@@ -321,6 +321,12 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // which is why the page-set guard passed on 810 of 810 landings and the heap
     // corruption continued. See `storage_flush::flush_gva_windows_before_fence`.
     crate::runtime::storage_flush::flush_gva_windows_before_fence(state, host);
+    // The linear compute-storage rail names a raw task GVA too — `mapping_id` 0,
+    // task id parked in `map_generation` — so it has no mapping incarnation to
+    // refuse on and owes the guest exactly the same ordering. See
+    // `storage_flush::flush_linear_windows_before_fence`; it arms about once per
+    // ten minutes of heavy compositing, so this costs nothing measurable.
+    crate::runtime::storage_flush::flush_linear_windows_before_fence(state, host);
     let Some(off) = stamp_slot_offset(index, state.page_size()) else {
         return;
     };

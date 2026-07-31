@@ -549,11 +549,40 @@ capture_then_revert() {
 QEMU_PID=$!
 trap 'capture_then_revert signal; exit 130' INT TERM
 
+# A boot that boot.efi aborted is not a wedge, and it must not be scored as one.
+#
+# Observed shape, twice: QEMU stays alive, the guest never issues a single GPU
+# command, the host window shows the macOS boot-failure graphic, and the fail log
+# fills with nothing but `host_window_cadence`. That is indistinguishable from a
+# device hang by every signal an agent normally reads, and one session lost 53
+# minutes to it before anyone opened the serial log. The serial log says it
+# plainly:
+#
+#   AAPL: #[EB.MM.AKMR|!] Err(0xE) <- EB.M.BAPr2 2 2 50271 0x700000
+#   AAPL: #[EB.B.MN|!]    Err(0xE) <- EB.MM.AKMR
+#   AAPL: #[EB|STOP] 0x15
+#   OC: Boot failed - Aborted
+#
+# boot.efi could not get the contiguous kernel region it asks for at a fixed
+# guest-physical address, so it stopped before loading the kernel. Nothing after
+# that point is a reading about this device.
+#
+# Detect it and exit distinctly (125), so a batch can retry the boot instead of
+# waiting out TESTING_TIMEOUT and then treating the sample as data.
+BOOT_ABORT_RE='#\[EB\|STOP\]|Boot failed - Aborted'
+
 elapsed=0
 while kill -0 "$QEMU_PID" 2>/dev/null; do
   if [ "$elapsed" -ge "$TESTING_TIMEOUT" ]; then
     capture_then_revert "timeout ${TESTING_TIMEOUT}s — wedge verdict"
     exit 124
+  fi
+  if [ -s "$SERIAL_LOG" ] && grep -qE "$BOOT_ABORT_RE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "boot-x86.sh: GUEST FIRMWARE ABORTED THE BOOT — the kernel never loaded."
+    grep -E "$BOOT_ABORT_RE|EB\.MM\.AKMR|EB\.B\.MN" "$SERIAL_LOG" 2>/dev/null | tail -5
+    echo "boot-x86.sh: no measurement from this boot is about the device. Retry it."
+    capture_then_revert "boot.efi aborted — firmware boot failure, not a device wedge"
+    exit 125
   fi
   sleep 5
   elapsed=$((elapsed + 5))

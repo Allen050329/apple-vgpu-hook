@@ -575,6 +575,75 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 ) {
 }
 
+/// Land every armed linear compute-storage window, for the same reason and under
+/// the same contract as [`flush_gva_windows_before_fence`].
+///
+/// This rail writes a raw task GVA. `ComputeStorageResidencyKey::linear` sets
+/// `mapping_id` to 0 and stores the *task id* in `map_generation`, so there is no
+/// mapping incarnation to compare and no lifecycle notify anywhere in the wire
+/// format — exactly the position the GVA render rail is in, and exactly why
+/// `6bc2220` could clear `flush_render_one` and `flush_storage_one` on
+/// `map_generation` drift and could not clear this one.
+///
+/// # Measured before it was repaired
+///
+/// One x86/Vulkan boot on the crash-hunt workload (Safari on three compositing
+/// pages, Finder windows, then 600 s of Mission Control ×71, Spotlight ×71,
+/// window drags ×142):
+///
+/// ```text
+/// linw_stamp_same       0
+/// linw_stamp_outlived   1     task=5 ref=52 gva=0x39f000 128x135 stamps=1019
+/// ```
+///
+/// Both halves matter. The rail is late whenever it lands at all — the one
+/// landing in ten minutes came 1 019 fences after the guest was told the work was
+/// done. And it lands almost never, which is what makes the repair free: the
+/// objection that stopped the fence repair from being applied to the render rail
+/// was the cost of writing back full-screen frames ~98 % of which nothing reads,
+/// and there is no such cost here. One window per ten minutes is not a writeback
+/// budget.
+///
+/// A rate this low cannot on its own convict this rail of any guest crash, and no
+/// such claim is made. What it does mean is that the correct behaviour is also
+/// the cheap one, so there is nothing to trade.
+///
+/// Shares `REIMS_VGPU_FENCE_FLUSH_OFF=1` with the GVA rail: one knob restores the
+/// unbounded behaviour on both, so an arm and its control stay one binary apart.
+#[cfg(feature = "backend-vulkan")]
+pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) {
+    if state.linear_deferred_flush.is_empty() || crate::observe::fence_flush_disabled() {
+        return;
+    }
+    // Snapshot the keys first: `flush_linear_one` disarms its own window and may
+    // flush others through the cache paths below it, so iterating the live map
+    // would borrow it across a mutation. A key whose window is gone by the time
+    // it comes up disarms to `None` and the flush is a no-op on the guest.
+    let armed: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = state
+        .linear_deferred_flush
+        .iter()
+        .map(|(key, entry)| (*key, entry.generation))
+        .collect();
+    for (key, generation) in armed {
+        if !state.linear_deferred_flush.contains_key(&key) {
+            continue;
+        }
+        crate::runtime::drain::note_store_route("linw_fence_flush");
+        let _ = flush_linear_one(state, host, &key, generation);
+    }
+}
+
+/// Metal-direct builds never arm linear windows — nothing to land at the fence.
+#[cfg(not(feature = "backend-vulkan"))]
+pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
+    _state: &mut DeviceState,
+    _host: &mut M,
+) {
+}
+
 /// Score a deferred window about to write guest RAM against the guest's fence.
 ///
 /// [`crate::runtime::drain::write_stamp`] is the only thing this device says to
