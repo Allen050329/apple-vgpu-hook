@@ -1800,6 +1800,71 @@ every rail. 291 MB is not an out-of-memory. The reason this is written up under 
 first one anyone has found — but a session long enough to make 291 MB into an OOM has not been run,
 so **the link to the reported crash is a hypothesis and not a measurement.**
 
+##### Fixed by recency, because neither staleness rule was available
+
+Both rules the sections above sized are dead, and the third option was never a staleness rule at
+all. `host_gva_surfaces` is now bounded by `GVA_ENCODE_CACHE_BYTE_CAP` (128 MiB, the same value and
+the same basis as `LINEAR_SAMPLED_MEMO_BYTE_CAP`, which bounds the sibling cache holding the same
+content) with least-recently-**used** eviction.
+
+The reason recency is admissible where staleness is not is the one property both other rules lack,
+and `LruBytesMemo`'s own header already named it: an entry read every frame but never rewritten — a
+wallpaper plane — is touched on every hit, so it is the **hottest** thing in the map and can never
+be the victim. Eviction reaches only entries nothing has looked at. That makes this a resource
+bound rather than a guess about what the guest still wants, which is the bar this project holds
+itself to.
+
+The touch is the whole mechanism, so it is wired at the three product read paths
+(`seed_color_load`, the sampled read and the Load seed in `metal_draw`), charged on a **confirmed
+serve** and not on an attempted one.
+
+Measured, one interleaved pair, one binary apart (`REIMS_VGPU_GVA_CACHE_CAP_OFF=1` is the only
+difference), 60 guest-driven mode changes each, `.agents/repros/gva-cache-cap-ab.sh`:
+
+```text
+              resizes  census  gva_max  max gva_bytes   evicted  wanted  forgotten  drift
+arm (capped)     60      349      209    114 809 056      257       0        0        0
+ctl (uncapped)   60      351      277    153 905 896        0       –        –        0
+
+gva trajectory, every 40th census line
+  arm    0 113 176 140 173 131 167 136 133      <- oscillates under the bound
+  ctl    0 110 156 182 197 234 255 261 273      <- strictly climbing, never once down
+```
+
+Four statements, and the third is the one that makes this a fix rather than a trade.
+
+**The bound holds.** The arm never exceeded 109.5 MiB against a 112 MiB low-water mark, at any of
+349 samples. The control ended at 146.8 MiB — past the 128 MiB cap — and its entry count was still
+strictly monotonic at the last sample, exactly as the uncapped 60-resize boot before it was.
+
+**The cap engaged, so the arm is measured.** 257 evictions. An arm reporting `evicted=0` would be a
+cap that never fired, which is *not* the same claim as a cap that fired safely, and the harness
+reports it as `UNMEASURED` for the cost question for that reason.
+
+**It cost nothing measurable.** `gva_cap_wanted` — lookups that missed on an identity the cap had
+evicted, which is precisely the harm and nothing else — is **0 against those 257 evictions**, and
+`forgotten` is 0, so that zero is exact rather than a lower bound. The wallpaper is intact in both
+arms by eye and by colour: mean RGB 0.681/0.246/0.109 against 0.691/0.248/0.107.
+
+**The running total is exact.** `gva_cap_drift` (the total the cap tests against, minus the real sum
+the census computes anyway for `gva_bytes`) was **0 on all 700 census lines across both boots**. The
+cap reads a running total rather than re-summing the map on every store, because enforcement runs on
+the store path; a second source of truth is how a bound silently stops bounding, so it reports its
+own divergence.
+
+**Scope it.** One pair, one workload — resize churn on an otherwise idle desktop. It is not a rate,
+it does not say no workload can be harmed, and it does not touch the reported crash: 291 MB was
+never shown to be an OOM and this makes it not happen rather than proving it was the cause.
+
+Two traps worth keeping. `DESKTOP_MEAN_FLOOR` (0.70) is **mis-calibrated for this sequence** — both
+arms scored `DARK` at ~0.665 on captures whose wallpaper is plainly correct, because the capture is
+a 1280x719 letterboxed host window and the floor was set for a different one. The arm-versus-control
+comparison is what carries the wallpaper claim; the absolute floor would have read as a regression
+in both arms. And enforcement runs *after* the insert, so it must be told which address the
+triggering store just wrote or a single entry over the low-water mark evicts itself and is never
+cached at all — reachable in production, since `MAX_SCANOUT_DIM` is 8192 and admits a 256 MiB entry
+against a 112 MiB mark.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
