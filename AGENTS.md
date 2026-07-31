@@ -1474,6 +1474,44 @@ Do not start Goal 4 by reading present code. Start by getting the guest to chang
 and confirm the rig can observe the change — a repro that cannot reach the state reports a clean
 device, which is the failure this document already paid three `none` results for.
 
+#### The guest can now be driven to 4K, and x86/Linux does not reproduce Goal 4
+
+`.agents/repros/guest-display-mode.m` is ~60 lines of CoreGraphics compiled **in the guest**
+(`/usr/bin/clang` and Command Line Tools are present, and so is network). No third-party binary and
+nothing to install:
+
+```sh
+scp .agents/repros/guest-display-mode.m macos-vm:/tmp/
+ssh macos-vm 'cd /tmp && clang -framework CoreGraphics -framework Foundation -o guest-display-mode guest-display-mode.m'
+ssh macos-vm '/tmp/guest-display-mode list'        # 4 distinct geometries, incl. 3840x2160
+ssh macos-vm '/tmp/guest-display-mode set 3840 2160'
+```
+
+It prints the mode that *actually took* rather than the one requested, because a mode change that
+silently does not apply is the failure direction that reads as a pass — the repro would drive a
+resize that never happened and score the device clean.
+
+**Measured, and it is a negative:** 22 mode changes on one x86/Vulkan boot — 12 on an idle desktop,
+then 10 more with Safari on a Wikipedia article — alternating 1920×1080 and 3840×2160. QEMU survived
+all 22, the 4K desktop screenshots correctly with the wallpaper intact, and the fail log carries no
+`deferred_flush_lost`, no `mapping_page_drift`, and no staging decline (`no_source`,
+`upload_no_staging`, `staging_failed`).
+
+**The structural reason matters more than the count.** `request_guest_geometry`
+(`host_window/present.rs:1040`) is `#[cfg(target_os = "macos")]`, and it emitted **0**
+`host_window_guest_resize` lines across all 22 changes. So on a Linux host the window never follows
+the guest: the guest renders 3840×2160 and the device scales it into the 1921×1079 window it already
+had. The swapchain recreation, the `PendingGuestResize` hold, and the
+`GUEST_RESIZE_WARN_AFTER` drop-to-letterbox path — the machinery a resize crash would most likely
+live in — **never execute on x86/Linux at all**.
+
+That scopes Goal 4 sharply, and it is the kind of pathway-specific fact this document's support
+matrix exists to force. Either the defect is **arm64/macOS-only**, in which case it cannot be
+reproduced or fixed on this host and needs an Apple host; or it is in guest-side 4K rendering, which
+x86 does exercise and which did not fail here. Do not read 22 clean resizes as "Goal 4 is fixed" —
+read them as "the x86 arm does not carry it", and note that the user's own crash report is macOS
+13.7.8 on `iMac19,1`, which is the x86 guest.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
