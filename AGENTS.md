@@ -1538,6 +1538,34 @@ pinned QEMU, so no boot has produced a footprint yet and the density figure abov
 not measured. The first driven boot on a tree carrying it should record the real density here —
 that number is what every later hit is weighed against.
 
+##### The completeness gate keyed on one source of the pointer, and missed the largest rail
+
+Worth reading before writing any gate of this shape, because it was green and wrong for one commit
+and the thing it was wrong about is the thing it existed to guarantee.
+
+The first cut enumerated every production caller of `HostOps::map_pages`, on the correct reasoning
+that a host pointer over guest pages is one of only two ways this device writes guest RAM.
+`runtime/mapping_write.rs` calls `map_pages` **zero times**. It takes its pointer from
+`mapper::ensure_contig_view` through two local wrappers and pokes BGRA rows straight into the view,
+never reaching `mapper::write_mapping_bytes` either. So the gate scored the file as reaching guest
+RAM by no mechanism at all — true of the needle, false of the file — and the six raw-pointer row
+writes that carry nearly every pixel this device produces were absent from the footprint.
+
+An empty-ish footprint answers "we never wrote there" to every panic it is asked about. The gate
+being green is what would have made that believed.
+
+**Key the gate on the capability, not on one source of it.** `GUEST_RAM_POINTER_SOURCES` now lists
+every way to obtain a writable alias — `map_pages`, `ensure_contig_view`, `map_fresh_span{,_within}`,
+`contig_for_{span,write}` — and the site set went from 4 files to **8**: `mapping_write.rs`,
+`metal_draw/mod.rs`, `compute_exec/mod.rs` and `scanout.rs` were all invisible.
+
+Two of the newly-visible files forced a third classification, and it is the interesting one. They
+write guest RAM but are marked *by their pointer source* — `gva_view::map_fresh_span_within` marks
+the span it resolves, once, for every caller. That is better than marking at each call site, so the
+gate cannot simply demand "every writer marks here": it has to distinguish `Here` from `BySource`
+from `ReadOnly` and assert all three, because a `BySource` file that also marks locally counts its
+frames twice. A two-valued gate would have forced the worse design to satisfy the check.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
