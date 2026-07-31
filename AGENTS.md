@@ -176,6 +176,39 @@ exactly one "new crash report" named `Retired` whether or not anything had crash
 an A/B scored one hit when the true count in both was zero. **A harness whose null result looks like
 a hit cannot score an arm.** Before believing a repro, confirm you have seen it print the negative.
 
+### A boot the firmware aborted is not a device wedge, and it looks exactly like one
+
+From outside, a `boot.efi` abort and a hung device are the same picture: QEMU alive, the guest
+answering nothing, **zero guest GPU commands**, and a fail log of nothing but
+`host_window_cadence`. One session read that as a regression from the change under test and spent 53
+minutes on it. The serial log settles it in one line:
+
+```text
+AAPL: #[EB.MM.AKMR|!] Err(0xE) <- EB.M.BAPr2 2 2 50271 0x700000
+AAPL: #[EB.B.MN|!]    Err(0xE) <- EB.MM.AKMR
+AAPL: #[EB|STOP] 0x15
+OC: Boot failed - Aborted
+```
+
+`boot.efi` draws a KASLR slide and asks for its 50271-page (~196 MiB) kernel region at
+`0x100000 + slide * 0x200000` with `AllocatePages(AllocateAddress, …)`. This firmware's map has ACPI
+NVS at `0x800000` and ~14 MiB of BootServicesData behind it, so every base below `0x1780000`
+collides — slides 0–11 of 256, **4.69 %**. Measured over the 513 serial logs then on disk: 24
+aborts, **4.68 %**, and their failing bases were exactly `0x100000, 0x300000 … 0x1700000`.
+
+Fixed at the source: OpenCore's `Booter → Quirks → ProvideCustomSlide` was `false` in the snapshot's
+`config.plist`, so nothing filtered the slide list. With it `true`, OpenCore computes the valid
+slides from the memory map and passes one (`slide=247` on the first boot after; the kernel reports
+`KASLR slide: 0x1ee00000 dynamic`). The change lives in a new immutable snapshot — snapshots are
+never edited in place — made by converting `OpenCore.qcow2` to raw, `mcopy`-ing the edited plist into
+the ESP at partition offset `0x100000`, converting back, and reflinking `macos.img`/`OVMF_VARS.fd`
+from the previous snapshot.
+
+`vm/boot-x86.sh` now watches the serial log for `#[EB|STOP]` / `Boot failed - Aborted` and exits
+**125** within ~30 s instead of sitting out `TESTING_TIMEOUT`. Treat 125 as "retry the boot"; no
+measurement from such a boot is about this device. `.agents/repros/boot-abort-rate.sh` turns it into
+a rate.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`
