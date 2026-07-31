@@ -3072,6 +3072,27 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// no change at all. The boot is consistent with the repair and also consistent
 /// with a quiet boot. It cannot confirm or refute the high-mode defect because
 /// it never entered the high mode, which is exactly the trap recorded above.
+///
+/// ### Second boot, and the two together are a result
+///
+/// A second 14-round boot, fresh VM, same harness, same binary family:
+///
+/// ```text
+/// boot 1   14 of 14 CLEAN   gvac_gw_wrote/1000 draws = 42.4
+/// boot 2   14 of 14 CLEAN   gvac_gw_wrote/1000 draws = 79.5
+/// pooled   28 of 28 CLEAN
+/// ```
+///
+/// Against this branch's own baseline of 11 corrupt of 42 rounds (26 %), 28
+/// consecutive clean rounds has probability 0.74^28 ~ 2e-4. Against the
+/// low-mode-only base rate of 3 of 22 (14 %) it is 0.86^28 ~ 1.5 %. Either way
+/// the null hypothesis that nothing changed is no longer comfortable, which is
+/// more than any earlier arm on this branch could say.
+///
+/// The caveat that survives: neither boot reached the HIGH mode. 79.5 is nearly
+/// double boot 1 and still short of the ~127 threshold, so the reliable
+/// high-recycling defect remains unscored — nothing here shows it is fixed, only
+/// that it did not appear. `lin_rung_blank_with_host_entry` was 0 on both.
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
