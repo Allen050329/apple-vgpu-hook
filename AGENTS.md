@@ -343,6 +343,37 @@ lines — one line per occurrence, like `mapping_page_drift ` or `deferred_flush
 `deferred_flush_lost` line that follows it, so the unanchored count double-counts. Print which
 convention each number uses (`(sum)` / `(lines)`) so the next reader does not have to re-derive it.
 
+### `grep -c` prints a count and exits 1, so `|| echo 0` emits two lines
+
+`n=$(grep -c foo file || echo 0)` is the natural way to write "count, defaulting to zero", and it is
+wrong: on zero matches `grep -c` **prints `0` and exits 1**, so the `||` fires and `n` becomes the
+two-line string `0\n0`. Any later `$(( ))` on it dies with `arithmetic syntax error`, and any
+`printf` of it silently emits a stray line.
+
+It has bitten twice here in one session. First as a cosmetic stray `0` under `clobber` and
+`identity_split` in the census output, which was read past. Then, unfixed, it killed an 8-boot icon
+run at the first scoring step — the loop wrote no rows at all and still printed its completion
+marker, so the output was an empty table that looked like "no boots corrupted".
+
+`grep -c` always prints a number when the file exists. Write `n=$(grep -c foo file 2>/dev/null);
+n=${n:-0}` and keep the default for the *missing file* case only.
+
+### A test double more generous than the host cannot fail the way production does
+
+`FakeHost` armed a `track_guest_writes` set at generation 1 the instant it was tracked, and returned
+`Some(0)` for an unarmed one. The product shim does neither: `reims_vgpu_dirty_gen` holds a new
+set at 0 for a deliberate two-harvest window, and `qemu::host_ops` maps that 0 to `None` because 0 is
+also "unknown token".
+
+So every test saw a readable baseline that the real host would never give, and a rail that could not
+work in production passed its whole suite. It shipped that way, and its dead counter
+(`gvac_gw_clean` = 0 of 201 331) was then written up in a doc comment as a discovery about the guest.
+
+When a fixture stands in for a host contract, model the contract's *refusals* — startup windows,
+sentinel values, rate limits — not just its happy answer. `guest_write_startup_window` and
+`finish_guest_write_arming` are that, kept opt-in so turning them on is a deliberate statement by the
+rail under test rather than a silent change to a hundred unrelated assertions.
+
 ### The corruption lands in the page the surface left, not the one it moved to
 
 Worth knowing before writing any repro for the write-after-free class, because it decides which
