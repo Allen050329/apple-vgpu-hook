@@ -1117,59 +1117,123 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
     }
 }
 
-/// Every production use of [`crate::runtime::host::HostOps::map_pages`], and
-/// whether the host pointer it returns is written through.
+/// Every way production code gets a host pointer that aliases guest RAM, so the
+/// scan below cannot be fooled by a file that writes guest memory without ever
+/// naming `map_pages`.
 ///
-/// `map_pages` hands back a writable alias of guest RAM, so it is one of the two
-/// ways this device can put bytes in the guest — the other being
-/// `HostMemory::write_gpa`, which has a single production implementation and is
-/// marked there. Every site here that writes must also mark
-/// `observe::footprint`, or that write's frames are missing from the set a guest
-/// panic is scored against. **The missing mark is the dangerous direction**: it
-/// produces a "this device never wrote that page" that is false, which is an
-/// exoneration nobody can tell from a real one.
+/// The first cut of this gate listed only `map_pages` callers and **had exactly
+/// that hole**. `runtime/mapping_write.rs` takes its pointer from
+/// `mapper::ensure_contig_view` through two local wrappers and pokes BGRA rows
+/// straight into it — the largest guest-write rail in the device — and the gate
+/// scored the file as having no `map_pages` call at all, which is true and
+/// irrelevant. It passed, and the footprint was missing that whole rail.
+///
+/// So the needle is the *pointer*, not one of its sources. Anything that hands
+/// back a writable alias belongs here.
+const GUEST_RAM_POINTER_SOURCES: &[&str] = &[
+    ".map_pages(",
+    "ensure_contig_view(",
+    "map_fresh_span(",
+    "map_fresh_span_within(",
+    "contig_for_span(",
+    "contig_for_write(",
+];
+
+/// Every production site that obtains a host pointer over guest RAM, and whether
+/// it writes through it.
+///
+/// A host pointer over guest pages is one of the two ways this device can put
+/// bytes in the guest — the other being `HostMemory::write_gpa`, which has a
+/// single production implementation and is marked there. Every site here that
+/// writes must also mark `observe::footprint`, or that write's frames are
+/// missing from the set a guest panic is scored against. **The missing mark is
+/// the dangerous direction**: it produces a "this device never wrote that page"
+/// that is false, which is an exoneration nobody can tell from a real one.
 ///
 /// So the classification is the point of the row, and the count is what stops a
 /// new call appearing inside an already-listed file without anyone deciding
 /// which kind it is.
-const MAP_PAGES_SITES: &[(&str, usize, bool, &str)] = &[
+/// How a site's writes reach `observe::footprint`, or why they need not.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum Marks {
+    /// Writes guest RAM and marks the footprint in this file.
+    Here,
+    /// Writes guest RAM, but the pointer source it calls marks on its behalf.
+    /// Correct and preferable — one marking site serves every caller — so this
+    /// file must *not* mark again or the frames are counted twice.
+    BySource,
+    /// Takes a guest-RAM pointer only to copy out of it.
+    ReadOnly,
+}
+
+const MAP_PAGES_SITES: &[(&str, usize, Marks, &str)] = &[
     (
         "runtime/gpa_map.rs",
         1,
-        true,
+        Marks::Here,
         "control-plane writes (stamp, DeviceInfo, display shared, child HEAD) \
          map the covering pages and poke bytes; marked on the exact byte range \
          after the copy",
     ),
     (
         "runtime/gva_view.rs",
-        4,
-        true,
-        "the raw-GVA rails. `write_span_multi` marks each packed run's exact \
-         destination; `map_fresh_span_within` marks the span it is about to hand \
-         to a caller that writes through the pointer. The read paths \
-         (`read_span_multi`, `host_ptr_for_span`) reach guest RAM only to copy \
-         out of it",
+        5,
+        Marks::Here,
+        "the raw-GVA rails, and the pointer source for the two files below. \
+         `write_span_multi` marks each packed run's exact destination; \
+         `map_fresh_span_within` marks the span it is about to hand to a caller \
+         that writes through the pointer. The read paths (`read_span_multi`, \
+         `host_ptr_for_span`) reach guest RAM only to copy out of it",
     ),
     (
         "runtime/mapper.rs",
-        3,
-        true,
+        5,
+        Marks::Here,
         "the mapping-keyed rails. `write_mapping_bytes` marks through the \
          mapping's own page list — a scatter, so never over the span's hull — on \
-         both the contiguous-view fast path and the per-run slow path. \
-         `ensure_contig_view` and `mapping_page_gpas` only build the view",
+         both the contiguous-view fast path and the per-run slow path",
+    ),
+    (
+        "runtime/mapping_write.rs",
+        8,
+        Marks::Here,
+        "the BGRA row writers, and the largest guest-write rail in the device. \
+         They take a contig view through `contig_for_write` and poke rows \
+         straight into it, reaching `mapper::write_mapping_bytes` not at all — \
+         which is exactly how the first cut of this gate missed them. \
+         `contig_for_write` marks for all of them",
+    ),
+    (
+        "runtime/metal_draw/mod.rs",
+        4,
+        Marks::BySource,
+        "`write_gva_rgba8_within` and its peer write rows through a `FreshSpan`; \
+         `gva_view::map_fresh_span_within` marks the span when it resolves it",
+    ),
+    (
+        "runtime/compute_exec/mod.rs",
+        2,
+        Marks::BySource,
+        "`write_linear_texture_bulk` writes rows through a `FreshSpan`; marked by \
+         `gva_view::map_fresh_span_within` as above",
     ),
     (
         "runtime/metal_draw/vulkan.rs",
         3,
-        false,
+        Marks::ReadOnly,
         "`task_gva_guest_runs`, `try_type11_sample_zero_copy` and \
          `try_type5_sample_zero_copy` build `engine::GuestRun` spans the engine \
          reads *out of* — vertex, storage and sampled sources uploaded to the \
          GPU. Nothing writes back through them, and the GPU cannot: \
-         `no_vk_ext_external_memory_host` holds that the one extension which \
-         would let it is never requested",
+         `the_host_pointer_import_extension_is_never_requested` holds that the \
+         one extension which would let it is never requested",
+    ),
+    (
+        "runtime/scanout.rs",
+        1,
+        Marks::ReadOnly,
+        "screen capture reads the scanout surface out of its contig view; it \
+         puts nothing back",
     ),
 ];
 
@@ -1191,12 +1255,27 @@ fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
         let text: String = masked.iter().copied().map(char::from).collect();
         let rel_path = rel(&path, &root);
         for line in text.lines() {
-            // `map_pages_stable` is a capability question, not a mapping.
-            if line.contains(".map_pages(") {
+            // A definition is not a caller: `fn ensure_contig_view(` would
+            // otherwise score the function that *is* the pointer source as a
+            // site that consumes one.
+            let is_definition = line.trim_start().starts_with("fn ")
+                || line.trim_start().starts_with("pub fn ")
+                || line.trim_start().starts_with("pub(crate) fn ");
+            if !is_definition
+                && GUEST_RAM_POINTER_SOURCES
+                    .iter()
+                    .any(|needle| line.contains(needle))
+            {
                 *found.entry(rel_path.clone()).or_default() += 1;
             }
-            if line.contains("footprint::note_written_range(")
-                || line.contains("footprint::note_written_pages(")
+            // `note_mapping_write_footprint` is the mapper's helper that resolves
+            // a write's frames through a mapping's scatter page list and marks
+            // them. It is a mark, so a file calling it is a marking file; leaving
+            // it off this list would fail a rail that does record its writes.
+            if !is_definition
+                && (line.contains("footprint::note_written_range(")
+                    || line.contains("footprint::note_written_pages(")
+                    || line.contains("note_mapping_write_footprint("))
             {
                 marks.insert(rel_path.clone());
             }
@@ -1215,7 +1294,7 @@ fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
          nothing writes back through it)."
     );
 
-    for (file, _, writes, why) in MAP_PAGES_SITES {
+    for (file, _, how, why) in MAP_PAGES_SITES {
         assert!(!why.is_empty(), "{file}: classify it, do not just list it");
         assert!(
             root.join(file).exists(),
@@ -1223,11 +1302,11 @@ fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
         );
         assert_eq!(
             marks.contains(*file),
-            *writes,
-            "{file}: MAP_PAGES_SITES says writes={writes}, but the file {} mark \
-             observe::footprint. A writing rail that does not mark leaves its \
-             frames out of the set, and the resulting `pn` miss reads exactly \
-             like a real exoneration.",
+            *how == Marks::Here,
+            "{file}: classified {how:?}, but the file {} mark observe::footprint. \
+             A writing rail that marks nowhere leaves its frames out of the set, \
+             and the resulting `pn` miss reads exactly like a real exoneration; a \
+             `BySource` rail that also marks here counts its frames twice.",
             if marks.contains(*file) {
                 "does"
             } else {

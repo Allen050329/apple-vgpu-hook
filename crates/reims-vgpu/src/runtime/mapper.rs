@@ -1832,7 +1832,12 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
 /// Each page contributes only its intersection with the byte range, so a write
 /// of one row into a 16 KiB arm64 page marks the frame that row is in and not
 /// the other three.
-fn note_mapping_write_footprint(state: &DeviceState, mapping_id: u32, off: u64, len: u64) {
+pub(crate) fn note_mapping_write_footprint(
+    state: &DeviceState,
+    mapping_id: u32,
+    off: u64,
+    len: u64,
+) {
     if len == 0 {
         return;
     }

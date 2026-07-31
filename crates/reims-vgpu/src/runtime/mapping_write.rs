@@ -211,7 +211,21 @@ fn contig_for_write<H: HostMemory + HostOps>(
         ));
         return None;
     }
-    contig_for_span(state, host, mapping_id, span_end)
+    let view = contig_for_span(state, host, mapping_id, span_end)?;
+    // Every raw-pointer write in this file goes through here, and none of them
+    // goes through `mapper::write_mapping_bytes` — they poke rows straight into
+    // the view. So this is where those writes enter `observe::footprint`, and
+    // without it the *largest* guest-write rail in the device would be missing
+    // from a set whose whole use is answering "did we write there?".
+    //
+    // Marked over `[0, span_end)` because that is the extent this function
+    // guarantees and the callers' row offsets are not visible here. That
+    // over-marks the pages before a rect's first row — the surface's own pages,
+    // never anyone else's, since the marking walks this mapping's page list — and
+    // over-marking can only turn a miss into a hit. Under-marking would
+    // manufacture the clean "we never wrote there" the set must never invent.
+    mapper::note_mapping_write_footprint(state, mapping_id, 0, span_end);
+    Some(view)
 }
 
 /// One past the last mapping byte a rect transfer touches: the last texel of its
@@ -1844,6 +1858,61 @@ mod tests {
         ));
         assert_eq!(row, [0x2a; 16]);
         assert_eq!(calls_after_write, 2);
+    }
+
+    /// The BGRA row writers reach `observe::footprint`.
+    ///
+    /// This is the rail the first cut of the footprint's completeness gate
+    /// missed, and it is the biggest one in the device. These writers never call
+    /// `mapper::write_mapping_bytes` and never call `HostOps::map_pages`: they
+    /// take a contig view through `contig_for_write` and poke rows straight into
+    /// it. A gate that scanned for `map_pages` callers therefore scored this
+    /// file as reaching guest RAM by no mechanism at all — which was true of the
+    /// needle and false of the file.
+    ///
+    /// A missing mark here would have left the footprint empty of nearly every
+    /// pixel this device writes, and an empty set answers "we never wrote there"
+    /// to every panic it is asked about.
+    #[test]
+    fn a_bgra_row_write_marks_the_footprint_through_its_contig_view() {
+        use crate::model::PAGE_SHIFT_X86;
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        // Adjacent so the contig view packs — this is the path production takes.
+        let gpa0 = 0x5000_0000u64;
+        host.map_range(gpa0, 2 * page as usize, 0);
+        let mid = 12u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.mapping_internal = 1;
+            m.page_entries = vec![
+                (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                ((((gpa0 + page) >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT)
+                    | PAGE_ENTRY_VALID,
+            ];
+        }
+        assert!(state.set_mapping_geom(mid, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        assert!(
+            mapper::ensure_contig_view(&mut state, &mut host, mid).is_some(),
+            "the fixture must take the contig path or it tests the other rail"
+        );
+        let src = [0xFFu8; 16];
+        assert!(write_bgra8(&mut state, &mut host, mid, &src, 8, 2, 2));
+
+        assert!(
+            footprint::wrote_gpa(gpa0),
+            "the surface's first frame must be in the set"
+        );
+        assert!(
+            !footprint::wrote_gpa(gpa0 + 8 * page),
+            "and nothing beyond the surface"
+        );
     }
 
     /// Linux product: non-packed page list still lands BGRA via multi-import.
