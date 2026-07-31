@@ -68,6 +68,24 @@ pub struct ReimsVgpuHostOps {
     /// teardown. Nothing imports guest pages now, `unmap_pages` on that shim
     /// really deallocates, and the flag is back to the narrow claim above.
     pub map_pages_stable: c_int,
+    /// Register `count` page-aligned GPAs as one guest-write-tracked set and
+    /// return a non-zero opaque token, or 0 when the host has no dirty bitmap.
+    /// Mutates QEMU MemoryRegion logging state, so the shim may only do the
+    /// enabling part with the BQL held — see the C side for how it defers.
+    pub track_guest_writes: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            gpas: *const u64,
+            count: usize,
+            page_size: usize,
+        ) -> u64,
+    >,
+    /// Release a token from `track_guest_writes`.
+    pub untrack_guest_writes: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64)>,
+    /// Monotonic count of host observations that some page of the token's set
+    /// was written; 0 for an unknown or not-yet-armed token. Safe from any
+    /// thread.
+    pub guest_write_gen: Option<unsafe extern "C" fn(ctx: *mut c_void, token: u64) -> u64>,
 }
 
 // SAFETY: QEMU keeps the table valid for the device lifetime; callbacks only
@@ -515,6 +533,43 @@ impl HostOps for QemuHost<'_> {
             None => true,
         }
     }
+
+    fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
+        if gpas.is_empty() || page_size == 0 {
+            return None;
+        }
+        let f = self.ops.track_guest_writes?;
+        // SAFETY: QEMU owns ctx; the slice outlives the call and the shim
+        // copies the page list before returning.
+        let token = unsafe { f(self.ops.ctx, gpas.as_ptr(), gpas.len(), page_size) };
+        // A shim that cannot track answers 0 rather than failing. Not a
+        // decline: "this host has no dirty bitmap" is a capability, and every
+        // consumer already has to handle it on the fixture hosts.
+        (token != 0).then_some(token)
+    }
+
+    fn untrack_guest_writes(&mut self, token: u64) {
+        if token == 0 {
+            return;
+        }
+        if let Some(f) = self.ops.untrack_guest_writes {
+            // SAFETY: token came from a successful track_guest_writes.
+            unsafe { f(self.ops.ctx, token) }
+        }
+    }
+
+    fn guest_write_gen(&self, token: u64) -> Option<u64> {
+        if token == 0 {
+            return None;
+        }
+        let f = self.ops.guest_write_gen?;
+        // SAFETY: QEMU owns ctx; the shim answers from its own lock.
+        let gen_ = unsafe { f(self.ops.ctx, token) };
+        // 0 is the shim's "unknown token, or not yet armed" answer. Reading it
+        // as a generation would let two pre-arm checks agree and vouch for a
+        // resident nothing has ever validated.
+        (gen_ != 0).then_some(gen_)
+    }
 }
 
 /// Host used when no QEMU ops table is bound (unit tests / headless create).
@@ -609,6 +664,9 @@ mod tests {
             map_pages: None,
             unmap_pages: None,
             map_pages_stable: 0,
+            track_guest_writes: None,
+            untrack_guest_writes: None,
+            guest_write_gen: None,
             is_ram_gpa: None,
             notify_actions: None,
         }

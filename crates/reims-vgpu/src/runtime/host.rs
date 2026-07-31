@@ -368,6 +368,54 @@ pub trait HostOps {
     fn is_ram_gpa(&self, _gpa: u64) -> bool {
         true
     }
+
+    /// Ask the host to observe writes this device does not make to `gpas`.
+    ///
+    /// A surface's pages are plain guest RAM. The guest CPU writes them with no
+    /// device operation, so no counter this crate keeps can witness such a
+    /// write — and any host-side copy of those pages (an engine resident, a
+    /// cache entry) is only reusable if something outside this crate can say
+    /// the pages have not moved underneath it. That is the hypervisor's dirty
+    /// bitmap, and this is the only door to it.
+    ///
+    /// `gpas` are guest page bases at `page_size` granularity — the same shape
+    /// [`HostOps::map_pages`] takes. Returns a non-zero opaque token, or `None`
+    /// when the host cannot observe such writes at all. A `None` here is not an
+    /// error: it means every consumer must assume the pages are written on
+    /// every check.
+    ///
+    /// The token owns host-side tracking state and must be released with
+    /// [`HostOps::untrack_guest_writes`] when the page list changes or the
+    /// surface goes away.
+    fn track_guest_writes(&mut self, _gpas: &[u64], _page_size: usize) -> Option<u64> {
+        None
+    }
+
+    /// Release a token from [`HostOps::track_guest_writes`]. A token of 0, or
+    /// one already released, is ignored.
+    fn untrack_guest_writes(&mut self, _token: u64) {}
+
+    /// Monotonic count of host observations that *some* page of `token`'s set
+    /// was written.
+    ///
+    /// A generation rather than a consumed "dirty since last call" flag on
+    /// purpose. A consumed flag is only correct for exactly one reader: the
+    /// first caller after a write eats the report and every later caller in the
+    /// same frame is told the pages are clean. A generation is idempotent — a
+    /// value recorded next to a host-side copy stays a valid witness for that
+    /// copy no matter how many other callers read it — which is what lets it
+    /// sit beside [`crate::model::MappingEntry::surface_content_epoch`] as the
+    /// half of the currency test the device-side epoch structurally cannot
+    /// cover.
+    ///
+    /// `None` for an unknown token, or from a host that cannot observe guest
+    /// writes. Two reads that return the same `Some(n)` prove the host saw no
+    /// write in between; they do **not** prove no write happened — a host only
+    /// observes writes at its own harvest points, so the guarantee is
+    /// "every write is observed by some later read", not "immediately".
+    fn guest_write_gen(&self, _token: u64) -> Option<u64> {
+        None
+    }
 }
 
 /// Arm64e guest page size (16 KiB). FakeHost / map_pages test fixture only —
@@ -452,6 +500,30 @@ pub struct FakeHost {
     rewires: std::cell::RefCell<Vec<Rewire>>,
     /// How many armed rewires have fired, so a test can assert its trigger hit.
     rewires_fired: std::cell::Cell<u64>,
+    /// Live [`HostOps::track_guest_writes`] sets, keyed by issued token.
+    guest_write_sets: BTreeMap<u64, GuestWriteSet>,
+    /// Last token issued; 0 is reserved for "no token".
+    guest_write_token_seq: u64,
+    /// Model a host with no dirty bitmap: [`HostOps::track_guest_writes`]
+    /// answers `None`, which every consumer must read as "assume written".
+    /// Default `false` — the fixture tracks, so a test that wants the
+    /// unobservable arm asks for it explicitly and every other test exercises
+    /// the tracking contract rather than the fallback.
+    pub guest_writes_unobservable: bool,
+}
+
+/// One [`HostOps::track_guest_writes`] registration in [`FakeHost`].
+///
+/// The product host learns of a write from the hypervisor's dirty bitmap; the
+/// fixture learns of it from [`FakeHost::guest_wrote_page`], which is the same
+/// event stated directly. Both then move `gen`, and nothing else does — so a
+/// test asserts on the contract the elision consumes, not on a simulation of
+/// KVM.
+#[derive(Debug, Default)]
+struct GuestWriteSet {
+    pages: Vec<u64>,
+    page_size: usize,
+    gen_: u64,
 }
 
 /// A guest page-table edit that fires from inside a device guest read.
@@ -529,6 +601,32 @@ impl Drop for FakeHost {
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// State that an agent outside this device wrote the page holding `gpa`,
+    /// and that the host observed it — the fixture's stand-in for a guest CPU
+    /// store landing in the hypervisor's dirty bitmap.
+    ///
+    /// Advances the generation of every live tracked set that holds the page.
+    /// A set that does not hold it is untouched, which is the property the
+    /// elision depends on: one surface's guest write must not invalidate
+    /// another's resident.
+    pub fn guest_wrote_page(&mut self, gpa: u64) {
+        for set in self.guest_write_sets.values_mut() {
+            if set.page_size == 0 {
+                continue;
+            }
+            let base = gpa & !(set.page_size as u64 - 1);
+            if set.pages.binary_search(&base).is_ok() {
+                set.gen_ = set.gen_.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Live [`HostOps::track_guest_writes`] registrations, so a test can prove
+    /// a token was released rather than leaked.
+    pub fn tracked_guest_write_sets(&self) -> usize {
+        self.guest_write_sets.len()
     }
 
     fn alloc_block(len: usize) -> Option<(usize, usize)> {
@@ -833,6 +931,40 @@ impl HostOps for FakeHost {
         self.stable_map_pages
     }
 
+    fn track_guest_writes(&mut self, gpas: &[u64], page_size: usize) -> Option<u64> {
+        if self.guest_writes_unobservable
+            || gpas.is_empty()
+            || page_size == 0
+            || !page_size.is_power_of_two()
+        {
+            return None;
+        }
+        let mut pages: Vec<u64> = gpas.iter().map(|g| g & !(page_size as u64 - 1)).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        self.guest_write_token_seq = self.guest_write_token_seq.wrapping_add(1);
+        let token = self.guest_write_token_seq;
+        self.guest_write_sets.insert(
+            token,
+            GuestWriteSet {
+                pages,
+                page_size,
+                // Starts at 1, not 0: a caller that recorded "no token" as 0
+                // must not read back a matching generation from a live set.
+                gen_: 1,
+            },
+        );
+        Some(token)
+    }
+
+    fn untrack_guest_writes(&mut self, token: u64) {
+        self.guest_write_sets.remove(&token);
+    }
+
+    fn guest_write_gen(&self, token: u64) -> Option<u64> {
+        self.guest_write_sets.get(&token).map(|s| s.gen_)
+    }
+
     /// Contiguous host view; `page_size` is the guest page size from the device.
     fn map_pages(&mut self, gpas: &[u64], page_size: usize) -> Option<usize> {
         self.map_pages_calls = self.map_pages_calls.saturating_add(1);
@@ -1038,6 +1170,96 @@ pub fn write_u32<M: HostMemory>(mem: &mut M, gpa: u64, v: u32) -> Result<(), Mem
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A generation, not a consumed flag: reading it twice must not change the
+    /// answer.
+    ///
+    /// This is the whole reason [`HostOps::guest_write_gen`] is shaped the way
+    /// it is. Under a consume-on-read flag the first draw of a frame eats the
+    /// write report and every later draw in that frame is told the surface is
+    /// clean — so a resident that one draw correctly refused, the next draw
+    /// happily loads from.
+    #[test]
+    fn guest_write_gen_is_idempotent() {
+        let mut h = FakeHost::new();
+        let p = GUEST_PAGE_SIZE as u64;
+        let token = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE).unwrap();
+        let first = h.guest_write_gen(token).unwrap();
+        assert_eq!(h.guest_write_gen(token), Some(first));
+        assert_eq!(h.guest_write_gen(token), Some(first));
+    }
+
+    /// A write to a tracked page moves that set's generation, and a write to a
+    /// page outside the set does not — one surface's guest write must not
+    /// invalidate another surface's host-side copy.
+    #[test]
+    fn guest_write_gen_moves_only_for_tracked_pages() {
+        let mut h = FakeHost::new();
+        let p = GUEST_PAGE_SIZE as u64;
+        let a = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE).unwrap();
+        let b = h.track_guest_writes(&[7 * p], GUEST_PAGE_SIZE).unwrap();
+        let (a0, b0) = (h.guest_write_gen(a).unwrap(), h.guest_write_gen(b).unwrap());
+
+        // Mid-page offset: the contract is stated in pages, so any address in
+        // the page counts.
+        h.guest_wrote_page(9 * p + 17);
+        assert_ne!(h.guest_write_gen(a), Some(a0), "tracked page must move a");
+        assert_eq!(h.guest_write_gen(b), Some(b0), "untracked page must not move b");
+
+        let a1 = h.guest_write_gen(a).unwrap();
+        h.guest_wrote_page(7 * p);
+        assert_eq!(h.guest_write_gen(a), Some(a1));
+        assert_ne!(h.guest_write_gen(b), Some(b0));
+    }
+
+    /// Releasing a token frees the set and makes the generation unreadable —
+    /// a stale token must answer `None` (assume written), never a generation
+    /// that could agree with a recorded one.
+    #[test]
+    fn untrack_guest_writes_releases_the_set() {
+        let mut h = FakeHost::new();
+        let p = GUEST_PAGE_SIZE as u64;
+        let token = h.track_guest_writes(&[p], GUEST_PAGE_SIZE).unwrap();
+        assert_eq!(h.tracked_guest_write_sets(), 1);
+        h.untrack_guest_writes(token);
+        assert_eq!(h.tracked_guest_write_sets(), 0);
+        assert_eq!(h.guest_write_gen(token), None);
+        // Idempotent release; a double free must not panic or resurrect.
+        h.untrack_guest_writes(token);
+        assert_eq!(h.guest_write_gen(0), None);
+    }
+
+    /// A host with no dirty bitmap says so once, at registration, rather than
+    /// handing out a token whose generation never moves — a never-moving
+    /// generation is indistinguishable from "definitely not written", which is
+    /// the one answer an unobservant host must never give.
+    #[test]
+    fn unobservable_host_refuses_the_token() {
+        let mut h = FakeHost::new();
+        h.guest_writes_unobservable = true;
+        let p = GUEST_PAGE_SIZE as u64;
+        assert_eq!(h.track_guest_writes(&[p], GUEST_PAGE_SIZE), None);
+        assert_eq!(h.tracked_guest_write_sets(), 0);
+    }
+
+    /// The trait default is the unobservant host: every consumer must already
+    /// handle `None`, so a shim that never fills the callback degrades to
+    /// "assume written" instead of silently vouching for stale pixels.
+    #[test]
+    fn hostops_default_cannot_observe_guest_writes() {
+        struct Bare;
+        impl HostOps for Bare {
+            fn mono_ns(&self) -> u64 {
+                0
+            }
+            fn enqueue(&mut self, _action: HostAction) {}
+            fn schedule_bh(&mut self) {}
+        }
+        let mut b = Bare;
+        assert_eq!(b.track_guest_writes(&[0], GUEST_PAGE_SIZE), None);
+        assert_eq!(b.guest_write_gen(1), None);
+        b.untrack_guest_writes(1);
+    }
 
     /// Unified-memory contract: a map_pages view aliases guest RAM — writes
     /// via write_gpa are visible through the view pointer and vice versa,

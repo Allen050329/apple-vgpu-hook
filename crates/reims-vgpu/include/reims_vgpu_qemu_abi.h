@@ -21,7 +21,12 @@
 extern "C" {
 #endif
 
-/* v11: reims_vgpu_qemu_window_run_main — run the host window as QEMU's process-main
+/* v12: ReimsVgpuHostOps.track_guest_writes / untrack_guest_writes /
+ *      guest_write_gen — the hypervisor dirty bitmap, the only witness for a
+ *      write to a surface's guest pages that no device operation made. Every
+ *      host-side copy of those pages is stale the instant the guest CPU stores
+ *      into them, and nothing this device counts can see that store.
+ * v11: reims_vgpu_qemu_window_run_main — run the host window as QEMU's process-main
  *      UI loop (required by AppKit on Darwin).
  * v10: ReimsVgpuHostOps.map_pages_stable — whether a map_pages view is a stable
  *      guest-RAM alias (x86 PCI: direct RAMBlock pointer, unmap is a no-op) or
@@ -38,7 +43,7 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 11u
+#define REIMS_VGPU_QEMU_ABI_VERSION 12u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
@@ -153,6 +158,28 @@ typedef struct ReimsVgpuHostOps {
      * older shim) must be treated as 0.
      */
     int map_pages_stable;
+    /*
+     * Guest-write tracking. A surface's pages are plain guest RAM: the guest
+     * CPU stores into them with no device operation, so no counter the Rust
+     * device keeps can witness such a store, and any host-side copy of those
+     * pages is silently stale from that instant. The hypervisor's dirty
+     * bitmap is the only witness, and these three calls are the door to it.
+     *
+     * track_guest_writes registers `count` page-aligned GPAs (each of
+     * `page_size` bytes) as one tracked set and returns a non-zero opaque
+     * token, or 0 when this host cannot observe such writes at all. Callers
+     * must read a 0 token as "assume written on every check".
+     *
+     * untrack_guest_writes releases a token. guest_write_gen returns a
+     * monotonic count of host observations that some page of the set was
+     * written, or 0 for an unknown token; it is safe from any thread, while
+     * track/untrack are not (they mutate QEMU MemoryRegion logging state and
+     * must run with the BQL held).
+     */
+    uint64_t (*track_guest_writes)(void *ctx, const uint64_t *gpas, size_t count,
+                                   size_t page_size);
+    void (*untrack_guest_writes)(void *ctx, uint64_t token);
+    uint64_t (*guest_write_gen)(void *ctx, uint64_t token);
 } ReimsVgpuHostOps;
 
 /* Default guest page size for arm64e / vmapple (create may override). */

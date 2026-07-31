@@ -1449,6 +1449,9 @@ mod tests {
             map_pages: None,
             unmap_pages: None,
             map_pages_stable: 0,
+            track_guest_writes: None,
+            untrack_guest_writes: None,
+            guest_write_gen: None,
             is_ram_gpa: None,
             notify_actions: None,
         }
