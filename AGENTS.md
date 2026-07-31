@@ -514,6 +514,13 @@ marker, so the output was an empty table that looked like "no boots corrupted".
 `grep -c` always prints a number when the file exists. Write `n=$(grep -c foo file 2>/dev/null);
 n=${n:-0}` and keep the default for the *missing file* case only.
 
+And check that the file exists, separately, before believing the count — because the missing-file case
+is the one that reads as a pass. Hit while writing this session's boot-validity gate: the serial log
+was named by a relative path from the wrong directory, `grep` found nothing because there was nothing
+to find, and the gate printed `panics=0 aborts=0`, which is exactly what a healthy boot prints. The
+`2>/dev/null` that keeps the output tidy is also what hides the `No such file` that would have said
+so. A gate over a path that might not exist must fail on the *path*, not on the count.
+
 ### A test double more generous than the host cannot fail the way production does
 
 `FakeHost` armed a `track_guest_writes` set at generation 1 the instant it was tracked, and returned
