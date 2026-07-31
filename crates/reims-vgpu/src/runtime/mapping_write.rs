@@ -113,6 +113,63 @@ fn contig_for_span<H: HostMemory + HostOps>(
     Some((ptr, len))
 }
 
+/// Take the write proof at the head of a writer, naming the rail that wanted it.
+///
+/// [`mapper::vouch_mapping_pages`] already fail-logs *why* a walk refused, with
+/// the page and both translations. This adds the one fact that line cannot
+/// carry: which writer was about to use the list. Four rails write through
+/// `page_entries` and they fail for different reasons at different rates, so a
+/// single undifferentiated refusal total would not say which one to read next.
+fn vouch_for_write<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    writer: &'static str,
+) -> Option<mapper::PagesVouched> {
+    let vouched = mapper::vouch_mapping_pages(state, host, mapping_id);
+    if vouched.is_none() {
+        crate::observe::fail(format!(
+            "mapping_write fail reason=pages_not_vouched mid={mapping_id} writer={writer}"
+        ));
+        crate::runtime::drain::note_store_route("mapw_pages_refused");
+    } else {
+        crate::runtime::drain::note_store_route("mapw_pages_vouched");
+    }
+    vouched
+}
+
+/// [`contig_for_span`] for a caller that is about to write through the pointer.
+///
+/// The view `ensure_contig_view` hands back is a live `mach_vm_remap` of guest
+/// PFNs, cached on the mapping and returned again on every later call. Its own
+/// doc states the contract — "always revalidate first so a cached contig never
+/// aliases PFNs after ReplacePhysical / guest recycle" — but the revalidation it
+/// names cannot deliver that for a type-4 surface: with no `MappingInternal` it
+/// re-resolves nothing and answers "resolvable" on a non-empty list alone. So a
+/// writer holding this pointer is holding whatever those PFNs became, and a
+/// full white frame poked through it is the `0xff`-filled freed guest heap the
+/// crash census reads back.
+///
+/// Reads keep [`contig_for_span`]: a read through a drifted view returns another
+/// process's bytes, which is a wrong picture and not a corrupted guest, and the
+/// two losses want separate slugs.
+fn contig_for_write<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    span_end: u64,
+    vouched: &mapper::PagesVouched,
+) -> Option<(usize, usize)> {
+    if !vouched.covers(state, mapping_id) {
+        crate::observe::fail(format!(
+            "mapping_write contig mid={mapping_id} reason=vouch_stale need={span_end} \
+             (the page list was cleared or replaced between the walk and this write)"
+        ));
+        return None;
+    }
+    contig_for_span(state, host, mapping_id, span_end)
+}
+
 /// One past the last mapping byte a rect transfer touches: the last texel of its
 /// last row, at `bpr` pitch, `x_off` bytes into the row.
 ///
@@ -267,6 +324,11 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     // Deferred-writeback flush-on-access: land pending resident content in
     // these pages before touching them.
     crate::runtime::storage_flush::flush_intersecting(state, host, mapping_id, base_off, span_end);
+    // Taken after the flush, because the flush can invalidate this mapping, and
+    // once for the whole frame, because the loop below writes a row at a time.
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "bgra8") else {
+        return false;
+    };
     let bpr = bpr_u32 as usize;
     let Some(tight) = pixel_format::tight_row_bytes(mw, format) else {
         return false;
@@ -283,7 +345,7 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     };
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..mh {
@@ -361,7 +423,7 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         for (lo, hi) in unskipped(base_off, base_off.saturating_add(frame.len() as u64), skip) {
             let within = (lo - base_off) as usize;
             let len = (hi - lo) as usize;
-            if !mapper::write_mapping_bytes(state, host, mapping_id, lo, &frame[within..within + len])
+            if !mapper::write_mapping_bytes(state, host, mapping_id, lo, &frame[within..within + len], &vouched)
             {
                 return false;
             }
@@ -501,7 +563,12 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let tight = tight as usize;
     let mut native = vec![0u8; tight];
     let mut seed_native = vec![0u8; tight];
-    let contig = contig_for_span(state, host, mapping_id, span_end);
+    // One proof for the whole image: the changed-span loop below writes each
+    // differing row separately, and the walk is a translation per page.
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
+        return false;
+    };
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
     for y in 0..mh as usize {
@@ -573,11 +640,12 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     mapping_id,
                     row_moff.saturating_add(start as u64),
                     &native[start..x],
+                    &vouched,
                 ) {
                     return false;
                 }
             }
-        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native) {
+        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched) {
             return false;
         }
     }
@@ -671,7 +739,10 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     }
     let span_end = (row_bytes as u64).saturating_mul(height as u64);
     let rb = row_bytes as usize;
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
+        return false;
+    };
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         // SAFETY: contig covers span_end from offset 0.
         let base = ptr as *mut u8;
         for y in 0..height as usize {
@@ -691,6 +762,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
                 mapping_id,
                 moff,
                 &src[src_off..src_off + rb],
+                &vouched,
             ) {
                 return false;
             }
@@ -1137,7 +1209,10 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     }
     let rb = row_bytes as usize;
     let bpr = surface_bpr as usize;
-    if let Some((ptr, _)) = contig_for_span(state, host, mapping_id, span_end) {
+    let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
+        return false;
+    };
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
         // The fragmented full-plane branch below already rejects on the same bound
         // (`frame_end > span_end`); enforce it here too so the contig fast paths
         // can never overrun. A correctly-sized writeback satisfies this exactly
@@ -1210,7 +1285,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             crate::observe::off(format!(
                 "mapping_write full_tight_direct mid={mapping_id} bytes={frame_len} bpr={surface_bpr} rows={height}"
             ));
-            if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &src[..frame_len]) {
+            if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &src[..frame_len], &vouched) {
                 return false;
             }
             let _ = state.mark_mapping_written(mapping_id);
@@ -1227,7 +1302,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             }
             frame[dst_off..dst_off + rb].copy_from_slice(&src[src_off..src_off + rb]);
         }
-        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame) {
+        if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &frame, &vouched) {
             return false;
         }
     } else {
@@ -1242,6 +1317,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
                 mapping_id,
                 moff,
                 &src[src_off..src_off + rb],
+                &vouched,
             ) {
                 return false;
             }
@@ -1545,11 +1621,140 @@ mod tests {
         let survivor = window(1024, 1088);
         state.compute_storage_residency.insert(hit, 5);
         state.compute_storage_residency.insert(survivor, 5);
+        let vouched =
+            mapper::vouch_mapping_pages(&mut state, &host, 7).expect("no walk to contradict");
         assert!(mapper::write_mapping_bytes(
-            &mut state, &mut host, 7, 16, &[0u8; 32]
+            &mut state, &mut host, 7, 16, &[0u8; 32], &vouched
         ));
         assert!(!state.compute_storage_residency.contains_key(&hit));
         assert!(state.compute_storage_residency.contains_key(&survivor));
+    }
+
+    /// A direct type-11 writeback must not land in a page the guest re-pointed
+    /// away, and this asserts it in the currency of the bug: the bytes of the
+    /// page the surface moved to.
+    ///
+    /// `type4_pages_still_ours` shipped with exactly one caller — the deferred
+    /// render flush — so this rail, which writes a full frame of pixels through
+    /// `MappingEntry::page_entries`, was unguarded. The crash reports are the
+    /// receipt: WindowServer aborting in `small_free_list_remove_ptr_no_clear`,
+    /// and guest-kernel kalloc poison finding whole freed elements filled with
+    /// `0xff` from offset 0 — opaque white BGRA in memory already handed to
+    /// somebody else.
+    ///
+    /// So the fixture recycles a page the way the guest does: adopt a list walked
+    /// through a live task page table, write a frame (which must land), re-point
+    /// the PTE with no packet — nothing bumps `map_generation`, which is the
+    /// whole defect — and require the second write to refuse. `data1` stands for
+    /// whatever the guest gave those pages to next, seeded with a pattern rather
+    /// than zeroes so "refused" and "wrote zeroes" cannot be confused.
+    #[test]
+    fn a_repointed_surface_refuses_the_write_and_leaves_the_new_owner_alone() {
+        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::model::{Type4Walk, PAGE_SHIFT_X86};
+
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let mut host = FakeHost::new();
+        let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+        let root_gpa = 3u64 << PAGE_SHIFT_X86;
+        let data0 = 4u64 << PAGE_SHIFT_X86;
+        let data1 = 10u64 << PAGE_SHIFT_X86;
+        host.map_range(dir_gpa, page as usize, 0);
+        host.map_range(root_gpa, page as usize, 0);
+        host.map_range(data0, page as usize, 0);
+        host.map_range(data1, page as usize, 0);
+
+        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.define_task(1, page, 2));
+        let mid = 6;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.mapped = true;
+            m.page_entries =
+                vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.type4_walk = Some(Type4Walk {
+                task_id: 1,
+                backing_pfn: 0,
+                map_generation: m.map_generation,
+            });
+        }
+
+        // A tight 8x4 BGRA8 frame of opaque white — the payload the crash census
+        // reads back out of freed guest memory.
+        let (w, h) = (8u32, 4u32);
+        let frame = vec![0xffu8; (w * h * RGBA8_BPP) as usize];
+        let stride = w * RGBA8_BPP;
+        assert!(
+            write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h),
+            "the list was just walked from this page table, so the frame lands"
+        );
+        let mut landed = [0u8; 16];
+        host.read_gpa(data0, &mut landed).unwrap();
+        assert_eq!(landed, [0xffu8; 16], "the first frame reached data0");
+
+        // Now the guest reclaims that page and hands it to something else, which
+        // writes its own bytes there — a malloc small-zone region, say, whose
+        // free-list pointers live *inside* the freed blocks. `0x5a` stands for
+        // them. This is the step the crash reports are about: the corruption
+        // lands in the page the surface *left*, not the one it moved to, because
+        // the device's cached contig view is a `mach_vm_remap` of the old PFNs
+        // and keeps resolving there.
+        host.write_gpa(data0, &[0x5au8; 16]).unwrap();
+
+        // And the surface is re-pointed. No MapMemory2, no UnmapMemory, no
+        // ReplacePhysical — nothing on the wire, so nothing bumps the
+        // incarnation.
+        let generation_before = state.mappings.get(&mid).unwrap().map_generation;
+        st32(&mut pte, (data1 >> PAGE_SHIFT_X86) as u32);
+        host.write_gpa(root_gpa, &pte).unwrap();
+        assert_eq!(
+            state.mappings.get(&mid).unwrap().map_generation,
+            generation_before,
+            "no packet arrived, so nothing bumped the incarnation"
+        );
+
+        let refused = !write_bgra8(&mut state, &mut host, mid, &frame, stride, w, h);
+        // The memory assertion comes first deliberately. A return value is this
+        // crate's opinion about what it did; `data0` is what the guest will
+        // actually find in its heap, and that is the claim the crash reports
+        // dispute. Asserting the opinion first would let a rail that returns
+        // false *after* writing pass the stronger half unread.
+        let mut recycled = [0u8; 16];
+        host.read_gpa(data0, &mut recycled).unwrap();
+        assert_eq!(
+            recycled,
+            [0x5au8; 16],
+            "the page the guest took away must still hold its new owner's bytes \
+             — this is the guest heap corruption the whole goal is about"
+        );
+        assert!(
+            refused,
+            "and the caller is told, so a lost frame is never read as a landed one"
+        );
+
+        // Refusing once is not enough: `page_entries` is what every later reader
+        // and writer resolves through, so a list a fresh walk has contradicted
+        // has to stop being believed rather than be skipped once.
+        assert!(
+            state.mappings.get(&mid).unwrap().page_entries.is_empty(),
+            "the contradicted list is dropped, so the next bind re-resolves"
+        );
+        assert_ne!(
+            state.mappings.get(&mid).unwrap().map_generation,
+            generation_before,
+            "and every window still armed against the old incarnation refuses \
+             on the map_generation check it already had"
+        );
     }
 
     /// compute_writeback_amplification: fragmented texture writeback imports

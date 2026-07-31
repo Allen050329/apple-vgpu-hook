@@ -1135,6 +1135,88 @@ pub fn type4_pages_still_ours<H: HostMemory>(
     true
 }
 
+/// Proof that a mapping's cached page list named the guest memory it was walked
+/// from at the moment this was taken, carried by value so a writer cannot reach
+/// guest RAM without holding one.
+///
+/// # Why a token and not a call
+///
+/// [`type4_pages_still_ours`] existed for a release with exactly one caller —
+/// [`crate::runtime::storage_flush::flush_render_one`] — while every other write
+/// through `MappingEntry::page_entries` went unchecked. That is not an oversight
+/// that a second call site fixes: the check has to be *reachable only through*
+/// the write, or the next rail added to this crate arrives unguarded too, and
+/// nothing in review distinguishes it from the guarded ones.
+///
+/// So [`write_mapping_bytes`] and the contig write view both demand one of
+/// these, and the four public writers in [`crate::runtime::mapping_write`] take
+/// it once at the head of the operation. "Once" is the other half of the design:
+/// the walk is a translation per page, and two of those writers call
+/// `write_mapping_bytes` per row, so checking inside the funnel would have cost
+/// rows x pages per frame — 2.2 M translations for a 1080p surface. Hoisting the
+/// proof to the operation and *presenting* it in the funnel keeps the guarantee
+/// without the quadratic.
+///
+/// # Why it carries the generation
+///
+/// Six sites clear or replace `page_entries` and all six bump `map_generation`.
+/// A token minted before one of them names a list that no longer exists, so it
+/// records the generation it was taken at and [`PagesVouched::covers`] re-checks
+/// it at the point of use. A carried-over token is then unusable by
+/// construction rather than by every future writer remembering a second field —
+/// the same rule [`crate::model::Type4Walk`] states for its own latch.
+#[derive(Clone, Copy, Debug)]
+pub struct PagesVouched {
+    mapping_id: u32,
+    map_generation: u32,
+}
+
+impl PagesVouched {
+    /// Whether this proof is about `mapping_id`'s page list *as it is now*.
+    ///
+    /// False once anything has cleared or replaced the list since the walk, so a
+    /// funnel that takes a token still refuses when the flush it performs first
+    /// invalidates the mapping underneath it.
+    pub fn covers(&self, state: &DeviceState, mapping_id: u32) -> bool {
+        self.mapping_id == mapping_id
+            && state
+                .mappings
+                .get(&mapping_id)
+                .is_some_and(|m| m.map_generation == self.map_generation)
+    }
+}
+
+/// Re-walk a mapping's page list and mint the proof a write needs, or refuse.
+///
+/// `None` means the list in hand does not name the surface's memory any more.
+/// The response is not to skip this one write: `page_entries` is what every
+/// later reader and writer resolves through, so the list is invalidated, which
+/// clears it, bumps `map_generation` and retires the contiguous view and the
+/// guest-write token with it. Every window still armed against the old
+/// incarnation then refuses on the `map_generation` check it already had, and
+/// the next type-4 bind re-resolves the surface from the object list.
+///
+/// Returning a token when there is nothing to check is deliberate and is why
+/// [`type4_pages_still_ours`] documents `true` as "nothing to check" rather than
+/// "verified": a mapping with no [`crate::model::Type4Walk`] latch has a page
+/// list this witness cannot speak about, and refusing every write to it would
+/// blank surfaces the device has no evidence against.
+pub fn vouch_mapping_pages<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> Option<PagesVouched> {
+    if !type4_pages_still_ours(state, host, mapping_id) {
+        let _ = state.invalidate_mapping_pages(mapping_id);
+        return None;
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    Some(PagesVouched {
+        mapping_id,
+        map_generation: m.map_generation,
+    })
+}
+
 const REVALIDATE_SLOW_US: u64 = 1_000;
 
 #[inline]
@@ -1573,12 +1655,17 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
 /// Covers fragmented page lists (Linux product): split GPAs into maximal packed
 /// runs, map each, poke, unmap. No `write_gpa`. Returns false if revalidate /
 /// map fails.
+///
+/// `vouched` is the caller's proof that the page list still names the surface's
+/// guest memory ([`vouch_mapping_pages`]); it is a parameter rather than a call
+/// here because two callers write a row at a time and the walk is per page.
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     mapping_id: u32,
     off: u64,
     buf: &[u8],
+    vouched: &PagesVouched,
 ) -> bool {
     if buf.is_empty() {
         return true;
@@ -1599,6 +1686,19 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
         off,
         off.saturating_add(buf.len() as u64),
     );
+    // The flush above can invalidate this mapping — that is exactly what it does
+    // when its own drift check refuses — so the proof is re-checked after it and
+    // not before. A stale token here is not a lost frame to mourn: the list it
+    // was taken against is gone, and writing through whatever replaced it is the
+    // corruption this token exists to prevent.
+    if !vouched.covers(state, mapping_id) {
+        crate::observe::fail(format!(
+            "mapping_write fail reason=vouch_stale mid={mapping_id} off={off:#x} len={:#x} \
+             (the page list was cleared or replaced between the walk and this write)",
+            buf.len()
+        ));
+        return false;
+    }
     // Fast path: one packed view covering the write.
     let need_end = off.saturating_add(buf.len() as u64);
     if let Some((ptr, len)) = ensure_contig_view(state, host, mapping_id) {
@@ -2011,7 +2111,10 @@ mod revalidate_tests {
         assert!(!read_mapping_bytes(
             &mut state, &mut host, mid, 0, &mut byte,
         ));
-        assert!(!write_mapping_bytes(&mut state, &mut host, mid, 0, &[1],));
+        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+        assert!(!write_mapping_bytes(
+            &mut state, &mut host, mid, 0, &[1], &vouched
+        ));
     }
 
     #[test]
@@ -2148,7 +2251,10 @@ mod revalidate_tests {
             "fragmented list must not pack under strict_linux_map"
         );
         let payload = b"FRAG-MULTI-IMPORT-OK!!!!"; // 24 bytes
-        assert!(write_mapping_bytes(&mut state, &mut host, mid, 0, payload));
+        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+        assert!(write_mapping_bytes(
+            &mut state, &mut host, mid, 0, payload, &vouched
+        ));
         // Second page offset = page_size.
         let mut hi = [0u8; 8];
         assert!(read_mapping_bytes(
@@ -2162,7 +2268,9 @@ mod revalidate_tests {
         // Cross-page write spanning the gap.
         let cross = vec![0xABu8; 16];
         let off = page - 8;
-        assert!(write_mapping_bytes(&mut state, &mut host, mid, off, &cross));
+        assert!(write_mapping_bytes(
+            &mut state, &mut host, mid, off, &cross, &vouched
+        ));
         let mut check = [0u8; 16];
         assert!(read_mapping_bytes(
             &mut state, &mut host, mid, off, &mut check
