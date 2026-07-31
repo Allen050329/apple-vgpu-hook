@@ -1013,3 +1013,55 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
         );
     }
 }
+
+/// The page-drift witness has exactly one production caller, so the policy and
+/// its control knob cannot be bypassed by adding a rail.
+///
+/// `mapper::type4_pages_still_ours` answers *whether* a mapping's cached page
+/// list still names the guest memory it was walked from.
+/// `mapper::mapping_pages_verdict` decides what the device does about the
+/// answer: count it, consult `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF`, and — when it
+/// refuses — invalidate the list rather than skip one write. Those are separable
+/// and a caller that reaches past the second to the first gets the question
+/// without any of the answer.
+///
+/// That is not hypothetical. The witness shipped in `1b6e423` with one caller,
+/// the deferred render flush, while the four direct writers in `mapping_write`
+/// wrote through the same `page_entries` unchecked; the crash class this crate
+/// is chasing lived in that gap for a release. Reviewing "did the new rail
+/// remember to call the check?" is exactly the question nobody asked, so it is
+/// asked here instead, once, by the compiler's test runner.
+///
+/// A new rail that genuinely needs the raw witness should call
+/// `mapping_pages_verdict` and match on the outcome. If it truly cannot, this
+/// test is the place to record why.
+#[test]
+fn the_page_drift_witness_is_only_consulted_through_the_policy() {
+    let root = crate_src();
+    let mut callers = Vec::new();
+    for path in rust_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        for (index, line) in text.lines().enumerate() {
+            if !line.contains("type4_pages_still_ours") {
+                continue;
+            }
+            // Its own definition, and the one function allowed to ask it.
+            if line.contains("pub fn type4_pages_still_ours") {
+                continue;
+            }
+            callers.push(format!("{}:{}", rel(&path, &root), index + 1));
+        }
+    }
+    assert_eq!(
+        callers.len(),
+        1,
+        "the page-drift witness must be reached only through \
+         mapper::mapping_pages_verdict, which is what counts the outcome, \
+         consults REIMS_VGPU_MAPPING_PAGE_GUARD_OFF and invalidates a \
+         contradicted list. Callers found:\n  {}",
+        callers.join("\n  ")
+    );
+}

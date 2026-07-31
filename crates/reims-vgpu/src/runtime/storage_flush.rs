@@ -1553,16 +1553,23 @@ fn mapping_pages_still_ours<M: HostMemory + HostOps>(
     host: &mut M,
     mapping_id: u32,
 ) -> bool {
-    if crate::runtime::mapper::type4_pages_still_ours(state, host, mapping_id) {
-        crate::runtime::drain::note_store_route("mapping_pages_ours");
-        return true;
+    use crate::runtime::mapper::PagesVerdict;
+    match crate::runtime::mapper::mapping_pages_verdict(state, host, mapping_id) {
+        PagesVerdict::Ours => {
+            crate::runtime::drain::note_store_route("mapping_pages_ours");
+            true
+        }
+        // Counted before the knob is consulted, so a control boot still reports
+        // how many writes it would have refused.
+        PagesVerdict::DriftedButGated => {
+            crate::runtime::drain::note_store_route("mapping_pages_drifted");
+            true
+        }
+        PagesVerdict::Drifted => {
+            crate::runtime::drain::note_store_route("mapping_pages_drifted");
+            false
+        }
     }
-    crate::runtime::drain::note_store_route("mapping_pages_drifted");
-    if crate::observe::mapping_page_guard_disabled() {
-        return true;
-    }
-    state.invalidate_mapping_pages(mapping_id);
-    false
 }
 
 /// Land a deferred **type-11 render Store**: perform the CPU writeback into the

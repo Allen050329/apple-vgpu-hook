@@ -1206,15 +1206,74 @@ pub fn vouch_mapping_pages<H: HostMemory + HostOps>(
     host: &H,
     mapping_id: u32,
 ) -> Option<PagesVouched> {
-    if !type4_pages_still_ours(state, host, mapping_id) {
-        let _ = state.invalidate_mapping_pages(mapping_id);
-        return None;
+    vouch_mapping_pages_verdict(state, host, mapping_id).1
+}
+
+/// [`vouch_mapping_pages`], also handing back what the re-walk found.
+///
+/// A caller that emits counters needs the verdict and not just the token,
+/// because `DriftedButGated` and `Ours` both yield a token and only one of them
+/// is a clean answer. Folding them together would make the control arm
+/// indistinguishable from a boot with no drift — a count that reads as success
+/// when it is the opposite.
+pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> (PagesVerdict, Option<PagesVouched>) {
+    let verdict = mapping_pages_verdict(state, host, mapping_id);
+    if verdict == PagesVerdict::Drifted {
+        return (verdict, None);
     }
-    let m = state.mappings.get(&mapping_id)?;
-    Some(PagesVouched {
+    let token = state.mappings.get(&mapping_id).map(|m| PagesVouched {
         mapping_id,
         map_generation: m.map_generation,
-    })
+    });
+    (verdict, token)
+}
+
+/// What the re-walk found, kept separate from what the device does about it.
+///
+/// Two rails ask this question — the deferred render flush and the four direct
+/// writers — and they want different counters but must not want different
+/// *policy*. Splitting "drifted" from "drifted, but the control knob is on"
+/// is what lets a control boot still report how many writes it would have
+/// refused, which is the whole reason the knob and the counters are separate
+/// instruments.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PagesVerdict {
+    /// The re-walk agreed with the cached list, or there was nothing to check.
+    Ours,
+    /// The re-walk disagreed, but `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF` is set, so
+    /// the write proceeds anyway and the list is left alone. This is the control
+    /// arm: same binary, unguarded behaviour, counters still emitted.
+    DriftedButGated,
+    /// The re-walk disagreed. The list has been invalidated — refusing this one
+    /// write is not enough, because `page_entries` is what every later reader and
+    /// writer resolves through.
+    Drifted,
+}
+
+/// The single decision both mapping-keyed rails take, so they cannot drift apart
+/// in policy or in what the control knob turns off.
+///
+/// An earlier shape had the deferred flush spell this out inline while the write
+/// rails had no gate at all, which would have made a control boot measure only
+/// half the change — the kind of divergence that makes an A/B report the rig
+/// rather than the code.
+pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    mapping_id: u32,
+) -> PagesVerdict {
+    if type4_pages_still_ours(state, host, mapping_id) {
+        return PagesVerdict::Ours;
+    }
+    if crate::observe::mapping_page_guard_disabled() {
+        return PagesVerdict::DriftedButGated;
+    }
+    state.invalidate_mapping_pages(mapping_id);
+    PagesVerdict::Drifted
 }
 
 const REVALIDATE_SLOW_US: u64 = 1_000;

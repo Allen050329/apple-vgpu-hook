@@ -126,14 +126,22 @@ fn vouch_for_write<M: HostMemory + HostOps>(
     mapping_id: u32,
     writer: &'static str,
 ) -> Option<mapper::PagesVouched> {
-    let vouched = mapper::vouch_mapping_pages(state, host, mapping_id);
-    if vouched.is_none() {
-        crate::observe::fail(format!(
-            "mapping_write fail reason=pages_not_vouched mid={mapping_id} writer={writer}"
-        ));
-        crate::runtime::drain::note_store_route("mapw_pages_refused");
-    } else {
-        crate::runtime::drain::note_store_route("mapw_pages_vouched");
+    let (verdict, vouched) = mapper::vouch_mapping_pages_verdict(state, host, mapping_id);
+    match verdict {
+        mapper::PagesVerdict::Ours => {
+            crate::runtime::drain::note_store_route("mapw_pages_vouched");
+        }
+        // Counted whether or not the knob let the write through, so a control
+        // boot still reports how many writes it would have refused. The knob
+        // prices the guard in lost frames; the counter prices the defect.
+        mapper::PagesVerdict::DriftedButGated | mapper::PagesVerdict::Drifted => {
+            crate::observe::fail(format!(
+                "mapping_write fail reason=pages_not_vouched mid={mapping_id} writer={writer} \
+                 gated={}",
+                u8::from(verdict == mapper::PagesVerdict::DriftedButGated)
+            ));
+            crate::runtime::drain::note_store_route("mapw_pages_refused");
+        }
     }
     vouched
 }
