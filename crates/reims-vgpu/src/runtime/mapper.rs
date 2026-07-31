@@ -1821,6 +1821,47 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
 /// `vouched` is the caller's proof that the page list still names the surface's
 /// guest memory ([`vouch_mapping_pages`]); it is a parameter rather than a call
 /// here because two callers write a row at a time and the walk is per page.
+/// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.
+///
+/// Resolved through the mapping's own page list rather than over the span's
+/// hull, because that list is a scatter: a surface's pages are wherever the
+/// guest allocator put them, and a hull would claim every frame in between —
+/// memory belonging to someone else, every one of which would then read as a
+/// hit for the rest of the boot.
+///
+/// Each page contributes only its intersection with the byte range, so a write
+/// of one row into a 16 KiB arm64 page marks the frame that row is in and not
+/// the other three.
+fn note_mapping_write_footprint(state: &DeviceState, mapping_id: u32, off: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let Some(m) = state.mappings.get(&mapping_id) else {
+        return;
+    };
+    let page_size = state.page_size();
+    let page_shift = state.page_shift;
+    let end = off.saturating_add(len);
+    let first = off / page_size;
+    let last = (end - 1) / page_size;
+    for i in first..=last {
+        let Some(&entry) = m.page_entries.get(i as usize) else {
+            // A short page list is a refusal the caller reports; there is no
+            // frame to name for a page the list does not have.
+            break;
+        };
+        let Some(gpa) = crate::contract::iosurface_pages::entry_gpa_shift(entry, page_shift) else {
+            continue;
+        };
+        let page_lo = i.saturating_mul(page_size);
+        let lo = off.max(page_lo);
+        let hi = end.min(page_lo.saturating_add(page_size));
+        if lo < hi {
+            crate::observe::footprint::note_written_range(gpa + (lo - page_lo), hi - lo);
+        }
+    }
+}
+
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1873,6 +1914,7 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
                     buf.len(),
                 );
             }
+            note_mapping_write_footprint(state, mapping_id, off, buf.len() as u64);
             return true;
         }
     }
@@ -1932,6 +1974,14 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
                 n,
             );
         }
+        // Packed run, so the `n` bytes at `host_off` are the `n` bytes at
+        // `run_gpas[0] + host_off`. Marked per run rather than once over
+        // `[off, end)` because the runs are what is contiguous; the mapping's
+        // list between them is not.
+        crate::observe::footprint::note_written_range(
+            run_gpas[0].saturating_add(host_off as u64),
+            n as u64,
+        );
         host.unmap_pages(ptr, total);
     }
     let import_us = import_started.elapsed().as_micros() as u64;
@@ -2438,6 +2488,139 @@ mod revalidate_tests {
             &mut state, &mut host, mid, off, &mut check
         ));
         assert_eq!(check, [0xABu8; 16]);
+    }
+
+    /// The mapping rail's writes reach `observe::footprint`, and claim exactly
+    /// the frames they wrote.
+    ///
+    /// This is the positive control the footprint's own unit tests cannot be:
+    /// those drive the bit set directly, so they prove the container works and
+    /// say nothing about whether any rail is wired to it. A footprint fed by no
+    /// rail reports an empty set, and an empty set answers "this device never
+    /// wrote that page" to every question — the exoneration that costs nothing
+    /// to produce and cannot be told from a real one.
+    ///
+    /// The negatives are the load-bearing half. A mapping's page list is a
+    /// scatter, so the tempting implementation — mark `[gpa_lo, gpa_hi]` over
+    /// the write's span — would claim the 64 Ki frames between these two pages,
+    /// none of which this device can reach through this mapping. Every one of
+    /// them would then read as a hit for the rest of the boot, against a guest
+    /// panic that had nothing to do with us.
+    #[test]
+    fn a_mapping_write_marks_its_own_frames_and_not_the_gap_between_them() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa0 = 0x1000_0000u64;
+        let gpa1 = 0x2000_0000u64;
+        host.map_range(gpa0, page as usize, 0);
+        host.map_range(gpa1, page as usize, 0);
+        let mid = 9u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = vec![
+                (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+        }
+        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+
+        // 24 bytes at offset 0: page 0 only.
+        assert!(write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            0,
+            b"FOOTPRINT-FIRST-PAGE!!!!",
+            &vouched
+        ));
+        assert!(footprint::wrote_gpa(gpa0), "the destination must be marked");
+        assert!(
+            !footprint::wrote_gpa(gpa1),
+            "a write that never reached page 1 must not claim it"
+        );
+        assert!(
+            !footprint::wrote_gpa((gpa0 + gpa1) / 2),
+            "the hull between the two pages belongs to whoever the guest gave it \
+             to; claiming it would make every later `pn` in that range a hit"
+        );
+        assert_eq!(footprint::counts(), (1, 0));
+
+        // Cross-page: now both, and still nothing between them.
+        assert!(write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            page - 8,
+            &[0xABu8; 16],
+            &vouched
+        ));
+        assert!(footprint::wrote_gpa(gpa1), "the second page is reached now");
+        assert!(!footprint::wrote_gpa((gpa0 + gpa1) / 2));
+        assert_eq!(
+            footprint::counts(),
+            (2, 0),
+            "two frames total, not the span between them"
+        );
+    }
+
+    /// The same claim for the contiguous-view fast path, which is the one
+    /// production takes.
+    ///
+    /// The two paths mark through different code — the fast path resolves the
+    /// destination from the mapping's page list because it has only a host
+    /// pointer and an offset, the slow path from each packed run it maps — so a
+    /// control over one says nothing about the other. The fast path is where
+    /// nearly all of the ~100 000 mapping writes a driven boot makes actually
+    /// go, so an unmarked one there is most of the footprint missing.
+    #[test]
+    fn a_contiguous_mapping_write_marks_only_the_pages_its_offset_reaches() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = 1u64 << PAGE_SHIFT_X86;
+        // Adjacent, so `ensure_contig_view` packs them into one view.
+        let gpa0 = 0x3000_0000u64;
+        let gpa1 = gpa0 + page;
+        host.map_range(gpa0, 2 * page as usize, 0);
+        let mid = 11u32;
+        state.map_surface(mid);
+        {
+            let m = state.mappings.get_mut(&mid).unwrap();
+            m.page_entries = vec![
+                (((gpa0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+                (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
+        }
+        assert!(
+            ensure_contig_view(&mut state, &mut host, mid).is_some(),
+            "the fixture must take the fast path or it is testing the other one"
+        );
+        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+
+        // Entirely inside page 1: the offset, not the base, decides the frame.
+        assert!(write_mapping_bytes(
+            &mut state,
+            &mut host,
+            mid,
+            page + 16,
+            &[0x5Au8; 32],
+            &vouched
+        ));
+        assert!(footprint::wrote_gpa(gpa1));
+        assert!(
+            !footprint::wrote_gpa(gpa0),
+            "marking from the mapping's base rather than the write's offset \
+             would claim page 0, which this write never touched"
+        );
+        assert_eq!(footprint::counts(), (1, 0));
     }
 }
 

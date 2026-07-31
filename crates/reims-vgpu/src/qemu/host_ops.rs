@@ -343,6 +343,12 @@ impl HostMemory for QemuHost<'_> {
         // SAFETY: QEMU owns ctx; buf is valid for len.
         let rc = unsafe { f(self.ops.ctx, gpa, buf.as_ptr(), buf.len()) };
         if rc == 0 {
+            // The only `HostMemory::write_gpa` that reaches real guest RAM, so
+            // it is where that whole funnel is recorded. `FakeHost` deliberately
+            // does not mark: a fixture's writes are not this device's, and
+            // counting them would put test addresses in a set whose entire
+            // purpose is to be compared against a live guest's panic.
+            crate::observe::footprint::note_written_range(gpa, buf.len() as u64);
             Ok(())
         } else {
             Err(Self::callback_decline(

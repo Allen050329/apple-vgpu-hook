@@ -1117,6 +1117,156 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
     }
 }
 
+/// Every production use of [`crate::runtime::host::HostOps::map_pages`], and
+/// whether the host pointer it returns is written through.
+///
+/// `map_pages` hands back a writable alias of guest RAM, so it is one of the two
+/// ways this device can put bytes in the guest — the other being
+/// `HostMemory::write_gpa`, which has a single production implementation and is
+/// marked there. Every site here that writes must also mark
+/// `observe::footprint`, or that write's frames are missing from the set a guest
+/// panic is scored against. **The missing mark is the dangerous direction**: it
+/// produces a "this device never wrote that page" that is false, which is an
+/// exoneration nobody can tell from a real one.
+///
+/// So the classification is the point of the row, and the count is what stops a
+/// new call appearing inside an already-listed file without anyone deciding
+/// which kind it is.
+const MAP_PAGES_SITES: &[(&str, usize, bool, &str)] = &[
+    (
+        "runtime/gpa_map.rs",
+        1,
+        true,
+        "control-plane writes (stamp, DeviceInfo, display shared, child HEAD) \
+         map the covering pages and poke bytes; marked on the exact byte range \
+         after the copy",
+    ),
+    (
+        "runtime/gva_view.rs",
+        4,
+        true,
+        "the raw-GVA rails. `write_span_multi` marks each packed run's exact \
+         destination; `map_fresh_span_within` marks the span it is about to hand \
+         to a caller that writes through the pointer. The read paths \
+         (`read_span_multi`, `host_ptr_for_span`) reach guest RAM only to copy \
+         out of it",
+    ),
+    (
+        "runtime/mapper.rs",
+        3,
+        true,
+        "the mapping-keyed rails. `write_mapping_bytes` marks through the \
+         mapping's own page list — a scatter, so never over the span's hull — on \
+         both the contiguous-view fast path and the per-run slow path. \
+         `ensure_contig_view` and `mapping_page_gpas` only build the view",
+    ),
+    (
+        "runtime/metal_draw/vulkan.rs",
+        3,
+        false,
+        "`task_gva_guest_runs`, `try_type11_sample_zero_copy` and \
+         `try_type5_sample_zero_copy` build `engine::GuestRun` spans the engine \
+         reads *out of* — vertex, storage and sampled sources uploaded to the \
+         GPU. Nothing writes back through them, and the GPU cannot: \
+         `no_vk_ext_external_memory_host` holds that the one extension which \
+         would let it is never requested",
+    ),
+];
+
+/// A `map_pages` caller that writes guest RAM must record where.
+///
+/// See [`MAP_PAGES_SITES`]. This is the mechanism behind the completeness claim
+/// `observe::footprint` makes: the footprint can only be trusted as evidence
+/// about a guest panic if the set of rails feeding it is closed, and "we
+/// remembered to hook the new one" is not a mechanism.
+#[test]
+fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
+    let root = crate_src();
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut marks: std::collections::BTreeSet<String> = Default::default();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        let rel_path = rel(&path, &root);
+        for line in text.lines() {
+            // `map_pages_stable` is a capability question, not a mapping.
+            if line.contains(".map_pages(") {
+                *found.entry(rel_path.clone()).or_default() += 1;
+            }
+            if line.contains("footprint::note_written_range(")
+                || line.contains("footprint::note_written_pages(")
+            {
+                marks.insert(rel_path.clone());
+            }
+        }
+    }
+
+    let expected: std::collections::BTreeMap<String, usize> = MAP_PAGES_SITES
+        .iter()
+        .map(|(file, n, _, _)| ((*file).to_string(), *n))
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the set of `map_pages` callers changed. Each one aliases guest RAM \
+         writably, so a new entry has to be classified in MAP_PAGES_SITES as a \
+         writer (and then mark observe::footprint) or as a reader (and say why \
+         nothing writes back through it)."
+    );
+
+    for (file, _, writes, why) in MAP_PAGES_SITES {
+        assert!(!why.is_empty(), "{file}: classify it, do not just list it");
+        assert!(
+            root.join(file).exists(),
+            "{file} no longer exists; drop the row"
+        );
+        assert_eq!(
+            marks.contains(*file),
+            *writes,
+            "{file}: MAP_PAGES_SITES says writes={writes}, but the file {} mark \
+             observe::footprint. A writing rail that does not mark leaves its \
+             frames out of the set, and the resulting `pn` miss reads exactly \
+             like a real exoneration.",
+            if marks.contains(*file) {
+                "does"
+            } else {
+                "does not"
+            }
+        );
+    }
+}
+
+/// The other funnel: `HostMemory::write_gpa` reaches guest RAM without
+/// `map_pages` at all, so the footprint has to be marked in the one production
+/// implementation of it.
+///
+/// `FakeHost`'s implementation deliberately does not mark, for the reason its
+/// [`MAP_PAGES_SITES`] row gives, so this asserts the QEMU side specifically
+/// rather than counting implementations.
+#[test]
+fn the_real_write_gpa_marks_the_footprint() {
+    let src = std::fs::read_to_string(crate_src().join("qemu/host_ops.rs"))
+        .expect("read the QEMU host shim");
+    let production = production_source(&src);
+    let masked = mask_comments_and_literals(&production);
+    let text: String = masked.iter().copied().map(char::from).collect();
+    let body = text
+        .split("fn write_gpa(")
+        .nth(1)
+        .expect("QemuHost still implements write_gpa");
+    // Bounded to the function: the next `fn ` starts the following method, and
+    // a mark that had drifted out of `write_gpa` into a neighbour would
+    // otherwise satisfy a whole-file search while recording nothing.
+    let body = body.split("\n    fn ").next().unwrap_or(body);
+    assert!(
+        body.contains("footprint::note_written_range("),
+        "QemuHost::write_gpa must record the frames it writes. It is one of the \
+         two ways this device reaches guest RAM, and the whole of the \
+         control-plane traffic goes through it."
+    );
+}
+
 /// Product raw-GVA writes that are deliberately **not** bounded to an armed
 /// page set, each with the authorisation that makes it sound.
 ///

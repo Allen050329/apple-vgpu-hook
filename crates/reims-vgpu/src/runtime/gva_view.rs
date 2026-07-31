@@ -715,6 +715,23 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
         host.unmap_pages(ptr_base, map_len);
         return None;
     }
+    // Recorded here, on the requested `[gva, gva+length)`, because the bytes go
+    // through the returned pointer in a caller this function never sees. That
+    // makes it the one hook in the set that records an *intent* rather than a
+    // completed copy: a caller that takes the span and writes less than it asked
+    // for leaves frames marked that no byte reached.
+    //
+    // This is the safe direction and only this direction. Over-marking can only
+    // turn a miss into a hit, and a hit is the weak verdict — it never asserts
+    // the device wrote somewhere it did not, it only declines to exonerate. The
+    // mirror — under-marking a real write — would manufacture the clean "we
+    // never wrote there" that this whole set exists to be trusted for.
+    //
+    // The span is contiguous in guest-physical space: `runs != 1` returned above.
+    crate::observe::footprint::note_written_range(
+        gpas[0].saturating_add(off as u64),
+        length,
+    );
     Some(FreshSpan {
         // SAFETY: map_pages returned `map_len` mapped bytes at `ptr_base`.
         ptr: unsafe { (ptr_base as *mut u8).add(off) },
@@ -821,6 +838,13 @@ fn write_span_multi<H: HostMemory + HostOps>(
                 n,
             );
         }
+        // A run is packed by construction, so the `n` bytes at `host_off` are
+        // the `n` bytes at `run_gpas[0] + host_off` in guest-physical space —
+        // the exact destination, not the run's hull.
+        crate::observe::footprint::note_written_range(
+            run_gpas[0].saturating_add(host_off as u64),
+            n as u64,
+        );
         host.unmap_pages(ptr, total);
     }
     Ok(())
@@ -1213,6 +1237,45 @@ mod tests {
         st32(&mut pte, 4);
         host.write_gpa(root_gpa, &pte).unwrap();
         (host, root_gpa, data0, data1, page)
+    }
+
+    /// The raw-GVA rail's writes reach `observe::footprint`, at the guest
+    /// physical address the walk resolved and nowhere else.
+    ///
+    /// The rail's whole shape is that the destination is not knowable from the
+    /// call — it is whatever the task's page table says at write time — so the
+    /// footprint has to be marked from the *resolved* GPA. Marking from the GVA
+    /// instead would be the same substitution the type-4 identity guard exists
+    /// to refuse, and it would fill the set with addresses in low guest RAM,
+    /// which is exactly where the panic census's victims live. Every such frame
+    /// would then read as a hit.
+    #[test]
+    fn a_raw_gva_write_marks_the_resolved_gpa_and_not_the_virtual_address() {
+        use crate::observe::footprint;
+
+        let _fp = footprint::exclusive_for_tests();
+        let (mut host, _root_gpa, data0, data1, page) = pt_fixture(PAGE_SHIFT_X86);
+        let mut state = state_x86();
+        assert!(state.define_task(1, page, 2));
+
+        let gva = 0x100u64;
+        write_span(&mut state, &mut host, 1, gva, &[0x7Eu8; 64]).expect("the walk resolves");
+
+        assert!(
+            footprint::wrote_gpa(data0),
+            "the frame the page table named must be marked"
+        );
+        assert!(
+            !footprint::wrote_gpa(gva),
+            "the guest VIRTUAL address is not a physical frame; marking it would \
+             put low guest RAM — where the panic census's victims live — into the \
+             set on every write"
+        );
+        assert!(
+            !footprint::wrote_gpa(data1),
+            "the page the guest did not point at is not ours"
+        );
+        assert_eq!(footprint::counts(), (1, 0));
     }
 
     /// A deferred write is bounded by the pages it was armed on, and the bound

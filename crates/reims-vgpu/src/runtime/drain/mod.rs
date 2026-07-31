@@ -3153,6 +3153,12 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
+        // Onto the census cadence rather than a timer of its own, so a reader
+        // pairing the footprint against `store_routes` is reading one clock.
+        // The run dump rate-limits itself; this is the only caller.
+        for line in crate::observe::footprint::census_lines(crate::observe::elapsed_ms() as u64) {
+            crate::observe::off(line);
+        }
         emit_engine_delta();
     }
 }

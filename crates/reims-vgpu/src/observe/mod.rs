@@ -43,6 +43,7 @@
 
 pub mod decline;
 pub mod emit;
+pub mod footprint;
 #[cfg(test)]
 mod gate;
 pub mod sink;
