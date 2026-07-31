@@ -1473,6 +1473,71 @@ route — it claimed the vouch "re-walks type-4 pages before each write", which 
 overstatement the witness's own doc warns against. The route matters, because the measurement above
 is what makes the claim true rather than the argument.
 
+#### "Did we write there?" is now a set lookup, and only 2 of 12 panics can ask it
+
+Every guard above answers *whether a write was allowed*. None of them answers the question the panic
+census actually poses, which is **where this device's writes went**. That question was never hard —
+it was unasked. XNU's `pmap_page_protect` panic prints a guest **physical page number**
+(`pn=0x46b53b`), and this device knew its own destinations only as transient locals, so the link
+between the census and this device stayed what this document calls it: a coincidence of shape.
+
+`observe::footprint` is the set that closes it — one bit per guest 4 KiB frame, set by every rail
+that can put bytes in guest RAM, accumulated for the whole boot, emitted on the existing per-second
+census:
+
+```text
+guest_write_footprint pages=34407 kib=137628 dropped=0 frame_shift=12
+guest_write_footprint_runs seq=7 part=1/12 runs=561 0x2cd26c-0x2cd50b 0xb9d9-0xb9e8 …
+```
+
+Frames are fixed at 4 KiB rather than the device's `page_shift`: it keeps guest page geometry out of
+hooks at layers that have no business knowing it, and it is at least as fine as any page this project
+supports, so an arm64 16 KiB page marks exactly four frames and nothing is rounded up into a frame no
+byte reached.
+
+**Read a hit and a miss differently — they are not symmetric.** A miss is strong: these rails
+demonstrably never wrote that frame, which exonerates them. A hit is evidence proportional to
+density, because the device is *supposed* to write those frames. A boot covering 0.8 % of a 16 GiB
+guest puts an unrelated victim inside about one time in 125; `pages` is on every summary line so a
+reader computes that ratio rather than assuming it.
+
+**The coverage limit is the part to internalise, and it was measured rather than assumed.** Of the 12
+panics on disk, **only 2 carry a `pn=`** — both `pmap_page_protect`. The other ten give a kernel VA
+(the kalloc poison element), a faulting VA (`CR2`), or a backtrace, and none of those can be turned
+into a guest physical frame after the fact. So the join covers about a sixth of the class.
+`.agents/repros/footprint-attribute.py` reports the rest as `UNSCOREABLE` and says which evidence it
+saw and declined to score. **Do not let a scorer fold those into `MISS`** — that would manufacture
+ten exonerations with no basis, which is this rig's standing failure direction.
+
+The scorer's own controls are the usual both-directions discipline (`--selftest`, and it passes): a
+`pn` inside a run, one on each run boundary, one just outside, one far outside, a VA-only panic, and
+a **truncated final dump**. That last one matters because a panic cuts the log mid-dump, and a
+partial set has frames missing — missing frames produce false `MISS`es. The scorer falls back to the
+newest *complete* dump and flags that the miss is correspondingly weaker. Pointed at a boot that
+predates the instrument it prints `UNSCOREABLE`, not `MISS`.
+
+**Completeness is a gate, not a promise.** There are exactly two ways this device reaches guest RAM:
+`HostMemory::write_gpa` (one production implementation, marked in `QemuHost`) and a host pointer from
+`HostOps::map_pages`. `every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint` pins
+all eight production `map_pages` callers with a stated verdict and asserts that every file classified
+as a writer marks and every reader does not, so a new writing rail that skips the hook fails the
+build. GPU-direct writes are not a gap: `VK_EXT_external_memory_host` is never requested and a
+separate gate holds that, so the three `metal_draw/vulkan.rs` sites are read-only upload sources.
+`FakeHost` deliberately does **not** mark — fixture addresses in a set whose only use is comparison
+against a live guest would be noise that reads as signal.
+
+Two implementation traps worth keeping, both caught by tests rather than by a boot. The run extractor
+used `(!word >> lo).trailing_zeros()`, which is 64 when a word is set through bit 63 — a length
+measured from bit 0, not from `lo` — so frames 60..=63 dumped as 60..=123, sixty frames never
+written. And the scatter form marks **per page, never over a page list's hull**: a surface's pages
+are wherever the guest allocator put them, and a hull would claim the guest's other allocations
+between them, every one of which then reads as a hit for the rest of the boot.
+
+**Not yet read off a live guest.** The instrument landed while a 40-boot panic soak was running on a
+pinned QEMU, so no boot has produced a footprint yet and the density figure above is illustrative,
+not measured. The first driven boot on a tree carrying it should record the real density here —
+that number is what every later hit is weighed against.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
