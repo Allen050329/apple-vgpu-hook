@@ -1064,6 +1064,46 @@ fn flush_one<M: HostMemory + HostOps>(
 /// Counted at the flush dispatcher rather than at each writer, so the two rails
 /// share one denominator; whether a landing actually reached guest RAM is what
 /// the existing `deferred_flush_*` lines already say.
+///
+/// # Measured, and the answer is NO — do not apply the GVA repair here
+///
+/// One 14-round x86/Vulkan icon boot:
+///
+/// ```text
+/// rendw_stamp_same    0     rendw_stamp_outlived 1088
+/// storw_stamp_same    0     storw_stamp_outlived   24
+/// elapsed over 217 latched spans: min 1, p50 66, p90 2551, max 17086
+/// ```
+///
+/// Read as a counter this looks exactly like the GVA rail's 810-of-810, and
+/// that reading is wrong. **The counter is not the hazard.** Outliving the fence
+/// only corrupts memory if the guest can repurpose that memory without the
+/// device finding out, and on these rails it cannot:
+///
+/// - [`flush_render_one`] and [`flush_storage_one`] both compare the mapping's
+///   live `map_generation` against `key.map_generation` and refuse with
+///   `deferred_flush_lost reason=map_generation_drift` before reading anything.
+/// - `map_generation` is bumped by exactly the events that let the guest reuse
+///   an IOSurface's storage — MAP, UNMAP, `ReplacePhysical`, MappingInternal
+///   reattach, any page-table refresh that changes PFNs.
+/// - A `DeleteIOSurfaceBacking2` that has not yet resolved leaves the backing
+///   *condemned*, and [`flush_intersecting`] refuses to take those windows at
+///   all.
+///
+/// So these windows name a specific mapping incarnation, and a guest that frees
+/// the storage invalidates the name. That is precisely the allocation identity
+/// the GVA rail did not have and could not be given: a type-2/3 target is a
+/// texture handle shifted into an address, with no lifecycle notify anywhere in
+/// the wire format, so `deferred_pages_still_ours` was the only guard available
+/// and page identity survives free-then-reuse.
+///
+/// The repair for the GVA rail is therefore NOT owed here, and applying it would
+/// not be free: landing every armed window at every fence on this rail means CPU
+/// writeback of full-screen 1920x1080 frames that ~98 % of the time nothing ever
+/// reads (see [`crate::model::DeferredOwner::Render`]). These counters stay as
+/// the standing check that the guard above keeps holding — if `map_generation`
+/// ever stops covering a way the guest can reclaim surface storage, this is
+/// where it shows up first.
 fn note_mapping_window_against_fence(
     state: &DeviceState,
     key: &crate::model::ComputeStorageResidencyKey,
