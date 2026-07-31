@@ -1639,13 +1639,38 @@ fn flush_render_one<M: HostMemory + HostOps>(
             std::borrow::Cow::Borrowed(bytes.as_slice())
         }
         crate::model::RenderWindowSource::Resident { epoch } => {
+            use crate::backend::vulkan::engine::ResidentContent;
             let identity = render_window_identity(key);
-            let live = crate::backend::vulkan::engine::resident_content_epoch(&identity);
-            if live != Some(*epoch) {
+            // Three outcomes, not two, and the third used to hide inside the
+            // second. `resident_content_epoch` answers `None` both for a slot a
+            // later draw un-stamped — expected traffic, the newer pass owns the
+            // surface now — and for a slot that is not there at all, which
+            // cannot happen to a pinned identity unless the arm and the flush
+            // spell that identity differently. One measured boot lost ~150
+            // frames here, `live=None` on every one of them, and nothing in the
+            // log could say which kind they were. See `engine::ResidentContent`.
+            let live = crate::backend::vulkan::engine::resident_content_state(&identity);
+            if live != ResidentContent::Epoch(*epoch) {
                 crate::backend::vulkan::engine::unpin_resident_target(&identity);
+                let (reason, route) = match live {
+                    ResidentContent::Absent => (
+                        "resident_absent (a pinned slot cannot be evicted, so the arm \
+                         and the flush name this target differently)",
+                        "rendflush_resident_absent",
+                    ),
+                    ResidentContent::Unstamped => (
+                        "resident_epoch_cleared (a draw landed on this surface after \
+                         the Store this window defers)",
+                        "rendflush_epoch_cleared",
+                    ),
+                    ResidentContent::Epoch(_) => {
+                        ("resident_epoch_drift", "rendflush_epoch_drift")
+                    }
+                };
+                crate::runtime::drain::note_store_route(route);
                 crate::observe::fail(format!(
                     "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
-                     reason=resident_epoch_drift want={epoch} live={live:?}",
+                     reason={reason} want={epoch} live={live:?}",
                     key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
                 ));
                 return false;

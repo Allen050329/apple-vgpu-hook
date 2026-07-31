@@ -3074,3 +3074,78 @@ fn measure_draw_cost_against_pass_size() {
     }
     eprintln!();
 }
+
+/// A deferred window's currency check must tell "no slot" apart from "slot with
+/// no stamp", because they are different defects and only one of them is legal.
+///
+/// `resident_content_epoch` collapses both to `None`, and that is right for the
+/// LOAD elision it was written for: a pass that cannot prove the resident holds
+/// the mapping's bytes takes the CPU seed and does not care why. A landing
+/// window is the opposite case. It pinned a content-ready slot at this identity
+/// and stamped it under the engine lock, so an *un-stamped* slot means a later
+/// draw claimed the surface — expected — while an *absent* one means nothing
+/// evicted a pinned slot, which cannot happen, unless the arm and the flush
+/// spell the identity differently. One boot lost ~150 full-screen frames to
+/// `live=None` with no way to tell which kind they were.
+#[test]
+fn resident_content_state_separates_an_absent_slot_from_an_unstamped_one() {
+    use reims_vgpu::backend::vulkan::engine::ResidentContent;
+    let _g = engine_test_session();
+    let (v, f) = triangle_spirv();
+
+    let absent = TargetIdentity::Surface {
+        id: 0x9A01,
+        width: 16,
+        height: 16,
+        generation: 1,
+    };
+    assert_eq!(
+        engine::resident_content_state(&absent),
+        ResidentContent::Absent,
+        "an identity nothing ever created has no slot, and that is not the same \
+         answer as a slot whose stamp was cleared"
+    );
+
+    let live = TargetIdentity::Surface {
+        id: 0x9A02,
+        width: 16,
+        height: 16,
+        generation: 1,
+    };
+    let mut make = engine_req(&v, &f, 16, 16);
+    make.target_identity = Some(live.clone());
+    match engine::execute_draw_request(&make) {
+        Ok(_) => {}
+        Err(e) if skip_if_no_gpu(&e.to_string()) => {
+            eprintln!("SKIP resident_content_state: {e}");
+            return;
+        }
+        Err(e) => panic!("target draw: {e}"),
+    }
+    // A draw leaves the slot ready and unvouched-for: `registry_mark_ready`
+    // clears the content stamp precisely so nothing believes a stale one.
+    assert_eq!(
+        engine::resident_content_state(&live),
+        ResidentContent::Unstamped,
+        "a freshly drawn slot exists but vouches for nothing"
+    );
+
+    assert!(
+        engine::stamp_resident_content_epoch(&live, 77),
+        "a content-ready slot accepts a stamp"
+    );
+    assert_eq!(
+        engine::resident_content_state(&live),
+        ResidentContent::Epoch(77),
+        "and reports exactly the epoch it was stamped with"
+    );
+
+    // A second draw into the same target is what a window's flush must decline
+    // on, and it must be reported as the cleared case rather than the absent one.
+    engine::execute_draw_request(&make).expect("second target draw");
+    assert_eq!(
+        engine::resident_content_state(&live),
+        ResidentContent::Unstamped,
+        "a draw since the stamp clears it — the slot is still there"
+    );
+}

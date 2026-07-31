@@ -408,6 +408,50 @@ pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
     guard.pools.registry_get(identity)?.content_epoch
 }
 
+/// What the registry says about an identity's content stamp, with the two ways
+/// [`resident_content_epoch`] can answer `None` told apart.
+///
+/// The elision path is right to collapse them: a LOAD that cannot prove the
+/// resident holds the mapping's bytes takes the CPU seed, and it does not care
+/// why. A *deferred window* landing its frame is the opposite case. It already
+/// pinned a content-ready slot at this identity and stamped it under the engine
+/// lock, so by the time it lands:
+///
+/// - [`ResidentContent::Unstamped`] is expected traffic. `registry_mark_ready`
+///   clears the stamp on every draw into a slot, so a later pass over the same
+///   surface says the resident no longer holds the frame this window promised.
+///   Declining is correct; the newer pass owns the surface now.
+/// - [`ResidentContent::Absent`] is not. Nothing may evict a pinned slot —
+///   `evict_registry_to_cap` and the idle drain both skip pinned slots by design
+///   — so an identity that has gone missing between the arm and the fence means
+///   the two spellings of it disagree: the arm pinned one `TargetIdentity` and
+///   the flush rebuilt another. That is a lost frame *and* a leaked pin, and it
+///   is the same defect shape as `74748d2` and `021e64b`, which is why it must
+///   not hide inside the same `None` as the expected case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentContent {
+    /// No slot at this identity: evicted, never created, or named differently
+    /// by whoever is asking.
+    Absent,
+    /// Slot present, stamp cleared by a draw since it was written.
+    Unstamped,
+    /// Slot present and vouched for at this mapping content epoch.
+    Epoch(u32),
+}
+
+/// [`ResidentContent`] for one identity — the reading a deferred window takes
+/// before it believes a resident still holds its frame.
+pub fn resident_content_state(identity: &TargetIdentity) -> ResidentContent {
+    let guard = lock_engine();
+    match guard.pools.registry_get(identity) {
+        None => ResidentContent::Absent,
+        Some(slot) => match slot.content_epoch {
+            None => ResidentContent::Unstamped,
+            Some(epoch) => ResidentContent::Epoch(epoch),
+        },
+    }
+}
+
 /// Record that this resident holds the mapping's content as of `epoch`. Returns
 /// false when the identity is absent or not content_ready, which the caller
 /// must treat as "the elision is off for this surface" rather than ignore.
