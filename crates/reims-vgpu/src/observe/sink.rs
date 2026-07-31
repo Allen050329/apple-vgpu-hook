@@ -796,22 +796,27 @@ pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
 /// survive the guest's statement that it CPU-wrote the resource, the way every
 /// window did while the `EXEC_INDIRECT2` resource table went unread.
 ///
-/// `1`/`all` arms both producers; `exec` and `inv` arm one each — the exec table
-/// and `CmdInvalidateResources` deliver different quads at different rates, so
-/// an `=1` arm that reverted both would score one producer against a control
-/// that had also given back the other.
+/// Three rails, armed by name or all at once with `1`/`all`:
 ///
-/// It gates exactly one action: dropping the pending windows of a mapping whose
-/// `clear_host_valid` just arrived. The `content_generation` bump and the
-/// recorded validity state stay on either way — the bump is what the invalidate
-/// producer has always done, and the state is inert bookkeeping. Narrowing the
-/// knob to the one action is what makes the arm and its control differ in the
-/// one thing being measured.
+/// - `exec` / `inv` — the two producers of the quad. Each gates one action:
+///   dropping the pending windows of a mapping whose `clear_host_valid` just
+///   arrived. They are separate because the producers deliver different quads at
+///   different rates, and an `=1` arm that reverted both would score one against
+///   a control that had also given back the other.
+/// - `writeback` — the flush-time gate, which refuses a deferred writeback into
+///   a mapping the guest has since declared it owns. Separate from the producer
+///   rails because it is the only one that can *withhold a frame*, and a boot
+///   read for missing pixels needs to arm exactly that.
 ///
-/// `validity_windows_dropped` is counted whichever way this is set, on purpose:
-/// a control boot reports the same number the armed boot acts on, so the two
-/// differ only in whether those windows landed. An arm and its control are one
-/// binary apart.
+/// What no rail gates: the `content_generation` bump and the recorded validity
+/// state. The bump is what the invalidate producer has always done, and the
+/// state is inert bookkeeping. Narrowing each knob to one action is what makes
+/// an arm and its control differ in the one thing being measured.
+///
+/// `validity_windows_dropped` and `validity_wb_{licensed,superseded,unstated}`
+/// are counted whichever way this is set, on purpose: a control boot reports the
+/// same numbers the armed boot acts on, so the two differ only in whether those
+/// writes landed. An arm and its control are one binary apart.
 pub fn resource_validity_disabled(site: &str) -> bool {
     static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {
@@ -1382,13 +1387,22 @@ mod tests {
             assert!(resource_validity_spec_arms(Some(spec), "exec"));
             assert!(resource_validity_spec_arms(Some(spec), "inv"));
         }
+        for spec in ["1", "all"] {
+            assert!(resource_validity_spec_arms(Some(spec), "writeback"));
+        }
         assert!(resource_validity_spec_arms(Some("exec"), "exec"));
         assert!(!resource_validity_spec_arms(Some("exec"), "inv"));
+        assert!(!resource_validity_spec_arms(Some("exec"), "writeback"));
         assert!(resource_validity_spec_arms(Some("inv, exec"), "inv"));
+        // The flush gate is the only rail that can withhold a frame, so it must
+        // be armable on its own without reverting either producer.
+        assert!(resource_validity_spec_arms(Some("writeback"), "writeback"));
+        assert!(!resource_validity_spec_arms(Some("writeback"), "exec"));
         // A typo arms nothing — never the whole family.
         for spec in ["", "0", "table", "yes"] {
             assert!(!resource_validity_spec_arms(Some(spec), "exec"));
             assert!(!resource_validity_spec_arms(Some(spec), "inv"));
+            assert!(!resource_validity_spec_arms(Some(spec), "writeback"));
         }
     }
 

@@ -157,6 +157,60 @@ pub fn next_validity(prev: ResourceValidity, ops: InvalidateValidityOps) -> Reso
     next
 }
 
+/// What the guest's last statement says about landing a deferred writeback into
+/// a mapping's pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritebackLicence {
+    /// The guest last said the host copy is authoritative. The writeback is owed.
+    Licensed,
+    /// The guest has since said its own pages hold the newer bytes. Landing our
+    /// frame would replace the guest's work with a copy it declared stale.
+    Superseded,
+    /// The guest has never named this resource in a validity quad, so there is
+    /// no statement to obey either way.
+    Unstated,
+}
+
+/// Read the licence for one mapping, counting the population as it goes.
+///
+/// Every landing is counted by outcome whether or not the caller enforces the
+/// verdict. `Unstated` is the reason this is a census and not just a gate: the
+/// safe reading of "the guest never said" is to allow the writeback, since
+/// refusing it withholds the device's frame and turns a compositing layer black
+/// — a failure this project has already paid a boot to discover once. The
+/// counter is what makes tightening that direction provable rather than a guess:
+/// an `unstated` rate that reaches zero is a rate that can be required.
+pub fn writeback_licence(state: &DeviceState, mapping_id: u32) -> WritebackLicence {
+    let validity = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.validity)
+        .unwrap_or_default();
+    let licence = if !validity.host_stated {
+        WritebackLicence::Unstated
+    } else if validity.host_valid {
+        WritebackLicence::Licensed
+    } else {
+        WritebackLicence::Superseded
+    };
+    crate::runtime::drain::note_store_route(match licence {
+        WritebackLicence::Licensed => "validity_wb_licensed",
+        WritebackLicence::Superseded => "validity_wb_superseded",
+        WritebackLicence::Unstated => "validity_wb_unstated",
+    });
+    licence
+}
+
+/// Whether a landing writeback must be refused on the guest's own statement.
+///
+/// Only `Superseded` refuses, and only with the `writeback` rail armed-in — the
+/// knob's default is to enforce, and `REIMS_VGPU_RESOURCE_VALIDITY_OFF=writeback`
+/// is the control that lets the write through while still counting it.
+pub fn writeback_refused(state: &DeviceState, mapping_id: u32) -> bool {
+    writeback_licence(state, mapping_id) == WritebackLicence::Superseded
+        && !crate::observe::resource_validity_disabled("writeback")
+}
+
 /// Take the mapping's pending windows, or count what would have been taken.
 ///
 /// The count is reported either way, which is what makes the knob a measurement
@@ -294,6 +348,46 @@ mod tests {
         state.mappings.entry(0).or_default().mapped = true;
         let out = apply(&mut state, 0, 0, quad(1, 0, 0, 0), ValiditySite::ExecTable);
         assert_eq!(out, ValidityOutcome::default());
+    }
+
+    /// A mapping the guest has never named must not have its writeback refused.
+    /// Refusing withholds the device's frame, which is a compositing layer going
+    /// black — a strictly worse failure than landing a frame nobody vouched for.
+    #[test]
+    fn a_never_stated_mapping_is_not_refused() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.mappings.entry(5).or_default().mapped = true;
+        assert_eq!(writeback_licence(&state, 5), WritebackLicence::Unstated);
+        assert!(!writeback_refused(&state, 5));
+    }
+
+    #[test]
+    fn a_licensed_mapping_is_owed_its_writeback() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.mappings.entry(5).or_default().mapped = true;
+        apply(&mut state, 0, 5, quad(0, 1, 0, 0), ValiditySite::ExecTable);
+        assert_eq!(writeback_licence(&state, 5), WritebackLicence::Licensed);
+        assert!(!writeback_refused(&state, 5));
+    }
+
+    /// The gate: once the guest says its own pages are authoritative, a window
+    /// armed before that statement must not land over them.
+    #[test]
+    fn a_superseded_mapping_refuses_its_writeback() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        state.mappings.entry(5).or_default().mapped = true;
+        apply(&mut state, 0, 5, quad(0, 1, 0, 0), ValiditySite::ExecTable);
+        apply(&mut state, 0, 5, quad(1, 0, 0, 0), ValiditySite::ExecTable);
+        assert_eq!(writeback_licence(&state, 5), WritebackLicence::Superseded);
+        assert!(writeback_refused(&state, 5));
+    }
+
+    /// A mapping this device does not hold has no statement either way, and the
+    /// flush rails' own `map_generation` guard is what refuses those.
+    #[test]
+    fn an_absent_mapping_reads_as_unstated() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(writeback_licence(&state, 999), WritebackLicence::Unstated);
     }
 
     fn arm_one_window(state: &mut DeviceState, mapping_id: u32) {

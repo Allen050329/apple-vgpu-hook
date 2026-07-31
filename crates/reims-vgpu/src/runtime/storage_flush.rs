@@ -1731,6 +1731,20 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // submission fully covers — so the quantity to read is `surface_resident`
     // against `surface_flush` in one second, not the lifetime ratio.
     crate::runtime::drain::note_store_route("surface_flush");
+    // Whether this writeback is owed at all, before any question about where it
+    // would land. The guard below asks "are these still our pages"; this asks
+    // the prior question the guest itself answers on every submission — has it
+    // since declared its own bytes newer than the frame this window holds.
+    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
+        release_window_pin_for_key(key, source);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=render mapping={} {}x{} fmt={:#x} gen={} \
+             reason=host_copy_superseded (the guest declared its own pages \
+             authoritative after the Store this window defers)",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
     // Recycled-pages guard, identical in intent to the compute rail's below and
     // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
     // arm time (ReplacePhysical, unmap/remap) points at pages this window's
@@ -1964,6 +1978,17 @@ fn flush_storage_one<M: HostMemory + HostOps>(
     // Same recycled-pages guard as the render flush: a surface window whose
     // defer-time map_generation no longer matches must not write through the
     // rewired pages.
+    // Same prior question as the render rail: is this writeback owed at all.
+    if crate::runtime::resource_validity::writeback_refused(state, key.mapping_id) {
+        crate::backend::vulkan::engine::unpin_resident_storage(key);
+        crate::observe::fail(format!(
+            "deferred_flush_lost kind=compute mapping={} {}x{} fmt={:#x} gen={} \
+             content_gen={generation} reason=host_copy_superseded (the guest declared \
+             its own pages authoritative after the dispatch this window defers)",
+            key.mapping_id, key.width, key.height, key.pixel_format, key.map_generation
+        ));
+        return false;
+    }
     let current = state
         .mappings
         .get(&key.mapping_id)
@@ -2953,6 +2978,61 @@ mod tests {
             state.compute_deferred_flush.contains_key(&k),
             "the window must survive for mapper::resolve to reprieve or drop"
         );
+    }
+
+    /// A window whose mapping the guest has since declared it owns must not
+    /// land, and the refusal must name itself.
+    ///
+    /// The window's frame is what the device rendered *before* the guest's CPU
+    /// write. Landing it replaces the guest's own bytes over the full attachment
+    /// extent with a copy the guest has already said is stale. Every other guard
+    /// on this path asks where the bytes would land; this one asks whether they
+    /// are owed at all, which is why it runs first.
+    #[test]
+    fn a_window_the_guest_superseded_is_refused_by_name() {
+        use crate::runtime::host::FakeHost;
+        use crate::runtime::resource_validity::{apply, ValiditySite};
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let k = key(9, 0, 4096);
+        let m = state.mappings.entry(9).or_default();
+        m.mapped = true;
+        m.map_generation = k.map_generation;
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Render {
+                armed_seq: 0,
+                armed_stamp_seq: 0,
+                source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
+                    0u8;
+                    4096
+                ])),
+            },
+        );
+        // The guest licensed this resource, then said it wrote it itself.
+        apply(
+            &mut state,
+            0,
+            9,
+            crate::runtime::decode::fifo::InvalidateValidityOps {
+                clear_host_valid: 0,
+                set_host_valid: 1,
+                clear_guest_valid: 0,
+                set_guest_valid: 0,
+            },
+            ValiditySite::ExecTable,
+        );
+        state.mappings.get_mut(&9).unwrap().validity.host_valid = false;
+
+        let cap = crate::observe::FailCapture::start();
+        let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
+        assert!(!ok, "a refused writeback is a reported loss, not a success");
+        let line = cap.one("deferred_flush_lost");
+        assert!(
+            line.contains("reason=host_copy_superseded"),
+            "the refusal must name itself: {line}"
+        );
+        assert!(state.compute_deferred_flush.is_empty());
     }
 
     #[test]
