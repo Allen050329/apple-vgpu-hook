@@ -3321,19 +3321,40 @@ fn note_gva_backing_verdict(
 ///
 /// What retires it for good is a photograph of the defect at pixel scale. A
 /// 14-round recomposite reproduced it (rounds 3-6 corrupt, held — one cell never
-/// recovers), and the corrupt cell magnified is **not** a small block of correct
-/// content in an empty square. It is a narrow tall block of *garbage*: black at
-/// the top fading to grey, with saturated red, green and violet texels along its
-/// bottom edge, and the white background immediately around it carries
-/// low-amplitude noise (240, 232, 245, 254 where the clean round is 255 exactly).
-/// The clean round's same columns are the folder's light-blue left edge.
+/// recovers), and the corrupt cell is **not** a small block of correct content
+/// in an empty square. Over the 11x25 screen rect the clean round of the same
+/// boot renders as the folder's light blue (`75D0FB`, `6AC7F4`, `BFDBE8`), the
+/// corrupt round is **greyscale end to end**: `FFFFFF` 133, `000000` 21,
+/// `FCFCFC` 14, `B0B0B0` 5, `505050` 5, `040404` 5, `424242`, `131313` — every
+/// dominant value has R == G == B. No blue survives anywhere in the cell.
 ///
-/// So the cell is not a correct draw with an emptied surround. The whole region
-/// holds uninitialized-looking content, which means the question this census was
-/// built to ask — "what emptied the texels outside the scissor" — was the wrong
-/// one. The question is what *filled* this rectangle, and neither a clear
-/// (`[0,0,0,0]`, transparent black, not noise) nor a lost seed (blank, not noise)
-/// produces that signature. Uninitialized device memory does.
+/// So the cell was not partially drawn. A colour image was replaced by a black
+/// one, which means the question this census was built to ask — "what emptied
+/// the texels outside the scissor" — was the wrong question. Nothing was
+/// emptied; something wrote black over the whole cell.
+///
+/// # This defect is invisible to every counter this crate has
+///
+/// The same six rounds, scored per round, clean (1-2) against corrupt (3-6):
+///
+///     lin_rung_guest_blank            0      0      0      0      0      0
+///     lin_rung_blank_with_host_entry  0      0      0      0      0      0
+///     lin_rung_guest_memo         39759  49930  42208  41145  45888  43339
+///     gvac_suspect                   31     55     47     53     57     45
+///     type11_seed_elided           8367   9851   8727   8345   8842   9010
+///     draw_partial_load_from_target 21473 27115  23017  22441  25099  23447
+///
+/// Every counter is proportional to round length; not one separates a corrupt
+/// round from a clean one. `lin_rung_guest_blank` is zero throughout, so on this
+/// reproduction no sampled bind returned an all-zero texture — which rules out
+/// the mechanism 61e6dce proposed and 2cc48d7 left open as the surviving lead,
+/// at least for this instance. The set of names in the census is identical
+/// across the break too: no decline fires on the round that breaks.
+///
+/// That is the finding to act on. A defect that is stable on screen for minutes
+/// and leaves no trace in a census this large is not going to be found by adding
+/// another counter to the same rails; the next instrument has to observe surface
+/// *content* across the transition, not the routes taken to produce it.
 ///
 /// The census stays because the partition it prints is cheap and is the
 /// denominator any future claim about this rail needs. It is no longer a lead.
