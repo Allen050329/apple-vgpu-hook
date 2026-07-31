@@ -237,6 +237,31 @@ not-patched. `shoot()` therefore synthesises `VERDICT=UNSCOREABLE` and the repor
 separately: **an unscoreable capture is neither clean nor patched**, and any of them voids the
 `none` on the line above it.
 
+### The harness never scrolled, and three `none` results say nothing
+
+Worse than the blind scorer, found by re-scoring the archived captures of those same three runs. The
+premise of `scroll-patch.sh` is that it visits twelve scroll offsets twice. It did not.
+
+Every `down-*.png` in a run carries a colour histogram **identical to the control's, count for
+count**, and consecutive down captures differ in `moved_frac = 0.0000` of sampled pixels. The down
+pass never moved. The up pass sat at one single other offset for all twelve of its captures. The
+files have distinct md5s — a clock ticks in the corner — which is why nothing noticed.
+
+**A harness that cannot reach the state cannot find the defect, and it reports that as a clean
+page.** `shoot()` now takes `--prev` and refuses any capture whose frame did not change, as
+`VERDICT=UNSCOREABLE`. The two populations are nowhere near the 0.10 threshold — an unmoved frame
+measures 0.0000 and a real screenful measures 0.9941 — so the number is not fitted between them.
+
+The first capture of the up pass is exempt and must be: that pass shoots before it scrolls, so it is
+deliberately the same offset as the last down capture.
+
+A third defect in the same instrument, from the same re-scoring. The palette was measured from a
+control that is **one screenful**, so it could not contain a hue that first appears six screenfuls
+down, and every scrolled capture showing a later band scored 0.92 off-palette — all of it correct
+page. The generator now emits a swatch of every colour it can ever use at the top of the page, so
+the control contains the whole palette by construction. Keeping it as page content rather than as a
+list in the scorer is what stops the two drifting apart when a hue is added.
+
 The same three-way split applies inside the scorer. `PATCHED` needs a *blob* of at least
 `--min-blob`; scattered off-palette pixels over the floor with no blob are `NOISY`. Collapsing those
 into `PATCHED`, which the scorer did at first, scores noise as a finding — injecting mild Gaussian
