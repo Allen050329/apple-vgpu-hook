@@ -941,13 +941,74 @@ made it look like. Wikipedia is also where the user reported the defect.
 
 That leaves the harness with a real tension rather than a fix: the page that provokes the class is
 the page whose palette cannot be scored, and the page that can be scored barely provokes it.
-`.agents/repros/g3-fabrication-ab.sh` splits the difference by browsing Wikipedia for
-`PREDRIVE_SECS` first and then scoring the flat page, so one boot carries both. Whether a
-provocation in the predrive produces a patch on a *different* page afterwards is exactly the thing
-that run is testing, and it is not obviously true.
 
 `scroll-patch.sh`'s three recorded `none` results are still unexplained by anything measured. "It
 never reached the state" is now only one candidate and no longer the leading one.
+
+#### The first attempt to join them measured its own gap — read the row as inconclusive
+
+`.agents/repros/g3-fabrication-ab.sh` tried to split the difference: browse Wikipedia for
+`PREDRIVE_SECS=480`, then score the flat page, so one boot carries both the provocation and a
+scoreable frame. Its control row looks like a result and is not one:
+
+```text
+ctl-1 OK attaches=2346 stores=18839 fabricated_attaches=20 persistent=[none] unscoreable=[none]
+```
+
+Twenty fabrications and a clean screen at all 24 scored offsets — which reads as "fabrication does
+not produce the visible patch". Then read the timestamps. The 20 fabrications land at
+t = 21, 103, 144, 190, 225, 269, 285, 306, 327, 347, 367, 408, 450, 468, 469, 489, 493, 494, 494,
+494 s, and the scored scroll phase ran from ~500 s to 660 s. **Not one fabrication happened during
+the phase that was scored, and none of them was on the page that was scored.** The provocation and
+the measurement were disjoint in both time and document.
+
+So the row is `INCONCLUSIVE`, not evidence in either direction, and the design is what produced it:
+predriving on one page and scoring another separates the two by construction. Do not cite that
+`persistent=[none]`.
+
+#### Scoring a patch without a palette: force the offset to paint twice
+
+`.agents/repros/reload-diff.py` is the instrument for the provoking page, and it drops the palette
+requirement entirely. The reported defect is *content that never arrived* — "that patch is all
+white/blank … that glitched patch lives in that particular place in the scroll buffer" — which is a
+claim about the difference between what was shown and what should have been. So make the page paint
+the same offset a second time (`cmd-R`, then the same counted key presses) and compare the pair. A
+patch is then **a localized disagreement between two renders of one offset**, which needs no palette
+and no page generator, and works whether the loss is white, black, page-background or stale content.
+
+The gate is the same quantity as the score, which is what makes it hard to fool. Two captures of the
+"same" offset reached by counted key presses may not be the same offset, and a harness that could
+not tell would score the mismatch as an enormous defect — the direction that reads as a finding.
+`same_frac` below `--min-same` is `UNSCOREABLE`; only inside a comparable pair does a localized
+disagreement count. Direction is reported too, and asymmetrically: `blank_first` (uniform in A,
+detailed in B) is the loss, and *both sides detailed* is `CHURN` — page animation, a clock, a
+lazily-loaded image — counted apart so a live site's moving parts cannot be folded into the count.
+
+**It was blind when first written, and the injected controls are what caught it.** Six synthetic
+pairs against a detailed frame:
+
+```text
+identical                       CLEAN
+white rectangle in A            PATCHED blank_first   <- all three were CHURN before the fix
+black rectangle in A            PATCHED blank_first
+page-background rectangle in A  PATCHED blank_first
+region shuffled in A            CHURN                 (animation, correctly not a finding)
+a different frame               UNSCOREABLE offset_mismatch
+```
+
+The bug was that "is this region uniform" took the **max** spread over the blob's cells, and a cell
+straddling the edge of a solid patch holds patch on one side and page on the other. One such
+boundary cell reported spread=255 for a perfectly solid white rectangle, so every injected fill
+classified as page animation. Eroding the blob by one cell before measuring is the fix. This is the
+same shape of blindness `scrollpatch.py` had — a rule that could not see the defect it was built for
+— found the same way, by injecting the defect into a control and checking the scorer notices.
+
+`.agents/repros/wiki-reload-diff.sh` drives it: pass A over N screenfuls, reload, pass B over the
+same offsets, score each pair. It carries three gates, and the first two are the failures this
+document has already paid for — consecutive captures inside a pass must **disagree** (the page
+actually scrolled), and after the reload the first capture must **agree** with pass A's first (the
+reload happened and re-registered at the top). A run failing either states so instead of reporting a
+clean page.
 
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
