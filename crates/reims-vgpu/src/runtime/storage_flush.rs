@@ -1569,7 +1569,7 @@ fn mapping_pages_still_ours<M: HostMemory + HostOps>(
 /// generation drift before it reads anything, so the rebuild is always for the
 /// generation the arm pinned.
 #[cfg(feature = "backend-vulkan")]
-fn render_window_identity(
+pub fn render_window_identity(
     key: &crate::model::ComputeStorageResidencyKey,
 ) -> crate::backend::vulkan::engine::TargetIdentity {
     crate::backend::vulkan::engine::TargetIdentity::Surface {
@@ -3504,6 +3504,87 @@ mod tests {
             ],
             [before[0] + 1, before[1] + 1],
             "and the storage rail must not be counted under the render rail's"
+        );
+    }
+
+    /// The window and the resident it pinned must be the same slot, and the two
+    /// spellings that name it must agree by construction.
+    ///
+    /// `arm_surface_resident_store` pins `render_chain_identity`, which prefers
+    /// the render-pass extent (`req.width`/`req.height`) and falls back to
+    /// color0's declared geometry. `flush_render_one` rebuilds
+    /// `render_window_identity` from `key.width`/`key.height`, which is color0's
+    /// geometry unconditionally. When a record's pass extent differs from its
+    /// attachment, those are different `TargetIdentity::Surface` values: the arm
+    /// pins one slot, the flush looks up another, `registry_get` misses, and the
+    /// frame is lost — reported as `live=Absent` — while the pin is leaked,
+    /// because eviction skips pinned slots by design.
+    ///
+    /// One measured boot lost ~135 frames a boot at 1920x1080 with `live=None`,
+    /// which is the whole desktop compositing layer keeping pre-Store bytes in
+    /// guest memory. This asserts the property that makes that impossible:
+    /// geometry is part of the identity, so the arm must not proceed unless the
+    /// two spellings are equal. `arm_surface_resident_store` checks exactly that
+    /// and declines to the synchronous route, which costs a readback and loses
+    /// nothing.
+    #[cfg(feature = "backend-vulkan")]
+    #[test]
+    fn a_window_and_the_resident_it_pins_cannot_be_named_at_two_geometries() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let k = key(7, 0, 256);
+        state.map_surface(k.mapping_id);
+        state.mappings.get_mut(&k.mapping_id).unwrap().map_generation = k.map_generation;
+        let from_key = super::render_window_identity(&k);
+
+        // The spelling the arm uses, when the pass extent equals the attachment
+        // and the mapping still carries the incarnation the key was built at.
+        assert_eq!(
+            from_key,
+            crate::runtime::present_identity::surface_identity(
+                &state,
+                k.mapping_id,
+                k.width,
+                k.height
+            ),
+            "with one geometry the two spellings must be the same value, or the \
+             rail is broken for every window rather than only the split ones"
+        );
+
+        // And when it does not. This is the value the arm would have pinned for
+        // a record whose pass extent is larger than its color0 attachment; the
+        // flush cannot find it from the key, which is why the arm refuses.
+        assert_ne!(
+            from_key,
+            crate::runtime::present_identity::surface_identity(
+                &state,
+                k.mapping_id,
+                k.width + 1,
+                k.height
+            ),
+            "geometry is part of the resident's shape, so a pass-extent identity \
+             is a different slot and must not be pinned on a window's behalf"
+        );
+
+        // Generation is the second axis, and it is the one that can move
+        // *inside* the arm. `arm_surface_resident_store` takes the identity from
+        // the live mapping before it builds the key, and the step between them —
+        // `prepare_surface_deferred_window` — lands intersecting windows, whose
+        // writeback re-resolves the mapping and can bump `map_generation`. The
+        // arm would then pin the pre-bump slot and hand the window a post-bump
+        // key. Same miss, same lost frame, same leaked pin.
+        crate::model::DeviceState::bump_map_generation(
+            state.mappings.get_mut(&k.mapping_id).unwrap(),
+        );
+        assert_ne!(
+            from_key,
+            crate::runtime::present_identity::surface_identity(
+                &state,
+                k.mapping_id,
+                k.width,
+                k.height
+            ),
+            "a generation that moved during the arm names a different slot, and \
+             the equality check is what stops the window being armed across it"
         );
     }
 

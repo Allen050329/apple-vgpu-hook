@@ -7274,6 +7274,33 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
 ) -> Option<u32> {
     let identity = type11_store_identity(state, req, true)?;
     let key = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)?;
+    // The slot this arm pins and the slot the flush will look up have to be the
+    // same slot, and until this check they were derived from two different
+    // spellings that are allowed to disagree. The arm's comes from
+    // `render_chain_identity`, which prefers the render extent
+    // (`req.width`/`req.height`) and falls back to the attachment's declared
+    // size; the flush rebuilds `TargetIdentity::Surface` from `key.width`/
+    // `key.height`, which are the attachment's size unconditionally. A record
+    // whose pass extent differs from its color0 geometry therefore pins one
+    // identity and hands the window another, and the flush finds no slot at all:
+    // the frame is lost and the pin — which nothing else drops, because eviction
+    // skips pinned slots — is leaked for the guest's lifetime.
+    //
+    // That is the defect shape of `74748d2` and `021e64b` a third time, so it is
+    // closed the same way: one spelling, checked, never two reconciled.
+    // Declining is free here — the caller treats `None` as "take the synchronous
+    // route", which pays a readback and loses nothing.
+    if crate::runtime::storage_flush::render_window_identity(&key) != identity {
+        crate::observe::Emit::decline(
+            "surface_resident_arm",
+            &SurfaceResidentArmDecline::IdentitySplit,
+        )
+        .field("mid", mapping_id)
+        .field("key_geom", format!("{}x{}", key.width, key.height))
+        .field("pass_geom", format!("{}x{}", req.width, req.height))
+        .fail_once(u64::from(mapping_id));
+        return None;
+    }
     if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
         crate::observe::Emit::decline(
             "surface_resident_arm",
@@ -7356,6 +7383,12 @@ enum SurfaceResidentArmDecline {
     PinRefused,
     NoEpoch { epoch: u32 },
     StampRefused,
+    /// The slot this arm would pin is not the slot the flush would look up —
+    /// the pass extent and the attachment geometry disagree. Unlike the other
+    /// three this is not a state question about the registry; it is the window
+    /// and the resident being named differently, and arming through it loses the
+    /// frame and leaks the pin.
+    IdentitySplit,
 }
 
 #[cfg(feature = "backend-vulkan")]
@@ -7365,12 +7398,13 @@ impl crate::observe::Decline for SurfaceResidentArmDecline {
             Self::PinRefused => "surface_resident_pin_refused",
             Self::NoEpoch { .. } => "surface_resident_no_epoch",
             Self::StampRefused => "surface_resident_stamp_refused",
+            Self::IdentitySplit => "surface_resident_identity_split",
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
-            Self::PinRefused | Self::StampRefused => Vec::new(),
+            Self::PinRefused | Self::StampRefused | Self::IdentitySplit => Vec::new(),
             Self::NoEpoch { epoch } => vec![("epoch", epoch.to_string())],
         }
     }
