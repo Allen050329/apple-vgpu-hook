@@ -390,9 +390,9 @@ device never touches. That is not a logic error with a backtrace worth reading; 
 writing where it no longer holds title, hitting whatever the guest allocator happened to put there.
 Read the *distribution*, not the individual trace.
 
-The `0xFF` recurs across all of them and is the same write seen from different victims: opaque white
-BGRA pixels. It is almost certainly a legitimate white frame landing at the wrong address — the
-defect is *where*, not *what*, so do not go looking for a source of white.
+~~The `0xFF` recurs across all of them and is the same write seen from different victims: opaque
+white BGRA pixels.~~ **Struck: tabulated, it recurs in 5 of the 12, and in 7 it does not appear at
+all.** See the section below before building anything on it.
 
 Panics still fire on binaries carrying the fence repairs (three on 2026-07-31 alone, one of them
 14:43 on a tree with all three raw-address rails bound). A fence binding orders a write against the
@@ -401,6 +401,69 @@ guest's completion stamp; it does not make the destination address correct. The 
 
 At 2.2 % an A/B needs ~150 boots per arm and is not affordable. Let panics accumulate as a side
 effect of every boot and re-sweep the census instead.
+
+##### Tabulated: the `0xFF` is in 5 of the 12, and one grep makes it look like all 635
+
+Nobody had counted. The claim struck above — "the `0xFF` recurs across all of them" — has shaped
+every Goal 1 decision since it was written, including which instruments got built. Tabulating the
+evidence *per panic*, rather than reading the pile:
+
+```text
+                                         bulk 0xff fill        all-ones register
+20260728-154602  Safari                        –                      –
+20260729-152409  WindowServer                  –                      –
+20260729-155116  followupd            sz:6144  off:0                  –
+20260729-155610  (nested panic)                –                      –
+20260729-174129  ReportCrash                   –                      –
+20260729-175456  com.apple.AppleU     sz:256   off:0                  –
+20260729-183422  ReportCrash                   –                      –
+20260729-195245  airportd                      –                      –
+20260730-210813  WindowServer                  –                      –
+20260731-135242  tccd                          –              RAX, R14   CR2=0x7
+20260731-140555  airportd                      –              RIP, CR2   CR2=0xffffffffffffffff
+20260731-144329  WindowServer                  –              RAX        CR2=0x16f
+─────────────────────────────────────────────────────────────────────────────────
+                                            2 of 12               3 of 12
+```
+
+**Seven of the twelve carry no `0xff` evidence at all.** Two carry the real thing — a `kalloc` poison
+check reporting a *whole freed element* filled from `off:0`, at `sz:6144` and `sz:256`. Three carry a
+single 8-byte field.
+
+**The three register cases are one shape, and the arithmetic says so.** Both faulting addresses are
+an all-ones pointer plus a small structure offset:
+
+```text
+tccd          CR2 = 0x7   = (-1) + 0x8      a load 8 bytes into an all-ones pointer
+WindowServer  CR2 = 0x16f = (-1) + 0x170    a load 0x170 bytes into an all-ones pointer
+airportd      RIP = CR2   = -1              an indirect CALL through an all-ones pointer
+```
+
+and the Safari `.ips` in `/tmp/icon-ab2/` is the userspace member (`rdi = -1`, faulting at `0x18`,
+which is where objc looks up the class cache after resolving an all-ones receiver to a nil class).
+
+**Do not read that as refuting the bulk-fill reading — it does not distinguish.** A bulk `0xff` fill
+sets every pointer inside the region it covers to `-1`, so a single dereferenced field holding `-1`
+is exactly what a victim *of a bulk fill* looks like from the register dump; the dump only shows the
+one field the code touched. What the table does establish is narrower and still worth having: the
+direct evidence for a bulk fill is **2 observations, not 12**, and any instrument justified by "the
+whole class is 0xff" is justified by two data points.
+
+**The harness trap, and it is the `Retired` shape again.** Every one of these logs contains
+`libignition: 1: log fd : 0xffffffffffffffff` — a boot-time line meaning "no log fd", i.e. `-1`. It
+is in **630 of the 635 serial logs on disk**, panicking or not:
+
+```text
+serial logs                                    635
+containing 0xffffffffffffffff anywhere         630   (99.2 %)
+of which actually panicked                      12
+```
+
+So `grep -l 0xffffffffffffffff vm/disks/run/serial-*.log` returns essentially every boot ever run,
+and a scorer built on that pattern reports a hit for a clean boot. **Anchor on the evidence, not on
+the value**: `element modified after free (off:…, val:0x…, sz:…)` for a bulk fill, and an anchored
+register name (`\b(RAX|RIP|CR2|R14): 0xffffffffffffffff`) for the single-word form. Confirm you have
+seen the negative before believing either.
 
 ##### Re-swept at 608 boots: 12 panics, and every one predates the identity guard
 
