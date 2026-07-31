@@ -654,6 +654,45 @@ Note the census undercounts. The `type4 pages` line is emitted only when `page_e
 (`first_attach`, `objects.rs:820-825`), so an attach over a still-populated list guesses silently.
 34 407 is a **lower bound**.
 
+#### Measured: the guess was standing in for an answer 20 ms away
+
+The guard landed in `d455c3e`; `REIMS_VGPU_TYPE4_IDENTITY_GUARD_OFF=1` restores the substitution.
+The per-surface evidence is far stronger than the aggregate, so read it first. On boot
+`20260731-192622` (Safari, `scroll-patch.sh`, 932 attaches) the guard refused twice, and **both
+surfaces resolved completely, on the same task, one or two frames later**:
+
+```text
+sid=210  refused t=53237  ->  type4 pages task=0 n=34 gva_hits=34 id_hits=0  t=53257   (+20 ms)
+sid=201  refused t=55081  ->  type4 pages task=0 n=34 gva_hits=34 id_hits=0  t=55092   (+11 ms)
+```
+
+That is the mechanism, and it is simpler than the one predicted. The guest had not finished mapping
+the surface's backing when the device first asked. Every caller is per-frame, so refusing costs a
+frame and returns the real translation; the old path instead cached a fabricated address **for the
+life of the surface**. So the defect was never "the walk cannot succeed" — it was "the device
+answered before the guest was ready, and kept the answer".
+
+**The predicted mechanism was not observed.** The reasoning that a guess ends the task search in
+`resolve_type4_surface_ex` (task 0 is probed first, and returning `true` stops the loop) is a real
+property of the code and has a unit test, but the rig does not exercise it: **all 980 successful
+attaches on the guarded boot resolved on `task=0`**, exactly as all 11 561 did before. Do not repeat
+the "the owning task was never tried" story as a rig finding — on this workload task 0 *is* the
+owner, and it is merely late.
+
+**The aggregate does not yet carry a claim.** Zero drift and zero lost flushes on the guarded boot
+looks decisive and is not: at the pre-guard rate (9 losses / 11 561 attaches) a 932-attach boot
+expects **0.73**, so observing 0 is p ≈ 0.48. It is consistent with the fix and equally consistent
+with a short boot. The Goal 3 scorer likewise returned 24/24 CLEAN — the same result the page gave
+*before* the change, so it discriminates nothing here and the page needs the harder provocation
+already noted above.
+
+One instrument correction, because the counter is asymmetric by construction.
+`type4_identity_pages` **cannot be compared across arms**. With the guard off the loop runs to the
+end and it counts every untranslatable page; with the guard on the loop returns at the first one, so
+it counts at most one per refused attach and merely tracks `type4_translate_refused` (3 and 3 on
+this boot). The pre-guard boot's guessing attaches averaged 325 pages each, so the guarded number
+understates the fabrication it prevents by about that factor.
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`

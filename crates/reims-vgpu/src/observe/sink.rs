@@ -834,14 +834,24 @@ pub fn mapping_page_guard_disabled() -> bool {
 ///
 /// The old fallback accepted any candidate that `read_gpa` could touch, which
 /// asks "is this RAM" rather than "is this the surface's", so nearly every
-/// failed walk was admitted. It also decided the outcome of the task search in
-/// `resolve_type4_surface_ex`: task 0 is probed first, and a guess made
-/// `apply_type4_backing` return `true` there, so the owning task was never
-/// tried and the fabricated address was cached as the surface's backing.
+/// failed walk was admitted, and the fabricated address was then cached as the
+/// surface's backing for the rest of its life.
 ///
-/// `type4_identity_pages` is emitted whichever way this is set, so a boot with
-/// the guard on still reports how many pages the old path would have
-/// fabricated. An arm and its control are one binary apart.
+/// What a refusal buys is a retry. Measured on boot `20260731-192622`, both
+/// refusals were followed by a full real-walk resolve of the same surface on
+/// the same task within one or two frames — `sid=210` refused at t=53237 and
+/// resolved `gva_hits=34 id_hits=0` at t=53257, `sid=201` refused at t=55081
+/// and resolved at t=55092. The guest had not finished mapping the backing yet,
+/// so the guess was standing in for an answer that was about to be available.
+///
+/// `type4_identity_pages` is emitted whichever way this is set, but it does not
+/// mean the same thing in both arms and must not be compared across them. With
+/// the guard off it counts every page the walk could not translate, because the
+/// loop runs to the end. With the guard on the loop returns at the first such
+/// page, so it counts at most one per refused attach and simply tracks
+/// `type4_translate_refused`. Reading the guarded number as "pages the old path
+/// would have fabricated" understates it by however many pages followed the
+/// first — on the pre-guard boot the guessing attaches averaged 325 pages each.
 pub fn type4_identity_guard_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| {

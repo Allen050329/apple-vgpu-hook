@@ -773,12 +773,22 @@ fn apply_type4_backing<M: HostMemory>(
     //
     // The fabricated PFN goes into `m.page_entries`, which is the address list
     // every later reader and writer resolves through, so a guess aims real
-    // pixel writes at memory the guest allocated for something else. And
-    // because `apply_type4_backing` returning `true` ends the task search in
-    // `resolve_type4_surface_ex` — task 0 is probed first — a guess made task 0
-    // claim surfaces it could not translate, so the owning task was never
-    // tried. Refusing lets that loop reach the task whose page tables actually
-    // map the backing; if none does, the callers are per-frame and re-ask.
+    // pixel writes at memory the guest allocated for something else — and it
+    // stays there, because the guess is cached as the surface's backing.
+    //
+    // What refusing buys, measured, is a retry. On boot 20260731-192622 both
+    // refusals were followed by a full real-walk resolve of the same surface on
+    // the same task within one or two frames: the guest had not finished
+    // mapping the backing when the device first asked. The callers are
+    // per-frame (scanout, bind, draw), so re-asking is already the shape of the
+    // code; the guess was standing in for an answer about to be available.
+    //
+    // Refusing also lets the task search do its job, which a guess ended.
+    // `apply_type4_backing` returning `true` stops the loop in
+    // `resolve_type4_surface_ex`, and task 0 is probed first, so a guess made
+    // task 0 claim surfaces it could not translate. That path is covered by
+    // `the_task_search_reaches_the_owner_when_task_zero_cannot_translate`; it
+    // has not been observed on the rig, where every attach resolves on task 0.
     let mut entries = Vec::with_capacity(page_count as usize);
     let mut gva_hits = 0u32;
     let mut id_hits = 0u32;
