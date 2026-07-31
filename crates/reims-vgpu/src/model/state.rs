@@ -714,6 +714,20 @@ pub struct MappingEntry {
     /// both. A token that outlived its list would report writes to pages this
     /// surface no longer owns and miss writes to the ones it does.
     pub guest_write_token: u64,
+    /// [`Self::map_generation`] the token above was built for.
+    ///
+    /// The lifecycle mutators retire the token eagerly, but they are not the
+    /// only writers of [`Self::page_entries`]: the mapper's plan adoption and
+    /// the type-4 page refresh both replace the list in place, and both retired
+    /// the contiguous view while leaving the token behind — a token naming
+    /// pages the surface no longer owns, which is the one thing it must never
+    /// be. Rather than add a third and a fourth site to remember,
+    /// `map_generation` is the key: every writer of the list already bumps it
+    /// exactly when the list changes, so a token whose generation does not
+    /// match is unusable by construction, and the eager retirement is left as
+    /// what it should have been — a way to free host state promptly rather than
+    /// the thing correctness rests on.
+    pub guest_write_token_gen: u32,
     /// [`crate::runtime::host::HostOps::guest_write_gen`] as it stood when this
     /// mapping's pixels were last published by a device Store.
     ///
@@ -1977,6 +1991,7 @@ impl DeviceState {
     /// re-tracked set's first readable generation coincide with it.
     fn take_guest_write_token(e: &mut MappingEntry) -> u64 {
         e.guest_write_gen_at_store = 0;
+        e.guest_write_token_gen = 0;
         std::mem::replace(&mut e.guest_write_token, 0)
     }
 

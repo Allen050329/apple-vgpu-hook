@@ -1066,10 +1066,17 @@ pub fn flush_retired_views<H: HostOps>(state: &mut DeviceState, host: &mut H) {
 ///
 /// Reads `page_entries` directly instead of going through
 /// [`mapping_page_gpas`]: the revalidation that function performs is a guest
-/// page-table walk, and the caller has already proved the mapping resolvable
-/// by rendering into it. What matters here is only that the token names the
-/// same page list the surface currently owns, which
-/// [`crate::model::MappingEntry::map_generation`] retirement guarantees.
+/// page-table walk, and the caller has already proved the mapping resolvable by
+/// rendering into it.
+///
+/// What keys the token to the surface's *current* pages is
+/// [`crate::model::MappingEntry::map_generation`], not the eager retirement in
+/// the lifecycle mutators. Two writers replace `page_entries` in place without
+/// going near those mutators — the mapper's own plan adoption and the type-4
+/// page refresh — and both retired the contiguous view while leaving the token
+/// alone. Both do bump the generation exactly when the list changes, so
+/// checking it here makes a carried-over token unusable by construction instead
+/// of depending on every future writer remembering a second thing to retire.
 pub fn ensure_guest_write_token<H: HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1078,9 +1085,21 @@ pub fn ensure_guest_write_token<H: HostOps>(
     let page_shift = state.page_shift;
     let page_size = state.page_size() as usize;
     let m = state.mappings.get(&mapping_id)?;
+    let map_generation = m.map_generation;
     if m.guest_write_token != 0 {
-        return Some(m.guest_write_token);
+        if m.guest_write_token_gen == map_generation {
+            return Some(m.guest_write_token);
+        }
+        // The list moved underneath the token. Everything recorded against it
+        // describes pages this surface may no longer own, so the Store stamp
+        // goes with it.
+        let e = state.mappings.get_mut(&mapping_id)?;
+        let stale = std::mem::replace(&mut e.guest_write_token, 0);
+        e.guest_write_token_gen = 0;
+        e.guest_write_gen_at_store = 0;
+        state.retired_guest_write_tokens.push(stale);
     }
+    let m = state.mappings.get(&mapping_id)?;
     if !m.mapped || m.page_entries.is_empty() {
         return None;
     }
@@ -1096,7 +1115,9 @@ pub fn ensure_guest_write_token<H: HostOps>(
         return None;
     }
     let token = host.track_guest_writes(&gpas, page_size)?;
-    state.mappings.get_mut(&mapping_id)?.guest_write_token = token;
+    let e = state.mappings.get_mut(&mapping_id)?;
+    e.guest_write_token = token;
+    e.guest_write_token_gen = map_generation;
     Some(token)
 }
 

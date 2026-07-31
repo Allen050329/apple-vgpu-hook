@@ -6146,11 +6146,19 @@ fn type11_guest_wrote_since_store<M: HostOps>(
         crate::runtime::drain::note_store_route("t11_gw_ref_no_mapping");
         return true;
     };
-    if m.guest_write_gen_at_store == 0 || m.guest_write_token == 0 {
-        // No Store has stamped this surface against a live token. Counted
-        // apart from a real write: "the rail never got started" and "the guest
-        // writes this surface every frame" are the same refusal here and
-        // completely different findings.
+    if m.guest_write_gen_at_store == 0
+        || m.guest_write_token == 0
+        // A token built for a different page list watches pages this surface
+        // may no longer own, so its generation is not a statement about the
+        // pages the resident would be reused for. Checked here and not only in
+        // `ensure_guest_write_token` because a LOAD can arrive between the list
+        // changing and the next Store rebuilding the token.
+        || m.guest_write_token_gen != m.map_generation
+    {
+        // No Store has stamped this surface against a live token for its
+        // current pages. Counted apart from a real write: "the rail never got
+        // started" and "the guest writes this surface every frame" are the same
+        // refusal here and completely different findings.
         crate::runtime::drain::note_store_route("t11_gw_ref_no_stamp");
         return true;
     }

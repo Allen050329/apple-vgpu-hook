@@ -1227,6 +1227,89 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
     );
 }
 
+/// A page list replaced in place must not leave the token vouching for it.
+///
+/// The lifecycle mutators retire the token eagerly, but they are not the only
+/// writers of `page_entries`: the mapper's plan adoption and the type-4 page
+/// refresh both replace the list and bump `map_generation` without going near
+/// them, and both used to retire the contiguous view while leaving the token
+/// behind. A token that outlives its list watches pages the surface no longer
+/// owns — it would report nothing while the guest writes the new ones.
+///
+/// `map_generation` is the key rather than a third retirement call site,
+/// because the next writer of the list would forget the call and not the bump.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_replaced_page_list_invalidates_the_token_it_was_built_for() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::runtime::host::{FakeHost, HostOps};
+
+    let entry_for = |gpa: u64, shift: u32| (((gpa >> shift) as u32) << PAGE_ENTRY_PFN_SHIFT)
+        | PAGE_ENTRY_VALID;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let mut host = FakeHost::new();
+    let page = state.page_size();
+    assert!(state.map_surface(7));
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = vec![entry_for(0x40 * page, PAGE_SHIFT_X86)];
+    }
+    let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+        .expect("FakeHost observes guest writes");
+    let stamped = host.guest_write_gen(token).expect("a live token has one");
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .guest_write_gen_at_store = stamped;
+    assert!(!type11_guest_wrote_since_store(&state, &host, 7));
+
+    // Exactly what the mapper's adoption and the type-4 refresh do: swap the
+    // list and bump the generation, without touching the token.
+    {
+        let m = state.mappings.get_mut(&7).expect("mapped above");
+        m.page_entries = vec![entry_for(0x88 * page, PAGE_SHIFT_X86)];
+        DeviceState::bump_map_generation(m);
+    }
+    assert_eq!(
+        state.mappings[&7].guest_write_token, token,
+        "the point of the test is that nothing retired it"
+    );
+    assert!(
+        type11_guest_wrote_since_store(&state, &host, 7),
+        "a token built for the old pages cannot vouch for the new ones"
+    );
+
+    // The next Store rebuilds it against the pages the surface now owns, and
+    // hands the old registration back for release.
+    let fresh = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, 7)
+        .expect("the new list is trackable");
+    assert_ne!(fresh, token, "a new list needs a new registration");
+    crate::runtime::mapper::flush_retired_views(&mut state, &mut host);
+    assert_eq!(
+        host.tracked_guest_write_sets(),
+        1,
+        "the stale set must be released, not leaked alongside the new one"
+    );
+
+    // And it watches the new pages: a write to one of them moves the fresh
+    // generation, and a write to the retired page does not.
+    let restamped = host.guest_write_gen(fresh).expect("live");
+    state
+        .mappings
+        .get_mut(&7)
+        .expect("mapped above")
+        .guest_write_gen_at_store = restamped;
+    host.guest_wrote_page(0x40 * page);
+    assert!(
+        !type11_guest_wrote_since_store(&state, &host, 7),
+        "the surface no longer owns that page"
+    );
+    host.guest_wrote_page(0x88 * page);
+    assert!(type11_guest_wrote_since_store(&state, &host, 7));
+}
+
 /// A host with no dirty bitmap must lose the elision, not gain a wrong frame.
 ///
 /// The conservative default is the whole reason `guest_write_gen` answers an
