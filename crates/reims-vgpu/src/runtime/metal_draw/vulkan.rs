@@ -3369,13 +3369,13 @@ fn note_gva_backing_verdict(
 /// denominator any future claim about this rail needs. It is no longer a lead.
 /// How much surface a taken type-11 seed elision covered, in whole texels.
 ///
-/// The elision's witness is unsound — it cannot see a guest CPU write to the
-/// surface's own pages — and the sound repair is the one the sibling linear rail
-/// already uses: re-read the guest's bytes and compare before trusting the
-/// resident. Whether that repair is affordable is entirely a question of how
-/// much memory the elisions actually cover, and the elision *count* cannot
+/// Measured to price the repair for an unsound witness: the epoch could not see
+/// a guest CPU write to the surface's own pages, and the obvious fix was the one
+/// the sibling linear rail uses — re-read the guest's bytes and compare before
+/// trusting the resident. Whether that was affordable was entirely a question of
+/// how much memory the elisions actually cover, and the elision *count* cannot
 /// answer it: 8367 elisions a round is either 130 MB of re-reading or 130 KB
-/// depending on a distribution nobody has measured.
+/// depending on a distribution nobody had measured.
 ///
 /// So this buckets by extent rather than counting again. A population dominated
 /// by icon-sized attachments can be revalidated for almost nothing; one
@@ -3414,14 +3414,14 @@ fn note_gva_backing_verdict(
 /// this class, including the small guest damage scissors that made the icon look
 /// like a partial draw.
 ///
-/// So the repair cannot be "revalidate before trusting", and it cannot be
-/// "drop the elision". What is missing is a witness for guest CPU writes that
-/// does not cost a read of the surface, and the hypervisor already has one:
-/// dirty-page tracking over the mapping's guest pages, which is exactly the
-/// mechanism emulated display devices use to notice a guest painting its own
-/// framebuffer. Plumbing that through `HostOps` as "were any of these pages
-/// dirtied since epoch N" makes the existing witness sound at O(pages/8) instead
-/// of O(bytes), and leaves the 237 GB saved.
+/// So the repair could not be "revalidate before trusting", and it could not be
+/// "drop the elision". What was missing was a witness for guest CPU writes that
+/// does not cost a read of the surface, and the hypervisor already had one.
+/// [`type11_guest_wrote_since_store`] is that witness, over
+/// `HostOps::guest_write_gen`: O(pages) at the harvest instead of O(bytes) at
+/// every LOAD, with the 237 GB left saved. One driven boot after it landed
+/// measured `type11_seed_elided` 283 against `type11_seed_uploaded` 23, so the
+/// reuse survived the soundness.
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
@@ -6109,6 +6109,22 @@ fn type11_load_currency_query(
 /// released with its page list, and a Store that never stamped. A false
 /// "unwritten" is the one answer that produces a wrong frame; a false
 /// "written" only costs a seed.
+///
+/// # What the ordering actually promises
+///
+/// The host observes writes at its own harvest points, and the shims harvest at
+/// the register write that hands the device work. So the promise is: every guest
+/// store ordered before a submission is visible to the draws that submission
+/// carries. It is *not* "immediately" — a store racing the draws that read the
+/// same surface is a race the guest already has against the GPU, and the next
+/// submission's harvest sees it either way, so the rail cannot latch.
+///
+/// The generation is read again at the Store, so a write that lands between a
+/// record's LOAD and its Store is stamped as though the resident contained it.
+/// That window is one packet's execution, it requires the guest to write a
+/// surface it has just asked the GPU to render into, and — unlike the epoch-only
+/// rail this replaced — the very next guest write moves the generation again and
+/// clears it.
 #[cfg(feature = "backend-vulkan")]
 fn type11_guest_wrote_since_store<M: HostOps>(
     state: &DeviceState,
