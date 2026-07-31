@@ -689,14 +689,35 @@ pub fn store_gva_owned(
     // previous store recorded — including a `None` that says the walk could
     // not name it. Carrying the old list forward would let a validated entry
     // vouch for pixels it did not produce.
+    // The old token was taken for the old page list. If these bytes came from
+    // exactly the same pages it still watches exactly the right memory, and it
+    // has to be kept: the host holds a freshly tracked set at "generation
+    // unreadable" for a two-harvest startup window, so a token retired and
+    // re-taken on every store never survives long enough to become readable.
+    // Retiring unconditionally is why `gvac_gw_clean` was 0 of 201 331 lookups
+    // on a 300 s boot — not because the guest had rewritten every entry, which
+    // is how that zero was read, but because no set this rail ever created
+    // outlived its own arming window.
+    let pages_unchanged = match (entry.backing.as_ref(), backing.as_ref()) {
+        (Some(old), Some(new)) => old.gpas == new.gpas,
+        _ => false,
+    };
     entry.backing = backing;
     entry.backing_suspect = false;
-    // The old token was taken for the old page list, so it goes with it. This
-    // runs in the *store*, not in the arming helper, because disarming is the
-    // half that must never be forgotten: an entry left holding a token for
-    // someone else's pages would report "unwritten" for pages it no longer
-    // owns. Re-arming is the caller's option (and only a performance one —
-    // see [`arm_gva_guest_write_witness`]); disarming is not.
+    if pages_unchanged {
+        // The *baseline* still goes, because it named the previous bytes and
+        // these are different ones. `arm_gva_guest_write_witness` re-reads it
+        // against the surviving token immediately after this returns, which is
+        // the only moment a baseline may be latched: the bytes are in hand.
+        entry.guest_write_gen_at_store = 0;
+        return;
+    }
+    // Any other change retires the token, including a `None` that says the walk
+    // could not name the pages. This runs in the *store*, not in the arming
+    // helper, because disarming is the half that must never be forgotten: an
+    // entry left holding a token for someone else's pages would report
+    // "unwritten" for pages it no longer owns. Re-arming is the caller's option
+    // (see [`arm_gva_guest_write_witness`]); disarming is not.
     let stale = std::mem::replace(&mut entry.guest_write_token, 0);
     entry.guest_write_gen_at_store = 0;
     if stale != 0 {
@@ -727,10 +748,34 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
     let Some(entry) = state.host_gva_surfaces.get(&gva) else {
         return;
     };
-    // Already armed for this page list: `store_gva_owned` clears the token
+    // Already tracking this page list: `store_gva_owned` clears the token
     // whenever it replaces the backing, so a live token is by construction a
-    // token for the pages the current bytes were produced from.
+    // token for the pages the current bytes were produced from. Keep it —
+    // re-registering costs a host call per store — but **re-read its
+    // generation**, because this runs immediately after the bytes were stored
+    // and the baseline has to name the bytes in hand.
+    //
+    // Latching once was the defect. `reims_vgpu_dirty_gen` holds a set's
+    // generation at 0 for a deliberate two-harvest startup window ("an absence
+    // of reports says nothing about the guest yet"), and this function runs
+    // directly after `track_guest_writes` — always inside that window. So the
+    // baseline was recorded as 0, always, and the early return meant it was
+    // never revisited. A real generation is never 0, so
+    // `gva_guest_wrote_since_store` could never match one, and `gvac_gw_clean`
+    // was unreachable by construction: 0 of 201 331 lookups on the last boot.
+    // `stamp_guest_write_gen` is the same rail done correctly on the mapping
+    // side, and it re-stamps on every store for exactly this reason.
     if entry.guest_write_token != 0 {
+        let token = entry.guest_write_token;
+        let gen_at_store = host.guest_write_gen(token).unwrap_or(0);
+        crate::runtime::drain::note_store_route(if gen_at_store == 0 {
+            "gvac_gw_restamp_unarmed"
+        } else {
+            "gvac_gw_restamp_armed"
+        });
+        if let Some(entry) = state.host_gva_surfaces.get_mut(&gva) {
+            entry.guest_write_gen_at_store = gen_at_store;
+        }
         return;
     }
     let Some(backing) = entry.backing.as_ref() else {
@@ -882,6 +927,19 @@ pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
     };
     if entry.guest_write_token == 0 {
         crate::runtime::drain::note_store_route("gvac_gw_unarmed");
+        return true;
+    }
+    // A baseline of 0 is not a generation, it is the absence of one: the set was
+    // still inside its startup window at the store that recorded it. Named apart
+    // from `unreadable` because the two have opposite follow-ups — this one says
+    // the *device* has no reference point, `unreadable` says the *host* cannot
+    // answer right now — and pooling them is what let a boot be read as "every
+    // entry had been rewritten by the guest" when most of the population had
+    // simply never had a readable baseline. The mapping rail draws the same
+    // distinction (`mapping_guest_write_verdict` returns `NoStamp` for
+    // `guest_write_gen_at_store == 0`).
+    if entry.guest_write_gen_at_store == 0 {
+        crate::runtime::drain::note_store_route("gvac_gw_no_baseline");
         return true;
     }
     match host.guest_write_gen(entry.guest_write_token) {
@@ -2104,5 +2162,94 @@ mod incarnation_tests {
         assert!(!state.mappings.contains_key(&orphan));
         assert!(surface_entry_is_current(&state, orphan));
         assert!(get(&state, orphan, w, h).is_some());
+    }
+}
+
+#[cfg(test)]
+mod arming_window_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use crate::runtime::host::{FakeHost, HostOps};
+
+    /// The GVA cache's guest-write witness must recover once the host's arming
+    /// window closes, or it can never report a clean entry at all.
+    ///
+    /// It could not. `reims_vgpu_dirty_gen` holds a tracked set's generation at
+    /// 0 for two harvests — an absence of write reports says nothing about the
+    /// guest until logging has been on for a full interval — and
+    /// `arm_gva_guest_write_witness` runs immediately after
+    /// `track_guest_writes`, so it always read 0. It then returned early on
+    /// every later store because a token already existed, so the useless
+    /// baseline was never revisited. A real generation is never 0, so the
+    /// comparison in `gva_guest_wrote_since_store` could not match one:
+    /// `gvac_gw_clean` was **0 of 201 331 lookups** on a 300 s boot, and a
+    /// previous session read that zero as a fact about the guest — "every entry
+    /// this cache still held had been rewritten" — when most of the population
+    /// had simply never had a baseline.
+    ///
+    /// Nothing caught it because `FakeHost` armed its sets instantly. A test
+    /// double more generous than the host it stands for cannot fail the way
+    /// production does, which is why `guest_write_startup_window` exists and why
+    /// this test turns it on.
+    #[test]
+    fn the_gva_witness_recovers_when_the_hosts_arming_window_closes() {
+        let page = 1u64 << PAGE_SHIFT_X86;
+        let gpa = 0x4000_0000u64;
+        let mut host = FakeHost::new();
+        host.guest_write_startup_window = true;
+        host.map_range(gpa, page as usize, 0);
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let gva = 0x8000u64;
+        let (w, h) = (4u32, 2u32);
+        let bytes = || vec![0x7fu8; (w * h * 4) as usize];
+        let backing = GvaBacking {
+            gpas: vec![gpa],
+            span: page,
+            task_id: 0,
+        };
+
+        store_gva_owned(&mut state, gva, w, h, bytes(), 0, Some(backing.clone()));
+        arm_gva_guest_write_witness(&mut state, &mut host, gva);
+        let token = state.host_gva_surfaces[&gva].guest_write_token;
+        assert_ne!(token, 0, "the pages are trackable, so a token is taken");
+        assert_eq!(
+            state.host_gva_surfaces[&gva].guest_write_gen_at_store, 0,
+            "inside the window the host has no generation to give"
+        );
+        assert!(
+            gva_guest_wrote_since_store(&state, &host, gva),
+            "and with no baseline the only safe answer is that the copy is stale"
+        );
+
+        // The window closes. Nothing about the guest changed.
+        host.finish_guest_write_arming();
+        assert_eq!(host.guest_write_gen(token), Some(1));
+
+        // The next store re-latches against the now-readable generation. This is
+        // the step the early return used to skip.
+        store_gva_owned(&mut state, gva, w, h, bytes(), 0, Some(backing));
+        arm_gva_guest_write_witness(&mut state, &mut host, gva);
+        assert_eq!(
+            state.host_gva_surfaces[&gva].guest_write_token, token,
+            "the token is kept — re-registering would cost a host call per store"
+        );
+        assert_eq!(
+            state.host_gva_surfaces[&gva].guest_write_gen_at_store, 1,
+            "but the baseline is re-read, because it must name the bytes stored"
+        );
+        assert!(
+            !gva_guest_wrote_since_store(&state, &host, gva),
+            "so an unwritten entry can finally be reported clean, which is the \
+             whole point of the rail"
+        );
+
+        // And it still reports a real write, so the recovery did not buy `clean`
+        // by making the witness blind.
+        host.guest_wrote_page(gpa);
+        assert!(
+            gva_guest_wrote_since_store(&state, &host, gva),
+            "a witness that only ever says clean is worse than one that never does"
+        );
     }
 }

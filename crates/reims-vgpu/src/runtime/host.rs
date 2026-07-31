@@ -531,6 +531,23 @@ pub struct FakeHost {
     /// unobservable arm asks for it explicitly and every other test exercises
     /// the tracking contract rather than the fallback.
     pub guest_writes_unobservable: bool,
+    /// Model the product shim's arming window: a freshly tracked set answers
+    /// "generation unreadable" until [`FakeHost::finish_guest_write_arming`].
+    ///
+    /// Default `false`, which is the fixture's historical behaviour — a set is
+    /// readable the instant it is tracked. That default is *wrong* about the
+    /// product host and it hid a defect for a release.
+    /// `reims_vgpu_dirty_gen` holds a set's generation at 0 for a deliberate
+    /// two-harvest window, because an absence of write reports says nothing
+    /// about the guest until logging has been on for a full interval. Any
+    /// consumer that reads a baseline immediately after tracking therefore reads
+    /// 0 on the real host and a usable generation here, so the fixture vouched
+    /// for a rail that could never work.
+    ///
+    /// Kept opt-in rather than flipped, because flipping it changes what a
+    /// hundred existing tests are asserting about; a rail that latches a
+    /// baseline should turn it on and prove it recovers.
+    pub guest_write_startup_window: bool,
 }
 
 /// One [`HostOps::track_guest_writes`] registration in [`FakeHost`].
@@ -646,6 +663,21 @@ impl FakeHost {
             if let Ok(i) = set.pages.binary_search(&base) {
                 set.gen_ = set.gen_.wrapping_add(1);
                 set.page_gen[i] = set.gen_;
+            }
+        }
+    }
+
+    /// Leave the arming window: every set still at generation 0 becomes
+    /// readable at 1, which is what the shim's first post-window harvest does.
+    ///
+    /// Writes observed *during* the window are deliberately not reflected, for
+    /// the same reason the shim does not reflect them: inside the window the
+    /// honest answer is "cannot say", and a consumer must already be treating it
+    /// as written.
+    pub fn finish_guest_write_arming(&mut self) {
+        for set in self.guest_write_sets.values_mut() {
+            if set.gen_ == 0 {
+                set.gen_ = 1;
             }
         }
     }
@@ -979,7 +1011,10 @@ impl HostOps for FakeHost {
                 page_size,
                 // Starts at 1, not 0: a caller that recorded "no token" as 0
                 // must not read back a matching generation from a live set.
-                gen_: 1,
+                // Under `guest_write_startup_window` it starts at 0 instead,
+                // which is what the product shim does, and stays there until
+                // `finish_guest_write_arming`.
+                gen_: u64::from(!self.guest_write_startup_window),
                 page_gen,
             },
         );
@@ -991,7 +1026,14 @@ impl HostOps for FakeHost {
     }
 
     fn guest_write_gen(&self, token: u64) -> Option<u64> {
-        self.guest_write_sets.get(&token).map(|s| s.gen_)
+        // 0 is "unknown token, or still arming", never a generation — the same
+        // contract `qemu::host_ops` enforces over the shim's answer. Returning
+        // `Some(0)` here would let a caller latch 0 as a baseline and then match
+        // it, which is the one answer that vouches for an unvalidated copy.
+        self.guest_write_sets
+            .get(&token)
+            .map(|s| s.gen_)
+            .filter(|gen_| *gen_ != 0)
     }
 
     fn guest_written_pages(&self, token: u64, since_gen: u64) -> Option<Vec<u64>> {
