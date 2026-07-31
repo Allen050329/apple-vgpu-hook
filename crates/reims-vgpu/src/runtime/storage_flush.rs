@@ -1649,12 +1649,20 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // Counted on the same one-line-per-second census as the Store routes, so a
     // boot reads `surface_deferred=N surface_flush=M` on one line.
     //
-    // That ratio is the only thing that separates a deferral from a
-    // rescheduling, and nothing else can report it: a reader draining every
-    // window every frame arms and flushes at identical rates and is
-    // indistinguishable from a working rail by arm count alone. M << N is the
-    // win; M ≈ N means some guest-page reader is asking for these bytes anyway
-    // and the next question is which one.
+    // That ratio used to be the only thing separating a deferral from a
+    // rescheduling: a reader draining every window every frame arms and flushes
+    // at identical rates and is indistinguishable from a working rail by arm
+    // count alone, so M << N was the win and M ≈ N meant some guest-page reader
+    // was asking for these bytes anyway.
+    //
+    // `flush_mapping_windows_before_fence` changes what the ratio means, and a
+    // census read on the old rule would draw the wrong conclusion from it. Every
+    // armed window now lands at the next completion stamp by design, so M ≈ N is
+    // the *intended* state and says nothing about guest-page readers. What the
+    // deferral still buys is coalescing inside one fence — a chain of passes into
+    // one surface, and the supersede of a window a later Store in the same
+    // submission fully covers — so the quantity to read is `surface_resident`
+    // against `surface_flush` in one second, not the lifetime ratio.
     crate::runtime::drain::note_store_route("surface_flush");
     // Recycled-pages guard, identical in intent to the compute rail's below and
     // to the GVA rail's `deferred_pages_still_ours`: a mapping rebound since
