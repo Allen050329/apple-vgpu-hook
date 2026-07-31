@@ -4709,20 +4709,45 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         SampledSourceRequest::Bytes(rgba, ..) => {
                             ("bytes", rgba.iter().all(|&b| b == 0))
                         }
+                        // Not knowable before the dedup: the pixels are on the
+                        // GPU and cost a readback to see, which is why this
+                        // reported a hardcoded `false` and no summary at all.
+                        // The real answer is computed below, once the dedup has
+                        // decided this bind is worth a readback.
                         #[cfg(feature = "backend-vulkan")]
                         SampledSourceRequest::Target(_) => ("resident", false),
                         #[cfg(feature = "backend-vulkan")]
                         SampledSourceRequest::GuestRuns(..) => ("guest_runs", false),
                     };
+                    // The resident rung re-probes once per *content epoch*
+                    // rather than once per (texture, geometry) first sighting.
+                    // First sighting alone is the wrong key for a resident: an
+                    // icon that binds correctly on its first composite and
+                    // blank on a later one is exactly the case this census
+                    // exists to catch, and first-sighting would log only the
+                    // good one. The epoch moves when the pixels change, so this
+                    // is one readback per icon per composite — for a 64x64
+                    // target, 16 KiB — and nothing at all when the content is
+                    // unchanged.
+                    #[cfg(feature = "backend-vulkan")]
+                    let resident_epoch = match &loaded {
+                        SampledSourceRequest::Target(identity) => {
+                            crate::backend::vulkan::engine::resident_content_epoch(identity)
+                        }
+                        _ => None,
+                    };
+                    #[cfg(not(feature = "backend-vulkan"))]
+                    let resident_epoch: Option<u32> = None;
                     let mut subject = std::hash::DefaultHasher::new();
                     std::hash::Hash::hash(&(texture_ref, tw, th), &mut subject);
                     let mut state = std::hash::DefaultHasher::new();
-                    std::hash::Hash::hash(&(rung, empty), &mut state);
+                    std::hash::Hash::hash(&(rung, empty, resident_epoch), &mut state);
                     if crate::observe::state_changed(
                         "sampled_content",
                         std::hash::Hasher::finish(&subject),
                         std::hash::Hasher::finish(&state),
                     ) {
+                        let mut empty = empty;
                         let detail = match &loaded {
                             SampledSourceRequest::Bytes(rgba, _, layout) => {
                                 crate::observe::content_summary(
@@ -4732,8 +4757,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     th,
                                 )
                             }
+                            // The one rung whose pixels the census could never
+                            // see. A resident is bound straight from the
+                            // registry's image, so answering "was this icon
+                            // blank when the compositor sampled it" costs a
+                            // readback — cheap here because the epoch key above
+                            // makes it once per composite, and paid only under
+                            // the probe.
+                            //
+                            // `distinct` is the discriminating field: a correct
+                            // icon carries hundreds of distinct texels and a
+                            // blank one collapses to a single colour. That is
+                            // the reading the aggregate census structurally
+                            // cannot produce, because one wrong icon among
+                            // ~11 000 draws a round is invisible to any
+                            // population count.
                             #[cfg(feature = "backend-vulkan")]
-                            SampledSourceRequest::Target(_) => String::new(),
+                            SampledSourceRequest::Target(identity) => {
+                                match crate::backend::vulkan::engine::read_target(identity) {
+                                    Ok(rb) => {
+                                        let px = rb.into_rgba8();
+                                        empty = px.iter().all(|&b| b == 0);
+                                        crate::observe::content_summary(&px, 4, tw, th)
+                                    }
+                                    // Named, not swallowed: a resident the probe
+                                    // cannot read is a hole in exactly the
+                                    // census this line exists to complete, and
+                                    // a silent empty string reads as "nothing
+                                    // to report".
+                                    Err(e) => format!("readback_failed={e}"),
+                                }
+                            }
                             #[cfg(feature = "backend-vulkan")]
                             SampledSourceRequest::GuestRuns(_, layout) => {
                                 format!("texel={}", layout.bytes_per_texel())
