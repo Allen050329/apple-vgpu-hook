@@ -213,6 +213,37 @@ the arithmetic — 12 bad slides of 256 predicts 4.69 %, and 24 of 513 measured 
 measurement from such a boot is about this device. `.agents/repros/boot-abort-rate.sh` turns it into
 a rate.
 
+### Every guest kernel panic this project ever caused is on disk, in `vm/disks/run/`
+
+`vm/disks/run/serial-*.log` is never cleaned. 547 of them were swept and **11 carried a guest
+kernel panic (2.0 % of boots)**. Nothing had ever reported one: `-action reboot=shutdown` turns the
+panic reboot into a QEMU exit, so the boot script said "qemu exited", the drive script said "VM IS
+GONE", and the word panic appeared nowhere.
+
+The reasons are a corruption census, not a grab bag:
+
+```text
+[kalloc.type.var6.6144]: element modified after free (off:0, val:0xffffffffffffffff, sz:6144)
+[kalloc.type.var3.256]:  element modified after free (off:0, val:0xffffffffffffffff, sz:256)
+pmap_page_protect() pmap=… pn=… vaddr=…                                              (x2)
+Kernel trap at 0xffffffffffffffff   <- indirect call through a clobbered ifnet fn ptr
+"hitting assertion" @AppleParavirtPageTable.cpp:200  <- in WindowServer's own submit
+Kernel trap at <various>                                                             (x4)
+```
+
+The two `element modified after free` reports are the strongest evidence this project has for the
+write-after-fence class. The kernel's poison check found a **whole freed element filled with 0xFF
+from offset 0** — 256 bytes in one, 6144 in the other. That is not a stray pointer; it is a bulk
+write of opaque white pixels into memory the guest kernel had already freed. Both predate
+`311cb11`, which is the repair for exactly that.
+
+`vm/boot-x86.sh` now detects a panic in the serial log, copies it to `/tmp/reims-vgpu-panics/`, and
+exits **126** — distinct from 125 (firmware abort) and 124 (wedge). Sweep the historical logs with:
+
+```sh
+for f in vm/disks/run/serial-*.log; do grep -l 'Debugger called: <panic>' "$f"; done
+```
+
 ### Never delete the live fail log
 
 The device holds an append fd on `/tmp/reims-vgpu-fail.log` from a background writer thread. `rm`

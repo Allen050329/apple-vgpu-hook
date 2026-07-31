@@ -571,6 +571,31 @@ trap 'capture_then_revert signal; exit 130' INT TERM
 # waiting out TESTING_TIMEOUT and then treating the sample as data.
 BOOT_ABORT_RE='#\[EB\|STOP\]|Boot failed - Aborted'
 
+# A guest KERNEL PANIC is the loudest result this rig can produce and it was, for
+# months, the quietest. `-action reboot=shutdown` turns the panic reboot into a
+# QEMU exit, so the boot script reported "qemu exited", the drive script reported
+# "VM IS GONE", and nothing anywhere said the word panic. The evidence was on disk
+# the whole time — `vm/disks/run/serial-*.log` is never cleaned, and a sweep of
+# 547 of them found 11 panics (2.0 %) whose reasons are a corruption census:
+#
+#   [kalloc.type.var6.6144]: element modified after free (val:0xffffffffffffffff)
+#   [kalloc.type.var3.256]:  element modified after free (val:0xffffffffffffffff)
+#   pmap_page_protect() pmap=... pn=... vaddr=...            (x2)
+#   Kernel trap at 0xffffffffffffffff  (an indirect call through a clobbered
+#                                       ifnet function pointer)
+#   "hitting assertion" @AppleParavirtPageTable.cpp:200
+#
+# The two `element modified after free` reports are the important ones: the
+# kernel's own poison check found a whole freed element (256 B and 6144 B) filled
+# with 0xFF from offset 0. That is not a stray pointer, it is a bulk write of
+# opaque white pixels into memory the guest kernel had already freed — the
+# kernel-side face of the write-after-fence class `311cb11` repaired.
+#
+# So say it at the moment it happens, and exit 126 so a batch can tell a panic
+# from a firmware abort (125), a wedge (124) and a clean exit.
+PANIC_RE='Debugger called: <panic>'
+PANIC_KEEP_DIR="${PANIC_KEEP_DIR:-/tmp/reims-vgpu-panics}"
+
 elapsed=0
 while kill -0 "$QEMU_PID" 2>/dev/null; do
   if [ "$elapsed" -ge "$TESTING_TIMEOUT" ]; then
@@ -584,9 +609,30 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
     capture_then_revert "boot.efi aborted — firmware boot failure, not a device wedge"
     exit 125
   fi
+  if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
+    echo "boot-x86.sh: GUEST KERNEL PANIC."
+    grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
+    mkdir -p "$PANIC_KEEP_DIR"
+    cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
+    echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
+    capture_then_revert "guest kernel panic"
+    exit 126
+  fi
   sleep 5
   elapsed=$((elapsed + 5))
 done
 
 wait "$QEMU_PID" 2>/dev/null || true
+# QEMU exiting on its own is normally a guest shutdown, but `-action
+# reboot=shutdown` makes a panic reboot look identical. Check before saying
+# nothing happened.
+if [ -s "$SERIAL_LOG" ] && grep -qF "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null; then
+  echo "boot-x86.sh: GUEST KERNEL PANIC (qemu exited on the panic reboot)."
+  grep -A2 -F "$PANIC_RE" "$SERIAL_LOG" 2>/dev/null | head -6
+  mkdir -p "$PANIC_KEEP_DIR"
+  cp -f "$SERIAL_LOG" "$PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")" 2>/dev/null || true
+  echo "boot-x86.sh: serial log kept at $PANIC_KEEP_DIR/$(basename "$SERIAL_LOG")"
+  capture_then_revert "guest kernel panic"
+  exit 126
+fi
 capture_then_revert "qemu exited"
