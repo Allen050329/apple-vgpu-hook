@@ -402,6 +402,30 @@ guest's completion stamp; it does not make the destination address correct. The 
 At 2.2 % an A/B needs ~150 boots per arm and is not affordable. Let panics accumulate as a side
 effect of every boot and re-sweep the census instead.
 
+##### Re-swept at 608 boots: 12 panics, and every one predates the identity guard
+
+The sweep is the prescription above, carried out. 608 serial logs, **12 panics (1.97 %)** — the same
+12. The newest is `20260731-144329`; `d455c3e` (the type-4 identity guard) landed at 19:17 that day
+and `fbf7bd9` (the fence bindings) at 17:02.
+
+```text
+boots after fbf7bd9 (fence bindings)   43    panics 0    expected 0.85 at the historical rate
+boots after d455c3e (identity guard)   14    panics 0    expected 0.28
+```
+
+**Do not read this as the repair being confirmed.** Under the historical rate a run of 43 clean boots
+has p = 0.42, and 14 has p = 0.76 — both are exactly what a short run looks like whether or not
+anything was fixed. It is consistent with the fix and equally consistent with having not yet drawn a
+panic. The direction is right and the n is not there; say so in that order.
+
+What it does establish is the denominator, so the next agent does not re-derive it: **the post-guard
+arm needs roughly 150 boots before a zero means anything**, and it has 14. Keep booting for other
+reasons and re-sweep — that is cheaper than a dedicated soak and it is the same data.
+
+Sweep with the loop above; count boots with `ls -1 vm/disks/run/serial-*.log | wc -l` and split by
+timestamp against a commit date (`git log -1 --format=%cd --date=format:'%Y%m%d-%H%M%S' <ref>`), since
+the log name is the run stamp and sorts lexically.
+
 ### A panicked boot must not be scored, and "no rounds" does not say it was not
 
 `.agents/repros/icon-boot-ab.sh` retries a boot that panics *before ssh* (exit 126) and does not

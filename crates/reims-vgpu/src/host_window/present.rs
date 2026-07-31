@@ -191,12 +191,56 @@ fn guest_resize_request(
     observed != Some(incoming) && incoming != window
 }
 
-/// A guest-driven native resize not yet confirmed by a matching `Resized`
-/// event. While it is outstanding the window holds its previous drawable
-/// (guest boot presents are seconds apart, so a mismatched interim present
-/// would stay on screen that long); the hold is bounded by
-/// [`GUEST_RESIZE_WARN_AFTER`], after which the request is dropped with a
-/// fail-visible line and presentation resumes letterboxed.
+/// How a `Resized` event answers an outstanding guest-driven request, or
+/// `None` when there is nothing outstanding to answer.
+///
+/// **Any `Resized` settles the hold, matching or not.** What the window is
+/// waiting for is the window system to answer, not to obey: `request_inner_size`
+/// is a request, and a compositor is free to adjust it for decorations, screen
+/// bounds or a fractional scale round-trip. An exact-match test reads every such
+/// answer as silence and holds until the alarm.
+///
+/// Measured on x86/Linux, one boot, driving the guest through its four modes —
+/// the applied size differs from the request on three of four, never by more
+/// than a pixel, and never in a fixed direction:
+///
+/// ```text
+/// requested 1920x1080 -> 1921x1079      requested 3840x2160 -> 3840x2160
+/// requested 1440x1080 -> 1440x1079      requested 1280x1024 -> 1281x1024
+/// ```
+///
+/// Under the old exact-match rule those three logged
+/// `native_resize_not_applied` — a fail-visible line saying the resize never
+/// happened, about a window that had resized — and each held *all* presentation
+/// for the full second the alarm takes, because [`App::draw_engine_window`]
+/// returns early while a request is outstanding. So a guest mode change froze
+/// the display for a second and then claimed it had been refused.
+///
+/// The alarm still has a job, and it is now the case it was written for: a
+/// window system that ignores the request entirely emits no `Resized` at all
+/// (tiling or fullscreen by policy), so nothing calls this and the hold times
+/// out.
+fn guest_resize_settled(
+    pending: Option<(u32, u32)>,
+    applied: (u32, u32),
+) -> Option<&'static str> {
+    let target = pending?;
+    Some(if target == applied {
+        "applied"
+    } else {
+        // The window system answered with a geometry of its own choosing. The
+        // presenter aspect-fits into it and the pointer maps through the same
+        // viewport, so this is a complete outcome and not a degraded one.
+        "adjusted"
+    })
+}
+
+/// A guest-driven native resize not yet confirmed by a `Resized` event. While
+/// it is outstanding the window holds its previous drawable (guest boot
+/// presents are seconds apart, so a mismatched interim present would stay on
+/// screen that long); the hold is bounded by [`GUEST_RESIZE_WARN_AFTER`], after
+/// which the request is dropped with a fail-visible line and presentation
+/// resumes letterboxed.
 struct PendingGuestResize {
     target: (u32, u32),
     requested_at: std::time::Instant,
@@ -1111,20 +1155,21 @@ impl App {
         }
     }
 
-    /// Clear the outstanding guest resize once the window system confirms the
-    /// exact target geometry (via `Resized` or a synchronous apply).
+    /// Clear the outstanding guest resize once the window system has answered
+    /// it (via `Resized` or a synchronous apply). See [`guest_resize_settled`]
+    /// for why any answer settles it, including one that adjusted the size.
     fn note_guest_resize_applied(&mut self, applied: (u32, u32)) {
-        if self
-            .pending_guest_resize
-            .as_ref()
-            .is_some_and(|pending| pending.target == applied)
-        {
-            crate::observe::off(format!(
-                "host_window_guest_resize status=applied width={} height={}",
-                applied.0, applied.1
-            ));
-            self.pending_guest_resize = None;
-        }
+        let target = self.pending_guest_resize.as_ref().map(|p| p.target);
+        let Some(status) = guest_resize_settled(target, applied) else {
+            return;
+        };
+        let requested = target.unwrap_or(applied);
+        crate::observe::off(format!(
+            "host_window_guest_resize status={status} width={} height={} \
+             requested={}x{}",
+            applied.0, applied.1, requested.0, requested.1
+        ));
+        self.pending_guest_resize = None;
     }
 }
 
@@ -2268,6 +2313,37 @@ mod tests {
             pointer_report((960.0, 540.0), (1920, 1080), Some((3840, 2160))),
             (1920, 1080, 3840, 2160)
         );
+    }
+
+    /// The measured x86/Linux answers. Three of the guest's four modes come
+    /// back adjusted by a pixel; under the old exact-match rule each of those
+    /// held all presentation for a second and then logged
+    /// `native_resize_not_applied` about a window that had in fact resized.
+    #[test]
+    fn a_window_system_that_adjusts_the_size_still_settles_the_hold() {
+        for (requested, applied) in [
+            ((1920, 1080), (1921, 1079)),
+            ((1440, 1080), (1440, 1079)),
+            ((1280, 1024), (1281, 1024)),
+        ] {
+            assert_eq!(
+                guest_resize_settled(Some(requested), applied),
+                Some("adjusted"),
+                "{requested:?} -> {applied:?} must settle the hold"
+            );
+        }
+        // The one that landed exactly is still reported as such.
+        assert_eq!(
+            guest_resize_settled(Some((3840, 2160)), (3840, 2160)),
+            Some("applied")
+        );
+    }
+
+    /// A `Resized` with nothing outstanding is a user drag, not an answer, and
+    /// must not synthesise a resize line.
+    #[test]
+    fn a_resize_with_nothing_pending_is_not_an_answer() {
+        assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
     }
 
     #[test]
