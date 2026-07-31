@@ -531,6 +531,52 @@ several different binaries as the session edited `crates/`. To attribute it, bui
 own source (`git checkout 7763f2f -- crates/ vendor/qemu`, the commit before `2327a79`) and run the
 same harness.
 
+#### Landing inside the fence does not empty the clobber window, and the code says it does
+
+`storage_flush.rs` states, at `render_flush_guest_written_ranges`, that once
+`flush_mapping_windows_before_fence` binds every armed window "the interval in which a guest store
+can be both after the Store and before the writeback does not exist", so that "a
+`render_flush_over_guest_write` after the binding names a window that landed outside the fence
+anyway, which is a defect and not a cost."
+
+One 600 s driven x86/Vulkan boot on the shipped default binary (`/tmp/type4ab/arm-1`, summed per the
+per-interval rule) falsifies the second half of that:
+
+```text
+surface_resident                35 115
+surface_flush                   35 115     every armed window landed
+rendw_stamp_outlived                 0     none of them outlived its fence
+rendw_stamp_same                35 115
+render_flush_over_guest_write      679     1.9 % still wrote over guest bytes
+```
+
+Both columns are as strong as they look — **zero** windows landed late, and **679** of them replaced
+bytes the guest had written since the Store. The inference joining them is what is wrong: the guest
+does not need to be told the render is finished before it may write to an IOSurface it owns, so
+CoreGraphics blits and inter-buffer damage forward-copies land in the Store→fence interval whether or
+not the window is punctual. The interval is short, not absent. The doc comment should be read as a
+statement of intent, not as an invariant the census confirms.
+
+Two reasons to trust the 679 rather than suspect the instrument. The verdict comes from
+`host.guest_write_gen(token)` — QEMU's own dirty generation for the tracked page set — so it does not
+share a code path with the fence machinery it is being compared against, which is the failure mode
+this document warns about elsewhere. And it is a three-way verdict: `NoStamp` and `Unreadable` are
+counted separately, so `Wrote` requires a real baseline generation and a real differing one.
+
+What it does **not** yet establish is harm. The clobbers concentrate on surfaces that are redrawn
+every frame — 541 of 679 on five 1920×1080 compositor mappings — where a replaced guest write
+self-heals on the next frame. The tail is the interesting part (1240×702 Safari content, 15×622
+scrollbars), and nobody has tied a single clobber to a visible artefact. Treat this as the leading
+**Goal 3** mechanism by rate — 679 per boot against `mapping_page_drift`'s 1 — and not as a
+demonstrated loss.
+
+Do not "fix" it by preserving the guest's pages without a control. The same function records a
+bisect where a preserving variant scored **0 of 14 rounds clean with the screen black at 19 Hz**,
+against 2–3 of 4 for the non-preserving arms. The machinery to do it properly
+(`write_bgra8_skipping`, `HostOps::guest_written_pages`) is still present and unused on this rail;
+`render_flush_guest_written_ranges` computes nothing and returns an empty `Vec`, so today it is
+purely a detector.
+
 ### `grep -c` prints a count and exits 1, so `|| echo 0` emits two lines
 
 `n=$(grep -c foo file || echo 0)` is the natural way to write "count, defaulting to zero", and it is
