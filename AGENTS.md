@@ -176,6 +176,31 @@ exactly one "new crash report" named `Retired` whether or not anything had crash
 an A/B scored one hit when the true count in both was zero. **A harness whose null result looks like
 a hit cannot score an arm.** Before believing a repro, confirm you have seen it print the negative.
 
+The mirror of that failure is the more dangerous one, because it reads as a pass. Every census A/B
+here scores a *count of bad events* scraped from `/tmp/reims-vgpu-fail.log` — windows that outlived
+a fence, declines, lost flushes. A boot that produced no GPU work at all, or one whose fail log was
+unlinked out from under the device's append fd, scores **zero of everything**, which is exactly what
+a perfect arm scores. So a count-based arm needs a validity gate that is independent of the count:
+confirm the log carries a `store_routes` census *and* that the census reports real store traffic,
+and report anything else as `UNMEASURED` rather than folding it in as clean.
+`.agents/repros/fence-census-ab.sh` is the worked example.
+
+Name the boot's serial log by the path `vm/boot-x86.sh` prints (`serial → …` on its first line), never
+by taking the newest match in `vm/disks/run/`. Picking by mtime attributes whichever boot wrote last
+— possibly another arm's, or a concurrent run's — to the boot being scored. Measured instance: in the
+six-round icon A/B of 2026-07-31 the round-2 *arm* boot guest-kernel-panicked
+(`serial-20260731-144329.log`, `IOAccelSegmentResourceList::prepare` with `RAX = 0xffffffffffffffff`)
+and the harness recorded it as `NO_ROUNDS` — indistinguishable in the verdict table from a boot that
+simply scored nothing. **A panicked arm is unmeasured, and it is also a result; a harness that cannot
+tell those apart loses both.**
+
+Two counters in that census were themselves blind until `2327a79`. `*_stamp_outlived` compares a
+window's `armed_stamp_seq` against `DeviceState::completion_stamp_seq`, and only `write_stamp`
+advanced that counter — the root completion stamp, written inline by `drain_main_fifo`, did not. A
+window that sat through hundreds of root completions therefore scored `stamp_same`. **A measurement
+that shares a code path with the thing it measures will agree with it.** When a counter says a rail
+is punctual, check what advances the clock before believing the rail.
+
 ### A boot the firmware aborted is not a device wedge, and it looks exactly like one
 
 From outside, a `boot.efi` abort and a hung device are the same picture: QEMU alive, the guest
