@@ -1349,6 +1349,58 @@ The general lesson, since it will recur: an enumeration is cheap to delegate and
 are not trustworthy without reading the arguments at each call site. Take the site list; re-derive the
 verdicts.
 
+#### The page-drift guard is armed on 100 % of writes, and until now that was unknowable
+
+`mapw_pages_refused = 0` had two readings and the census printed them identically: a guard that
+examined every write and found no drift, or a guard that was never armed for any of them. Those are
+opposite claims about the write-after-free class, and `mapping_write`'s own doc hedged in prose —
+"the guard here is currently inert; say so rather than counting it as the repair" — because nobody
+could tell from the numbers.
+
+The reason is structural. The witness had **five exits and only one of them checked a page**: no
+mapping, no latched `type4_walk`, a walk latched at a superseded `map_generation`, and an empty page
+list all returned "true" without walking anything. Its own doc said so — "a caller must not read
+`true` as 'these pages were verified'" — and both callers then folded that into the same
+`PagesVerdict::Ours` a full clean re-walk produces.
+
+Split (`Type4Witness::{Verified, Unwitnessed(why), Drifted}`), the answer is unambiguous. One
+420 s driven boot of `blur-provoke.sh` — the backdrop-blur-under-window-capture page from the user's
+own crash report, the heaviest surface churn this rig produces — 412 census intervals, counters
+summed per the per-interval rule:
+
+```text
+                    verified   unwitnessed   refused
+direct writers        52 459             0         0     100.00 % verified
+deferred flush        52 445             0         0     100.00 % verified
+
+mapw_unwit_no_walk 0   _superseded 0   _no_pages 0   _no_mapping 0
+```
+
+So the zero was the good reading. **Every one of ~105 000 mapping-keyed writes across both rails was
+re-walked page by page against the guest's own page table before it landed, and not one list had
+drifted.** That is a completeness statement about the mapping rails on the provoking workload, and
+it is the first time the `refused = 0` figure has meant anything.
+
+Boot health: 1 286 attaches, 0 guest panics, 0 fabricated attaches, 0 drift, 0 lost flushes; 4 type-4
+refusals (3 corrected, 1 terminal, **0 stranded**).
+
+Three limits, and the first is the one to respect. **`Unwitnessed` has no live positive control** —
+it read 0 across 105 000 writes, and this document's own rule is that a counter which has only ever
+read zero has not been shown to work. What stands in for it is a unit test that drives all four
+states and asserts each slug, so it is not a dead wire; it is not the same as having seen one fire on
+the rig. Second, one boot, one workload. Third, this says **nothing about the raw-address rails**
+(`flush_gva_one`, `flush_linear_one`), which name guest addresses with no mapping incarnation and are
+guarded by `deferred_pages_still_ours` and the fence ordering instead.
+
+Note also what this retires: the recurring suspicion that `ensure_contig_view` hands back a stale
+`mach_vm_remap` after a silent re-point. It does not. `resolve_mapping_backing` retires the view and
+bumps `map_generation` whenever the resolved plan differs, `ensure_contig_view` revalidates before
+returning a cached pointer, and every writer additionally holds a `PagesVouched` token checked after
+the flush that could invalidate it. A delegated audit reached the same conclusion but by the wrong
+route — it claimed the vouch "re-walks type-4 pages before each write", which is exactly the
+overstatement the witness's own doc warns against. The route matters, because the measurement above
+is what makes the claim true rather than the argument.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
