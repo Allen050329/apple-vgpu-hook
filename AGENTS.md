@@ -392,15 +392,37 @@ convention each number uses (`(sum)` / `(lines)`) so the next reader does not ha
 
 ### Measured: the fence bindings close the Finder icon class
 
-The first A/B on this rig to separate the icon class, and the first done properly one-binary-apart.
-Both arms built from `fbf7bd9`, nothing in `crates/` touched between them, `icon-composite.sh` with
-4 rounds per boot, 8 boots per arm.
+Two experiments, both one-binary-apart from `fbf7bd9` with nothing in `crates/` touched between
+arms, `icon-composite.sh` at 4 rounds per boot. The second was **interleaved** — arm and control
+alternating, and which one leads flipping each pair — to remove the first's blocked-in-time
+confound.
 
 ```text
-arm  (default)                       0 corrupt / 8 boots    0 corrupt / 32 rounds
-ctl  (REIMS_VGPU_FENCE_FLUSH_OFF=all) 4 corrupt / 8 boots    5 corrupt / 32 rounds
-                       Fisher two-tailed  p = 0.077 (boots)  p = 0.053 (rounds)
+                                       boots            rounds
+first A/B   arm  (default)          0 / 8            0 / 32
+   (blocked) ctl  (FENCE_FLUSH_OFF)  4 / 8            5 / 32     p = 0.077 / 0.053
+replicate   arm                     0 / 6            0 / 24
+(interleaved) ctl                   2 / 6            2 / 24     p = 0.455 / 0.489
+────────────────────────────────────────────────────────────────────────────────
+combined    arm                     0 / 14           0 / 56
+            ctl                     6 / 14           7 / 56     p = 0.016 / 0.013
 ```
+
+Read it as three statements, not one.
+
+**The replicate alone does not reach significance.** 2 of 6 against 0 of 6 is p = 0.46; on its own
+it is not evidence. What it does do is reproduce the *direction* under a design that cannot be
+explained by the hour the arm ran in, which is the specific objection the first experiment could not
+answer.
+
+**The first experiment's effect size was inflated.** 4 of 8 control boots corrupt did not survive:
+the interleaved rate is 2 of 6. Pooled, the control corrupts about 43 % of boots, and the pooled
+figure is the one to quote — a later run predicted from 50 % will look like a regression when it
+lands at 30 %.
+
+**The arm has not corrupted once in 14 boots and 56 rounds.** That is the practically load-bearing
+fact and it does not depend on the p-value: the shipped configuration shows no icon corruption on
+this rig, and the only change that brings it back is turning the fence bindings off.
 
 The control's validity gate is independent of its icon score and it passed hard. Stated properly —
 summed per boot, per rail, over the four interleaved pairs of the replicate:
@@ -427,12 +449,8 @@ one.
 (The earlier figure here, "1 000–1 700 per round", was the census cadence times the interval count —
 the arithmetic the section above this one now warns about. The per-boot totals are the row above.)
 
-Three cautions that belong with the number:
+Two cautions that belong with the number:
 
-- **p is 0.05–0.08.** The direction is clean and the pre-registered threshold was met, but this is one
-  experiment at the edge. A replicate is the cheap way to settle it.
-- **The design was blocked in time** — 8 arm boots, then 8 control boots — so the arm is confounded
-  with the hour it ran in. Interleave the next one.
 - **Nothing in the census sees this class.** 71 counters, compared per round across 5 corrupt and 27
   clean rounds on identical binaries: **not one separates them**, and the knob's own counter shows no
   dose-response (corrupt rounds average *fewer* outlived windows, 125.6 vs 131.1 per 1000 draws; boot
@@ -440,10 +458,12 @@ Three cautions that belong with the number:
   mechanism in `store_routes` — it is not in there. The fence changes *when* a write lands, and
   nothing counts lateness per surface.
 
-Also unexplained, and recorded so a bigger sample can confirm or kill it: all 5 corrupt rounds were
-round 2 or 3 of 4, never round 1 and never round 4 (p ≈ 0.03 under uniform). `icon-recovery.sh`
-already found this class self-heals in ~10 s, so capture timing within a boot may matter as much as
-device state.
+**Killed by the replicate: the round-position effect.** The first experiment's 5 corrupt rounds were
+all round 2 or 3 of 4, never 1 and never 4 — p ≈ 0.03 under uniform, and it was recorded here so a
+bigger sample could confirm or kill it. The replicate's two corrupt rounds were round **2** and round
+**4**, so "never round 4" is gone on the first new observation that could have contradicted it. This
+is what a p ≈ 0.03 pattern found by looking at five points, after the fact, in a table of many
+possible patterns, is worth. Leave the note as a worked example rather than deleting it.
 
 **What this does not say.** It does not identify *which* fence commit closed the class.
 `REIMS_VGPU_FENCE_FLUSH_OFF=all` reverts the whole group. The prime suspect is `2327a79` (the root
