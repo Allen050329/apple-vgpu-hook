@@ -400,6 +400,17 @@ pub fn note_written_pages<I: IntoIterator<Item = u64>>(gpas: I, page_size: u64) 
 /// workload sample the same writes.
 const PAYLOAD_SAMPLE_EVERY: u64 = 64;
 
+/// The shortest all-`0xff` run that could have produced a report in the panic
+/// census, and therefore the shortest one worth counting.
+///
+/// The two `kalloc` poison reports in `AGENTS.md` read "element modified after
+/// free (off:0, val:0xffffffffffffffff, sz:6144)" and the same at `sz:256`: the
+/// kernel found a **whole freed element** filled with `0xff` from offset 0. So a
+/// write that could have produced the smaller of them put at least 256
+/// consecutive `0xff` bytes into guest RAM. The number is that element size, not
+/// a threshold picked to fit an observation.
+const FF_RUN_MIN: usize = 256;
+
 struct PayloadCensus {
     calls: AtomicU64,
     sampled: AtomicU64,
@@ -407,6 +418,12 @@ struct PayloadCensus {
     all_zero: AtomicU64,
     bytes_sampled: AtomicU64,
     bytes_all_ff: AtomicU64,
+    /// Sampled buffers carrying at least one run of [`FF_RUN_MIN`] `0xff` bytes.
+    ff_run: AtomicU64,
+    /// The longest such run seen. Exact at and above [`FF_RUN_MIN`]; shorter
+    /// runs are deliberately not searched for, so a value below the threshold
+    /// never appears.
+    ff_run_max: AtomicU64,
 }
 
 static PAYLOAD: PayloadCensus = PayloadCensus {
@@ -416,7 +433,45 @@ static PAYLOAD: PayloadCensus = PayloadCensus {
     all_zero: AtomicU64::new(0),
     bytes_sampled: AtomicU64::new(0),
     bytes_all_ff: AtomicU64::new(0),
+    ff_run: AtomicU64::new(0),
+    ff_run_max: AtomicU64::new(0),
 };
+
+/// The longest run of `0xff` bytes in `buf`, searched only for runs of at least
+/// [`FF_RUN_MIN`]; `0` when there is none.
+///
+/// Probing every [`FF_RUN_MIN`]th byte is exact for the runs being looked for
+/// and costs `len / 256` loads on a buffer that has none: any run of
+/// `FF_RUN_MIN` consecutive bytes contains at least one index that is a multiple
+/// of `FF_RUN_MIN`, so a run long enough to matter cannot hide between probes.
+/// Only a probe that lands on `0xff` pays to expand.
+fn longest_ff_run(buf: &[u8]) -> usize {
+    let mut best = 0usize;
+    // Exclusive end of the run last expanded. Probes stay on the fixed
+    // `FF_RUN_MIN` grid — moving them to the end of a run would break the
+    // alignment the correctness argument rests on — so this is what stops a
+    // long run being re-expanded once per probe that lands inside it.
+    let mut measured_end = 0usize;
+    let mut i = 0usize;
+    while i < buf.len() {
+        if buf[i] == 0xFF && i >= measured_end {
+            let mut lo = i;
+            while lo > 0 && buf[lo - 1] == 0xFF {
+                lo -= 1;
+            }
+            let mut hi = i + 1;
+            while hi < buf.len() && buf[hi] == 0xFF {
+                hi += 1;
+            }
+            if hi - lo >= FF_RUN_MIN {
+                best = best.max(hi - lo);
+            }
+            measured_end = hi;
+        }
+        i += FF_RUN_MIN;
+    }
+    best
+}
 
 /// Record the *shape* of a guest write's payload, sampled.
 ///
@@ -440,8 +495,23 @@ static PAYLOAD: PayloadCensus = PayloadCensus {
 /// together, and a freshly allocated surface really is zero-filled, so the two
 /// populations are known to be distinct in the guest.
 ///
-/// The scan short-circuits on the first byte that differs, so a photograph costs
-/// one comparison and only a genuinely uniform buffer pays for its length.
+/// # `all_ff` alone answers a question nobody asked
+///
+/// It requires the **whole** buffer to be `0xff`, and the rails here hand over
+/// whole frames and whole source images. A white browser page has a menu bar, a
+/// scrollbar and text in it, so a device rendering it faithfully writes
+/// megabytes of white and `all_ff` still reads zero. The first live reading —
+/// `all_ff=0` over 25 529 samples — was recorded with that caveat unstated, and
+/// it cannot bear the weight it looked like it could.
+///
+/// [`FF_RUN_MIN`] is the predicate the panic census actually implies: a run long
+/// enough to have filled the smaller of the two poisoned `kalloc` elements. Both
+/// numbers are kept — `all_ff` is the strict form and stays comparable with the
+/// boots already recorded — but `ff_run` is the one to read.
+///
+/// The uniform scans short-circuit on the first byte that differs, and the run
+/// probe costs `len / 256` loads on a buffer with no long white span, so a
+/// photograph pays almost nothing either way.
 pub fn note_written_payload(buf: &[u8]) {
     if buf.is_empty() {
         return;
@@ -462,6 +532,11 @@ pub fn note_written_payload(buf: &[u8]) {
     } else if buf.iter().all(|&b| b == 0x00) {
         PAYLOAD.all_zero.fetch_add(1, Ordering::Relaxed);
     }
+    let run = longest_ff_run(buf) as u64;
+    if run > 0 {
+        PAYLOAD.ff_run.fetch_add(1, Ordering::Relaxed);
+        PAYLOAD.ff_run_max.fetch_max(run, Ordering::Relaxed);
+    }
 }
 
 /// `(calls, sampled, all_ff, all_zero, bytes_sampled, bytes_all_ff)`.
@@ -473,6 +548,14 @@ pub fn payload_counts() -> (u64, u64, u64, u64, u64, u64) {
         PAYLOAD.all_zero.load(Ordering::Relaxed),
         PAYLOAD.bytes_sampled.load(Ordering::Relaxed),
         PAYLOAD.bytes_all_ff.load(Ordering::Relaxed),
+    )
+}
+
+/// `(sampled buffers carrying a run of at least [`FF_RUN_MIN`], longest run)`.
+pub fn ff_run_counts() -> (u64, u64) {
+    (
+        PAYLOAD.ff_run.load(Ordering::Relaxed),
+        PAYLOAD.ff_run_max.load(Ordering::Relaxed),
     )
 }
 
@@ -506,11 +589,13 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     // census lines multiplies by the cadence — the 100x error AGENTS.md records.
     let (retired_frames, retired_hits) = retired_counts();
     let (retire_scans, retire_scan_pages) = retire_scan_counts();
+    let (ff_run, ff_run_max) = ff_run_counts();
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
          all_ff={all_ff} all_zero={all_zero} samp_bytes={bytes_sampled} \
-         ff_bytes={bytes_all_ff} retired={retired_frames} \
+         ff_bytes={bytes_all_ff} ff_run={ff_run} ff_run_max={ff_run_max} \
+         ff_run_min={FF_RUN_MIN} retired={retired_frames} \
          write_after_retire={retired_hits} retire_scans={retire_scans} \
          retire_scan_pages={retire_scan_pages} (levels, not per-interval)"
     )];
@@ -572,6 +657,8 @@ pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
         &PAYLOAD.all_zero,
         &PAYLOAD.bytes_sampled,
         &PAYLOAD.bytes_all_ff,
+        &PAYLOAD.ff_run,
+        &PAYLOAD.ff_run_max,
     ] {
         cell.store(0, Ordering::Relaxed);
     }
@@ -722,6 +809,101 @@ mod tests {
         nearly[0] = 0xFE;
         note_written_payload(&nearly);
         assert_eq!(payload_counts().2, 0);
+    }
+
+    /// The case `all_ff` is blind to, and the reason the run predicate exists.
+    ///
+    /// A white browser page has a menu bar, a scrollbar and text in it, so the
+    /// frame this device writes is never uniform — and `all_ff` reads zero on
+    /// exactly the workload the white-frame hypothesis is about. A run of
+    /// [`FF_RUN_MIN`] is what the `kalloc` poison reports imply, and it is
+    /// present in that frame by the megabyte.
+    #[test]
+    fn a_mostly_white_frame_scores_no_all_ff_and_a_long_ff_run() {
+        let _g = fresh();
+        let mut frame = vec![0xFFu8; 64 * 1024];
+        // Chrome at the top and a scrollbar column: enough to break uniformity,
+        // nowhere near enough to break up the white.
+        for b in frame.iter_mut().take(1024) {
+            *b = 0x20;
+        }
+        frame[40_000] = 0x00;
+        note_written_payload(&frame);
+        assert_eq!(
+            payload_counts().2,
+            0,
+            "not uniform, so `all_ff` cannot see it — which is the defect in \
+             reading `all_ff=0` as 'this device does not write white'"
+        );
+        let (ff_run, ff_run_max) = ff_run_counts();
+        assert_eq!(ff_run, 1);
+        assert_eq!(
+            ff_run_max,
+            (40_000 - 1024) as u64,
+            "the longer of the two white spans the dark pixel splits: chrome to \
+             it (38 976) beats it to the end (25 535)"
+        );
+    }
+
+    /// The negative, and it has to be checked at the probe stride: a scan that
+    /// steps 256 bytes must not report a run assembled from separate ones.
+    #[test]
+    fn short_ff_runs_and_content_score_nothing() {
+        let _g = fresh();
+        // Runs of 255 — one byte short — at every probe point, so a scan that
+        // rounded up or joined across the gap would score them.
+        let mut buf = vec![0x11u8; 64 * FF_RUN_MIN];
+        for chunk in buf.chunks_mut(FF_RUN_MIN + 1) {
+            let n = chunk.len().min(FF_RUN_MIN - 1);
+            for b in chunk.iter_mut().take(n) {
+                *b = 0xFF;
+            }
+        }
+        assert_eq!(longest_ff_run(&buf), 0, "255 is not 256");
+        note_written_payload(&buf);
+        assert_eq!(ff_run_counts(), (0, 0));
+
+        // And a photograph: no long uniform anything.
+        let noise: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(37) % 251) as u8).collect();
+        assert_eq!(longest_ff_run(&noise), 0);
+    }
+
+    /// Exactly at the threshold, and unaligned to the probe grid.
+    ///
+    /// The correctness argument for probing every [`FF_RUN_MIN`]th byte is that
+    /// any run that long contains a multiple of [`FF_RUN_MIN`]. A run placed to
+    /// straddle two probes with its start between them is where an off-by-one in
+    /// that argument would show, so it is checked at every offset in a stride.
+    #[test]
+    fn a_threshold_length_run_is_found_at_every_alignment() {
+        for off in 0..FF_RUN_MIN {
+            let mut buf = vec![0x00u8; FF_RUN_MIN * 4];
+            for b in buf.iter_mut().skip(off).take(FF_RUN_MIN) {
+                *b = 0xFF;
+            }
+            assert_eq!(
+                longest_ff_run(&buf),
+                FF_RUN_MIN,
+                "a {FF_RUN_MIN}-byte run starting at {off} must be found"
+            );
+        }
+    }
+
+    /// Two long runs in one buffer report the longer, and neither is double
+    /// counted into a length that was never written.
+    #[test]
+    fn the_longest_of_several_runs_is_reported_and_none_are_joined() {
+        let _g = fresh();
+        let mut buf = vec![0x00u8; 4096];
+        for b in buf.iter_mut().skip(100).take(300) {
+            *b = 0xFF;
+        }
+        for b in buf.iter_mut().skip(1000).take(900) {
+            *b = 0xFF;
+        }
+        assert_eq!(longest_ff_run(&buf), 900);
+        note_written_payload(&buf);
+        assert_eq!(ff_run_counts(), (1, 900), "one buffer, longest run 900");
     }
 
     #[test]

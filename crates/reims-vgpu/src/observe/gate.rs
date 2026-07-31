@@ -1316,6 +1316,131 @@ fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
     }
 }
 
+/// Whether a guest-RAM writer feeds the **payload** census, and why.
+///
+/// A separate axis from [`Marks`], because they are separate instruments over
+/// the same rails and a file can satisfy one and not the other. That is not
+/// hypothetical: `runtime/mapping_write.rs` marked the footprint through
+/// `contig_for_write` and sampled no payload at all, so the first live
+/// `all_ff=0` reading was taken from a census blind to the rail carrying nearly
+/// every pixel — the identical shape to the footprint gap that keying on
+/// `map_pages` alone once produced, one instrument later.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum Payload {
+    /// Calls `note_written_payload` with the source buffer.
+    Sampled,
+    /// Deliberately not sampled, for the reason in the row.
+    Skipped,
+}
+
+/// Every guest-RAM writer, and whether the payload census sees it.
+///
+/// Read-only sites are absent by construction: they put no bytes in guest RAM,
+/// so there is no payload of theirs to shape. The test below derives the writer
+/// set from [`MAP_PAGES_SITES`] rather than repeating it, so a new writing rail
+/// cannot be added to one table and forgotten in this one.
+const PAYLOAD_CENSUS_SITES: &[(&str, Payload, &str)] = &[
+    (
+        "runtime/gpa_map.rs",
+        Payload::Skipped,
+        "control-plane writes — a completion stamp, DeviceInfo, the child HEAD. \
+         Tens of bytes each and orders of magnitude more frequent than a frame, \
+         so sampling them would spend the 1-in-64 budget on writes that cannot \
+         carry a 256-byte run and starve the census of the pixel writes it \
+         exists to shape. They are still in the footprint, which is what \
+         answers where the bytes went",
+    ),
+    (
+        "runtime/gva_view.rs",
+        Payload::Sampled,
+        "`write_gva_bytes` samples once for the call, before the per-run copies",
+    ),
+    (
+        "runtime/mapper.rs",
+        Payload::Sampled,
+        "`write_mapping_bytes` samples once for the call, before either the \
+         contiguous fast path or the per-run slow path",
+    ),
+    (
+        "runtime/mapping_write.rs",
+        Payload::Sampled,
+        "`contig_for_write` samples the source image for all four row writers, \
+         the same funnel that marks their footprint",
+    ),
+    (
+        "runtime/metal_draw/mod.rs",
+        Payload::Sampled,
+        "`write_gva_rgba8_within` and `write_gva_rgba8_rect` sample the RGBA8 \
+         source once each after the fresh walk resolves. Not `BySource` like \
+         their footprint: `map_fresh_span_within` resolves a span and never sees \
+         a buffer, so there is nothing for it to sample on their behalf",
+    ),
+    (
+        "runtime/compute_exec/mod.rs",
+        Payload::Sampled,
+        "`write_linear_texture_bulk` samples its source rows once for the call, \
+         for the same reason",
+    ),
+];
+
+/// Every rail that writes guest RAM either feeds the payload census or says why
+/// it does not.
+///
+/// The footprint answers *where* this device wrote; the payload census answers
+/// *what*, and the panic evidence needs both — a victim full of `0xff` is only
+/// attributable if this device is known to write, or not to write, long `0xff`
+/// runs. A rail missing from the census makes its zero mean less than it reads.
+#[test]
+fn every_guest_ram_writer_is_classified_for_the_payload_census() {
+    let root = crate_src();
+    let mut samples: std::collections::BTreeSet<String> = Default::default();
+    for path in production_files(&root) {
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let production = production_source(&src);
+        let masked = mask_comments_and_literals(&production);
+        let text: String = masked.iter().copied().map(char::from).collect();
+        for line in text.lines() {
+            let is_definition = line.trim_start().starts_with("fn ")
+                || line.trim_start().starts_with("pub fn ")
+                || line.trim_start().starts_with("pub(crate) fn ");
+            if !is_definition && line.contains("note_written_payload(") {
+                samples.insert(rel(&path, &root));
+            }
+        }
+    }
+
+    // The writers, taken from the footprint table so the two cannot drift.
+    let writers: std::collections::BTreeSet<&str> = MAP_PAGES_SITES
+        .iter()
+        .filter(|(_, _, how, _)| *how != Marks::ReadOnly)
+        .map(|(file, ..)| *file)
+        .collect();
+    let classified: std::collections::BTreeSet<&str> =
+        PAYLOAD_CENSUS_SITES.iter().map(|(file, ..)| *file).collect();
+    assert_eq!(
+        writers, classified,
+        "every rail that puts bytes in guest RAM needs a payload-census verdict. \
+         A new writer that is only in MAP_PAGES_SITES is in the footprint and \
+         invisible to the census, which is how `all_ff=0` came to be reported \
+         about a device whose largest rail was never scanned."
+    );
+
+    for (file, how, why) in PAYLOAD_CENSUS_SITES {
+        assert!(!why.is_empty(), "{file}: classify it, do not just list it");
+        assert_eq!(
+            samples.contains(*file),
+            *how == Payload::Sampled,
+            "{file}: classified {how:?}, but the file {} call \
+             footprint::note_written_payload.",
+            if samples.contains(*file) {
+                "does"
+            } else {
+                "does not"
+            }
+        );
+    }
+}
+
 /// The other funnel: `HostMemory::write_gpa` reaches guest RAM without
 /// `map_pages` at all, so the footprint has to be marked in the one production
 /// implementation of it.

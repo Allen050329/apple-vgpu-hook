@@ -203,6 +203,7 @@ fn contig_for_write<H: HostMemory + HostOps>(
     mapping_id: u32,
     span_end: u64,
     vouched: &mapper::PagesVouched,
+    src: &[u8],
 ) -> Option<(usize, usize)> {
     if !vouched.covers(state, mapping_id) {
         crate::observe::fail(format!(
@@ -225,6 +226,19 @@ fn contig_for_write<H: HostMemory + HostOps>(
     // over-marking can only turn a miss into a hit. Under-marking would
     // manufacture the clean "we never wrote there" the set must never invent.
     mapper::note_mapping_write_footprint(state, mapping_id, 0, span_end);
+    // And the payload census, for the same reason and with the same blind spot
+    // if it is left out. The peer rails sample once per call in
+    // `mapper::write_mapping_bytes` and `gva_view::write_gva_bytes`; this file
+    // reaches neither, so without this the census reporting "no white payload in
+    // any sample" would be reporting it about every rail except the one carrying
+    // the pixels.
+    //
+    // `src` is the whole source image, and a partial write — skip ranges, a
+    // changed-span pass — puts only some of it in guest RAM. That over-reports,
+    // and the direction is deliberate: over-reporting a white run makes the
+    // payload a *weaker* discriminator, while under-reporting would manufacture
+    // the "we do not write white" that would clear this device on no evidence.
+    crate::observe::footprint::note_written_payload(src);
     Some(view)
 }
 
@@ -403,7 +417,7 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     };
 
     // Fast path: one packed view, poke rows in place.
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..mh {
@@ -626,7 +640,7 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rgba8_changed") else {
         return false;
     };
-    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched);
+    let contig = contig_for_write(state, host, mapping_id, span_end, &vouched, rgba);
     // SAFETY: when Some, contig covers span_end.
     let base = contig.map(|(ptr, _)| unsafe { (ptr as *mut u8).add(base_off as usize) });
     for y in 0..mh as usize {
@@ -800,7 +814,7 @@ pub fn write_raw_rows<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "raw_rows") else {
         return false;
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // SAFETY: contig covers span_end from offset 0.
         let base = ptr as *mut u8;
         for y in 0..height as usize {
@@ -1270,7 +1284,7 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
     let Some(vouched) = vouch_for_write(state, host, mapping_id, "rect_raw") else {
         return false;
     };
-    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched) {
+    if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
         // The fragmented full-plane branch below already rejects on the same bound
         // (`frame_end > span_end`); enforce it here too so the contig fast paths
         // can never overrun. A correctly-sized writeback satisfies this exactly
