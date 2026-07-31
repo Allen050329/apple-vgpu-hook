@@ -2226,6 +2226,7 @@ mod tests {
             },
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
             },
         );

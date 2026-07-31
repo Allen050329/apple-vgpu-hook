@@ -909,7 +909,10 @@ pub enum DeferredOwner {
     /// `ComputeStorageResidencyKey`, read with
     /// `engine::read_resident_storage(key, generation)`. The generation is the
     /// resident's **content** generation, unrelated to `key.map_generation`.
-    Storage { generation: u32 },
+    Storage {
+        generation: u32,
+        armed_stamp_seq: u64,
+    },
     /// Type-11 render Store rail: the window **owns the frame it deferred**,
     /// tight BGRA8 at `key.width x key.height`, shared with the
     /// [`crate::runtime::surface_cache`] entry that was stored from the same
@@ -937,8 +940,33 @@ pub enum DeferredOwner {
     /// pixel read dispatches.
     Render {
         armed_seq: u64,
+        armed_stamp_seq: u64,
         source: RenderWindowSource,
     },
+}
+
+impl DeferredOwner {
+    /// [`DeviceState::completion_stamp_seq`] when this window was armed.
+    ///
+    /// Both rails carry it for the same reason [`GvaDeferredEntry::
+    /// armed_stamp_seq`] does: a window that lands after the guest was fenced
+    /// writes memory the guest was already entitled to reclaim, and no check
+    /// taken after the fence can tell that memory apart from the target it used
+    /// to be. Unlike the GVA rail, these windows are keyed by a
+    /// `ComputeStorageResidencyKey` that carries `map_generation`, so the flush
+    /// can already refuse a mapping incarnation the guest replaced — which is
+    /// why this rail is measured before it is changed rather than assumed to
+    /// share the GVA rail's verdict.
+    pub fn armed_stamp_seq(&self) -> u64 {
+        match self {
+            Self::Storage {
+                armed_stamp_seq, ..
+            }
+            | Self::Render {
+                armed_stamp_seq, ..
+            } => *armed_stamp_seq,
+        }
+    }
 }
 
 /// Where a [`DeferredOwner::Render`] window's frame lives.

@@ -7244,7 +7244,11 @@ fn finish_surface_deferred_window(
     let resident = matches!(source, crate::model::RenderWindowSource::Resident { .. });
     state.compute_deferred_flush.insert(
         key,
-        crate::model::DeferredOwner::Render { armed_seq, source },
+        crate::model::DeferredOwner::Render {
+            armed_seq,
+            armed_stamp_seq: state.completion_stamp_seq,
+            source,
+        },
     );
     // Raw task-GVA reads that alias these physical pages flush through
     // `flush_intersecting_task_gva`, which finds the mapping via this index.
@@ -8134,6 +8138,7 @@ mod vulkan_split_tests {
                 },
                 crate::model::DeferredOwner::Render {
                     armed_seq: seq,
+                    armed_stamp_seq: 0,
                     source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(
                         vec![0u8; 4 * 4 * 4],
                     )),

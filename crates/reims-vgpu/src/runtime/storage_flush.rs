@@ -1038,13 +1038,64 @@ fn flush_one<M: HostMemory + HostOps>(
     key: &crate::model::ComputeStorageResidencyKey,
     owner: crate::model::DeferredOwner,
 ) -> bool {
+    note_mapping_window_against_fence(state, key, &owner);
     match owner {
-        crate::model::DeferredOwner::Storage { generation } => {
-            flush_storage_one(state, host, key, generation)
-        }
+        crate::model::DeferredOwner::Storage {
+            generation,
+            armed_stamp_seq: _,
+        } => flush_storage_one(state, host, key, generation),
         crate::model::DeferredOwner::Render { source, .. } => {
             flush_render_one(state, host, key, &source)
         }
+    }
+}
+
+/// Score a mapping-keyed deferred window against the guest's fence, exactly as
+/// [`note_window_outlived_its_stamp`] scores the GVA rail.
+///
+/// This rail is measured before it is changed, because it is not obviously the
+/// same case. `ComputeStorageResidencyKey` carries `map_generation`, so a flush
+/// here can already refuse a mapping incarnation the guest replaced — an
+/// allocation identity the GVA rail simply did not have. Whether that is
+/// *enough* depends on whether a guest can free a type-11 surface's storage and
+/// have it reused without the map generation moving, and that is a question for
+/// a boot rather than for an argument.
+///
+/// Counted at the flush dispatcher rather than at each writer, so the two rails
+/// share one denominator; whether a landing actually reached guest RAM is what
+/// the existing `deferred_flush_*` lines already say.
+fn note_mapping_window_against_fence(
+    state: &DeviceState,
+    key: &crate::model::ComputeStorageResidencyKey,
+    owner: &crate::model::DeferredOwner,
+) {
+    let rail = match owner {
+        crate::model::DeferredOwner::Storage { .. } => "storage",
+        crate::model::DeferredOwner::Render { .. } => "render",
+    };
+    let elapsed = state
+        .completion_stamp_seq
+        .wrapping_sub(owner.armed_stamp_seq());
+    if elapsed == 0 {
+        crate::runtime::drain::note_store_route(match rail {
+            "storage" => "storw_stamp_same",
+            _ => "rendw_stamp_same",
+        });
+        return;
+    }
+    crate::runtime::drain::note_store_route(match rail {
+        "storage" => "storw_stamp_outlived",
+        _ => "rendw_stamp_outlived",
+    });
+    if crate::observe::first_sight(
+        "mapping_window_outlived_stamp",
+        u64::from(key.mapping_id) ^ ((key.width as u64) << 32) ^ key.height as u64,
+    ) {
+        crate::observe::fail(format!(
+            "mapping_window_outlived_stamp rail={rail} mapping={} {}x{} stamps={elapsed} \
+             (guest was fenced before these bytes were written)",
+            key.mapping_id, key.width, key.height
+        ));
     }
 }
 
@@ -1613,6 +1664,7 @@ mod tests {
     fn render_owner(armed_seq: u64) -> crate::model::DeferredOwner {
         crate::model::DeferredOwner::Render {
             armed_seq,
+            armed_stamp_seq: 0,
             source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
                 0u8;
                 4 * 4 * 4
@@ -1711,7 +1763,7 @@ mod tests {
         m.map_generation = 5;
         state.compute_deferred_flush.insert(
             key(9, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         let cap = crate::observe::FailCapture::start();
         assert!(!super::flush_intersecting(
@@ -1898,6 +1950,7 @@ mod tests {
             key(9, 0, 256),
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Resident { epoch: 7 },
             },
         );
@@ -1990,6 +2043,7 @@ mod tests {
             key(9, 0, 256),
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(frame.clone())),
             },
         );
@@ -2100,6 +2154,7 @@ mod tests {
             k,
             crate::model::DeferredOwner::Render {
                 armed_seq: 1,
+                armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Resident { epoch: 11 },
             },
         );
@@ -2172,7 +2227,7 @@ mod tests {
             .insert(key(9, 0, 256), render_owner(7));
         state.compute_deferred_flush.insert(
             key(9, 256, 512),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         let cap = crate::observe::FailCapture::start();
         super::drop_windows(&mut state, 9, "unit");
@@ -2214,7 +2269,7 @@ mod tests {
         }
         state
             .compute_deferred_flush
-            .insert(k, crate::model::DeferredOwner::Storage { generation: 3 });
+            .insert(k, crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 });
         // The guest deletes the backing; the window is kept for the fingerprint
         // decision and the page list moves to `condemned_entries`.
         assert!(state.condemn_surface_backing(9));
@@ -2236,7 +2291,7 @@ mod tests {
         // (fail-visible loss), remove the window, and return false.
         state.compute_deferred_flush.insert(
             key(9, 0, 4096),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
         assert!(!ok, "lost window must report failure");
@@ -2247,7 +2302,7 @@ mod tests {
         // Disjoint mapping id: untouched.
         state.compute_deferred_flush.insert(
             key(10, 0, 4096),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         assert!(super::flush_intersecting(
             &mut state,
@@ -2301,11 +2356,11 @@ mod tests {
         let ckey = |mapping_id: u32| key(mapping_id, 0, 0x1000);
         state.compute_deferred_flush.insert(
             ckey(9),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         state.compute_deferred_flush.insert(
             ckey(10),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         // Product defer sites index pages at defer time.
         state.index_deferred_alias_pages(9);
@@ -2350,12 +2405,12 @@ mod tests {
         }
         state.compute_deferred_flush.insert(
             key(9, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         let disjoint = key(10, 0, 0x1000);
         state.compute_deferred_flush.insert(
             disjoint,
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         // Linear windows never name the mapping: one aliases mapping 9's
         // physical page, one sits on a disjoint page.
@@ -2859,6 +2914,60 @@ mod tests {
     /// claims. Logging drift while still writing is exactly what this used to
     /// do, and the guest heap corruption that allowed — WindowServer aborting in
     /// `small_free_list_remove_ptr_no_clear` — is why it decides now.
+    /// The mapping-keyed rails get the same reading as the GVA rail, per rail,
+    /// so a boot can say whether `map_generation` in the key is already enough
+    /// to make deferral here safe — rather than the two being assumed alike.
+    #[test]
+    fn each_mapping_rail_is_scored_against_the_fence_under_its_own_name() {
+        use crate::runtime::drain::store_route_count;
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let k = key(7, 0, 256);
+
+        let render = render_owner(1);
+        let storage = crate::model::DeferredOwner::Storage {
+            generation: 3,
+            armed_stamp_seq: 0,
+        };
+
+        // Inside the fence: neither rail may be reported.
+        let before = [
+            store_route_count("rendw_stamp_outlived"),
+            store_route_count("storw_stamp_outlived"),
+        ];
+        super::note_mapping_window_against_fence(&state, &k, &render);
+        super::note_mapping_window_against_fence(&state, &k, &storage);
+        assert_eq!(
+            [
+                store_route_count("rendw_stamp_outlived"),
+                store_route_count("storw_stamp_outlived")
+            ],
+            before,
+            "a window landed inside its own fence is the safe case on both rails"
+        );
+
+        // Past the fence: each rail reports under its own counter, so a boot can
+        // tell a render-Store window from a compute-storage one.
+        state.completion_stamp_seq = 5;
+        super::note_mapping_window_against_fence(&state, &k, &render);
+        assert_eq!(
+            [
+                store_route_count("rendw_stamp_outlived"),
+                store_route_count("storw_stamp_outlived")
+            ],
+            [before[0] + 1, before[1]],
+            "the render rail must not be counted under the storage rail's name"
+        );
+        super::note_mapping_window_against_fence(&state, &k, &storage);
+        assert_eq!(
+            [
+                store_route_count("rendw_stamp_outlived"),
+                store_route_count("storw_stamp_outlived")
+            ],
+            [before[0] + 1, before[1] + 1],
+            "and the storage rail must not be counted under the render rail's"
+        );
+    }
+
     /// A completion stamp is the guest's licence to free everything it allocated
     /// for the work being completed, so the stamp must leave nothing owed to
     /// guest RAM. Asserted through [`crate::runtime::drain::write_stamp`] itself
@@ -3314,15 +3423,15 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         state.compute_deferred_flush.insert(
             key(7, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3 },
+            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
         );
         state.compute_deferred_flush.insert(
             key(7, 256, 512),
-            crate::model::DeferredOwner::Storage { generation: 4 },
+            crate::model::DeferredOwner::Storage { generation: 4, armed_stamp_seq: 0 },
         );
         state.compute_deferred_flush.insert(
             key(8, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 5 },
+            crate::model::DeferredOwner::Storage { generation: 5, armed_stamp_seq: 0 },
         );
 
         // Disjoint range takes nothing.

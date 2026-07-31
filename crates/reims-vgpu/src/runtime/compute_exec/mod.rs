@@ -3886,7 +3886,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             }
             state
                 .compute_deferred_flush
-                .insert(key, crate::model::DeferredOwner::Storage { generation });
+                .insert(
+                    key,
+                    crate::model::DeferredOwner::Storage {
+                        generation,
+                        armed_stamp_seq: state.completion_stamp_seq,
+                    },
+                );
             state.index_deferred_alias_pages(*mapping_id);
             let _ = state.mark_mapping_written(*mapping_id);
             note_storage_residency_writeback(state, t);
