@@ -1108,7 +1108,30 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // result was discarded. The identical gate on the guest-pages
                 // branch below had already been worked out and removed for this
                 // reason; its comment says so. This one kept paying for the scan.
-                if let Some(bgra) = crate::runtime::surface_cache::get(state, mid, w, h) {
+                // ...but only while the hypervisor has not seen the guest
+                // rewrite the pages these bytes are a copy of. This rung sits
+                // above both rungs that read the guest's own pages, so a stale
+                // hit here is never corrected by anything below it; falling
+                // through costs a re-read and reaches content that is
+                // authoritative by construction.
+                //
+                // Only `Wrote` refuses. The census says the pooled answer is
+                // 14 092 `no_stamp` against 304 `wrote` — and `no_stamp` means
+                // "nobody asked the host to watch these pages", which is a
+                // statement about this device's arming, not about the guest.
+                // Refusing on it would turn 98 % of the rung off and re-read a
+                // surface per bind on the strength of a rail that was never
+                // armed. The arming gap is the follow-up; serving bytes the
+                // host has *watched the guest replace* is the part that is
+                // wrong today.
+                let host_cache_is_current = !matches!(
+                    mapping_guest_write_verdict(state, host, mid),
+                    GuestWriteVerdict::Wrote
+                );
+                if let Some(bgra) = host_cache_is_current
+                    .then(|| crate::runtime::surface_cache::get(state, mid, w, h))
+                    .flatten()
+                {
                     let rgba = std::sync::Arc::new(swap_rb_channels(bgra));
                     note_type11_sample_rung(state, host, "t11rung_host_cache", mid);
                     return Some((
@@ -7491,6 +7514,73 @@ mod vulkan_split_tests {
         assert!(
             resolve_type11_load_seed(&mut state, &mut host, mid, w, h + 1).is_none(),
             "a mismatched extent must refuse by name, not seed something else"
+        );
+    }
+
+    /// The type-4 host-cache sample rung must not serve a surface the
+    /// hypervisor has watched the guest rewrite.
+    ///
+    /// That rung sits above both rungs that read the guest's own pages
+    /// (`t11rung_zero_copy`, `t11rung_guest_memo`), so a stale hit is never
+    /// corrected by anything below it — and its first census said `gw_clean` was
+    /// **zero** across 14 396 binds. Only the demonstrated write refuses:
+    /// `no_stamp` is a statement about this device's arming, not the guest's
+    /// behaviour, and refusing on it would re-read a surface per bind.
+    #[test]
+    fn the_host_cache_sample_rung_refuses_a_surface_the_guest_rewrote() {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        use crate::runtime::host::{FakeHost, HostOps};
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        let page = state.page_size();
+        // Chosen not to collide with any other test's mapping id: `first_sight`
+        // latches per (reason, discriminant) for the life of the process.
+        let mid = 911u32;
+        assert!(state.map_surface(mid), "mid must be inside MAX_MAPPINGS");
+        let gpa = 0x55 * page;
+        {
+            let m = state.mappings.get_mut(&mid).expect("mapped above");
+            m.mapped = true;
+            m.page_entries =
+                vec![(((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+        }
+
+        // Unarmed: the verdict cannot vouch, but "nobody asked the host to
+        // watch" is not "the guest wrote", so the rung still serves.
+        assert_eq!(
+            mapping_guest_write_verdict(&state, &host, mid),
+            GuestWriteVerdict::NoStamp
+        );
+        assert!(
+            !matches!(
+                mapping_guest_write_verdict(&state, &host, mid),
+                GuestWriteVerdict::Wrote
+            ),
+            "an unarmed rail must not cost every bind a re-read"
+        );
+
+        // Armed and stamped by a Store: the copy and the pages agree.
+        let token = crate::runtime::mapper::ensure_guest_write_token(&mut state, &mut host, mid)
+            .expect("FakeHost observes guest writes");
+        state
+            .mappings
+            .get_mut(&mid)
+            .expect("mapped above")
+            .guest_write_gen_at_store = host.guest_write_gen(token).expect("a live token has one");
+        assert_eq!(
+            mapping_guest_write_verdict(&state, &host, mid),
+            GuestWriteVerdict::Clean,
+            "a surface nobody wrote since the Store may be served from the copy"
+        );
+
+        // The guest CPU rewrites the surface. No device operation, so nothing
+        // else in this crate moves — this is the only witness that can see it.
+        host.guest_wrote_page(gpa);
+        assert_eq!(
+            mapping_guest_write_verdict(&state, &host, mid),
+            GuestWriteVerdict::Wrote,
+            "the host saw the write, so the host-side copy is a stale picture"
         );
     }
 
