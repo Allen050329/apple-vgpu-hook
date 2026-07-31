@@ -4033,7 +4033,18 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         generation: 0,
     };
 
-    let secs = build_secondary_targets(&state, &colors, &pipeline, &primary, 64, 64, [0.0; 4]);
+    let mut host = crate::runtime::host::FakeHost::new();
+    let secs = build_secondary_targets(
+        &state,
+        &mut host,
+        1,
+        &colors,
+        &pipeline,
+        &primary,
+        64,
+        64,
+        [0.0; 4],
+    );
     assert_eq!(secs.len(), 1, "one secondary attachment expected");
     let blend = secs[0].blend.expect(
         "slot 1 declares blending_enabled — before this fix every secondary \
@@ -4059,7 +4070,18 @@ fn a_secondary_mrt_slot_binds_its_own_blend() {
         ],
         ..RenderPipelineDescriptor::default()
     };
-    let secs = build_secondary_targets(&state, &colors, &unblended, &primary, 64, 64, [0.0; 4]);
+    let mut host = crate::runtime::host::FakeHost::new();
+    let secs = build_secondary_targets(
+        &state,
+        &mut host,
+        1,
+        &colors,
+        &unblended,
+        &primary,
+        64,
+        64,
+        [0.0; 4],
+    );
     assert_eq!(secs.len(), 1);
     assert!(
         secs[0].blend.is_none(),

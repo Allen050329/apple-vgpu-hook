@@ -1037,6 +1037,26 @@ pub struct GvaDeferredEntry {
     pub alloc_gen: u64,
 }
 
+/// What an MRT draw rendered into a secondary attachment's GVA
+/// ([`DeviceState::mrt_secondary_gvas`]).
+///
+/// The span fields are the *producer's*, not the sampler's, and that is the
+/// whole point: the sampler re-walks this exact `row_stride * height` range to
+/// ask whether the address still resolves to the pages the mask was rendered
+/// over. Two walks of two different spans would disagree for reasons that have
+/// nothing to do with the guest recycling the address, and every such
+/// disagreement would decline a bind that was correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MrtSecondaryRecord {
+    pub width: u32,
+    pub height: u32,
+    /// Guest bytes per row the producer's attachment was described by.
+    pub row_stride: u32,
+    /// Page-set hash of the producer's span — the `generation` of the
+    /// `TargetIdentity::Gva` its resident lives under.
+    pub alloc_gen: u64,
+}
+
 /// Everything a later flush needs to land a deferred **linear compute-storage
 /// Store** (`ComputeStorageResidencyKey::linear` — a raw task GVA, `mapping_id`
 /// 0). The engine resident holds the authoritative pixels;
@@ -1819,20 +1839,18 @@ pub struct DeviceState {
     /// told this render was done before we wrote its bytes?
     pub completion_stamp_seq: u64,
     /// GVAs rendered this guest lifetime as an **MRT secondary attachment**
-    /// (e.g. the vibrancy RG16Float coverage mask) → its
-    /// `(width, height, generation)`. The producer records the identity's
-    /// geometry and generation here; a later draw sampling a type-2/3 texture at
-    /// the same GVA rebuilds `TargetIdentity::Gva` from all three and binds the
-    /// engine resident directly instead of reading zero. Coherent by
-    /// construction: only GVAs we actively rendered as secondaries are eligible,
-    /// and the geometry must match the sampler's descriptor.
+    /// (e.g. the vibrancy RG16Float coverage mask) → what the producer rendered
+    /// there. A later draw sampling a type-2/3 texture at the same GVA rebuilds
+    /// `TargetIdentity::Gva` and binds the engine resident directly instead of
+    /// reading zero.
     ///
-    /// The generation is carried rather than assumed so the sampler's key is the
-    /// producer's key by construction — the two would otherwise have to agree by
-    /// spelling, and a producer that starts naming its allocation would silently
-    /// stop being findable. Cleared at guest reset with the rest of the lifetime
-    /// state.
-    pub mrt_secondary_gvas: std::collections::HashMap<u64, (u32, u32, u64)>,
+    /// This map is a *lifetime* record: entries are added when a mask is
+    /// rendered and only cleared at guest reset, so an address being present
+    /// here is not evidence that the address still names the allocation that
+    /// mask belongs to. [`MrtSecondaryRecord::alloc_gen`] is what settles that —
+    /// the sampler re-walks the producer's span and binds only when the pages
+    /// still hash the same. See `metal_draw::vulkan::try_sample_mrt_secondary`.
+    pub mrt_secondary_gvas: std::collections::HashMap<u64, MrtSecondaryRecord>,
     /// GVA windows whose task died (`delete_task`) — the GVA walk is gone, so
     /// the runtime lands these **cache-only** (no guest write) and unpins
     /// (`storage_flush::retire_gva_windows`).

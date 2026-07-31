@@ -874,8 +874,16 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
 /// rendered it into an engine resident and recorded its GVA in
 /// [`DeviceState::mrt_secondary_gvas`]. When a type-2/3 texture sampling this
 /// GVA has a matching-geometry, content-ready resident, bind it directly so the
-/// material alpha reads the real mask instead of zero. Coherent by
-/// construction: only GVAs we actively rendered as secondaries are eligible.
+/// material alpha reads the real mask instead of zero.
+///
+/// [`DeviceState::mrt_secondary_gvas`] is a *lifetime* map — entries are added
+/// when a mask is rendered and only cleared at guest reset — so an address in it
+/// is not evidence that the address still names the allocation that mask belongs
+/// to. The generation is what settles that: this bind walks the sampled span's
+/// pages now and keys the registry on the LIVE hash, so an address the guest has
+/// handed to a second allocation resolves to a different key and misses rather
+/// than binding the first allocation's coverage mask into a later material.
+/// `mrtsec_same_alloc` against `mrtsec_realloc` says how often the two disagree.
 #[cfg(feature = "backend-vulkan")]
 fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -891,9 +899,10 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
     let desc_bytes = objects::read_descriptor(state, host, task_id, &entry)?;
     let tex = decode_texture_descriptor(&desc_bytes).ok()?;
     let (gva, layout) = tex.level_gva(0, state.page_shift)?;
-    // Geometry AND generation come from the producer's record, so the key this
+    // Everything about the mask comes from the producer's record: the key this
     // bind looks up is the key the MRT draw rendered into by construction.
-    let (w, h, generation) = *state.mrt_secondary_gvas.get(&gva)?;
+    let record = *state.mrt_secondary_gvas.get(&gva)?;
+    let (w, h) = (record.width, record.height);
     // The sampler's descriptor geometry must match the rendered mask exactly.
     if layout.width != w || layout.height != h {
         // The sampled GVA IS a rendered mask, but the sampler's geometry differs
@@ -906,11 +915,26 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
         );
         return None;
     }
+    // Walked now, not taken from the map: the recorded value describes the
+    // allocation the producer rendered, and the question here is whether the
+    // address still names it.
+    let live_gen =
+        gva_span_alloc_generation(state, host, task_id, gva, record.row_stride, record.height);
+    if live_gen != record.alloc_gen {
+        crate::runtime::drain::note_store_route("mrtsec_realloc");
+        crate::runtime::census::present_proxy::note_mrt_mask_bind_miss(
+            crate::runtime::census::present_proxy::MaskBindMiss::AllocationChanged,
+            w,
+            h,
+        );
+        return None;
+    }
+    crate::runtime::drain::note_store_route("mrtsec_same_alloc");
     let id = TargetIdentity::Gva {
         gva,
         width: w,
         height: h,
-        generation,
+        generation: live_gen,
     };
     if !engine::resident_content_ready(&id) {
         crate::runtime::census::present_proxy::note_mrt_mask_bind_miss(
@@ -4096,8 +4120,14 @@ pub(crate) fn publish_surface_store<M: HostMemory + HostOps>(
 /// (0,1,2,… matching the shader's `location`s), matching framebuffer geometry,
 /// a known color-renderable format, and a resolvable identity.
 #[cfg(feature = "backend-vulkan")]
-fn build_secondary_targets(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is a distinct wire-derived input to the attachment set"
+)]
+fn build_secondary_targets<M: HostMemory + HostOps>(
     state: &DeviceState,
+    host: &mut M,
+    task_id: u32,
     colors: &[ColorRtRequest],
     pipeline: &crate::runtime::decode::resource::RenderPipelineDescriptor,
     primary: &crate::backend::vulkan::engine::TargetIdentity,
@@ -4155,22 +4185,27 @@ fn build_secondary_targets(
         // Identity mirrors the primary namespaces: type-2/3 linear GVA, else
         // type-11 surface.
         //
-        // A secondary's GVA keeps `generation: 0` — it is not named by its
-        // backing pages the way color0 is. The generation for color0 is the hash
-        // of the pages behind *that* span, and this attachment is a different
-        // address (a secondary equal to the primary is rejected below), so the
-        // primary's value would not describe this allocation; naming this one
-        // would need its own page walk, and this function is handed neither a
-        // `HostOps` to walk with nor the task the walk would run under.
-        // Consumers do not have to know that: `mrt_secondary_gvas` records
-        // whatever generation lands here and `try_sample_mrt_secondary` binds
-        // with the recorded value, so producer and sampler agree either way.
+        // A secondary GVA is named by its own backing pages, exactly like color0
+        // — the primary's generation describes a different address (a secondary
+        // equal to the primary is rejected above), so it takes its own walk.
+        // Without one this attachment is keyed on `(gva, width, height)` alone
+        // and two guest allocations reusing that address at that geometry share
+        // one GPU image; `try_sample_mrt_secondary` then hands a later material
+        // the previous allocation's coverage mask, which is the vibrancy rail's
+        // form of the wrong-content class `74748d2` closed for color0.
         let identity = if c.target_gva != 0 {
             TargetIdentity::Gva {
                 gva: c.target_gva,
                 width: c.width,
                 height: c.height,
-                generation: 0,
+                generation: gva_span_alloc_generation(
+                    state,
+                    host,
+                    task_id,
+                    c.target_gva,
+                    c.row_stride,
+                    c.height,
+                ),
             }
         } else if c.mapping_id != 0 {
             crate::runtime::present_identity::surface_identity(
@@ -6281,6 +6316,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         if let Some(primary_id) = resources.target_identity.clone() {
             let secs = build_secondary_targets(
                 state,
+                host,
+                req.task_id,
                 &req.colors,
                 &pd,
                 &primary_id,
@@ -6288,7 +6325,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 h,
                 req.blend_color.unwrap_or([0.0; 4]),
             );
-            for sec in &secs {
+            for (sec, c) in secs.iter().zip(req.colors.iter().skip(1)) {
                 if let crate::backend::vulkan::engine::TargetIdentity::Gva {
                     gva,
                     width,
@@ -6296,9 +6333,21 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     generation,
                 } = &sec.identity
                 {
-                    state
-                        .mrt_secondary_gvas
-                        .insert(*gva, (*width, *height, *generation));
+                    // `row_stride` travels with the record because the sampler
+                    // re-walks THIS span to ask whether the address still names
+                    // this allocation; a walk over the sampler's own stride
+                    // would disagree for reasons unrelated to the question.
+                    // `secs` is built from `colors[1..]` in order, so the zip
+                    // pairs each attachment with the request it came from.
+                    state.mrt_secondary_gvas.insert(
+                        *gva,
+                        crate::model::MrtSecondaryRecord {
+                            width: *width,
+                            height: *height,
+                            row_stride: c.row_stride,
+                            alloc_gen: *generation,
+                        },
+                    );
                 }
             }
             resources.secondary_targets = secs;
@@ -6933,7 +6982,38 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
     }
     // Same span as the deferred arm walks (`arm_gva_deferred_store`) so the two
     // describe one region: the guest bytes a Store into this target writes.
-    let span = (c0.row_stride as u64).saturating_mul(c0.height as u64);
+    gva_span_alloc_generation(
+        state,
+        host,
+        req.task_id,
+        c0.target_gva,
+        c0.row_stride,
+        c0.height,
+    )
+}
+
+/// The page-set generation of one `row_stride * height` GVA span under one task.
+///
+/// Every GVA render target is named this way, not only color0: the secondary MRT
+/// attachments go through here too ([`build_secondary_targets`]), and so does the
+/// sampler that later binds one ([`try_sample_mrt_secondary`]). One spelling, so
+/// a producer and its consumer cannot disagree about what names an allocation.
+///
+/// A short walk yields 0. An incomplete walk names no allocation, and hashing the
+/// pages that happened to resolve would be an identity the guest never had.
+#[cfg(feature = "backend-vulkan")]
+fn gva_span_alloc_generation<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &mut M,
+    task_id: u32,
+    gva: u64,
+    row_stride: u32,
+    height: u32,
+) -> u64 {
+    if gva == 0 {
+        return 0;
+    }
+    let span = (row_stride as u64).saturating_mul(height as u64);
     if span == 0 {
         return 0;
     }
@@ -6941,8 +7021,8 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
     crate::runtime::gva_mem::visit_task_gva_page_gpas(
         host,
         &state.tasks,
-        req.task_id,
-        c0.target_gva,
+        task_id,
+        gva,
         span,
         state.page_shift,
         1,
@@ -6951,7 +7031,7 @@ fn gva_alloc_generation<M: HostMemory + HostOps>(
             true
         },
     );
-    let expect_pages = ((c0.target_gva % state.page_size()) + span).div_ceil(state.page_size());
+    let expect_pages = ((gva % state.page_size()) + span).div_ceil(state.page_size());
     if (pages.len() as u64) < expect_pages {
         return 0;
     }
@@ -8747,5 +8827,97 @@ mod vulkan_split_tests {
         // binding a 2D view under a cube sampler.
         assert!(sampled_image_shape(SampledImageKind::Cube).is_none());
         assert!(sampled_image_shape(SampledImageKind::CubeArray).is_none());
+    }
+    /// An MRT secondary attachment is named by ITS OWN guest pages.
+    ///
+    /// `74748d2` gave color0 a page-set generation and deliberately left the
+    /// secondaries at 0, because `build_secondary_targets` had no `HostOps` to
+    /// walk with. That left the vibrancy coverage mask keyed on
+    /// `(gva, width, height)` alone — the exact keying that hands a second
+    /// allocation the first one's image — and `mrt_secondary_gvas` is a lifetime
+    /// map, so a stale entry outlives the allocation it describes indefinitely.
+    #[test]
+    fn a_secondary_attachment_is_named_by_its_own_guest_pages() {
+        use crate::backend::vulkan::engine::TargetIdentity;
+        use crate::runtime::decode::resource::{PipelineColorAttachment, RenderPipelineDescriptor};
+
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        let mut host = FakeHost::new();
+        map_one_gva_page(&mut host, 4);
+        assert!(state.define_task(1, 0x1_0000, 2));
+
+        let pipeline = RenderPipelineDescriptor {
+            color_attachments: vec![
+                PipelineColorAttachment {
+                    slot: 0,
+                    ..PipelineColorAttachment::default()
+                },
+                PipelineColorAttachment {
+                    slot: 1,
+                    ..PipelineColorAttachment::default()
+                },
+            ],
+            ..RenderPipelineDescriptor::default()
+        };
+        // Slot 1 is the mask: one guest page at GVA 0x1000, 8 rows of 32 bytes.
+        let colors = vec![
+            ColorRtRequest {
+                slot: 0,
+                texture_ref: 10,
+                mapping_id: 9,
+                width: 8,
+                height: 8,
+                format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+                ..ColorRtRequest::default()
+            },
+            ColorRtRequest {
+                slot: 1,
+                texture_ref: 11,
+                target_gva: 0x1000,
+                row_stride: 32,
+                width: 8,
+                height: 8,
+                format: crate::contract::pixel_format::MTL_FORMAT_RG16_FLOAT,
+                ..ColorRtRequest::default()
+            },
+        ];
+        // Any identity that is not the secondary's; the function only compares.
+        let primary = TargetIdentity::Gva {
+            gva: 0xdead_0000,
+            width: 8,
+            height: 8,
+            generation: 0,
+        };
+
+        let gen_of = |host: &mut FakeHost| {
+            let secs = super::build_secondary_targets(
+                &state, host, 1, &colors, &pipeline, &primary, 8, 8, [0.0; 4],
+            );
+            assert_eq!(secs.len(), 1, "slot 1 is a resolvable secondary");
+            match secs[0].identity {
+                TargetIdentity::Gva { generation, .. } => generation,
+                ref other => panic!("a target_gva secondary must be a Gva identity, got {other:?}"),
+            }
+        };
+
+        let gen_a = gen_of(&mut host);
+        assert_ne!(
+            gen_a, 0,
+            "a fully walked secondary span must name its allocation"
+        );
+        assert_eq!(
+            gen_of(&mut host),
+            gen_a,
+            "an unchanged mapping must not mint a second identity"
+        );
+
+        // The guest hands GVA 0x1000 to a different page. Same task, same
+        // address, same geometry — only the memory changed.
+        map_one_gva_page(&mut host, 5);
+        assert_ne!(
+            gen_of(&mut host),
+            gen_a,
+            "two allocations at one secondary address must not share one image"
+        );
     }
 }

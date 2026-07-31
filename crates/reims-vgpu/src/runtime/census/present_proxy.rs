@@ -94,6 +94,12 @@ pub enum MaskBindMiss {
     GeometryMismatch,
     /// The mask resident is not content-ready.
     ResidentNotReady,
+    /// The sampled GVA no longer resolves to the pages the mask was rendered
+    /// over: the guest handed this address to a second allocation, so the
+    /// recorded mask is not this sample's content. Declining here is the whole
+    /// point — binding it would put the previous allocation's coverage into a
+    /// later material.
+    AllocationChanged,
 }
 
 impl crate::observe::Decline for MaskBindMiss {
@@ -101,6 +107,7 @@ impl crate::observe::Decline for MaskBindMiss {
         match self {
             Self::GeometryMismatch => "mask_bind_geometry_mismatch",
             Self::ResidentNotReady => "mask_bind_resident_not_ready",
+            Self::AllocationChanged => "mask_bind_allocation_changed",
         }
     }
 }
@@ -111,6 +118,7 @@ impl MaskBindMiss {
         match self {
             Self::GeometryMismatch => 10,
             Self::ResidentNotReady => 11,
+            Self::AllocationChanged => 12,
         }
     }
 }

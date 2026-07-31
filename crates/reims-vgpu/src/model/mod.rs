@@ -16,7 +16,7 @@ pub use state::{
     GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView, HostLinearTexture,
     HostSurface,
     IosfcRegs, LinearDeferredEntry, LinearSampledMemo, MapperCapture, MappingEntry, MmioWindow,
-    PacketFault, PaintSrc,
+    MrtSecondaryRecord, PacketFault, PaintSrc,
     PendingWork, PresentBacking, PresentState, RenderWindowSource, StampSlot, SurfaceWriteKind,
     TaskEntry, TaskMapSpan, WriteGate,
 };
