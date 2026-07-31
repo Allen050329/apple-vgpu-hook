@@ -772,6 +772,86 @@ it counts at most one per refused attach and merely tracks `type4_translate_refu
 this boot). The pre-guard boot's guessing attaches averaged 325 pages each, so the guarded number
 understates the fabrication it prevents by about that factor.
 
+#### Measured: two interleaved pairs, and the guard fabricates nothing
+
+`.agents/repros/type4-guess-ab.sh /tmp/type4ab 2`, `DRIVE_SECS=600`, arms one binary apart
+(`REIMS_VGPU_TYPE4_IDENTITY_GUARD_OFF=1` is the only difference), interleaved with the leading arm
+flipping each pair. All four logs re-scored **uniformly with one scorer afterwards** — the row the
+harness writes live for the first arm was produced by an older scorer and reported `drift=2` where a
+uniform re-score gives `1`, which is the double-count the `^`-anchoring rule elsewhere in this
+document describes.
+
+```text
+            attaches  refusals  corrected  terminal  stranded  fab_attaches  fab_pages
+arm-1         1 815         5          2         3         0             0          0
+arm-2         2 412         6          4         2         0             0          0
+ctl-1         2 448         0          –         –         –             8      4 519
+ctl-2         1 885         0          –         –         –             9      3 284
+────────────────────────────────────────────────────────────────────────────────────────
+arm           4 227        11          6         5         0             0          0
+ctl           4 333         0          –         –         –            17      7 803
+```
+
+Read it as three statements.
+
+**The guard fabricates nothing, on 4 227 attaches.** Not "less" — none. Flip the knob and the same
+binary invents a whole backing for 17 surfaces covering 7 803 pages, about **30.5 MiB of write
+targets** aimed by address rather than by ownership.
+
+**Every fabrication is whole-surface, and the geometry is the interesting part.** All 17 have
+`gva_hits=0`: the walk failed for *every* page, not for a few that happened not to be faulted in.
+Seven of ctl-1's eight are **1225×512** — the WebKit tile strip — and the rest are the 15×622
+scrollbar. So the class lands on exactly the surface kind whose loss the Goal 3 report describes.
+
+**No surface went missing for longer than a frame, in either arm.** `stranded` is 0 across 11
+refusals; the split is 6 corrected and 5 terminal. Refusing costs a frame on the surfaces it
+corrects and costs nothing on the ones that were being torn down.
+
+Two things this does **not** say. It is not a crash-rate measurement — four boots cannot move a
+2.2 % panic rate, and no panic or `.ips` from these boots has been tied to a fabricated address. And
+`drift`/`lost` do not separate the arms here (1/1 and 0/0 against 0/0 and 0/0): at the pre-guard rate
+a 2 000-attach boot expects well under one, so these counts are consistent with the fix and equally
+consistent with short boots. **Quote the fabrication columns, not the drift columns.**
+
+#### A fabricated backing is contiguous, and a real one is not
+
+Worth knowing because it makes every archived log re-readable without new instrumentation. The
+fabricated GPA is the GVA, and the GVAs are contiguous by construction — page `i` is
+`(backing_pfn + i) << page_shift` — so a fabricated span is exactly `page_count` pages end to end. A
+real walk returns whatever the guest allocator gave. The same surface, one incarnation apart on
+ctl-1:
+
+```text
+mid=165 gen=1 pages=640 lo=0x2a0138000 hi=0x2eb598000   contig_view_fragmented runs=161   real
+mid=165 gen=2 pages=640 lo=0x1aeda000  hi=0x1b15a000    hi-lo = 0x280000 = 640 pages       fabricated
+```
+
+So `mapping_gpa_span` alone identifies the defect: a `src=type4` span whose `hi - lo` equals
+`pages << page_shift` is a fabrication, and one with a `contig_view_fragmented runs=` in the hundreds
+is a translation. Note also where the fabricated spans land — 0x18bda000–0x20dda000, **415–549 MiB**
+— which is low guest RAM, where the kernel's own allocations live.
+
+#### Fabrication is a late-session phenomenon, and a fresh-boot harness cannot see it
+
+The single most important fact for anyone pointing a pixel scorer at this class. Fabrication
+timestamps, both control boots of the run above, in ms since the device's first log line:
+
+```text
+ctl-1   419 686  421 800  434 641  494 616  527 811  554 685  614 648  633 659
+ctl-2   402 295  459 571  489 797  508 285  508 320  568 190  589 265  628 321  629 455
+```
+
+**Nothing before 402 s.** `scroll-patch.sh` opens its page as soon as ssh answers and defaults
+`PREDRIVE_SECS=0`, so all three of its recorded `none` results scored the first minutes of a boot —
+a stretch in which this class has never once been observed. That is the likeliest reading of those
+nulls, and it is a harness fault of the same family as the ones above: the harness could not reach
+the state, and reported that as a clean page. Any run meant to see this class must drive past the
+earliest observed fabrication first; `.agents/repros/g3-fabrication-ab.sh` sets `PREDRIVE_SECS=480`
+for that reason and says so in situ.
+
+Why it is late is not established. Accumulated address-space churn is the obvious guess and it is
+only a guess — nobody has varied session length as an independent variable.
+
 ### The user's crash report is a corrupt malloc free list under a backdrop blur
 
 `~/Downloads/crash-report-from-user.txt`, WindowServer on macOS 13.7.8, 76 s after boot. Read the
