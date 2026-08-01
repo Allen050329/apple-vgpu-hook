@@ -1111,167 +1111,6 @@ fn log_storage_image_access(pipe: u32, binding: u32, access: &str, bytes: u64) {
     ));
 }
 
-/// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or type-11).
-///
-/// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
-/// RE (type-5 wire + metal_draw sample path): surfaceID@0 is a type-4 object id (= mapping
-/// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and
-/// stage from the **mapping registry**, never re-resolving the surface id through the
-/// compute task's object list (that list uses a separate texture-ref namespace — live
-/// ensure=1 then MissingTexture/GuestIo class when `resolve_type11_ref(task, sid)` hit a
-/// different type-11 slot).
-/// Local handoff dir for metal2vulkan failure artifacts. `$REIMS_VGPU_M2V_FAIL_DIR`
-/// overrides; else `$REIMS_VGPU_REPO_ROOT/m2v-handoff/artifacts` (gitignored); else
-/// `/tmp/reims-vgpu-m2v-compute-fails`.
-fn m2v_handoff_dir_from_env(
-    fail_dir: Option<std::ffi::OsString>,
-    repo_root: Option<std::ffi::OsString>,
-) -> std::path::PathBuf {
-    fail_dir
-        .map(std::path::PathBuf::from)
-        .or_else(|| repo_root.map(|r| std::path::PathBuf::from(r).join("m2v-handoff/artifacts")))
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reims-vgpu-m2v-compute-fails"))
-}
-
-pub(crate) fn m2v_handoff_dir() -> std::path::PathBuf {
-    m2v_handoff_dir_from_env(
-        std::env::var_os("REIMS_VGPU_M2V_FAIL_DIR"),
-        std::env::var_os("REIMS_VGPU_REPO_ROOT"),
-    )
-}
-
-/// Which pipelines a `REIMS_VGPU_M2V_DUMP_*_PIPES` probe knob selects: a
-/// comma-separated list of pipeline refs, or `all`. Shared by the draw and
-/// compute handoff dumps so the two knobs cannot drift apart.
-///
-/// Probe tooling only — never alters device behavior. An unset variable parses
-/// to "none", so a normal boot pays one atomic load per encode.
-pub(crate) struct HandoffPipeSelection(Option<(bool, Vec<u32>)>);
-
-impl HandoffPipeSelection {
-    pub(crate) fn from_raw(raw: Option<String>) -> Self {
-        Self(raw.map(|raw| {
-            let all = raw.trim().eq_ignore_ascii_case("all");
-            let list = raw
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
-            (all, list)
-        }))
-    }
-
-    pub(crate) fn from_env(var: &str) -> Self {
-        Self::from_raw(std::env::var(var).ok())
-    }
-
-    pub(crate) fn wants(&self, pipe: u32) -> bool {
-        matches!(&self.0, Some((all, list)) if *all || list.contains(&pipe))
-    }
-}
-
-/// Persist the exact inputs of a compute kernel that failed downstream, for
-/// off-VM handoff to the metal2vulkan agent.
-///
-/// Writes, under [`m2v_handoff_dir`], stem `pipe<N>.<reason>`:
-/// - `.mtlb` — raw MTLB container,
-/// - `.air`  — extracted bitcode member (the exact bytes the m2v Kernel stage
-///   consumes; disassemble with `llvm-dis`),
-/// - `.spv`  — the translated SPIR-V when the failure is *post*-translation
-///   (reflection / storage-format), so the agent sees what m2v emitted
-///   (disassemble with `spirv-dis`); omitted when translation itself failed,
-/// - `.txt`  — `reason`, dims, blob lengths, and the caller's `meta` line.
-///
-/// One dump per `(pipe, reason)` per boot: a translate-fail and a
-/// reflection-fail for the same pipe both land, but a hot per-frame reject does
-/// not spam.
-fn dump_kernel_handoff(
-    pipe: u32,
-    reason: &str,
-    mtlb: &[u8],
-    air: &[u8],
-    spirv: Option<&[u32]>,
-    meta: &str,
-) {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<(u32, String)>>> = Mutex::new(None);
-    {
-        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let set = g.get_or_insert_with(HashSet::new);
-        if !set.insert((pipe, reason.to_string())) {
-            return;
-        }
-    }
-    let dir = m2v_handoff_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let stem = format!("pipe{pipe}.{reason}");
-    let _ = std::fs::write(dir.join(format!("{stem}.mtlb")), mtlb);
-    let _ = std::fs::write(dir.join(format!("{stem}.air")), air);
-    let spv_len = if let Some(words) = spirv {
-        let mut bytes = Vec::with_capacity(words.len().saturating_mul(4));
-        for w in words {
-            bytes.extend_from_slice(&w.to_le_bytes());
-        }
-        let _ = std::fs::write(dir.join(format!("{stem}.spv")), &bytes);
-        bytes.len()
-    } else {
-        0
-    };
-    let _ = std::fs::write(
-        dir.join(format!("{stem}.txt")),
-        format!(
-            "pipe={pipe}\nreason={reason}\nmtlb_len={}\nair_len={}\nspv_len={spv_len}\n{meta}\n",
-            mtlb.len(),
-            air.len()
-        ),
-    );
-    crate::observe::fail(format!(
-        "compute_linux m2v_dump pipe={pipe} reason={reason} dir={} air_len={} spv_len={spv_len}",
-        dir.display(),
-        air.len()
-    ));
-}
-
-/// How much of a bound buffer the handoff dump writes.
-///
-/// Metal's `setBytes:length:atIndex:` is specified for blocks of at most 4 KiB,
-/// so anything a kernel receives as inline constants — dimensions, weights, a
-/// colour conversion matrix — is inside that bound by construction. A vertex or
-/// image buffer bound at the same index can be megabytes, and writing those
-/// would turn a per-pipe probe into a per-boot disk hazard.
-const HANDOFF_BUFFER_PREVIEW_LEN: usize = 4096;
-
-fn handoff_buffer_preview(bytes: &[u8]) -> &[u8] {
-    &bytes[..bytes.len().min(HANDOFF_BUFFER_PREVIEW_LEN)]
-}
-
-/// Write the constant-block prefix of each buffer bound to a dumped kernel.
-///
-/// The SPIR-V says which bindings a kernel reads and the AIR says what it does
-/// with them, but neither says what was *in* them. A kernel that takes its
-/// parameters from a buffer — which is how a conversion matrix normally
-/// arrives — is otherwise opaque off-VM.
-///
-/// Files land beside the kernel as `pipe<N>.<reason>.buf<index>.bin`, truncated
-/// to [`HANDOFF_BUFFER_PREVIEW_LEN`]; the sidecar `.txt` records each buffer's
-/// full length next to how much was written, so a truncation cannot be misread
-/// as a short buffer. Guest-owned bytes: the directory is gitignored, and the
-/// dump is off unless a pipe is explicitly listed.
-fn dump_kernel_buffers(pipe: u32, reason: &str, bufs: &[StagedBuffer]) {
-    let dir = m2v_handoff_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    for s in bufs {
-        let _ = std::fs::write(
-            dir.join(format!("pipe{pipe}.{reason}.buf{}.bin", s.bind.index)),
-            handoff_buffer_preview(&s.bytes),
-        );
-    }
-}
-
 /// What an engine-resident copy of a window can serve one staged binding.
 ///
 /// `Seed` means a storage binding's output is already GPU-resident at this
@@ -1314,6 +1153,15 @@ pub(crate) fn resident_serve(
     .then_some(ResidentServe::Sample(key, mirror_generation))
 }
 
+/// Load tight raw texels for a compute texture binding (type-2/3, type-5→surface, or type-11).
+///
+/// Type-5 (`RefTextureHandle`) is the live CI wallpaper path (`compute_stage_tex … ot=5`).
+/// RE (type-5 wire + metal_draw sample path): surfaceID@0 is a type-4 object id (= mapping
+/// mid). Product draw samples call [`objects::ensure_surface_for_present`] on that id and
+/// stage from the **mapping registry**, never re-resolving the surface id through the
+/// compute task's object list (that list uses a separate texture-ref namespace — live
+/// ensure=1 then MissingTexture/GuestIo class when `resolve_type11_ref(task, sid)` hit a
+/// different type-11 slot).
 pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3133,19 +2981,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     ) {
         Ok(b) => b,
         Err(e) => {
-            // Handoff: on a translator failure, dump the exact kernel inputs
-            // (raw MTLB container + extracted AIR) once per pipe so the
-            // metal2vulkan agent can reproduce off-VM. Apple-owned IR — path is
-            // gitignored (REIMS_VGPU_M2V_FAIL_DIR or /tmp). One file per pipe; sidecar
-            // records the tg dims + error.
-            dump_kernel_handoff(
-                acc.pipeline_ref,
-                "translate",
-                &mtlb,
-                air,
-                None,
-                &format!("threadgroup=[{tg_x},{tg_y},{tg_z}]\nerror={e}"),
-            );
             crate::observe::Emit::decline("compute_linux_m2v", &e)
                 .field("pipe", acc.pipeline_ref)
                 .fail_once(acc.pipeline_ref as u64);
@@ -3161,37 +2996,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             return ComputeStatus::MetalFailed("compute_vk_spirv_parse");
         }
     };
-
-    // Compute analog of `REIMS_VGPU_M2V_DUMP_DRAW_PIPES`: the failure sites
-    // below dump only kernels that were refused, so a kernel that translates and
-    // runs — and produces wrong pixels — is invisible to off-VM inspection.
-    // Listing it here lands its AIR and translated SPIR-V once per boot.
-    {
-        use std::sync::OnceLock;
-        static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
-        let wanted = WANTED
-            .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES"));
-        if wanted.wants(acc.pipeline_ref) {
-            let mut meta = format!(
-                "grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}] textures={} buffers={}",
-                acc.textures.len(),
-                staged_bufs.len()
-            );
-            for s in &staged_bufs {
-                let preview = handoff_buffer_preview(&s.bytes);
-                meta.push_str(&format!(
-                    "\nbuf index={} ref={} gva={:#x} len={} dumped={}",
-                    s.bind.index,
-                    s.bind.buffer_ref,
-                    s.gva,
-                    s.bytes.len(),
-                    preview.len()
-                ));
-            }
-            dump_kernel_handoff(acc.pipeline_ref, "probe", &mtlb, air, Some(&spirv), &meta);
-            dump_kernel_buffers(acc.pipeline_ref, "probe", &staged_bufs);
-        }
-    }
 
     let mut buffer_accesses = Vec::with_capacity(staged_bufs.len());
     let mut buffer_readonly_count = 0usize;
@@ -3220,17 +3024,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     "compute_linux buffer_access fail reason=spirv_ambiguous_binding pipe={} idx={} ref={}",
                     acc.pipeline_ref, s.bind.index, s.bind.buffer_ref
                 ));
-                dump_kernel_handoff(
-                    acc.pipeline_ref,
-                    "buffer_ambiguous_binding",
-                    &mtlb,
-                    air,
-                    Some(&spirv),
-                    &format!(
-                        "buffer_index={} buffer_ref={} grid=[{grid_x},{grid_y},{grid_z}] tg=[{tg_x},{tg_y},{tg_z}]",
-                        s.bind.index, s.bind.buffer_ref
-                    ),
-                );
                 return ComputeStatus::Unsupported("buffer_spirv_ambiguous_binding");
             }
             None => {
@@ -3337,24 +3130,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     if is_storage { "storage" } else { "sampled" },
                     e.class()
                 ));
-                // Hand off the exact kernel so the m2v/format-table agent sees
-                // which storage/sampled image format the shader declares. Every
-                // status now names its check, so the handoff directory is keyed
-                // by that slug instead of by the flat `stage_tex_status` every
-                // non-`Unsupported` refusal used to share.
-                dump_kernel_handoff(
-                    acc.pipeline_ref,
-                    e.reason(),
-                    &mtlb,
-                    air,
-                    Some(&spirv),
-                    &format!(
-                        "tex_index={} tex_ref={} ot={ot} binding={binding} access={} status={e:?}",
-                        t.index,
-                        t.texture_ref,
-                        if is_storage { "storage" } else { "sampled" }
-                    ),
-                );
                 return e;
             }
         }

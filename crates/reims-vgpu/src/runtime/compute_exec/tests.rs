@@ -80,22 +80,6 @@ fn compute_defer_readback_follows_gpu_only_content_gate() {
     assert!(!compute_defer_readback_allowed(true, true, false));
 }
 
-#[test]
-fn m2v_handoff_dir_prefers_explicit_dir_then_repo_local_private_dir() {
-    assert_eq!(
-        m2v_handoff_dir_from_env(Some("/custom/m2v".into()), Some("/repo".into())),
-        std::path::PathBuf::from("/custom/m2v")
-    );
-    assert_eq!(
-        m2v_handoff_dir_from_env(None, Some("/repo".into())),
-        std::path::PathBuf::from("/repo/m2v-handoff/artifacts")
-    );
-    assert_eq!(
-        m2v_handoff_dir_from_env(None, None),
-        std::path::PathBuf::from("/tmp/reims-vgpu-m2v-compute-fails")
-    );
-}
-
 /// A type-5 view names its IOSurface plane on the wire (record `+0x20`, the
 /// `newTextureWithDescriptor:iosurface:plane:` argument). When two planes share
 /// geometry and bytes-per-element the geometry scan cannot separate them and
@@ -242,64 +226,6 @@ fn stage_texture_type5_plane_index_beats_the_ambiguous_geometry_scan() {
         }
         _ => panic!("a type-5 view over a surface mapping must write back as type-11"),
     }
-}
-
-/// The buffer handoff writes a bounded prefix, and the bound is the one Metal
-/// puts on an inline constant block (`setBytes:` is specified to 4 KiB). A
-/// buffer shorter than that must be written whole — truncating a 64-byte
-/// constant block would lose the thing the dump exists to capture — and a
-/// larger one must stop exactly at the bound rather than spill a whole image
-/// buffer to disk.
-#[test]
-fn handoff_buffer_preview_writes_short_buffers_whole_and_caps_long_ones() {
-    assert_eq!(handoff_buffer_preview(&[]).len(), 0);
-    let small = vec![0xa5u8; 64];
-    assert_eq!(handoff_buffer_preview(&small), &small[..]);
-    let exact = vec![0x5au8; HANDOFF_BUFFER_PREVIEW_LEN];
-    assert_eq!(
-        handoff_buffer_preview(&exact).len(),
-        HANDOFF_BUFFER_PREVIEW_LEN
-    );
-    let big = vec![0x11u8; HANDOFF_BUFFER_PREVIEW_LEN * 4 + 7];
-    let preview = handoff_buffer_preview(&big);
-    assert_eq!(preview.len(), HANDOFF_BUFFER_PREVIEW_LEN);
-    // The prefix, not a sample or the tail: offsets in the dump must match
-    // offsets in the guest buffer or reading a struct out of it is guesswork.
-    assert_eq!(preview, &big[..HANDOFF_BUFFER_PREVIEW_LEN]);
-}
-
-/// The draw and compute handoff dumps share one selection parse, so a boot that
-/// lists a pipe for one knob gets the same answer from the other. Unset must
-/// select nothing: these dumps write Apple-owned IR, so a default-on knob would
-/// litter the handoff directory on every normal boot.
-#[test]
-fn handoff_pipe_selection_matches_all_or_a_listed_ref_and_nothing_when_unset() {
-    let none = HandoffPipeSelection::from_raw(None);
-    assert!(!none.wants(0));
-    assert!(!none.wants(196));
-
-    let all = HandoffPipeSelection::from_raw(Some("all".into()));
-    assert!(all.wants(196));
-    assert!(all.wants(0));
-    // Case and surrounding whitespace come from a shell export, not from us.
-    assert!(HandoffPipeSelection::from_raw(Some("  ALL \n".into())).wants(7));
-
-    let listed = HandoffPipeSelection::from_raw(Some("53, 196,155".into()));
-    assert!(listed.wants(53));
-    assert!(listed.wants(196));
-    assert!(listed.wants(155));
-    assert!(!listed.wants(154));
-
-    // An unparseable entry drops itself, not the whole list.
-    let mixed = HandoffPipeSelection::from_raw(Some("53,notapipe,196".into()));
-    assert!(mixed.wants(53));
-    assert!(mixed.wants(196));
-    assert!(!mixed.wants(0));
-
-    // An empty variable is an empty list, not `all`.
-    let empty = HandoffPipeSelection::from_raw(Some(String::new()));
-    assert!(!empty.wants(0));
-    assert!(!empty.wants(196));
 }
 
 #[test]

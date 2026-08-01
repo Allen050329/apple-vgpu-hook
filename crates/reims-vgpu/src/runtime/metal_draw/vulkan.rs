@@ -692,8 +692,6 @@ type LoadedLinearSample = (
     Option<LinearSampleIdentity>,
     TexelLayout,
 );
-#[cfg(feature = "backend-vulkan")]
-type DrawHandoffStage<'a> = (&'a str, &'a [u8], &'a [u8], &'a [u8]);
 
 /// Authoritative contents when a fragment texture aliases a GVA color target.
 ///
@@ -3725,79 +3723,6 @@ fn build_secondary_targets<M: HostMemory + HostOps>(
     out
 }
 
-/// Draw-pipeline analog of the compute `dump_kernel_handoff`.
-/// `REIMS_VGPU_M2V_DUMP_DRAW_PIPES` selects pipes through the shared
-/// [`HandoffPipeSelection`] — a comma-separated list of pipeline refs, or
-/// `all`, same grammar as `REIMS_VGPU_M2V_DUMP_COMPUTE_PIPES`. A listed pipe's
-/// vertex and fragment stages land under
-/// [`crate::runtime::compute_exec::m2v_handoff_dir`] once per boot as
-/// `pipe<N>.draw.{vertex,fragment}.{mtlb,air,spv}` plus a `.txt` with the draw
-/// shape. Probe tooling only — never alters device behavior; unset env means
-/// zero work per draw beyond one cached parse.
-#[cfg(feature = "backend-vulkan")]
-fn dump_draw_handoff(
-    req: &DrawEncodeRequest,
-    vertex_func_ref: u32,
-    fragment_func_ref: u32,
-    stages: [DrawHandoffStage<'_>; 2],
-) {
-    use crate::runtime::compute_exec::HandoffPipeSelection;
-    use std::sync::OnceLock;
-    static WANTED: OnceLock<HandoffPipeSelection> = OnceLock::new();
-    let pipe = req.pipeline_ref;
-    if !WANTED
-        .get_or_init(|| HandoffPipeSelection::from_env("REIMS_VGPU_M2V_DUMP_DRAW_PIPES"))
-        .wants(pipe)
-    {
-        return;
-    }
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
-    {
-        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if !g.get_or_insert_with(HashSet::new).insert(pipe) {
-            return;
-        }
-    }
-    let dir = crate::runtime::compute_exec::m2v_handoff_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    for (stage, mtlb, air, spv) in stages {
-        let stem = format!("pipe{pipe}.draw.{stage}");
-        let _ = std::fs::write(dir.join(format!("{stem}.mtlb")), mtlb);
-        let _ = std::fs::write(dir.join(format!("{stem}.air")), air);
-        let _ = std::fs::write(dir.join(format!("{stem}.spv")), spv);
-    }
-    let ftex: Vec<u32> = req
-        .fragment_textures
-        .iter()
-        .map(|t| t.texture_ref)
-        .collect();
-    let fbuf: Vec<u32> = req.fragment_buffers.iter().map(|b| b.index).collect();
-    let meta = format!(
-        "pipe={pipe}\nv_func_ref={vertex_func_ref}\nf_func_ref={fragment_func_ref}\n\
-         geom={}x{} fmt={}\nvtx_count={} inst={} prim={} indexed={}\n\
-         ftex_refs={ftex:?}\nfbuf_indices={fbuf:?}\ncolors={} depth={} stencil={}\n",
-        req.colors.first().map(|c| c.width).unwrap_or(0),
-        req.colors.first().map(|c| c.height).unwrap_or(0),
-        req.colors.first().map(|c| c.format).unwrap_or(0),
-        req.vertex_count,
-        req.instance_count,
-        req.primitive_type,
-        req.indexed.is_some(),
-        req.colors.len(),
-        req.depth_attach.is_some(),
-        req.stencil_attach.is_some(),
-    );
-    let _ = std::fs::write(dir.join(format!("pipe{pipe}.draw.txt")), meta);
-    crate::observe::fail(format!(
-        "linux_m2v draw_dump pipe={pipe} dir={}",
-        dir.display()
-    ));
-}
-
 /// Translate guest MTLB stages via metal2vulkan and raster with the internal Vulkan engine.
 ///
 /// Builds engine [`DrawRequest`] resources from stream binds (stage-in attrs, SSBOs,
@@ -3930,16 +3855,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             },
         )
     })?;
-
-    dump_draw_handoff(
-        req,
-        pd.vertex_func_ref,
-        pd.fragment_func_ref,
-        [
-            ("vertex", &v_mtlb, v_air, &v_shader.spirv),
-            ("fragment", &f_mtlb, f_air, &f_shader.spirv),
-        ],
-    );
 
     let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
         return Ok(M2vDrawSpan::None);
