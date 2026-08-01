@@ -452,11 +452,37 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # session values (only when absent) and export them. XAUTHORITY carries a
   # per-login random suffix; override any of these in the environment if yours
   # differ (e.g. a different seat, DISPLAY, or Wayland socket).
-  : "${XDG_RUNTIME_DIR:=/run/user/1000}"
+  : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
   : "${WAYLAND_DISPLAY:=wayland-0}"
   : "${DISPLAY:=:0}"
-  : "${XAUTHORITY:=/run/user/1000/xauth_Kmhxwx}"
-  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY XAUTHORITY
+  # XAUTHORITY's suffix is a per-login random string, so it cannot be written
+  # down: a hardcoded one goes stale at the next login and then points at a file
+  # that does not exist. Discover the newest cookie in the runtime dir instead.
+  if [ -z "${XAUTHORITY:-}" ]; then
+    for _xauth in $(ls -t "$XDG_RUNTIME_DIR"/xauth_* 2>/dev/null); do
+      XAUTHORITY="$_xauth"
+      break
+    done
+  fi
+  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY
+  [ -n "${XAUTHORITY:-}" ] && export XAUTHORITY
+
+  # A window with no display server still opens, still says "first frame
+  # presented", and still fills the log with `host_window_cadence` — at a
+  # present rate governed by nothing consuming the images. That reads exactly
+  # like a pacing defect in this device. Measuring it once already produced a
+  # peak of 33 Hz against a guest that believed it was drawing 119, so say so
+  # here rather than letting a later reader believe the number.
+  if command -v xdpyinfo >/dev/null 2>&1 && ! xdpyinfo >/dev/null 2>&1; then
+    if [ ! -S "$XDG_RUNTIME_DIR/${WAYLAND_DISPLAY:-wayland-0}" ]; then
+      echo "boot-x86.sh: WARNING — no usable display connection." >&2
+      echo "boot-x86.sh:   DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-unset}" >&2
+      echo "boot-x86.sh:   The host window will open with nothing consuming it." >&2
+      echo "boot-x86.sh:   Guest-side measurements stay valid; every host-window" >&2
+      echo "boot-x86.sh:   number (host_window_cadence present_hz, busy_acquire," >&2
+      echo "boot-x86.sh:   direct_frac) is MEANINGLESS on this boot." >&2
+    fi
+  fi
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
