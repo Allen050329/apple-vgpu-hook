@@ -38,20 +38,10 @@ struct PreparedSampledImage {
     upload: Option<BufferSlot>,
     /// Copy-on-sample source `(resident image, its current layout)`.
     resident_src: Option<(vk::Image, vk::ImageLayout)>,
-    /// Byte-reinterpret hop for a resident whose vk format differs from the
-    /// sampled view but whose rows are byte-identical (equal row bytes and
-    /// height): the seed goes image→buffer→image through this pooled buffer,
-    /// since `vkCmdCopyImage` cannot cross texel-block sizes.
-    reinterpret: Option<ReinterpretHop>,
     width: u32,
     height: u32,
 }
 
-struct ReinterpretHop {
-    buffer: vk::Buffer,
-    src_width: u32,
-    src_height: u32,
-}
 
 /// Post-dispatch copy destination for one storage image.
 enum ComputeImageDst {
@@ -187,21 +177,22 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
     Ok(())
 }
 
-/// Validate the resident sampled-image copy contract and return whether the
-/// source needs a byte-preserving buffer reinterpret hop.
-fn resident_sample_reinterpret(
+/// A copy-on-sample bind must name a resident whose image is byte-for-byte the
+/// image the view will sample: same vk format, same width, same height. The
+/// runtime only ever binds the key it looked the mirror up under, so an
+/// inexact source means the registry and the mirror disagree — refuse by name
+/// rather than reinterpreting bytes the shader did not ask us to reinterpret.
+fn resident_sample_exact(
     resource: &ComputeSampledImageResource,
     bind: ComputeResidentSampleBind,
     src_key: StorageImageKey,
-) -> Result<bool, DrawError> {
+) -> Result<(), DrawError> {
     let exact = src_key.format.vk_format() == resource.format.vk_format()
         && src_key.width == resource.width
         && src_key.height == resource.height;
-    let source_row_bytes = src_key.width as u64 * src_key.format.bytes_per_texel() as u64;
-    let resource_row_bytes = resource.width as u64 * resource.format.bytes_per_texel() as u64;
-    let byte_compatible =
-        source_row_bytes == resource_row_bytes && src_key.height == resource.height;
-    if !(exact || byte_compatible) {
+    if !exact {
+        let source_row_bytes = src_key.width as u64 * src_key.format.bytes_per_texel() as u64;
+        let resource_row_bytes = resource.width as u64 * resource.format.bytes_per_texel() as u64;
         return Err(DrawError::ComputeExecution(
             ComputeExecutionDecline::ResidentSampleByteShapeMismatch {
                 binding: resource.binding,
@@ -217,7 +208,7 @@ fn resident_sample_reinterpret(
             },
         ));
     }
-    Ok(!exact)
+    Ok(())
 }
 
 pub(crate) unsafe fn execute_compute_inner(
@@ -326,7 +317,7 @@ pub(crate) unsafe fn execute_compute_inner(
             sampled_only: true,
         };
         let img = pools.acquire_storage_image(ctx, key, counters)?;
-        let (upload, resident_src, reinterpret) = if let Some(bind) = resource.resident_bind {
+        let (upload, resident_src) = if let Some(bind) = resource.resident_bind {
             // The caller skipped the guest read; the placeholder bytes must
             // never reach the GPU. Every mismatch names the check that
             // refused.
@@ -352,29 +343,11 @@ pub(crate) unsafe fn execute_compute_inner(
                     },
                 ));
             }
-            // An exact source copies image→image; a byte-reinterpret source
-            // (rows byte-identical: equal row bytes and height, formats/widths
-            // differ) hops through a buffer. Anything else is a shape loss.
-            let src_row_bytes = src_key.width as u64 * src_key.format.bytes_per_texel() as u64;
-            let reinterpret = resident_sample_reinterpret(resource, bind, src_key)?;
-            let hop = if reinterpret {
-                let st = pools.acquire_staging(
-                    ctx,
-                    src_row_bytes * src_key.height as u64,
-                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
-                    counters,
-                )?;
-                counters.note_compute_sampled_reinterpret_copy(resource.bytes.len() as u64);
-                Some(ReinterpretHop {
-                    buffer: st.buffer,
-                    src_width: src_key.width,
-                    src_height: src_key.height,
-                })
-            } else {
-                None
-            };
+            // The source must be byte-identical to the view; anything else is
+            // a shape loss the runtime cannot have produced.
+            resident_sample_exact(resource, bind, src_key)?;
             counters.note_compute_sampled_resident_copy(resource.bytes.len() as u64);
-            (None, Some((src_image, src_layout)), hop)
+            (None, Some((src_image, src_layout)))
         } else {
             let st = pools.acquire_staging(
                 ctx,
@@ -384,14 +357,13 @@ pub(crate) unsafe fn execute_compute_inner(
             )?;
             pools.write_staging(ctx, &st, &resource.bytes)?;
             counters.note_compute_sampled_upload(resource.bytes.len() as u64);
-            (Some(st), None, None)
+            (Some(st), None)
         };
         sampled_slots.push(PreparedSampledImage {
             binding: resource.binding,
             img,
             upload,
             resident_src,
-            reinterpret,
             width: resource.width,
             height: resource.height,
         });
@@ -657,87 +629,32 @@ pub(crate) unsafe fn execute_compute_inner(
                 &[],
                 &to_src,
             );
-            if let Some(hop) = &prepared.reinterpret {
-                // Byte-reinterpret: image→buffer→image. The tight buffer holds
-                // the identical byte stream under both formats (equal row
-                // bytes, equal height — guarded at prepare).
-                let layers = vk::ImageSubresourceLayers {
+            let copy = [vk::ImageCopy::default()
+                .src_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
                     layer_count: 1,
-                };
-                let to_buf = [vk::BufferImageCopy::default()
-                    .image_subresource(layers)
-                    .image_extent(vk::Extent3D {
-                        width: hop.src_width,
-                        height: hop.src_height,
-                        depth: 1,
-                    })];
-                ctx.device.cmd_copy_image_to_buffer(
-                    cb,
-                    src_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    hop.buffer,
-                    &to_buf,
-                );
-                let buf_barrier = [vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .buffer(hop.buffer)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE)];
-                ctx.device.cmd_pipeline_barrier(
-                    cb,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &buf_barrier,
-                    &[],
-                );
-                let to_img = [vk::BufferImageCopy::default()
-                    .image_subresource(layers)
-                    .image_extent(vk::Extent3D {
-                        width: prepared.width,
-                        height: prepared.height,
-                        depth: 1,
-                    })];
-                ctx.device.cmd_copy_buffer_to_image(
-                    cb,
-                    hop.buffer,
-                    img.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &to_img,
-                );
-            } else {
-                let copy = [vk::ImageCopy::default()
-                    .src_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .dst_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .extent(vk::Extent3D {
-                        width: prepared.width,
-                        height: prepared.height,
-                        depth: 1,
-                    })];
-                ctx.device.cmd_copy_image(
-                    cb,
-                    src_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    img.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &copy,
-                );
-            }
+                })
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .extent(vk::Extent3D {
+                    width: prepared.width,
+                    height: prepared.height,
+                    depth: 1,
+                })];
+            ctx.device.cmd_copy_image(
+                cb,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                img.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy,
+            );
             if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
                 let restore = [vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -1221,10 +1138,10 @@ mod tests {
         source: StorageImageKey,
     ) -> &'static str {
         let bind = resource.resident_bind.unwrap();
-        match resident_sample_reinterpret(resource, bind, source) {
+        match resident_sample_exact(resource, bind, source) {
             Err(DrawError::ComputeExecution(decline)) => decline.slug(),
             Err(other) => panic!("expected typed compute execution decline, got {other}"),
-            Ok(_) => panic!("expected resident-sample shape refusal"),
+            Ok(()) => panic!("expected resident-sample shape refusal"),
         }
     }
 
@@ -1255,25 +1172,21 @@ mod tests {
     fn resident_sample_shape_causes_are_not_collapsed() {
         let exact = resident_sample_resource();
         assert_eq!(
-            resident_sample_reinterpret(
-                &exact,
-                exact.resident_bind.unwrap(),
-                resident_sample_key()
-            ),
-            Ok(false)
+            resident_sample_exact(&exact, exact.resident_bind.unwrap(), resident_sample_key()),
+            Ok(())
         );
 
-        let mut reinterpret = resident_sample_resource();
-        reinterpret.width = 2;
-        reinterpret.format = StorageImageFormat::Rg8Unorm;
-        reinterpret.bytes.resize(4, 0);
+        // Row-byte-identical but a different format and width. This used to be
+        // accepted and reinterpreted through a buffer hop; it is now refused,
+        // because only a disagreement between the registry and the mirror can
+        // produce it.
+        let mut row_compatible = resident_sample_resource();
+        row_compatible.width = 2;
+        row_compatible.format = StorageImageFormat::Rg8Unorm;
+        row_compatible.bytes.resize(4, 0);
         assert_eq!(
-            resident_sample_reinterpret(
-                &reinterpret,
-                reinterpret.resident_bind.unwrap(),
-                resident_sample_key()
-            ),
-            Ok(true)
+            resident_sample_shape_slug(&row_compatible, resident_sample_key()),
+            "vk_compute_exec_resident_sample_byte_shape_mismatch"
         );
 
         let mut byte_mismatch = resident_sample_resource();

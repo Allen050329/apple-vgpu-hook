@@ -151,10 +151,6 @@ engine_counters! {
         /// image (copy-on-sample) — bytes are the elided host upload size.
         compute_sampled_resident_copies,
         compute_sampled_resident_copy_bytes,
-        /// Subset of the resident copies that crossed vk formats through the
-        /// image→buffer→image byte-reinterpret hop (row-byte-identical views).
-        compute_sampled_reinterpret_copies,
-        compute_sampled_reinterpret_copy_bytes,
         /// Compute storage images whose post-dispatch readback was deferred —
         /// the pinned resident stays authoritative; bytes are the elided
         /// device→host readback size (the CPU writeback of the same size is
@@ -315,13 +311,6 @@ impl EngineCounters {
         self.compute_sampled_resident_copies
             .fetch_add(1, Ordering::Relaxed);
         self.compute_sampled_resident_copy_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    pub fn note_compute_sampled_reinterpret_copy(&self, bytes: u64) {
-        self.compute_sampled_reinterpret_copies
-            .fetch_add(1, Ordering::Relaxed);
-        self.compute_sampled_reinterpret_copy_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
