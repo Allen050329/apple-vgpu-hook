@@ -254,8 +254,6 @@ pub fn decode_invalidate_resources(payload: &[u8]) -> Option<InvalidateResources
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecResourceDesc {
     pub object_id: u32,
-    /// LE dword form of the four validity-op bytes (see [`InvalidateValidityOps`]).
-    pub flags: u32,
     pub ops: InvalidateValidityOps,
     /// Bytes `+0x08..0x18`. Zeroed by the Ventura 13.7.8 x86 kext; kept raw
     /// rather than dropped so a build that populates them is visible instead of
@@ -299,7 +297,6 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
         tail.copy_from_slice(&payload[tail_off..tail_off + CHILD_EXEC_RESOURCE_TAIL_LEN as usize]);
         descs.push(ExecResourceDesc {
             object_id,
-            flags,
             ops: InvalidateValidityOps::from_le_dword(flags),
             tail,
         });

@@ -13,6 +13,10 @@
 //! by several call sites — so the line is written here instead. They are still
 //! declines. The execution path calls them, never the reverse.
 //!
+//! Every one of them names a loss that is still happening. A census whose
+//! question has been answered is not a fifth kind of decline, it is a probe
+//! that outlived its investigation; see "Removing one" below.
+//!
 //! # The rule these all obey
 //!
 //! **Measuring is allowed; branching on the measurement is not.** Nothing in
@@ -28,13 +32,6 @@
 //! | [`srgb_census`] | which rails drop the sRGB transfer function |
 //! | [`view_swizzle_census`] | type-8 view swizzles dropped, or served by rewriting texels on the CPU |
 //! | [`t11_decline`] | why the type-11 sampled rail declined its zero-copy gather, by reason |
-//! | [`exec_resource_table`] | what the guest declares about each resource an `EXEC_INDIRECT2` submission touches |
-//!
-//! [`exec_resource_table`] is the one entry here that reports guest *input*
-//! rather than a device decline, and it qualifies on the same test: the loss is
-//! otherwise invisible. The guest's statement that it CPU-wrote a resource is
-//! delivered once, inside a table this device stepped over unread, so no counter
-//! could separate "the guest never said" from "we discarded what it said".
 //!
 //! # Adding one
 //!
@@ -44,8 +41,24 @@
 //! successful work never had one. Modules and rate-halves have been deleted on
 //! exactly that test more often than they have been added; run it before writing
 //! the next one.
+//!
+//! # Removing one
+//!
+//! A census that reports guest *input* rather than a device decline is a
+//! measurement, and a measurement is done when it has an answer. `exec_res_table`
+//! was the one such entry: it counted every field of the `EXEC_INDIRECT2`
+//! resource table for one boot, established that `set_host_valid` licenses
+//! exactly the resources a submission stores into, that the ids are the task's
+//! object-ref space and not the mapping space, and that the trailing 16 bytes
+//! are zero — then went on recounting all three for every submission of every
+//! boot after. The findings live where they are acted on, in
+//! `runtime/exec.rs:consume_resource_table`; the only one that could still
+//! change is a guest that starts populating the tail, and that is now a typed
+//! decline raised at the record, not a counter nobody reads.
+//!
+//! The test to apply: name the reading the next window could produce that the
+//! last thousand did not. If there isn't one, the census has become a probe.
 
-pub mod exec_resource_table;
 pub mod present_proxy;
 pub mod srgb_census;
 pub mod t11_decline;

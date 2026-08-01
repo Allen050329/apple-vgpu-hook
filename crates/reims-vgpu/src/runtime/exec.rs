@@ -189,7 +189,6 @@ pub struct ExecResult {
     pub deferred: bool,
     pub texture_refs: Vec<u32>,
     pub type11_mappings: Vec<u32>,
-    pub color_targets: Vec<u32>,
     pub saw_draw: bool,
     pub clears_applied: u32,
     pub metal_draws_ok: u32,
@@ -346,7 +345,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
         finish_stream(state, host, task_id, &mut out, &acc);
     }
-    census_resource_table(state, task_id, &resource_descs, &out);
     out.total_us = elapsed_us(exec_started);
     out
 }
@@ -379,11 +377,31 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 /// set by construction. The table names the submission's whole residency list,
 /// which is a superset of what its command buffers reference. What *would* be
 /// the finding is this count staying high for ids that later do execute.
+///
+/// # What `set_host_valid` means, and how that is known
+///
+/// It licenses exactly the resources the submission stores into. That was an
+/// inference from IOAccel resource-list usage until a census correlated the two
+/// sides over one driven boot: of 19 135 stores, **zero** landed on a resource
+/// the table had not licensed, and the records that both license a resource and
+/// name a mapping this device holds (1 382 vs 1 380 licensed-and-stored) are the
+/// render targets. `clear_host_valid` is the other direction and arrives 15 423
+/// times in the same boot — one per guest CPU write, never resent.
+///
+/// The census that measured it is gone; a correlation with no counter-examples
+/// over 19 135 trials is a finding, not a thing to keep re-deriving per frame.
 fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
     let mut unknown = 0u32;
     for d in descs {
+        if d.tail_nonzero_bytes() > 0 {
+            crate::observe::Emit::decline("exec_res_table", &ResourceTableDecline::TailPopulated)
+                .field("task", task_id)
+                .field("object", d.object_id)
+                .field("tail_nz", d.tail_nonzero_bytes())
+                .fail_once(0);
+        }
         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
         if !outcome.missed {
             continue;
@@ -394,47 +412,36 @@ fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecRe
             unknown = unknown.saturating_add(1);
         }
     }
-    // Rate-summarised on the same per-second window as the census: this is the
-    // hottest opcode in the device and a per-record line would bury the fail
-    // view. The census reports the same population by registry
-    // (`unresolved` / `as_map` / `as_tex` / `as_obj`).
+    // Rate-summarised on the per-second store-route window: this is the hottest
+    // opcode in the device and a per-record line would bury the fail view.
     crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
     crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
 }
 
-/// Feed one submission's resource table to the per-window census, together with
-/// the objects its decoded streams stored into.
-///
-/// Runs after the streams so the store side is complete. A submission that
-/// returned early — no command buffers, or translation still cold — is not
-/// counted; the cold one is retried and counted on the attempt that executes.
-fn census_resource_table(
-    state: &DeviceState,
-    task_id: u32,
-    descs: &[ExecResourceDesc],
-    out: &ExecResult,
-) {
-    // Both namespaces, because the table's id space is not proven to be either:
-    // a color target is named by texture ref, and the mapping id it resolves to
-    // is what `CmdInvalidateResources` records name.
-    let mut stored: Vec<u32> = Vec::with_capacity(out.color_targets.len() * 2);
-    for &texture_ref in &out.color_targets {
-        if !stored.contains(&texture_ref) {
-            stored.push(texture_ref);
-        }
-        if let Some(&mid) = state.texture_to_mapping.get(&(task_id, texture_ref)) {
-            if !stored.contains(&mid) {
-                stored.push(mid);
-            }
+/// The one part of an `EXEC_INDIRECT2` resource-table record this device cannot
+/// act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceTableDecline {
+    /// A record set one of the trailing 16 bytes, whose meaning is unrecovered.
+    ///
+    /// Zero across 84 868 records on the Ventura 13.7.8 x86 build, so ignoring
+    /// them costs nothing *there*. A build that starts using them is a statement
+    /// this device is discarding, which is why it raises a line rather than
+    /// passing unread — once per boot, because the field is a property of the
+    /// guest build and not of the record that happened to carry it first.
+    TailPopulated,
+}
+
+impl crate::observe::Decline for ResourceTableDecline {
+    fn slug(&self) -> &'static str {
+        match self {
+            Self::TailPopulated => "exec_res_tail_populated",
         }
     }
-    crate::runtime::census::exec_resource_table::note_table(descs, &stored, |id| {
-        crate::runtime::census::exec_resource_table::IdKind {
-            mapping: state.mappings.contains_key(&id),
-            texture: state.texture_to_mapping.contains_key(&(task_id, id)),
-            object: state.objects.contains(&(task_id, id)),
-        }
-    });
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 fn elapsed_us(started: std::time::Instant) -> u64 {
@@ -1237,9 +1244,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     } else if let Some(entry) = acc.color_slots.iter_mut().find(|(s, _)| *s == slot)
                     {
                         entry.1 = att;
-                    }
-                    if !out.color_targets.contains(&att.texture_ref) {
-                        out.color_targets.push(att.texture_ref);
                     }
                     if !acc.color_targets.contains(&att.texture_ref) {
                         acc.color_targets.push(att.texture_ref);
@@ -2288,20 +2292,20 @@ mod tests {
         assert!(!r.saw_draw);
     }
 
-    /// The resource table the guest puts between the header and the command
-    /// buffers must be decoded and censused on the live exec path.
+    /// Bytes `+0x08..0x18` of a resource-table record are zero on every build
+    /// this project has measured, and their meaning is unrecovered. A guest that
+    /// starts setting them is telling this device something it cannot act on, so
+    /// the record must raise a line rather than pass unread.
     ///
-    /// Without the census wiring this passes vacuously on any payload, so the
-    /// test asserts the *content* of the drained line: the table's two records
-    /// and their quads have to survive from wire bytes to window. The submission
-    /// loads no stream — a gva no page table backs — because the census sits
-    /// after the stream loop and must be reached whether or not work executed.
+    /// The record with the populated tail is second, and the first is clean: a
+    /// check that fired on the *table* rather than the record would pass this
+    /// too, so the assertion names the object id.
     #[test]
-    fn an_exec_submission_censuses_its_resource_table() {
+    fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
         use crate::runtime::decode::fifo::{
-            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+            CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL,
+            CHILD_EXEC_RESOURCE_VALIDITY_OPS,
         };
-        let _ = crate::runtime::census::exec_resource_table::take_window();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let mut host = FakeHost::new();
         assert!(state.define_task(3, 0x1_0000, 2), "slot 3 must be live");
@@ -2320,10 +2324,7 @@ mod tests {
             N_RES,
         );
         st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
-        for (i, (id, flags)) in [(0x40u32, 0x0000_0001u32), (0x41, 0x0000_0100)]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, id) in [0x40u32, 0x41].into_iter().enumerate() {
             let off = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
                 + i * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
             st32(
@@ -2332,9 +2333,16 @@ mod tests {
             );
             st32(
                 &mut payload[off + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
-                flags,
+                0x0000_0001,
             );
         }
+        // One byte, in the last record, at the far end of the tail: the widest
+        // gap between "the decoder read the tail" and "the decoder read a dword
+        // it already had".
+        let last = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        payload[last + CHILD_EXEC_RESOURCE_TAIL as usize + 15] = 0xa5;
+
         let cb = CHILD_EXEC_INDIRECT_HEADER_LEN as usize + table_len;
         st64(
             &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
@@ -2345,24 +2353,14 @@ mod tests {
             64,
         );
 
+        let cap = crate::observe::sink::FailCapture::start();
         let r = process_exec_indirect2(&mut state, &mut host, &payload);
         assert_eq!(r.task_id, 3);
         assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
-
-        let line = crate::runtime::census::exec_resource_table::take_window()
-            .expect("the exec path must census its resource table");
-        assert!(line.contains(" subs=1 "), "{line}");
-        assert!(line.contains(" descs=2 "), "{line}");
-        assert!(line.contains(" ids=2 "), "{line}");
-        assert!(line.contains(" clr_h=1 "), "{line}");
-        assert!(line.contains(" set_h=1 "), "{line}");
-        assert!(
-            line.contains(" quads=[0x00000001:1,0x00000100:1]"),
-            "{line}"
-        );
-        // Neither id is a live object in this state, so both are unresolvable —
-        // and the census has to say so rather than count them as known.
-        assert!(line.contains(" unresolved=2 "), "{line}");
+        let line = cap.one("exec_res_table");
+        assert!(line.contains("reason=exec_res_tail_populated"), "{line}");
+        assert!(line.contains(" object=65 "), "{line}");
+        assert!(line.contains(" tail_nz=1"), "{line}");
     }
 
     /// A submission whose table says the guest CPU-wrote a resource must not

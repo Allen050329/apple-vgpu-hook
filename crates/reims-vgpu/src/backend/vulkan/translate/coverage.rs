@@ -877,13 +877,11 @@ const FIFO_RESOURCE_COMMANDS: &[FieldCoverage] = decoded_fields! {
         "fifo::ExecResourceDesc.object_id",
         "fifo::ExecResourceDesc.ops",
     ];
-    declined "exec_res_table" at "runtime/census/exec_resource_table.rs:note_table" => [
-        // The raw dword the quad decodes from. `ops` is what the consumer acts
-        // on; this is kept for the census histogram, the way the sibling
-        // `InvalidateResourceRecord` keeps both.
-        "fifo::ExecResourceDesc.flags",
-        // Zero across 84 868 records on the Ventura 13.7.8 x86 build. Counted
-        // rather than dropped so a build that populates them is visible.
+    declined "exec_res_table" at "runtime/exec.rs:consume_resource_table" => [
+        // Zero across 84 868 records on the Ventura 13.7.8 x86 build, so their
+        // unrecovered meaning costs nothing there. Read rather than dropped so a
+        // build that populates them raises `exec_res_tail_populated` instead of
+        // passing unread.
         "fifo::ExecResourceDesc.tail",
     ];
 };
@@ -1899,16 +1897,20 @@ mod tests {
         }
         assert_eq!(
             (honored, declined, dropped, absent),
+            // Moved 2026-08-01, second: `ExecResourceDesc.flags` left the
+            // manifest with the field. It was the raw dword `ops` decodes from,
+            // kept only for the `exec_res_table` census histogram, so deleting
+            // that census left nothing reading it. `declined` fell by one.
+            //
             // Moved 2026-08-01: the four `ExecResourceDesc` fields entered the
             // manifest — the EXEC_INDIRECT2 resource table, which the device
             // used to step over unread. `object_id` and `ops` are Honored by
-            // `consume_resource_table`; `flags` and `tail` are Declined, carried
-            // only by the `exec_res_table` census.
+            // `consume_resource_table`; `tail` is Declined there too.
             //
             // Moved 2026-07-30: `colorAttachments[n].writeMask` went
             // NotOnTheWire -> Honored, so `absent` fell by one and `honored`
             // rose by one. It is on the wire after all, as tag 0x09.
-            (253, 62, 23, 24),
+            (253, 61, 23, 24),
             "the coverage census moved; update this baseline in the same commit \
              that moves it, and describe which way it moved"
         );

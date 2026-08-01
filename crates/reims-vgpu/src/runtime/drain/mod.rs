@@ -3164,12 +3164,6 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
-        // Same cadence, same reason: `EXEC_INDIRECT2` is the hottest opcode in
-        // the device, so its resource table is reported as one window line
-        // rather than one line per submission.
-        if let Some(line) = crate::runtime::census::exec_resource_table::take_window() {
-            crate::observe::off(line);
-        }
         // Onto the census cadence rather than a timer of its own, so a reader
         // pairing the footprint against `store_routes` is reading one clock.
         // The run dump rate-limits itself; this is the only caller.
