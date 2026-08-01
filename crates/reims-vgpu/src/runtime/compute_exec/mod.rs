@@ -1441,17 +1441,26 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         );
         #[cfg_attr(
             not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-consumption block below assigns it")
+            allow(
+                unused_mut,
+                reason = "the Vulkan resident-consumption block below assigns it"
+            )
         )]
         let mut seed_generation = 0;
         #[cfg_attr(
             not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-consumption block below assigns it")
+            allow(
+                unused_mut,
+                reason = "the Vulkan resident-consumption block below assigns it"
+            )
         )]
         let mut seed_skipped = false;
         #[cfg_attr(
             not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-consumption block below assigns it")
+            allow(
+                unused_mut,
+                reason = "the Vulkan resident-consumption block below assigns it"
+            )
         )]
         let mut sample_resident = None;
         #[cfg(feature = "backend-vulkan")]
@@ -1884,7 +1893,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // the whole request on mismatch.
         #[cfg_attr(
             not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-sample block below assigns it")
+            allow(
+                unused_mut,
+                reason = "the Vulkan resident-sample block below assigns it"
+            )
         )]
         let mut sample_resident = None;
         #[cfg(feature = "backend-vulkan")]
@@ -1978,13 +1990,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 "compute_stage_tex type11_fail reason=read mapping={mapping_id} {width}x{height} off={surface_offset} bpr={surface_bpr} span_end={span_end} pages={pages_n}"
             ));
             return Err(ComputeStatus::GuestIo("compute_stage_tex_type11_read"));
-        }
-        if crate::observe::content_probe_enabled() && !seed_skipped && sample_resident.is_none() {
-            crate::observe::off(format!(
-                "compute_content stage=stage_read mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} storage={} gen={seed_generation} {}",
-                is_storage as u8,
-                crate::observe::content_summary(&bytes, bpp, width, height),
-            ));
         }
         let writeback = if is_storage {
             TextureWriteback::Type11 {
@@ -2154,23 +2159,35 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     });
     #[cfg_attr(
         not(feature = "backend-vulkan"),
-        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+        allow(
+            unused_mut,
+            reason = "the Vulkan resident-window block below assigns it"
+        )
     )]
     let mut seed_skipped = false;
     #[cfg_attr(
         not(feature = "backend-vulkan"),
-        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+        allow(
+            unused_mut,
+            reason = "the Vulkan resident-window block below assigns it"
+        )
     )]
     let mut seed_generation = 0u32;
     #[cfg_attr(
         not(feature = "backend-vulkan"),
-        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+        allow(
+            unused_mut,
+            reason = "the Vulkan resident-window block below assigns it"
+        )
     )]
     let mut sample_resident = None;
     let mut bytes = vec![0u8; need];
     #[cfg_attr(
         not(feature = "backend-vulkan"),
-        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+        allow(
+            unused_mut,
+            reason = "the Vulkan resident-window block below assigns it"
+        )
     )]
     let mut have_bytes = false;
     // Resident-authoritative window (deferred linear writeback): consume the
@@ -2355,7 +2372,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // defer-time page index so aliased raw-GVA readers land it first.
     #[cfg_attr(
         not(feature = "backend-vulkan"),
-        allow(unused_mut, reason = "the Vulkan storage-residency block below assigns it")
+        allow(
+            unused_mut,
+            reason = "the Vulkan storage-residency block below assigns it"
+        )
     )]
     let mut residency = None;
     #[cfg(feature = "backend-vulkan")]
@@ -2642,14 +2662,6 @@ fn writeback_texture<M: HostMemory + HostOps>(
             bpp,
         } => {
             let tight = width.saturating_mul(*bpp);
-            if crate::observe::content_probe_enabled() {
-                crate::observe::off(format!(
-                    "compute_content stage=write_out mapping={mapping_id} {width}x{height} fmt={:#x} bind={} {}",
-                    tex.pixel_format,
-                    tex.binding,
-                    crate::observe::content_summary(&tex.bytes, *bpp, *width, *height),
-                ));
-            }
             if !mapping_write::write_full_rect_raw_at(
                 state,
                 host,
@@ -3933,15 +3945,13 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     crate::runtime::storage_flush::release_window_pin(&victim, &victim_owner);
                 }
             }
-            state
-                .compute_deferred_flush
-                .insert(
-                    key,
-                    crate::model::DeferredOwner::Storage {
-                        generation,
-                        armed_stamp_seq: state.completion_stamp_seq,
-                    },
-                );
+            state.compute_deferred_flush.insert(
+                key,
+                crate::model::DeferredOwner::Storage {
+                    generation,
+                    armed_stamp_seq: state.completion_stamp_seq,
+                },
+            );
             state.index_deferred_alias_pages(*mapping_id);
             let _ = state.mark_mapping_written(*mapping_id);
             note_storage_residency_writeback(state, t);

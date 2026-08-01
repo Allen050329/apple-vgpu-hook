@@ -225,8 +225,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
                     }
                 }
                 for (key, entry) in linear_index.iter() {
-                    if entry.pages.contains(&gpa_page)
-                        && !linear_hits.iter().any(|(k, _)| k == key)
+                    if entry.pages.contains(&gpa_page) && !linear_hits.iter().any(|(k, _)| k == key)
                     {
                         linear_hits.push((*key, entry.generation));
                     }
@@ -565,17 +564,12 @@ pub(crate) fn deferred_pages_still_ours<M: HostMemory + HostOps>(
 /// `supersede_gva_window` still drops a window the same submission re-renders.
 /// What it stops buying is survival across the fence, which was never the
 /// device's to sell.
-///
-/// `REIMS_VGPU_FENCE_FLUSH_OFF=gva` (or `=1`/`=all`) restores the old unbounded
-/// behaviour so an arm and its control can be measured on one binary.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
 ) {
-    if state.gva_deferred_flush.is_empty()
-        || crate::observe::fence_flush_disabled(crate::observe::FenceFlushRail::Gva)
-    {
+    if state.gva_deferred_flush.is_empty() {
         return;
     }
     // Oldest-first, so windows land in the order they were rendered: a later
@@ -627,17 +621,12 @@ pub fn flush_gva_windows_before_fence<M: HostMemory + HostOps>(
 /// A rate this low cannot on its own convict this rail of any guest crash, and no
 /// such claim is made. What it does mean is that the correct behaviour is also
 /// the cheap one, so there is nothing to trade.
-///
-/// `REIMS_VGPU_FENCE_FLUSH_OFF=linear` (or `=1`/`=all`) restores the unbounded
-/// behaviour here, so an arm and its control stay one binary apart.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
 ) {
-    if state.linear_deferred_flush.is_empty()
-        || crate::observe::fence_flush_disabled(crate::observe::FenceFlushRail::Linear)
-    {
+    if state.linear_deferred_flush.is_empty() {
         return;
     }
     // Snapshot the keys first: `flush_linear_one` disarms its own window and may
@@ -754,9 +743,8 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// its fence pays a readback for each: `surface_resident 49 706` against
 /// `surface_flush 12 343` bounds it at 4× the current landings. That is the trade
 /// this binding makes, and it is a trade rather than a regression only if the
-/// measurement says so, so it is measured on one binary under
-/// `REIMS_VGPU_FENCE_FLUSH_OFF=mapping` with `present_hz` and `draw_us` read both
-/// ways.
+/// measurement says so, and `present_hz` and `draw_us` were read both ways to
+/// settle it.
 ///
 /// The GVA rail's binding was expected to cost frame rate and paid back instead
 /// (5.9 → 9.5 Hz, `draw_us` 524 ms → 156 ms), because the unbounded rail spent
@@ -783,21 +771,12 @@ pub fn flush_linear_windows_before_fence<M: HostMemory + HostOps>(
 /// this incarnation. That hold is the existing contract and the fence does not
 /// override it — such a window is not owed to guest RAM until the resolve says
 /// the memory is still ours.
-///
-/// `REIMS_VGPU_FENCE_FLUSH_OFF=mapping` restores the unbounded behaviour on this
-/// rail *only*. That matters more here than on the other two: the GVA and linear
-/// bindings are already measured and the icon verdict depends on them, so an
-/// `=1` control would price this rail against a control that had also given back
-/// two repairs. `=1`/`=all` still revert every rail, for a bisection that wants
-/// the pre-fence device back.
 #[cfg(feature = "backend-vulkan")]
 pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
 ) {
-    if state.compute_deferred_flush.is_empty()
-        || crate::observe::fence_flush_disabled(crate::observe::FenceFlushRail::Mapping)
-    {
+    if state.compute_deferred_flush.is_empty() {
         return;
     }
     // Snapshot first: landing one window consumes its overlapping siblings
@@ -809,7 +788,13 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
             continue;
         }
         crate::runtime::drain::note_store_route("mapw_fence_flush");
-        flush_intersecting(state, host, key.mapping_id, key.surface_offset, key.span_end);
+        flush_intersecting(
+            state,
+            host,
+            key.mapping_id,
+            key.surface_offset,
+            key.span_end,
+        );
     }
 }
 
@@ -871,16 +856,14 @@ fn mapping_windows_fence_order(
     let mut rest: Vec<crate::model::ComputeStorageResidencyKey> = Vec::new();
     for (key, owner) in &state.compute_deferred_flush {
         match owner {
-            crate::model::DeferredOwner::Render { armed_seq, .. } => render.push((*armed_seq, *key)),
+            crate::model::DeferredOwner::Render { armed_seq, .. } => {
+                render.push((*armed_seq, *key))
+            }
             crate::model::DeferredOwner::Storage { .. } => rest.push(*key),
         }
     }
     render.sort_unstable_by_key(|(seq, _)| *seq);
-    render
-        .into_iter()
-        .map(|(_, key)| key)
-        .chain(rest)
-        .collect()
+    render.into_iter().map(|(_, key)| key).chain(rest).collect()
 }
 
 /// Score a deferred window about to write guest RAM against the guest's fence.
@@ -1538,10 +1521,6 @@ fn note_mapping_window_against_fence(
 /// disk hit apfs, airportd, tccd, a HID driver and WindowServer, which is not a
 /// bug in one path but a device writing where it no longer has title.
 ///
-/// `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF=1` restores the unguarded write. The
-/// counters are emitted either way, so the knob measures the guard's *cost*
-/// while the counters measure its *rate* — a boot with the guard off still says
-/// how many writes it would have refused.
 /// # Drift refuses this write and stops the list being believed again
 ///
 /// Refusing the one window is not enough. The list is what every later reader
@@ -1583,12 +1562,6 @@ fn mapping_pages_still_ours<M: HostMemory + HostOps>(
         // against `mapping_pages_drifted` was not the guard's hit rate.
         PagesVerdict::Unwitnessed(_) => {
             crate::runtime::drain::note_store_route("mapping_pages_unwitnessed");
-            true
-        }
-        // Counted before the knob is consulted, so a control boot still reports
-        // how many writes it would have refused.
-        PagesVerdict::DriftedButGated => {
-            crate::runtime::drain::note_store_route("mapping_pages_drifted");
             true
         }
         PagesVerdict::Drifted => {
@@ -1844,9 +1817,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
                          the Store this window defers)",
                         "rendflush_epoch_cleared",
                     ),
-                    ResidentContent::Epoch(_) => {
-                        ("resident_epoch_drift", "rendflush_epoch_drift")
-                    }
+                    ResidentContent::Epoch(_) => ("resident_epoch_drift", "rendflush_epoch_drift"),
                 };
                 crate::runtime::drain::note_store_route(route);
                 crate::observe::fail(format!(
@@ -2036,16 +2007,6 @@ fn flush_storage_one<M: HostMemory + HostOps>(
         return false;
     }
     let tight = key.width.saturating_mul(texel);
-    if crate::observe::content_probe_enabled() {
-        crate::observe::off(format!(
-            "compute_content stage=flush_out mapping={} {}x{} fmt={:#x} gen={generation} {}",
-            key.mapping_id,
-            key.width,
-            key.height,
-            key.pixel_format,
-            crate::observe::content_summary(&bytes, texel, key.width, key.height),
-        ));
-    }
     if !crate::runtime::mapping_write::write_full_rect_raw_at(
         state,
         host,
@@ -2361,7 +2322,10 @@ mod tests {
         m.map_generation = 5;
         state.compute_deferred_flush.insert(
             key(9, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let cap = crate::observe::FailCapture::start();
         assert!(!super::flush_intersecting(
@@ -2578,8 +2542,7 @@ mod tests {
                 host.guest_wrote_page(page);
             }
             let cap = crate::observe::FailCapture::start();
-            let preserve =
-                super::render_flush_guest_written_ranges(&state, &host, &key(9, 0, 256));
+            let preserve = super::render_flush_guest_written_ranges(&state, &host, &key(9, 0, 256));
             let clobbers: Vec<String> = cap
                 .lines()
                 .into_iter()
@@ -2930,7 +2893,10 @@ mod tests {
             .insert(key(9, 0, 256), render_owner(7));
         state.compute_deferred_flush.insert(
             key(9, 256, 512),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let cap = crate::observe::FailCapture::start();
         super::drop_windows(&mut state, 9, "unit");
@@ -2970,9 +2936,13 @@ mod tests {
             m.map_generation = 2;
             m.page_entries = vec![(0x300 << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
         }
-        state
-            .compute_deferred_flush
-            .insert(k, crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 });
+        state.compute_deferred_flush.insert(
+            k,
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
+        );
         // The guest deletes the backing; the window is kept for the fingerprint
         // decision and the page list moves to `condemned_entries`.
         assert!(state.condemn_surface_backing(9));
@@ -3063,7 +3033,10 @@ mod tests {
         // (fail-visible loss), remove the window, and return false.
         state.compute_deferred_flush.insert(
             key(9, 0, 4096),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let ok = super::flush_intersecting(&mut state, &mut host, 9, 0, u64::MAX);
         assert!(!ok, "lost window must report failure");
@@ -3074,7 +3047,10 @@ mod tests {
         // Disjoint mapping id: untouched.
         state.compute_deferred_flush.insert(
             key(10, 0, 4096),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         assert!(super::flush_intersecting(
             &mut state,
@@ -3128,11 +3104,17 @@ mod tests {
         let ckey = |mapping_id: u32| key(mapping_id, 0, 0x1000);
         state.compute_deferred_flush.insert(
             ckey(9),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         state.compute_deferred_flush.insert(
             ckey(10),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         // Product defer sites index pages at defer time.
         state.index_deferred_alias_pages(9);
@@ -3177,12 +3159,18 @@ mod tests {
         }
         state.compute_deferred_flush.insert(
             key(9, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         let disjoint = key(10, 0, 0x1000);
         state.compute_deferred_flush.insert(
             disjoint,
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         // Linear windows never name the mapping: one aliases mapping 9's
         // physical page, one sits on a disjoint page.
@@ -3362,7 +3350,11 @@ mod tests {
         state.completion_stamp_seq = 41;
         state.arm_linear_deferred_window(key, 1, [p(0xA)].into_iter().collect());
         assert_eq!(
-            state.linear_deferred_flush.get(&key).unwrap().armed_stamp_seq,
+            state
+                .linear_deferred_flush
+                .get(&key)
+                .unwrap()
+                .armed_stamp_seq,
             41,
             "the window must carry the fence it was armed under"
         );
@@ -3803,7 +3795,11 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let k = key(7, 0, 256);
         state.map_surface(k.mapping_id);
-        state.mappings.get_mut(&k.mapping_id).unwrap().map_generation = k.map_generation;
+        state
+            .mappings
+            .get_mut(&k.mapping_id)
+            .unwrap()
+            .map_generation = k.map_generation;
         let from_key = super::render_window_identity(&k);
 
         // The spelling the arm uses, when the pass extent equals the attachment
@@ -4133,7 +4129,11 @@ mod tests {
             ),
             "an unmoved window's resident is the draw's own prior content"
         );
-        assert_eq!(tail(at), "", "an unmoved window must be quiet on both sides");
+        assert_eq!(
+            tail(at),
+            "",
+            "an unmoved window must be quiet on both sides"
+        );
 
         // The guest handed this address to a different allocation. The resident
         // still exists, still has the geometry, and still reports content_ready
@@ -4369,15 +4369,24 @@ mod tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         state.compute_deferred_flush.insert(
             key(7, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 3, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 3,
+                armed_stamp_seq: 0,
+            },
         );
         state.compute_deferred_flush.insert(
             key(7, 256, 512),
-            crate::model::DeferredOwner::Storage { generation: 4, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 4,
+                armed_stamp_seq: 0,
+            },
         );
         state.compute_deferred_flush.insert(
             key(8, 0, 256),
-            crate::model::DeferredOwner::Storage { generation: 5, armed_stamp_seq: 0 },
+            crate::model::DeferredOwner::Storage {
+                generation: 5,
+                armed_stamp_seq: 0,
+            },
         );
 
         // Disjoint range takes nothing.

@@ -1169,11 +1169,7 @@ pub fn type4_pages_witness<H: HostMemory>(
     }
     let page_shift = state.page_shift;
     let page_size = crate::contract::iosurface_pages::page_size_of(page_shift);
-    let Some(task) = state
-        .tasks
-        .get(walk.task_id as usize)
-        .filter(|t| t.active)
-    else {
+    let Some(task) = state.tasks.get(walk.task_id as usize).filter(|t| t.active) else {
         // The task that owned the translation is gone. Its page table is gone
         // with it, so the cached GPAs are unbacked by anything this device can
         // still read — which is exactly the state a write must not proceed in.
@@ -1203,9 +1199,6 @@ pub fn type4_pages_witness<H: HostMemory>(
             // nothing had moved and the device simply could not translate it.
             // Both outcomes refuse the write; only one of them is about the
             // guest.
-            if crate::observe::type4_identity_guard_disabled() && cached == Some(gva) {
-                continue;
-            }
             crate::observe::fail(format!(
                 "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
                  cached={cached:?} live=None reason=no_translation \
@@ -1342,10 +1335,10 @@ pub fn vouch_mapping_pages<H: HostMemory + HostOps>(
 /// [`vouch_mapping_pages`], also handing back what the re-walk found.
 ///
 /// A caller that emits counters needs the verdict and not just the token,
-/// because `DriftedButGated` and `Ours` both yield a token and only one of them
-/// is a clean answer. Folding them together would make the control arm
-/// indistinguishable from a boot with no drift — a count that reads as success
-/// when it is the opposite.
+/// because `Unwitnessed` and `Ours` both yield a token and only one of them is
+/// a clean answer. Folding them together would make a boot that never armed the
+/// guard indistinguishable from one with no drift — a count that reads as
+/// success when it is the opposite.
 pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -1366,10 +1359,7 @@ pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
 ///
 /// Two rails ask this question — the deferred render flush and the four direct
 /// writers — and they want different counters but must not want different
-/// *policy*. Splitting "drifted" from "drifted, but the control knob is on"
-/// is what lets a control boot still report how many writes it would have
-/// refused, which is the whole reason the knob and the counters are separate
-/// instruments.
+/// *policy*.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PagesVerdict {
     /// The re-walk agreed with the cached list, every page of it.
@@ -1382,10 +1372,6 @@ pub enum PagesVerdict {
     /// passed or had simply never been armed, and those are opposite claims
     /// about the write-after-free class.
     Unwitnessed(&'static str),
-    /// The re-walk disagreed, but `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF` is set, so
-    /// the write proceeds anyway and the list is left alone. This is the control
-    /// arm: same binary, unguarded behaviour, counters still emitted.
-    DriftedButGated,
     /// The re-walk disagreed. The list has been invalidated — refusing this one
     /// write is not enough, because `page_entries` is what every later reader and
     /// writer resolves through.
@@ -1410,9 +1396,6 @@ pub fn mapping_pages_verdict<H: HostMemory + HostOps>(
         // counter, because only one of the two is evidence.
         Type4Witness::Unwitnessed(why) => return PagesVerdict::Unwitnessed(why),
         Type4Witness::Drifted => {}
-    }
-    if crate::observe::mapping_page_guard_disabled() {
-        return PagesVerdict::DriftedButGated;
     }
     state.invalidate_mapping_pages(mapping_id);
     PagesVerdict::Drifted
@@ -1942,10 +1925,7 @@ fn licence_from(
 }
 
 /// [`licence_from`] for a call site that holds only the mapping id.
-fn write_licence(
-    state: &DeviceState,
-    mapping_id: u32,
-) -> crate::observe::footprint::WriteLicence {
+fn write_licence(state: &DeviceState, mapping_id: u32) -> crate::observe::footprint::WriteLicence {
     licence_from(
         state
             .mappings
@@ -2431,7 +2411,12 @@ mod revalidate_tests {
         ));
         let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
         assert!(!write_mapping_bytes(
-            &mut state, &mut host, mid, 0, &[1], &vouched
+            &mut state,
+            &mut host,
+            mid,
+            0,
+            &[1],
+            &vouched
         ));
     }
 
@@ -2694,7 +2679,9 @@ mod revalidate_tests {
         let page = 1u64 << PAGE_SHIFT_X86;
         let shared = 0x6000_0000u64;
         let only_mine = 0x6000_0000u64 + page;
-        let entry = |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        let entry = |gpa: u64| {
+            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+        };
 
         for mid in [20u32, 21] {
             state.map_surface(mid);
@@ -2747,8 +2734,7 @@ mod revalidate_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let page = 1u64 << PAGE_SHIFT_X86;
         let gpa = 0x6100_0000u64;
-        let entry =
-            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        let entry = (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
 
         state.map_surface(30);
         let m = state.mappings.get_mut(&30).unwrap();
@@ -2773,7 +2759,11 @@ mod revalidate_tests {
             "the retire scan must run; a zero here is what made the detector \
              UNMEASURED on every driven boot"
         );
-        assert_eq!(footprint::retired_counts().0, 1, "the condemned page retires");
+        assert_eq!(
+            footprint::retired_counts().0,
+            1,
+            "the condemned page retires"
+        );
 
         footprint::note_written_range(footprint::Rail::Mapping, gpa, 16);
         assert_eq!(
@@ -2809,8 +2799,9 @@ mod revalidate_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let gone = 0x7000_0000u64;
         let kept = 0x7100_0000u64;
-        let entry =
-            |gpa: u64| (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
+        let entry = |gpa: u64| {
+            (((gpa >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+        };
 
         state.map_surface(70);
         {
@@ -2967,8 +2958,8 @@ mod tests {
     /// legitimate write in production.
     #[test]
     fn the_page_witness_sees_a_rewire_no_packet_announced() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
         use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
         use crate::runtime::host::{FakeHost, HostMemory};
 
@@ -2997,8 +2988,9 @@ mod tests {
         {
             let m = state.mappings.get_mut(&6).unwrap();
             m.mapped = true;
-            m.page_entries =
-                vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.page_entries = vec![
+                (((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
             m.type4_walk = Some(Type4Walk {
                 task_id: 1,
                 backing_pfn: 0,
@@ -3251,8 +3243,7 @@ mod tests {
             {
                 let m = state.mappings.get_mut(&6).unwrap();
                 m.mapped = true;
-                m.page_entries =
-                    vec![(cached_pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+                m.page_entries = vec![(cached_pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
                 m.type4_walk = Some(Type4Walk {
                     task_id: 1,
                     backing_pfn: BACKING_PFN,
@@ -3276,11 +3267,15 @@ mod tests {
 
         let identity = refuse_with(BACKING_PFN);
         assert!(
-            identity.iter().any(|l| l.contains("reason=identity_entry_corrected")),
+            identity
+                .iter()
+                .any(|l| l.contains("reason=identity_entry_corrected")),
             "an entry equal to its own GVA is this device's guess, not a move: {identity:?}"
         );
         assert!(
-            !identity.iter().any(|l| l.contains("reason=translation_moved")),
+            !identity
+                .iter()
+                .any(|l| l.contains("reason=translation_moved")),
             "nothing moved — blaming the guest here is the bug: {identity:?}"
         );
 
@@ -3293,7 +3288,9 @@ mod tests {
             "a real entry that disagrees is still a move: {moved:?}"
         );
         assert!(
-            !moved.iter().any(|l| l.contains("reason=identity_entry_corrected")),
+            !moved
+                .iter()
+                .any(|l| l.contains("reason=identity_entry_corrected")),
             "only an entry equal to its GVA is the substitution: {moved:?}"
         );
     }

@@ -58,13 +58,6 @@ pub enum ValiditySite {
 }
 
 impl ValiditySite {
-    fn slug(self) -> &'static str {
-        match self {
-            Self::ExecTable => "exec",
-            Self::InvalidateResources => "inv",
-        }
-    }
-
     fn clear_host_route(self) -> &'static str {
         match self {
             Self::ExecTable => "validity_clr_host_exec",
@@ -123,11 +116,8 @@ pub fn apply(
                 .windows_dropped
                 .saturating_add(drop_stale_windows(state, id, site));
             let seq = state.next_validity_seq();
-            let bump = !crate::observe::resource_validity_disabled("bump");
             if let Some(m) = state.mappings.get_mut(&id) {
-                if bump {
-                    m.content_generation = m.content_generation.saturating_add(1);
-                }
+                m.content_generation = m.content_generation.saturating_add(1);
                 // Stamped rather than latched: the claim is about this moment,
                 // and the device's next publish into this surface supersedes it.
                 m.validity.host_cleared_seq = seq;
@@ -260,24 +250,15 @@ pub fn writeback_refused(state: &DeviceState, mapping_id: u32) -> bool {
     let licence = writeback_licence(state, mapping_id);
     crate::runtime::drain::note_store_route(licence.route());
     licence == WritebackLicence::Superseded
-        && !crate::observe::resource_validity_disabled("writeback")
 }
 
-/// Take the mapping's pending windows, or count what would have been taken.
-///
-/// The count is reported either way, which is what makes the knob a measurement
-/// rather than a hiding place: a control boot reports the same
-/// `validity_windows_dropped` number the armed boot acts on, so the two differ
-/// only in whether those windows landed.
+/// Take the mapping's pending windows, reporting how many were taken.
 fn drop_stale_windows(state: &mut DeviceState, mapping_id: u32, site: ValiditySite) -> u32 {
     let pending = state.deferred_flush_window_count(mapping_id);
     if pending == 0 {
         return 0;
     }
     crate::runtime::drain::note_store_route_n("validity_windows_dropped", pending as u64);
-    if crate::observe::resource_validity_disabled(site.slug()) {
-        return 0;
-    }
     crate::runtime::storage_flush::drop_windows(
         state,
         mapping_id,
@@ -389,7 +370,13 @@ mod tests {
     #[test]
     fn an_unknown_object_is_reported_as_a_miss() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let out = apply(&mut state, 0, 4242, quad(1, 0, 0, 0), ValiditySite::ExecTable);
+        let out = apply(
+            &mut state,
+            0,
+            4242,
+            quad(1, 0, 0, 0),
+            ValiditySite::ExecTable,
+        );
         assert!(out.missed);
         assert_eq!(out.bumped, 0);
     }
@@ -494,7 +481,8 @@ mod tests {
                 armed_stamp_seq: 0,
                 source: crate::model::RenderWindowSource::Owned(std::sync::Arc::new(vec![
                     0u8;
-                    64 * 64 * 4
+                    64 * 64
+                        * 4
                 ])),
             },
         );

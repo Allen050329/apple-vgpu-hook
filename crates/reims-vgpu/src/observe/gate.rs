@@ -1091,7 +1091,11 @@ fn the_production_filter_drops_test_only_files_and_nothing_else() {
          production scans and a removed one must not be listed here"
     );
     // And the production files those live beside are still scanned.
-    for expect in ["runtime/drain/mod.rs", "runtime/mipmap.rs", "observe/mod.rs"] {
+    for expect in [
+        "runtime/drain/mod.rs",
+        "runtime/mipmap.rs",
+        "observe/mod.rs",
+    ] {
         assert!(
             production.iter().any(|p| p == expect),
             "the filter dropped production file {expect}"
@@ -1415,8 +1419,10 @@ fn every_guest_ram_writer_is_classified_for_the_payload_census() {
         .filter(|(_, _, how, _)| *how != Marks::ReadOnly)
         .map(|(file, ..)| *file)
         .collect();
-    let classified: std::collections::BTreeSet<&str> =
-        PAYLOAD_CENSUS_SITES.iter().map(|(file, ..)| *file).collect();
+    let classified: std::collections::BTreeSet<&str> = PAYLOAD_CENSUS_SITES
+        .iter()
+        .map(|(file, ..)| *file)
+        .collect();
     assert_eq!(
         writers, classified,
         "every rail that puts bytes in guest RAM needs a payload-census verdict. \
@@ -1581,8 +1587,8 @@ fn every_unbounded_raw_gva_write_is_named_and_justified() {
 /// list still names the guest memory it was walked from — and, since it reports
 /// `Unwitnessed` apart from `Verified`, whether it was in a position to know.
 /// `mapper::mapping_pages_verdict` decides what the device does about the
-/// answer: count it, consult `REIMS_VGPU_MAPPING_PAGE_GUARD_OFF`, and — when it
-/// refuses — invalidate the list rather than skip one write. Those are separable
+/// answer: count it, and — when it refuses — invalidate the list rather than
+/// skip one write. Those are separable
 /// and a caller that reaches past the second to the first gets the question
 /// without any of the answer.
 ///
@@ -1620,9 +1626,8 @@ fn the_page_drift_witness_is_only_consulted_through_the_policy() {
         callers.len(),
         1,
         "the page-drift witness must be reached only through \
-         mapper::mapping_pages_verdict, which is what counts the outcome, \
-         consults REIMS_VGPU_MAPPING_PAGE_GUARD_OFF and invalidates a \
-         contradicted list. Callers found:\n  {}",
+         mapper::mapping_pages_verdict, which is what counts the outcome and \
+         invalidates a contradicted list. Callers found:\n  {}",
         callers.join("\n  ")
     );
 }

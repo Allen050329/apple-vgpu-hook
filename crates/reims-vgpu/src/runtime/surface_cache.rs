@@ -165,8 +165,8 @@ fn surface_entry_is_current(state: &DeviceState, surface_id: u32) -> bool {
 /// on a guess is the wrong way round: a withheld Load seed renders the pass onto
 /// a cleared target, which is a compositing layer going solid black, and this
 /// project has already paid a boot for that failure direction (`13ae46d`, 0 of
-/// 14 rounds). So this counts first and `REIMS_VGPU_SURFACE_CACHE_GEN_STRICT=1`
-/// is what acts on it, which keeps an arm and its control one binary apart.
+/// 14 rounds). So a stale incarnation is counted and reported, and still
+/// served; nothing here refuses on it.
 fn surface_entry_may_serve(state: &DeviceState, surface_id: u32) -> bool {
     if !state.host_surfaces.contains_key(&surface_id) {
         return true;
@@ -186,7 +186,7 @@ fn surface_entry_may_serve(state: &DeviceState, surface_id: u32) -> bool {
             entry.height
         ));
     }
-    !crate::observe::surface_cache_gen_strict()
+    true
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
@@ -683,9 +683,7 @@ pub fn store_gva_owned(
     // been charged for it is now a different question. Retiring the witness key
     // here keeps `gva_cap_wanted` a count of lookups the cap actually cost,
     // rather than one that keeps accruing against content that came back.
-    state
-        .gva_eviction_witness
-        .note_restored(gva, width, height);
+    state.gva_eviction_witness.note_restored(gva, width, height);
     let touch = state.next_gva_touch();
     let entry = state.host_gva_surfaces.entry(gva).or_default();
     entry.last_touch = touch;
@@ -788,9 +786,6 @@ fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: us
 /// because refusing to cache a surface for being big is how a 4K wallpaper
 /// stops being cached at all.
 pub fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
-    if crate::observe::gva_cache_cap_disabled() {
-        return;
-    }
     let cap = state.gva_cache_byte_cap;
     let low_water = cap - cap / 8;
     // The running total, not a fresh sum: this runs on the store path, which is
@@ -975,9 +970,8 @@ pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
 /// texture memory, which is the condition, not the mechanism.
 ///
 /// The two corrupt rounds in the low mode are the reminder that this class has
-/// been two defects since it was first split (see
-/// [`crate::observe::sink::content_reuse_disabled`]): a high-recycling round
-/// corrupts reliably, and something else corrupts occasionally regardless.
+/// been two defects since it was first split: a high-recycling round corrupts
+/// reliably, and something else corrupts occasionally regardless.
 ///
 /// # Cross-validated on a second boot, and it earns its keep by refusing credit
 ///
@@ -1167,7 +1161,8 @@ pub fn mark_gva_backing_suspect(
         // decides — so an over-mark costs one walk that comes back
         // `Confirmed`, while a missed mark leaves a stale entry serving with
         // nobody ever asking it to prove itself.
-        if !crate::runtime::gva_view::task_matches(backing.task_id, task_id) || entry.backing_suspect
+        if !crate::runtime::gva_view::task_matches(backing.task_id, task_id)
+            || entry.backing_suspect
         {
             continue;
         }
@@ -1507,7 +1502,6 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     // here is a level. Take the last line for all of them either way; do not
     // sum any of it.
     let (cap_evicted, cap_wanted, cap_forgotten) = state.gva_eviction_witness.counts();
-    let cap_off = crate::observe::gva_cache_cap_disabled() as u8;
     // The running total the cap actually tests against, minus the real sum this
     // census just computed for `gva_bytes`. Always 0; anything else means a
     // mutation site changed `bgra` without telling `gva_cache_bytes`, and the
@@ -1521,7 +1515,7 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          gva_backing_bytes={backing_bytes} \
          gva_backing_moved={moved} gva_backing_unmapped={unmapped} \
          gva_backing_checked={checked} \
-         gva_cap_off={cap_off} gva_cap_bytes={} gva_cap_drift={cap_drift} \
+         gva_cap_bytes={} gva_cap_drift={cap_drift} \
          gva_cap_evicted={cap_evicted} gva_cap_wanted={cap_wanted} \
          gva_cap_forgotten={cap_forgotten} \
          linear={} linear_bytes={} linear_largest={}",
@@ -1708,7 +1702,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
 
         store(&mut st, 7, 4, 4, px.clone());
-        seen.insert(get_from_with_gen(&st.host_surfaces, 7, 4, 4).expect("mid store").1);
+        seen.insert(
+            get_from_with_gen(&st.host_surfaces, 7, 4, 4)
+                .expect("mid store")
+                .1,
+        );
         store_texture(&mut st, 9, 4, 4, px.clone());
         seen.insert(
             get_from_with_gen(&st.host_texture_surfaces, 9, 4, 4)
@@ -1724,7 +1722,10 @@ mod tests {
         seen.insert(st.host_surfaces.get(&7).expect("ceded entry").host_gen);
 
         assert_eq!(seen.len(), 4, "four stores, four distinct generations");
-        assert!(!seen.contains(&0), "0 is reserved for 'no host content yet'");
+        assert!(
+            !seen.contains(&0),
+            "0 is reserved for 'no host content yet'"
+        );
     }
 
     /// Deferred linear residency lifecycle: note marks the entry
@@ -2307,7 +2308,15 @@ mod tests {
         }
         // An entry stored with no recorded backing cannot be marked — there is
         // nothing to compare it against, and it reports `Unrecorded` forever.
-        store_gva_owned(&mut st, 9 * page, w, h, vec![0u8; (w * h * 4) as usize], 0, None);
+        store_gva_owned(
+            &mut st,
+            9 * page,
+            w,
+            h,
+            vec![0u8; (w * h * 4) as usize],
+            0,
+            None,
+        );
 
         // Exactly the two entries the range overlaps.
         assert_eq!(mark_gva_backing_suspect(&mut st, 1, 2 * page, 2 * page), 2);
@@ -2486,7 +2495,10 @@ mod tests {
         // store records the new pages.
         repoint_pte(&mut host, root_gpa, 1, 12);
         let second_gpa = store_armed(&mut st, &mut host, gva, 0x5A);
-        assert_ne!(first_gpa, second_gpa, "the address names different pages now");
+        assert_ne!(
+            first_gpa, second_gpa,
+            "the address names different pages now"
+        );
 
         // A write to the *old* pages says nothing about this entry.
         host.guest_wrote_page(first_gpa);
@@ -2566,7 +2578,10 @@ mod tests {
         let (w, h) = (64u32, 192u32);
 
         let whole = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
-        assert!(whole.gpas.iter().all(|&g| g != 0), "fixture starts complete");
+        assert!(
+            whole.gpas.iter().all(|&g| g != 0),
+            "fixture starts complete"
+        );
         store_gva_owned(
             &mut st,
             gva,
@@ -2629,7 +2644,11 @@ mod tests {
 
         evict_gva(&mut st, page);
         crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
-        assert_eq!(host.tracked_guest_write_sets(), 1, "the evicted entry's set");
+        assert_eq!(
+            host.tracked_guest_write_sets(),
+            1,
+            "the evicted entry's set"
+        );
 
         let _ = st.take_all_host_views();
         crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
@@ -2669,8 +2688,7 @@ mod incarnation_tests {
     /// The rate is unmeasured, and the failure direction of refusing is worse
     /// than the failure direction of serving: a withheld Load seed renders onto
     /// a cleared target, which is a compositing layer going solid black. The
-    /// identity is captured and counted first; `REIMS_VGPU_SURFACE_CACHE_GEN_STRICT`
-    /// is what acts on it.
+    /// identity is captured and counted; nothing acts on it.
     #[test]
     fn a_cached_surface_frame_knows_which_incarnation_it_came_from() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2715,7 +2733,7 @@ mod incarnation_tests {
         // Unchanged by default: counted, not yet refused.
         assert!(
             get(&state, mid, w, h).is_some(),
-            "REIMS_VGPU_SURFACE_CACHE_GEN_STRICT is what turns the refusal on"
+            "a stale incarnation is reported, not refused"
         );
     }
 
@@ -2731,7 +2749,13 @@ mod incarnation_tests {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         let (w, h) = (8u32, 4u32);
         let texture_ref = 12u32;
-        store_texture(&mut state, texture_ref, w, h, vec![0x3cu8; (w * h * 4) as usize]);
+        store_texture(
+            &mut state,
+            texture_ref,
+            w,
+            h,
+            vec![0x3cu8; (w * h * 4) as usize],
+        );
         assert_eq!(
             state.host_texture_surfaces[&texture_ref].map_generation_at_store, 0,
             "a texture ref names no mapping incarnation"
@@ -3158,7 +3182,10 @@ mod cap_tests {
         let served = get_gva(&state, gva, w, h)
             .expect("an oversized entry rides alone rather than being refused");
         assert!(served.iter().all(|&b| b == 0x77));
-        assert_eq!(state.gva_cache_bytes, big, "and the total still describes it");
+        assert_eq!(
+            state.gva_cache_bytes, big,
+            "and the total still describes it"
+        );
         assert_eq!(
             state.gva_eviction_witness.evicted, 0,
             "nothing was evicted: there was nothing else to evict"
@@ -3198,7 +3225,11 @@ mod cap_tests {
 
         // Replace at an existing key, same size: the total must not move.
         store_frame(&mut state, 0x1000, 0xFF);
-        assert_eq!(state.gva_cache_bytes, 8 * FRAME_BYTES, "replace double-charged");
+        assert_eq!(
+            state.gva_cache_bytes,
+            8 * FRAME_BYTES,
+            "replace double-charged"
+        );
         assert_eq!(state.gva_cache_bytes, truth(&state));
 
         // Replace at an existing key with a *different* geometry: the old bytes
@@ -3224,9 +3255,16 @@ mod cap_tests {
         state.gva_cache_byte_cap = 4 * FRAME_BYTES;
         for i in 0..64u64 {
             store_frame(&mut state, 0x400_0000 + i * 0x1000, i as u8);
-            assert_eq!(state.gva_cache_bytes, truth(&state), "under the cap, round {i}");
+            assert_eq!(
+                state.gva_cache_bytes,
+                truth(&state),
+                "under the cap, round {i}"
+            );
         }
-        assert!(state.gva_eviction_witness.evicted > 0, "the cap must have run");
+        assert!(
+            state.gva_eviction_witness.evicted > 0,
+            "the cap must have run"
+        );
     }
 
     use std::sync::atomic::Ordering::Relaxed;

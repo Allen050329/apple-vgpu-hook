@@ -828,7 +828,6 @@ fn apply_type4_backing<M: HostMemory>(
     let mut entries = Vec::with_capacity(page_count as usize);
     let mut gva_hits = 0u32;
     let mut id_hits = 0u32;
-    let identity_allowed = crate::observe::type4_identity_guard_disabled();
     for i in 0..page_count {
         let gva = ((surf.backing_pfn as u64) + i) << page_shift;
         let walked = gva_mem::translate_task_gva(host, task, gva, page_shift);
@@ -838,18 +837,13 @@ fn apply_type4_backing<M: HostMemory>(
                 Some(g)
             }
             None => {
-                // Counted whichever way the guard is set, so a guarded boot
-                // still reports what the old path would have fabricated.
+                // Still counted, so the refusal reports how many pages the old
+                // identity guess would have fabricated a backing for.
                 let mut probe = [0u8; 1];
-                let ram = host.read_gpa(gva, &mut probe).is_ok();
-                if ram {
+                if host.read_gpa(gva, &mut probe).is_ok() {
                     id_hits = id_hits.saturating_add(1);
                 }
-                if ram && identity_allowed {
-                    Some(gva)
-                } else {
-                    None
-                }
+                None
             }
         };
         let Some(gpa) = gpa else {
@@ -1220,17 +1214,11 @@ fn resolve_type4_surface_ex<M: HostMemory>(
                         {
                             Some(gpa) => cached == Some(gpa & !(page_size - 1)),
                             // No translation now, so nothing here can vouch for
-                            // the cached table. With the guard on the device
-                            // never caches a GVA-as-GPA entry, so this only
-                            // matched a guess; say stale and let the rebuild
+                            // the cached table. The device never caches a
+                            // GVA-as-GPA entry, so say stale and let the rebuild
                             // refuse, which is what moves the task search on to
-                            // the task that can translate. With the guard off,
-                            // keep the old answer so the control arm is one
-                            // binary apart and not one policy apart.
-                            None => {
-                                crate::observe::type4_identity_guard_disabled()
-                                    && cached == Some(gva)
-                            }
+                            // the task that can translate.
+                            None => false,
                         }
                     };
                     let last = m.page_entries.len() - 1;

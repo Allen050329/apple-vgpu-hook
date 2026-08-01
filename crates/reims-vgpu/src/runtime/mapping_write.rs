@@ -167,14 +167,9 @@ fn vouch_for_write<M: HostMemory + HostOps>(
                 _ => "mapw_unwit_no_mapping",
             });
         }
-        // Counted whether or not the knob let the write through, so a control
-        // boot still reports how many writes it would have refused. The knob
-        // prices the guard in lost frames; the counter prices the defect.
-        mapper::PagesVerdict::DriftedButGated | mapper::PagesVerdict::Drifted => {
+        mapper::PagesVerdict::Drifted => {
             crate::observe::fail(format!(
-                "mapping_write fail reason=pages_not_vouched mid={mapping_id} writer={writer} \
-                 gated={}",
-                u8::from(verdict == mapper::PagesVerdict::DriftedButGated)
+                "mapping_write fail reason=pages_not_vouched mid={mapping_id} writer={writer}"
             ));
             crate::runtime::drain::note_store_route("mapw_pages_refused");
         }
@@ -289,7 +284,11 @@ pub type SkipRanges<'a> = &'a [(u64, u64)];
 /// bytes are excluded*. Two open-coded walks would be two chances to disagree.
 fn unskipped(start: u64, end: u64, skip: SkipRanges<'_>) -> Vec<(u64, u64)> {
     if skip.is_empty() {
-        return if start < end { vec![(start, end)] } else { vec![] };
+        return if start < end {
+            vec![(start, end)]
+        } else {
+            vec![]
+        };
     }
     let mut out = Vec::new();
     let mut cur = start;
@@ -495,8 +494,14 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         for (lo, hi) in unskipped(base_off, base_off.saturating_add(frame.len() as u64), skip) {
             let within = (lo - base_off) as usize;
             let len = (hi - lo) as usize;
-            if !mapper::write_mapping_bytes(state, host, mapping_id, lo, &frame[within..within + len], &vouched)
-            {
+            if !mapper::write_mapping_bytes(
+                state,
+                host,
+                mapping_id,
+                lo,
+                &frame[within..within + len],
+                &vouched,
+            ) {
                 return false;
             }
         }
@@ -717,7 +722,8 @@ pub fn write_rgba8_image_changed<M: HostMemory + HostOps>(
                     return false;
                 }
             }
-        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched) {
+        } else if !mapper::write_mapping_bytes(state, host, mapping_id, row_moff, &native, &vouched)
+        {
             return false;
         }
     }
@@ -1357,7 +1363,14 @@ fn write_rect_raw_at_impl<M: HostMemory + HostOps>(
             crate::observe::off(format!(
                 "mapping_write full_tight_direct mid={mapping_id} bytes={frame_len} bpr={surface_bpr} rows={height}"
             ));
-            if !mapper::write_mapping_bytes(state, host, mapping_id, base_off, &src[..frame_len], &vouched) {
+            if !mapper::write_mapping_bytes(
+                state,
+                host,
+                mapping_id,
+                base_off,
+                &src[..frame_len],
+                &vouched,
+            ) {
                 return false;
             }
             let _ = state.mark_mapping_written(mapping_id);
@@ -1474,7 +1487,13 @@ mod tests {
             m.mapping_internal = 1;
             m.page_entries = entries;
             assert!(state.set_mapping_geom(4, W, H, MTL_FORMAT_BGRA8_UNORM));
-            crate::runtime::surface_cache::store(&mut state, 4, W, H, vec![0u8; (W * H * 4) as usize]);
+            crate::runtime::surface_cache::store(
+                &mut state,
+                4,
+                W,
+                H,
+                vec![0u8; (W * H * 4) as usize],
+            );
 
             let frame = vec![0xAAu8; (W * H * 4) as usize];
             // Page 2 of the surface, in mapping-offset space.
@@ -1752,8 +1771,9 @@ mod tests {
         {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.mapped = true;
-            m.page_entries =
-                vec![(((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+            m.page_entries = vec![
+                (((data0 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
+            ];
             m.type4_walk = Some(Type4Walk {
                 task_id: 1,
                 backing_pfn: 0,
@@ -1804,8 +1824,7 @@ mod tests {
         let mut recycled = [0u8; 16];
         host.read_gpa(data0, &mut recycled).unwrap();
         assert_eq!(
-            recycled,
-            [0x5au8; 16],
+            recycled, [0x5au8; 16],
             "the page the guest took away must still hold its new owner's bytes \
              — this is the guest heap corruption the whole goal is about"
         );

@@ -24,16 +24,16 @@ use crate::runtime::decode::render::{
     PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::resource::ListObjectEntry;
+#[cfg(feature = "backend-vulkan")]
+use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_function_descriptor, decode_render_pipeline_descriptor, decode_sampler_descriptor,
     decode_texture_descriptor, texture_type8_opcode, BufferTextureDescriptor, DecodeStatus,
-    FunctionDescriptor, RenderPipelineDescriptor, OBJECT_TYPE_BUFFER,
-    OBJECT_TYPE_FUNCTION, OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
+    FunctionDescriptor, RenderPipelineDescriptor, OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION,
+    OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
 };
-#[cfg(feature = "backend-vulkan")]
-use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
@@ -347,9 +347,8 @@ pub struct DrawEncodeRequest {
     /// geometry then get two registry slots instead of one shared GPU image
     /// whose pixels belong to whichever of them rendered last.
     ///
-    /// 0 means "no allocation named": color0 is not a GVA target, the span does
-    /// not fully walk, or `REIMS_VGPU_GVA_IDENTITY_GEN_OFF=1`. Vulkan rail only;
-    /// the Metal arm never reads it.
+    /// 0 means "no allocation named": color0 is not a GVA target, or the span
+    /// does not fully walk. Vulkan rail only; the Metal arm never reads it.
     pub gva_alloc_gen: u64,
 }
 
