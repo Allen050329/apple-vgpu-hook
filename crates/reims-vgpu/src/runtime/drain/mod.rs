@@ -954,8 +954,7 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                             // counter is what `armed_stamp_seq` is compared
                             // against, so a rail that does not move it reads as
                             // punctual however long it actually waited.
-                            state.completion_stamp_seq =
-                                state.completion_stamp_seq.wrapping_add(1);
+                            state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
                             completed = true;
                         } else {
                             // The guest waits on this root completion stamp; a
@@ -1883,7 +1882,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
 ) -> ChildPacketDisposition {
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
-            apply_define_task2(state, host, &packet.payload, &format!("child ch={channel_id}"));
+            apply_define_task2(
+                state,
+                host,
+                &packet.payload,
+                &format!("child ch={channel_id}"),
+            );
         }
         CHILD_OP_SET_OBJECT_LIST => {
             if packet.payload.len() >= SET_OBJECT_LIST_LEN {
@@ -2243,9 +2247,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             // `2 * task_id + 1`: live, unrelated tasks whose
                             // pending frames were then landed cache-only and so
                             // never reached guest RAM.
-                            e.task_id == task_id
-                                && wgva < hi
-                                && gva < wgva.saturating_add(e.span())
+                            e.task_id == task_id && wgva < hi && gva < wgva.saturating_add(e.span())
                         })
                         .map(|(&wgva, _)| wgva)
                         .collect();
@@ -3243,6 +3245,11 @@ impl DrainDutyCensus {
 /// it: the guest's MMIO access is stopped for exactly this long, on the vCPU
 /// thread, inside `device_iosfc_read`/`device_iosfc_write`.
 ///
+/// Those two are reached only from `reims_vgpu_qemu_iosfc_read`/`_write`, which
+/// only `reims-vgpu-mmio` calls: the PCI device exposes no IOSFC region, so on
+/// x86 this census is silent because the path does not exist, not because the
+/// guest was never stalled. x86's own mechanism is [`DoorbellCensus`].
+///
 /// Only the contended path is timed: the uncontended path takes `try_lock` and
 /// costs an atomic increment, so a fast access pays nothing for the measurement
 /// itself. It does still drive the report, once per [`UNCONTENDED_POLL`]
@@ -3322,6 +3329,110 @@ impl VcpuLockCensus {
             "vcpu_lock_wait win_ms={win_ms} waits={waits} uncontended={free} \
              wait_us={total} max_wait_us={max} frame_waits={frames} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
+    }
+}
+
+/// How long a guest MMIO doorbell sat queued before the host applied it.
+///
+/// This is the *other* half of the stall, and on the PCI pathway it is the only
+/// half there is. `reims-vgpu-pci` exposes no IOSFC region — only
+/// `reims-vgpu-mmio` calls `reims_vgpu_qemu_iosfc_read`/`_write` — so
+/// [`VcpuLockCensus`], which instruments `lock_device_for_vcpu`, measures a code
+/// path x86 does not have and is silent there by construction rather than by
+/// result. Reading that silence as "the drain never stalled the guest" is
+/// exactly the mistake it was rebuilt to prevent, so the x86 mechanism gets its
+/// own census.
+///
+/// x86's vCPU never blocks: `device_gfx_write` takes `inner` with `try_lock` and
+/// on failure pushes to `gfx_ingress` and returns, so the guest's store retires
+/// immediately. The write is then applied by `lock_for_drain`, which takes
+/// `inner` with a **blocking** lock and therefore cannot run until the drain
+/// worker's current tranche ends. The cost is not a stopped vCPU, it is a
+/// doorbell that the guest believes was accepted and whose work does not start
+/// for up to a whole tranche — measured at `max_tranche_us` up to 43 ms while
+/// `drain_duty` sat at 0.92.
+///
+/// `direct` counts writes that found the lock free and skipped the queue, and it
+/// is load-bearing for the same reason `uncontended` is next door: `queued=0`
+/// with a large `direct` is a working doorbell path, while both at zero is no
+/// traffic at all.
+#[derive(Default)]
+pub(crate) struct DoorbellCensus {
+    queued: std::sync::atomic::AtomicU64,
+    age_us: std::sync::atomic::AtomicU64,
+    max_age_us: std::sync::atomic::AtomicU64,
+    /// Queued writes whose apply was late by at least a whole frame interval.
+    frame_late: std::sync::atomic::AtomicU64,
+    direct: std::sync::atomic::AtomicU64,
+    last_report_ms: std::sync::atomic::AtomicU64,
+}
+
+impl DoorbellCensus {
+    /// Count one write applied straight from the vCPU thread, lock uncontended.
+    ///
+    /// Polled on the same one-in-[`UNCONTENDED_POLL`] rule as the free
+    /// acquisitions next door, and for the same reason: this is the hot MMIO
+    /// path, and a window with no queueing still has to be able to say so.
+    pub(crate) fn note_direct(&self, now_ms: impl FnOnce() -> u64) -> Option<String> {
+        let prior = self
+            .direct
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !prior.is_multiple_of(UNCONTENDED_POLL) {
+            return None;
+        }
+        self.maybe_report(now_ms())
+    }
+
+    /// Record the queue age of one applied doorbell.
+    pub(crate) fn note_queued(&self, age_us: u64, now_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queued.fetch_add(1, Relaxed);
+        self.age_us.fetch_add(age_us, Relaxed);
+        self.max_age_us.fetch_max(age_us, Relaxed);
+        if age_us >= DRAIN_TRANCHE_SLOW_US {
+            self.frame_late.fetch_add(1, Relaxed);
+        }
+        self.maybe_report(now_ms)
+    }
+
+    fn maybe_report(&self, now_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.last_report_ms.load(Relaxed);
+        if last == 0 {
+            self.last_report_ms.store(now_ms, Relaxed);
+            return None;
+        }
+        let win_ms = now_ms.saturating_sub(last);
+        if win_ms < DRAIN_DUTY_REPORT_MS {
+            return None;
+        }
+        self.last_report_ms.store(now_ms, Relaxed);
+        let queued = self.queued.swap(0, Relaxed);
+        let total = self.age_us.swap(0, Relaxed);
+        let max = self.max_age_us.swap(0, Relaxed);
+        let late = self.frame_late.swap(0, Relaxed);
+        let direct = self.direct.swap(0, Relaxed);
+        Some(format!(
+            "gfx_doorbell_delay win_ms={win_ms} queued={queued} direct={direct} \
+             age_us={total} max_age_us={max} frame_late={late} slow_us={DRAIN_TRANCHE_SLOW_US}"
+        ))
+    }
+}
+
+static DOORBELL: std::sync::LazyLock<DoorbellCensus> =
+    std::sync::LazyLock::new(DoorbellCensus::default);
+
+/// Count one doorbell applied on the vCPU thread without queueing.
+pub fn note_doorbell_direct() {
+    if let Some(line) = DOORBELL.note_direct(|| crate::observe::elapsed_ms() as u64) {
+        crate::observe::off(line);
+    }
+}
+
+/// Record how long one doorbell sat in `gfx_ingress` before being applied.
+pub fn note_doorbell_queued(age_us: u64) {
+    if let Some(line) = DOORBELL.note_queued(age_us, crate::observe::elapsed_ms() as u64) {
+        crate::observe::off(line);
     }
 }
 
@@ -3893,8 +4004,6 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
         }
     }
 }
-
-
 
 /// Host paint consumed the current +0x188 retain (Painted or Unchanged).
 ///

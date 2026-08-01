@@ -120,6 +120,13 @@ struct QueuedGfxWrite {
     offset: u64,
     data: u64,
     size: u32,
+    /// When the vCPU published this write, or `None` when it was applied
+    /// straight through without ever entering the queue.
+    ///
+    /// The guest's store retires the moment this is pushed, so the guest cannot
+    /// see the delay; the age measured against this stamp is the only place the
+    /// deferral becomes visible. See [`crate::runtime::drain::DoorbellCensus`].
+    queued_at: Option<std::time::Instant>,
 }
 
 /// Link to a running host-owned presentation window ([[host-window]]).
@@ -285,6 +292,10 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 }
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
+    match write.queued_at {
+        Some(at) => runtime::drain::note_doorbell_queued(at.elapsed().as_micros() as u64),
+        None => runtime::drain::note_doorbell_direct(),
+    }
     if let Some(ops) = slot.ops {
         let mut host = QemuHost::new(&ops, &mut inner.actions, &slot.prompt_actions);
         inner
@@ -920,7 +931,12 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             return true;
         }
     }
-    let write = QueuedGfxWrite { offset, data, size };
+    let mut write = QueuedGfxWrite {
+        offset,
+        data,
+        size,
+        queued_at: None,
+    };
     let mut ingress = slot.gfx_ingress.lock();
     if ingress.is_empty() {
         if let Some(mut inner) = slot.inner.try_lock() {
@@ -928,6 +944,9 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
             return true;
         }
     }
+    // Stamped only on the path that actually defers, so the direct path pays no
+    // clock read at all.
+    write.queued_at = Some(std::time::Instant::now());
     ingress.push_back(write);
     drop(ingress);
     schedule_device(&slot);
@@ -1728,6 +1747,7 @@ mod tests {
             offset: crate::model::GFX_REG_CHILD_DOORBELL,
             data: 4,
             size: crate::model::MMIO_U32,
+            queued_at: Some(std::time::Instant::now()),
         });
 
         assert!(device_drain(id));

@@ -356,7 +356,12 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
         "the named mid must be the ClearOnly case this test is about"
     );
 
-    process_child_packet(&mut state, &mut host, 5, &present_packet(CHILD_OP_PRESENT_X86, 2));
+    process_child_packet(
+        &mut state,
+        &mut host,
+        5,
+        &present_packet(CHILD_OP_PRESENT_X86, 2),
+    );
 
     assert_eq!(state.present.present_mapping, 2, "guest names mid 2");
     assert!(
@@ -799,7 +804,12 @@ fn present_x86_op6_paints_surface_id_mapping() {
     let px = [0x22u8; 16];
     assert!(write_bgra8(&mut state, &mut host, 5, &px, 8, 2, 2));
 
-    process_child_packet(&mut state, &mut host, 5, &present_packet(CHILD_OP_PRESENT_X86, 5));
+    process_child_packet(
+        &mut state,
+        &mut host,
+        5,
+        &present_packet(CHILD_OP_PRESENT_X86, 5),
+    );
     assert_eq!(state.present.present_mapping, 5);
     assert!(state.present.frame_flush_seen);
     assert!(state.present.frame_valid || state.present.frame_encode_pending);
@@ -901,7 +911,12 @@ fn display_swap_signals_present_complete_on_shared_page() {
     );
     host.put_u32(shared + DISPLAY_SHARED_PENDING, DISPLAY_ONLINE_EVENT_MASK);
 
-    process_child_packet(&mut state, &mut host, 4, &present_packet(CHILD_OP_DISPLAY_SWAP, 3));
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &present_packet(CHILD_OP_DISPLAY_SWAP, 3),
+    );
 
     let mut le = [0u8; 4];
     assert!(host
@@ -1873,6 +1888,59 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
     assert!(line.contains("wait_us=31151"), "{line}");
 }
 
+/// The stall the PCI pathway actually has: a doorbell the guest thinks landed.
+///
+/// `reims-vgpu-pci` exposes no IOSFC region, so `lock_device_for_vcpu` — and
+/// with it the whole `vcpu_lock_wait` census — is unreachable on x86. Its
+/// silence there is structural, not a result, and reading it as "the drain
+/// never stalled the guest" is the error the census next door was rebuilt to
+/// stop making. x86's vCPU does not block; it queues, and the queued write does
+/// not run until the drain worker's tranche ends. That delay is what this
+/// measures.
+#[test]
+fn the_doorbell_census_separates_a_deferred_apply_from_a_direct_one() {
+    use crate::runtime::drain::{DoorbellCensus, UNCONTENDED_POLL};
+    let c = DoorbellCensus::default();
+    assert!(c.note_queued(1, 5_000).is_none(), "first call arms only");
+
+    for _ in 0..300 {
+        assert!(
+            c.note_direct(|| 5_050).is_none(),
+            "direct applies inside the window must not report"
+        );
+    }
+    // Two delays the guest would never notice, one that costs it a whole frame.
+    c.note_queued(120, 5_100);
+    c.note_queued(700, 5_200);
+    c.note_queued(43_000, 5_300);
+    let line = c.note_queued(80, 6_100).expect("a full window must report");
+
+    assert!(line.contains("queued=5"), "{line}");
+    assert!(line.contains("direct=300"), "{line}");
+    assert!(line.contains("age_us=43901"), "{line}");
+    assert!(line.contains("max_age_us=43000"), "{line}");
+    assert!(line.contains("frame_late=1"), "{line}");
+
+    // And a window that only ever applied directly still reports, so "nothing
+    // was ever deferred" and "no MMIO reached this device" stay distinguishable.
+    let c = DoorbellCensus::default();
+    let mut line = None;
+    for i in 0..=UNCONTENDED_POLL {
+        let now = if i == 0 { 5_000 } else { 6_200 };
+        if let Some(l) = c.note_direct(|| now) {
+            assert!(line.is_none(), "one report per window");
+            line = Some(l);
+        }
+    }
+    let line = line.expect("a window of direct applies must report");
+    assert!(line.contains("queued=0"), "{line}");
+    assert!(line.contains("frame_late=0"), "{line}");
+    assert!(
+        line.contains(&format!("direct={}", UNCONTENDED_POLL + 1)),
+        "{line}"
+    );
+}
+
 /// A window in which the vCPU never blocked must still report.
 ///
 /// As first shipped the census was driven only from the wait path, so zero
@@ -1884,7 +1952,7 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
 /// `uncontended`) is something the log can actually say.
 #[test]
 fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
-    use crate::runtime::drain::{UNCONTENDED_POLL, VcpuLockCensus};
+    use crate::runtime::drain::{VcpuLockCensus, UNCONTENDED_POLL};
     let c = VcpuLockCensus::default();
     let mut line = None;
     // The clock is only read at a poll, so the window spans exactly one poll
@@ -1907,7 +1975,6 @@ fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
         "{line}"
     );
 }
-
 
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated
@@ -2532,7 +2599,10 @@ fn an_unbacked_present_fails_unless_a_resident_positively_carries_it() {
     ];
     assert_eq!(words, ["resident", "nothing", "unknown"]);
     assert_eq!(
-        words.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        words
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         3,
         "each carrier state needs its own word"
     );
@@ -2789,7 +2859,10 @@ fn display_txn_payload_probe_rearms_on_trailer_change_but_not_on_surface_id() {
 #[test]
 fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
-    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, Some(2)));
+    assert_eq!(
+        display_txn_trailer_slots(CHILD_OP_PRESENT_X86),
+        (1, Some(2))
+    );
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
     assert_eq!(
         display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
@@ -2813,7 +2886,11 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
         p[off..off + 4].copy_from_slice(&0x5eu32.to_le_bytes());
         assert_eq!(present_surface_id(op, &p), Some(0x5e), "op {op:#x}");
         // One byte short of the command's own trailer is not a present.
-        assert_eq!(present_surface_id(op, &p[..p.len() - 1]), None, "op {op:#x}");
+        assert_eq!(
+            present_surface_id(op, &p[..p.len() - 1]),
+            None,
+            "op {op:#x}"
+        );
     }
 
     // The swap has to survive the budget key, not just the log line: a gamma
@@ -3153,13 +3230,8 @@ fn the_root_completion_stamp_lands_the_deferred_rails_and_moves_the_counter() {
     st16(&mut packet[PACKET_STAMP_COUNT..], 0);
     st32(&mut packet[PACKET_TOTAL_SIZE..], PACKET_HEADER_LEN);
     st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
-    gpa_map::write_bytes(
-        &mut host,
-        fifo_gpa + page_size as u64,
-        &packet,
-        page_size,
-    )
-    .expect("seed the root ring");
+    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
+        .expect("seed the root ring");
     state
         .gfx
         .fifo_read
@@ -3244,7 +3316,9 @@ fn deleting_a_task_retires_its_own_deferred_windows_and_not_its_doubles() {
         format: 0x50,
         armed_seq: task_id as u64,
         armed_stamp_seq: 0,
-        pages: [0x9000u64 + u64::from(task_id) * 0x1000].into_iter().collect(),
+        pages: [0x9000u64 + u64::from(task_id) * 0x1000]
+            .into_iter()
+            .collect(),
         alloc_gen: 0,
     };
     // Task 5 is the one deleted; 10 and 11 are its doubles and 2 is its half.
