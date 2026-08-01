@@ -1026,12 +1026,11 @@ fn compute_defer_readback_allowed(
 /// boot that drives multiplanar video and several ping-pong canvases at once,
 /// which is the case the "planar layouts a few more" guess was aimed at.
 ///
-/// `deferred_windows storage_peak` answers the question the eviction count
-/// could not — how close the population came — and reads **2** on the same
-/// workload. That is exactly the ping-pong canvas this doc predicted needs 2,
-/// so the shape of the guess is confirmed while the number is not: 8 is 4x the
-/// observed high-water mark, and nothing has yet produced the "planar layouts a
-/// few more" case that chose it.
+/// How close the population came was measured separately, and reads **2**
+/// across every boot in a 72 MB accumulated log. That is exactly the ping-pong
+/// canvas this doc predicted needs 2, so the shape of the guess is confirmed
+/// while the number is not: 8 is 4x the observed high-water mark, and nothing
+/// has yet produced the "planar layouts a few more" case that chose it.
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
@@ -1071,18 +1070,9 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
         .filter(|key| key.mapping_id == mapping_id && **key != candidate.key)
         .cloned()
         .collect();
-    // Including the window inserted below, so `peak` is the population this
+    // Counting the window inserted below, so the cap bounds the population this
     // mapping actually holds.
     let over_cap = (siblings.len() + 1).saturating_sub(STORAGE_RESIDENCY_WINDOWS_PER_MAPPING);
-    crate::runtime::census::deferred_windows::note_population(
-        crate::runtime::census::deferred_windows::Rail::Storage,
-        siblings.len() + 1,
-        STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
-    );
-    crate::runtime::census::deferred_windows::note_evicted(
-        crate::runtime::census::deferred_windows::Rail::Storage,
-        over_cap.min(siblings.len()),
-    );
     for victim in siblings.iter().take(over_cap) {
         state.compute_storage_residency.remove(victim);
         // Dropping a mirror entry costs the next read of that window its

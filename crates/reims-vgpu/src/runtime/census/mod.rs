@@ -65,10 +65,21 @@
 //! loader is expected control flow that yields the same pixels, so it stays
 //! quiet.
 //!
+//! `deferred_windows` was the third: peak population and forced-eviction count
+//! for the three deferred-window caps (GVA 16, surface 16, storage 8), built to
+//! answer whether any of them had ever bound. Across every boot in a 72 MB
+//! accumulated log it emitted exactly two distinct lines, differing only in
+//! `storage_peak` (1 vs 2) — every peak far under its cap, every `evicted` zero.
+//! That answer is recorded on the three constants. The alarm it was standing in
+//! for survives at each enforcing site, where it belongs: the GVA rail's forced
+//! landings are already `gva_deferred_flush trigger=window_cap`, the storage
+//! rail's are `compute_mirror_evicted`, and the surface rail now emits
+//! `surface_window_cap_evicted`. Those fire when a cap binds instead of
+//! restating a level once a second forever.
+//!
 //! The test to apply: name the reading the next window could produce that the
 //! last thousand did not. If there isn't one, the census has become a probe.
 
-pub mod deferred_windows;
 pub mod present_proxy;
 pub mod srgb_census;
 pub mod view_swizzle_census;

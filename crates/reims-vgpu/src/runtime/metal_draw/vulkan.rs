@@ -6093,17 +6093,19 @@ pub(crate) fn read_resident_chain(state: &DeviceState, req: &DrawEncodeRequest) 
 /// skips pinned slots and soft-exceeds `REGISTRY_CAP=64`); arming past this
 /// count lands the oldest window first so pinned pressure stays bounded.
 ///
-/// Measured, one driven x86/Vulkan boot — Chess, Maps, the WebGL aquarium,
-/// page-downs, a title-bar drag and apple.com: `deferred_windows gva_peak=1
-/// gva_evicted=0`. The simultaneously-live population never exceeded the one
-/// window being armed, so **this cap has never bound**. That is what
-/// `flush_all_windows_before_fence` forces — every completion stamp lands every
-/// window first, so windows cannot accumulate across a fence, only within one
-/// drain tranche. 16 is therefore not justified by this reading; it is
-/// unfalsified by it. Retiring the cap needs a workload that arms several
-/// Stores between two stamps, and the ordering machinery it drives
-/// (`gva_deferred_seq`, `take_oldest_gva_deferred_window`) is only reachable at
-/// a population above one.
+/// Measured across every boot in a 72 MB accumulated log — Chess, Maps, the
+/// WebGL aquarium, page-downs, a title-bar drag, apple.com: the live population
+/// never exceeded the one window being armed, and nothing was ever evicted, so
+/// **this cap has never bound**. That is what `flush_all_windows_before_fence`
+/// forces — every completion stamp lands every window first, so windows cannot
+/// accumulate across a fence, only within one drain tranche. 16 is therefore not
+/// justified by that reading; it is unfalsified by it. Retiring the cap needs a
+/// workload that arms several Stores between two stamps, and the ordering
+/// machinery it drives (`gva_deferred_seq`, `take_oldest_gva_deferred_window`)
+/// is only reachable at a population above one.
+///
+/// If it ever does bind, each forced landing says so as
+/// `gva_deferred_flush ... trigger=window_cap`.
 #[cfg(feature = "backend-vulkan")]
 const GVA_DEFERRED_WINDOW_CAP: usize = 16;
 
@@ -6113,10 +6115,12 @@ const GVA_DEFERRED_WINDOW_CAP: usize = 16;
 /// composite touches a handful of layers, so this is headroom, not a working
 /// set the guest routinely exceeds.
 ///
-/// Same boot, same verdict: `surface_peak` reached only the window being armed,
-/// `surface_evicted=0`. "A composite touches a handful of layers" predicted a
-/// population of a few; the measured one is one. See the note on
-/// `GVA_DEFERRED_WINDOW_CAP` for why, and for what would change the answer.
+/// Same logs, same verdict: the live population reached only the window being
+/// armed, and nothing was ever evicted. "A composite touches a handful of
+/// layers" predicted a population of a few; the measured one is one. See the
+/// note on `GVA_DEFERRED_WINDOW_CAP` for why, and for what would change the
+/// answer. If it ever does bind, `evict_render_windows_to_cap` emits
+/// `surface_window_cap_evicted`.
 #[cfg(feature = "backend-vulkan")]
 const SURFACE_DEFERRED_WINDOW_CAP: usize = 16;
 
@@ -6543,27 +6547,23 @@ fn render_window_count(state: &DeviceState) -> usize {
 /// returns the same stuck window forever, which is the bug this replaced.
 #[cfg(feature = "backend-vulkan")]
 fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
-    // `+ 1` for the window both callers arm immediately after this returns, so
-    // the reading is the simultaneously-live population the cap is trying to
-    // bound — the same convention the GVA rail uses.
-    crate::runtime::census::deferred_windows::note_population(
-        crate::runtime::census::deferred_windows::Rail::Surface,
-        render_window_count(state) + 1,
-        SURFACE_DEFERRED_WINDOW_CAP,
-    );
     for (mid, lo, hi) in render_windows_oldest_first(state) {
         let before = render_window_count(state);
         if before < SURFACE_DEFERRED_WINDOW_CAP {
             return;
         }
         crate::runtime::storage_flush::flush_intersecting(state, host, mid, lo, hi);
+        // Forcing a window to land early is the cap taking work off the guest's
+        // own schedule, so it says so — this is the surface rail's counterpart
+        // to `gva_deferred_flush trigger=window_cap` and `compute_mirror_evicted`.
         // The fixpoint drags in siblings overlapping the same guest bytes, so
-        // one pass can land more than the window it was aimed at. Count what
+        // one pass can land more than the window it was aimed at; report what
         // actually left rather than one per pass.
-        crate::runtime::census::deferred_windows::note_evicted(
-            crate::runtime::census::deferred_windows::Rail::Surface,
+        crate::observe::off(format!(
+            "surface_window_cap_evicted mid={mid} off={lo} end={hi} live={before} \
+             cap={SURFACE_DEFERRED_WINDOW_CAP} landed={}",
             before.saturating_sub(render_window_count(state)),
-        );
+        ));
     }
 }
 
@@ -6809,12 +6809,12 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
         return false;
     }
-    let mut cap_evicted = 0usize;
+    // Each forced landing names itself as `gva_deferred_flush trigger=window_cap`,
+    // so the cap is fail-visible without a counter beside it.
     while state.gva_deferred_flush.len() >= GVA_DEFERRED_WINDOW_CAP {
         let Some((old_gva, old_entry)) = state.take_oldest_gva_deferred_window() else {
             break;
         };
-        cap_evicted += 1;
         let _ = crate::runtime::storage_flush::flush_gva_one(
             state,
             host,
@@ -6824,14 +6824,6 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
             "window_cap",
         );
     }
-    crate::runtime::census::deferred_windows::note_evicted(crate::runtime::census::deferred_windows::Rail::Gva, cap_evicted);
-    // Counted after the cap has been applied and including the window about to
-    // be armed below, so `peak` is the population the guest actually held.
-    crate::runtime::census::deferred_windows::note_population(
-        crate::runtime::census::deferred_windows::Rail::Gva,
-        state.gva_deferred_flush.len() + 1,
-        GVA_DEFERRED_WINDOW_CAP,
-    );
     let producer_object_type = objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
         .map(|entry| entry.object_type)
         .unwrap_or(0);
