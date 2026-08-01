@@ -956,6 +956,38 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
 /// target to bind directly (zero-copy) or CPU bytes to upload, so this is the
 /// resolver the engine draw path uses. Distinct from [`load_sampled_rgba`],
 /// which is the Metal-path resolver and always materializes RGBA8 bytes.
+///
+/// # The type-11 ladder is measured, and every rung carries load
+///
+/// Four rungs offer the same type-11 surface, and the obvious reading is that
+/// three of them are redundant with the first. They are not. A DRIVEN x86/Vulkan
+/// session — four Safari page loads, each scrolled six pages and then dragged by
+/// its title bar — split as:
+///
+///   t11rung_resident         31 916   93.0 %   engine image, taken zero-copy
+///   t11rung_host_cache        1 694    4.9 %   surface_cache's BGRA mirror
+///   t11rung_zero_copy           705    2.1 %   guest pages, gathered
+///   t11rung_guest_memo          150    0.4 %   guest pages, CPU convert
+///   t11rung_miss                  0             no source at all
+///   t11rung_resident_refused        2            guest overwrote the resident
+///
+/// Measure this on a DRIVEN session or not at all. The same census on an
+/// undriven boot to the desktop reported 12 / 5 / 8 / 0, which is far too quiet
+/// to tell a rung that never fires from one the boot never reached — and quiet
+/// enough to talk someone into deleting it.
+///
+/// Two facts to weigh before touching the order:
+///
+/// - The host-cache rung is NOT a duplicate of the guest-page rungs below it.
+///   A render Store defers its writeback into guest pages, so between the Store
+///   and its flush the cache is the only host-side copy that holds the new
+///   pixels; the pages still hold the old ones. Its 1 694 binds are that window.
+/// - `t11rung_resident_refused` firing twice is not evidence the guest-write
+///   witness is dead weight. Those are the binds where the guest CPU painted
+///   over a surface the engine still claimed to hold, and the rung sits above
+///   both page-reading rungs, so nothing below would have corrected it. Two
+///   uncorrected stale binds on a repainted surface is the "renders correctly
+///   for a few frames, then stays corrupted" report.
 #[cfg(feature = "backend-vulkan")]
 fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,

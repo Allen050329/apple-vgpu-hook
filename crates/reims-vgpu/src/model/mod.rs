@@ -294,7 +294,6 @@ mod tests {
         d.state.gfx.fifo_written = PACKET_HEADER_LEN + 12;
         d.state.pending.main_drain = true;
         d.drain(&mut h);
-        assert!(d.state.is_tahoe);
         assert_eq!(
             h.get_u32(pfn_to_gpa(reply_pfn, PAGE_SHIFT_ARM64E)),
             DEVICE_INFO_CAPS[0].0

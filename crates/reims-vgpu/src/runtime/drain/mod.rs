@@ -582,7 +582,6 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
     match effective {
         ROOT_OP_DEVICE_INFO_TAHOE => {
-            state.is_tahoe = true;
             if packet.payload.len() >= DEVICE_INFO_TAHOE_REPLY_PFN + 4 {
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);

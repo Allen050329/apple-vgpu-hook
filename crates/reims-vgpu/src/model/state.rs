@@ -1857,7 +1857,6 @@ pub struct DeviceState {
     pub page_shift: u32,
     pub gfx: GfxRegs,
     pub iosfc: IosfcRegs,
-    pub is_tahoe: bool,
     pub active_child_mask: u32,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
@@ -2227,7 +2226,6 @@ impl DeviceState {
             page_shift,
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
-            is_tahoe: false,
             active_child_mask: 0,
             translation_deferred_mask: 0,
             translation_order_hold_mask: 0,
