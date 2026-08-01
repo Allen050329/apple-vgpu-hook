@@ -203,6 +203,12 @@ pub enum CopyKind {
     TextureToTextureSliceLevel,
 }
 
+/// What a blit command's source/destination/resource ref names.
+///
+/// There is deliberately no `Fence`: the two fence opcodes carry their ref in
+/// [`Command::fence`] under [`Kind::Fence`] and leave every `RefKind` field at
+/// `None`, so a `RefKind::Fence` was a second name for a ref this decoder puts
+/// somewhere else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RefKind {
     #[default]
@@ -210,7 +216,6 @@ pub enum RefKind {
     Buffer,
     Texture,
     Resource,
-    Fence,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

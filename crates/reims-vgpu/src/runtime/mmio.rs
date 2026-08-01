@@ -4,7 +4,7 @@
 //! schedule a host BH. No heavy decode or GPU work on this path.
 
 use crate::model::*;
-use crate::model::{DeviceState, FailEvent, MmioWindow};
+use crate::model::{DeviceState, FailEvent};
 use crate::runtime::host::{HostAction, HostMemory, HostOps};
 use crate::runtime::mapper;
 
@@ -27,7 +27,6 @@ pub fn gfx_read(state: &mut DeviceState, offset: u64, size: u32) -> u64 {
     }
     if size != MMIO_U32 {
         state.record_fail(FailEvent::BadMmioAccess {
-            window: MmioWindow::Gfx,
             offset,
             size,
         });
@@ -121,7 +120,6 @@ pub fn gfx_write<H: HostMemory + HostOps>(
     }
     if size != MMIO_U32 {
         state.record_fail(FailEvent::BadMmioAccess {
-            window: MmioWindow::Gfx,
             offset,
             size,
         });

@@ -111,8 +111,13 @@ pub enum FailEvent {
         channel: u32,
         fault: ExecFault,
     },
+    /// A gfx-window access whose width is neither 32 nor 64 bits.
+    ///
+    /// Only the gfx rail can raise this. The iosfc window's handlers mask the
+    /// read to the requested width and ignore the width on write, so there is
+    /// no size they refuse — which is why this carries no window discriminator:
+    /// a field with one reachable value tells the log's reader nothing.
     BadMmioAccess {
-        window: MmioWindow,
         offset: u64,
         size: u32,
     },
@@ -155,30 +160,12 @@ impl crate::observe::Decline for FailEvent {
                 vec![("ch", channel.to_string()), ("head", head.to_string())]
             }
             Self::UnsupportedExec { channel, .. } => vec![("ch", channel.to_string())],
-            Self::BadMmioAccess {
-                window,
-                offset,
-                size,
-            } => vec![
-                (
-                    "window",
-                    match window {
-                        MmioWindow::Gfx => "gfx",
-                        MmioWindow::Iosfc => "iosfc",
-                    }
-                    .to_string(),
-                ),
+            Self::BadMmioAccess { offset, size } => vec![
                 ("offset", format!("{offset:#x}")),
                 ("size", size.to_string()),
             ],
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MmioWindow {
-    Gfx,
-    Iosfc,
 }
 
 /// Gfx named registers + sparse backing for unnamed offsets.
@@ -3719,7 +3706,6 @@ mod fail_vocabulary_tests {
         );
         assert_eq!(
             FailEvent::BadMmioAccess {
-                window: MmioWindow::Gfx,
                 offset: 0x1000,
                 size: 2
             }

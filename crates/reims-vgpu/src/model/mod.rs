@@ -16,7 +16,7 @@ pub use state::{
     GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView,
     GvaEvictionWitness, HostLinearTexture, HostSurface, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
-    IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry, MmioWindow,
+    IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry,
     MrtSecondaryRecord, PacketFault, PaintSrc,
     PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity,
     SurfaceWriteKind,

@@ -3080,12 +3080,6 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
             binding,
             descriptor_len,
         },
-        DecodeStatus::ErrBadLength(_) => DrawPreparationDecline::SamplerDescriptorBadLength {
-            sampler_ref,
-            binding,
-            descriptor_len,
-            declared_len,
-        },
         DecodeStatus::ErrUnknownType(_) => DrawPreparationDecline::SamplerDescriptorUnknownType {
             sampler_ref,
             binding,

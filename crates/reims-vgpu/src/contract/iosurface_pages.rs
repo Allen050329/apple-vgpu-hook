@@ -85,12 +85,18 @@ pub const ARM_KERNEL_VA_BASE: u64 = 0xfffffe00_00000000;
 /// x86_64 Darwin canonical kernel half (bits 63:47 all ones in 48-bit VA).
 pub const X86_KERNEL_VA_MIN: u64 = 0xffff8000_00000000;
 
+/// Why a mapper/page-table resolve refused, or [`Status::Ok`] if it did not.
+///
+/// Every variant here names a check this walker actually performs. `ErrArgs`,
+/// `ErrOverflow` and `ErrSpanRange` used to sit alongside them and were never
+/// constructed: the argument checks are `ErrShortDescriptor`, the arithmetic
+/// goes through `checked_*` helpers that fold overflow into the length and
+/// page-count refusals, and the span walk refuses as `ErrPageCount`. A refusal
+/// class the code cannot reach is a claim the fail log can never substantiate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ok,
-    ErrArgs(&'static str),
     ErrShortDescriptor(&'static str),
-    ErrOverflow(&'static str),
     ErrNotKernelVa(&'static str),
     ErrInternalRead(&'static str),
     ErrInternalOwner(&'static str),
@@ -101,16 +107,13 @@ pub enum Status {
     ErrPageTableRead(&'static str),
     ErrPageEntry(&'static str),
     ErrNoPageTable(&'static str),
-    ErrSpanRange(&'static str),
 }
 
 impl crate::observe::Refusal for Status {
     fn refusal(&self) -> Option<&'static str> {
         match self {
             Self::Ok => None,
-            Self::ErrArgs(reason)
-            | Self::ErrShortDescriptor(reason)
-            | Self::ErrOverflow(reason)
+            Self::ErrShortDescriptor(reason)
             | Self::ErrNotKernelVa(reason)
             | Self::ErrInternalRead(reason)
             | Self::ErrInternalOwner(reason)
@@ -120,17 +123,14 @@ impl crate::observe::Refusal for Status {
             | Self::ErrPageCount(reason)
             | Self::ErrPageTableRead(reason)
             | Self::ErrPageEntry(reason)
-            | Self::ErrNoPageTable(reason)
-            | Self::ErrSpanRange(reason) => Some(reason),
+            | Self::ErrNoPageTable(reason) => Some(reason),
         }
     }
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         let class = match self {
             Self::Ok => return Vec::new(),
-            Self::ErrArgs(_) => "args",
             Self::ErrShortDescriptor(_) => "short_descriptor",
-            Self::ErrOverflow(_) => "overflow",
             Self::ErrNotKernelVa(_) => "not_kernel_va",
             Self::ErrInternalRead(_) => "internal_read",
             Self::ErrInternalOwner(_) => "internal_owner",
@@ -141,7 +141,6 @@ impl crate::observe::Refusal for Status {
             Self::ErrPageTableRead(_) => "page_table_read",
             Self::ErrPageEntry(_) => "page_entry",
             Self::ErrNoPageTable(_) => "no_page_table",
-            Self::ErrSpanRange(_) => "span_range",
         };
         vec![("class", class.to_string())]
     }

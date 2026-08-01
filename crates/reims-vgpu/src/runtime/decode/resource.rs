@@ -23,13 +23,16 @@ use crate::contract::endian::{st16, st32}; // ICB layout fixture encoder only
 /// constructed anywhere in the crate** — they existed only as arms of a
 /// `decode_status_name` helper that itself had no callers — so they are gone
 /// and this is a [`crate::observe::Decline`], not a `Refusal`.
+///
+/// `ErrBadLength` went the same way. Every length disagreement this decoder can
+/// see is a read that ran off the end, and all three sites of the compact-TLV
+/// walk already say so with their own slug (`res_tlv_offset_past_end`,
+/// `res_tlv_header_short`, `res_tlv_value_short`). A second class for the same
+/// condition would only split one check's census across two names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
     /// The blob is shorter than the field being read.
     ErrShort(&'static str),
-    /// A declared length disagrees with the buffer, or a TLV walk does not land
-    /// exactly on the end.
-    ErrBadLength(&'static str),
     /// An object-list type tag this host has no contract for.
     ErrUnknownType(&'static str),
     /// A well-formed blob whose tag/opcode names a variant the decoder does not
@@ -40,10 +43,7 @@ pub enum DecodeStatus {
 impl crate::observe::Decline for DecodeStatus {
     fn slug(&self) -> &'static str {
         match self {
-            Self::ErrShort(s)
-            | Self::ErrBadLength(s)
-            | Self::ErrUnknownType(s)
-            | Self::ErrUnsupported(s) => s,
+            Self::ErrShort(s) | Self::ErrUnknownType(s) | Self::ErrUnsupported(s) => s,
         }
     }
 
@@ -52,7 +52,6 @@ impl crate::observe::Decline for DecodeStatus {
             "class",
             match self {
                 Self::ErrShort(_) => "short",
-                Self::ErrBadLength(_) => "bad_length",
                 Self::ErrUnknownType(_) => "unknown_type",
                 Self::ErrUnsupported(_) => "unsupported",
             }
@@ -432,9 +431,6 @@ pub struct PipelineColorAttachment {
     /// alone, so this cannot ride inside the blend state.
     pub write_mask: ColorWriteMask,
 }
-
-/// Color-attachment[0] blend + format (compat alias for first entry).
-pub type PipelineColorAttachment0 = PipelineColorAttachment;
 
 /// Decoded type-7 render pipeline (functions + optional stage-in attrs).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -850,6 +846,14 @@ pub struct IndirectCommandBufferDescriptor {
     pub layout: IcbCommandLayout,
 }
 
+/// One decoded object-list descriptor.
+///
+/// There is deliberately no `Unknown`: an object type this host has no contract
+/// for is [`DecodeStatus::ErrUnknownType`], and a type-7 subtype it does not
+/// implement is [`DecodeStatus::ErrUnsupported`]. Both name the check that
+/// refused. An `Unknown` variant would let the same condition arrive as a
+/// successful decode carrying nothing, which every consumer would then have to
+/// re-refuse without knowing why.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Descriptor {
     Buffer(BufferDescriptor),
@@ -868,7 +872,6 @@ pub enum Descriptor {
         height: u32,
     },
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
-    Unknown,
 }
 
 /// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
