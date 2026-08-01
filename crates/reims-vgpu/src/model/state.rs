@@ -1182,8 +1182,9 @@ pub struct HostSurface {
     /// virtual address) and on any GVA store whose walk did not resolve.
     pub backing: Option<GvaBacking>,
     // No guest-CPU-write witness sits here, and that is a known gap rather
-    // than an omission. `backing_suspect` answers whether this GVA still
-    // *names* these pages; nothing answers whether the guest CPU *wrote* them.
+    // than an omission. `surface_cache::gva_backing_state` answers whether this
+    // GVA still *names* these pages; nothing answers whether the guest CPU
+    // *wrote* them.
     // A guest store into pages that never moved produces no notify, no verdict
     // and no device operation, so this entry can keep serving bytes the guest
     // has already replaced.
@@ -1495,11 +1496,12 @@ pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
 ///   allocates new addresses, so every abandoned entry belongs to a task that
 ///   is still alive.
 /// - **Evicting what no longer translates would black out the wallpaper.** This
-///   cache is deliberately retained across Unmap (see
-///   [`crate::runtime::surface_cache::note_unmap_retain_gva`]), so "the guest
-///   unmapped this VA" is the *normal* state of exactly the content the cache
-///   exists to hold: at idle, before any resize, 14 of 27 entries were already
-///   unmapped.
+///   cache is deliberately retained across Unmap — nothing on the Unmap path
+///   touches it — so "the guest unmapped this VA" is the *normal* state of
+///   exactly the content the cache exists to hold: at idle, before any resize,
+///   14 of 27 entries were already unmapped, and a later driven boot read 105
+///   of 138. Only [`crate::runtime::surface_cache::GvaBackingState::Moved`]
+///   carries positive evidence that an address belongs to someone else.
 ///
 /// Recency is neither. It is a resource bound, and its safety property is the
 /// one those rules lack: [`crate::model::LruBytesMemo`]'s header already names

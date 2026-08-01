@@ -582,7 +582,9 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
 ///
 /// On discrete hosts this is the **GPU-private** texture content for that VA.
 /// Guest MapMemory2 unmap/remap changes PFNs under the same GVA but does **not**
-/// destroy the encode — see [`note_unmap_retain_gva`] (Unmap retains; Map notify-only).
+/// destroy the encode: nothing on the Unmap path touches this map, deliberately
+/// — an unmapped VA is the normal state of the wallpaper class this cache holds.
+/// [`gva_backing_state`] is what says whether the key still names these pages.
 pub fn store_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32, bgra: Vec<u8>) {
     store_gva_owned(state, gva, width, height, bgra, 0, None);
 }
@@ -851,7 +853,8 @@ pub fn get_gva_with_gen(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
+/// Explicit drop (tests / object delete). Unmap does **not** come through here;
+/// see [`store_gva`] for why the map is retained across it.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
     if let Some(entry) = state.host_gva_surfaces.remove(&gva) {
         // The other site that changes this map's byte total; see
@@ -1012,31 +1015,82 @@ pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64, u64) {
 /// Measure-only. Nothing may evict on this yet: it exists to size the rule
 /// before the rule is written.
 pub fn gva_backing_moved<H: HostMemory>(state: &DeviceState, host: &H) -> (u64, u64, u64) {
-    let page_shift = state.page_shift;
-    let page_mask = !((1u64 << page_shift) - 1);
     let (mut moved, mut unmapped, mut checked) = (0, 0, 0);
-    for (&gva, entry) in &state.host_gva_surfaces {
-        let Some(backing) = entry.backing.as_ref() else {
-            continue;
-        };
-        let Some(&recorded) = backing.gpas.first() else {
-            continue;
-        };
-        let Some(task) = state
-            .tasks
-            .get(backing.task_id as usize)
-            .filter(|t| t.active)
-        else {
-            continue;
-        };
-        checked += 1;
-        match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
-            None => unmapped += 1,
-            Some(live) if (live & page_mask) != (recorded & page_mask) => moved += 1,
-            Some(_) => {}
+    for &gva in state.host_gva_surfaces.keys() {
+        match gva_backing_state(state, host, gva) {
+            GvaBackingState::Unrecorded => {}
+            GvaBackingState::Same => checked += 1,
+            GvaBackingState::Unmapped => {
+                checked += 1;
+                unmapped += 1;
+            }
+            GvaBackingState::Moved => {
+                checked += 1;
+                moved += 1;
+            }
         }
     }
     (moved, unmapped, checked)
+}
+
+/// Whether one GVA-keyed entry's key still translates to the pages its pixels
+/// were produced from.
+///
+/// The single spelling of that question. [`gva_backing_moved`] sums it over the
+/// whole map for the level census; the colour LOAD seed asks it about the one
+/// entry it is about to serve. Two spellings of "did this address move" would be
+/// two answers, and the serve-side reading is only worth having if it is the
+/// same reading the census reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GvaBackingState {
+    /// No backing was recorded, or the task that recorded it is gone. The
+    /// question cannot be asked, which is not the same as answering "fresh".
+    Unrecorded,
+    /// The key translates to the page it was stored over.
+    Same,
+    /// The key does not translate at all. Not evidence of reuse on its own —
+    /// `d455c3e` found the device answers before the guest has finished
+    /// mapping, and a transient walk failure looks exactly like this.
+    Unmapped,
+    /// The key translates, to a different page than recorded: the guest handed
+    /// this address to another allocation. The only state that carries positive
+    /// evidence these pixels belong to someone else.
+    Moved,
+}
+
+/// [`GvaBackingState`] for one key. First recorded page only — enough to tell a
+/// reused address from a retained one, and a whole-list walk of a 4K entry is
+/// ~2 025 walks.
+pub fn gva_backing_state<H: HostMemory>(
+    state: &DeviceState,
+    host: &H,
+    gva: u64,
+) -> GvaBackingState {
+    let page_shift = state.page_shift;
+    let page_mask = !((1u64 << page_shift) - 1);
+    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
+        return GvaBackingState::Unrecorded;
+    };
+    let Some(backing) = entry.backing.as_ref() else {
+        return GvaBackingState::Unrecorded;
+    };
+    let Some(&recorded) = backing.gpas.first() else {
+        return GvaBackingState::Unrecorded;
+    };
+    // Same liveness test the walk itself applies: present in the table AND
+    // flagged active. A dead task's page table cannot answer the question.
+    let Some(task) = state
+        .tasks
+        .get(backing.task_id as usize)
+        .filter(|t| t.active)
+    else {
+        return GvaBackingState::Unrecorded;
+    };
+    match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
+        None => GvaBackingState::Unmapped,
+        Some(live) if (live & page_mask) != (recorded & page_mask) => GvaBackingState::Moved,
+        Some(_) => GvaBackingState::Same,
+    }
 }
 
 /// Emit [`cache_levels`] at most once per census interval.
@@ -1801,6 +1855,58 @@ mod tests {
         assert_eq!(holed.gpas.len(), 3, "one slot per page, holes included");
         assert_eq!(holed.gpas[1], 0, "the hole sits where the page is");
         assert_ne!(holed.gpas, full.gpas);
+    }
+
+    /// "Cannot tell" is its own answer, and the serve site is where conflating
+    /// it with "fresh" would cost a frame.
+    ///
+    /// `the_backing_probe_separates_a_reassigned_address_from_an_unmapped_one`
+    /// pins Same/Moved/Unmapped through the map-wide sum, which now delegates
+    /// here, so those need no second statement. What only the per-entry answer
+    /// can be asked is the case the sum *skips*: an entry whose walk never
+    /// resolved, and a key that was never stored. The colour LOAD seed asks
+    /// about one address at a time, so it meets both, and a probe that answered
+    /// `Same` for either would report a clean result for a question it never
+    /// asked.
+    #[test]
+    fn a_backing_the_probe_cannot_read_is_not_a_fresh_one() {
+        let mut host = FakeHost::new();
+        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        setup_depth1_task(&mut host, &mut st);
+        let page = 1u64 << PAGE_SHIFT_ARM64E;
+        // 64x64 BGRA8 is exactly one 16 KiB page.
+        let (w, h) = (64u32, 64u32);
+        let gva = page;
+
+        let backing = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
+        assert_eq!(backing.gpas.len(), 1);
+        store_gva_owned(
+            &mut st,
+            gva,
+            w,
+            h,
+            vec![0xAB; (w * h * 4) as usize],
+            0,
+            Some(backing),
+        );
+        assert_eq!(
+            gva_backing_state(&st, &host, gva),
+            GvaBackingState::Same,
+            "control: a store whose walk resolved reads its own pages back"
+        );
+
+        // Re-store the same key with no backing: the walk did not resolve, so
+        // there is nothing to compare and the entry drops out of the census
+        // denominator rather than counting as fresh.
+        store_gva_owned(&mut st, gva, w, h, vec![0xCD; (w * h * 4) as usize], 0, None);
+        assert_eq!(gva_backing_state(&st, &host, gva), GvaBackingState::Unrecorded);
+        assert_eq!(gva_backing_moved(&st, &host), (0, 0, 0), "and is not counted");
+
+        assert_eq!(
+            gva_backing_state(&st, &host, gva + page),
+            GvaBackingState::Unrecorded,
+            "a key that was never stored is not an answer about backing"
+        );
     }
 
 

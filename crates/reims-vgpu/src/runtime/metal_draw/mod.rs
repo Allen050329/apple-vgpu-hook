@@ -3948,6 +3948,49 @@ fn seed_color_load<M: HostMemory + HostOps>(
         // available. Two other readers of it were removed on measurements that
         // said the opposite (the sampled rung, 0 serves in 286 800 attempts);
         // this one is why the map, its byte cap and its eviction policy stay.
+        // Whether the address this seed is about to be served from still names
+        // the pages the pixels were produced over.
+        //
+        // # The level census and the serve census disagree, and the serve one wins
+        //
+        // `host_cache_levels` reports this for the map as a whole and reads
+        // alarming: 25 moved and 149 unmapped of 176 entries on a driven boot
+        // (31/105/138 on the one before). Read as a hazard that says most of
+        // the cache would hand a LOAD seed some other allocation's pixels.
+        //
+        // It does not. A level is not a serve, and asked at the serve site the
+        // same question answers differently — one driven x86/Vulkan boot
+        // (Spotlight, Mission Control, Notification Center, Finder gallery/icon
+        // + corner resize, apple.com scroll, Wikipedia, title-bar drag, window
+        // closes, wallpaper drag):
+        //
+        //   gva_seed_backing_same        536      (load_seed_ok_color = 537)
+        //   gva_seed_backing_moved         0
+        //   gva_seed_backing_unmapped      0
+        //   gva_seed_backing_unrecorded    0
+        //
+        // The two populations are disjoint: the entries the guest re-points or
+        // unmaps are not the entries a LOAD seed reads. So there is no
+        // wrong-content hazard on this reader, and the moved/unmapped bulk is
+        // dead weight rather than a defect — which is a claim about what to
+        // evict, not about what to serve.
+        //
+        // Keep this asking. It is the denominator that makes the level census
+        // interpretable, and its other three legs are pinned by
+        // `surface_cache`'s unit tests, so a zero here is a measured zero and
+        // not a probe that cannot tell the cases apart.
+        if target_gva != 0 && crate::runtime::surface_cache::has_gva(state, target_gva, width, height)
+        {
+            use crate::runtime::surface_cache::GvaBackingState as B;
+            crate::runtime::drain::note_store_route(
+                match crate::runtime::surface_cache::gva_backing_state(state, host, target_gva) {
+                    B::Unrecorded => "gva_seed_backing_unrecorded",
+                    B::Same => "gva_seed_backing_same",
+                    B::Unmapped => "gva_seed_backing_unmapped",
+                    B::Moved => "gva_seed_backing_moved",
+                },
+            );
+        }
         let cached = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else {
