@@ -1869,6 +1869,50 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     assert!(c.take_flush_rails().is_none(), "{rails}");
 }
 
+/// The render rail's 6.9 ms has to divide before it can be fixed.
+///
+/// `flush_rails` names the rail; it does not say whether the cost is the GPU
+/// round trip or the bytes. Those have opposite fixes — a dirty rect shrinks
+/// the copy and does nothing at all to a fence wait — so a split that fuses
+/// them licenses the wrong change.
+#[test]
+fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
+    use crate::runtime::drain::{DrainDutyCensus, ReadbackPhase};
+    let c = DrainDutyCensus::default();
+    assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
+    assert!(
+        c.take_readback_split().is_none(),
+        "a window with no readback must stay silent"
+    );
+
+    // One flush's worth: a cheap submit, a long fence, a moderate copy out and
+    // a moderate copy into guest pages.
+    c.note_readback(ReadbackPhase::Submit, 120);
+    c.note_readback(ReadbackPhase::Fence, 5_400);
+    c.note_readback(ReadbackPhase::Map, 800);
+    c.note_readback(ReadbackPhase::Write, 600);
+    // A second flush that waited far longer on the GPU.
+    c.note_readback(ReadbackPhase::Submit, 100);
+    c.note_readback(ReadbackPhase::Fence, 9_000);
+    c.note_readback(ReadbackPhase::Map, 750);
+    c.note_readback(ReadbackPhase::Write, 640);
+    assert!(c.note(0, 0, 6_100).is_some(), "a full window must report");
+
+    let split = c
+        .take_readback_split()
+        .expect("a window that read back must split");
+    assert!(split.contains("win_ms=1100"), "{split}");
+    assert!(split.contains("submit_us=220 submit=2"), "{split}");
+    assert!(split.contains("fence_us=14400 fence=2"), "{split}");
+    assert!(split.contains("map_us=1550 map=2"), "{split}");
+    assert!(split.contains("write_us=1240 write=2"), "{split}");
+    // The tail matters for the same reason it does on the rail above: a mean
+    // fence of 7.2 ms and a worst of 9 ms is a steady tax, not a hitch.
+    assert!(split.contains("fence_max_us=9000"), "{split}");
+
+    assert!(c.take_readback_split().is_none(), "the window must reset");
+}
+
 /// The vCPU's wait must be measured where the guest pays it.
 ///
 /// Every other figure about a long tranche is taken from the side that *holds*

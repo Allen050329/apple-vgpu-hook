@@ -818,6 +818,7 @@ unsafe fn copy_image_level0_to_host(
     rb_size: u64,
     ops: ReadbackOps,
 ) -> Result<Vec<u8>, DrawError> {
+    let submit_started = std::time::Instant::now();
     let readback = pools.acquire_readback(ctx, rb_size, counters)?;
     let (cb, fence) = pools.begin_entry(ctx, counters)?;
     ctx.device
@@ -893,8 +894,24 @@ unsafe fn copy_image_level0_to_host(
         .map_err(|e| DrawError::VkCall(VkCall::new(ops.submit, e)))?;
     let cleanup = pools.seal_entry(Vec::new(), Vec::new());
     pools.finish_entry_async(cleanup);
+    // Split three ways rather than timed as a whole: the submit and the copy
+    // scale with the surface, the fence does not scale with anything we control,
+    // and the fix for one is not the fix for the others.
+    use crate::runtime::drain::{ReadbackPhase, note_readback_phase};
+    note_readback_phase(
+        ReadbackPhase::Submit,
+        submit_started.elapsed().as_micros() as u64,
+    );
+    let fence_started = std::time::Instant::now();
     pools.wait_entry_fence(ctx, counters, fence)?;
-    pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate)
+    note_readback_phase(
+        ReadbackPhase::Fence,
+        fence_started.elapsed().as_micros() as u64,
+    );
+    let map_started = std::time::Instant::now();
+    let out = pools::read_back_slot(ctx, &readback, rb_size, ops.map, ops.invalidate);
+    note_readback_phase(ReadbackPhase::Map, map_started.elapsed().as_micros() as u64);
+    out
 }
 
 /// A resident target's pixels plus the physical channel order they came out in.

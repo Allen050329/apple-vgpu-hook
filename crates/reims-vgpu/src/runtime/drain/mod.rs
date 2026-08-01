@@ -3155,6 +3155,56 @@ pub enum FlushRail {
     Storage,
 }
 
+/// The inside of a [`FlushRail::Render`] flush, which is 100% of the drain
+/// worker's flush cost on a driven boot and is four very different things.
+///
+/// Live: `render_us=688003 render=100`, i.e. 6.9 ms per flush, ~69% of the
+/// worker's entire second, with the other three rails at zero. Knowing that is
+/// not yet enough to fix it, because the four parts below have opposite fixes.
+/// A cost in [`Fence`](Self::Fence) is a GPU round trip and shrinking the copy
+/// would not touch it; a cost in [`Map`](Self::Map) or [`Write`](Self::Write)
+/// is bytes and a dirty rect would. Guessing between them is how the last
+/// attempt picked its target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadbackPhase {
+    /// Record the copy command buffer and submit it. No GPU wait.
+    Submit,
+    /// Block on the readback fence: pure GPU round-trip latency, and the part
+    /// no smaller copy can reduce.
+    Fence,
+    /// Map, invalidate and memcpy the staging buffer into a host `Vec`.
+    Map,
+    /// Write the frame into the guest's pages (`write_bgra8_skipping`).
+    Write,
+}
+
+impl ReadbackPhase {
+    const ALL: [ReadbackPhase; 4] = [
+        ReadbackPhase::Submit,
+        ReadbackPhase::Fence,
+        ReadbackPhase::Map,
+        ReadbackPhase::Write,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            ReadbackPhase::Submit => 0,
+            ReadbackPhase::Fence => 1,
+            ReadbackPhase::Map => 2,
+            ReadbackPhase::Write => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            ReadbackPhase::Submit => "submit",
+            ReadbackPhase::Fence => "fence",
+            ReadbackPhase::Map => "map",
+            ReadbackPhase::Write => "write",
+        }
+    }
+}
+
 impl FlushRail {
     const ALL: [FlushRail; 4] = [
         FlushRail::Render,
@@ -3204,6 +3254,10 @@ pub(crate) struct DrainDutyCensus {
     rail_us: [std::sync::atomic::AtomicU64; 4],
     rail_count: [std::sync::atomic::AtomicU64; 4],
     rail_max_us: [std::sync::atomic::AtomicU64; 4],
+    /// The inside of the render rail, indexed by [`ReadbackPhase::index`].
+    rb_us: [std::sync::atomic::AtomicU64; 4],
+    rb_count: [std::sync::atomic::AtomicU64; 4],
+    rb_max_us: [std::sync::atomic::AtomicU64; 4],
     /// The window length `note` last reported, so `take_flush_rails` states the
     /// same denominator instead of deriving a second one.
     last_win_ms: std::sync::atomic::AtomicU64,
@@ -3272,6 +3326,37 @@ impl DrainDutyCensus {
             body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
         }
         any.then(|| format!("flush_rails win_ms={win_ms}{body}"))
+    }
+
+    /// The inside of the render rail over the window `drain_duty` just
+    /// reported, or `None` when nothing was read back in it.
+    ///
+    /// Sits under `flush_rails`'s `render_us` and divides it: a `fence_us` that
+    /// owns the line is GPU round-trip latency and no smaller copy touches it,
+    /// while a `map_us`/`write_us` that owns it is bytes and a dirty rect would.
+    pub(crate) fn take_readback_split(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for phase in ReadbackPhase::ALL {
+            let i = phase.index();
+            let us = self.rb_us[i].swap(0, Relaxed);
+            let n = self.rb_count[i].swap(0, Relaxed);
+            let max = self.rb_max_us[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = phase.label();
+            body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
+        }
+        any.then(|| format!("readback_split win_ms={win_ms}{body}"))
+    }
+
+    pub(crate) fn note_readback(&self, phase: ReadbackPhase, us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = phase.index();
+        self.rb_us[i].fetch_add(us, Relaxed);
+        self.rb_count[i].fetch_add(1, Relaxed);
+        self.rb_max_us[i].fetch_max(us, Relaxed);
     }
 
     /// Accumulate one completed tranche and return the line when a report is
@@ -3559,6 +3644,10 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(rails) = DRAIN_DUTY.take_flush_rails() {
             crate::observe::off(rails);
         }
+        // Under `flush_rails`, dividing its `render_us`.
+        if let Some(split) = DRAIN_DUTY.take_readback_split() {
+            crate::observe::off(split);
+        }
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
@@ -3757,6 +3846,11 @@ pub fn note_drain_skipped() {
 /// Attribute elapsed time since `started` to one phase of the current tranche.
 pub fn note_drain_phase(phase: DrainPhase, started: std::time::Instant) {
     DRAIN_DUTY.note_phase(phase, started.elapsed().as_micros() as u64);
+}
+
+/// Attribute one slice of a render-rail flush to the part of it that was spent.
+pub fn note_readback_phase(phase: ReadbackPhase, us: u64) {
+    DRAIN_DUTY.note_readback(phase, us);
 }
 
 /// Count one guest-Store routing decision, by route name.

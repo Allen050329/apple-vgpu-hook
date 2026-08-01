@@ -1826,6 +1826,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     };
     let bgra: &[u8] = frame.as_ref();
     let preserve = render_flush_guest_written_ranges(state, host, key);
+    let write_started = std::time::Instant::now();
     let ok = crate::runtime::mapping_write::write_bgra8_skipping(
         state,
         host,
@@ -1835,6 +1836,10 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.width,
         key.height,
         &preserve,
+    );
+    crate::runtime::drain::note_readback_phase(
+        crate::runtime::drain::ReadbackPhase::Write,
+        write_started.elapsed().as_micros() as u64,
     );
     if !ok {
         crate::observe::fail(format!(
