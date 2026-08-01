@@ -1581,6 +1581,15 @@ fn finish_stream<M: HostMemory + HostOps>(
     }
 
     // Render ICB execute (`0x14`/`0x15`) — open pass over color slots and run ICB.
+    // Counted in FRONT of every gate below, because the only always-on report
+    // of this rail (`exec_summary`'s `icb_ok`/`icb_fail`) is emitted solely for
+    // packets that already failed, so an ICB that succeeds is invisible there
+    // and the whole rail reads as "never runs". This says how often the decoded
+    // stream asks for one at all, which is the denominator `runtime/icb`
+    // (2818 product lines) has never had.
+    if acc.execute_icb.is_some() {
+        crate::runtime::drain::note_store_route("icb_exec_seen");
+    }
     if let Some(exec) = &acc.execute_icb {
         if !acc.color_slots.is_empty() {
             // Pipeline optional for empty ICB; use first pass color geometry via mrt helper.
@@ -1698,7 +1707,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                     loc,
                     len,
                 ) {
-                    EncodeStatus::Ok => out.render_icb_ok += 1,
+                    EncodeStatus::Ok => {
+                        crate::runtime::drain::note_store_route("icb_exec_ok");
+                        out.render_icb_ok += 1;
+                    }
                     st => {
                         out.render_icb_fail += 1;
                         // Was `st={st:?}` — the variant, Debug-rendered, with no
