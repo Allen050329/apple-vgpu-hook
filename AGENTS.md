@@ -105,15 +105,25 @@ Some capabilities cannot be delivered from the host at all, because they are dec
 inside Apple's guest-side driver and userland plugin. Record them here rather than rediscovering
 them: each of these has already cost a session.
 
-**Chrome cannot be GPU-accelerated on the macOS guest.** ANGLE's Metal backend gates display
-creation on `[MTLCreateSystemDefaultDevice() supportsFamily:MTLGPUFamilyMac2]`, and the guest's
-Metal device answers NO — it reports Mac1, Common1 and Common2 only. The check runs *before* the
-EGL display object exists, so no ANGLE feature override, EGL attribute or Chrome flag can reach it,
-and it returns `EGL_NO_DISPLAY` with `EGL_SUCCESS` and no message, which is why it reads as an
-unexplained failure. The family comes from a `featureProfile` constant hardcoded in Apple's
-`AppleParavirtGPUMetal.bundle`, not from any value this host sends. Chrome's remaining path is
-ANGLE-GL on Apple's software renderer, which is what it already uses by default. Do not spend
-another session on Chrome flag combinations.
+**Chrome's GPU blocker is one capability: Tier 2 argument buffers.** ANGLE's Metal backend gates
+display creation on `[MTLCreateSystemDefaultDevice() supportsFamily:MTLGPUFamilyMac2]`, and the
+guest answers NO. The check runs *before* the EGL display object exists, so no ANGLE feature
+override, EGL attribute or Chrome flag can reach it, and it returns `EGL_NO_DISPLAY` with
+`EGL_SUCCESS` and no message — which is why it reads as an unexplained failure. Chrome flag
+combinations are therefore not worth another session; the gate is a device capability.
+
+Which capability is now pinned down, and it is **not** a blanket "Apple pinned us to family 1".
+Measured on the live guest: `supportsFeatureSet` is **true** for `macOS_GPUFamily1_v1/v2/v3/v4`
+and false only for `macOS_GPUFamily2_v1`; `argumentBuffersSupport` is **Tier 1**. The device
+genuinely is Metal 2 — which is what its own `ioreg` reports — and `MTLGPUFamilyMac2` corresponds
+to `macOS_GPUFamily2_v1`, whose headline requirement is Tier 2 argument buffers.
+
+**Whether the host can raise that is an open question, not a settled no.** An earlier note in this
+file asserted a hardcoded `featureProfile` of `10000` making it host-independent; that assertion is
+**refuted** — a device pinned at 10000 could not report `macOS_GPUFamily1_v4` true. Do not repeat
+it. The live lead is that the protocol version ladder leaves `metalHeaps` off until rung 43 and
+`bufferFromIOSurface` off until rung 60 while this guest negotiates rung 4, and Tier 2 argument
+buffers are closely tied to heap support.
 
 **Hardware OpenGL does not exist in the guest.** Apple's Metal plugin returns `supportsOpenGL = 0`
 unconditionally and the kext's `Info.plist` declares no `IOGLBundleName`, so the guest's only CGL
