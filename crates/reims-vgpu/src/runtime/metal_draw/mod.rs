@@ -18,7 +18,7 @@ use crate::runtime::census::srgb_census;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
 use crate::runtime::decode::render::{
-    DepthAttachment, Stage, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_DONT_CARE,
+    DepthAttachment, StencilAttachment, PASS_LOAD_ACTION_CLEAR, PASS_LOAD_ACTION_DONT_CARE,
     PASS_LOAD_ACTION_LOAD, PASS_STORE_ACTION_STORE,
 };
 use crate::runtime::decode::resource::ListObjectEntry;
@@ -237,24 +237,31 @@ fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     decode_depth_stencil_descriptor(&desc).map_err(|_| "depth_stencil_desc_decode")
 }
 
+/// One slot of a render encoder's vertex or fragment buffer table.
+///
+/// The stage is not a field. A bind lives in `vertex_buffers` or in
+/// `fragment_buffers`, and which table holds it *is* the stage; carrying it
+/// again inside the element made two encodings of one fact that had to agree,
+/// and nothing ever read the copy.
 #[derive(Clone, Debug, Default)]
 pub struct BufferBind {
-    pub stage: Stage,
     pub index: u32,
     pub buffer_ref: u32,
     pub offset: u64,
 }
 
+/// One slot of a render encoder's vertex or fragment texture table. The stage
+/// is the table it is in; see [`BufferBind`].
 #[derive(Clone, Debug, Default)]
 pub struct TextureBind {
-    pub stage: Stage,
     pub index: u32,
     pub texture_ref: u32,
 }
 
+/// One slot of a render encoder's vertex or fragment sampler table. The stage
+/// is the table it is in; see [`BufferBind`].
 #[derive(Clone, Debug, Default)]
 pub struct SamplerBind {
-    pub stage: Stage,
     pub index: u32,
     pub sampler_ref: u32,
 }

@@ -3676,8 +3676,6 @@ fn wire_backed_mesh_threadgroups_e2e() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn inherit_buffers_encoder_fragment_color() {
-    use crate::runtime::decode::render::Stage;
-
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
 
@@ -3758,7 +3756,6 @@ fn inherit_buffers_encoder_fragment_color() {
         first_vertex: 0,
         target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
         fragment_buffers: vec![BufferBind {
-            stage: Stage::Fragment,
             index: 0,
             buffer_ref: 13,
             offset: 0,

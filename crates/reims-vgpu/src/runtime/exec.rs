@@ -1083,9 +1083,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 &mut acc.fragment_buffers,
                 |b| b.index,
                 |index, (buffer_ref, offset)| {
-                    (buffer_ref != 0).then_some(BufferBind {
-                        stage: cmd.stage,
-                        index,
+                    (buffer_ref != 0).then_some(BufferBind {                        index,
                         buffer_ref,
                         offset,
                     })
@@ -1136,9 +1134,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                             out.type11_mappings.push(texture_ref);
                         }
                     }
-                    Some(TextureBind {
-                        stage: cmd.stage,
-                        index,
+                    Some(TextureBind {                        index,
                         texture_ref,
                     })
                 },
@@ -1154,9 +1150,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 &mut acc.fragment_samplers,
                 |b| b.index,
                 |index, sampler_ref| {
-                    (sampler_ref != 0).then_some(SamplerBind {
-                        stage: cmd.stage,
-                        index,
+                    (sampler_ref != 0).then_some(SamplerBind {                        index,
                         sampler_ref,
                     })
                 },
@@ -3028,8 +3022,7 @@ mod tests {
         let mut acc = StreamAccum {
             pipeline_ref: 61,
             vertex_buffers: Arc::new(vec![BufferBind {
-                stage: Stage::Vertex,
-                index: 0,
+            index: 0,
                 buffer_ref: 9,
                 offset: 0,
             }]),
@@ -3077,8 +3070,7 @@ mod tests {
         let mut acc = StreamAccum {
             pipeline_ref: 61,
             vertex_buffers: Arc::new(vec![BufferBind {
-                stage: Stage::Vertex,
-                index: 0,
+            index: 0,
                 buffer_ref: 9,
                 offset: 0,
             }]),
@@ -3108,9 +3100,7 @@ mod tests {
             &mut acc.fragment_buffers,
             |b| b.index,
             |index, (buffer_ref, offset)| {
-                Some(BufferBind {
-                    stage: Stage::Vertex,
-                    index,
+                Some(BufferBind {                    index,
                     buffer_ref,
                     offset,
                 })
@@ -3502,8 +3492,7 @@ mod tests {
             draw: (3, 1, 3, 0),
             indexed: None,
             vertex_buffers: Arc::new(vec![BufferBind {
-                stage: Stage::Vertex,
-                index: 0,
+            index: 0,
                 buffer_ref: 1,
                 offset: 0,
             }]),
@@ -3599,8 +3588,7 @@ mod tests {
             draw: (3, 1, 3, 0),
             indexed: None,
             vertex_buffers: Arc::new(vec![BufferBind {
-                stage: Stage::Vertex,
-                index: 0,
+            index: 0,
                 buffer_ref: 1,
                 offset: 0,
             }]),
