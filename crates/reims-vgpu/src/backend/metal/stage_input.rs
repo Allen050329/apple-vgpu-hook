@@ -10,7 +10,7 @@ use crate::backend::metal::constants::{
     REIMS_VGPU_METAL_MAX_ATTRS, REIMS_VGPU_METAL_MAX_BUFFERS,
 };
 use crate::backend::metal::util::{set_err, ErrOut, Status};
-use metal::{MTLAttributeFormat, MTLIndexType, MTLStepFunction, StageInputOutputDescriptor};
+use metal::{MTLAttributeFormat, MTLIndexType, StageInputOutputDescriptor};
 
 // Apple Metal.framework MTLStepFunction raw values (MTLStageInputOutputDescriptor.h).
 // Do not use metal-0.33's MTLStepFunction as u32 for X/Y Indexed — that crate

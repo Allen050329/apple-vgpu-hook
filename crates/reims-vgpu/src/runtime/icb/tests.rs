@@ -2401,7 +2401,6 @@ fn wire_backed_draw_patches_tessellation_e2e() {
 fn wire_backed_draw_indexed_patches_tessellation_e2e() {
     use crate::runtime::decode::resource::{
         render_draw_indexed_patches_icb_layout, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES,
-        OBJECT_TYPE_BUFFER,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2606,7 +2605,7 @@ fn fill_render_object_mesh_threadgroups_oracle() {
 fn wire_backed_dual_export_object_mesh_e2e() {
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
-        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
+        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2790,7 +2789,7 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
 fn wire_backed_mesh_spi_pipeline_e2e() {
     use crate::runtime::decode::resource::{
         decode_render_pipeline_descriptor, render_draw_mesh_threadgroups_icb_layout,
-        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
+        MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3040,7 +3039,7 @@ fn fill_render_object_buffer_bind_oracle() {
 fn wire_backed_mesh_buffer_bind_e2e() {
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threads_icb_layout_with_binds, ICB_DESC_LAYOUT,
-        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADS, OBJECT_TYPE_BUFFER,
+        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADS,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3132,7 +3131,7 @@ fn wire_backed_mesh_buffer_bind_e2e() {
 fn wire_backed_object_buffer_bind_e2e() {
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
-        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS, OBJECT_TYPE_BUFFER,
+        ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3449,7 +3448,6 @@ fn wire_backed_object_tg_memory_e2e() {
     use crate::runtime::decode::resource::{
         encode_icb_command_layout, render_draw_mesh_threadgroups_icb_layout_ex, ICB_DESC_LAYOUT,
         ICB_DESC_MAX_OBJECT_TG_BINDS, ICB_LAYOUT_LEN, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
-        OBJECT_TYPE_BUFFER,
     };
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4030,9 +4028,7 @@ fn fill_render_stagein_draw_execute_oracle() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_draw_primitives_stagein_e2e() {
-    use crate::runtime::decode::resource::{
-        render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
-    };
+    use crate::runtime::decode::resource::{render_icb_layout, MTL_INDIRECT_CMD_DRAW};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4344,9 +4340,7 @@ fn fill_render_attribute_stride_stagein_execute() {
 #[test]
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn wire_backed_attribute_stride_stagein_e2e() {
-    use crate::runtime::decode::resource::{
-        render_icb_layout, MTL_INDIRECT_CMD_DRAW, OBJECT_TYPE_BUFFER,
-    };
+    use crate::runtime::decode::resource::{render_icb_layout, MTL_INDIRECT_CMD_DRAW};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();

@@ -314,7 +314,7 @@ pub fn new_texture_view_swizzled(
         if ptr.is_null() {
             None
         } else {
-            Some(unsafe { Texture::from_ptr(ptr as *mut _) })
+            Some(Texture::from_ptr(ptr as *mut _))
         }
     }
 }

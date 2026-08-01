@@ -138,9 +138,9 @@ impl ComputeSession {
             };
             use metal::MTLResourceOptions;
 
-            let mut stage_cond = |this: &mut Self,
-                                  buffer_ref: u32,
-                                  offset: u64|
+            let stage_cond = |this: &mut Self,
+                              buffer_ref: u32,
+                              offset: u64|
              -> Result<(metal::Buffer, u64), ComputeStatus> {
                 let end = offset.checked_add(4).ok_or(ComputeStatus::MissingBuffer(
                     "compute_control_cond_offset_overflow",
@@ -734,14 +734,12 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
                         depth: 1,
                     },
                 };
-                unsafe {
-                    tex.replace_region(
-                        region,
-                        0,
-                        staged.bytes.as_ptr() as *const _,
-                        (staged.width as u64) * (bpp as u64),
-                    );
-                }
+                tex.replace_region(
+                    region,
+                    0,
+                    staged.bytes.as_ptr() as *const _,
+                    (staged.width as u64) * (bpp as u64),
+                );
                 // Residency for resources referenced through the AB.
                 let res_usage = if is_storage {
                     MTLResourceUsage::Write | MTLResourceUsage::Read
@@ -1088,8 +1086,6 @@ mod tests {
     use super::*;
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::contract::endian::{st32, st64};
-    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-    use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     use crate::runtime::decode::resource::{

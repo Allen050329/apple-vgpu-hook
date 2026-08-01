@@ -1597,7 +1597,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             let row = req.width.saturating_mul(4);
             let depth_len = (row as usize).saturating_mul(height as usize);
             let mut buf = vec![0u8; depth_len];
-            let mut mid =
+            let mid =
                 objects::resolve_type11_ref(state, host, req.task_id, da.texture_ref).unwrap_or(0);
             if mid != 0 {
                 let _ = mapper::ensure_resolved_for_scanout(state, host, mid);
@@ -1660,7 +1660,7 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
         {
             let stencil_len = (width as usize).saturating_mul(height as usize);
             let mut buf = vec![0u8; stencil_len];
-            let mut mid =
+            let mid =
                 objects::resolve_type11_ref(state, host, req.task_id, sa.texture_ref).unwrap_or(0);
             if mid != 0 {
                 let _ = mapper::ensure_resolved_for_scanout(state, host, mid);

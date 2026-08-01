@@ -614,7 +614,6 @@ fn get_render_pipeline_state(
     fragment: &Function,
     vertex_descriptor: Option<&VertexDescriptor>,
     key: &RenderPsoKey,
-    blend: Option<&ReimsVgpuBlendState>,
     err: ErrOut<'_>,
 ) -> Result<(RenderPipelineState, u32, u32), Status> {
     if let Some(hit) = render_pso_lookup(key) {
@@ -678,7 +677,7 @@ fn get_render_pipeline_state(
             Status::execute("metal_render_pso_create_failed").field("key_hash", key.key_hash)
         })?;
 
-    let reflection_ptr = unsafe { reflection.as_ptr() as *mut objc::runtime::Object };
+    let reflection_ptr = reflection.as_ptr() as *mut objc::runtime::Object;
     let vert_mask = render_reflection_sampler_mask(reflection_ptr, true);
     let frag_mask = render_reflection_sampler_mask(reflection_ptr, false);
 
@@ -1012,9 +1011,7 @@ fn bind_sampled_images(
                 depth: 1,
             },
         };
-        unsafe {
-            texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
-        }
+        texture.replace_region(region, 0, bytes as *const _, bytes_per_row);
         if fragment_stage {
             encoder.set_fragment_texture(texture_index as u64, Some(&texture));
         } else {
@@ -1273,14 +1270,12 @@ fn configure_depth_attachment(
                 depth: 1,
             },
         };
-        unsafe {
-            texture.replace_region(
-                region,
-                0,
-                depth.data as *const _,
-                (width as u64) * (std::mem::size_of::<f32>() as u64),
-            );
-        }
+        texture.replace_region(
+            region,
+            0,
+            depth.data as *const _,
+            (width as u64) * (std::mem::size_of::<f32>() as u64),
+        );
     }
     retained.push(texture.clone());
     if let Some(att) = pass.depth_attachment() {
@@ -1320,9 +1315,7 @@ fn configure_stencil_attachment(
                 depth: 1,
             },
         };
-        unsafe {
-            texture.replace_region(region, 0, stencil.data as *const _, width as u64);
-        }
+        texture.replace_region(region, 0, stencil.data as *const _, width as u64);
     }
     retained.push(texture.clone());
     if let Some(att) = pass.stencil_attachment() {
@@ -1675,7 +1668,6 @@ pub fn render_core_mrt(
         &fragment,
         vertex_descriptor.as_ref(),
         &pso_key,
-        blend,
         err,
     ) {
         Ok(v) => v,
@@ -1706,14 +1698,12 @@ pub fn render_core_mrt(
                     depth: 1,
                 },
             };
-            unsafe {
-                target.replace_region(
-                    region,
-                    0,
-                    seed.as_ptr() as *const _,
-                    (width as u64) * (bpp as u64),
-                );
-            }
+            target.replace_region(
+                region,
+                0,
+                seed.as_ptr() as *const _,
+                (width as u64) * (bpp as u64),
+            );
         }
         retained_tex.push(target.clone());
         color_textures.push((slot, target, bpp));
@@ -2033,14 +2023,12 @@ pub fn render_core_mrt(
                     depth: 1,
                 },
             };
-            unsafe {
-                target.get_bytes(
-                    readback.as_mut_ptr() as *mut _,
-                    (width as u64) * (*bpp as u64),
-                    region,
-                    0,
-                );
-            }
+            target.get_bytes(
+                readback.as_mut_ptr() as *mut _,
+                (width as u64) * (*bpp as u64),
+                region,
+                0,
+            );
             let n = out.len().min(target_len);
             out[..n].copy_from_slice(&readback[..n]);
         }
@@ -2057,14 +2045,12 @@ pub fn render_core_mrt(
                         depth: 1,
                     },
                 };
-                unsafe {
-                    tex.get_bytes(
-                        depth.data as *mut _,
-                        (width as u64) * (std::mem::size_of::<f32>() as u64),
-                        region,
-                        0,
-                    );
-                }
+                tex.get_bytes(
+                    depth.data as *mut _,
+                    (width as u64) * (std::mem::size_of::<f32>() as u64),
+                    region,
+                    0,
+                );
             }
         }
     }
@@ -2079,9 +2065,7 @@ pub fn render_core_mrt(
                         depth: 1,
                     },
                 };
-                unsafe {
-                    tex.get_bytes(stencil.data as *mut _, width as u64, region, 0);
-                }
+                tex.get_bytes(stencil.data as *mut _, width as u64, region, 0);
             }
         }
     }

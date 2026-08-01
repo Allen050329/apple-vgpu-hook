@@ -671,6 +671,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 }
 
 /// Sampled texture source + geometry for an engine draw.
+#[cfg(feature = "backend-vulkan")]
 enum SampledSourceRequest {
     /// Shared texel bytes + optional producer identity (see
     /// [`LinearSampleIdentity`]) + the byte layout of those texels; the Arc lets
@@ -700,6 +701,7 @@ struct LinearSampleIdentity {
     generation: u64,
 }
 
+#[cfg(feature = "backend-vulkan")]
 type LoadedType5View = (
     u32,
     u32,
@@ -707,6 +709,7 @@ type LoadedType5View = (
     LinearSampleIdentity,
     TexelLayout,
 );
+#[cfg(feature = "backend-vulkan")]
 type LoadedLinearSample = (
     u32,
     u32,
@@ -714,6 +717,7 @@ type LoadedLinearSample = (
     Option<LinearSampleIdentity>,
     TexelLayout,
 );
+#[cfg(feature = "backend-vulkan")]
 type DrawHandoffStage<'a> = (&'a str, &'a [u8], &'a [u8], &'a [u8]);
 
 /// Authoritative contents when a fragment texture aliases a GVA color target.
@@ -953,6 +957,7 @@ fn try_sample_mrt_secondary<M: HostMemory + HostOps>(
 /// target to bind directly (zero-copy) or CPU bytes to upload, so this is the
 /// resolver the engine draw path uses. Distinct from [`load_sampled_rgba`],
 /// which is the Metal-path resolver and always materializes RGBA8 bytes.
+#[cfg(feature = "backend-vulkan")]
 fn resolve_sampled_source<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1383,6 +1388,7 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
     ))
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn type5_view_requires_materialization(
     base_has_geom: bool,
@@ -1401,6 +1407,7 @@ fn type5_view_requires_materialization(
 
 /// The decoded device-surface fields a failed sample-window derivation dumps
 /// for diagnosis: `(width, height, pixel_format, bytes_per_row, alloc_size)`.
+#[cfg(feature = "backend-vulkan")]
 type SampleWindowDesc = (u32, u32, u32, u32, u32);
 
 /// Why the type-5 serialized-view loader refused to materialize a plane.
@@ -1415,6 +1422,7 @@ type SampleWindowDesc = (u32, u32, u32, u32, u32);
 /// migration recorded as still sharing the word. The `type5_view_` prefix keeps
 /// `grep reason=type5_view_…` answerable against the copy path that shares the
 /// surface; crate-wide distinctness is `observe::gate`'s job.
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type5ViewDecline {
     /// The serialized view is volumetric; only `depth == 1` planes materialize.
@@ -1464,6 +1472,7 @@ enum Type5ViewDecline {
     Convert { row: usize, bpp: u32 },
 }
 
+#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for Type5ViewDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1562,6 +1571,7 @@ impl crate::observe::Decline for Type5ViewDecline {
 /// always-on channel. Measured on one x86/Vulkan boot before the guest-pages rung
 /// existed: **121 distinct (mapping, geometry) wipes** in ~170 s, four of them at
 /// the full 1920x1080 composite extent, against 0 in the idle phase.
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedDecline {
     /// The cache holds no entry for this mapping id and the mapping's own pages
@@ -1595,6 +1605,7 @@ enum Type11SeedDecline {
     CededToResident,
 }
 
+#[cfg(feature = "backend-vulkan")]
 impl crate::observe::Decline for Type11SeedDecline {
     fn slug(&self) -> &'static str {
         match self {
@@ -1781,6 +1792,7 @@ fn resolve_type11_load_seed<M: HostMemory + HostOps>(
 /// bind re-reads the native plane window so a guest write is always observed;
 /// conversion, allocation, and — via the returned content identity — the
 /// engine upload are skipped when the bytes are unchanged.
+#[cfg(feature = "backend-vulkan")]
 fn load_type5_view_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2142,6 +2154,7 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
 
 /// Cap on [`DeviceState::guest_run_memo`] entries (FIFO evict). Entries are a
 /// few dozen bytes each; the cap only bounds pathological churn.
+#[cfg(feature = "backend-vulkan")]
 const GUEST_RUN_MEMO_CAP: usize = 512;
 
 /// Memoized [`task_gva_guest_runs`]: resolve `[gva, gva+span)` under the task
@@ -2757,6 +2770,7 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
     ))
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn linear_sampled_memo_reuse(
     state: &DeviceState,
     task_id: u32,
@@ -2798,6 +2812,7 @@ fn linear_sampled_memo_reuse(
 /// format; every other format converts to RGBA8 per row. Shared by the
 /// guest-linear memo's miss-fill so its padded and tight branches agree
 /// byte-for-byte with the direct loader.
+#[cfg(feature = "backend-vulkan")]
 fn native_scratch_to_upload(
     scratch: &[u8],
     w: u32,
@@ -2861,6 +2876,7 @@ fn native_scratch_to_upload(
 /// That is measured, not asserted, and it is why the surviving Finder icon
 /// class is not a wrong-bytes defect on this rung: the bytes served are the
 /// bytes at the address the guest named, checked afresh each time.
+#[cfg(feature = "backend-vulkan")]
 #[allow(clippy::too_many_arguments)]
 fn load_linear_guest_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3120,6 +3136,7 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// double boot 1 and still short of the ~127 threshold, so the reliable
 /// high-recycling defect remains unscored — nothing here shows it is fixed, only
 /// that it did not appear. `lin_rung_blank_with_host_entry` was 0 on both.
+#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the census line carries the identity of the sample it scored"
@@ -3209,6 +3226,7 @@ fn note_guest_rung_blank(
 /// [`crate::runtime::surface_cache::gva_guest_wrote_since_store`] is the
 /// repair. This probe stays because it is the only thing that can *prove* the
 /// repair holds — it compares bytes, where the witness compares generations.
+#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the audit line carries the identity of the entry it scored"
@@ -3271,6 +3289,7 @@ fn audit_gva_cache_against_guest<M: HostMemory + HostOps>(
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -3452,6 +3471,7 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
 /// The Vulkan rail writes back only color attachment 0, so this narrows
 /// [`sync_store_target_pages`] to that record and to the case where this record
 /// owns guest writeback at all.
+#[cfg(feature = "backend-vulkan")]
 fn sync_store_allowed_pages<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -3519,6 +3539,7 @@ fn sync_store_allowed_pages<M: HostMemory>(
 /// until the guest CPU rewrites them in place. See
 /// [`crate::runtime::surface_cache::gva_guest_wrote_since_store`], which asks
 /// the other half.
+#[cfg(feature = "backend-vulkan")]
 #[must_use]
 fn note_gva_backing_verdict(
     verdict: crate::runtime::surface_cache::BackingVerdict,
@@ -3717,6 +3738,7 @@ fn note_gva_backing_verdict(
 /// every LOAD, with the 237 GB left saved. One driven boot after it landed
 /// measured `type11_seed_elided` 283 against `type11_seed_uploaded` 23, so the
 /// reuse survived the soundness.
+#[cfg(feature = "backend-vulkan")]
 fn note_type11_elision_extent(w: u32, h: u32) {
     let texels = (w as u64).saturating_mul(h as u64);
     crate::runtime::drain::note_store_route(match texels {
@@ -3731,6 +3753,7 @@ fn note_type11_elision_extent(w: u32, h: u32) {
     crate::runtime::drain::note_store_route_n("t11elide_texels", texels);
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the census joins the scissor rect, the target, and how the attachment was loaded"
@@ -3819,6 +3842,7 @@ fn note_draw_coverage(
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn note_load_seed_outcome(
     door: &'static str,
     seeded: bool,
@@ -3875,6 +3899,7 @@ fn note_load_seed_outcome(
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn gva_cache_linear_texture_type(object_type: u8) -> bool {
     matches!(
@@ -3887,6 +3912,7 @@ fn gva_cache_linear_texture_type(object_type: u8) -> bool {
 /// wrappers may alias the same GVA allocation, so a matching GVA+geometry cache
 /// entry can serve either tag. Other nonzero object-type transitions remain
 /// separate resource classes and fall through to current ref/guest backing.
+#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bool {
     producer_type == 0
@@ -3902,6 +3928,7 @@ fn gva_cache_owner_allows_object_type(producer_type: u8, current_type: u8) -> bo
 /// records the pages it resolves to so a later sample can tell whether the
 /// address still names this allocation, and asks the host to watch them so a
 /// later sample can also tell whether the guest has since rewritten it.
+#[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
     reason = "the cache identity mirrors the object, GVA, texture geometry, and guest backing"
@@ -6679,12 +6706,14 @@ fn type11_guest_wrote_since_store<M: HostOps>(
 /// the guest; on the boot that first measured the ladder it was 14 092 of 14 396
 /// cache binds, so refusing on it would turn the rung off on the strength of a
 /// rail that was never armed.
+#[cfg(feature = "backend-vulkan")]
 fn guest_wrote_allocation(verdict: GuestWriteVerdict) -> bool {
     matches!(verdict, GuestWriteVerdict::Wrote)
 }
 
 /// Where the guest's writes since the stamping Store landed, relative to the
 /// pixel window a sampled bind reads.
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GuestWriteSite {
     /// At least one written page overlaps the sampled window, so every
@@ -6716,6 +6745,7 @@ enum GuestWriteSite {
 /// mapping does not own — is [`GuestWriteSite::Unknown`], which the caller
 /// treats as [`GuestWriteSite::Pixels`]. Serving a stale copy is a wrong frame
 /// that is then held; re-reading the guest's pages costs a copy.
+#[cfg(feature = "backend-vulkan")]
 fn guest_write_site<M: HostOps>(
     state: &DeviceState,
     host: &M,
@@ -6826,6 +6856,7 @@ fn merge_guest_writes_into_pages<M: HostMemory + HostOps>(
 ///
 /// Half-open on both sides: a range that abuts the window without entering it
 /// is the padding page after the last row, not the last row.
+#[cfg(feature = "backend-vulkan")]
 fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> bool {
     ranges
         .iter()
@@ -6862,6 +6893,7 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// with a guest-write token, and 304 because the guest had demonstrably
 /// rewritten the pages since the Store. The resident rung above it, at 6.4
 /// times the traffic, had no column at all because it asked no question.
+#[cfg(feature = "backend-vulkan")]
 fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     crate::runtime::drain::note_store_route(rung);
     if let Some(gw) = sample_rung_gw_route(rung, guest_write) {
@@ -6871,6 +6903,7 @@ fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
 
 /// The census column for a rung's guest-write verdict, or `None` for a rung the
 /// verdict says nothing about.
+#[cfg(feature = "backend-vulkan")]
 fn sample_rung_gw_route(rung: &str, guest_write: GuestWriteVerdict) -> Option<&'static str> {
     Some(match (rung, guest_write) {
         ("t11rung_resident", GuestWriteVerdict::Clean) => "t11rung_resident_gw_clean",

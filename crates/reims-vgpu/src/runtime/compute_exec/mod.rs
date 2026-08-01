@@ -1439,8 +1439,20 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             format,
         );
+        #[cfg_attr(
+            not(feature = "backend-vulkan"),
+            allow(unused_mut, reason = "the Vulkan resident-consumption block below assigns it")
+        )]
         let mut seed_generation = 0;
+        #[cfg_attr(
+            not(feature = "backend-vulkan"),
+            allow(unused_mut, reason = "the Vulkan resident-consumption block below assigns it")
+        )]
         let mut seed_skipped = false;
+        #[cfg_attr(
+            not(feature = "backend-vulkan"),
+            allow(unused_mut, reason = "the Vulkan resident-consumption block below assigns it")
+        )]
         let mut sample_resident = None;
         #[cfg(feature = "backend-vulkan")]
         {
@@ -1731,6 +1743,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                 "compute_stage_tex_mapping_gone",
             ))?;
         let map_generation = m.map_generation;
+        #[cfg_attr(
+            not(feature = "backend-vulkan"),
+            allow(unused_mut, reason = "the Vulkan resident-skip block below assigns it")
+        )]
         let mut seed_generation = m.content_generation;
         let pages_n = m.page_entries.len();
         // Wire type-4 `length` (page-aligned getResidentSize), stashed as device_desc.alloc_size.
@@ -1838,6 +1854,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // The zero placeholder is never seeded — the engine fails visibly
         // with `vk_compute_exec_resident_seed_generation_lost` if the resident
         // vanishes by acquire time.
+        #[cfg_attr(
+            not(feature = "backend-vulkan"),
+            allow(unused_mut, reason = "the Vulkan resident-skip block below assigns it")
+        )]
         let mut seed_skipped = false;
         #[cfg(feature = "backend-vulkan")]
         if is_storage {
@@ -1862,6 +1882,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // between the resident image and the sampled view the engine will
         // create — the engine's resident-bind path guards it and would fail
         // the whole request on mismatch.
+        #[cfg_attr(
+            not(feature = "backend-vulkan"),
+            allow(unused_mut, reason = "the Vulkan resident-sample block below assigns it")
+        )]
         let mut sample_resident = None;
         #[cfg(feature = "backend-vulkan")]
         if !is_storage {
@@ -2128,10 +2152,26 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format,
         )
     });
+    #[cfg_attr(
+        not(feature = "backend-vulkan"),
+        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+    )]
     let mut seed_skipped = false;
+    #[cfg_attr(
+        not(feature = "backend-vulkan"),
+        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+    )]
     let mut seed_generation = 0u32;
+    #[cfg_attr(
+        not(feature = "backend-vulkan"),
+        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+    )]
     let mut sample_resident = None;
     let mut bytes = vec![0u8; need];
+    #[cfg_attr(
+        not(feature = "backend-vulkan"),
+        allow(unused_mut, reason = "the Vulkan resident-window block below assigns it")
+    )]
     let mut have_bytes = false;
     // Resident-authoritative window (deferred linear writeback): consume the
     // engine resident without bytes when possible; otherwise flush it into the
@@ -2313,6 +2353,10 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // mapped at writeback time (the sync path would have written guest
     // pages), the deferred-writeback arm records a flush obligation with a
     // defer-time page index so aliased raw-GVA readers land it first.
+    #[cfg_attr(
+        not(feature = "backend-vulkan"),
+        allow(unused_mut, reason = "the Vulkan storage-residency block below assigns it")
+    )]
     let mut residency = None;
     #[cfg(feature = "backend-vulkan")]
     if is_storage {

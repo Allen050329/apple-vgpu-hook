@@ -1493,6 +1493,7 @@ fn deferred_gva_sample_eligibility_rules() {
     );
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
     let mut state = DeviceState::new(DeviceId(7), PAGE_SHIFT_ARM64E);
@@ -1519,6 +1520,7 @@ fn linear_sampled_memo_serves_only_exact_generation_and_geometry() {
     assert!(linear_sampled_memo_reuse(&state, 3, 45, 0x30_2000, 5, 1, 1).is_none());
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_cache_owner_object_type_transitions_are_named() {
     assert!(gva_cache_owner_allows_object_type(
@@ -2925,6 +2927,7 @@ fn an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram() {
 
 /// Type-2/3 GVA wallpaper layers must be sampleable from texture_ref host
 /// cache (not surface_id mid map) after encode Store.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_layer_host_cache_roundtrip_for_sample() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2972,6 +2975,7 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
     assert_eq!(&sampled[0..4], &[81, 126, 185, 255]);
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn type3_linear_sample_uses_type2_gva_storage_cache() {
     use crate::contract::endian::{st16, st32, st64};
@@ -3078,6 +3082,7 @@ fn type3_linear_sample_uses_type2_gva_storage_cache() {
 /// Guest-CPU-produced tight linear textures: unchanged native bytes must
 /// reuse the memoized RGBA Arc under a stable generation identity; a guest
 /// write must be observed and produce a new generation.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
     use crate::contract::endian::{st16, st32, st64};
@@ -3186,6 +3191,7 @@ fn guest_linear_memo_reuses_arc_and_observes_guest_writes() {
 /// == Bgra8`, no CPU channel swap), carries a memo identity so the engine
 /// skips its content hash + upload, and that the row gather takes exactly
 /// the tight texels — skipping the padding — into the tight output.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn padded_bgra8_memoized_uploads_native_without_swizzle() {
     use crate::contract::endian::{st16, st32, st64};
@@ -3366,6 +3372,7 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
 /// A type-5 ref is not itself a surface id. The descriptor's surface_id
 /// remains authoritative even when the numeric ref collides with another
 /// live display mapping (live app-launch ref=2 -> sid=71 class).
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
     use crate::contract::endian::st32;
@@ -3484,6 +3491,7 @@ fn type5_sample_uses_descriptor_surface_id_not_ref_collision() {
 /// 2-byte IOSurface FourCC (`LA08`) while the type-5 descriptor carries
 /// the exact RG8 Metal view. Defaulting the base to BGRA asks for a
 /// 632-byte row against the wire's 320-byte row and drops the draw.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
     use crate::contract::endian::{st16, st32, st64};
@@ -3633,6 +3641,7 @@ fn type5_sample_uses_serialized_rg8_view_over_unknown_surface_fourcc() {
 /// The type-5 view memo: unchanged plane bytes reuse the converted Arc and
 /// carry a stable content identity (engine upload skipped); a guest write
 /// to the plane is observed on the next bind and mints a new generation.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     use crate::contract::endian::{st16, st32, st64};
@@ -3744,6 +3753,7 @@ fn type5_view_memo_reuses_unchanged_planes_and_invalidates_on_write() {
     assert!(!std::sync::Arc::ptr_eq(&rgba1, &rgba3));
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn type5_view_materializes_only_when_base_identity_differs() {
     use crate::contract::pixel_format::MTL_FORMAT_RG8_UNORM;
@@ -3880,6 +3890,7 @@ fn texture_view_decline_preserves_decode_leaf_and_chain_identity() {
 /// whitespace-free fields, and is distinct — the same discipline the
 /// capture and import rails took, so `grep reason=type5_view_…` stays
 /// answerable against the blit rail's `t5_*` copy vocabulary next door.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
     use crate::observe::Decline as _;
@@ -3937,6 +3948,7 @@ fn every_type5_view_reason_is_namespaced_distinct_and_log_safe() {
 /// base geometry plus the decoded device descriptor, or `desc=missing` when
 /// the descriptor could not be decoded. Both branches must render exactly
 /// what the old ad-hoc `detail` string did.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn sample_window_renders_the_descriptor_or_its_absence() {
     let present = Type5ViewDecline::SampleWindow {
