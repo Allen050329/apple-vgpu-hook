@@ -1395,7 +1395,6 @@ pub struct PresentState {
     pub mapping_id: u32,
     pub width: u32,
     pub height: u32,
-    pub bpr: u32,
     /// Content generation observed at last DisplaySwap enqueue.
     pub generation: u32,
     /// A host-owned presentation window is live (device_drain refreshes this
