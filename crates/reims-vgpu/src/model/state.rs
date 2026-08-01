@@ -1316,28 +1316,23 @@ pub struct HostSurface {
     /// longer be the ones the GVA names. Cleared by the next lookup that
     /// re-walks and confirms them.
     pub backing_suspect: bool,
-    /// [`crate::runtime::host::HostOps::track_guest_writes`] token taken for
-    /// exactly [`Self::backing`]'s page list, or 0 when this entry has none.
-    ///
-    /// [`Self::backing_suspect`] answers whether this GVA still *names* these
-    /// pages; it cannot answer whether the guest CPU *wrote* them. A guest
-    /// store into pages that never moved produces no notify, no verdict, and no
-    /// device operation, so nothing in this crate can witness it — the entry
-    /// keeps serving bytes the guest has already replaced. This token is the
-    /// hypervisor's dirty bitmap standing in for the witness that does not
-    /// exist on this side.
-    ///
-    /// Set to 0 by every store that replaces [`Self::backing`] (the old token
-    /// watches pages this entry no longer claims), so an entry is armed only
-    /// while the token describes its current page list. An unarmed entry is
-    /// read as "assume written" — forgetting to arm costs a re-read, never a
-    /// wrong picture.
-    pub guest_write_token: u64,
-    /// [`crate::runtime::host::HostOps::guest_write_gen`] of
-    /// [`Self::guest_write_token`] at the moment these bytes were stored. A
-    /// later read of the same generation proves the host has observed no write
-    /// to the entry's pages since.
-    pub guest_write_gen_at_store: u64,
+    // No guest-CPU-write witness sits here, and that is a known gap rather
+    // than an omission. `backing_suspect` answers whether this GVA still
+    // *names* these pages; nothing answers whether the guest CPU *wrote* them.
+    // A guest store into pages that never moved produces no notify, no verdict
+    // and no device operation, so this entry can keep serving bytes the guest
+    // has already replaced.
+    //
+    // A `track_guest_writes` token used to sit here for exactly that. It could
+    // never answer: its baseline was latched immediately after the token was
+    // registered, inside the dirty tracker's two-harvest startup window where a
+    // generation reads 0, and was re-latched only by a later store to the same
+    // address. The entries this cache exists for are stored once and sampled
+    // forever, so their baseline stayed 0 for the boot. Over five boots the
+    // comparison it existed to make ran zero times. Anything reinstating it has
+    // to fix that first: re-read the baseline until it is non-zero, the way
+    // `mapper::stamp_guest_write_gen` gets it right on the mapping rail by
+    // re-stamping on every write.
 }
 
 /// Raw type-2/3 texture content retained by the discrete backend.
@@ -2434,17 +2429,6 @@ impl DeviceState {
                 views.push(view);
             }
             let token = Self::take_guest_write_token(mapping);
-            if token != 0 {
-                tokens.push(token);
-            }
-        }
-        // The GVA-keyed encode cache holds tokens of its own, for the same
-        // reason and with the same owner. A reset that released only the
-        // mapping tokens would leak one host-side tracking set per cached
-        // texture VA across every device lifetime.
-        for entry in self.host_gva_surfaces.values_mut() {
-            let token = std::mem::replace(&mut entry.guest_write_token, 0);
-            entry.guest_write_gen_at_store = 0;
             if token != 0 {
                 tokens.push(token);
             }

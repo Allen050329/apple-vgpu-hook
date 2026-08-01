@@ -576,7 +576,6 @@ pub fn mirror_linear_color_cache<M: HostMemory + crate::runtime::host::HostOps>(
     store_texture(state, texture_ref, width, height, bgra.clone());
     let backing = gva_backing(state, host, task_id, gva, width, height);
     store_gva_owned(state, gva, width, height, bgra, 0, backing);
-    arm_gva_guest_write_witness(state, host, gva);
 }
 
 /// Type-2/3 encode cache by target GVA.
@@ -689,35 +688,8 @@ pub fn store_gva_owned(
     // on a 300 s boot — not because the guest had rewritten every entry, which
     // is how that zero was read, but because no set this rail ever created
     // outlived its own arming window.
-    let pages_unchanged = match (entry.backing.as_ref(), backing.as_ref()) {
-        (Some(old), Some(new)) => old.gpas == new.gpas,
-        _ => false,
-    };
     entry.backing = backing;
     entry.backing_suspect = false;
-    if pages_unchanged {
-        // The *baseline* still goes, because it named the previous bytes and
-        // these are different ones. `arm_gva_guest_write_witness` re-reads it
-        // against the surviving token immediately after this returns, which is
-        // the only moment a baseline may be latched: the bytes are in hand.
-        entry.guest_write_gen_at_store = 0;
-        charge_gva_cache_bytes(state, reclaimed, charged);
-        enforce_gva_cache_cap(state, gva);
-        return;
-    }
-    // Any other change retires the token, including a `None` that says the walk
-    // could not name the pages. This runs in the *store*, not in the arming
-    // helper, because disarming is the half that must never be forgotten: an
-    // entry left holding a token for someone else's pages would report
-    // "unwritten" for pages it no longer owns. Re-arming is the caller's option
-    // (see [`arm_gva_guest_write_witness`]); disarming is not.
-    let stale = std::mem::replace(&mut entry.guest_write_token, 0);
-    entry.guest_write_gen_at_store = 0;
-    if stale != 0 {
-        // Only the host can free host-side tracking state, and this function
-        // has no host. `flush_retired_views` drains the list.
-        state.retired_guest_write_tokens.push(stale);
-    }
     charge_gva_cache_bytes(state, reclaimed, charged);
     enforce_gva_cache_cap(state, gva);
 }
@@ -793,254 +765,6 @@ pub fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
         let (width, height) = (e.width, e.height);
         state.gva_eviction_witness.note_evicted(gva, width, height);
         evict_gva(state, gva);
-    }
-}
-
-/// Ask the host to watch the guest pages a freshly stored GVA entry was
-/// produced from, and record the generation those bytes are current as of.
-///
-/// Called by the stores that have a host to ask. Split from
-/// [`store_gva_owned`] rather than folded into it because the two halves have
-/// opposite failure directions: a store that fails to *disarm* serves a stale
-/// picture, while a store that fails to *arm* only makes the next read fall
-/// through to the guest's own pages. The dangerous half is unconditional and
-/// host-free; this one is best-effort.
-///
-/// A host with no dirty bitmap answers `None` from `track_guest_writes` and the
-/// entry stays unarmed forever, which every reader takes as "assume written".
-pub fn arm_gva_guest_write_witness<H: crate::runtime::host::HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    gva: u64,
-) {
-    let page_size = state.page_size() as usize;
-    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
-        return;
-    };
-    // Already tracking this page list: `store_gva_owned` clears the token
-    // whenever it replaces the backing, so a live token is by construction a
-    // token for the pages the current bytes were produced from. Keep it —
-    // re-registering costs a host call per store — but **re-read its
-    // generation**, because this runs immediately after the bytes were stored
-    // and the baseline has to name the bytes in hand.
-    //
-    // Latching once was the defect. `reims_vgpu_dirty_gen` holds a set's
-    // generation at 0 for a deliberate two-harvest startup window ("an absence
-    // of reports says nothing about the guest yet"), and this function runs
-    // directly after `track_guest_writes` — always inside that window. So the
-    // baseline was recorded as 0, always, and the early return meant it was
-    // never revisited. A real generation is never 0, so
-    // `gva_guest_wrote_since_store` could never match one, and `gvac_gw_clean`
-    // was unreachable by construction: 0 of 201 331 lookups on the last boot.
-    // `stamp_guest_write_gen` is the same rail done correctly on the mapping
-    // side, and it re-stamps on every store for exactly this reason.
-    if entry.guest_write_token != 0 {
-        let token = entry.guest_write_token;
-        let gen_at_store = host.guest_write_gen(token).unwrap_or(0);
-        crate::runtime::drain::note_store_route(if gen_at_store == 0 {
-            "gvac_gw_restamp_unarmed"
-        } else {
-            "gvac_gw_restamp_armed"
-        });
-        if let Some(entry) = state.host_gva_surfaces.get_mut(&gva) {
-            entry.guest_write_gen_at_store = gen_at_store;
-        }
-        return;
-    }
-    let Some(backing) = entry.backing.as_ref() else {
-        return;
-    };
-    if backing.gpas.is_empty() {
-        return;
-    }
-    // `task_gva_page_gpas_dense` keeps one slot per page and writes `0` where a
-    // page did not resolve, because its other caller compares whole lists as a
-    // mapping identity and holes have to keep their positions. A hole is not an
-    // address, so it must not be armed: `track_guest_writes` would watch guest
-    // page 0 on this surface's behalf, and page 0 is busy, so the witness would
-    // report writes that are nothing to do with these pixels.
-    //
-    // Dropping the holes and arming the rest is the other option and is worse.
-    // This witness is asked whether the guest wrote a surface, and a partial
-    // watch can only answer "clean" about a page it never watched — a false
-    // clean is what lets the device reuse content the guest has replaced. An
-    // unarmed witness says "unknown", which every reader already handles,
-    // because the host shim maps token 0 to `None` during its own startup
-    // window.
-    if backing.gpas.contains(&0) {
-        crate::runtime::drain::note_store_route("gvac_gw_hole_unarmed");
-        return;
-    }
-    let gpas = backing.gpas.clone();
-    let Some(token) = host.track_guest_writes(&gpas, page_size) else {
-        return;
-    };
-    // Read the generation *after* registration, so the recorded value is one
-    // the host could actually have produced for this token.
-    let gen_at_store = host.guest_write_gen(token).unwrap_or(0);
-    let Some(entry) = state.host_gva_surfaces.get_mut(&gva) else {
-        // The entry vanished between the borrow above and here (no path does
-        // this today, but the token is real either way and must not leak).
-        state.retired_guest_write_tokens.push(token);
-        return;
-    };
-    entry.guest_write_token = token;
-    entry.guest_write_gen_at_store = gen_at_store;
-}
-
-/// Has the guest CPU written this entry's pages since its bytes were stored?
-///
-/// `true` is the answer for every way the question cannot be settled — no
-/// entry, no token, a host that cannot observe guest writes — because the only
-/// safe default for a cache of somebody else's memory is that it is stale. The
-/// caller falls through to the guest's own pages, which are authoritative by
-/// construction.
-///
-/// Each refusal is counted apart from the others: "this rail was never armed"
-/// and "the guest rewrites this texture every frame" are the same fall-through
-/// and completely different findings.
-///
-/// # What it measured, including what it did not fix
-///
-/// One 14-round Finder recomposite boot under load, x86 / Vulkan:
-/// **`gvac_gw_clean` is zero.** Not small — zero, across every window of the
-/// whole boot, against `gvac_gw_wrote` running 26-1757 per round. Every entry
-/// this cache still held had been rewritten by the guest since it was stored.
-/// That is independent confirmation of the probe's byte compare
-/// (`gvac_content_differ` == `gvac_content_checked`) from a different
-/// instrument on a different boot: the rail was serving a stale picture
-/// essentially every time it served at all.
-///
-/// **It did not close the icon class.** Seven of fourteen rounds still
-/// corrupted, so the wrong pixels were not coming from here, or not only from
-/// here. What the counter did buy is the first quantity that separates a
-/// corrupt round from a clean one, after a session of counters that could not:
-///
-/// ```text
-/// clean rounds    gvac_gw_wrote  26  279  306  486  634  662
-/// corrupt rounds                255  346 1445 1571 1639 1674 1752 1757
-/// ```
-///
-/// Normalised per 1000 draws (`draw_scissor_full`, since every other draw-path
-/// counter in this census is strictly proportional to round length and none of
-/// them separates anything), it is **bimodal with an empty gap**:
-///
-/// ```text
-/// low  mode  3.1  23.5  32.7  49.6  57.5  68.8   all six CLEAN rounds
-///           28.4  30.4                          + two corrupt rounds (2, 7)
-/// high mode 126.7 134.3 142.1 142.5 145.0 147.3  six CORRUPT rounds, no clean
-/// ```
-///
-/// Nothing lands between 68.8 and 126.7, and no clean round reaches the high
-/// mode. Read it as a load proxy and not as a cause — the rail is fully refused
-/// now, so what this counts is how hard the guest is recycling and rewriting
-/// texture memory *in place*. Above roughly 120 per 1000 draws the round
-/// corrupts every time.
-///
-/// That is the condition under which naming a resource by its address stops
-/// working. The engine's resident registry no longer does: `TargetIdentity::Gva`
-/// carries the hash of the guest pages behind the target as its `generation`
-/// (`metal_draw::vulkan::gva_alloc_generation`), so two allocations reusing one
-/// address at one geometry get two slots rather than one shared image — the same
-/// treatment `surface_identity` gives the `Surface` rail with `map_generation`.
-/// This counter stays as the load proxy: it says how hard the guest is recycling
-/// texture memory, which is the condition, not the mechanism.
-///
-/// The two corrupt rounds in the low mode are the reminder that this class has
-/// been two defects since it was first split: a high-recycling round corrupts
-/// reliably, and something else corrupts occasionally regardless.
-///
-/// # Cross-validated on a second boot, and it earns its keep by refusing credit
-///
-/// The next 14-round boot scored **1 corrupt of 14**, against 7 of 14 on the
-/// one above, with a fix landed in between. Read as a rate that would have been
-/// a result. Scored against this counter it is not: *every round of that boot
-/// was in the low mode* (peak 74.4, against a corrupting threshold of ~127), so
-/// the model predicted no high-mode corruption and there was none. The
-/// improvement is the load, not the change.
-///
-/// Pooled over both boots the split holds:
-///
-/// ```text
-/// high mode  6 rounds   6 corrupt   100 %
-/// low  mode 22 rounds   3 corrupt    14 %
-/// ```
-///
-/// This is why the raw corrupt-round count must not be used to score a change
-/// on this class, and it is the first quantity here that can say so. A boot that
-/// never enters the high mode cannot confirm or refute a fix for the reliable
-/// defect, and two of the three boots taken this session did not.
-///
-/// # RETRACTED: this counter does not predict the icon class
-///
-/// The model above was built on two boots and a third refutes it. Three
-/// 14-round boots on one binary, after the GVA rail was bounded by the fence:
-///
-/// ```text
-/// boot          gvac_gw_wrote/1000 draws   rounds corrupt
-/// icon-fence            42.4                    0 of 14
-/// icon-fence2           79.5                    0 of 14
-/// hi-mode              109.9 -> see below       0 of 14   (clean arm)
-/// hi-mode2              74.5                   14 of 14
-/// ```
-///
-/// The all-corrupt boot has a **lower** normalised count than the all-clean one
-/// it is paired against (74.5 against 109.9), and neither reaches the ~127 the
-/// model calls the corrupting threshold. So the bimodal split does not survive
-/// contact with a third and fourth boot, and no conclusion above that rests on
-/// "this boot was in the low mode" should be trusted — including the caution
-/// that a low-mode boot cannot score a fix. It cannot, but not for this reason.
-///
-/// What DOES separate those two boots is not instantaneous load at all: the
-/// corrupt one had been driven for 600 s (Mission Control, Spotlight, window
-/// drags) before the icon harness started, and the clean one was fresh. The
-/// class tracks accumulated session history. The counters that move with it are
-/// remap counters — `gvac_suspect` 15.8x, `gvac_moved` 10.5x, and `rmemo_stale`
-/// 0 -> 19, the last of which had never been observed at all (previously zero
-/// over 1 639 738 verified hits) and means the guest re-pointed a GPU-mapped
-/// range with no notification arriving first.
-///
-/// That is a regime where naming a resource by its address stops working, which
-/// is what the paragraph above this section already said the open work was.
-pub fn gva_guest_wrote_since_store<H: crate::runtime::host::HostOps>(
-    state: &DeviceState,
-    host: &H,
-    gva: u64,
-) -> bool {
-    let Some(entry) = state.host_gva_surfaces.get(&gva) else {
-        crate::runtime::drain::note_store_route("gvac_gw_no_entry");
-        return true;
-    };
-    if entry.guest_write_token == 0 {
-        crate::runtime::drain::note_store_route("gvac_gw_unarmed");
-        return true;
-    }
-    // A baseline of 0 is not a generation, it is the absence of one: the set was
-    // still inside its startup window at the store that recorded it. Named apart
-    // from `unreadable` because the two have opposite follow-ups — this one says
-    // the *device* has no reference point, `unreadable` says the *host* cannot
-    // answer right now — and pooling them is what let a boot be read as "every
-    // entry had been rewritten by the guest" when most of the population had
-    // simply never had a readable baseline. The mapping rail draws the same
-    // distinction (`mapping_guest_write_verdict` returns `NoStamp` for
-    // `guest_write_gen_at_store == 0`).
-    if entry.guest_write_gen_at_store == 0 {
-        crate::runtime::drain::note_store_route("gvac_gw_no_baseline");
-        return true;
-    }
-    match host.guest_write_gen(entry.guest_write_token) {
-        Some(gen_) if gen_ == entry.guest_write_gen_at_store => {
-            crate::runtime::drain::note_store_route("gvac_gw_clean");
-            false
-        }
-        Some(_) => {
-            crate::runtime::drain::note_store_route("gvac_gw_wrote");
-            true
-        }
-        None => {
-            crate::runtime::drain::note_store_route("gvac_gw_unreadable");
-            true
-        }
     }
 }
 
@@ -1235,31 +959,12 @@ pub fn get_gva_with_gen(
     Some((&e.bgra[..need], e.host_gen))
 }
 
-/// Borrow a GVA encode plus its decoded producer object type.
-pub fn get_gva_with_owner(
-    state: &DeviceState,
-    gva: u64,
-    width: u32,
-    height: u32,
-) -> Option<(&[u8], u64, u8)> {
-    let (e, need) = read_gva(state, gva, width, height)?;
-    Some((&e.bgra[..need], e.host_gen, e.producer_object_type))
-}
-
 /// Explicit drop (tests / object delete). Prefer [`note_unmap_retain_gva`] on Unmap.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
-    // The entry's guest-write token is host-side state for a page list that no
-    // longer has an owner here; dropping the entry without retiring it would
-    // leak one tracking set per deleted texture VA.
     if let Some(entry) = state.host_gva_surfaces.remove(&gva) {
         // The other site that changes this map's byte total; see
         // [`DeviceState::gva_cache_bytes`].
         state.gva_cache_bytes = state.gva_cache_bytes.saturating_sub(entry.bgra.len());
-        if entry.guest_write_token != 0 {
-            state
-                .retired_guest_write_tokens
-                .push(entry.guest_write_token);
-        }
     }
 }
 
@@ -1649,16 +1354,16 @@ mod tests {
         let (gva, w, h) = (0xa4_c000u64, 2u32, 2u32);
 
         store_gva(&mut st, gva, w, h, vec![0x11; (w * h * 4) as usize]);
-        let (_, first, _) = get_gva_with_owner(&st, gva, w, h).expect("first store");
+        let (_, first) = get_gva_with_gen(&st, gva, w, h).expect("first store");
 
         evict_gva(&mut st, gva);
         assert!(
-            get_gva_with_owner(&st, gva, w, h).is_none(),
+            get_gva_with_gen(&st, gva, w, h).is_none(),
             "the arm removes the entry outright"
         );
 
         store_gva(&mut st, gva, w, h, vec![0x22; (w * h * 4) as usize]);
-        let (bytes, second, _) = get_gva_with_owner(&st, gva, w, h).expect("second store");
+        let (bytes, second) = get_gva_with_gen(&st, gva, w, h).expect("second store");
 
         assert_eq!(bytes[0], 0x22, "the cache holds the new content");
         assert_ne!(
@@ -1931,10 +1636,9 @@ mod tests {
         let mut owned = vec![0u8; 16];
         owned[0] = 0xcc;
         store_gva_owned(&mut st, gva, 2, 2, owned, 2, None);
-        let (got, generation, object_type) = get_gva_with_owner(&st, gva, 2, 2).unwrap();
+        let (got, generation) = get_gva_with_gen(&st, gva, 2, 2).unwrap();
         assert_eq!(got[0], 0xcc);
         assert_eq!(generation, 3);
-        assert_eq!(object_type, 2);
         evict_gva(&mut st, gva);
         assert!(get_gva(&st, gva, 2, 2).is_none());
     }
@@ -2349,292 +2053,12 @@ mod tests {
         assert_ne!(holed.gpas, full.gpas);
     }
 
-    /// Store a 64x64 BGRA8 entry at `gva` with its backing walked and its
-    /// guest-write witness armed — the shape both product stores produce.
-    fn store_armed(st: &mut DeviceState, host: &mut FakeHost, gva: u64, fill: u8) -> u64 {
-        let (w, h) = (64u32, 64u32);
-        let backing = gva_backing(st, host, 1, gva, w, h).expect("walk resolves");
-        let gpa = backing.gpas[0];
-        store_gva_owned(
-            st,
-            gva,
-            w,
-            h,
-            vec![fill; (w * h * 4) as usize],
-            0,
-            Some(backing),
-        );
-        arm_gva_guest_write_witness(st, host, gva);
-        gpa
-    }
 
-    /// The verdict this cache had could not see a guest CPU write, and that is
-    /// the one way it goes wrong that nothing else catches.
-    ///
-    /// `backing_suspect` is driven by the Unmap/Map notify: it answers whether
-    /// this GVA still *names* these pages. A guest CPU store into pages that
-    /// never moved issues no notify, touches no device operation, and moves no
-    /// generation on this side — so the entry passes `Unchanged` and keeps
-    /// serving an icon the guest has already replaced. Measured live at 64x64
-    /// with the content probe on: every audited serve of this rail disagreed
-    /// with the guest's own pages (`gvac_content_differ` == `gvac_content_checked`).
-    ///
-    /// The hypervisor's dirty bitmap is the only witness that can see it, and
-    /// asking it is what this test asserts.
-    #[test]
-    fn a_guest_cpu_write_invalidates_a_gva_entry_no_notify_can_see() {
-        let mut host = FakeHost::new();
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_depth1_task(&mut host, &mut st);
-        let gva = 1u64 << PAGE_SHIFT_ARM64E;
-        let gpa = store_armed(&mut st, &mut host, gva, 0xA5);
 
-        // Nothing has touched the pages: the entry is current and serves.
-        assert!(
-            !gva_guest_wrote_since_store(&st, &host, gva),
-            "a freshly stored entry whose pages nobody wrote is current"
-        );
-        assert_eq!(
-            revalidate_gva_backing(&mut st, &host, 1, gva),
-            BackingVerdict::Unchanged,
-            "no notify has touched the span"
-        );
 
-        // The guest CPU rewrites the texture in place. No notify, no remap, no
-        // device operation — the backing verdict cannot move, and does not.
-        host.guest_wrote_page(gpa);
-        assert_eq!(
-            revalidate_gva_backing(&mut st, &host, 1, gva),
-            BackingVerdict::Unchanged,
-            "the pages did not move, so the backing verdict still says they did not"
-        );
-        assert!(
-            gva_guest_wrote_since_store(&st, &host, gva),
-            "the host observed the write, so the cached bytes are stale"
-        );
 
-        // Storing the guest's new bytes re-arms against the same pages and the
-        // entry is current again — the rail recovers rather than latching off.
-        store_armed(&mut st, &mut host, gva, 0x5A);
-        assert!(
-            !gva_guest_wrote_since_store(&st, &host, gva),
-            "a store after the write re-arms the witness"
-        );
-    }
 
-    /// The case this cache exists for must survive the new refusal.
-    ///
-    /// A mapping that churns and comes back — Unmap then Map2 restoring the
-    /// same PFNs — is the retained-wallpaper class. The pixels are still this
-    /// allocation's pixels, and nothing wrote them, so the entry must still
-    /// serve. A witness that refused here would black out the wallpaper to fix
-    /// an icon.
-    #[test]
-    fn a_mapping_that_churned_without_a_guest_write_still_serves() {
-        let mut host = FakeHost::new();
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_depth1_task(&mut host, &mut st);
-        let page = 1u64 << PAGE_SHIFT_ARM64E;
-        let gva = page;
-        store_armed(&mut st, &mut host, gva, 0xA5);
 
-        assert_eq!(mark_gva_backing_suspect(&mut st, 1, gva, page), 1);
-        assert_eq!(
-            revalidate_gva_backing(&mut st, &host, 1, gva),
-            BackingVerdict::Confirmed,
-            "the same pages came back"
-        );
-        assert!(
-            !gva_guest_wrote_since_store(&st, &host, gva),
-            "a remap is not a write; the retained encode is still the guest's picture"
-        );
-    }
-
-    /// A token watches a page list, so it must not outlive the list it was
-    /// taken for.
-    ///
-    /// `store_gva_owned` replaces `backing` unconditionally, and the token has
-    /// to go with it: carried forward, it would report "unwritten" about pages
-    /// this entry no longer claims — an entry vouching for itself with somebody
-    /// else's witness. Disarming lives in the store for exactly this reason,
-    /// while arming is the caller's option.
-    #[test]
-    fn replacing_the_backing_retires_the_token_taken_for_the_old_pages() {
-        let mut host = FakeHost::new();
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let root_gpa = setup_depth1_task(&mut host, &mut st);
-        let page = 1u64 << PAGE_SHIFT_ARM64E;
-        let gva = page;
-        let first_gpa = store_armed(&mut st, &mut host, gva, 0xA5);
-        assert_eq!(host.tracked_guest_write_sets(), 1);
-
-        // The guest points the address at a different allocation and the next
-        // store records the new pages.
-        repoint_pte(&mut host, root_gpa, 1, 12);
-        let second_gpa = store_armed(&mut st, &mut host, gva, 0x5A);
-        assert_ne!(
-            first_gpa, second_gpa,
-            "the address names different pages now"
-        );
-
-        // A write to the *old* pages says nothing about this entry.
-        host.guest_wrote_page(first_gpa);
-        assert!(
-            !gva_guest_wrote_since_store(&st, &host, gva),
-            "the old page list is not this entry's page list"
-        );
-        // A write to the pages it actually holds does.
-        host.guest_wrote_page(second_gpa);
-        assert!(gva_guest_wrote_since_store(&st, &host, gva));
-
-        // And the first token is released rather than leaked.
-        crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
-        assert_eq!(
-            host.tracked_guest_write_sets(),
-            1,
-            "one live set for the current page list, the superseded one released"
-        );
-    }
-
-    /// Every way the question cannot be settled reads as "written".
-    ///
-    /// An entry stored without a resolvable backing has no page list to watch,
-    /// and a host with no dirty bitmap has nothing to watch it with. Both leave
-    /// the entry unarmed, and an unarmed entry must fall through to the guest's
-    /// own pages — forgetting to arm costs a re-read, never a wrong picture.
-    #[test]
-    fn an_unarmed_gva_entry_is_read_as_written() {
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut host = FakeHost::new();
-        setup_depth1_task(&mut host, &mut st);
-        let gva = 1u64 << PAGE_SHIFT_ARM64E;
-
-        // No backing recorded: nothing to register.
-        store_gva(&mut st, gva, 64, 64, vec![0xA5u8; 64 * 64 * 4]);
-        arm_gva_guest_write_witness(&mut st, &mut host, gva);
-        assert_eq!(host.tracked_guest_write_sets(), 0);
-        assert!(gva_guest_wrote_since_store(&st, &host, gva));
-
-        // A host that cannot observe guest writes answers `None` forever.
-        let mut blind = FakeHost::new();
-        blind.guest_writes_unobservable = true;
-        let mut st2 = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_depth1_task(&mut blind, &mut st2);
-        store_armed(&mut st2, &mut blind, gva, 0xA5);
-        assert_eq!(blind.tracked_guest_write_sets(), 0);
-        assert!(
-            gva_guest_wrote_since_store(&st2, &blind, gva),
-            "an incapable host leaves every entry unwitnessed, so every entry is stale"
-        );
-
-        // An address with no entry at all is not a silent pass either.
-        assert!(gva_guest_wrote_since_store(&st, &host, 0xdead_0000));
-    }
-
-    /// A hole in the page list is not an address, so it must not be watched.
-    ///
-    /// `task_gva_page_gpas_dense` writes `0` where a page did not resolve,
-    /// because its other caller compares whole lists as a mapping identity and
-    /// the holes have to keep their positions. Arming that list registers guest
-    /// page 0 on this surface's behalf, and page 0 is busy, so the witness would
-    /// answer with traffic that has nothing to do with these pixels.
-    ///
-    /// Dropping the holes and arming the rest is the tempting alternative and is
-    /// the worse one: a partial watch can only ever answer "clean" about a page
-    /// it never watched, and a false clean is what lets the device keep content
-    /// the guest has already replaced. Unarmed reads as written, which costs a
-    /// re-read and never a wrong picture.
-    #[test]
-    fn a_backing_with_a_hole_is_not_armed() {
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let mut host = FakeHost::new();
-        let root_gpa = setup_depth1_task(&mut host, &mut st);
-        let page = 1u64 << PAGE_SHIFT_ARM64E;
-        let gva = page;
-        // 64x192 BGRA8 spans three pages, so there is a middle one to punch out.
-        let (w, h) = (64u32, 192u32);
-
-        let whole = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
-        assert!(
-            whole.gpas.iter().all(|&g| g != 0),
-            "fixture starts complete"
-        );
-        store_gva_owned(
-            &mut st,
-            gva,
-            w,
-            h,
-            vec![0xA5u8; (w * h * 4) as usize],
-            0,
-            Some(whole),
-        );
-        arm_gva_guest_write_witness(&mut st, &mut host, gva);
-        // Assert the entry's token, not the host's live-set count: a superseded
-        // set stays live until `flush_retired_views` drains it, so the count
-        // cannot distinguish "armed again" from "the old one is still around".
-        assert_ne!(
-            st.host_gva_surfaces.get(&gva).map(|e| e.guest_write_token),
-            Some(0),
-            "a complete page list is the case that must still arm"
-        );
-
-        // Punch the middle page out and re-store: the list keeps its length and
-        // carries a hole where the page was.
-        repoint_pte(&mut host, root_gpa, 2, 0);
-        let holed = gva_backing(&st, &host, 1, gva, w, h).expect("walk still names the span");
-        assert_eq!(holed.gpas[1], 0, "the hole sits where the page is");
-        store_gva_owned(
-            &mut st,
-            gva,
-            w,
-            h,
-            vec![0x5Au8; (w * h * 4) as usize],
-            0,
-            Some(holed),
-        );
-        arm_gva_guest_write_witness(&mut st, &mut host, gva);
-        assert_eq!(
-            st.host_gva_surfaces.get(&gva).map(|e| e.guest_write_token),
-            Some(0),
-            "the holed list must leave the entry unarmed, not watch guest page 0"
-        );
-        assert!(
-            gva_guest_wrote_since_store(&st, &host, gva),
-            "an unarmed entry reads as written"
-        );
-    }
-
-    /// Dropping an entry drops its host-side tracking set with it.
-    ///
-    /// `evict_gva` runs on every deferred GVA render Store arm and the reset
-    /// path walks the whole map, so a token left behind on either would leak
-    /// one hypervisor tracking set per cached texture VA per device lifetime.
-    #[test]
-    fn evict_and_reset_release_gva_write_tokens() {
-        let mut host = FakeHost::new();
-        let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        setup_depth1_task(&mut host, &mut st);
-        let page = 1u64 << PAGE_SHIFT_ARM64E;
-        store_armed(&mut st, &mut host, page, 0xA5);
-        store_armed(&mut st, &mut host, 2 * page, 0xA5);
-        assert_eq!(host.tracked_guest_write_sets(), 2);
-
-        evict_gva(&mut st, page);
-        crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
-        assert_eq!(
-            host.tracked_guest_write_sets(),
-            1,
-            "the evicted entry's set"
-        );
-
-        let _ = st.take_all_host_views();
-        crate::runtime::mapper::flush_retired_views(&mut st, &mut host);
-        assert_eq!(
-            host.tracked_guest_write_sets(),
-            0,
-            "a device reset releases the GVA cache's tokens too"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2746,95 +2170,6 @@ mod incarnation_tests {
         assert!(!state.mappings.contains_key(&orphan));
         assert!(surface_entry_is_current(&state, orphan));
         assert!(get(&state, orphan, w, h).is_some());
-    }
-}
-
-#[cfg(test)]
-mod arming_window_tests {
-    use super::*;
-    use crate::model::{DeviceId, PAGE_SHIFT_X86};
-    use crate::runtime::host::{FakeHost, HostOps};
-
-    /// The GVA cache's guest-write witness must recover once the host's arming
-    /// window closes, or it can never report a clean entry at all.
-    ///
-    /// It could not. `reims_vgpu_dirty_gen` holds a tracked set's generation at
-    /// 0 for two harvests — an absence of write reports says nothing about the
-    /// guest until logging has been on for a full interval — and
-    /// `arm_gva_guest_write_witness` runs immediately after
-    /// `track_guest_writes`, so it always read 0. It then returned early on
-    /// every later store because a token already existed, so the useless
-    /// baseline was never revisited. A real generation is never 0, so the
-    /// comparison in `gva_guest_wrote_since_store` could not match one:
-    /// `gvac_gw_clean` was **0 of 201 331 lookups** on a 300 s boot, and a
-    /// previous session read that zero as a fact about the guest — "every entry
-    /// this cache still held had been rewritten" — when most of the population
-    /// had simply never had a baseline.
-    ///
-    /// Nothing caught it because `FakeHost` armed its sets instantly. A test
-    /// double more generous than the host it stands for cannot fail the way
-    /// production does, which is why `guest_write_startup_window` exists and why
-    /// this test turns it on.
-    #[test]
-    fn the_gva_witness_recovers_when_the_hosts_arming_window_closes() {
-        let page = 1u64 << PAGE_SHIFT_X86;
-        let gpa = 0x4000_0000u64;
-        let mut host = FakeHost::new();
-        host.guest_write_startup_window = true;
-        host.map_range(gpa, page as usize, 0);
-
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-        let gva = 0x8000u64;
-        let (w, h) = (4u32, 2u32);
-        let bytes = || vec![0x7fu8; (w * h * 4) as usize];
-        let backing = GvaBacking {
-            gpas: vec![gpa],
-            span: page,
-            task_id: 0,
-        };
-
-        store_gva_owned(&mut state, gva, w, h, bytes(), 0, Some(backing.clone()));
-        arm_gva_guest_write_witness(&mut state, &mut host, gva);
-        let token = state.host_gva_surfaces[&gva].guest_write_token;
-        assert_ne!(token, 0, "the pages are trackable, so a token is taken");
-        assert_eq!(
-            state.host_gva_surfaces[&gva].guest_write_gen_at_store, 0,
-            "inside the window the host has no generation to give"
-        );
-        assert!(
-            gva_guest_wrote_since_store(&state, &host, gva),
-            "and with no baseline the only safe answer is that the copy is stale"
-        );
-
-        // The window closes. Nothing about the guest changed.
-        host.finish_guest_write_arming();
-        assert_eq!(host.guest_write_gen(token), Some(1));
-
-        // The next store re-latches against the now-readable generation. This is
-        // the step the early return used to skip.
-        store_gva_owned(&mut state, gva, w, h, bytes(), 0, Some(backing));
-        arm_gva_guest_write_witness(&mut state, &mut host, gva);
-        assert_eq!(
-            state.host_gva_surfaces[&gva].guest_write_token, token,
-            "the token is kept — re-registering would cost a host call per store"
-        );
-        assert_eq!(
-            state.host_gva_surfaces[&gva].guest_write_gen_at_store, 1,
-            "but the baseline is re-read, because it must name the bytes stored"
-        );
-        assert!(
-            !gva_guest_wrote_since_store(&state, &host, gva),
-            "so an unwritten entry can finally be reported clean, which is the \
-             whole point of the rail"
-        );
-
-        // And it still reports a real write, so the recovery did not buy `clean`
-        // by making the witness blind.
-        host.guest_wrote_page(gpa);
-        assert!(
-            gva_guest_wrote_since_store(&state, &host, gva),
-            "a witness that only ever says clean is worse than one that never does"
-        );
     }
 }
 

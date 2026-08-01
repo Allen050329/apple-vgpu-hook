@@ -3826,7 +3826,6 @@ pub(crate) fn host_cache_store_gva_layer<M: HostMemory + HostOps>(
             object_type,
             backing,
         );
-        crate::runtime::surface_cache::arm_gva_guest_write_witness(state, host, gva);
     }
 }
 
