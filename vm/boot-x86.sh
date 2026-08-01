@@ -483,24 +483,28 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
       echo "boot-x86.sh:   direct_frac) is MEANINGLESS on this boot." >&2
     fi
   fi
-  # A display connection that *does* work is not the same as a surface anyone is
-  # looking at, and this warning does not cover the difference. A Wayland or X
-  # compositor throttles a surface that is occluded, minimised, or on another
-  # workspace — which is the normal state of a window opened by an agent-driven
-  # boot with no human at the seat. The result is a present rate pinned to
-  # whatever cadence the compositor grants, and it reads exactly like a device
-  # pacing defect.
+  # A display connection that works is not the same as one whose pacing is ours,
+  # and this warning does not cover the difference.
   #
-  # Measured: a boot with a live Wayland socket held `presents=20` per second
-  # exactly, against `offered=51` and `busy_acquire=330`, and was unchanged by
-  # switching the swapchain from FIFO to MAILBOX (`present_mode=mailbox
-  # images=3` confirmed granted in `host_window_swapchain`). A present mode
-  # cannot explain a rate it does not move, so treat a suspiciously round
-  # `present_hz` here as the compositor's number until a human-visible window
-  # says otherwise.
-  echo "boot-x86.sh: NOTE — host-window pacing needs a *visible* window." >&2
-  echo "boot-x86.sh:   An occluded or unfocused surface is throttled by the" >&2
-  echo "boot-x86.sh:   compositor, so host_window_cadence measures that, not us." >&2
+  # Measured on a boot with a live Wayland socket: `presents=20` per second
+  # exactly, against `offered=51` and `busy_acquire=330`. Switching the swapchain
+  # from FIFO to MAILBOX did not move it — `host_window_swapchain` confirms
+  # `present_mode=mailbox images=3` was granted — and a present mode cannot
+  # explain a rate it does not change. So the 20.0 Hz ceiling is the presentation
+  # engine releasing images at that cadence, not this device pacing them.
+  #
+  # What it is remains open. The obvious guess is compositor throttling of a
+  # surface nobody is looking at, but that guess has counter-evidence: KWin
+  # reported the window `minimized=false active=<itself>` while this was
+  # happening, so it was focused and visible. Do not repeat the occlusion story
+  # as though it were established.
+  #
+  # The practical rule is unchanged: treat a suspiciously round `present_hz` on
+  # an agent-driven boot as the host's number until it has been reproduced on a
+  # seat with a human watching the window.
+  echo "boot-x86.sh: NOTE — host-window pacing here may be the host's, not ours." >&2
+  echo "boot-x86.sh:   A measured boot pinned presents at exactly 20.0 Hz against" >&2
+  echo "boot-x86.sh:   offered=51, unchanged by FIFO->MAILBOX. Cause not settled." >&2
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
