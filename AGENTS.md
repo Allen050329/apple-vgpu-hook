@@ -133,8 +133,18 @@ cargo test -p reims-vgpu --no-default-features --features backend-vulkan,host-wi
 cargo test -p reims-vgpu --no-default-features --features backend-metal -- --test-threads=1
 ```
 
-`backend-metal` is Apple-only; run that arm only on Apple hosts. Run the feature matrix from the
-repo root when cfgs, features, backend boundaries, or shared Rust code change:
+*Running* `backend-metal` is Apple-only, but *checking* it is not. `src/lib.rs` gates the arm on
+`target_os`, not on the host, so any host can type-check it with no Apple SDK:
+
+```sh
+cargo check -p reims-vgpu --target aarch64-apple-darwin --all-targets --features backend-metal
+```
+
+Do this whenever you touch shared Rust code. Treating the arm as unavailable off Apple is what let
+it rot to 11 errors once; "I am not on a Mac" is not a reason to leave it unchecked. Say
+compile-checked rather than tested when that is what you did. Run the feature matrix from the repo
+root when cfgs, features, backend boundaries, or shared Rust code change — it now includes that
+cell:
 
 ```sh
 scripts/feature-matrix/feature-matrix.sh
@@ -161,7 +171,9 @@ Each commit should have a detailed message body that states:
 - What was not verified, if anything.
 
 Rust commits should be warning-free under clippy with `-D warnings` for every affected matrix arm.
-Use the appropriate subset for the host and change; the Metal command is Apple-only:
+Use the appropriate subset for the host and change. The first command needs an Apple host; off
+Apple, substitute the `cargo check --target aarch64-apple-darwin` above, which is weaker than
+clippy but far better than skipping the arm:
 
 ```sh
 cargo clippy -p reims-vgpu --all-targets --features backend-metal -- -D warnings
