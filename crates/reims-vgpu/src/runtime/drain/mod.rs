@@ -139,17 +139,48 @@ fn display_txn_trailer_len(opcode: u16) -> usize {
     }
 }
 
-/// Word slots of the surface id and the task field within the trailer. The
-/// gamma command swaps the two relative to the plain one, which is why this is
-/// keyed on the opcode rather than assumed.
-fn display_txn_trailer_slots(opcode: u16) -> (usize, usize) {
-    if opcode == CHILD_OP_PRESENT_GAMMA_X86 {
-        // [pipe][task][surface][gamma…]
-        (2, 1)
-    } else {
-        // [pipe][surface][task]
-        (1, 2)
+/// Word slots of the surface id and the task field within the trailer, keyed on
+/// the command that emitted it.
+///
+/// These are three different FIFO commands, not one shape with variations, so
+/// nothing here may be assumed from one opcode to another:
+///
+/// - op6 `CmdDisplayTransaction3` — `[pipe][surface][task]`.
+/// - op7, its gamma variant — `[pipe][task][surface][gamma…]`; the first two
+///   words are swapped relative to op6.
+/// - op8 `CmdDisplaySwapMapping` — `[display][_][mapping]`. This one names a
+///   single mapping instead of serializing a transaction, so its surface word
+///   is `DISPLAY_SWAP_MAPPING` (0x08), *not* op6's 0x04, and it has no known
+///   task field at all. Reading it at op6's slot would return the unidentified
+///   word between the display index and the mapping.
+///
+/// Slots are `regs.rs`'s `PRESENT_*` / `DISPLAY_SWAP_*` byte offsets divided by
+/// four; this is the only place either reading of those offsets is spelled out,
+/// so the present path and the payload census cannot decode the field
+/// differently.
+fn display_txn_trailer_slots(opcode: u16) -> (usize, Option<usize>) {
+    match opcode {
+        CHILD_OP_PRESENT_GAMMA_X86 => (PRESENT_GAMMA_X86_SURFACE_ID / 4, Some(1)),
+        CHILD_OP_DISPLAY_SWAP => (DISPLAY_SWAP_MAPPING / 4, None),
+        _ => (PRESENT_X86_SURFACE_ID / 4, Some(2)),
     }
+}
+
+/// The surface id a display-present payload names, read from offset zero.
+///
+/// The slot is the one `display_txn_trailer_slots` gives for the emitting
+/// command, so this head-relative reading and the tail-relative reading the
+/// census takes cannot drift apart.
+///
+/// `None` is a payload too short to hold the command's own trailer. That loses
+/// the present outright, so callers must name it rather than presenting mapping
+/// zero and completing the packet in silence.
+fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
+    let trailer = display_txn_trailer_len(opcode);
+    (payload.len() >= trailer).then(|| {
+        let off = display_txn_trailer_slots(opcode).0 * 4;
+        ld32(&payload[off..])
+    })
 }
 
 /// Measurement for the display-transaction wire shape (`display_txn_payload`).
@@ -188,7 +219,7 @@ fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &P
     let (surface_slot, task_slot) = display_txn_trailer_slots(packet.opcode);
     let pipe = tail(0);
     let surface = tail(surface_slot);
-    let task = tail(task_slot);
+    let task = task_slot.and_then(tail);
 
     let seen = state
         .display
@@ -1909,75 +1940,41 @@ fn process_child_packet<H: HostMemory + HostOps>(
          *   arm ch4, **or** op6/7 on x86 Ventura/Tahoe display ch5).
          * - ch2 PRESENT_FRAME 0x28 / FLUSH 0x3b: bookkeeping only (mid-composite).
          */
-        CHILD_OP_DISPLAY_SWAP => {
+        // The three display present commands. op8 `CmdDisplaySwapMapping` is
+        // the arm/EFI-era path; x86 Ventura/Tahoe drives the display pipe with
+        // op6 `CmdDisplayTransaction3` and its gamma variant op7. They differ
+        // only in where the surface word sits, which
+        // `display_txn_trailer_slots` owns for all three.
+        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_PRESENT_X86 | CHILD_OP_PRESENT_GAMMA_X86) => {
             note_display_txn_payload(state, channel_id, packet);
-            let mapping = if packet.payload.len() >= DISPLAY_SWAP_MIN_LEN {
-                ld32(&packet.payload[DISPLAY_SWAP_MAPPING..])
-            } else {
-                0
-            };
-            // Offline: display index @0 vs mapping @8 (arm op8).
-            if packet.payload.len() >= 12 {
-                let disp = ld32(&packet.payload[DISPLAY_SWAP_DISPLAY..]);
-                // Per-present decode census (~30k/session under animation);
-                // the present rate lives in the present_proxy summary, so gate
-                // the per-packet line behind REIMS_VGPU_DRAW_LOG.
-                crate::observe::line(format!(
-                    "present_op8 ch={channel_id} disp={disp} mid={mapping} plen={} unpainted={}",
+            let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
+                crate::observe::fail(format!(
+                    "packet_short reason=display_present_short ch={channel_id} op={opcode:#x} \
+                     plen={} need={}",
                     packet.payload.len(),
-                    state.present.unpainted_presents
+                    display_txn_trailer_len(opcode)
                 ));
-            }
-            if present_named_mapping(state, host, channel_id, mapping)
-                == ChildPacketDisposition::Deferred
-            {
-                return ChildPacketDisposition::Deferred;
-            }
-        }
-        // x86 Ventura/Tahoe display pipe: present is opcode 6/7 (not 0x28).
-        // Live fail log: UnknownChildOpcode ch5 op6 — no paint until handled.
-        CHILD_OP_PRESENT_X86 => {
-            note_display_txn_payload(state, channel_id, packet);
-            let mapping = if packet.payload.len() >= PRESENT_X86_MIN_LEN {
-                ld32(&packet.payload[PRESENT_X86_SURFACE_ID..])
-            } else {
-                0
+                return ChildPacketDisposition::Complete;
             };
-            // op6 trailer: [pipe_index@0][surface_id@4][task@8]. The word at +8
-            // is the submitting task's field, not a completion stamp — the
-            // packet's own stamp lives in the FIFO header.
-            if packet.payload.len() >= 12 {
-                let disp = ld32(&packet.payload[0..]);
-                let task = ld32(&packet.payload[8..]);
-                crate::observe::line(format!(
-                    "present_op6 ch={channel_id} pipe={disp} sid={mapping} task={task:#x} plen={} unpainted={} prior_present_mapping={}",
-                    packet.payload.len(),
-                    state.present.unpainted_presents,
-                    state.present.present_mapping
-                ));
-            }
-            if present_named_mapping(state, host, channel_id, mapping)
-                == ChildPacketDisposition::Deferred
-            {
-                return ChildPacketDisposition::Deferred;
-            }
-        }
-        CHILD_OP_PRESENT_GAMMA_X86 => {
-            note_display_txn_payload(state, channel_id, packet);
-            let mapping = if packet.payload.len() >= PRESENT_GAMMA_X86_SURFACE_ID + 4 {
-                ld32(&packet.payload[PRESENT_GAMMA_X86_SURFACE_ID..])
-            } else if packet.payload.len() >= PRESENT_X86_MIN_LEN {
-                ld32(&packet.payload[PRESENT_X86_SURFACE_ID..])
-            } else {
-                0
-            };
-            if packet.payload.len() >= 12 {
-                crate::observe::line(format!(
-                    "present_op7 ch={channel_id} sid={mapping} plen={} unpainted={}",
-                    packet.payload.len(),
-                    state.present.unpainted_presents
-                ));
-            }
+            // Per-present decode census (~30k/session under animation); the
+            // present rate lives in the present_proxy summary, so gate the
+            // per-packet line behind REIMS_VGPU_DRAW_LOG. `pipe` is the display
+            // index for op8 and the pipe index for op6/7 — payload word 0 in
+            // both. `task` is op6/7's task field, which is the submitting task's
+            // and not a completion stamp; the packet's own stamp lives in the
+            // FIFO header. op8 has no such word, and prints `-`.
+            let (_, task_slot) = display_txn_trailer_slots(opcode);
+            let task = task_slot
+                .map(|slot| format!("{:#x}", ld32(&packet.payload[slot * 4..])))
+                .unwrap_or_else(|| "-".to_string());
+            crate::observe::line(format!(
+                "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
+                 plen={} unpainted={} prior_present_mapping={}",
+                ld32(&packet.payload[0..]),
+                packet.payload.len(),
+                state.present.unpainted_presents,
+                state.present.present_mapping
+            ));
             if present_named_mapping(state, host, channel_id, mapping)
                 == ChildPacketDisposition::Deferred
             {

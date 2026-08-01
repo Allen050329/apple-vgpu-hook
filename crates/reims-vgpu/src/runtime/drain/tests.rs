@@ -2756,13 +2756,32 @@ fn display_txn_payload_probe_rearms_on_trailer_change_but_not_on_surface_id() {
 #[test]
 fn display_txn_trailer_slots_follow_the_emitting_command() {
     // command 6: [pipe][surface][task] — surface in slot 1, task in slot 2.
-    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, 2));
+    assert_eq!(display_txn_trailer_slots(CHILD_OP_PRESENT_X86), (1, Some(2)));
     // command 7: [pipe][task][surface][gamma…] — the two are swapped.
     assert_eq!(
         display_txn_trailer_slots(CHILD_OP_PRESENT_GAMMA_X86),
-        (2, 1)
+        (2, Some(1))
     );
-    assert_eq!(display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP), (1, 2));
+    // command 8 `CmdDisplaySwapMapping` is not a transaction at all: it names
+    // one mapping, at DISPLAY_SWAP_MAPPING (0x08) = slot 2, and carries no task
+    // word. Borrowing op6's (1, 2) here would make the census report the
+    // unidentified middle word as the surface and the mapping as a task.
+    assert_eq!(
+        display_txn_trailer_slots(CHILD_OP_DISPLAY_SWAP),
+        (DISPLAY_SWAP_MAPPING / 4, None)
+    );
+    // The present path reads the same field the census does, for every command.
+    for (op, off) in [
+        (CHILD_OP_PRESENT_X86, PRESENT_X86_SURFACE_ID),
+        (CHILD_OP_PRESENT_GAMMA_X86, PRESENT_GAMMA_X86_SURFACE_ID),
+        (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
+    ] {
+        let mut p = vec![0u8; display_txn_trailer_len(op)];
+        p[off..off + 4].copy_from_slice(&0x5eu32.to_le_bytes());
+        assert_eq!(present_surface_id(op, &p), Some(0x5e), "op {op:#x}");
+        // One byte short of the command's own trailer is not a present.
+        assert_eq!(present_surface_id(op, &p[..p.len() - 1]), None, "op {op:#x}");
+    }
 
     // The swap has to survive the budget key, not just the log line: a gamma
     // packet whose *task* is zero and whose surface id is non-zero must land in

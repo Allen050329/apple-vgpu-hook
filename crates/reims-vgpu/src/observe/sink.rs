@@ -7,7 +7,7 @@
 //!
 //! | Prefix | Meaning |
 //! | --- | --- |
-//! | `OFF present_op6/7/8` | Display present packet (channel, surface/mapping id, stamp) |
+//! | `OFF present_txn` | Display present packet (`op` 6/7/8, channel, surface id, task) |
 //! | `OFF present_black` | max_rgb==0 after capture (console will stay black) |
 //! | `OFF present_paint` | HostAction paint / Unchanged |
 //! | `OFF host_cache_store` | Discrete-GPU host surface cache write |

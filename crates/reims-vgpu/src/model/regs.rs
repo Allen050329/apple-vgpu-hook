@@ -141,9 +141,12 @@ pub const CHILD_OP_GET_COMPUTE_INFO: u16 = 0x3b;
 /// full rebind RE is open — accept so guest is not blocked on UnknownChildOpcode.
 pub const CHILD_OP_REPLACE_PHYSICAL: u16 = 0x3c;
 
-/// Present payload: surface/mapping id offset for op 6 (and DisplaySwap-style).
+/// `CmdDisplayTransaction3` (op 6) trailer `[pipe][surface][task]`: surface id
+/// offset. `CmdDisplaySwapMapping` (op 8) is a different command with a
+/// different payload — see `DISPLAY_SWAP_MAPPING`, which is not this offset.
 pub const PRESENT_X86_SURFACE_ID: usize = 0x04;
-/// Present-with-gamma surface id offset.
+/// The gamma variant (op 7) trailer is `[pipe][task][surface][gamma…]`, so its
+/// surface and task words are swapped relative to op 6's.
 pub const PRESENT_GAMMA_X86_SURFACE_ID: usize = 0x08;
 pub const PRESENT_X86_MIN_LEN: usize = 12;
 
