@@ -1022,21 +1022,57 @@ pub fn reflected_sampled_kind(reflection: &ShaderReflection, binding: u32) -> Re
     }
 }
 
-/// Sampled-vs-storage class for descriptor `binding` from the translator's
-/// reflection: a `writable` (write/read_write) texture is a storage image, a
-/// read/sample texture is sampled. The declared Metal qualifier is authoritative,
-/// so this is exact at translate time (never `Unknown`). `None` when reflection
-/// carries no texture shape for the binding (an unbound/unused descriptor).
-pub fn image_access_from_reflection(
+/// How the compute rail must treat texture descriptor `binding`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReflectedComputeTexture {
+    /// Reflection lists no texture shape here. Metal permits binding a texture
+    /// the shader never samples or writes, so this is expected control flow —
+    /// the caller stages nothing and invents no access semantics for it.
+    Absent,
+    /// A single-layer, non-multisampled 2D texture, carrying its
+    /// sampled-vs-storage class. This is the only shape the compute rail can
+    /// stage: a binding comes from one type-11 plane window or one linear GVA
+    /// level, both flat `width × height` rectangles.
+    Plain2d(ImageAccess),
+    /// The shader declares a shape with a slice, depth, or sample axis the
+    /// compute rail has no staged source for. `axis` names it for the fail log.
+    UnstageableShape { axis: &'static str },
+}
+
+/// Classify texture descriptor `binding` for the compute rail from the
+/// translator's reflection.
+///
+/// Sampled-vs-storage comes from the declared Metal access qualifier
+/// (`TextureShape.writable`), which is exact at translate time — there is no
+/// `Unknown`. The shape axis comes from the same decoded `OpTypeImage`, and
+/// the rail refuses anything it would otherwise stage as 2D behind the
+/// shader's back: binding a `TYPE_2D` view to a SPIR-V image declared
+/// `2DArray`/`3D`/`1D`/`Cube`/`Buffer`/multisampled is a descriptor-type
+/// mismatch, not a degraded render.
+pub fn reflected_compute_texture(
     reflection: &ShaderReflection,
     binding: u32,
-) -> Option<ImageAccess> {
-    let shape = texture_shape_for_binding(reflection, binding)?;
-    Some(if shape.writable {
-        ImageAccess::Storage
-    } else {
-        ImageAccess::Sampled
-    })
+) -> ReflectedComputeTexture {
+    let Some(shape) = texture_shape_for_binding(reflection, binding) else {
+        return ReflectedComputeTexture::Absent;
+    };
+    let axis = match shape.dimension {
+        TextureDimension::D1 => Some("dim_1d"),
+        TextureDimension::D3 => Some("dim_3d"),
+        TextureDimension::Cube => Some("dim_cube"),
+        TextureDimension::Buffer => Some("dim_buffer"),
+        TextureDimension::D2 if shape.arrayed => Some("arrayed"),
+        TextureDimension::D2 if shape.multisampled => Some("multisampled"),
+        TextureDimension::D2 => None,
+    };
+    match axis {
+        Some(axis) => ReflectedComputeTexture::UnstageableShape { axis },
+        None => ReflectedComputeTexture::Plain2d(if shape.writable {
+            ImageAccess::Storage
+        } else {
+            ImageAccess::Sampled
+        }),
+    }
 }
 
 /// Validate that the translator's reflection is internally well-formed, once per
@@ -1399,17 +1435,17 @@ mod tests {
             shape(TextureDimension::D2, false, true),
         ));
         assert_eq!(
-            image_access_from_reflection(&r, sampled),
-            Some(ImageAccess::Sampled)
+            reflected_compute_texture(&r, sampled),
+            ReflectedComputeTexture::Plain2d(ImageAccess::Sampled)
         );
         assert_eq!(
-            image_access_from_reflection(&r, storage),
-            Some(ImageAccess::Storage)
+            reflected_compute_texture(&r, storage),
+            ReflectedComputeTexture::Plain2d(ImageAccess::Storage)
         );
-        // A binding reflection does not carry => None (the walk's miss).
+        // A binding reflection does not carry => Absent (the walk's miss).
         assert_eq!(
-            image_access_from_reflection(&r, TEXTURE_BINDING_BASE + 9),
-            None
+            reflected_compute_texture(&r, TEXTURE_BINDING_BASE + 9),
+            ReflectedComputeTexture::Absent
         );
         // Absent, not Unsupported: the binding is not in the reflection at all,
         // and only `reflected_sampled_kind` can tell those apart.
@@ -1417,6 +1453,52 @@ mod tests {
             reflected_sampled_kind(&r, TEXTURE_BINDING_BASE + 9),
             ReflectedSampledKind::Absent
         );
+    }
+
+    /// The compute rail stages one flat `width × height` rectangle per texture
+    /// binding, so every declared shape with a slice, depth, or sample axis must
+    /// come back named rather than collapsing into the plain-2D arm — binding a
+    /// `TYPE_2D` view to an image the shader declared otherwise is a
+    /// descriptor-type mismatch, not a degraded render.
+    #[test]
+    fn every_unstageable_compute_texture_shape_names_its_axis() {
+        let bind = TEXTURE_BINDING_BASE + 4;
+        let unstageable = [
+            (TextureDimension::D1, false, false, "dim_1d"),
+            (TextureDimension::D1, true, false, "dim_1d"),
+            (TextureDimension::D3, false, false, "dim_3d"),
+            (TextureDimension::Cube, false, false, "dim_cube"),
+            (TextureDimension::Cube, true, false, "dim_cube"),
+            (TextureDimension::Buffer, false, false, "dim_buffer"),
+            (TextureDimension::D2, true, false, "arrayed"),
+            (TextureDimension::D2, false, true, "multisampled"),
+        ];
+        for (dimension, arrayed, multisampled, axis) in unstageable {
+            for writable in [false, true] {
+                let mut r = empty_reflection(ShaderStage::Kernel);
+                let mut s = shape(dimension, arrayed, writable);
+                s.multisampled = multisampled;
+                r.bindings.push(texture_binding(bind, s));
+                assert_eq!(
+                    reflected_compute_texture(&r, bind),
+                    ReflectedComputeTexture::UnstageableShape { axis },
+                    "dim={dimension:?} arrayed={arrayed} ms={multisampled} writable={writable}"
+                );
+            }
+        }
+
+        // The one stageable shape, both access classes, is not swept up by it.
+        for (writable, want) in [(false, ImageAccess::Sampled), (true, ImageAccess::Storage)] {
+            let mut r = empty_reflection(ShaderStage::Kernel);
+            r.bindings.push(texture_binding(
+                bind,
+                shape(TextureDimension::D2, false, writable),
+            ));
+            assert_eq!(
+                reflected_compute_texture(&r, bind),
+                ReflectedComputeTexture::Plain2d(want)
+            );
+        }
     }
 
     #[test]

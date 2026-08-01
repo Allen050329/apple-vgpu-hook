@@ -3256,20 +3256,21 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let mut staged_tex: Vec<StagedTexture> = Vec::new();
     let mut storage_writeonly_count = 0usize;
     for t in &acc.textures {
-        use crate::runtime::spirv_bind::{ImageAccess, StorageImageAccess};
+        use crate::runtime::spirv_bind::{
+            ImageAccess, ReflectedComputeTexture, StorageImageAccess,
+        };
         let binding = TEXTURE_BIND_BASE + t.index;
-        // Sampled-vs-storage comes solely from the translator's reflection — the
-        // declared Metal access qualifier, exact at translate time. The always-on
-        // `census_reflection_wellformed` guard proves the reflection is internally
-        // consistent per translate.
-        let image_access = crate::runtime::spirv_bind::image_access_from_reflection(
+        // Both the sampled-vs-storage class and the shape come solely from the
+        // translator's reflection — the declared Metal texture type, exact at
+        // translate time. The always-on `census_reflection_wellformed` guard
+        // proves the reflection is internally consistent per translate.
+        let is_storage = match crate::runtime::spirv_bind::reflected_compute_texture(
             &kernel_shader.reflection,
             binding,
-        );
-        let is_storage = match image_access {
-            Some(ImageAccess::Sampled) => false,
-            Some(ImageAccess::Storage) => true,
-            None => {
+        ) {
+            ReflectedComputeTexture::Plain2d(ImageAccess::Sampled) => false,
+            ReflectedComputeTexture::Plain2d(ImageAccess::Storage) => true,
+            ReflectedComputeTexture::Absent => {
                 // Metal permits unused bound resources. If reflection lists no
                 // texture shape at this binding, the shader does not sample/write
                 // it — do not stage or invent access/writeback semantics for it.
@@ -3278,6 +3279,18 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     acc.pipeline_ref, t.index, t.texture_ref, binding
                 ));
                 continue;
+            }
+            ReflectedComputeTexture::UnstageableShape { axis } => {
+                // The rail stages one flat plane window or one linear GVA level
+                // per binding, so it can only ever produce a single-layer 2D
+                // image. Binding that to a shader image declared with a slice,
+                // depth, or sample axis is a descriptor-type mismatch — refuse
+                // by name instead of dispatching against the wrong view.
+                crate::observe::fail(format!(
+                    "compute_linux texture_shape fail reason=unstageable_{axis} pipe={} i={} ref={} bind={binding}",
+                    acc.pipeline_ref, t.index, t.texture_ref
+                ));
+                return ComputeStatus::Unsupported("texture_shape_unstageable");
             }
         };
         let storage_access = if is_storage {
