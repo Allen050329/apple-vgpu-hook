@@ -5970,10 +5970,9 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// [`guest_replaced_host_copies`] sent the bind to the guest's pages instead.
 /// It is the direct measure of how much wrong content that rung used to serve.
 ///
-/// # What it measured on its first boot
+/// # Baseline, before the resident rung was gated
 ///
-/// One 14-round Finder recomposite boot under load, x86 / Vulkan, before the
-/// resident rung was gated:
+/// One 14-round Finder recomposite boot under load, x86 / Vulkan:
 ///
 /// ```text
 /// t11rung_resident    92730     (no currency test at all)
@@ -5983,11 +5982,32 @@ fn ranges_touch_window(ranges: &[(u64, u64)], base_off: u64, span_end: u64) -> b
 /// t11rung_miss            0
 /// ```
 ///
-/// `gw_clean` is **zero**. Every one of 14 396 cache binds served bytes the
-/// hypervisor could not vouch for — 14 092 because the mapping was never armed
-/// with a guest-write token, and 304 because the guest had demonstrably
-/// rewritten the pages since the Store. The resident rung above it, at 6.4
-/// times the traffic, had no column at all because it asked no question.
+/// That is the *pre-gating* world and it is kept only as the before-picture: the
+/// resident rung ran with no column at all because it asked no question, and
+/// every one of the 14 396 cache binds served bytes the hypervisor could not
+/// vouch for.
+///
+/// # What it reads now, which is the reading to reason from
+///
+/// Both statements above have since been overtaken, so do not carry the bolded
+/// `gw_clean == 0` forward — it was true of a build that no longer exists. One
+/// driven x86 / Vulkan boot (Safari page loads, scrolls, title-bar drags):
+///
+/// ```text
+/// t11rung_resident    632   gw_clean 242  gw_no_stamp 426
+/// t11rung_host_cache  131   gw_clean   8  gw_no_stamp 123
+/// ```
+///
+/// The gate did what it was for: the resident rung now asks the question, and
+/// `gw_clean` is non-zero on both copy-serving rungs. `no_stamp` still dominates
+/// — most mappings are never armed with a guest-write token — so the currency
+/// test mostly answers "cannot vouch", but it no longer *always* does.
+///
+/// The other six cells of the (rung × verdict) table have never fired on this
+/// pathway: `gw_no_mapping` and `gw_unreadable` on either rung, and
+/// `gw_wrote_elsewhere` on either rung. They are denominators, not dead code —
+/// their being empty is what says a served copy is never a copy the hypervisor
+/// actively contradicted.
 #[cfg(feature = "backend-vulkan")]
 fn note_type11_sample_rung(rung: &'static str, guest_write: GuestWriteVerdict) {
     crate::runtime::drain::note_store_route(rung);
