@@ -2932,8 +2932,16 @@ fn an_rgba8_store_outside_the_tasks_declared_span_still_reaches_guest_ram() {
     assert_eq!(&back[..4], &[30, 20, 10, 255]);
 }
 
-/// Type-2/3 GVA wallpaper layers must be sampleable from texture_ref host
-/// cache (not surface_id mid map) after encode Store.
+/// An encode Store of a type-2/3 GVA wallpaper layer lands in the texture_ref
+/// and GVA caches and NOT in the surface_id map — three separate namespaces
+/// that happen to be keyed by the same integer.
+///
+/// That a *sample* then reaches those bytes is `type3_sample_uses_type2_gva_cache`'s
+/// job: it builds the object-list entry and the descriptor the resolver needs.
+/// This fixture has neither, and the only rung that ever served it took its
+/// geometry from whichever cache entry was keyed by the ref rather than from a
+/// decoded descriptor. That rung is gone, so what this test can still assert
+/// about the resolver is that it declines.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_layer_host_cache_roundtrip_for_sample() {
@@ -2970,16 +2978,14 @@ fn gva_layer_host_cache_roundtrip_for_sample() {
         crate::runtime::surface_cache::get_gva(&state, gva, w, h).unwrap()[0],
         185
     );
-    // Sample path must hit texture cache without guest GVA walk / object list.
+    // No object list, so no decoded descriptor and therefore no geometry this
+    // call may serve bytes at. Declining is the contract; inventing a geometry
+    // from a cache entry is what used to happen.
     let mut host = crate::runtime::host::FakeHost::new();
-    let (sw, sh, sampled_mid, sampled) =
-        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None).expect("sample from cache");
-    assert_eq!((sw, sh), (w, h));
-    assert_eq!(sampled_mid, 0, "linear cache sample is not a type-11 edge");
-    let SampledSourceRequest::Bytes(sampled, _, _) = sampled else {
-        panic!("cache-only fixture unexpectedly resolved resident target");
-    };
-    assert_eq!(&sampled[0..4], &[81, 126, 185, 255]);
+    assert!(
+        resolve_sampled_source(&mut state, &mut host, 0, tex_ref, None).is_none(),
+        "a ref with no object-list entry must resolve to no sampled source"
+    );
 }
 
 #[cfg(feature = "backend-vulkan")]

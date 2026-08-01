@@ -329,21 +329,6 @@ pub fn get_texture(
     get_from(&state.host_texture_surfaces, texture_ref, width, height)
 }
 
-/// Any size under texture_ref (sample path when descriptor geom unknown).
-pub fn get_texture_any(state: &DeviceState, texture_ref: u32) -> Option<(u32, u32, &[u8])> {
-    let e = state.host_texture_surfaces.get(&texture_ref)?;
-    if e.width == 0 || e.height == 0 || e.bgra.is_empty() {
-        return None;
-    }
-    let need = (e.height as usize)
-        .saturating_mul(e.width as usize)
-        .saturating_mul(RGBA8_BPP as usize);
-    if e.bgra.len() < need {
-        return None;
-    }
-    Some((e.width, e.height, &e.bgra[..need]))
-}
-
 pub fn evict_texture(state: &mut DeviceState, texture_ref: u32) {
     state.host_texture_surfaces.remove(&texture_ref);
 }

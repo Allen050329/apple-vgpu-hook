@@ -1357,20 +1357,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
 
-    // Fallback: texture_ref encode cache any size (unit tests without object list).
-    if let Some((w, h, bgra)) = crate::runtime::surface_cache::get_texture_any(state, texture_ref) {
-        let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
-        if bgra.len() >= need {
-            let rgba = swap_rb_channels(&bgra[..need]);
-            return Some((
-                w,
-                h,
-                0,
-                SampledSourceRequest::Bytes(std::sync::Arc::new(rgba), None, TexelLayout::Rgba8),
-            ));
-        }
-    }
-
     // Linear / view path returns only RGBA; the geometry comes from the decoded
     // texture descriptor and from nowhere else. A payload shorter than the
     // descriptor's own `width * height * 4` is not a geometry this call may
@@ -5684,12 +5670,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
 
-        let vertex_count = if resources.indexed.is_some() {
-            // Ignored by engine when indexed; still pass for validation.
-            req.vertex_count.max(1)
-        } else {
-            req.vertex_count.max(1)
-        };
+        // The engine ignores this when the draw is indexed (the index count
+        // governs), but it still validates it, so it is passed either way.
+        let vertex_count = req.vertex_count.max(1);
 
         // Decide FIRST whether a census line will be emitted at all; the
         // resource metas below (per-attr/ssbo format!, hex prefixes, 16-float
