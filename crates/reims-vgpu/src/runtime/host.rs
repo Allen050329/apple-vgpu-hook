@@ -439,12 +439,14 @@ pub trait HostOps {
     }
 }
 
-/// Arm64e guest page size (16 KiB). FakeHost / map_pages test fixture only —
-/// product paths use `state.page_size()` / `page_size_of(page_shift)`.
-/// Named without a portable alias: do not use this as x86 page size.
-pub const GUEST_PAGE_SIZE_ARM64E: usize = 16384;
-/// Historical alias for arm fixtures; prefer [`GUEST_PAGE_SIZE_ARM64E`].
-pub const GUEST_PAGE_SIZE: usize = GUEST_PAGE_SIZE_ARM64E;
+/// Arm64e guest page size, from the contract shift rather than a literal.
+/// FakeHost / `map_pages` test fixture only — product paths use
+/// `state.page_size()` / `page_size_of(page_shift)`.
+///
+/// Arch-qualified with no portable alias, deliberately. A bare `GUEST_PAGE_SIZE_ARM64E`
+/// reads as "the guest's page size" and is 16 KiB whatever the guest is, which
+/// is the spelling `model::regs` records as the cause of x86 wild writes.
+pub const GUEST_PAGE_SIZE_ARM64E: usize = 1usize << crate::contract::gva::PAGE_SHIFT_ARM64E;
 
 /// mach VM aliasing for FakeHost views — the same mechanism the QEMU shim
 /// uses in production (`mach_vm_remap` of guest RAM), exercised for real in
@@ -632,7 +634,7 @@ impl Drop for FakeHost {
                 }
             }
             for r in self.ranges.drain(..) {
-                let layout = std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE)
+                let layout = std::alloc::Layout::from_size_align(r.alloc_len, GUEST_PAGE_SIZE_ARM64E)
                     .unwrap_or(std::alloc::Layout::from_size_align(r.alloc_len, 1).unwrap());
                 // SAFETY: ptr/alloc_len from alloc_block.
                 unsafe { std::alloc::dealloc(r.ptr as *mut u8, layout) };
@@ -676,7 +678,7 @@ impl FakeHost {
     fn alloc_block(len: usize) -> Option<(usize, usize)> {
         #[cfg(target_os = "macos")]
         unsafe {
-            let alloc_len = len.max(1).next_multiple_of(GUEST_PAGE_SIZE);
+            let alloc_len = len.max(1).next_multiple_of(GUEST_PAGE_SIZE_ARM64E);
             let mut addr = 0u64;
             let kr = mach_vm::mach_vm_allocate(
                 mach_vm::mach_task_self_,
@@ -693,8 +695,8 @@ impl FakeHost {
         {
             // Real host pages so map_pages can return an aliasing pointer (product
             // contig write path). Align to 16 KiB so arm fixtures work.
-            let alloc_len = len.max(1).next_multiple_of(GUEST_PAGE_SIZE);
-            let layout = std::alloc::Layout::from_size_align(alloc_len, GUEST_PAGE_SIZE).ok()?;
+            let alloc_len = len.max(1).next_multiple_of(GUEST_PAGE_SIZE_ARM64E);
+            let layout = std::alloc::Layout::from_size_align(alloc_len, GUEST_PAGE_SIZE_ARM64E).ok()?;
             // SAFETY: non-zero layout.
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             if ptr.is_null() {
@@ -1247,8 +1249,8 @@ mod tests {
     #[test]
     fn guest_write_gen_is_idempotent() {
         let mut h = FakeHost::new();
-        let p = GUEST_PAGE_SIZE as u64;
-        let token = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE).unwrap();
+        let p = GUEST_PAGE_SIZE_ARM64E as u64;
+        let token = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E).unwrap();
         let first = h.guest_write_gen(token).unwrap();
         assert_eq!(h.guest_write_gen(token), Some(first));
         assert_eq!(h.guest_write_gen(token), Some(first));
@@ -1260,9 +1262,9 @@ mod tests {
     #[test]
     fn guest_write_gen_moves_only_for_tracked_pages() {
         let mut h = FakeHost::new();
-        let p = GUEST_PAGE_SIZE as u64;
-        let a = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE).unwrap();
-        let b = h.track_guest_writes(&[7 * p], GUEST_PAGE_SIZE).unwrap();
+        let p = GUEST_PAGE_SIZE_ARM64E as u64;
+        let a = h.track_guest_writes(&[4 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E).unwrap();
+        let b = h.track_guest_writes(&[7 * p], GUEST_PAGE_SIZE_ARM64E).unwrap();
         let (a0, b0) = (h.guest_write_gen(a).unwrap(), h.guest_write_gen(b).unwrap());
 
         // Mid-page offset: the contract is stated in pages, so any address in
@@ -1288,9 +1290,9 @@ mod tests {
     #[test]
     fn guest_written_pages_names_which_pages_moved_since_a_recorded_generation() {
         let mut h = FakeHost::new();
-        let p = GUEST_PAGE_SIZE as u64;
+        let p = GUEST_PAGE_SIZE_ARM64E as u64;
         let t = h
-            .track_guest_writes(&[4 * p, 7 * p, 9 * p], GUEST_PAGE_SIZE)
+            .track_guest_writes(&[4 * p, 7 * p, 9 * p], GUEST_PAGE_SIZE_ARM64E)
             .unwrap();
         let g0 = h.guest_write_gen(t).unwrap();
         assert_eq!(h.guest_written_pages(t, g0), Some(vec![]));
@@ -1317,8 +1319,8 @@ mod tests {
     #[test]
     fn untrack_guest_writes_releases_the_set() {
         let mut h = FakeHost::new();
-        let p = GUEST_PAGE_SIZE as u64;
-        let token = h.track_guest_writes(&[p], GUEST_PAGE_SIZE).unwrap();
+        let p = GUEST_PAGE_SIZE_ARM64E as u64;
+        let token = h.track_guest_writes(&[p], GUEST_PAGE_SIZE_ARM64E).unwrap();
         assert_eq!(h.tracked_guest_write_sets(), 1);
         h.untrack_guest_writes(token);
         assert_eq!(h.tracked_guest_write_sets(), 0);
@@ -1336,8 +1338,8 @@ mod tests {
     fn unobservable_host_refuses_the_token() {
         let mut h = FakeHost::new();
         h.guest_writes_unobservable = true;
-        let p = GUEST_PAGE_SIZE as u64;
-        assert_eq!(h.track_guest_writes(&[p], GUEST_PAGE_SIZE), None);
+        let p = GUEST_PAGE_SIZE_ARM64E as u64;
+        assert_eq!(h.track_guest_writes(&[p], GUEST_PAGE_SIZE_ARM64E), None);
         assert_eq!(h.tracked_guest_write_sets(), 0);
     }
 
@@ -1355,7 +1357,7 @@ mod tests {
             fn schedule_bh(&mut self) {}
         }
         let mut b = Bare;
-        assert_eq!(b.track_guest_writes(&[0], GUEST_PAGE_SIZE), None);
+        assert_eq!(b.track_guest_writes(&[0], GUEST_PAGE_SIZE_ARM64E), None);
         assert_eq!(b.guest_write_gen(1), None);
         b.untrack_guest_writes(1);
     }
@@ -1369,21 +1371,21 @@ mod tests {
     #[test]
     fn map_pages_view_aliases_guest_ram() {
         let mut h = FakeHost::new();
-        let p = GUEST_PAGE_SIZE as u64;
-        h.map_range(0x10 * p, GUEST_PAGE_SIZE, 0);
-        h.map_range(0x99 * p, GUEST_PAGE_SIZE, 0);
-        let Some(view) = h.map_pages(&[0x10 * p, 0x99 * p], GUEST_PAGE_SIZE) else {
+        let p = GUEST_PAGE_SIZE_ARM64E as u64;
+        h.map_range(0x10 * p, GUEST_PAGE_SIZE_ARM64E, 0);
+        h.map_range(0x99 * p, GUEST_PAGE_SIZE_ARM64E, 0);
+        let Some(view) = h.map_pages(&[0x10 * p, 0x99 * p], GUEST_PAGE_SIZE_ARM64E) else {
             // FakeHost without contig remap: not the product QEMU path.
             return;
         };
         // write_gpa → view
         h.put_u32(0x99 * p + 8, 0xdead_beef);
-        let via_view = unsafe { *((view + GUEST_PAGE_SIZE + 8) as *const u32) };
+        let via_view = unsafe { *((view + GUEST_PAGE_SIZE_ARM64E + 8) as *const u32) };
         assert_eq!(via_view, 0xdead_beef);
         // view → read_gpa
         unsafe { *((view + 4) as *mut u32) = 0x1122_3344 };
         assert_eq!(h.get_u32(0x10 * p + 4), 0x1122_3344);
-        h.unmap_pages(view, 2 * GUEST_PAGE_SIZE);
+        h.unmap_pages(view, 2 * GUEST_PAGE_SIZE_ARM64E);
     }
 
     #[test]

@@ -52,15 +52,6 @@ pub const DEVICE_DESC_BPE: usize = 0x20;
 pub const DEVICE_DESC_PLANE_COUNT: usize = 0x24;
 pub const DEVICE_DESC_PLANES: usize = 0x40;
 
-/// Arm64e page shift/size — fixtures and C ABI defaults that still assume arm.
-/// Product paths must use `page_size_of(state.page_shift)` / `*_shift` APIs.
-///
-/// There is no x86 pair here. `contract::gva` is where a page geometry is
-/// named, `model::regs` re-exports both shifts and the one `u64` page size a
-/// caller has ever wanted, and a third copy in this module was read by nothing.
-pub const PAGE_SHIFT_ARM64E: u32 = crate::contract::gva::PAGE_SHIFT_ARM64E;
-pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
-
 #[inline]
 pub fn page_size_of(page_shift: u32) -> u64 {
     1u64 << page_shift
@@ -772,7 +763,7 @@ pub fn build_table_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::iosurface_pages::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
+    use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SIZE_ARM64E};
     use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
     use crate::observe::Refusal;
 

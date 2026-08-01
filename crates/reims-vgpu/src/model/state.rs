@@ -362,20 +362,6 @@ pub struct TaskSpanReadout {
     pub nearest_gap: Option<u64>,
 }
 
-impl TaskSpanReadout {
-    /// Whether `gva` falls within `[lo, hi)`, the extent of everything the task
-    /// declared.
-    ///
-    /// This is what tells a *hole* between two declarations apart from a range
-    /// in a region the task never declared anything in, and both come back
-    /// `union == 0`. `own == 0` is neither: a task that filed nothing has no
-    /// extent, and `lo == hi == 0` must not read as "everything is outside it"
-    /// by arithmetic accident.
-    pub fn gva_inside_extent(&self, gva: u64) -> bool {
-        self.own > 0 && gva >= self.lo && gva < self.hi
-    }
-}
-
 /// Guest-declared MapMemory2 span (notify-only; no host PTE invent).
 ///
 /// Used to fail-closed product GVA writes outside any recorded map when the
@@ -3896,8 +3882,11 @@ mod fail_vocabulary_tests {
         state.note_task_map(1, 0x12000, page);
         let hole = state.task_span_readout(1, 0x11000, page, SH);
         assert_eq!((hole.pages, hole.union, hole.own), (1, 0, 2));
+        // Inside `[lo, hi)` is what separates a hole from a foreign range —
+        // both report `union == 0`. Read off the readout's own fields; the
+        // product asks the question this way and nowhere else.
         assert!(
-            hole.gva_inside_extent(0x11000),
+            hole.own > 0 && (hole.lo..hole.hi).contains(&0x11000),
             "inside the declared extent is what separates a hole from a foreign range"
         );
 

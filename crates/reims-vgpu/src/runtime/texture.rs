@@ -78,11 +78,6 @@ pub fn register_from_descriptor_bytes(
     }
 }
 
-/// Bump content generation after a host write into the mapping (render/blit).
-pub fn mark_mapping_written(state: &mut DeviceState, mapping_id: u32) -> u32 {
-    state.mark_mapping_written(mapping_id)
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -98,8 +93,8 @@ mod tests {
         let m = s.mappings.get(&5).unwrap();
         assert!(m.has_geom);
         assert_eq!((m.width, m.height, m.format), (640, 480, 0x50));
-        assert_eq!(mark_mapping_written(&mut s, 5), 1);
-        assert_eq!(mark_mapping_written(&mut s, 5), 2);
+        assert_eq!(s.mark_mapping_written(5), 1);
+        assert_eq!(s.mark_mapping_written(5), 2);
 
         let mut desc = [0u8; 0x20];
         st32(&mut desc[0..], 9);
