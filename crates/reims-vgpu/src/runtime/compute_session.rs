@@ -544,7 +544,7 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
     };
     use crate::backend::metal::runtime::new_buffer_from_host;
     use crate::backend::metal::samplers::make_explicit_sampler;
-    use crate::backend::metal::util::image_len;
+    use crate::backend::metal::util::{image_len, valid_buffer_binding};
     use crate::contract::endian::ld32;
     use crate::runtime::compute_exec::{
         load_compute_pipeline, load_mtlb, nested_job_from_icb_resources, stage_buffer,
@@ -586,6 +586,29 @@ fn apply_icb_compute_encoder_inheritance<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
+            // Metal's kernel buffer argument table has
+            // `REIMS_VGPU_METAL_MAX_BUFFERS` entries, and
+            // `setBuffer:offset:atIndex:` past the end raises an out-of-range
+            // exception — which aborts the process instead of declining, so the
+            // bound has to be checked before the call and not after. `b.index`
+            // comes from the decoded stream, so nothing upstream constrains it.
+            //
+            // The three sibling bind paths all gate on this limit already: direct
+            // compute through `valid_buffer_binding`, and both render paths
+            // (direct draw and ICB inheritance) through `MAX_BIND_SLOTS`, which is
+            // the same 31. This path had no device-limit gate at all — only the
+            // descriptor check below, which the guest disables outright by leaving
+            // `max_kernel_buffer_bind_count` at 0.
+            if !valid_buffer_binding(b.index) {
+                return Err(ComputeStatus::Unsupported(
+                    "icb_inherit_buffer_binding_out_of_range",
+                ));
+            }
+            // Narrower than the device limit and separate from it: the guest's own
+            // declared per-command bind count for this ICB. Kept as it stands —
+            // whether `maxKernelBufferBindCount` is meant to bound *parent-encoder*
+            // binds under `inheritBuffers`, as opposed to binds recorded into an
+            // ICB command, is not settled from the decoded fields.
             if desc.max_kernel_buffer_bind_count > 0
                 && b.index as u64 >= desc.max_kernel_buffer_bind_count as u64
             {
