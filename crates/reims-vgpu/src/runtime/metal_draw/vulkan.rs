@@ -2531,12 +2531,51 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
         return None;
     }
     let key = (task_id, gva, w, h, sample_fmt);
-    let hit = state
-        .guest_linear_memo
-        .get_touch(&key)
+    // Three-way, because "the memo did not answer" has two causes that want
+    // opposite fixes and a hit/miss pair cannot tell them apart.
+    //
+    // This memo cannot skip the guest read — the read is *how* it knows the
+    // content is unchanged — so a hit buys exactly one thing: it skips
+    // `native_scratch_to_upload`, the pixel-format conversion. Everything else
+    // it costs is paid on every bind regardless: the read, the memcmp against
+    // `native`, and a cap charged for storing the native bytes *and* their
+    // converted copy.
+    //
+    // So the memo is worth its keep only if `lin_memo_hit` dominates.
+    // `lin_memo_changed` is the memcmp running in full and buying nothing — the
+    // guest rewrote the plane, which is the case the memo cannot help. And
+    // `lin_memo_absent` is the key never repeating, where the cap is holding
+    // bytes no bind will ask for again.
+    //
+    // **Measured, and it earns its keep.** One driven x86 / Vulkan boot (two
+    // Safari page loads, scrolls, three title-bar drags): hit 7221, changed 557,
+    // absent 179 — a **90.8 %** hit rate, so nine binds in ten skip the format
+    // conversion entirely. The three arms sum to 7957, which is exactly
+    // `lin_rung_guest_memo` for the same boot; that reconciliation is what says
+    // the census is complete rather than merely quiet.
+    //
+    // This was instrumented to decide whether to delete the memo, on the
+    // suspicion it was another cache paying its own miss on every hit. It is
+    // not: unlike a walk memo it cannot skip the guest read, but the read was
+    // never what it claimed to save. Keep it. The counters stay because the
+    // answer is workload-dependent — a guest that rewrites its planes every
+    // frame would push `changed` up and invert the conclusion — so this is a
+    // ratio worth re-reading, not a settled fact worth deleting.
+    let hit = match state.guest_linear_memo.get_touch(&key) {
+        None => {
+            crate::runtime::drain::note_store_route("lin_memo_absent");
+            None
+        }
         // Vec equality is length + byte memcmp with early exit on change.
-        .filter(|m| m.native == scratch)
-        .map(|m| (m.rgba.clone(), m.generation, m.bgra8));
+        Some(m) if m.native == scratch => {
+            crate::runtime::drain::note_store_route("lin_memo_hit");
+            Some((m.rgba.clone(), m.generation, m.bgra8))
+        }
+        Some(_) => {
+            crate::runtime::drain::note_store_route("lin_memo_changed");
+            None
+        }
+    };
     if let Some((rgba, generation, bgra8)) = hit {
         let fmt = if bgra8 {
             TexelLayout::Bgra8
