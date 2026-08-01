@@ -5013,8 +5013,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // frame this rail would vouch for is not in the slot it would pin.
         let renders_into_surface_identity =
             type11_resident_target.is_some() && resources.target_identity == type11_resident_target;
-        let identity_taken_by_another_rail =
-            resources.target_identity.is_some() && !renders_into_surface_identity;
         // `!skip_readback` is implied — a set flag means one of the rails above
         // claimed this record, and each returns its own span before
         // `ResidentSurfaceStore` is reached, so a record that armed here as well
@@ -5028,40 +5026,28 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.skip_readback = true;
             surface_resident_store = true;
         }
-        // Every rail that could skip this Store's readback has now had its say.
-        // A composite Store that still reads back costs a full-surface GPU→CPU
-        // copy plus the fence wait that is charged per byte, and the always-on
-        // channel could not say which of these conditions kept it: `store_routes`
-        // counts the route TAKEN, so the 256/s that land on `surface_deferred`
-        // are indistinguishable from each other. Ordered first-failure, into the
-        // same per-second window `drain_duty` divides, so the count sits beside
-        // the `readbacks` it explains.
+        // There is no first-failure classifier here for a composite Store that
+        // still reads back, and its four counters are gone.
         //
-        // `t11_keep_chain_from_resident` used to head this list and owned the
-        // whole population; it is gone because a chained Store is no longer
-        // refused. The reason it could head the list at all is worth keeping in
-        // mind when reading this probe: an ordered first-failure cannot separate
-        // two conditions that are the same fact, and `chain_from_resident` and
-        // `identity_taken_by_another_rail` were both true on every one of those
-        // Stores.
-        if !resources.skip_readback && store_is_store && writeback_guest {
-            if let Some(c0) = req.colors.first() {
-                if c0.mapping_id != 0 {
-                    // No `store_action` arm: `store_is_store` gating this block is
-                    // that same field read off that same `c0`, so an arm testing it
-                    // again could not fire. It was written as one and never could.
-                    crate::runtime::drain::note_store_route(if identity_taken_by_another_rail {
-                        "t11_keep_identity_taken"
-                    } else if type11_resident_target.is_none() {
-                        "t11_keep_no_chain_identity"
-                    } else if !deferred_gpu_only_content_allowed_for_surface() {
-                        "t11_keep_gpu_only_denied"
-                    } else {
-                        "t11_keep_not_defer_eligible"
-                    });
-                }
-            }
-        }
+        // It answered "which of these conditions kept the readback" over the
+        // population `store_routes` could not split — the 256/s landing on
+        // `surface_deferred`. That population no longer exists. Its outer gate
+        // (`!skip_readback && store_is_store && writeback_guest` with
+        // `mapping_id != 0`) was never once true: none of
+        // `t11_keep_identity_taken`, `t11_keep_no_chain_identity`,
+        // `t11_keep_gpu_only_denied` or `t11_keep_not_defer_eligible` appears
+        // anywhere in the always-on log, across every boot it holds. Not even
+        // the `else` arm, which is what separates "the classifier ran and every
+        // Store was defer-eligible" from "the classifier never ran" — an
+        // ordered first-failure with an empty population reports the same
+        // silence as a broken one, and this one had no denominator to say
+        // which. Every type-11 Store either skips its readback or is not a
+        // writeback Store.
+        //
+        // `identity_taken_by_another_rail` went with it; it had no other
+        // reader, so the comparison it made ran once per draw for a counter
+        // nothing incremented. `renders_into_surface_identity` above is the
+        // live half and stays — it gates the readback skip itself.
         if chain_load_from_target {
             if resources.target_identity.is_none() {
                 // chain_from_resident implies a protocol target identity; a
