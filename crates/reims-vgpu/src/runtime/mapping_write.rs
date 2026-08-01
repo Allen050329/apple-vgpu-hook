@@ -445,8 +445,15 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     // in its tail.
     let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
 
+    use crate::runtime::drain::{
+        SurfaceWritePhase, note_surface_write_path, note_surface_write_phase,
+    };
+    let frame_bytes = (mh as u64).saturating_mul(tight as u64);
+
     // Fast path: one packed view, poke rows in place.
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
+        note_surface_write_path(true, frame_bytes);
+        let land_started = std::time::Instant::now();
         // SAFETY: contig covers span_end; revalidated in ensure_contig_view.
         let base = unsafe { (ptr as *mut u8).add(base_off as usize) };
         for y in 0..mh {
@@ -486,7 +493,13 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
                 }
             }
         }
+        note_surface_write_phase(
+            SurfaceWritePhase::Land,
+            land_started.elapsed().as_micros() as u64,
+        );
     } else {
+        note_surface_write_path(false, frame_bytes);
+        let stage_started = std::time::Instant::now();
         // Fragmented: stage native rows then multi-import (one map_pages pass set).
         // The sample window ends at the final row's last texel, not at
         // `bpr * height`; padding after the final row is outside the texture
@@ -528,6 +541,11 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
             }
             frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
         }
+        note_surface_write_phase(
+            SurfaceWritePhase::Stage,
+            stage_started.elapsed().as_micros() as u64,
+        );
+        let land_started = std::time::Instant::now();
         // One call per surviving run rather than one for the whole frame: the
         // mapper writes the bytes it is handed, so a skipped page has to be
         // absent from the slice rather than masked inside it.
@@ -545,6 +563,10 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
                 return false;
             }
         }
+        note_surface_write_phase(
+            SurfaceWritePhase::Land,
+            land_started.elapsed().as_micros() as u64,
+        );
     }
     state.invalidate_storage_residency_window(mapping_id, base_off, span_end);
     let _ = state.mark_mapping_written(mapping_id);
@@ -595,6 +617,7 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
         return true;
     }
+    let cache_started = std::time::Instant::now();
     let mut cache = vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
     let row_src = width.saturating_mul(RGBA8_BPP) as usize;
     for y in 0..mh as usize {
@@ -605,6 +628,10 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    note_surface_write_phase(
+        SurfaceWritePhase::Cache,
+        cache_started.elapsed().as_micros() as u64,
+    );
     // This write just made the host copy and the guest pages agree, so it is the
     // moment the copy's currency can be pinned. Nothing else arms this mapping:
     // the type-4 sampled ladder's first census read `gw_no_stamp` 14 092 against

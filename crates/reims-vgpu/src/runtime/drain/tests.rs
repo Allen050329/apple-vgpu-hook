@@ -1913,6 +1913,48 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(c.take_readback_split().is_none(), "the window must reset");
 }
 
+/// The largest phase of the largest rail is three full-frame passes under one
+/// name, and a total cannot say which of them it is.
+///
+/// `write_us` covers the staged buffer, the bytes reaching guest pages and the
+/// host-side cache duplicate. Those have entirely different fixes — two are
+/// per-flush multi-megabyte allocations that could be reused and one is the work
+/// the guest actually asked for — so a reader holding only the sum has no way to
+/// tell an unavoidable cost from two avoidable ones. The path counts are part of
+/// the answer, not decoration: `stage_us=0` means the contiguous path, and
+/// without `contig`/`frag` that is indistinguishable from free staging.
+#[test]
+fn the_write_split_separates_the_guest_s_bytes_from_the_buffers_built_around_them() {
+    use crate::runtime::drain::{SurfaceWriteCensus, SurfaceWritePhase};
+    let c = SurfaceWriteCensus::default();
+    assert!(
+        c.take(1_000).is_none(),
+        "a window with no surface write must stay silent"
+    );
+
+    // One fragmented write: staged, landed, then cached.
+    c.note_path(false, 8_290_000);
+    c.note(SurfaceWritePhase::Stage, 1_200);
+    c.note(SurfaceWritePhase::Land, 1_500);
+    c.note(SurfaceWritePhase::Cache, 1_100);
+    // One contiguous write: no staging pass at all.
+    c.note_path(true, 8_290_000);
+    c.note(SurfaceWritePhase::Land, 900);
+    c.note(SurfaceWritePhase::Cache, 1_300);
+
+    let line = c.take(1_000).expect("traffic must report");
+    assert!(line.contains("contig=1 frag=1"), "{line}");
+    assert!(line.contains("bytes=16580000"), "{line}");
+    assert!(line.contains("stage_us=1200 stage=1"), "{line}");
+    assert!(line.contains("land_us=2400 land=2"), "{line}");
+    assert!(line.contains("cache_us=2400 cache=2"), "{line}");
+    // The tail, for the same reason every other split here carries one: a mean
+    // cannot tell a steady tax from an occasional stall.
+    assert!(line.contains("land_max_us=1500"), "{line}");
+
+    assert!(c.take(1_000).is_none(), "the window must reset");
+}
+
 /// Whether the readback's fence wait has anywhere to hide is a measurement, and
 /// it is this one.
 ///

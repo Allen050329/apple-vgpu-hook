@@ -3232,6 +3232,126 @@ impl FlushRail {
     }
 }
 
+/// The inside of [`ReadbackPhase::Write`], which is now the largest phase of the
+/// largest rail and is three full-frame passes wearing one name.
+///
+/// `write_us=377356 write=95` is 3.97 ms per flush and 40% of the drain worker's
+/// busy second, on an 8.29 MB frame — an effective 2.1 GB/s against ~9 GB/s for
+/// the readback's own memcpy of the identical bytes. A previous attempt read
+/// that gap as "cache-cold scattered writes into guest RAM, so only fewer bytes
+/// help", removed a staging hop on that basis and measured no change.
+///
+/// The gap is a factor of four, which is the shape of doing the work four times,
+/// not of doing it once badly. `write_bgra8_skipping` makes up to three
+/// whole-frame passes and the name covers all of them, so none of them can be
+/// ruled in or out:
+///
+/// - [`Stage`](Self::Stage) — the fragmented path's `frame` buffer: an 8 MB
+///   allocation plus every row copied into it, before a single guest byte moves.
+///   The contiguous path skips this entirely, so which path the composite takes
+///   decides whether it exists at all.
+/// - [`Land`](Self::Land) — the bytes actually reaching guest pages. This is the
+///   only pass the guest needs and the only one a dirty rect would shrink.
+/// - [`Cache`](Self::Cache) — a second 8 MB allocation holding a host-side
+///   duplicate of the same frame for [`crate::runtime::surface_cache`], built
+///   unconditionally on every non-skipping write.
+///
+/// Two of the three are freshly allocated multi-megabyte buffers per flush, ~95
+/// times a second. A `vec![0u8; 8_290_000]` is not free even zeroed by the
+/// allocator: the pages come back untouched and the fill faults every one of
+/// them in. Whether that is the missing factor is exactly what this measures.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SurfaceWritePhase {
+    /// Build the staged whole-frame buffer (fragmented path only).
+    Stage,
+    /// Move the bytes into the guest's pages.
+    Land,
+    /// Build and store the host-side [`crate::runtime::surface_cache`] copy.
+    Cache,
+}
+
+impl SurfaceWritePhase {
+    const ALL: [SurfaceWritePhase; 3] = [
+        SurfaceWritePhase::Stage,
+        SurfaceWritePhase::Land,
+        SurfaceWritePhase::Cache,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            SurfaceWritePhase::Stage => 0,
+            SurfaceWritePhase::Land => 1,
+            SurfaceWritePhase::Cache => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            SurfaceWritePhase::Stage => "stage",
+            SurfaceWritePhase::Land => "land",
+            SurfaceWritePhase::Cache => "cache",
+        }
+    }
+}
+
+/// [`SurfaceWritePhase`] totals over the census window, plus which of the two
+/// landing paths the writes took.
+///
+/// `contig` and `frag` are counted because the split is not readable from the
+/// phase totals alone: a `stage_us` of zero means the contiguous path, and a
+/// reader with no path count cannot tell that from "the staging is free".
+#[derive(Default)]
+pub(crate) struct SurfaceWriteCensus {
+    us: [std::sync::atomic::AtomicU64; 3],
+    count: [std::sync::atomic::AtomicU64; 3],
+    max_us: [std::sync::atomic::AtomicU64; 3],
+    contig: std::sync::atomic::AtomicU64,
+    frag: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl SurfaceWriteCensus {
+    fn note(&self, phase: SurfaceWritePhase, us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = phase.index();
+        self.us[i].fetch_add(us, Relaxed);
+        self.count[i].fetch_add(1, Relaxed);
+        self.max_us[i].fetch_max(us, Relaxed);
+    }
+
+    fn note_path(&self, contiguous: bool, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if contiguous {
+            self.contig.fetch_add(1, Relaxed);
+        } else {
+            self.frag.fetch_add(1, Relaxed);
+        }
+        self.bytes.fetch_add(bytes, Relaxed);
+    }
+
+    fn take(&self, win_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let contig = self.contig.swap(0, Relaxed);
+        let frag = self.frag.swap(0, Relaxed);
+        if contig == 0 && frag == 0 {
+            return None;
+        }
+        let bytes = self.bytes.swap(0, Relaxed);
+        let mut body = String::new();
+        for phase in SurfaceWritePhase::ALL {
+            let i = phase.index();
+            let us = self.us[i].swap(0, Relaxed);
+            let n = self.count[i].swap(0, Relaxed);
+            let max = self.max_us[i].swap(0, Relaxed);
+            let label = phase.label();
+            body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
+        }
+        Some(format!(
+            "write_split win_ms={win_ms} contig={contig} frag={frag} bytes={bytes}{body}"
+        ))
+    }
+}
+
 /// How long a resident-backed render window sits armed before its flush reads
 /// it, which is the only interval the readback's GPU round trip could hide in.
 ///
@@ -3260,7 +3380,6 @@ impl FlushRail {
 /// sent. The 2.6 ms is the GPU rendering the frame. Only cheaper draws, or not
 /// holding the device lock across the wait, can move it.
 ///
-
 /// `multi` is not noise to be averaged away. The age of "the arm" is a single
 /// number only when exactly one window was armed since the last flush; a window
 /// that drifted out through one of `flush_render_one`'s refusals never reaches
@@ -3735,6 +3854,20 @@ static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
 static RESIDENT_ARM: std::sync::LazyLock<ResidentArmCensus> =
     std::sync::LazyLock::new(ResidentArmCensus::default);
 
+static SURFACE_WRITE: std::sync::LazyLock<SurfaceWriteCensus> =
+    std::sync::LazyLock::new(SurfaceWriteCensus::default);
+
+/// Attribute `us` of one surface writeback to one of its whole-frame passes.
+pub fn note_surface_write_phase(phase: SurfaceWritePhase, us: u64) {
+    SURFACE_WRITE.note(phase, us);
+}
+
+/// Record which landing path one surface writeback took, and how many bytes of
+/// frame it carried.
+pub fn note_surface_write_path(contiguous: bool, bytes: u64) {
+    SURFACE_WRITE.note_path(contiguous, bytes);
+}
+
 /// Stamp one resident-backed render window as armed.
 pub fn note_resident_window_armed() {
     RESIDENT_ARM.note_arm(crate::observe::elapsed_us());
@@ -3762,6 +3895,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // question is whether `age_us/aged` leaves room for `fence_us/fence`.
         if let Some(age) = RESIDENT_ARM.take(DRAIN_DUTY.last_window_ms()) {
             crate::observe::off(age);
+        }
+        // Under `readback_split`, dividing its `write_us` the same way it
+        // divides `flush_rails`'s `render_us`.
+        if let Some(write) = SURFACE_WRITE.take(DRAIN_DUTY.last_window_ms()) {
+            crate::observe::off(write);
         }
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
