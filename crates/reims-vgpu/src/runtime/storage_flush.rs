@@ -1145,7 +1145,10 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     // outcomes that are not — a refused write, and a window whose span the guest
     // had already torn down — each emit their own typed line above, so the
     // always-on view keeps the losses and drops the running commentary.
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Gva),
+        started,
+    );
     crate::observe::line(format!(
         "gva_deferred_flush gva={gva:#x} {}x{} fmt={:#x} guest={guest} trigger={trigger} bytes={} us={}",
         entry.width,
@@ -1298,7 +1301,10 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
             crate::runtime::compute_exec::LinearWrite::Failed => "write_fail",
         }
     };
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Linear),
+        started,
+    );
     crate::observe::off(format!(
         "linear_deferred_flush task={task_id} ref={texture_ref} {}x{} fmt={:#x} gen={generation} guest={guest} bytes={} us={}",
         key.width,
@@ -1866,7 +1872,10 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     }
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Render),
+        started,
+    );
     crate::observe::line(format!(
         "render_deferred_flush mapping={} {}x{} fmt={:#x} ok={} bytes={} us={}",
         key.mapping_id,
@@ -2003,7 +2012,10 @@ fn flush_storage_one<M: HostMemory + HostOps>(
     // re-establish the mirror entry the write's own invalidation dropped so
     // chained seed skips stay live.
     state.compute_storage_residency.insert(*key, generation);
-    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Flush, started);
+    crate::runtime::drain::note_drain_phase(
+        crate::runtime::drain::DrainPhase::Flush(crate::runtime::drain::FlushRail::Storage),
+        started,
+    );
     crate::observe::off(format!(
         "compute_deferred_flush mapping={} {}x{} fmt={:#x} gen={generation} bytes={} us={}",
         key.mapping_id,

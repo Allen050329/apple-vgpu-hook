@@ -1735,7 +1735,7 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
 ///   instead of a lifetime average.
 #[test]
 fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases() {
-    use crate::runtime::drain::{DrainDutyCensus, DrainPhase};
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase, FlushRail};
     let c = DrainDutyCensus::default();
 
     // The first call only arms the window: reporting here would divide the whole
@@ -1774,7 +1774,7 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
         c.note_phase(DrainPhase::Draw, 20_000);
     }
     c.note_phase(DrainPhase::Compute, 7_000);
-    c.note_phase(DrainPhase::Flush, 11_000);
+    c.note_phase(DrainPhase::Flush(FlushRail::Render), 11_000);
 
     // An idle window must read near zero rather than inheriting the busy one,
     // and `skipped` must survive as its own arm: a worker that keeps bailing
@@ -1814,16 +1814,16 @@ fn the_drain_duty_census_reads_a_rate_over_its_window_and_splits_the_two_phases(
 /// per-frame cost read as an occasional hitch.
 #[test]
 fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
-    use crate::runtime::drain::{DrainDutyCensus, DrainPhase};
+    use crate::runtime::drain::{DrainDutyCensus, DrainPhase, FlushRail};
     let c = DrainDutyCensus::default();
     assert!(c.note(0, 0, 5_000).is_none(), "first call arms only");
 
     // Nine cheap flushes and one long one: the mean is unremarkable, the tail
     // is the whole story.
     for _ in 0..9 {
-        c.note_phase(DrainPhase::Flush, 1_000);
+        c.note_phase(DrainPhase::Flush(FlushRail::Linear), 1_000);
     }
-    c.note_phase(DrainPhase::Flush, 30_000);
+    c.note_phase(DrainPhase::Flush(FlushRail::Render), 30_000);
     // Two tranches over a frame budget and one comfortably under it.
     c.note(30_000, 0, 5_500);
     c.note(9_000, 0, 5_600);
@@ -1846,6 +1846,27 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     // The threshold is derived from the delivered VBL cadence, not written
     // down, so it tracks the refresh rate rather than aging beside it.
     assert!(line.contains("slow_us=8333"), "{line}");
+
+    // The same window, split by rail. Nine cheap flushes on one rail and one
+    // expensive flush on another is exactly the shape the aggregate cannot
+    // express: `flushes=10` reads as one busy mechanism, while the count says
+    // the linear rail owns nine tenths of it and the cost says the render rail
+    // owns three quarters. Those two readings point at different code.
+    let rails = c.take_flush_rails().expect("a window that flushed must split");
+    assert!(rails.contains("win_ms=1100"), "{rails}");
+    assert!(rails.contains("render_us=30000 render=1"), "{rails}");
+    assert!(rails.contains("linear_us=9000 linear=9"), "{rails}");
+    assert!(rails.contains("gva_us=0 gva=0"), "{rails}");
+    assert!(rails.contains("storage_us=0 storage=0"), "{rails}");
+    assert!(rails.contains("linear_max_us=1000"), "{rails}");
+    assert!(rails.contains("render_max_us=30000"), "{rails}");
+    // The rails are a partition of the aggregate, not a second measurement of
+    // it: 30000 + 9000 is the `flush_us=39000` asserted above and 1 + 9 its
+    // `flushes=10`. A split that did not reconcile would be worse than none.
+
+    // The window resets with the line, so an idle one says nothing at all
+    // rather than repeating the busy window's attribution.
+    assert!(c.take_flush_rails().is_none(), "{rails}");
 }
 
 /// The vCPU's wait must be measured where the guest pays it.

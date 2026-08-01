@@ -3127,7 +3127,59 @@ pub enum DrainPhase {
     /// is exactly as interesting an answer as "the dispatch is".
     Compute,
     /// Deferred window flush: resident readback + guest writeback.
-    Flush,
+    Flush(FlushRail),
+}
+
+/// Which deferred-writeback rail a [`DrainPhase::Flush`] was spent on.
+///
+/// The aggregate `flush_us` is three quarters of the drain worker's wall clock
+/// on a driven boot and had no owner, so every fix aimed at it was aimed by
+/// guess. It is not one mechanism: four independent rails report as `Flush`, and
+/// their counts are nowhere near proportional. One measured second read
+/// `flushes=103` beside `surface_flush=15`, so the render rail the cost had been
+/// attributed to is under a sixth of the *count* — and nothing said whose
+/// microseconds those were.
+///
+/// Count and cost answer different questions here. A rail that flushes 71 times
+/// at 50 µs and a rail that flushes 15 times at 7 ms are indistinguishable in
+/// `flushes` and are opposite problems, so both are reported per rail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlushRail {
+    /// `flush_render_one`: pinned resident readback, then guest writeback.
+    Render,
+    /// `flush_gva_one`: deferred GVA-addressed surface writeback.
+    Gva,
+    /// `flush_linear_one`: deferred linear-texture writeback.
+    Linear,
+    /// `flush_storage_one`: deferred compute-storage writeback.
+    Storage,
+}
+
+impl FlushRail {
+    const ALL: [FlushRail; 4] = [
+        FlushRail::Render,
+        FlushRail::Gva,
+        FlushRail::Linear,
+        FlushRail::Storage,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            FlushRail::Render => 0,
+            FlushRail::Gva => 1,
+            FlushRail::Linear => 2,
+            FlushRail::Storage => 3,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            FlushRail::Render => "render",
+            FlushRail::Gva => "gva",
+            FlushRail::Linear => "linear",
+            FlushRail::Storage => "storage",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3147,6 +3199,14 @@ pub(crate) struct DrainDutyCensus {
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
     /// blocked 30 ms" — which are different defects with different fixes.
     max_flush_us: std::sync::atomic::AtomicU64,
+    /// `flush_us`, `flushes` and `max_flush_us` again, split by [`FlushRail`]
+    /// and indexed by [`FlushRail::index`].
+    rail_us: [std::sync::atomic::AtomicU64; 4],
+    rail_count: [std::sync::atomic::AtomicU64; 4],
+    rail_max_us: [std::sync::atomic::AtomicU64; 4],
+    /// The window length `note` last reported, so `take_flush_rails` states the
+    /// same denominator instead of deriving a second one.
+    last_win_ms: std::sync::atomic::AtomicU64,
     /// Tranches that held the device lock for at least one whole guest frame.
     /// `max_tranche_us` is a max with no count, so it cannot distinguish one
     /// 38 ms tranche from three 20 ms ones; this is that count.
@@ -3176,13 +3236,42 @@ impl DrainDutyCensus {
         let (total, count) = match phase {
             DrainPhase::Draw => (&self.draw_us, &self.draws),
             DrainPhase::Compute => (&self.compute_us, &self.computes),
-            DrainPhase::Flush => (&self.flush_us, &self.flushes),
+            DrainPhase::Flush(_) => (&self.flush_us, &self.flushes),
         };
         total.fetch_add(us, Relaxed);
         count.fetch_add(1, Relaxed);
-        if matches!(phase, DrainPhase::Flush) {
+        if let DrainPhase::Flush(rail) = phase {
             self.max_flush_us.fetch_max(us, Relaxed);
+            let i = rail.index();
+            self.rail_us[i].fetch_add(us, Relaxed);
+            self.rail_count[i].fetch_add(1, Relaxed);
+            self.rail_max_us[i].fetch_max(us, Relaxed);
         }
+    }
+
+    /// The per-rail split of the window `drain_duty` just reported, or `None`
+    /// when nothing flushed in it.
+    ///
+    /// A separate line rather than twelve more columns on `drain_duty`, and
+    /// driven by that line's emitter rather than a cadence of its own, so the
+    /// two divide against each other: the rails must sum to `flush_us` and their
+    /// counts to `flushes`. Valid only immediately after `note` returns `Some`,
+    /// which is the only place it is called.
+    pub(crate) fn take_flush_rails(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for rail in FlushRail::ALL {
+            let i = rail.index();
+            let us = self.rail_us[i].swap(0, Relaxed);
+            let n = self.rail_count[i].swap(0, Relaxed);
+            let max = self.rail_max_us[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = rail.label();
+            body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
+        }
+        any.then(|| format!("flush_rails win_ms={win_ms}{body}"))
     }
 
     /// Accumulate one completed tranche and return the line when a report is
@@ -3212,6 +3301,7 @@ impl DrainDutyCensus {
             return None;
         }
         self.last_report_ms.store(now_ms, Relaxed);
+        self.last_win_ms.store(win_ms, Relaxed);
         let tranches = self.tranches.swap(0, Relaxed);
         let skipped = self.skipped.swap(0, Relaxed);
         let drain = self.drain_us.swap(0, Relaxed);
@@ -3464,6 +3554,11 @@ static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
         crate::observe::off(line);
+        // Immediately after `drain_duty`, so the two read as one record: the
+        // rails must sum to its `flush_us` and their counts to its `flushes`.
+        if let Some(rails) = DRAIN_DUTY.take_flush_rails() {
+            crate::observe::off(rails);
+        }
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
