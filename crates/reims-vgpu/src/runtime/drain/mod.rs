@@ -3243,8 +3243,24 @@ impl FlushRail {
 /// nothing but complexity in the path that publishes composited pixels.
 ///
 /// So this measures that separation before anything is built on it, rather than
-/// assuming the GPU has idle time in between.
+/// assuming the GPU has idle time in between. **It refuted the proposal.** On a
+/// driven boot: `arms=95 flushes=95 aged=95 age_us=33341 max_age_us=372`, i.e.
+/// a mean arm→flush interval of **351 µs** with a **372 µs** worst case, beside
+/// `fence_us=248748 fence=95` — a **2.6 ms** mean fence wait in the same second.
+/// The interval is seven times shorter than the wait it would have to hide, and
+/// the tight max says that is the whole distribution and not a mean concealing
+/// a long tail. Submitting at the arm would leave ~2.2 ms of the 2.6 ms still to
+/// wait, for a deferred readback slot and a second fence lifetime in the path
+/// that publishes composited pixels.
 ///
+/// What that also settles is *what the fence wait is*. It is not scheduling
+/// latency with slack to reclaim: the arm and the flush are 351 µs apart inside
+/// one tranche, so the draws that produce the composite are still executing when
+/// the copy is submitted, and the copy queues behind them however early it is
+/// sent. The 2.6 ms is the GPU rendering the frame. Only cheaper draws, or not
+/// holding the device lock across the wait, can move it.
+///
+
 /// `multi` is not noise to be averaged away. The age of "the arm" is a single
 /// number only when exactly one window was armed since the last flush; a window
 /// that drifted out through one of `flush_render_one`'s refusals never reaches
