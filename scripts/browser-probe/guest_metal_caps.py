@@ -20,6 +20,21 @@ import sys
 objc = ctypes.CDLL(ctypes.util.find_library("objc"))
 ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
 ctypes.CDLL("/System/Library/Frameworks/Foundation.framework/Foundation")
+# CoreGraphics must be in the process BEFORE the first Metal device call, or
+# `MTLCreateSystemDefaultDevice()` reports nil on a machine whose device is
+# perfectly healthy.
+#
+# Metal resolves the system default through `CGSCreateDefaultMetalDevice`, which
+# it looks up with `dlsym` after `dlopen`ing CoreGraphics, and it returns nil
+# with no fallback when that lookup fails. The work is behind a `dispatch_once`,
+# so the answer is latched for the life of the process: loading CoreGraphics
+# afterwards and asking again still returns nil.
+#
+# A normal application links CoreGraphics and never sees this. A bare `ctypes`
+# process does not, which made this probe report a nil default device and no
+# browser could be blamed for it — the nil was ours. Keep this above the first
+# Metal call.
+ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
 
 objc.objc_getClass.restype = ctypes.c_void_p
 objc.objc_getClass.argtypes = [ctypes.c_char_p]
@@ -80,10 +95,11 @@ def main():
     dev.MTLCopyAllDevices.restype = ctypes.c_void_p
     d = dev.MTLCreateSystemDefaultDevice()
     print("MTLCreateSystemDefaultDevice:", "nil" if not d else "ok")
-    # A nil system default device with a non-empty MTLCopyAllDevices is the
-    # interesting case: ANGLE-Metal and Dawn both ask for the system default
-    # and give up when it is nil, so the device's own properties are what
-    # decide whether any browser can reach the GPU.
+    # ANGLE-Metal and Dawn both ask for the system default and give up when it
+    # is nil, so this line decides whether a browser can reach the GPU at all.
+    # It is expected to read "ok" here: see the CoreGraphics note at the top of
+    # this file for the one way it can lie, and `guest_default_device.py` for a
+    # probe that distinguishes every reason it could legitimately be nil.
     arr = dev.MTLCopyAllDevices()
     n = msg(ctypes.c_ulonglong, arr, b"count") if arr else 0
     print("MTLCopyAllDevices count     :", n)
