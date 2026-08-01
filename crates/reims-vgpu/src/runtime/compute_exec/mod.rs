@@ -1864,7 +1864,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // dispatch's storage output — live class: the dispatch samples the very
         // window it storage-writes) never needs the guest read either.
         #[cfg(feature = "backend-vulkan")]
-        let (seed_skipped, mut sample_resident) = match state
+        let (seed_skipped, sample_resident) = match state
             .compute_storage_residency
             .get(&residency_key)
             .copied()
@@ -1888,59 +1888,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         };
         #[cfg(not(feature = "backend-vulkan"))]
         let (seed_skipped, sample_resident) = (false, None);
-        #[cfg(feature = "backend-vulkan")]
-        if !is_storage {
-            // Reinterpret sibling: a resident of the SAME byte window (the
-            // 5-field mapping/offset/bpr/span prefix orders the BTreeMap, so
-            // the range touches only sibling views of this window) whose rows
-            // are byte-identical to this view (equal row bytes, equal height)
-            // serves it through the engine's image→buffer→image hop —
-            // `vkCmdCopyImage` cannot cross texel-block sizes. Live class:
-            // the 1928-wide BGRA8 fade view of the resident 482-wide
-            // Rgba32Uint blur window (equal 7712-byte rows).
-            if sample_resident.is_none() {
-                if let Some(dst_fmt) = mtl_to_engine_sampled(stage_fmt) {
-                    let dst_row_bytes = width as u64 * dst_fmt.bytes_per_texel() as u64;
-                    let lo = crate::model::ComputeStorageResidencyKey {
-                        width: 0,
-                        height: 0,
-                        pixel_format: 0,
-                        texture_ref: 0,
-                        ..residency_key
-                    };
-                    let hi = crate::model::ComputeStorageResidencyKey {
-                        width: u32::MAX,
-                        height: u32::MAX,
-                        pixel_format: u16::MAX,
-                        texture_ref: u32::MAX,
-                        ..residency_key
-                    };
-                    for (sib, &mirror_generation) in state.compute_storage_residency.range(lo..=hi)
-                    {
-                        if *sib == residency_key || sib.height != height {
-                            continue;
-                        }
-                        let Some((resident_generation, resident_fmt)) =
-                            crate::backend::vulkan::engine::compute_resident_sample_source(sib)
-                        else {
-                            continue;
-                        };
-                        if resident_generation != mirror_generation
-                            || sib.width as u64 * resident_fmt.bytes_per_texel() as u64
-                                != dst_row_bytes
-                        {
-                            continue;
-                        }
-                        sample_resident = Some((*sib, mirror_generation));
-                        crate::observe::off(format!(
-                            "compute_stage_resident_reinterpret mapping={mapping_id} src={}x{} sfmt={:#x} dst={width}x{height} fmt={stage_fmt:#x} gen={mirror_generation} bytes={need}",
-                            sib.width, sib.height, sib.pixel_format
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
         let mut bytes = vec![0u8; need];
         if !seed_skipped
             && sample_resident.is_none()

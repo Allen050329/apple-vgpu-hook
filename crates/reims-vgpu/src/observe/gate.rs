@@ -611,15 +611,10 @@ fn no_present_state_field_is_write_only() {
 /// before skipping the guest read that would otherwise seed or sample the
 /// window. They once carried three byte-for-byte copies of that agreement, and a
 /// copy that drifts serves stale or wrongly-formatted content with no visible
-/// failure. `resident_serve` is now the only production caller of the engine's
-/// two residency queries.
-///
-/// The one documented exception is the reinterpret-sibling scan, which asks
-/// `compute_resident_sample_source` about a *different* key than the one the
-/// mirror was looked up under, and matches on row bytes rather than on format
-/// equality. It is a different contract, so it is named here rather than folded
-/// in. `mtl_to_engine_sampled` is the format-equality half of the sampled rule;
-/// a second use of it against `vk_format()` is the copy coming back.
+/// failure. `resident_serve` is the only production caller of the engine's two
+/// residency queries, with no licensed peer: every rail asks the same question
+/// about the same key it looked the mirror up under, and matches on format
+/// equality rather than on row bytes.
 #[test]
 fn the_engine_residency_agreement_is_decided_in_one_place() {
     const ENGINE: &str = "backend/vulkan/engine";
@@ -646,12 +641,11 @@ fn the_engine_residency_agreement_is_decided_in_one_place() {
     assert_eq!(
         sites,
         vec![
-            "runtime/compute_exec/mod.rs calls compute_resident_sample_source( 2x".to_string(),
+            "runtime/compute_exec/mod.rs calls compute_resident_sample_source( 1x".to_string(),
             "runtime/compute_exec/mod.rs calls compute_resident_storage_generation( 1x".to_string(),
         ],
-        "the mirror-vs-engine residency agreement moved or was copied; it belongs \
-         in compute_exec::resident_serve, whose only licensed peer is the \
-         reinterpret-sibling scan's cross-key sample lookup"
+        "the mirror-vs-engine residency agreement moved or was copied; it \
+         belongs in compute_exec::resident_serve and nowhere else"
     );
 }
 
