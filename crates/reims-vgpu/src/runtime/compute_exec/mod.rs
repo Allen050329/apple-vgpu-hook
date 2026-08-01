@@ -39,9 +39,7 @@ use crate::runtime::decode::resource::{
     TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::resource::{
-    decode_sampler_descriptor, OBJECT_TYPE_IOSURFACE, TYPE7_OBJECT_SAMPLER,
-};
+use crate::runtime::decode::resource::{decode_sampler_descriptor, TYPE7_OBJECT_SAMPLER};
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
@@ -4346,8 +4344,8 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         ReimsVgpuThreadgroupMemory, REIMS_VGPU_BINDING_SAMPLER_BASE,
         REIMS_VGPU_BINDING_TEXTURE_BASE, REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADGROUPS,
         REIMS_VGPU_COMPUTE_DISPATCH_KIND_THREADS, REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ,
-        REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE, REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE,
-        REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT, REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL,
+        REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_READ_WRITE, REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT,
+        REIMS_VGPU_MTL_DISPATCH_TYPE_SERIAL,
     };
     use crate::backend::metal::compute::{
         compute_core, compute_encode_on_encoder, reflect_compute_textures_mtlb,
@@ -4649,20 +4647,12 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
         }
         sess.retained.extend(retain.buffers.iter().cloned());
         sess.retained.extend(retain.indirect.iter().cloned());
-        for t in &retain.sampled {
-            let _ = t; // lifetime held by session via NestedDispatchJob storage only
-        }
         sess.nested_jobs.push(NestedDispatchJob {
             staged_bufs,
             storage_tex,
             mtl_buffers: retain.buffers,
             mtl_storage: retain.images,
         });
-        let _ = (
-            dispatch_type,
-            OBJECT_TYPE_IOSURFACE,
-            REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE,
-        );
         return ComputeStatus::Ok;
     }
 
@@ -4708,10 +4698,6 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
             return e;
         }
     }
-    let _ = (
-        OBJECT_TYPE_IOSURFACE,
-        REIMS_VGPU_COMPUTE_TEXTURE_ACCESS_WRITE,
-    );
     ComputeStatus::Ok
 }
 
