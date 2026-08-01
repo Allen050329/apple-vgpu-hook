@@ -201,6 +201,31 @@ mod tests {
         assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 0x3e);
     }
 
+    /// A version this host does not implement must come back as the newest one
+    /// it does, not as itself.
+    ///
+    /// The guest switches on what it reads back, and its switch has no arm
+    /// above `PROTOCOL_VERSION_MAX` — everything past the top rung lands in a
+    /// default that turns object tables, the child doorbell, heaps and
+    /// buffer-from-IOSurface all off at once. Echoing the request is therefore
+    /// not a harmless pass-through: it is how a guest newer than this host gets
+    /// silently degraded to a near-empty device.
+    #[test]
+    fn version_handshake_clamps_above_what_this_host_implements() {
+        let mut d = dev();
+        let mut h = FakeHost::new();
+        d.gfx_write(&mut h, GFX_REG_VERSION, PROTOCOL_VERSION_MAX as u64 + 1, MMIO_U32);
+        assert_eq!(
+            d.gfx_read(GFX_REG_VERSION, MMIO_U32),
+            PROTOCOL_VERSION_MAX as u64
+        );
+        // A guest older than this host keeps its own version: the host must not
+        // answer with features the guest never asked to speak.
+        d.reset();
+        d.gfx_write(&mut h, GFX_REG_VERSION, 4, MMIO_U32);
+        assert_eq!(d.gfx_read(GFX_REG_VERSION, MMIO_U32), 4);
+    }
+
     #[test]
     fn both_register_windows() {
         let mut d = dev();

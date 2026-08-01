@@ -178,7 +178,22 @@ pub fn gfx_write<H: HostMemory + HostOps>(
             .interrupt_fault
             .store(val, std::sync::atomic::Ordering::Release),
         GFX_REG_FIFO_BASE_PAGE => state.gfx.fifo_base_page = val,
-        GFX_REG_VERSION => state.gfx.version = val,
+        GFX_REG_VERSION => {
+            // The guest writes the highest protocol version it speaks and then
+            // reads this register back; the value it reads selects, in the
+            // guest driver, an entire feature set — object tables, the child
+            // doorbell, heaps, buffer-from-IOSurface, the FIFO depth. It is the
+            // single widest-reaching thing the guest asks this device, and
+            // until now it was an unobserved echo, so no log could say which
+            // feature set the guest ended up configuring.
+            let negotiated = negotiate_protocol_version(val);
+            if negotiated != state.gfx.version {
+                crate::observe::off(format!(
+                    "protocol_version requested={val} negotiated={negotiated} max={PROTOCOL_VERSION_MAX}"
+                ));
+            }
+            state.gfx.version = negotiated;
+        }
         GFX_REG_EFI_DISPLAY => state.gfx.efi_display = val,
         GFX_REG_EFI_MODE_SELECT => state.gfx.efi_mode_select = val,
         GFX_REG_EFI_FB_START => {

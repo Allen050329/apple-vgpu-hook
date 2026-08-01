@@ -263,6 +263,31 @@ pub const MAPPER_REQUEST_MAP: u32 = 1;
 pub const MAPPER_REQUEST_UNMAP: u32 = 2;
 pub const MAPPER_REQUEST_ENTRY_LEN: usize = 16;
 
+/// Highest protocol version this host implements.
+///
+/// The guest writes the highest version *it* speaks to `GFX_REG_VERSION`, reads
+/// the register back, and switches on what it read to fill its feature struct:
+/// object tables, the child doorbell, EFI display, heaps, buffer-from-IOSurface,
+/// the FIFO depth and the D32S8 stencil byte count. The ladder's top rung is 62;
+/// **every value above 62 falls into the guest's default arm, which turns every
+/// one of those features off**. So echoing a number this host does not implement
+/// is not a no-op — it silently degrades the guest to a near-empty device.
+///
+/// 62 is not a fitted constant: it is the top rung of the guest's own switch and
+/// the clamp Apple's host-side implementation applies to the same register.
+pub const PROTOCOL_VERSION_MAX: u32 = 62;
+
+/// What this host writes back for a guest-requested protocol version.
+///
+/// Clamping is the whole point. A guest newer than this host asks for a version
+/// past the top rung, and an echo would hand that number straight back and land
+/// the guest in its all-features-off default; clamping lands it on the newest
+/// rung both sides implement.
+#[inline]
+pub fn negotiate_protocol_version(requested: u32) -> u32 {
+    requested.min(PROTOCOL_VERSION_MAX)
+}
+
 /// Device-info capability table (key, value) — wire ABI from live bring-up.
 pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (1, 8),
