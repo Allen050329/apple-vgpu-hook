@@ -1583,7 +1583,8 @@ mod tests {
     }
 
     /// The interrupt-status atomics stay wired to the same slot across reset
-    /// (GfxRegs::reset must preserve the shared Arcs, only zeroing values).
+    /// ([`model::DeviceState::reset`] must preserve the shared `Arc`s and only
+    /// zero the values they hold).
     #[test]
     fn intr_status_atomics_survive_reset() {
         let id = device_create(None, PAGE_SHIFT_ARM64E).expect("create");

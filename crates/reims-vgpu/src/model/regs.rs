@@ -3,10 +3,15 @@
 //! Sources: `apple-pv-gpu.h`, `reims_vgpu_fifo_format.h`.
 //! Values are protocol constants — not content heuristics.
 
-/// Gfx MMIO window size (16 KiB).
+/// Gfx MMIO window size (16 KiB); bounds the sparse register store.
+///
+/// The iosfc window's size is not mirrored here. QEMU declares both regions
+/// (`REIMS_VGPU_MMIO_{GFX,IOSFC}_MMIO_SIZE` in `reims-vgpu-mmio.c`) and Rust
+/// only needs a bound for state it keeps per offset, which the iosfc rail does
+/// not do — it decodes five named registers and ignores the rest. A second
+/// unread copy of the iosfc size would be a source of truth nothing checks
+/// against the one that actually sizes the `MemoryRegion`.
 pub const GFX_MMIO_SIZE: u64 = 0x4000;
-/// IOSurface-mapper MMIO window size (64 KiB).
-pub const IOSFC_MMIO_SIZE: u64 = 0x10000;
 
 /// Control block base inside the gfx window.
 pub const REG_BASE: u64 = 0x1000;
@@ -128,8 +133,8 @@ pub const CHILD_OP_EXEC_INDIRECT2: u16 = 0x37;
 pub const CHILD_OP_DEFINE_TASK2: u16 = 0x38;
 /// PVG CmdMapMemory2 (task GPU-VA map).
 pub const CHILD_OP_MAP_MEMORY2: u16 = 0x39;
-/// PVG CmdGetComputeInfo (query). Formerly misnamed present-frame-flush.
-pub const CHILD_OP_PRESENT_FRAME_FLUSH: u16 = 0x3b;
+/// PVG CmdGetComputeInfo (query). Archive material calls the same opcode
+/// `present-frame-flush`; that reading is wrong and has no constant here.
 pub const CHILD_OP_GET_COMPUTE_INFO: u16 = 0x3b;
 /// PVG CmdReplacePhysical (`replacePhysical` → `{taskID, objectID}`).
 /// Live fail log: ch2 op 0x3c total_size=20 (header+payload). Stamp-complete;

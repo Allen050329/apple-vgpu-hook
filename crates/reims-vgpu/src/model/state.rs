@@ -231,26 +231,6 @@ impl Default for GfxRegs {
 }
 
 impl GfxRegs {
-    pub fn reset(&mut self) {
-        // Preserve the shared interrupt-status atomics: the registry slot holds
-        // clones for lock-free ISR reads; replacing them would detach that rail.
-        let disp = Arc::clone(&self.interrupt_status_disp);
-        let gpu = Arc::clone(&self.interrupt_status_gpu);
-        let fault = Arc::clone(&self.interrupt_fault);
-        let fifo_read = Arc::clone(&self.fifo_read);
-        disp.store(0, Ordering::Release);
-        gpu.store(0, Ordering::Release);
-        fault.store(0, Ordering::Release);
-        fifo_read.store(0, Ordering::Release);
-        *self = Self {
-            interrupt_status_disp: disp,
-            interrupt_status_gpu: gpu,
-            interrupt_fault: fault,
-            fifo_read,
-            ..Self::default()
-        };
-    }
-
     pub fn sparse_get(&self, offset: u64) -> u32 {
         let idx = (offset / 4) as u32;
         self.sparse.get(&idx).copied().unwrap_or(0)

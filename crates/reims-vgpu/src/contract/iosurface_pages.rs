@@ -5,7 +5,6 @@ use crate::contract::pixel_format;
 use crate::contract::{align_up_u64, checked_add_u64, checked_mul_u64};
 
 pub const U32_SIZE: usize = 4;
-pub const U64_SIZE: usize = 8;
 
 /// Minimum typed type-11 object-list descriptor length (geometry prefix).
 /// Live blobs are often longer (0x38/0x58) with an unused/constant tail.
@@ -55,11 +54,12 @@ pub const DEVICE_DESC_PLANES: usize = 0x40;
 
 /// Arm64e page shift/size — fixtures and C ABI defaults that still assume arm.
 /// Product paths must use `page_size_of(state.page_shift)` / `*_shift` APIs.
+///
+/// There is no x86 pair here. `contract::gva` is where a page geometry is
+/// named, `model::regs` re-exports both shifts and the one `u64` page size a
+/// caller has ever wanted, and a third copy in this module was read by nothing.
 pub const PAGE_SHIFT_ARM64E: u32 = crate::contract::gva::PAGE_SHIFT_ARM64E;
 pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
-/// x86 page shift/size.
-pub const PAGE_SHIFT_X86: u32 = crate::contract::gva::PAGE_SHIFT_X86;
-pub const PAGE_SIZE_X86: u64 = 1u64 << PAGE_SHIFT_X86;
 
 #[inline]
 pub fn page_size_of(page_shift: u32) -> u64 {
