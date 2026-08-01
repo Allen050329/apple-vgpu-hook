@@ -922,6 +922,40 @@ pub fn read_raw_rows<M: HostMemory + HostOps>(
     true
 }
 
+/// Resolve the window a mapping's own latched geometry names, for a rectangle
+/// addressed in that geometry rather than in an explicit plane window.
+///
+/// The resolution [`read_rect_raw`] and [`write_rect_raw`] share: the latched
+/// format (BGRA8 when the mapping never declared one), the plane window
+/// [`type11_sample_window`] decodes for it, and the texel size. Returns
+/// `(base_offset, bytes_per_row, span_end, bytes_per_texel)`, or `None` when
+/// the mapping is gone, carries no latched geometry, has no decodable window,
+/// has an unknown format, or the rectangle leaves the surface.
+fn mapping_geom_window(
+    state: &DeviceState,
+    mapping_id: u32,
+    origin_x: u32,
+    origin_y: u32,
+    width: u32,
+    height: u32,
+) -> Option<(u64, u32, u64, u32)> {
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.has_geom {
+        return None;
+    }
+    let format = if m.format != 0 {
+        m.format
+    } else {
+        MTL_FORMAT_BGRA8_UNORM
+    };
+    let (base_off, bpr, span_end) = type11_sample_window(m, mapping_id, m.width, m.height, format)?;
+    let bpp = pixel_format::bytes_per_pixel(format)?;
+    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
+        return None;
+    }
+    Some((base_off, bpr, span_end, bpp))
+}
+
 /// Read a rectangular texel region from a mapped type-11 IOSurface.
 /// Contig HostOps view when possible; else multi-import.
 #[allow(
@@ -940,28 +974,11 @@ pub fn read_rect_raw<M: HostMemory + HostOps>(
     dst: &mut [u8],
     dst_stride: u32,
 ) -> bool {
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
-    };
-    if !m.has_geom {
-        return false;
-    }
-    let format = if m.format != 0 {
-        m.format
-    } else {
-        MTL_FORMAT_BGRA8_UNORM
-    };
-    let Some((base_off, bpr, span_end)) =
-        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    let Some((base_off, bpr, span_end, bpp)) =
+        mapping_geom_window(state, mapping_id, origin_x, origin_y, width, height)
     else {
         return false;
     };
-    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-        return false;
-    };
-    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
-        return false;
-    }
     read_rect_raw_at(
         state, host, mapping_id, base_off, bpr, span_end, origin_x, origin_y, width, height, bpp,
         dst, dst_stride,
@@ -1140,28 +1157,11 @@ pub fn write_rect_raw<M: HostMemory + HostOps>(
     src: &[u8],
     src_stride: u32,
 ) -> bool {
-    let Some(m) = state.mappings.get(&mapping_id) else {
-        return false;
-    };
-    if !m.has_geom {
-        return false;
-    }
-    let format = if m.format != 0 {
-        m.format
-    } else {
-        MTL_FORMAT_BGRA8_UNORM
-    };
-    let Some((base_off, bpr, span_end)) =
-        type11_sample_window(m, mapping_id, m.width, m.height, format)
+    let Some((base_off, bpr, span_end, bpp)) =
+        mapping_geom_window(state, mapping_id, origin_x, origin_y, width, height)
     else {
         return false;
     };
-    let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-        return false;
-    };
-    if origin_x.saturating_add(width) > m.width || origin_y.saturating_add(height) > m.height {
-        return false;
-    }
     write_rect_raw_at(
         state, host, mapping_id, base_off, bpr, span_end, origin_x, origin_y, width, height, bpp,
         src, src_stride,
