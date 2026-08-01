@@ -52,11 +52,14 @@ pub enum ScanoutCopyResult {
     Failed,
 }
 
-#[cfg(feature = "backend-vulkan")]
 /// Read mapping pages into `dst` without updating present/paint generation.
 ///
 /// Used by draw bind materialization (sampled type-11 textures). Returns true
 /// when geometry and page table produced a full image.
+///
+/// Backend-agnostic on purpose: it resolves and scatters guest pages and
+/// touches no engine, and the Metal arm's `load_type11_mapping_rgba` needs it
+/// for the same reason the Vulkan arm does.
 pub fn read_mapping_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut M,

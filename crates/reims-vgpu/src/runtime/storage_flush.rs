@@ -1946,7 +1946,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     _host: &mut M,
     key: &crate::model::ComputeStorageResidencyKey,
-    _bgra: &[u8],
+    _source: &crate::model::RenderWindowSource,
 ) -> bool {
     // No engine ⇒ nothing can have deferred; drop the obligation fail-visibly.
     let _ = state;
@@ -2549,6 +2549,7 @@ mod tests {
     /// write, so a store the device's own render superseded can still be named
     /// "written since the Store". See
     /// [`super::render_flush_guest_written_ranges`].
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_render_window_landing_over_guest_writes_reports_them_and_preserves_nothing() {
         use crate::runtime::host::{FakeHost, HostOps};
@@ -2687,6 +2688,7 @@ mod tests {
     /// key. If those two spellings ever disagree the pin protects one image while
     /// the flush reads another: the frame is silently the wrong one, and no
     /// assertion in the crate is watching for it because both lookups *succeed*.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_render_windows_key_rebuilds_the_identity_the_draw_rendered_into() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -2799,6 +2801,7 @@ mod tests {
     /// entry with a bare `remove` leaves `deferred_alias_pages` holding page
     /// refs for a mapping with no windows left, and the raw-GVA sampling guard
     /// then walks pages nothing defers on.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_superseded_render_window_is_dropped_and_releases_its_alias_pages() {
         use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -2842,6 +2845,7 @@ mod tests {
     /// the release named: it has to be rebuilt from the superseded window's own
     /// key, since a covered sibling may carry a different geometry over the same
     /// guest range.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn superseding_a_resident_window_releases_the_pin_it_held() {
         use crate::backend::vulkan::engine::TargetIdentity;
@@ -2886,6 +2890,7 @@ mod tests {
     /// Superseding one window must not disturb a sibling covering a different
     /// guest range on the same mapping — that one holds bytes the new Store does
     /// not write, and dropping it would lose them.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn superseding_one_window_leaves_a_disjoint_sibling_armed() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
@@ -3937,6 +3942,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn window_page_drift_refuses_the_guest_write_and_is_silent_without_it() {
         use crate::contract::endian::st32;
@@ -4073,6 +4079,7 @@ mod tests {
     /// outcome word*. A drift line is the only record either consumer leaves,
     /// and `guest=refused` on a line emitted by a Load would say guest memory
     /// was protected when what was actually refused was a stale picture.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn the_resident_load_reader_gets_the_same_drift_verdict_under_its_own_name() {
         use crate::contract::endian::st32;
@@ -4173,6 +4180,7 @@ mod tests {
     /// would permit, and the positive control below would fail — which is the
     /// point of siting it at a nonzero offset rather than at GVA 0, where both
     /// readings coincide.
+    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_linear_window_whose_pages_moved_is_refused_and_reads_its_span_as_a_length() {
         use crate::contract::endian::st32;

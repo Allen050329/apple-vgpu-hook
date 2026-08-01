@@ -1614,6 +1614,7 @@ impl crate::observe::Decline for Type11SeedDecline {
 
 /// Which rung of the type-11 `LOAD` seed ladder produced the attachment's prior
 /// contents.
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Type11SeedRung {
     /// The host render cache held this mapping at exactly this geometry.
@@ -1622,6 +1623,7 @@ enum Type11SeedRung {
     GuestPages,
 }
 
+#[cfg(feature = "backend-vulkan")]
 impl Type11SeedRung {
     fn name(self) -> &'static str {
         match self {
@@ -1649,6 +1651,7 @@ impl Type11SeedRung {
 /// The mapping's own latched geometry and generation ride along on every arm:
 /// `want == mapgeom` is the condition under which the guest-pages rung can serve
 /// at all, so the pair says whether a miss was recoverable.
+#[cfg(feature = "backend-vulkan")]
 fn note_type11_load_seed(
     state: &DeviceState,
     mapping_id: u32,
@@ -1738,6 +1741,7 @@ fn note_type11_load_seed(
 ///
 /// `None` means the guest's LOAD could not be honoured at all, and
 /// [`note_type11_load_seed`] has already said which check refused.
+#[cfg(feature = "backend-vulkan")]
 fn resolve_type11_load_seed<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,

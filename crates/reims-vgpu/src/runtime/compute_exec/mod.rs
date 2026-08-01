@@ -4083,6 +4083,7 @@ fn guest_numeric_class(guest: crate::backend::vulkan::engine::StorageImageFormat
     }
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn specialized_storage_image_format(
     guest: crate::backend::vulkan::engine::StorageImageFormat,
     shader: crate::runtime::spirv_bind::ImageFormat,
