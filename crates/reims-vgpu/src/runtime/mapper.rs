@@ -1562,7 +1562,28 @@ pub(crate) fn mapping_guest_write_verdict<M: HostOps>(
     let Some(m) = state.mappings.get(&mapping_id) else {
         return GuestWriteVerdict::NoMapping;
     };
+    // The dominant disjunct is the first, and the reason is the shim's arming
+    // window rather than anything about this mapping. `reims_vgpu_dirty_track`
+    // sets `arm_at = harvests + 2`, and `reims_vgpu_dirty_harvest` pins
+    // `s->gen = 0` until `harvests >= arm_at`; `HostOps::guest_write_gen` maps
+    // that 0 to `None`, so `stamp_guest_write_gen` records 0 and counts
+    // `t11_gw_unarmed`. Every Store landing inside a token's first two harvests
+    // therefore stamps 0, and every LOAD against that stamp lands here.
+    //
+    // That window is per *token*, not per boot: `ensure_guest_write_token`
+    // retires the token and builds a new one whenever `guest_write_token_gen`
+    // has fallen behind `map_generation`, so a mapping whose page list churns
+    // re-enters the window each time. It is the structural explanation for
+    // `t11_gw_ref_no_stamp` running far ahead of `t11_gw_ref_moved` — the
+    // refusals are this device's own startup cost, repeated, not guest writes.
     if m.guest_write_gen_at_store == 0
+        // Subsumed by the stamp test above rather than independent: every writer
+        // that zeroes the token zeroes the stamp in the same breath
+        // (`DeviceState::take_guest_write_token`, and the stale-token path in
+        // `ensure_guest_write_token`), and a default `MappingEntry` starts with
+        // both at 0. Kept because it is the cheap half of a check whose false
+        // "unwritten" is the one answer that produces a wrong frame, so a future
+        // writer that clears only the token must not be able to slip past.
         || m.guest_write_token == 0
         // A token built for a different page list watches pages this surface
         // may no longer own, so its generation is not a statement about the
