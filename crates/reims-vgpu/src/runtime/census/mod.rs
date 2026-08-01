@@ -28,7 +28,7 @@
 //!
 //! | Module | Class it reports |
 //! |---|---|
-//! | [`present_proxy`] | `secondary_mrt_drop` / `mrt_mask_bind_miss` — a multi-RT draw degraded to single-RT, or a rendered mask that failed to bind at sample time — plus `stale_online_pending` and [`present_proxy::window_publish`], the sole record that a captured frame never reached the host window |
+//! | [`present_proxy`] | `secondary_mrt_drop` — a multi-RT draw degraded to single-RT — plus `stale_online_pending` and [`present_proxy::window_publish`], the sole record that a captured frame never reached the host window |
 //! | [`srgb_census`] | which rails drop the sRGB transfer function |
 //! | [`view_swizzle_census`] | type-8 view swizzles dropped, or served by rewriting texels on the CPU |
 //!

@@ -8,7 +8,7 @@
 //! | Proxy | Meaning |
 //! | --- | --- |
 //! | `stale_online_pending` | A post-ack display IRQ raised with the shared-page ONLINE bit still pending |
-//! | `secondary_mrt_drop` / `mrt_mask_bind_miss` | A multi-RT draw degraded to single-RT, or a rendered mask failed to bind at sample time |
+//! | `secondary_mrt_drop` | A multi-RT draw degraded to single-RT |
 //! | `empty_sample` | A resolved fragment/vertex sample whose payload was all-zero |
 //!
 //! [`window_publish`] emits one line per window and stays silent while its
@@ -68,8 +68,7 @@ impl crate::observe::Decline for MrtDrop {
 }
 
 impl MrtDrop {
-    /// Compact stable code for the dedup key. Disjoint from [`MaskBindMiss`]'s
-    /// because both share one dedup set.
+    /// Compact stable code for the dedup key.
     fn code(self) -> u8 {
         match self {
             Self::NonContiguousSlot => 1,
@@ -77,48 +76,6 @@ impl MrtDrop {
             Self::UnknownFormat => 3,
             Self::NoIdentity => 4,
             Self::AliasesPrimary => 5,
-        }
-    }
-}
-
-/// Why a sample that matched a rendered MRT mask failed to bind it.
-///
-/// The sample side of [`MrtDrop`]. Both used to answer `geometry_mismatch` —
-/// one string for two different checks in two different proxies, so a grep for
-/// it could not tell a dropped render from a failed sample. They are now
-/// distinct slugs; that collision is what registering the census vocabulary
-/// found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaskBindMiss {
-    /// The mask resident's geometry differs from the sample's.
-    GeometryMismatch,
-    /// The mask resident is not content-ready.
-    ResidentNotReady,
-    /// The sampled GVA no longer resolves to the pages the mask was rendered
-    /// over: the guest handed this address to a second allocation, so the
-    /// recorded mask is not this sample's content. Declining here is the whole
-    /// point — binding it would put the previous allocation's coverage into a
-    /// later material.
-    AllocationChanged,
-}
-
-impl crate::observe::Decline for MaskBindMiss {
-    fn slug(&self) -> &'static str {
-        match self {
-            Self::GeometryMismatch => "mask_bind_geometry_mismatch",
-            Self::ResidentNotReady => "mask_bind_resident_not_ready",
-            Self::AllocationChanged => "mask_bind_allocation_changed",
-        }
-    }
-}
-
-impl MaskBindMiss {
-    /// Dedup code, disjoint from [`MrtDrop::code`] — the two share one set.
-    fn code(self) -> u8 {
-        match self {
-            Self::GeometryMismatch => 10,
-            Self::ResidentNotReady => 11,
-            Self::AllocationChanged => 12,
         }
     }
 }
@@ -165,29 +122,6 @@ pub fn note_secondary_mrt_drop(reason: MrtDrop, width: u32, height: u32) {
     // machine-readable line is worth more here than a sentence the reader can
     // get from the slug.
     observe::Emit::decline("secondary_mrt_drop", &reason)
-        .field("geom", format!("{width}x{height}"))
-        .fail();
-}
-
-/// Sibling of [`note_secondary_mrt_drop`] for the SAMPLE side: a draw sampled a
-/// texture whose GVA matches a mask this frame rendered as an MRT secondary (so it
-/// IS the vibrancy coverage-mask sample), but the bind failed — geometry mismatch
-/// or the secondary resident was not content-ready — so the material falls through
-/// to the host-cache / guest-pages path and its alpha modulation may read a stale
-/// or zero mask (the see-through frosted-material class).
-/// Fires only when the sampled GVA is a KNOWN rendered mask (never on ordinary
-/// texture samples), deduped on `(reason, w, h)`. Runs on the render/drain worker.
-/// Measure-only. Shares the `secondary_mrt_drop_seen` dedup set (disjoint codes).
-pub fn note_mrt_mask_bind_miss(reason: MaskBindMiss, width: u32, height: u32) {
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if !st
-        .secondary_mrt_drop_seen
-        .insert((reason.code(), width, height))
-    {
-        return;
-    }
-    drop(st);
-    observe::Emit::decline("mrt_mask_bind_miss", &reason)
         .field("geom", format!("{width}x{height}"))
         .fail();
 }
@@ -295,9 +229,8 @@ pub mod window_publish {
     /// Why the host window published nothing for a frame it was asked to show.
     ///
     /// One variant today, and a type rather than a literal because bare
-    /// `resident_not_ready` is one grep away from the MRT mask rail's
-    /// `mask_bind_resident_not_ready` — a different subsystem answering a
-    /// same-sounding question. A second drop cause gets its own variant here.
+    /// `resident_not_ready` is a question several subsystems answer; the slug
+    /// says which one. A second drop cause gets its own variant here.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum WindowPublishDrop {
         /// The engine had no content-ready resident to hand the window.
@@ -452,54 +385,6 @@ mod tests {
         assert!(
             log.contains("stale_online_pending src=vbl pending=0x4 count=1"),
             "first stale-online must log the always-on line"
-        );
-    }
-
-    /// The sample side and the render side of the MRT-mask class had one name
-    /// between them.
-    ///
-    /// Both `note_secondary_mrt_drop` and `note_mrt_mask_bind_miss` were called
-    /// with the bare string `"geometry_mismatch"`, so a `grep reason=` for it
-    /// could not tell a dropped multi-RT render from a mask sample that failed to
-    /// bind — two different checks in two different proxies. Crate-wide
-    /// uniqueness is the gate; this names the pair the gate is protecting.
-    #[test]
-    fn the_render_and_sample_sides_of_the_mask_class_have_different_names() {
-        use crate::observe::Decline as _;
-        assert_ne!(
-            MrtDrop::GeometryMismatch.slug(),
-            MaskBindMiss::GeometryMismatch.slug()
-        );
-        assert!(MrtDrop::GeometryMismatch.slug().starts_with("mrt_drop_"));
-        assert!(MaskBindMiss::GeometryMismatch
-            .slug()
-            .starts_with("mask_bind_"));
-        // The dedup codes must stay disjoint too: both proxies share one set, so
-        // a collision there would silence one of them per geometry.
-        assert_ne!(
-            MrtDrop::GeometryMismatch.code(),
-            MaskBindMiss::GeometryMismatch.code()
-        );
-        let mrt: Vec<u8> = [
-            MrtDrop::NonContiguousSlot,
-            MrtDrop::GeometryMismatch,
-            MrtDrop::UnknownFormat,
-            MrtDrop::NoIdentity,
-            MrtDrop::AliasesPrimary,
-        ]
-        .iter()
-        .map(|r| r.code())
-        .collect();
-        let mask: Vec<u8> = [
-            MaskBindMiss::GeometryMismatch,
-            MaskBindMiss::ResidentNotReady,
-        ]
-        .iter()
-        .map(|r| r.code())
-        .collect();
-        assert!(
-            mrt.iter().all(|c| !mask.contains(c)),
-            "dedup codes overlap: {mrt:?} vs {mask:?}"
         );
     }
 
