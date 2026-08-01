@@ -494,7 +494,7 @@ pub fn note_written_pages<I: IntoIterator<Item = u64>>(rail: Rail, gpas: I, page
 
 /// One in this many guest writes is scanned for its payload shape.
 ///
-/// Sampled rather than exhaustive because the scan is over the whole payload —
+/// Sampled rather than exhaustive because the scan spans the whole payload —
 /// framebuffer-sized on the store rails, at the 28-111 stores/s `store_routes`
 /// measures, on a drain worker `drain_duty` already shows at duty 0.93-0.99.
 /// A deterministic counter rather than a random draw so two boots of the same
@@ -515,10 +515,7 @@ const FF_RUN_MIN: usize = 256;
 struct PayloadCensus {
     calls: AtomicU64,
     sampled: AtomicU64,
-    all_ff: AtomicU64,
-    all_zero: AtomicU64,
     bytes_sampled: AtomicU64,
-    bytes_all_ff: AtomicU64,
     /// Sampled buffers carrying at least one run of [`FF_RUN_MIN`] `0xff` bytes.
     ff_run: AtomicU64,
     /// The longest such run seen. Exact at and above [`FF_RUN_MIN`]; shorter
@@ -530,10 +527,7 @@ struct PayloadCensus {
 static PAYLOAD: PayloadCensus = PayloadCensus {
     calls: AtomicU64::new(0),
     sampled: AtomicU64::new(0),
-    all_ff: AtomicU64::new(0),
-    all_zero: AtomicU64::new(0),
     bytes_sampled: AtomicU64::new(0),
-    bytes_all_ff: AtomicU64::new(0),
     ff_run: AtomicU64::new(0),
     ff_run_max: AtomicU64::new(0),
 };
@@ -584,35 +578,32 @@ fn longest_ff_run(buf: &[u8]) -> usize {
 /// is *where*, not *what*, so do not go looking for a source of white".
 ///
 /// That is a reasonable inference and it has never been measured. It is also
-/// load-bearing: if this device writes all-`0xff` payloads constantly — a white
-/// browser page is exactly that — then the payload tells a reader nothing, and
-/// a victim full of `0xff` is no more likely to be ours than any other. If it
-/// almost never does, the payload is a far sharper discriminator than the
+/// load-bearing: if this device writes long `0xff` payloads constantly — a
+/// white browser page is exactly that — then the payload tells a reader nothing,
+/// and a victim full of `0xff` is no more likely to be ours than any other. If
+/// it almost never does, the payload is a far sharper discriminator than the
 /// footprint alone, which is only as strong as its density.
 ///
-/// Both answers are worth having and neither is available today, so this counts
-/// rather than concluding. `all_zero` is the control on the counter itself: a
-/// scanner that reported everything as uniform would show both climbing
-/// together, and a freshly allocated surface really is zero-filled, so the two
-/// populations are known to be distinct in the guest.
+/// That answer is worth having and is not available from the footprint, so this
+/// counts rather than concluding.
 ///
-/// # `all_ff` alone answers a question nobody asked
+/// # A run, not a whole-buffer test
 ///
-/// It requires the **whole** buffer to be `0xff`, and the rails here hand over
-/// whole frames and whole source images. A white browser page has a menu bar, a
-/// scrollbar and text in it, so a device rendering it faithfully writes
-/// megabytes of white and `all_ff` still reads zero. The first live reading —
-/// `all_ff=0` over 25 529 samples — was recorded with that caveat unstated, and
-/// it cannot bear the weight it looked like it could.
+/// A uniform test asks whether the **whole** buffer is `0xff`, and the rails
+/// here hand over whole frames and whole source images. A white browser page has
+/// a menu bar, a scrollbar and text in it, so a device faithfully writing
+/// megabytes of white still scores zero uniform buffers. A live two-phase boot
+/// showed exactly that: not one uniform buffer across all 36 618 samples, on a
+/// boot where `ff_run` fired 258 times and reached a longest run of 4 961 bytes.
+/// That makes every uniform reading taken before it void rather than merely
+/// weak, so there is nothing left to keep comparable and no uniform counter here.
 ///
 /// [`FF_RUN_MIN`] is the predicate the panic census actually implies: a run long
-/// enough to have filled the smaller of the two poisoned `kalloc` elements. Both
-/// numbers are kept — `all_ff` is the strict form and stays comparable with the
-/// boots already recorded — but `ff_run` is the one to read.
+/// enough to have filled the smaller of the two poisoned `kalloc` elements. It
+/// is the number to read, and the only shape counted.
 ///
-/// The uniform scans short-circuit on the first byte that differs, and the run
-/// probe costs `len / 256` loads on a buffer with no long white span, so a
-/// photograph pays almost nothing either way.
+/// The run probe costs `len / 256` loads on a buffer with no long white span, so
+/// a photograph pays almost nothing, and nothing here walks a whole payload.
 pub fn note_written_payload(buf: &[u8]) {
     if buf.is_empty() {
         return;
@@ -625,14 +616,6 @@ pub fn note_written_payload(buf: &[u8]) {
     PAYLOAD
         .bytes_sampled
         .fetch_add(buf.len() as u64, Ordering::Relaxed);
-    if buf.iter().all(|&b| b == 0xFF) {
-        PAYLOAD.all_ff.fetch_add(1, Ordering::Relaxed);
-        PAYLOAD
-            .bytes_all_ff
-            .fetch_add(buf.len() as u64, Ordering::Relaxed);
-    } else if buf.iter().all(|&b| b == 0x00) {
-        PAYLOAD.all_zero.fetch_add(1, Ordering::Relaxed);
-    }
     let run = longest_ff_run(buf) as u64;
     if run > 0 {
         PAYLOAD.ff_run.fetch_add(1, Ordering::Relaxed);
@@ -640,15 +623,12 @@ pub fn note_written_payload(buf: &[u8]) {
     }
 }
 
-/// `(calls, sampled, all_ff, all_zero, bytes_sampled, bytes_all_ff)`.
-pub fn payload_counts() -> (u64, u64, u64, u64, u64, u64) {
+/// `(calls, sampled, bytes_sampled)`.
+pub fn payload_counts() -> (u64, u64, u64) {
     (
         PAYLOAD.calls.load(Ordering::Relaxed),
         PAYLOAD.sampled.load(Ordering::Relaxed),
-        PAYLOAD.all_ff.load(Ordering::Relaxed),
-        PAYLOAD.all_zero.load(Ordering::Relaxed),
         PAYLOAD.bytes_sampled.load(Ordering::Relaxed),
-        PAYLOAD.bytes_all_ff.load(Ordering::Relaxed),
     )
 }
 
@@ -684,7 +664,7 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let fp = &*FOOTPRINT;
     let (pages, dropped) = counts();
     let kib = (pages << FRAME_SHIFT) / 1024;
-    let (calls, sampled, all_ff, all_zero, bytes_sampled, bytes_all_ff) = payload_counts();
+    let (calls, sampled, bytes_sampled) = payload_counts();
     // Levels, not per-interval: these are running totals for the boot, like the
     // frame count beside them and unlike `store_routes`. Summing them across
     // census lines multiplies by the cadence — the 100x error AGENTS.md records.
@@ -696,8 +676,7 @@ pub fn census_lines(now_ms: u64) -> Vec<String> {
     let mut out = vec![format!(
         "guest_write_footprint pages={pages} kib={kib} dropped={dropped} \
          frame_shift={FRAME_SHIFT} writes={calls} sampled={sampled} \
-         all_ff={all_ff} all_zero={all_zero} samp_bytes={bytes_sampled} \
-         ff_bytes={bytes_all_ff} ff_run={ff_run} ff_run_max={ff_run_max} \
+         samp_bytes={bytes_sampled} ff_run={ff_run} ff_run_max={ff_run_max} \
          ff_run_min={FF_RUN_MIN} retired={retired_frames} \
          write_after_retire={retired_hits} war_mapping={war_map} \
          war_rawgva={war_raw} war_gpa={war_gpa} war_licensed={war_lic} \
@@ -765,10 +744,7 @@ pub(crate) fn exclusive_for_tests() -> std::sync::MutexGuard<'static, ()> {
     for cell in [
         &PAYLOAD.calls,
         &PAYLOAD.sampled,
-        &PAYLOAD.all_ff,
-        &PAYLOAD.all_zero,
         &PAYLOAD.bytes_sampled,
-        &PAYLOAD.bytes_all_ff,
         &PAYLOAD.ff_run,
         &PAYLOAD.ff_run_max,
     ] {
@@ -889,49 +865,37 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_census_separates_uniform_white_from_uniform_black_and_from_content() {
+    fn the_payload_census_samples_one_write_per_block_and_totals_their_bytes() {
         let _g = fresh();
         // The sampler takes call 0 and then every 64th, so drive it in blocks of
         // PAYLOAD_SAMPLE_EVERY and assert on what it sampled, not on what it saw.
+        // `samp_bytes` is the denominator every rate read off this census uses,
+        // so it has to count the sampled buffers only, never the calls skipped.
         let white = vec![0xFFu8; 4096];
         let black = vec![0x00u8; 4096];
         let mut content = vec![0xFFu8; 4096];
-        content[4095] = 0xFE; // uniform but for one byte: not white
+        content[4095] = 0xFE;
         for buf in [&white, &black, &content] {
             for _ in 0..PAYLOAD_SAMPLE_EVERY {
                 note_written_payload(buf);
             }
         }
-        let (calls, sampled, all_ff, all_zero, samp_bytes, ff_bytes) = payload_counts();
+        let (calls, sampled, samp_bytes) = payload_counts();
         assert_eq!(calls, 3 * PAYLOAD_SAMPLE_EVERY);
         assert_eq!(sampled, 3, "one sample per block of {PAYLOAD_SAMPLE_EVERY}");
-        assert_eq!((all_ff, all_zero), (1, 1));
         assert_eq!(samp_bytes, 3 * 4096);
-        assert_eq!(ff_bytes, 4096, "only the white buffer's bytes");
     }
 
-    #[test]
-    fn a_payload_one_byte_short_of_white_is_not_white() {
-        let _g = fresh();
-        // The discriminator is worth nothing if it rounds. A frame the guest
-        // will read as white-but-for-a-pixel is not the all-0xff fill the panic
-        // census reports, and counting it as one would inflate the very number
-        // this census exists to decide a hypothesis on.
-        let mut nearly = vec![0xFFu8; 1024];
-        nearly[0] = 0xFE;
-        note_written_payload(&nearly);
-        assert_eq!(payload_counts().2, 0);
-    }
-
-    /// The case `all_ff` is blind to, and the reason the run predicate exists.
+    /// The case a whole-buffer test is blind to, and the reason the run
+    /// predicate is the one counted.
     ///
     /// A white browser page has a menu bar, a scrollbar and text in it, so the
-    /// frame this device writes is never uniform — and `all_ff` reads zero on
-    /// exactly the workload the white-frame hypothesis is about. A run of
+    /// frame this device writes is never uniform — and a uniform test reads zero
+    /// on exactly the workload the white-frame hypothesis is about. A run of
     /// [`FF_RUN_MIN`] is what the `kalloc` poison reports imply, and it is
     /// present in that frame by the megabyte.
     #[test]
-    fn a_mostly_white_frame_scores_no_all_ff_and_a_long_ff_run() {
+    fn a_mostly_white_frame_scores_a_long_ff_run() {
         let _g = fresh();
         let mut frame = vec![0xFFu8; 64 * 1024];
         // Chrome at the top and a scrollbar column: enough to break uniformity,
@@ -941,12 +905,6 @@ mod tests {
         }
         frame[40_000] = 0x00;
         note_written_payload(&frame);
-        assert_eq!(
-            payload_counts().2,
-            0,
-            "not uniform, so `all_ff` cannot see it — which is the defect in \
-             reading `all_ff=0` as 'this device does not write white'"
-        );
         let (ff_run, ff_run_max) = ff_run_counts();
         assert_eq!(ff_run, 1);
         assert_eq!(
@@ -1019,13 +977,13 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_payload_is_not_counted_as_uniform() {
+    fn an_empty_payload_is_not_counted_at_all() {
         let _g = fresh();
-        // `[].iter().all(..)` is vacuously true for both tests, so an empty
-        // buffer would score as white AND as black at once.
+        // A zero-length write carries no shape to sample. Counting it would
+        // spend sampling slots on nothing and walk the 1-in-64 phase off the
+        // pixel writes this census exists to shape.
         note_written_payload(&[]);
-        let (calls, sampled, all_ff, all_zero, _, _) = payload_counts();
-        assert_eq!((calls, sampled, all_ff, all_zero), (0, 0, 0, 0));
+        assert_eq!(payload_counts(), (0, 0, 0));
     }
 
     #[test]

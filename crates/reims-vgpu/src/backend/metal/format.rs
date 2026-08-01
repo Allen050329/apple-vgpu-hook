@@ -21,29 +21,24 @@ pub fn storage_image_format(format: u32) -> Option<(MTLPixelFormat, usize)> {
     }
 }
 
+/// Bytes per texel for a raw `MTLPixelFormat` value.
+///
+/// Asks [`crate::contract::pixel_format::bytes_per_pixel`] rather than carrying
+/// a table. The two are the same numbering: the contract's wire codes *are*
+/// Apple's `MTLPixelFormat` values, so `MTL_FORMAT_BGRA8_UNORM` is `0x50` and
+/// `MTLPixelFormat::BGRA8Unorm` is 80.
+///
+/// This rail used to keep its own switch covering thirteen formats against the
+/// contract's twenty-four, agreeing with it on every one they shared. Nothing
+/// held the two in step, and the gap was not inert: a depth, stencil or 32-bit
+/// single-channel target that the contract sizes correctly returned `None` here
+/// and was refused for no reason visible at the call site.
+///
+/// The `u16` narrowing is the format-code domain, not a truncation: every
+/// `MTLPixelFormat` fits, so a wider value names no format and declines.
 pub fn mtl_pixel_format_bpp(pixel_format: u32) -> Option<usize> {
-    // Compare raw MTLPixelFormat values (same as ObjC switch).
-    match pixel_format {
-        x if x == MTLPixelFormat::A8Unorm as u32 || x == MTLPixelFormat::R8Unorm as u32 => Some(1),
-        x if x == MTLPixelFormat::R16Float as u32 || x == MTLPixelFormat::RG8Unorm as u32 => {
-            Some(2)
-        }
-        x if x == MTLPixelFormat::RGBA8Unorm as u32
-            || x == MTLPixelFormat::RGBA8Unorm_sRGB as u32
-            || x == MTLPixelFormat::BGRA8Unorm as u32
-            || x == MTLPixelFormat::BGRA8Unorm_sRGB as u32
-            || x == MTLPixelFormat::RG16Float as u32 =>
-        {
-            Some(4)
-        }
-        x if x == MTLPixelFormat::RGBA16Float as u32 || x == MTLPixelFormat::RGBA16Uint as u32 => {
-            Some(8)
-        }
-        x if x == MTLPixelFormat::RGBA32Float as u32 || x == MTLPixelFormat::RGBA32Uint as u32 => {
-            Some(16)
-        }
-        _ => None,
-    }
+    let code = u16::try_from(pixel_format).ok()?;
+    crate::contract::pixel_format::bytes_per_pixel(code).map(|bpp| bpp as usize)
 }
 
 pub fn pixel_format_from_u32(v: u32) -> MTLPixelFormat {
@@ -103,6 +98,33 @@ mod tests {
         ];
         for (format, bytes) in cases {
             assert_eq!(mtl_pixel_format_bpp(format as u32), Some(bytes));
+        }
+    }
+
+    /// The formats this rail's own table did not carry.
+    ///
+    /// Each one is sized by the contract and was refused here, which is the gap
+    /// a second hand-maintained table opens: the widths were never in dispute,
+    /// only which of the two tables a caller happened to reach.
+    #[test]
+    fn formats_the_local_table_used_to_miss_are_sized_by_the_contract() {
+        let cases = [
+            (MTLPixelFormat::Stencil8, 1),
+            (MTLPixelFormat::Depth16Unorm, 2),
+            (MTLPixelFormat::R32Uint, 4),
+            (MTLPixelFormat::R32Sint, 4),
+            (MTLPixelFormat::R32Float, 4),
+            (MTLPixelFormat::RGB9E5Float, 4),
+            (MTLPixelFormat::Depth32Float, 4),
+            (MTLPixelFormat::RGBA8Uint, 4),
+            (MTLPixelFormat::RGBA8Sint, 4),
+        ];
+        for (format, bytes) in cases {
+            assert_eq!(
+                mtl_pixel_format_bpp(format as u32),
+                Some(bytes),
+                "{format:?} is sized by the contract and used to be refused here"
+            );
         }
     }
 

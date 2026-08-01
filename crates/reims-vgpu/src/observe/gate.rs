@@ -1325,10 +1325,10 @@ fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
 /// A separate axis from [`Marks`], because they are separate instruments over
 /// the same rails and a file can satisfy one and not the other. That is not
 /// hypothetical: `runtime/mapping_write.rs` marked the footprint through
-/// `contig_for_write` and sampled no payload at all, so the first live
-/// `all_ff=0` reading was taken from a census blind to the rail carrying nearly
-/// every pixel — the identical shape to the footprint gap that keying on
-/// `map_pages` alone once produced, one instrument later.
+/// `contig_for_write` and sampled no payload at all, so the first live payload
+/// readings were taken from a census blind to the rail carrying nearly every
+/// pixel — the identical shape to the footprint gap that keying on `map_pages`
+/// alone once produced, one instrument later.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum Payload {
     /// Calls `note_written_payload` with the source buffer.
@@ -1427,8 +1427,8 @@ fn every_guest_ram_writer_is_classified_for_the_payload_census() {
         writers, classified,
         "every rail that puts bytes in guest RAM needs a payload-census verdict. \
          A new writer that is only in MAP_PAGES_SITES is in the footprint and \
-         invisible to the census, which is how `all_ff=0` came to be reported \
-         about a device whose largest rail was never scanned."
+         invisible to the census, which is how a payload reading of zero came \
+         to be reported about a device whose largest rail was never scanned."
     );
 
     for (file, how, why) in PAYLOAD_CENSUS_SITES {
