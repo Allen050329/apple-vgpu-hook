@@ -2158,10 +2158,7 @@ pub struct DeviceState {
     /// `remove(0)` that shifts all `GUEST_RUN_MEMO_CAP` (512) entries on every
     /// miss once full.
     pub guest_run_memo: std::collections::VecDeque<GuestRunMemoEntry>,
-    /// Covering-view reuse counter — drives the 1-in-32 sampled staleness
-    /// verify in `ensure_gva_view` (stale cached-view read class).
-    pub view_verify_ctr: u64,
-    /// Total stale views the sampled verify caught (fail-logged as
+    /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
     /// Draw-time buffer-bind coherence-flush no-intersection memo. Maps a
@@ -2289,7 +2286,6 @@ impl DeviceState {
             gva_host_views: Vec::new(),
             tranche: MemoCounters::default(),
             guest_run_memo: std::collections::VecDeque::new(),
-            view_verify_ctr: 0,
             view_stale_reads: 0,
             flush_nohit_memo: std::collections::HashMap::new(),
             flush_verify_ctr: 0,

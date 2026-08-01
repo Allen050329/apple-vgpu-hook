@@ -376,37 +376,30 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     if let Some(v) = find_covering_view(state, task_id, gva, length) {
         let (vptr, vlen) = (v.ptr, v.ptr_len);
         let view = v.clone();
-        // Sampled staleness verify (1-in-32 reuses): re-translate the view's
-        // first/last leaf and compare GPAs. A guest PT rewire the Unmap/Map2
-        // notifies missed (or that raced ahead of the FIFO) makes the cached
-        // view alias pages the guest already recycled — reads through it see
-        // freshly zeroed memory (the black-tile class). A mismatch retires
-        // the view fail-visibly and rebuilds fresh below.
-        state.view_verify_ctr = state.view_verify_ctr.wrapping_add(1);
-        // The denominator, and it turned out to be the whole answer.
-        // `gva_view_stale` reading zero says nothing on its own: it is equally
-        // the sound of a cache that never goes stale and of a check that never
-        // runs. `view_reuse` is every read served from a cached host pointer
-        // and `view_verify` the subset that proved itself.
+        // Staleness verify, on EVERY reuse: re-translate the view's first/last
+        // leaf and compare GPAs. A guest PT rewire that the Unmap/Map2 notifies
+        // missed (or that raced ahead of the FIFO) makes the cached view alias
+        // pages the guest already recycled — reads through it see freshly
+        // zeroed memory, which is the black-tile class. A mismatch retires the
+        // view fail-visibly and rebuilds fresh below.
         //
-        // Measured across four driven x86/Vulkan boots: `view_reuse` is **0**.
-        // `find_covering_view` never matches on this pathway, so no read is
-        // ever served from a registered view, the 1-in-32 gate below never
-        // fires, and `gva_view_stale=0` was the sound of a check that never
-        // ran. Views are still built and retired (`gva_view_drop` is nonzero),
-        // so this is a cache with a zero hit rate rather than an idle module.
+        // This used to run on 1 reuse in 32, which meant a view known to be
+        // stale was still handed back for the other 31 — the check could only
+        // ever bound how long wrong bytes were served, not prevent them. A
+        // sampling rate on a correctness test is a guess about how often the
+        // guest rewires under us, and we have no such number from the contract.
+        // Two leaf walks is also far cheaper than the full-span walk the cache
+        // exists to avoid, so verifying always is what the cache can afford.
         //
-        // Two consequences for anyone reading this next. The sampling gate is
-        // not protecting x86/Vulkan from anything and tuning it would change
-        // nothing here — it has to be justified, if at all, on a pathway where
-        // the reuse count is not zero. And a stale cached view is not how this
-        // pathway reads wrong bytes, because it does not read through cached
-        // views at all.
+        // What the rate is NOT justified by is x86/Vulkan traffic: `view_reuse`
+        // measured 0 across five driven boots there, because guest spans on a
+        // 12-bit page shift are essentially always fragmented (476
+        // `gva_view_fragmented` refusals in one driven session) and a fragmented
+        // span is never registered. The cache has a zero hit rate on that rail,
+        // so nothing here is on its hot path either way. Do not read that as the
+        // module being idle in general — a 14-bit page shift covers the same
+        // span in a quarter of the pages and can plausibly hit.
         crate::runtime::drain::note_store_route("view_reuse");
-        if !state.view_verify_ctr.is_multiple_of(32) {
-            return Some((vptr, vlen));
-        }
-        crate::runtime::drain::note_store_route("view_verify");
         if view_gpas_current(host, state, &view) {
             return Some((vptr, vlen));
         }
@@ -1659,8 +1652,9 @@ mod tests {
         assert_eq!(back, [0xaa; 4], "old page must not see the second write");
     }
 
-    /// The 1-in-32 sampled reuse verify catches a PT rewire under a cached
-    /// view, retires it, and rebuilds fresh; unsampled reuses stay cheap.
+    /// Every reuse verifies, so a PT rewire under a cached view is caught on
+    /// the FIRST read after it happens — the view is retired and rebuilt, and
+    /// no read is ever served through the stale mapping.
     #[test]
     fn stale_covering_view_detected_and_rebuilt() {
         let page_shift = PAGE_SHIFT_X86;
@@ -1677,15 +1671,11 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
 
-        // Unsampled reuse still returns the cached view (sampling contract).
-        state.view_verify_ctr = 0;
-        let (p1, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
-        assert_eq!(p1, p0);
-        assert_eq!(state.view_stale_reads, 0);
-
-        // Sampled reuse (ctr hits a multiple of 32) detects, retires, rebuilds.
-        state.view_verify_ctr = 31;
+        // The very next reuse detects, retires, and rebuilds. Under the old
+        // 1-in-32 gate this same call returned `p0` — the stale mapping — and
+        // left `view_stale_reads` at 0.
         let (p2, _) = ensure_gva_view(&mut state, &mut host, 1, gva, 16).unwrap();
+        assert_ne!(p2, p0, "a stale view must never be handed back");
         assert_eq!(state.view_stale_reads, 1);
         assert_eq!(state.gva_host_views.len(), 1);
         assert_eq!(state.gva_host_views[0].first_gpa, data1);
