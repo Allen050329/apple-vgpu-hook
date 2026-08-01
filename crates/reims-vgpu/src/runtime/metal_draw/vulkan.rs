@@ -3267,24 +3267,17 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         }
     }
     crate::runtime::drain::note_store_route("lin_rung_gva_bypassed");
-    // This rung validates `texture_ref` + geometry and **not** the GVA, so on
-    // paper it can serve one resource's pixels under another's ref after the
-    // guest rebinds a ref to a different descriptor at the same size. It reads
-    // as the most dangerous cache in the sampled ladder, and it is not, because
-    // it is never taken: `lin_rung_gva_bypassed` and `lin_rung_guest_memo` are
-    // *equal* in every per-second window of two full 14-round boots (441/441,
-    // 684/684, 2318/2318, …), which means every bypass falls straight past this
-    // rung to the guest's own pages. `lin_rung_texref` has never appeared in a
-    // census line.
+    // A rung keyed on `texture_ref` + geometry alone used to sit here. It did not
+    // validate the GVA, so it could serve one resource's pixels under another's
+    // ref once the guest rebound a ref to a different descriptor at the same
+    // size, and it carried no identity for the engine to re-check either. It was
+    // also never worth that: `lin_rung_gva_bypassed` and `lin_rung_guest_memo`
+    // ran *equal* through every per-second window of two full 14-round boots
+    // (441/441, 684/684, 2318/2318, …), and its own counter reached 2 against
+    // 725 233 sampled loads. Every bypass already fell straight past it to the
+    // guest's own pages, which are authoritative, so those two samples now read
+    // the same pages the other 725 231 did.
     //
-    // Left in place rather than deleted: a rung with zero traffic is not a rung
-    // that cannot be reached, and its counter is what says so. Do not spend a
-    // session on it without first showing `lin_rung_texref` is nonzero.
-    if let Some(bgra) = crate::runtime::surface_cache::get_texture(state, texture_ref, w, h) {
-        crate::runtime::drain::note_store_route("lin_rung_texref");
-        let rgba = swap_rb_channels(bgra);
-        return Some((w, h, std::sync::Arc::new(rgba), None, TexelLayout::Rgba8));
-    }
     // Guest-CPU-produced linear textures (wallpaper, glyph atlases) have no
     // host producer generation. Re-read the native rows and byte-compare
     // against the memo: unchanged content reuses the retained swizzled Arc

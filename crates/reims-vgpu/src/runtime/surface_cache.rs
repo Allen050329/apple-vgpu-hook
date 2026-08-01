@@ -123,14 +123,11 @@ fn live_map_generation(state: &DeviceState, surface_id: u32) -> u32 {
 }
 
 /// Whether a cached surface_id frame was produced from the incarnation the
-/// mapping is on now. Pure question, no counter and no knob.
+/// mapping is on now. Pure question, no counter.
 ///
-/// Kept separate from [`surface_entry_may_serve`] because they are different
-/// questions and an earlier draft here answered them with one function — which
-/// its own test caught, by asserting a re-pointed entry was not current and
-/// getting `true` back, because the knob was off. "These bytes are from the
-/// incarnation in front of us" and "the device is willing to serve them anyway"
-/// must not share a return value.
+/// Kept separate from [`note_surface_entry_incarnation`], which reports the
+/// answer, so that "these bytes are from the incarnation in front of us" stays a
+/// question this crate can ask without also deciding what to do about it.
 ///
 /// # Measured: this never fires, and the reason generalises
 ///
@@ -157,23 +154,23 @@ fn surface_entry_is_current(state: &DeviceState, surface_id: u32) -> bool {
     entry.map_generation_at_store == live_map_generation(state, surface_id)
 }
 
-/// Whether a surface_id lookup may hand back what it found, counting the answer
-/// so a boot carries the rate either way.
+/// Record which incarnation a surface_id lookup is about to serve from.
 ///
-/// Behaviour is deliberately unchanged at this commit. "How often does this
-/// cache serve a frame across a re-point?" has never been measured, and refusing
-/// on a guess is the wrong way round: a withheld Load seed renders the pass onto
-/// a cleared target, which is a compositing layer going solid black, and this
+/// This reports; it does not refuse. "How often does this cache serve a frame
+/// across a re-point?" measured zero (`surfcache_gen_stale` 0 against
+/// `surfcache_gen_same` 16 186 over a 300 s boot), and refusing on a guess is
+/// the wrong way round anyway: a withheld Load seed renders the pass onto a
+/// cleared target, which is a compositing layer going solid black, and this
 /// project has already paid a boot for that failure direction (`13ae46d`, 0 of
-/// 14 rounds). So a stale incarnation is counted and reported, and still
-/// served; nothing here refuses on it.
-fn surface_entry_may_serve(state: &DeviceState, surface_id: u32) -> bool {
+/// 14 rounds). So a stale incarnation is counted and named in the log, and the
+/// frame is still served.
+fn note_surface_entry_incarnation(state: &DeviceState, surface_id: u32) {
     if !state.host_surfaces.contains_key(&surface_id) {
-        return true;
+        return;
     }
     if surface_entry_is_current(state, surface_id) {
         crate::runtime::drain::note_store_route("surfcache_gen_same");
-        return true;
+        return;
     }
     crate::runtime::drain::note_store_route("surfcache_gen_stale");
     if let Some(entry) = state.host_surfaces.get(&surface_id) {
@@ -186,14 +183,11 @@ fn surface_entry_may_serve(state: &DeviceState, surface_id: u32) -> bool {
             entry.height
         ));
     }
-    true
 }
 
 /// Borrow host-cache frame when geom matches request (surface_id namespace).
 pub fn get(state: &DeviceState, surface_id: u32, width: u32, height: u32) -> Option<&[u8]> {
-    if !surface_entry_may_serve(state, surface_id) {
-        return None;
-    }
+    note_surface_entry_incarnation(state, surface_id);
     get_from(&state.host_surfaces, surface_id, width, height)
 }
 
@@ -295,9 +289,7 @@ pub fn get_shared(
     width: u32,
     height: u32,
 ) -> Option<std::sync::Arc<Vec<u8>>> {
-    if !surface_entry_may_serve(state, surface_id) {
-        return None;
-    }
+    note_surface_entry_incarnation(state, surface_id);
     let need = get_from(&state.host_surfaces, surface_id, width, height)?.len();
     let e = state.host_surfaces.get(&surface_id)?;
     Some(if e.bgra.len() == need {
