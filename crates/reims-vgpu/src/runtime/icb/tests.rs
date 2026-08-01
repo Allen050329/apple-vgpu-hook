@@ -126,6 +126,67 @@ fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
     assert!(state.set_object_list(1, 0, 32));
 }
 
+/// The nine-field mesh draw with every count at one — the shape a test that is
+/// about something else needs so the slot decodes, not a case in its own right.
+/// Twelve bodies wrote it out; the two that vary their counts still do.
+fn unit_mesh_draw() -> IcbRenderDraw {
+    IcbRenderDraw::MeshThreadgroups {
+        threadgroups_x: 1,
+        threadgroups_y: 1,
+        threadgroups_z: 1,
+        object_tg_x: 1,
+        object_tg_y: 1,
+        object_tg_z: 1,
+        mesh_tg_x: 1,
+        mesh_tg_y: 1,
+        mesh_tg_z: 1,
+    }
+}
+
+/// A one-threadgroup concurrent dispatch of `tg_x` x `tg_y` x `tg_z` threads.
+/// Every fill test in this file uses grid 1x1x1 and varies only the
+/// threadgroup, so the grid is not a parameter.
+fn unit_grid_dispatch(tg_x: u32, tg_y: u32, tg_z: u32) -> IcbFillDispatch {
+    IcbFillDispatch::ConcurrentThreadgroups {
+        grid_x: 1,
+        grid_y: 1,
+        grid_z: 1,
+        tg_x,
+        tg_y,
+        tg_z,
+    }
+}
+
+/// A kernel bind at the buffer's base with no attribute stride. The two tests
+/// that are *about* the stride API build theirs by hand.
+fn kernel_bind(index: u32, buffer_ref: u32) -> IcbKernelBufferBind {
+    IcbKernelBufferBind {
+        index,
+        buffer_ref,
+        offset: 0,
+        wire_va: 0,
+        attribute_stride: 0,
+        has_attribute_stride: false,
+    }
+}
+
+/// A render bind at the buffer's base: no wire VA, no attribute stride, and the
+/// default stage, so `is_fragment` is the whole of what it says. Binds that
+/// carry a wire VA, a stride, or a non-default stage are the subject of their
+/// own tests and stay written out.
+fn render_bind(index: u32, buffer_ref: u32, is_fragment: bool) -> IcbRenderBufferBind {
+    IcbRenderBufferBind {
+        index,
+        buffer_ref,
+        offset: 0,
+        wire_va: 0,
+        attribute_stride: 0,
+        has_attribute_stride: false,
+        is_fragment,
+        stage: IcbRenderBindStage::default(),
+    }
+}
+
 fn make_icb_desc_bytes(max_cmds: u32, max_kernel: u16, inherit_buffers: bool) -> Vec<u8> {
     make_icb_desc_bytes_tg(
         max_cmds,
@@ -748,24 +809,10 @@ fn fill_and_execute_mul3add1_writeback() {
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbKernelBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-            }],
+            buffers: vec![kernel_bind(0, 7)],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 4,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(4, 1, 1),
         },
     )
     .expect("fill");
@@ -828,16 +875,7 @@ fn decode_encode_render_draw_slot_roundtrip() {
     let fill = IcbRenderFill {
         command_index: 0,
         pipeline_ref: 42,
-        buffers: vec![IcbRenderBufferBind {
-            index: 0,
-            buffer_ref: 7,
-            offset: 0,
-            wire_va: 0,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-            is_fragment: false,
-            stage: IcbRenderBindStage::default(),
-        }],
+        buffers: vec![render_bind(0, 7, false)],
         object_threadgroup_memory: vec![],
         draw: IcbRenderDraw::Primitives {
             primitive_type: 3,
@@ -881,26 +919,8 @@ fn decode_encode_render_draw_indexed_slot_roundtrip() {
         command_index: 0,
         pipeline_ref: 11,
         buffers: vec![
-            IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 8,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::default(),
-            },
-            IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            },
+            render_bind(0, 8, false),
+            render_bind(0, 13, true),
         ],
         object_threadgroup_memory: vec![],
         draw: IcbRenderDraw::Indexed {
@@ -1131,16 +1151,7 @@ fn fill_render_draw_patches_tessellation_oracle() {
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 11,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::default(),
-            }],
+            buffers: vec![render_bind(0, 11, false)],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Patches {
                 number_of_patch_control_points: 3,
@@ -1239,16 +1250,7 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 11,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: false,
-                stage: IcbRenderBindStage::default(),
-            }],
+            buffers: vec![render_bind(0, 11, false)],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::IndexedPatches {
                 number_of_patch_control_points: 3,
@@ -1617,17 +1619,7 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     )
     .expect("fill DrawMeshThreadgroups");
@@ -1777,26 +1769,8 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
             command_index: 0,
             pipeline_ref: 6,
             buffers: vec![
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 11,
-                    offset: 0,
-                    wire_va: 0,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: false,
-                    stage: IcbRenderBindStage::default(),
-                },
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 13,
-                    offset: 0,
-                    wire_va: 0,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: true,
-                    stage: IcbRenderBindStage::default(),
-                },
+                render_bind(0, 11, false),
+                render_bind(0, 13, true),
             ],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Indexed {
@@ -1832,24 +1806,10 @@ fn decode_encode_command_slot_roundtrip() {
     let fill = IcbComputeFill {
         command_index: 0,
         pipeline_ref: 6,
-        buffers: vec![IcbKernelBufferBind {
-            index: 0,
-            buffer_ref: 7,
-            offset: 0,
-            wire_va: 0,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-        }],
+        buffers: vec![kernel_bind(0, 7)],
         threadgroup_memory: vec![],
         barrier: false,
-        dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-            grid_x: 1,
-            grid_y: 1,
-            grid_z: 1,
-            tg_x: 4,
-            tg_y: 1,
-            tg_z: 1,
-        },
+        dispatch: unit_grid_dispatch(4, 1, 1),
     };
     let slot = encode_compute_command_slot(&layout, &fill).unwrap();
     assert_eq!(slot.len(), layout.command_size as usize);
@@ -1919,24 +1879,10 @@ fn buffer_backed_fill_execute_mul3add1() {
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbKernelBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-            }],
+            buffers: vec![kernel_bind(0, 7)],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 4,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(4, 1, 1),
         },
     )
     .unwrap();
@@ -2046,14 +1992,7 @@ fn apply_0x1d1_auto_binds_backing() {
             buffers: vec![],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 1,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(1, 1, 1),
         },
     )
     .unwrap();
@@ -2133,16 +2072,7 @@ fn fill_render_draw_indexed_execute_oracle() {
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            }],
+            buffers: vec![render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Indexed {
                 primitive_type: 3,
@@ -2235,16 +2165,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            }],
+            buffers: vec![render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Indexed {
                 primitive_type: 3,
@@ -2585,17 +2506,7 @@ fn fill_render_object_mesh_threadgroups_oracle() {
             // length 0 = clear; exercise API path with empty vec is fine.
             // Non-zero object TG mem optional for this payload-only shader.
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     )
     .expect("fill object+mesh threadgroups");
@@ -2663,17 +2574,7 @@ fn wire_backed_dual_export_object_mesh_e2e() {
         pipeline_ref: 6,
         buffers: vec![],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x: 1,
-            threadgroups_y: 1,
-            threadgroups_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode dual-export slot");
 
@@ -2764,17 +2665,7 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     )
     .expect("fill separate object+mesh+frag refs");
@@ -2848,17 +2739,7 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
         pipeline_ref: 6,
         buffers: vec![],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x: 1,
-            threadgroups_y: 1,
-            threadgroups_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh SPI slot");
 
@@ -3020,17 +2901,7 @@ fn fill_render_object_buffer_bind_oracle() {
                 stage: IcbRenderBindStage::Object,
             }],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     )
     .expect("fill object buffer bind");
@@ -3195,17 +3066,7 @@ fn wire_backed_object_buffer_bind_e2e() {
             stage: IcbRenderBindStage::Object,
         }],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x: 1,
-            threadgroups_y: 1,
-            threadgroups_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode object bind slot");
 
@@ -3258,17 +3119,7 @@ fn decode_encode_object_tg_memory_mesh_slot() {
                 length: 32,
             },
         ],
-        draw: IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x: 1,
-            threadgroups_y: 1,
-            threadgroups_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode");
     assert_eq!(
@@ -3348,17 +3199,7 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
                 index: 0,
                 length: 8, // not multiple of 16
             }],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     );
     assert_eq!(
@@ -3429,17 +3270,7 @@ fn fill_render_object_tg_memory_oracle() {
                 index: 0,
                 length: 16,
             }],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     )
     .expect("fill object TG memory");
@@ -3502,17 +3333,7 @@ fn wire_backed_object_tg_memory_e2e() {
             index: 0,
             length: 16,
         }],
-        draw: IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x: 1,
-            threadgroups_y: 1,
-            threadgroups_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode object TG slot");
 
@@ -3649,17 +3470,7 @@ fn wire_backed_mesh_threadgroups_e2e() {
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: 1,
-                threadgroups_y: 1,
-                threadgroups_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_draw(),
         },
     )
     .expect("encode MeshThreadgroups slot");
@@ -3851,16 +3662,7 @@ fn inherit_pipeline_encoder_fragment_color() {
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 0,
-            buffers: vec![IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            }],
+            buffers: vec![render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Indexed {
                 primitive_type: 3,
@@ -3984,26 +3786,8 @@ fn fill_render_stagein_draw_execute_oracle() {
             command_index: 0,
             pipeline_ref: 6,
             buffers: vec![
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 11,
-                    offset: 0,
-                    wire_va: 0,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: false,
-                    stage: IcbRenderBindStage::default(),
-                },
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 13,
-                    offset: 0,
-                    wire_va: 0,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: true,
-                    stage: IcbRenderBindStage::default(),
-                },
+                render_bind(0, 11, false),
+                render_bind(0, 13, true),
             ],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Primitives {
@@ -4188,14 +3972,7 @@ fn decode_encode_attribute_stride_table() {
         ],
         threadgroup_memory: vec![],
         barrier: false,
-        dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-            grid_x: 1,
-            grid_y: 1,
-            grid_z: 1,
-            tg_x: 1,
-            tg_y: 1,
-            tg_z: 1,
-        },
+        dispatch: unit_grid_dispatch(1, 1, 1),
     };
     let slot = encode_compute_command_slot(&layout, &fill).unwrap();
     let so = layout.attribute_stride_offset as usize;
@@ -4226,16 +4003,7 @@ fn decode_encode_attribute_stride_table() {
                 is_fragment: false,
                 stage: IcbRenderBindStage::default(),
             },
-            IcbRenderBufferBind {
-                index: 0,
-                buffer_ref: 13,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-                is_fragment: true,
-                stage: IcbRenderBindStage::default(),
-            },
+            render_bind(0, 13, true),
         ],
         object_threadgroup_memory: vec![],
         draw: IcbRenderDraw::Primitives {
@@ -4318,16 +4086,7 @@ fn fill_render_attribute_stride_stagein_execute() {
                     is_fragment: false,
                     stage: IcbRenderBindStage::default(),
                 },
-                IcbRenderBufferBind {
-                    index: 0,
-                    buffer_ref: 13,
-                    offset: 0,
-                    wire_va: 0,
-                    attribute_stride: 0,
-                    has_attribute_stride: false,
-                    is_fragment: true,
-                    stage: IcbRenderBindStage::default(),
-                },
+                render_bind(0, 13, true),
             ],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Primitives {
@@ -4493,14 +4252,7 @@ fn decode_encode_barrier_and_threadgroup_memory() {
             },
         ],
         barrier: true,
-        dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-            grid_x: 1,
-            grid_y: 1,
-            grid_z: 1,
-            tg_x: 1,
-            tg_y: 1,
-            tg_z: 1,
-        },
+        dispatch: unit_grid_dispatch(1, 1, 1),
     };
     let slot = encode_compute_command_slot(&layout, &fill).unwrap();
     assert_eq!(ld32(&slot[layout.barrier_offset as usize..]), 1);
@@ -4566,27 +4318,13 @@ fn fill_compute_barrier_and_tg_memory_execute() {
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbKernelBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-            }],
+            buffers: vec![kernel_bind(0, 7)],
             threadgroup_memory: vec![IcbThreadgroupMemory {
                 index: 0,
                 length: 16,
             }],
             barrier: true,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 4,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(4, 1, 1),
         },
     )
     .expect("fill with barrier+tg");
@@ -4682,14 +4420,7 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
             buffers: vec![],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 4,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(4, 1, 1),
         },
     )
     .expect("fill inheritBuffers dispatch");
@@ -4790,24 +4521,10 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 0,
-            buffers: vec![IcbKernelBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-            }],
+            buffers: vec![kernel_bind(0, 7)],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 4,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(4, 1, 1),
         },
     )
     .expect("fill inheritPipeline dispatch");
@@ -4992,24 +4709,10 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![IcbKernelBufferBind {
-                index: 0,
-                buffer_ref: 7,
-                offset: 0,
-                wire_va: 0,
-                attribute_stride: 0,
-                has_attribute_stride: false,
-            }],
+            buffers: vec![kernel_bind(0, 7)],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: 4,
-                tg_y: 1,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(4, 1, 1),
         },
     )
     .expect("fill mul3add1 ICB");
@@ -5141,14 +4844,7 @@ fn icb_argument_buffer_storage_texture_xyplane() {
             buffers: vec![],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: W,
-                tg_y: H,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(W, H, 1),
         },
     )
     .expect("fill AB storage ICB");
@@ -5274,14 +4970,7 @@ fn icb_argument_buffer_sample_and_write() {
             buffers: vec![],
             threadgroup_memory: vec![],
             barrier: false,
-            dispatch: IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: 1,
-                grid_y: 1,
-                grid_z: 1,
-                tg_x: W,
-                tg_y: H,
-                tg_z: 1,
-            },
+            dispatch: unit_grid_dispatch(W, H, 1),
         },
     )
     .expect("fill AB sample ICB");
