@@ -4648,138 +4648,37 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // Cross-pass resident Load: a deferred GVA Store window at this exact
-        // target means the engine resident — not guest/cache bytes — is the
-        // authoritative prior content. When this record itself renders into
-        // that registry identity, load directly from it (no CPU seed, no
-        // flush); any mismatch lands the window first so the seeds below read
-        // fresh bytes.
-        if !chain_load_from_target && gpu_only_content_allowed {
-            if let Some(c0) = req.colors.first() {
-                // Denominator, taken before the window test rather than inside
-                // it. Both slugs below sit past five conditions, so a zero on
-                // the pair cannot say whether the guest never issues this shape
-                // of draw or issues it and no deferred window is open at the
-                // time. Those are different facts and the pair alone cannot
-                // tell them apart — the same blindness `a522d05` found on the
-                // MRT rail. `xpass_c0_not_gva_load` proves this probe runs.
-                //
-                // First reading, driven x86/Vulkan boot:
-                //
-                //   xpass_c0_not_gva_load         4859
-                //   xpass_c0_gva_load_no_window      0
-                //   xpass_c0_gva_load_window_open    0
-                //
-                // (`gva_deferred` 2508 the same boot, so the window rail itself
-                // is busy.) Every draw that reaches this gate has a colour0 that
-                // is not a seedless LOAD'd GVA target — so the block is stopped
-                // one level above the window test, by the request shape. The
-                // reading is consistent with the resident-chain rail already
-                // owning this case: a serialized GVA pass sets
-                // `chain_from_resident` on records 2.., which sets
-                // `chain_load_from_target` and skips this gate entirely. If that
-                // holds on a second boot, this is a second mechanism for
-                // something the first carries in full, and the `else` flush
-                // below is the only part that would need a home.
-                let c0_is_seedless_gva_load = c0.load_action == PASS_LOAD_ACTION_LOAD
-                    && c0.mapping_id == 0
-                    && c0.target_gva != 0
-                    && c0.target_seed_rgba.is_none();
-                let window_open =
-                    c0_is_seedless_gva_load && state.gva_deferred_flush.contains_key(&c0.target_gva);
-                crate::runtime::drain::note_store_route(if !c0_is_seedless_gva_load {
-                    "xpass_c0_not_gva_load"
-                } else if !window_open {
-                    "xpass_c0_gva_load_no_window"
-                } else {
-                    "xpass_c0_gva_load_window_open"
-                });
-                if window_open {
-                    let entry_geom = state
-                        .gva_deferred_flush
-                        .get(&c0.target_gva)
-                        .map(|e| (e.width, e.height));
-                    let will_target_registry = c0.store_action == PASS_STORE_ACTION_STORE
-                        && (!writeback_guest || gva_store_defer_eligible(req));
-                    let identity = crate::backend::vulkan::engine::TargetIdentity::Gva {
-                        gva: c0.target_gva,
-                        width: w,
-                        height: h,
-                        generation: req.gva_alloc_gen,
-                    };
-                    // A GVA is only a name, and this rail trusts one across
-                    // passes. `generation` is the hash of the guest pages behind
-                    // the span, so an address handed to a second allocation
-                    // resolves to a different registry key and this Load misses
-                    // rather than reading the first allocation's pixels. That is
-                    // the structural half; the drift check below is the half
-                    // that keeps the *window* honest, because the window is what
-                    // states that guest pages are stale.
-                    //
-                    // The window this Load is about to trust was armed against a
-                    // specific page set; if the address now resolves to pages
-                    // that set never held, the window no longer describes this
-                    // memory and its bytes are not this draw's prior content.
-                    //
-                    // The flush path has refused exactly this condition since
-                    // it was written, to keep a write off somebody else's
-                    // pages. The read path did not ask, which left the two
-                    // sides of one window disagreeing about whether it still
-                    // belongs to its address. Same question, same helper.
-                    //
-                    // **Unmeasured, and a previous comment here said otherwise.**
-                    // It claimed "one 14-round Finder recomposite boot:
-                    // `gva_xpass_load_same_alloc` 3142, `gva_xpass_load_realloc`
-                    // 0" and reasoned from it. Neither slug appears anywhere in
-                    // the always-on log, across every boot it holds, including
-                    // driven ones aimed at that same workload — and
-                    // `note_store_route` has no allowlist, so an absent slug was
-                    // never emitted. The 3142 cannot be reproduced; treat it as
-                    // withdrawn rather than as evidence.
-                    //
-                    // What is true is that the drift check costs nothing when it
-                    // never fires and that the two sides of one window
-                    // disagreeing about whether it still belongs to its address
-                    // is a defect whether or not the guest exercises it. The
-                    // denominator above is what will say which. Until it reads
-                    // non-zero, nothing here is measured.
-                    let window_is_still_ours = state
-                        .gva_deferred_flush
-                        .get(&c0.target_gva)
-                        .cloned()
-                        .is_some_and(|entry| {
-                            crate::runtime::storage_flush::window_pages_still_ours(
-                                state,
-                                host,
-                                c0.target_gva,
-                                &entry,
-                                "xpass_load",
-                                "resident=refused",
-                            )
-                        });
-                    crate::runtime::drain::note_store_route(if window_is_still_ours {
-                        "gva_xpass_load_same_alloc"
-                    } else {
-                        "gva_xpass_load_realloc"
-                    });
-                    if will_target_registry
-                        && entry_geom == Some((w, h))
-                        && window_is_still_ours
-                        && crate::backend::vulkan::engine::resident_content_ready(&identity)
-                    {
-                        chain_load_from_target = true;
-                    } else {
-                        crate::runtime::storage_flush::flush_gva_exact(
-                            state,
-                            host,
-                            c0.target_gva,
-                            true,
-                            "load_seed",
-                        );
-                    }
-                }
-            }
-        }
+        // There is no cross-pass GVA resident-Load rung here, and its absence
+        // is measured rather than assumed.
+        //
+        // One used to sit between the chain gate above and the type-11 gate
+        // below: when a deferred GVA Store window covered this exact target, it
+        // set `chain_load_from_target` from the window's resident instead of
+        // taking a seed, and flushed the window early when it could not. A
+        // denominator placed in front of it (`df81115`) read, over two driven
+        // x86/Vulkan boots on different workloads:
+        //
+        //   xpass_c0_not_gva_load         4859 / 5616
+        //   xpass_c0_gva_load_no_window      0 /    0
+        //   xpass_c0_gva_load_window_open    0 /    0
+        //
+        // with `gva_deferred` at 2508 / 2605, so the window rail itself was
+        // busy throughout. No draw reaching that point has a colour0 that is a
+        // seedless LOAD'd GVA target: `req.chain_from_resident` is set on
+        // records 2.. of a serialized GVA pass, which sets
+        // `chain_load_from_target` above and skipped the rung entirely. The
+        // resident-chain rail carries the case in full.
+        //
+        // Two facts made the deletion safe rather than merely quiet. The `else`
+        // arm's `flush_gva_exact` was an *early* landing of the window, not
+        // this draw's seed — `target_seed_rgba` is decided when the request is
+        // built, so a flush here left the seed door at `none` regardless, and
+        // an unflushed window is landed later by `storage_flush` on its own
+        // triggers. And the consequence is visible without the rung: a LOAD
+        // that arrives with no seed emits `load_seed_lost_other` through the
+        // always-on path, which read 0 across three boots alongside
+        // `load_seed_ok` 984 / 1001 / 941 — every seed on record came through
+        // the `color_seed` or `mapping` door.
         // Type-11 composite Load: when the resident this record is about to
         // render into was stamped with the mapping's current
         // `surface_content_epoch`, its image already holds exactly the bytes
