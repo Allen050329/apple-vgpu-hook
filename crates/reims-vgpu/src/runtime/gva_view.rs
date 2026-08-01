@@ -36,7 +36,7 @@ fn fragmented_span_key(task_id: u32, gva: u64, pages: usize, runs: usize) -> u64
 
 /// True if half-open ranges `[a, a+la)` and `[b, b+lb)` overlap.
 #[inline]
-pub fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
+fn ranges_overlap(a: u64, la: u64, b: u64, lb: u64) -> bool {
     if la == 0 || lb == 0 {
         return false;
     }
@@ -136,7 +136,7 @@ pub fn retire_gva_views_overlapping(
 }
 
 /// Find a covering view for `task_id` + `[gva, gva+length)` if one is registered.
-pub fn find_covering_view(
+fn find_covering_view(
     state: &DeviceState,
     task_id: u32,
     gva: u64,
@@ -369,7 +369,7 @@ pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
 /// a **packed** sequential host-VA run — fragmented GVA spans return `None` here;
 /// use [`write_span_within`] / [`read_span`] which multi-import maximal runs. Does not invent
 /// PTEs.
-pub fn ensure_gva_view<H: HostMemory + HostOps>(
+fn ensure_gva_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     task_id: u32,

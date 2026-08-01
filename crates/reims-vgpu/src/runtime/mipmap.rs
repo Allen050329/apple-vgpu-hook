@@ -83,7 +83,7 @@ impl crate::observe::Refusal for MipmapStatus {
 ///
 /// Kept as the no-device fallback and pure unit-test helper; product path prefers
 /// Metal-filtered generation.
-pub fn downsample_rgba8_box(
+fn downsample_rgba8_box(
     src: &[u8],
     src_w: u32,
     src_h: u32,

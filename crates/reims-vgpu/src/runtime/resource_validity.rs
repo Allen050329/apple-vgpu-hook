@@ -143,7 +143,7 @@ pub fn apply(
 /// device: it is the part that has to match the host framework's
 /// `setIsHostValid:` / `setIsGuestValid:` semantics, and the part a second
 /// producer could silently disagree with.
-pub fn next_validity(prev: ResourceValidity, ops: InvalidateValidityOps) -> ResourceValidity {
+fn next_validity(prev: ResourceValidity, ops: InvalidateValidityOps) -> ResourceValidity {
     let mut next = prev;
     if ops.clear_host_valid != 0 {
         next.host_valid = false;
@@ -187,7 +187,7 @@ pub enum WritebackLicence {
 ///
 /// Pure — the counting is [`note_writeback_licence`]'s job, so a caller that
 /// only wants to attribute a write does not inflate the flush census.
-pub fn writeback_licence(state: &DeviceState, mapping_id: u32) -> WritebackLicence {
+fn writeback_licence(state: &DeviceState, mapping_id: u32) -> WritebackLicence {
     licence_of(
         state
             .mappings

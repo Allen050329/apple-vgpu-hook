@@ -732,7 +732,7 @@ fn charge_gva_cache_bytes(state: &mut DeviceState, reclaimed: usize, charged: us
 /// entry therefore rides alone and over the cap, matching the sibling memo,
 /// because refusing to cache a surface for being big is how a 4K wallpaper
 /// stops being cached at all.
-pub fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
+fn enforce_gva_cache_cap(state: &mut DeviceState, protect: u64) {
     let cap = state.gva_cache_byte_cap;
     let low_water = cap - cap / 8;
     // The running total, not a fresh sum: this runs on the store path, which is
@@ -840,7 +840,7 @@ pub fn has_gva(state: &DeviceState, gva: u64, width: u32, height: u32) -> bool {
 ///
 /// This is diagnostic provenance for the linear-sample loss proxy; selection
 /// semantics are identical to [`get_gva`].
-pub fn get_gva_with_gen(
+fn get_gva_with_gen(
     state: &DeviceState,
     gva: u64,
     width: u32,
@@ -919,7 +919,7 @@ impl CacheLevel {
 /// an entry's allocation rather than copying it — so a cache figure is the size
 /// of the pixels reachable through the cache, not memory additional to the
 /// windows.
-pub fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
+fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel) {
     (
         CacheLevel::of(&state.host_surfaces, |e| e.bgra.len()),
         CacheLevel::of(&state.host_gva_surfaces, |e| e.bgra.len()),
@@ -952,7 +952,7 @@ pub fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel)
 /// reader. See [`crate::model::GvaBacking`].
 ///
 /// Measure-only, like everything else here.
-pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64) {
+fn gva_cache_staleness(state: &DeviceState) -> (u64, u64) {
     let mut dead_task = 0;
     let mut no_backing = 0;
     for entry in state.host_gva_surfaces.values() {
@@ -1009,7 +1009,7 @@ pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64) {
 ///
 /// Measure-only. Nothing may evict on this yet: it exists to size the rule
 /// before the rule is written.
-pub fn gva_backing_moved<H: HostMemory>(state: &DeviceState, host: &H) -> (u64, u64, u64) {
+fn gva_backing_moved<H: HostMemory>(state: &DeviceState, host: &H) -> (u64, u64, u64) {
     let (mut moved, mut unmapped, mut checked) = (0, 0, 0);
     for &gva in state.host_gva_surfaces.keys() {
         match gva_backing_state(state, host, gva) {
