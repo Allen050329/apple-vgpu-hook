@@ -1627,11 +1627,14 @@ const MAP_PAGES_SITES: &[(&str, usize, Marks, &str)] = &[
     ),
     (
         "runtime/mapper.rs",
-        5,
+        3,
         Marks::Here,
-        "the mapping-keyed rails. `write_mapping_bytes` marks through the \
-         mapping's own page list — a scatter, so never over the span's hull — on \
-         both the contiguous-view fast path and the per-run slow path",
+        "the mapping-keyed rails. Both directions share one walk, \
+         `copy_mapping_runs`, which marks through the mapping's own page list — \
+         a scatter, so never over the span's hull — on both the contiguous-view \
+         fast path and the per-run slow path, and only when the direction is a \
+         write. Was 5 sites while the write and read walks were separate copies \
+         of the same arithmetic",
     ),
     (
         "runtime/mapping_write.rs",

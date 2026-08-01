@@ -1904,6 +1904,167 @@ pub(crate) fn note_mapping_write_footprint(
     }
 }
 
+/// Which way a mapping-rail run copy moves bytes.
+///
+/// The direction is the only thing the write and read walks disagree about, so
+/// it is the only thing that is a parameter.
+enum RunCopy<'a> {
+    Write(&'a [u8]),
+    Read(&'a mut [u8]),
+}
+
+impl RunCopy<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Write(buf) => buf.len(),
+            Self::Read(buf) => buf.len(),
+        }
+    }
+
+    fn is_write(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    /// Move `n` bytes between the caller's buffer at `buf_off` and the mapped
+    /// host range at `host_off`.
+    ///
+    /// # Safety
+    ///
+    /// `host_ptr` must be a live mapping of at least `host_off + n` bytes, and
+    /// `buf_off + n` must be within the caller's buffer. The single caller
+    /// checks both against the run's mapped total before calling.
+    unsafe fn apply(&mut self, host_ptr: usize, host_off: usize, buf_off: usize, n: usize) {
+        match self {
+            Self::Write(buf) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(buf_off),
+                    (host_ptr as *mut u8).add(host_off),
+                    n,
+                );
+            },
+            Self::Read(buf) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (host_ptr as *const u8).add(host_off),
+                    buf.as_mut_ptr().add(buf_off),
+                    n,
+                );
+            },
+        }
+    }
+}
+
+/// Copy `[off, off+len)` between a caller buffer and the mapping's guest pages.
+///
+/// One packed contig view when the mapping has one that covers the range;
+/// otherwise the page list is split into maximal packed runs, each mapped,
+/// copied and unmapped in turn.
+///
+/// **This is the only implementation of that walk.** The
+/// `buf_off`/`host_off`/`n` arithmetic and the bounds check that guards it used
+/// to exist once per direction. One of those directions is the guest-corruption
+/// rail, so a bound corrected on the read copy and not the write copy would
+/// have been silent — and the two are otherwise identical.
+///
+/// `site` names the caller in the refusal lines. Every failure here loses the
+/// caller's bytes, so all four are named; the read direction used to return a
+/// bare `false` on three of them and left the caller with no reason.
+///
+/// Callers flush deferred writeback over the range first, and the write
+/// direction re-checks its [`PagesVouched`] after that flush.
+fn copy_mapping_runs<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    mapping_id: u32,
+    off: u64,
+    mut copy: RunCopy<'_>,
+    site: &str,
+) -> bool {
+    let len = copy.len();
+    let need_end = off.saturating_add(len as u64);
+    // Fast path: one packed view covering the whole range.
+    if let Some((ptr, view_len)) = ensure_contig_view(state, host, mapping_id) {
+        if (view_len as u64) >= need_end && (off as usize) + len <= view_len {
+            // SAFETY: the view covers `need_end`, checked directly above.
+            unsafe { copy.apply(ptr, off as usize, 0, len) };
+            if copy.is_write() {
+                note_mapping_write_footprint(state, mapping_id, off, len as u64);
+            }
+            return true;
+        }
+    }
+    let Some(gpas) = mapping_page_gpas(state, host, mapping_id) else {
+        crate::observe::fail(format!(
+            "{site} fail reason=revalidate mid={mapping_id} off={off:#x} len={len:#x}"
+        ));
+        return false;
+    };
+    let page_size = state.page_size();
+    let page_sz = page_size as usize;
+    let span_end = (gpas.len() as u64).saturating_mul(page_size);
+    if need_end > span_end {
+        crate::observe::fail(format!(
+            "{site} fail reason=short_table mid={mapping_id} off={off:#x} len={len:#x} span={span_end:#x}"
+        ));
+        return false;
+    }
+    flush_retired_views(state, host);
+    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
+    let import_started = std::time::Instant::now();
+    for run in &runs {
+        let run_gpas = &gpas[run.clone()];
+        let run_mlo = (run.start as u64).saturating_mul(page_size);
+        let run_mhi = (run.end as u64).saturating_mul(page_size);
+        let copy_lo = off.max(run_mlo);
+        let copy_hi = need_end.min(run_mhi);
+        if copy_lo >= copy_hi {
+            continue;
+        }
+        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
+            crate::observe::fail(format!(
+                "{site} fail reason=map_pages mid={mapping_id} run_pages={} mlo={run_mlo:#x}",
+                run_gpas.len()
+            ));
+            return false;
+        };
+        let total = run_gpas.len().saturating_mul(page_sz);
+        let buf_off = (copy_lo - off) as usize;
+        let host_off = (copy_lo - run_mlo) as usize;
+        let n = (copy_hi - copy_lo) as usize;
+        if host_off + n > total || buf_off + n > len {
+            host.unmap_pages(ptr, total);
+            crate::observe::fail(format!(
+                "{site} fail reason=run_bounds mid={mapping_id} host_off={host_off:#x} \
+                 buf_off={buf_off:#x} n={n:#x} total={total:#x} len={len:#x}"
+            ));
+            return false;
+        }
+        // SAFETY: the map covers `total`, and `host_off + n <= total` and
+        // `buf_off + n <= len` were both just checked.
+        unsafe { copy.apply(ptr, host_off, buf_off, n) };
+        if copy.is_write() {
+            // Packed run, so the `n` bytes at `host_off` are the `n` bytes at
+            // `run_gpas[0] + host_off`. Marked per run rather than once over
+            // the whole range because the runs are what is contiguous; the
+            // mapping's list between them is not.
+            crate::observe::footprint::note_written_range(
+                crate::observe::footprint::Rail::Mapping,
+                run_gpas[0].saturating_add(host_off as u64),
+                n as u64,
+            );
+        }
+        host.unmap_pages(ptr, total);
+    }
+    let import_us = import_started.elapsed().as_micros() as u64;
+    if mapping_run_import_is_slow(import_us) {
+        crate::observe::off(format!(
+            "{site}_runs mid={mapping_id} us={import_us} bytes={len} pages={} runs={}",
+            gpas.len(),
+            runs.len()
+        ));
+    }
+    true
+}
+
 /// Write `buf` into mapping linear offset `off` via packed map_pages runs.
 ///
 /// Covers fragmented page lists (Linux product): split GPAs into maximal packed
@@ -1956,99 +2117,7 @@ pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     // Sampled payload shape, taken once for the call rather than per run, so a
     // fragmented write and a packed one of the same bytes count the same.
     crate::observe::footprint::note_written_payload(buf);
-    // Fast path: one packed view covering the write.
-    let need_end = off.saturating_add(buf.len() as u64);
-    if let Some((ptr, len)) = ensure_contig_view(state, host, mapping_id) {
-        if (len as u64) >= need_end && (off as usize) + buf.len() <= len {
-            // SAFETY: view covers need_end.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    (ptr as *mut u8).add(off as usize),
-                    buf.len(),
-                );
-            }
-            note_mapping_write_footprint(state, mapping_id, off, buf.len() as u64);
-            return true;
-        }
-    }
-    let gpas = match mapping_page_gpas(state, host, mapping_id) {
-        Some(g) => g,
-        None => {
-            crate::observe::fail(format!(
-                "mapping_write fail reason=revalidate mid={mapping_id} off={off:#x} len={:#x}",
-                buf.len()
-            ));
-            return false;
-        }
-    };
-    let page_size = state.page_size();
-    let page_sz = page_size as usize;
-    let span_end = (gpas.len() as u64).saturating_mul(page_size);
-    if need_end > span_end {
-        crate::observe::fail(format!(
-            "mapping_write fail reason=short_table mid={mapping_id} off={off:#x} len={:#x} span={span_end:#x}",
-            buf.len()
-        ));
-        return false;
-    }
-    flush_retired_views(state, host);
-    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
-    let import_started = std::time::Instant::now();
-    let end = need_end;
-    for run in &runs {
-        let run_gpas = &gpas[run.clone()];
-        let run_mlo = (run.start as u64).saturating_mul(page_size);
-        let run_mhi = (run.end as u64).saturating_mul(page_size);
-        let copy_lo = off.max(run_mlo);
-        let copy_hi = end.min(run_mhi);
-        if copy_lo >= copy_hi {
-            continue;
-        }
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            crate::observe::fail(format!(
-                "mapping_write fail reason=map_pages mid={mapping_id} run_pages={} mlo={run_mlo:#x}",
-                run_gpas.len()
-            ));
-            return false;
-        };
-        let total = run_gpas.len().saturating_mul(page_sz);
-        let buf_off = (copy_lo - off) as usize;
-        let host_off = (copy_lo - run_mlo) as usize;
-        let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > buf.len() {
-            host.unmap_pages(ptr, total);
-            return false;
-        }
-        // SAFETY: map covers total; host_off+n in range.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr().add(buf_off),
-                (ptr as *mut u8).add(host_off),
-                n,
-            );
-        }
-        // Packed run, so the `n` bytes at `host_off` are the `n` bytes at
-        // `run_gpas[0] + host_off`. Marked per run rather than once over
-        // `[off, end)` because the runs are what is contiguous; the mapping's
-        // list between them is not.
-        crate::observe::footprint::note_written_range(
-            crate::observe::footprint::Rail::Mapping,
-            run_gpas[0].saturating_add(host_off as u64),
-            n as u64,
-        );
-        host.unmap_pages(ptr, total);
-    }
-    let import_us = import_started.elapsed().as_micros() as u64;
-    if mapping_run_import_is_slow(import_us) {
-        crate::observe::off(format!(
-            "mapping_write_runs mid={mapping_id} us={import_us} bytes={} pages={} runs={}",
-            buf.len(),
-            gpas.len(),
-            runs.len()
-        ));
-    }
-    true
+    copy_mapping_runs(state, host, mapping_id, off, RunCopy::Write(buf), "mapping_write")
 }
 
 /// Read mapping linear `[off, off+buf.len())` via packed map_pages runs.
@@ -2071,72 +2140,7 @@ pub fn read_mapping_bytes<H: HostMemory + HostOps>(
         off,
         off.saturating_add(buf.len() as u64),
     );
-    let need_end = off.saturating_add(buf.len() as u64);
-    if let Some((ptr, len)) = ensure_contig_view(state, host, mapping_id) {
-        if (len as u64) >= need_end && (off as usize) + buf.len() <= len {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (ptr as *const u8).add(off as usize),
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                );
-            }
-            return true;
-        }
-    }
-    let gpas = match mapping_page_gpas(state, host, mapping_id) {
-        Some(g) => g,
-        None => return false,
-    };
-    let page_size = state.page_size();
-    let page_sz = page_size as usize;
-    let span_end = (gpas.len() as u64).saturating_mul(page_size);
-    if need_end > span_end {
-        return false;
-    }
-    flush_retired_views(state, host);
-    let runs = crate::runtime::gva_view::contig_page_runs(&gpas, page_size);
-    let import_started = std::time::Instant::now();
-    let end = need_end;
-    for run in &runs {
-        let run_gpas = &gpas[run.clone()];
-        let run_mlo = (run.start as u64).saturating_mul(page_size);
-        let run_mhi = (run.end as u64).saturating_mul(page_size);
-        let copy_lo = off.max(run_mlo);
-        let copy_hi = end.min(run_mhi);
-        if copy_lo >= copy_hi {
-            continue;
-        }
-        let Some(ptr) = host.map_pages(run_gpas, page_sz) else {
-            return false;
-        };
-        let total = run_gpas.len().saturating_mul(page_sz);
-        let buf_off = (copy_lo - off) as usize;
-        let host_off = (copy_lo - run_mlo) as usize;
-        let n = (copy_hi - copy_lo) as usize;
-        if host_off + n > total || buf_off + n > buf.len() {
-            host.unmap_pages(ptr, total);
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                (ptr as *const u8).add(host_off),
-                buf.as_mut_ptr().add(buf_off),
-                n,
-            );
-        }
-        host.unmap_pages(ptr, total);
-    }
-    let import_us = import_started.elapsed().as_micros() as u64;
-    if mapping_run_import_is_slow(import_us) {
-        crate::observe::off(format!(
-            "mapping_read_runs mid={mapping_id} us={import_us} bytes={} pages={} runs={}",
-            buf.len(),
-            gpas.len(),
-            runs.len()
-        ));
-    }
-    true
+    copy_mapping_runs(state, host, mapping_id, off, RunCopy::Read(buf), "mapping_read")
 }
 
 /// Report a per-run host-pointer import that took at least a millisecond.
