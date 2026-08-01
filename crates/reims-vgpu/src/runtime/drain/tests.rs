@@ -1851,7 +1851,10 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
     assert!(c.note_wait(1, 5_000).is_none(), "first call arms only");
 
     for _ in 0..500 {
-        c.note_uncontended();
+        assert!(
+            c.note_uncontended(|| 5_050).is_none(),
+            "free acquisitions inside the window must not report"
+        );
     }
     // Two waits shorter than a frame, one longer.
     c.note_wait(200, 5_100);
@@ -1868,6 +1871,41 @@ fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions
     // it are both real waits and are counted in the window they bound.
     assert!(line.contains("waits=5"), "{line}");
     assert!(line.contains("wait_us=31151"), "{line}");
+}
+
+/// A window in which the vCPU never blocked must still report.
+///
+/// As first shipped the census was driven only from the wait path, so zero
+/// waits emitted zero lines — and a silent log then means both "the drain never
+/// stalled the guest" and "no IOSFC traffic reached this device at all". A live
+/// driven boot produced exactly that silence, which reads as the reassuring one
+/// of the two and is worthless as evidence either way. The free path now drives
+/// the same report, so the strong negative (`waits=0` beside a large
+/// `uncontended`) is something the log can actually say.
+#[test]
+fn the_vcpu_lock_census_reports_a_window_that_never_blocked() {
+    use crate::runtime::drain::{UNCONTENDED_POLL, VcpuLockCensus};
+    let c = VcpuLockCensus::default();
+    let mut line = None;
+    // The clock is only read at a poll, so the window spans exactly one poll
+    // interval: the acquisition that arms it and the one that closes it.
+    for i in 0..=UNCONTENDED_POLL {
+        let now = if i == 0 { 5_000 } else { 6_400 };
+        if let Some(l) = c.note_uncontended(|| now) {
+            assert!(line.is_none(), "one report per window");
+            line = Some(l);
+        }
+    }
+    let line = line.expect("a window of free acquisitions must report");
+    assert!(line.contains("waits=0"), "{line}");
+    assert!(line.contains("frame_waits=0"), "{line}");
+    assert!(line.contains("max_wait_us=0"), "{line}");
+    assert!(line.contains("win_ms=1400"), "{line}");
+    // Every acquisition up to and including the one that closed the window.
+    assert!(
+        line.contains(&format!("uncontended={}", UNCONTENDED_POLL + 1)),
+        "{line}"
+    );
 }
 
 

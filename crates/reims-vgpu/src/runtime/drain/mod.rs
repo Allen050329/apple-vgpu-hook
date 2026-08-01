@@ -3243,8 +3243,13 @@ impl DrainDutyCensus {
 /// it: the guest's MMIO access is stopped for exactly this long, on the vCPU
 /// thread, inside `device_iosfc_read`/`device_iosfc_write`.
 ///
-/// Only the contended path is timed. The uncontended path takes `try_lock` and
-/// never reads the clock, so a fast access pays nothing for this.
+/// Only the contended path is timed: the uncontended path takes `try_lock` and
+/// costs an atomic increment, so a fast access pays nothing for the measurement
+/// itself. It does still drive the report, once per [`UNCONTENDED_POLL`]
+/// acquisitions — without that, a window with zero waits emits nothing and
+/// silence means both "the guest was never blocked" and "no IOSFC traffic
+/// arrived". Reading the second as the first is how an instrument talks someone
+/// out of a real stall.
 #[derive(Default)]
 pub(crate) struct VcpuLockCensus {
     waits: std::sync::atomic::AtomicU64,
@@ -3256,10 +3261,31 @@ pub(crate) struct VcpuLockCensus {
     last_report_ms: std::sync::atomic::AtomicU64,
 }
 
+/// One in this many uncontended acquisitions reads the clock.
+///
+/// The uncontended path is the guest's hot MMIO path — hundreds of thousands of
+/// acquisitions a second on a driven boot — so it cannot afford an
+/// `Instant::now()` each time. It still has to reach the report, or a window
+/// with no waits at all stays silent and "the guest was never blocked" is
+/// indistinguishable from "no IOSFC traffic reached this device". Those are
+/// opposite conclusions and the whole point of the census is to tell them apart.
+const UNCONTENDED_POLL: u64 = 1024;
+
 impl VcpuLockCensus {
-    pub(crate) fn note_uncontended(&self) {
-        self.uncontended
+    /// Count one free acquisition, returning the line when a report is due.
+    ///
+    /// The clock is read once per [`UNCONTENDED_POLL`] acquisitions, which puts
+    /// the report's granularity at that many MMIO accesses rather than at the
+    /// exact second boundary. `win_ms` is measured, not assumed, so a window
+    /// that closes late reports its true length.
+    pub(crate) fn note_uncontended(&self, now_ms: impl FnOnce() -> u64) -> Option<String> {
+        let prior = self
+            .uncontended
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !prior.is_multiple_of(UNCONTENDED_POLL) {
+            return None;
+        }
+        self.maybe_report(now_ms())
     }
 
     /// Record one contended wait and return the line when a report is due.
@@ -3271,6 +3297,12 @@ impl VcpuLockCensus {
         if us >= DRAIN_TRANCHE_SLOW_US {
             self.frame_waits.fetch_add(1, Relaxed);
         }
+        self.maybe_report(now_ms)
+    }
+
+    /// The window logic both paths share.
+    fn maybe_report(&self, now_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
         let last = self.last_report_ms.load(Relaxed);
         if last == 0 {
             self.last_report_ms.store(now_ms, Relaxed);
@@ -3297,8 +3329,13 @@ static VCPU_LOCK: std::sync::LazyLock<VcpuLockCensus> =
     std::sync::LazyLock::new(VcpuLockCensus::default);
 
 /// Count one uncontended device-lock acquisition from the vCPU thread.
+///
+/// Emits the same one-line census as the wait path, so a window that saw
+/// traffic but never blocked still says so.
 pub fn note_vcpu_lock_free() {
-    VCPU_LOCK.note_uncontended();
+    if let Some(line) = VCPU_LOCK.note_uncontended(|| crate::observe::elapsed_ms() as u64) {
+        crate::observe::off(line);
+    }
 }
 
 /// Record one contended device-lock wait from the vCPU thread; emits at most
