@@ -1954,24 +1954,35 @@ const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 /// threshold only — never a correctness gate; below it the bind takes the CPU
 /// staging read instead.
 ///
-/// **The number is not derived and the claim behind it is not measured.** Its
-/// sibling [`ZERO_COPY_SAMPLED_MIN_BYTES`] carries a census basis — 1 051
-/// sampled declines, 100 % of them this floor — and this one carries only an
-/// assertion that "the CPU staging read is cheaper", which nothing has
-/// compared. The comparison is also not directly observable: the cost of the
-/// gather this floor refuses is never paid, so there is no counterfactual in
-/// the log.
+/// # The floor earns its keep, measured
 ///
-/// What *is* observable is the population it governs, and
-/// `zc_buffer_below_floor` against `zc_buffer_gathered` is it. **First reading:
-/// 19 218 declined against 126 693 gathered — 13 % of binds — on a driven
-/// x86/Vulkan boot** (Chess, Maps, the WebGL aquarium, Wikipedia, apple.com).
+/// It governs one bind in eight: `zc_buffer_below_floor` 19 218 against
+/// `zc_buffer_gathered` 126 693 on a driven x86/Vulkan boot (Chess, Maps, the
+/// WebGL aquarium, Wikipedia, apple.com).
 ///
-/// So the floor is not inert and cannot simply be dropped; it decides one bind
-/// in eight. That makes the unmeasured cost claim worth settling rather than
-/// worth ignoring, and the way to settle it is a boot with the floor at 0
-/// compared against this one on `draw_phase`. Until then the 16 KiB stands as
-/// what it is: a guess with a known blast radius.
+/// Two boots of that same drive — one with the floor at 16 KiB, one with it at
+/// 0 so every bind is gathered — on `draw_phase` normalised per draw (81 759 vs
+/// 81 055 draws, 0.9 % apart):
+///
+/// | field       | floor 16 KiB | floor 0 |   delta |
+/// |-------------|-------------:|--------:|--------:|
+/// | `prep_us`   |        16.13 |   16.56 |  +2.7 % |
+/// | `stage_us`  |        13.33 |   13.49 |  +1.3 % |
+/// | `record_us` |         3.87 |    3.82 |  -1.1 % |
+/// | `submit_us` |        42.87 |   48.59 | +13.3 % |
+/// | total       |        76.19 |   82.46 |  +8.2 % |
+///
+/// Removing the floor costs 8 % of per-draw device time, so it stays. But the
+/// reason it used to give was wrong, and the table is how. The old comment said
+/// "below this the CPU staging read is cheaper"; `stage_us` barely moved when
+/// 19 218 binds stopped being staged, so those small buffers were never the
+/// staging cost. The cost is in **`submit_us`** — every gathered bind is a
+/// recorded GPU gather, and 19 218 more of them make the submit 13 % dearer.
+///
+/// What is still not established is **16 KiB specifically**. This says a floor
+/// above zero beats no floor on this workload; it does not say this is the best
+/// one. A sweep would settle that, and until one is run the value is a guess
+/// whose direction has evidence and whose magnitude does not.
 #[cfg(feature = "backend-vulkan")]
 const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 
