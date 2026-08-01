@@ -1720,9 +1720,16 @@ fn every_map_pages_caller_is_classified_and_the_writers_mark_the_footprint() {
             // a write's frames through a mapping's scatter page list and marks
             // them. It is a mark, so a file calling it is a marking file; leaving
             // it off this list would fail a rail that does record its writes.
+            // Two spellings, because there are two markers. `note_written_range`
+            // is the direct one; `note_mapping_write_footprint` resolves a
+            // write's frames through a mapping's scatter page list first, which
+            // is what keeps a fragmented surface from claiming the frames
+            // between its pages. There was a third accepted spelling,
+            // `footprint::note_written_pages`, and no product rail ever called
+            // it — a gate that accepts a call nothing makes can license a file
+            // it never should.
             if !is_definition
                 && (line.contains("footprint::note_written_range(")
-                    || line.contains("footprint::note_written_pages(")
                     || line.contains("note_mapping_write_footprint("))
             {
                 marks.insert(rel_path.clone());

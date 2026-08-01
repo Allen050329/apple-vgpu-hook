@@ -483,15 +483,6 @@ pub fn note_written_range_licensed(rail: Rail, gpa: u64, len: u64, licence: Writ
     }
 }
 
-/// Record a written page for each GPA in `gpas`, each covering `page_size`
-/// bytes. The scatter form: a mapping's page list is not contiguous, so a range
-/// over its hull would claim frames between the pages that no write reached.
-pub fn note_written_pages<I: IntoIterator<Item = u64>>(rail: Rail, gpas: I, page_size: u64) {
-    for gpa in gpas {
-        note_written_range(rail, gpa, page_size.max(1));
-    }
-}
-
 /// One in this many guest writes is scanned for its payload shape.
 ///
 /// Sampled rather than exhaustive because the scan spans the whole payload —
@@ -786,7 +777,8 @@ mod tests {
     #[test]
     fn marking_the_same_frame_twice_counts_it_once() {
         let _g = fresh();
-        note_written_pages(Rail::Mapping, [0x5000, 0x5000], 0x1000);
+        note_written_range(Rail::Mapping, 0x5000, 0x1000);
+        note_written_range(Rail::Mapping, 0x5000, 0x1000);
         note_written_range(Rail::Mapping, 0x5fff, 1);
         assert_eq!(counts().0, 1, "distinct frames, not marks");
     }
@@ -797,7 +789,9 @@ mod tests {
         // A fragmented surface's page list. A range over its hull would mark
         // 0x2000..0x8000 as well, which is memory belonging to someone else —
         // and every one of those frames would then read as a hit.
-        note_written_pages(Rail::Mapping, [0x1000, 0x9000], 0x1000);
+        for gpa in [0x1000u64, 0x9000] {
+            note_written_range(Rail::Mapping, gpa, 0x1000);
+        }
         assert_eq!(counts().0, 2);
         assert!(!wrote_gpa(0x5000), "the gap is not ours to claim");
     }
@@ -805,7 +799,7 @@ mod tests {
     #[test]
     fn an_arm64_page_marks_its_four_frames_exactly() {
         let _g = fresh();
-        note_written_pages(Rail::Mapping, [0x4000], 1 << 14);
+        note_written_range(Rail::Mapping, 0x4000, 1 << 14);
         assert_eq!(counts().0, 4, "16 KiB is four 4 KiB frames");
         for f in 4..8u64 {
             assert!(wrote_gpa(f << 12));
