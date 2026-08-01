@@ -115,7 +115,7 @@ fn contig_for_span<H: HostMemory + HostOps>(
 
 /// Take the write proof at the head of a writer, naming the rail that wanted it.
 ///
-/// [`mapper::vouch_mapping_pages`] already fail-logs *why* a walk refused, with
+/// [`mapper::vouch_mapping_pages_verdict`] already fail-logs *why* a walk refused, with
 /// the page and both translations. This adds the one fact that line cannot
 /// carry: which writer was about to use the list. Four rails write through
 /// `page_entries` and they fail for different reasons at different rates, so a
@@ -1712,8 +1712,9 @@ mod tests {
         let survivor = window(1024, 1088);
         state.compute_storage_residency.insert(hit, 5);
         state.compute_storage_residency.insert(survivor, 5);
-        let vouched =
-            mapper::vouch_mapping_pages(&mut state, &host, 7).expect("no walk to contradict");
+        let vouched = mapper::vouch_mapping_pages_verdict(&mut state, &host, 7)
+            .1
+            .expect("no walk to contradict");
         assert!(mapper::write_mapping_bytes(
             &mut state, &mut host, 7, 16, &[0u8; 32], &vouched
         ));

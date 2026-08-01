@@ -1322,21 +1322,11 @@ impl PagesVouched {
 /// "verified": a mapping with no [`crate::model::Type4Walk`] latch has a page
 /// list this witness cannot speak about, and refusing every write to it would
 /// blank surfaces the device has no evidence against.
-pub fn vouch_mapping_pages<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &H,
-    mapping_id: u32,
-) -> Option<PagesVouched> {
-    vouch_mapping_pages_verdict(state, host, mapping_id).1
-}
-
-/// [`vouch_mapping_pages`], also handing back what the re-walk found.
-///
-/// A caller that emits counters needs the verdict and not just the token,
-/// because `Unwitnessed` and `Ours` both yield a token and only one of them is
-/// a clean answer. Folding them together would make a boot that never armed the
-/// guard indistinguishable from one with no drift — a count that reads as
-/// success when it is the opposite.
+/// The verdict is handed back alongside the token, not folded into it, because
+/// `Unwitnessed` and `Ours` both yield a token and only one of them is a clean
+/// answer. A caller that emits counters needs to tell them apart: folding them
+/// together would make a boot that never armed the guard indistinguishable from
+/// one with no drift — a count that reads as success when it is the opposite.
 pub fn vouch_mapping_pages_verdict<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &H,
@@ -2080,7 +2070,7 @@ fn copy_mapping_runs<H: HostMemory + HostOps>(
 /// map fails.
 ///
 /// `vouched` is the caller's proof that the page list still names the surface's
-/// guest memory ([`vouch_mapping_pages`]); it is a parameter rather than a call
+/// guest memory ([`vouch_mapping_pages_verdict`]); it is a parameter rather than a call
 /// here because two callers write a row at a time and the walk is per page.
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2395,7 +2385,9 @@ mod revalidate_tests {
         assert!(!read_mapping_bytes(
             &mut state, &mut host, mid, 0, &mut byte,
         ));
-        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
         assert!(!write_mapping_bytes(
             &mut state,
             &mut host,
@@ -2540,7 +2532,9 @@ mod revalidate_tests {
             "fragmented list must not pack under strict_linux_map"
         );
         let payload = b"FRAG-MULTI-IMPORT-OK!!!!"; // 24 bytes
-        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
         assert!(write_mapping_bytes(
             &mut state, &mut host, mid, 0, payload, &vouched
         ));
@@ -2605,7 +2599,9 @@ mod revalidate_tests {
                 (((gpa1 >> PAGE_SHIFT_X86) as u32) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID,
             ];
         }
-        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
 
         // 24 bytes at offset 0: page 0 only.
         assert!(write_mapping_bytes(
@@ -2900,7 +2896,9 @@ mod revalidate_tests {
             ensure_contig_view(&mut state, &mut host, mid).is_some(),
             "the fixture must take the fast path or it is testing the other one"
         );
-        let vouched = vouch_mapping_pages(&mut state, &host, mid).expect("no walk to contradict");
+        let vouched = vouch_mapping_pages_verdict(&mut state, &host, mid)
+            .1
+            .expect("no walk to contradict");
 
         // Entirely inside page 1: the offset, not the base, decides the frame.
         assert!(write_mapping_bytes(

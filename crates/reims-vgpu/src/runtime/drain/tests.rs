@@ -1988,7 +1988,7 @@ fn unmap_memory_retains_gva_host_cache_for_sample() {
         px[2] = 81;
         px[3] = 255;
     }
-    surface_cache::store_gva(&mut state, gva, w, h, bgra);
+    surface_cache::store_gva_owned(&mut state, gva, w, h, bgra, 0, None);
     // Simulated HostOps view of the same GVA (zero-copy import substrate).
     state.gva_host_views.push(GvaHostView {
         task_id: 1,
@@ -2099,7 +2099,7 @@ fn map_memory2_does_not_flush_gva_host_cache_on_wire() {
     bgra[1] = 126;
     bgra[2] = 81;
     bgra[3] = 255;
-    surface_cache::store_gva(&mut state, gva, 2, 2, bgra);
+    surface_cache::store_gva_owned(&mut state, gva, 2, 2, bgra, 0, None);
 
     let mut pl = vec![0u8; 20];
     st32(&mut pl[0..], 1);

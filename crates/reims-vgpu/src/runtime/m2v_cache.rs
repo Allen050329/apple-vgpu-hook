@@ -724,7 +724,12 @@ pub fn translate_cached_kernel_reflected(
     Ok(shader)
 }
 
-/// Snapshot counters (tests / census).
+/// Snapshot counters for tests.
+///
+/// The census does not come through here — the `linux_m2v_translate ok` line
+/// above reads `hits`/`misses` off the lock it already holds. This is only how a
+/// test asks the same question from outside, which is why it cannot be
+/// `#[cfg(test)]`: `tests/reflection_adoption.rs` is a separate crate.
 pub fn stats() -> (u64, u64, usize) {
     let c = global().lock().unwrap_or_else(|e| e.into_inner());
     (c.hits, c.misses, c.entries.len())

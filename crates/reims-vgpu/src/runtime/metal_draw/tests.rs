@@ -2998,12 +2998,14 @@ fn color_load_seed_uses_provenance_and_preserves_black() {
         h,
         vec![0, 180, 0, 255, 0, 180, 0, 255],
     );
-    crate::runtime::surface_cache::store_gva(
+    crate::runtime::surface_cache::store_gva_owned(
         &mut state,
         target_gva,
         w,
         h,
         vec![0, 0, 0, 255, 0, 0, 0, 255],
+        0,
+        None,
     );
 
     let seed = seed_color_load(
