@@ -2833,6 +2833,35 @@ fn load_linear_guest_memoized<M: HostMemory + HostOps>(
 /// double boot 1 and still short of the ~127 threshold, so the reliable
 /// high-recycling defect remains unscored — nothing here shows it is fixed, only
 /// that it did not appear. `lin_rung_blank_with_host_entry` was 0 on both.
+///
+/// ## Read the two zeros above as fail-line counts, not occurrence counts
+///
+/// `lin_rung_blank_with_host_entry` names **two different quantities**, and
+/// every "0" recorded above is the smaller one. The `fail` line below is behind
+/// `first_sight` on `(gva, w, h)`, so it fires once per distinct span for the
+/// life of the boot; the `store_route` counter beside it is unconditional. A
+/// boot that revisits the same spans can therefore report a handful of lines
+/// and hundreds of occurrences, and the two are not comparable.
+///
+/// Three independent driven boots on a later binary — Chess, Maps, the WebGL
+/// aquarium, page-downs, a title-bar drag, apple.com — read:
+///
+/// ```text
+/// store_route occurrences   263 / 299 / 360
+/// distinct fail lines        15          (same boot as the 360)
+/// ```
+///
+/// Every sample was 64x64 on `rung=guest_memo`, which is the icon-cell geometry
+/// this section was written to chase. What that does *not* establish is a
+/// regression: the readings above came from `icon-boot-ab.sh`'s round harness on
+/// an older binary, and this is a different workload on a different build, so
+/// build and workload are confounded and neither can be blamed. Isolating it
+/// means re-running that harness and reading the occurrence counter, not the
+/// line count.
+///
+/// What it does establish is that the "0"s above cannot be reasoned from as
+/// though the class had stopped happening. On the general workload it happens
+/// roughly three hundred times a boot.
 #[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
