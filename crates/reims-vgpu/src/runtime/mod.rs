@@ -69,9 +69,8 @@ pub mod task_slot;
 pub mod texture;
 
 pub use drain::{
-    complete_async_job, drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending,
-    enqueue_async_stamp_surface, signal_display_vbl, wait_surface_mapping,
-    wait_surface_other_channels, write_stamp, Packet, PacketError,
+    drain_child_fifo, drain_main_fifo, drain_other_child_fifos, drain_pending, signal_display_vbl,
+    write_stamp, Packet, PacketError,
 };
 pub use host::{
     read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,

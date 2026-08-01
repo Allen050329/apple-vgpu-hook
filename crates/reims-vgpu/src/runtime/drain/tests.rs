@@ -811,32 +811,6 @@ fn map_surface_clears_stale_geom() {
     assert_eq!(m.height, 0);
 }
 
-/// qemu-shim: DisplaySwap present completion is with the packet stamp
-/// after +0x188 retain (PGDisplay presentFrame completion block), not
-/// deferred until host paint. waitForPendingFrames gates *entry*.
-#[test]
-fn display_swap_stamp_ready_after_present_retain_not_paint() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let host = FakeHost::new();
-    // Sync stamp path: ready immediately, drains to write_stamp.
-    let slot = StampSlot {
-        stamp_index: 0,
-        stamp_value: 42,
-        ready: true,
-        job_id: None,
-        target_mapping: 0,
-    };
-    state.child_stamps[4].push(slot);
-    let ready = state.child_stamps[4].drain_ready();
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].stamp_value, 42);
-    assert!(
-        state.child_stamps[4].queue.is_empty(),
-        "ready present stamp flushes without waiting for paint"
-    );
-    let _ = host;
-}
-
 /// x86 Ventura/Tahoe display pipe: present opcode 6 paints like DisplaySwap.
 #[test]
 fn present_x86_op6_paints_surface_id_mapping() {
@@ -1262,32 +1236,6 @@ fn wait_surface_noop_when_no_async_job() {
         2,
         2
     ));
-    let gen = state.mappings.get(&7).unwrap().content_generation;
-    state.active_child_mask = (1 << 1) | (1 << 4);
-    let out = wait_surface_other_channels(&mut state, &mut host, 4, 7);
-    assert_eq!(out, gen, "no async job ⇒ return current gen");
-    assert_eq!(wait_surface_mapping(&mut state, &mut host, 0), 0);
-}
-
-/// qemu-shim e2e: surface_inflight sees async job target_mapping until
-/// complete_async_job; wait_surface after complete is quiet.
-#[test]
-fn wait_surface_surface_inflight_tracks_async_target_mapping() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let job = enqueue_async_stamp_surface(&mut state, 1, 0, 99, 42).expect("job");
-    assert!(
-        surface_inflight(&state, 42),
-        "not-ready job with target_mapping must be inflight"
-    );
-    assert!(
-        !surface_inflight(&state, 7),
-        "other mapping is not inflight"
-    );
-    // After complete, slot is ready and drained — no longer inflight.
-    complete_async_job(&mut state, &mut host, 1, job);
-    assert!(!surface_inflight(&state, 42));
-    assert_eq!(wait_surface_mapping(&mut state, &mut host, 42), 0);
 }
 
 /// qemu-shim dual-mid: incomplete last_store on one mid (logo/partial)

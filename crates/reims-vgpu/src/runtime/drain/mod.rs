@@ -5,7 +5,7 @@
 
 use crate::contract::endian::{ld16, ld32, st16, st32};
 use crate::model::*;
-use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, StampSlot};
+use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault};
 use crate::observe::Emit;
 use crate::runtime::decode::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
@@ -620,7 +620,6 @@ fn process_root_packet<H: HostMemory + HostOps>(
                     state.translation_order_hold_mask &= !bit;
                     state.present_translation_hold_mask &= !bit;
                     state.child_rings[ch as usize] = Default::default();
-                    state.child_stamps[ch as usize].reset();
                 }
             }
         }
@@ -1424,8 +1423,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         channel_id
     };
     drain_other_child_fifos(state, host, skip);
-    // Archive render_wait_surface: already-submitted async jobs only.
-    let _ = wait_surface_mapping(state, host, mapping);
     drain_other_child_fifos(state, host, skip);
     // Main-ring Dekker only (not full drain_stranded): guest may
     // publish root control work while child drains ran. Full
@@ -2219,7 +2216,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // reuse/clear write pixels into pages the guest has recycled.
                 let object_id = crate::contract::endian::ld32(&packet.payload[0..]);
                 let task_id = crate::contract::endian::ld32(&packet.payload[4..]);
-                let _ = wait_surface_mapping(state, host, object_id);
                 // Never write guest pages here — the delete trails the guest's
                 // CPU-side release asynchronously and the pages may already be
                 // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
@@ -2414,7 +2410,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         let mut flushed = 0u32;
                         let mut flush_ok = true;
                         for &oid in &cmd.object_ids {
-                            let _gen = wait_surface_mapping(state, host, oid);
                             let (ok, n) =
                                 crate::runtime::storage_flush::flush_mapping_for_guest_read(
                                     state, host, oid,
@@ -2679,22 +2674,18 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
-                // Ordered stamp: sync packets ready immediately (DisplaySwap
-                // included — PGDisplay present completion after +0x188 retain,
-                // not after host encode/paint). target_mapping=0: no async
-                // surface hazard for wait_surface.
-                let slot = StampSlot {
-                    stamp_index,
-                    stamp_value: packet.completion_stamp,
-                    ready: true,
-                    job_id: None,
-                    target_mapping: 0,
-                };
-                state.child_stamps[channel_id as usize].push(slot);
-                let ready = state.child_stamps[channel_id as usize].drain_ready();
-                for s in ready {
-                    write_stamp(state, host, s.stamp_index, s.stamp_value);
-                }
+                // Completion stamp. Execution is sync-per-packet: the packet's
+                // work is done by the time control reaches here, so the stamp is
+                // owed now. DisplaySwap included — PGDisplay present completion
+                // follows the +0x188 retain, not host encode/paint.
+                //
+                // The archive orders stamps through a per-channel queue because
+                // its draw jobs complete asynchronously (`ApplePVGPUDrawJob`,
+                // `apple_pv_gpu_render_wait_surface`). If this device ever grows
+                // an async execution path, that ordering has to come back with
+                // it — and be written against the async model that then exists,
+                // not inherited from an empty queue.
+                write_stamp(state, host, stamp_index, packet.completion_stamp);
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;
@@ -3696,67 +3687,7 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
     }
 }
 
-/// Archive `apple_pv_gpu_surface_inflight`: true iff a not-ready stamp slot
-/// names this type-11 mapping as its async write target.
-fn surface_inflight(state: &DeviceState, mapping: u32) -> bool {
-    if mapping == 0 {
-        return false;
-    }
-    for ch in 0..MAX_CHANNELS {
-        for slot in &state.child_stamps[ch].queue {
-            if !slot.ready && slot.target_mapping == mapping {
-                return true;
-            }
-        }
-    }
-    false
-}
 
-/// Archive `apple_pv_gpu_render_wait_surface` for a type-11 mapping.
-///
-/// Archive (apple-pv-gpu-render.c):
-/// ```c
-/// if (draw_jobs_inflight == 0 || !surface_inflight(s, is_gva, key)) return;
-/// while (draw_jobs_inflight > 0 && surface_inflight(s, is_gva, key))
-///     aio_poll(...);
-/// ```
-/// Waits only for **already-submitted** async jobs that still write this
-/// surface. Does **not** drain other child FIFOs, does **not** loop on
-/// `content_generation`, does **not** require multiple "quiet rounds".
-///
-/// Product currently completes draws before the packet stamp (sync-per-packet),
-/// so this is a no-op unless an async job was enqueued with `target_mapping`.
-/// Returns the mapping's content generation after the wait (0 if unmapped).
-pub fn wait_surface_other_channels<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    _skip_channel: u32,
-    mapping: u32,
-) -> u32 {
-    let _ = host;
-    if mapping == 0 {
-        return 0;
-    }
-    // Product has no host-side aio_poll worker loop yet. When async jobs with
-    // target_mapping are introduced, completions must mark the slot ready
-    // (complete_async_job) before or during this wait — same as archive BH.
-    // Never invent FIFO drains here as a substitute for surface_inflight.
-    debug_assert!(
-        !surface_inflight(state, mapping),
-        "wait_surface: async job still targets mapping {mapping} (no product aio_poll)"
-    );
-    mapping_content_gen(state, mapping)
-}
-
-/// RAW barrier before snapshotting a type-11 surface (DisplaySwap present,
-/// sample Load, color Load seed). Same archive `render_wait_surface` path.
-pub fn wait_surface_mapping<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    mapping: u32,
-) -> u32 {
-    wait_surface_other_channels(state, host, 0, mapping)
-}
 
 /// Host paint consumed the current +0x188 retain (Painted or Unchanged).
 ///
@@ -3783,15 +3714,6 @@ fn note_present_backpressure_hold(state: &mut DeviceState, channel: u32, head: u
         "THRASH present_action_starvation reason=pending_frames_cap ch={channel} head={head} tail={tail} unpainted={} episode={}",
         state.present.unpainted_presents, state.present.backpressure_hold_count
     ));
-}
-
-#[inline]
-fn mapping_content_gen(state: &DeviceState, mapping: u32) -> u32 {
-    state
-        .mappings
-        .get(&mapping)
-        .map(|m| m.content_generation)
-        .unwrap_or(0)
 }
 
 /// Publish the poll-tick/Dekker rescue to the asynchronous drain owner.
@@ -3902,50 +3824,6 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // Land GVA render-Store windows whose task died this drain (cache-only —
     // the GVA walk went with the task) and unpin their residents.
     crate::runtime::storage_flush::retire_gva_windows(state, host);
-}
-
-/// Enqueue an async stamp that holds the channel order until marked ready.
-///
-/// `target_mapping` is the type-11 surface this job writes (0 = none) — archive
-/// `DrawJob.mapping_id` for `surface_inflight` / `render_wait_surface`.
-pub fn enqueue_async_stamp_surface(
-    state: &mut DeviceState,
-    channel_id: u32,
-    stamp_index: u32,
-    stamp_value: u32,
-    target_mapping: u32,
-) -> Option<u64> {
-    if channel_id as usize >= MAX_CHANNELS {
-        return None;
-    }
-    let job = state.alloc_job_id();
-    state.child_stamps[channel_id as usize].push(StampSlot {
-        stamp_index,
-        stamp_value,
-        ready: false,
-        job_id: Some(job),
-        target_mapping,
-    });
-    Some(job)
-}
-
-/// Complete an async job and fire any leading ready stamps.
-pub fn complete_async_job<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    channel_id: u32,
-    job_id: u64,
-) {
-    if channel_id as usize >= MAX_CHANNELS {
-        return;
-    }
-    if !state.child_stamps[channel_id as usize].mark_ready(job_id) {
-        return;
-    }
-    let ready = state.child_stamps[channel_id as usize].drain_ready();
-    for s in ready {
-        write_stamp(state, host, s.stamp_index, s.stamp_value);
-    }
 }
 
 #[cfg(test)]

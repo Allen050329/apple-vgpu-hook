@@ -10,7 +10,7 @@ mod state;
 pub use lru_memo::LruBytesMemo;
 pub use regs::*;
 pub use state::{
-    ChannelRing, ChannelStamps, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
+    ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
     DeviceState, DisplayHandshake, ExecFault, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
     FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
     GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView,
@@ -18,7 +18,7 @@ pub use state::{
     GVA_EVICTION_WITNESS_KEYS,
     IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry, MmioWindow,
     MrtSecondaryRecord, PacketFault, PaintSrc,
-    PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity, StampSlot,
+    PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity,
     SurfaceWriteKind,
     TaskEntry, TaskMapSpan, Type4Walk, WriteGate,
 };
@@ -117,7 +117,7 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::contract::endian::st32;
     use crate::runtime::{
-        FakeHost, HostActionKind, HostMemory, complete_async_job, enqueue_async_stamp_surface,
+        FakeHost, HostActionKind, HostMemory,
     };
 
     #[test]
@@ -304,29 +304,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stamp_order_async_then_sync() {
-        let mut d = dev();
-        let mut h = FakeHost::new();
-        setup_boot_regs(&mut d, &mut h);
-        let ch = 1u32;
-        let job = enqueue_async_stamp_surface(&mut d.state, ch, ch, 5, 0).unwrap();
-        d.state.child_stamps[ch as usize].push(StampSlot {
-            stamp_index: ch,
-            stamp_value: 6,
-            ready: true,
-            job_id: None,
-            target_mapping: 0,
-        });
-        let ready = d.state.child_stamps[ch as usize].drain_ready();
-        assert!(ready.is_empty());
-        complete_async_job(&mut d.state, &mut h, ch, job);
-        assert_eq!(
-            h.get_u32(pfn_to_gpa(0x10, PAGE_SHIFT_ARM64E) + ch as u64 * 4),
-            6
-        );
-        assert!(h.action_count(HostActionKind::IrqGfxPulse) >= 2);
-    }
 
     #[test]
     fn reset_clears_state() {

@@ -1,7 +1,7 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
 use crate::model::{GFX_MMIO_SIZE, LruBytesMemo, MAX_CHANNELS, MAX_MAPPINGS, MAX_TASKS};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -298,60 +298,6 @@ pub struct ChannelRing {
     pub base_pfn: u32,
     pub length: u32,
     pub page_gpas: Vec<u64>,
-}
-
-/// Ordered completion stamp slot (submission order per channel).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StampSlot {
-    pub stamp_index: u32,
-    pub stamp_value: u32,
-    /// False while an async job owns this slot.
-    pub ready: bool,
-    /// Deferred job id (opaque); None = sync stamp.
-    pub job_id: Option<u64>,
-    /// Type-11 color/write target for async draw/compute jobs (`0` = none).
-    /// Archive `ApplePVGPUDrawJob.mapping_id` / compute image mapping — used by
-    /// `render_wait_surface` / product `surface_inflight` only.
-    pub target_mapping: u32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ChannelStamps {
-    pub queue: VecDeque<StampSlot>,
-}
-
-impl ChannelStamps {
-    pub fn reset(&mut self) {
-        self.queue.clear();
-    }
-
-    /// Enqueue a stamp. Fires immediately only if ready and queue was empty of pending.
-    pub fn push(&mut self, slot: StampSlot) {
-        self.queue.push_back(slot);
-    }
-
-    /// Mark the first slot with `job_id` ready.
-    pub fn mark_ready(&mut self, job_id: u64) -> bool {
-        for s in self.queue.iter_mut() {
-            if s.job_id == Some(job_id) {
-                s.ready = true;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Pop all leading ready slots (in order).
-    pub fn drain_ready(&mut self) -> Vec<StampSlot> {
-        let mut out = Vec::new();
-        while let Some(front) = self.queue.front() {
-            if !front.ready {
-                break;
-            }
-            out.push(self.queue.pop_front().unwrap());
-        }
-        out
-    }
 }
 
 /// Task directory / object-list ownership.
@@ -1851,7 +1797,6 @@ pub struct DeviceState {
     pub present_translation_hold_mask: u32,
     pub pending: PendingWork,
     pub child_rings: [ChannelRing; MAX_CHANNELS],
-    pub child_stamps: [ChannelStamps; MAX_CHANNELS],
     pub tasks: [TaskEntry; MAX_TASKS],
     /// Count of MapMemory2/UnmapMemory packets (measure census).
     pub map_family_events: u64,
@@ -2015,8 +1960,6 @@ pub struct DeviceState {
     pub cursor: CursorState,
     pub display: DisplayHandshake,
     pub fails: Vec<FailEvent>,
-    /// Next async job id for ordered stamps.
-    pub next_job_id: u64,
     /// Last successful directed mapper capture (consumed on matching MAP/UNMAP).
     pub mapper_capture: Option<MapperCapture>,
     /// Cached IOSurfaceParavirtMapperDevice KVA from capture.
@@ -2194,7 +2137,6 @@ impl DeviceState {
             present_translation_hold_mask: 0,
             pending: PendingWork::default(),
             child_rings: std::array::from_fn(|_| ChannelRing::default()),
-            child_stamps: std::array::from_fn(|_| ChannelStamps::default()),
             tasks: std::array::from_fn(|_| TaskEntry::default()),
             map_family_events: 0,
             task_map_spans: Vec::new(),
@@ -2225,7 +2167,6 @@ impl DeviceState {
             mapper_device_kva: 0,
             display: DisplayHandshake::default(),
             fails: Vec::new(),
-            next_job_id: 1,
             fence_generations: BTreeMap::new(),
             draining_channel: 0,
             draining_mask: 0,
@@ -2613,12 +2554,6 @@ impl DeviceState {
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;
         self.gfx.fifo_read = fifo_read;
-    }
-
-    pub fn alloc_job_id(&mut self) -> u64 {
-        let id = self.next_job_id;
-        self.next_job_id = self.next_job_id.saturating_add(1);
-        id
     }
 
     /// Queue the engine-unpin for a dying linear cache entry that still owns a
