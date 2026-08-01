@@ -3,7 +3,7 @@
 //! Prefer structure correctness over full exec.c coverage: known root/child
 //! control-plane ops update device state; unknown opcodes are recorded visibly.
 
-use crate::contract::endian::{ld16, ld32, st16, st32};
+use crate::contract::endian::{ld16, ld32, ld64, st16, st32};
 use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault};
 use crate::observe::Emit;
@@ -71,6 +71,20 @@ const DISPLAY_TXN_PAYLOAD_SAMPLES: u32 = 4;
 /// inline plane list would be tens of bytes, not kilobytes; this bounds a
 /// pathological length without truncating the interesting case.
 const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
+
+/// The task's address-space length from a `DefineTask2` payload.
+///
+/// The field is 64 bits wide, and the payload layout says so: it sits at
+/// `DEFINE_TASK_LENGTH` (0x04) and the next field, `DEFINE_TASK_DIRECTORY_PFN`,
+/// is at 0x0c — eight bytes later. Callers must have already checked
+/// `payload.len() >= DEFINE_TASK_LEN` (16), which covers the whole field.
+///
+/// The root and child arms decode the same wire field, and read it the same
+/// way here. The child arm used to take only the low 32 bits, which truncated
+/// the length of any task spanning 4 GiB or more.
+fn define_task_length(payload: &[u8]) -> u64 {
+    ld64(&payload[DEFINE_TASK_LENGTH..])
+}
 
 /// Trailer size `submitTransaction` appends after serializing the transaction's
 /// resource list: `[pipe][task][surface][gamma…]` for the gamma command,
@@ -625,14 +639,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
         ROOT_OP_DEFINE_TASK2 => {
             if packet.payload.len() >= DEFINE_TASK_LEN {
                 let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
-                let length = ld32(&packet.payload[DEFINE_TASK_LENGTH..]) as u64;
-                // length field is only low 32 in compact layout; full u64 at +4 if present.
-                let length = if packet.payload.len() >= 12 {
-                    u64::from(ld32(&packet.payload[DEFINE_TASK_LENGTH..]))
-                        | (u64::from(ld32(&packet.payload[DEFINE_TASK_LENGTH + 4..])) << 32)
-                } else {
-                    length
-                };
+                let length = define_task_length(&packet.payload);
                 let dir = ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]);
                 let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
                 let ok = state.define_task(task_id, length, dir);
@@ -1744,7 +1751,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         CHILD_OP_DEFINE_TASK2 => {
             if packet.payload.len() >= DEFINE_TASK_LEN {
                 let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
-                let length = u64::from(ld32(&packet.payload[DEFINE_TASK_LENGTH..]));
+                let length = define_task_length(&packet.payload);
                 let dir = ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]);
                 let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
                 let ok = state.define_task(task_id, length, dir);

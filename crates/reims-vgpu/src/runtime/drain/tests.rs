@@ -3222,3 +3222,30 @@ fn deleting_a_task_retires_its_own_deferred_windows_and_not_its_doubles() {
     );
     assert_eq!(state.retired_gva_windows[0].1.task_id, 5);
 }
+
+/// Root and child `DefineTask2` decode one wire field one way.
+///
+/// The length lives at `DEFINE_TASK_LENGTH` (0x04) and the next field,
+/// `DEFINE_TASK_DIRECTORY_PFN`, is at 0x0c — so the field is eight bytes, not
+/// four. The child arm used to read only the low 32 bits with `ld32`, which
+/// truncated any task spanning 4 GiB or more to its low half while the root
+/// arm, decoding the same packet layout, kept the full value. A guest whose
+/// task address space crosses that line had its span silently shortened on
+/// one path and not the other.
+#[test]
+fn a_define_task_length_is_the_full_eight_byte_field_on_both_arms() {
+    // The layout is what makes the field eight bytes wide; assert it rather
+    // than restating the width.
+    assert_eq!(DEFINE_TASK_DIRECTORY_PFN - DEFINE_TASK_LENGTH, 8);
+
+    let mut payload = vec![0u8; DEFINE_TASK_LEN];
+    // 6 GiB: past u32, with a non-zero low half so a truncation is not a zero.
+    let length = 6u64 << 30;
+    payload[DEFINE_TASK_LENGTH..DEFINE_TASK_LENGTH + 8].copy_from_slice(&length.to_le_bytes());
+    assert_eq!(define_task_length(&payload), length);
+    assert_ne!(
+        define_task_length(&payload),
+        u64::from(ld32(&payload[DEFINE_TASK_LENGTH..])),
+        "a low-32 read would have lost the high half"
+    );
+}

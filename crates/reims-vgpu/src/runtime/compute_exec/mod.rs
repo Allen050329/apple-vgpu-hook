@@ -2887,6 +2887,34 @@ pub(crate) fn flush_nested_jobs<M: HostMemory + HostOps>(
 
 type DispatchDims = (u32, u32, u32, u32, u32, u32, bool);
 
+/// [`resolve_dispatch_dims`], with the refusal named on the always-on log.
+///
+/// Both dispatch executors want the same thing on failure: the decline, the
+/// command kind, the wire grid and threadgroup, and how many textures were
+/// bound. Naming it once is what keeps the Metal and Vulkan arms from
+/// drifting into two spellings of the same refusal.
+fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    cmd: &ComputeCommand,
+    acc: &ComputeAccum,
+) -> Result<DispatchDims, ComputeStatus> {
+    resolve_dispatch_dims(state, host, task_id, cmd).inspect_err(|e| {
+        crate::observe::line(format!(
+            "compute_resolve_dims fail {e:?} kind={:?} grid=[{},{},{}] tg=[{},{},{}] ntex={}",
+            cmd.kind,
+            cmd.grid.x,
+            cmd.grid.y,
+            cmd.grid.z,
+            cmd.threads_per_threadgroup.x,
+            cmd.threads_per_threadgroup.y,
+            cmd.threads_per_threadgroup.z,
+            acc.textures.len()
+        ));
+    })
+}
+
 /// Resolve grid/threadgroup dims for direct or indirect dispatches.
 fn resolve_dispatch_dims<M: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3003,22 +3031,9 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
     }
     // Dims first (cheap; proves sentinel recovery without m2v/vk).
     let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims(state, host, task_id, cmd) {
+        match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
             Ok(v) => v,
-            Err(e) => {
-                crate::observe::line(format!(
-                "compute_resolve_dims fail {e:?} kind={:?} grid=[{},{},{}] tg=[{},{},{}] ntex={}",
-                cmd.kind,
-                cmd.grid.x,
-                cmd.grid.y,
-                cmd.grid.z,
-                cmd.threads_per_threadgroup.x,
-                cmd.threads_per_threadgroup.y,
-                cmd.threads_per_threadgroup.z,
-                acc.textures.len()
-            ));
-                return e;
-            }
+            Err(e) => return e,
         };
     if tg_x == 0 || tg_y == 0 || tg_z == 0 || grid_x == 0 || grid_y == 0 || grid_z == 0 {
         return ComputeStatus::BadGrid("compute_vk_zero_dims");
@@ -4218,22 +4233,9 @@ fn execute_dispatch_metal<M: HostMemory + HostOps>(
     };
 
     let (grid_x, grid_y, grid_z, tg_x, tg_y, tg_z, dispatch_threads) =
-        match resolve_dispatch_dims(state, host, task_id, cmd) {
+        match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
             Ok(v) => v,
-            Err(e) => {
-                crate::observe::line(format!(
-                "compute_resolve_dims fail {e:?} kind={:?} grid=[{},{},{}] tg=[{},{},{}] ntex={}",
-                cmd.kind,
-                cmd.grid.x,
-                cmd.grid.y,
-                cmd.grid.z,
-                cmd.threads_per_threadgroup.x,
-                cmd.threads_per_threadgroup.y,
-                cmd.threads_per_threadgroup.z,
-                acc.textures.len()
-            ));
-                return e;
-            }
+            Err(e) => return e,
         };
 
     let dispatch_kind = if dispatch_threads {

@@ -2327,7 +2327,11 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         let (base_off, bpr_u32, _span_end) = type11_sample_window(m, mid, w, h, format)?;
         (native, base_off, bpr_u32 as u64)
     };
-    let (span, row_length_texels) = strided_window_extent(w, h, RGBA8_BPP as u64, bpr)?;
+    // From the layout the translation chose, as the type-5 rail does, so the
+    // texel size cannot disagree with the image the engine creates. The
+    // `is_four_byte_color` gate above already fixes it at four.
+    let (span, row_length_texels) =
+        strided_window_extent(w, h, native.bytes_per_texel() as u64, bpr)?;
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
@@ -2866,55 +2870,30 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
     if state.gva_deferred_flush.contains_key(&gva) {
         crate::runtime::storage_flush::flush_gva_exact(state, host, gva, true, "gva_sample");
     }
-    // The GVA encode cache used to be read here, behind two gates: does this
-    // address still name the pages the bytes were made from
-    // (`revalidate_gva_backing`), and has the guest CPU-written them since
-    // (`gva_guest_wrote_since_store`). It never once served.
+    // Two cache rungs that used to sit here are deliberately absent; both were
+    // measured dead before removal, so do not restore either.
     //
-    // Not "rarely" — never, and for a structural reason. The second gate has
-    // four early returns before it reaches the host, and every call took one:
-    // over five boots, the last of them driven under Safari load, its verdicts
-    // were `no_entry` 171 711 and `no_baseline` 115 089, against `clean` 0,
-    // `wrote` 0, `unarmed` 0 and `unreadable` 0. The two sum to 286 800, which
-    // is exactly the bypass count, so the comparison the gate exists to make ran
-    // zero times.
+    // The GVA encode cache rung could not serve. Its freshness gate
+    // (`gva_guest_wrote_since_store`) answered `no_entry`/`no_baseline` 286 800
+    // times against `clean`/`wrote` zero — exactly the bypass count — because
+    // `arm_gva_guest_write_witness` stamps its baseline inside the dirty
+    // tracker's two-harvest startup window and re-stamps only on a *later*
+    // store. A surface stored once and sampled forever never gets one, so the
+    // gate can only answer "stale". The sibling mapping rail escapes this by
+    // re-stamping on every write (`mapper::stamp_guest_write_gen`).
     //
-    // `no_baseline` is the interesting half and it is not a guest behaviour.
-    // `arm_gva_guest_write_witness` records its baseline immediately after
-    // registering the token, inside the dirty tracker's deliberate two-harvest
-    // startup window where a generation reads 0, and re-stamps only on a *later*
-    // store to the same address. The entries this cache exists for — a wallpaper
-    // plane stored once and sampled forever — get no later store, so their
-    // baseline stays 0 for the life of the boot and the gate can only answer
-    // "stale". The sibling mapping rail escapes this by re-stamping on every
-    // write (`mapper::stamp_guest_write_gen`), which is why its verdicts are
-    // live (`t11rung_resident_gw_clean` 18 350 in the same boot).
+    // The other was keyed on `texture_ref` + geometry with no GVA validation,
+    // so it could serve one resource's pixels under another's ref after a
+    // rebind at the same size. It reached 2 serves against 725 233 sampled
+    // loads.
     //
-    // So this rung was `if false` with a page-table revalidation attached, 6 917
-    // walks in that boot to reach a serve that cannot happen. The guest's own
-    // pages, read below, are authoritative and are what every one of those
-    // 286 800 samples already used.
-    //
-    // What this does NOT resolve: the cache is still live and still read, by the
-    // colour-LOAD seed paths in `try_metal2vulkan_draw` and
-    // `metal_draw::seed_color_load`. Neither consults the write witness at all,
-    // and the same boot held 397 entries over 105 MiB whose backing pages were
-    // 393/397 unmapped. Those are serving pixels for guest pages that are gone,
-    // which is the retained-wallpaper case the cache was built for and also the
-    // case nothing can currently validate. That is a contract gap, not a tuning
-    // one: it is unknown what the guest's own statement of ownership is for a
-    // surface whose pages it has unmapped.
-    //
-    // A rung keyed on `texture_ref` + geometry alone used to sit here. It did not
-    // validate the GVA, so it could serve one resource's pixels under another's
-    // ref once the guest rebound a ref to a different descriptor at the same
-    // size, and it carried no identity for the engine to re-check either. It was
-    // also never worth that: `lin_rung_gva_bypassed` and `lin_rung_guest_memo`
-    // ran *equal* through every per-second window of two full 14-round boots
-    // (441/441, 684/684, 2318/2318, …), and its own counter reached 2 against
-    // 725 233 sampled loads. Every bypass already fell straight past it to the
-    // guest's own pages, which are authoritative, so those two samples now read
-    // the same pages the other 725 231 did.
+    // Still open, and a contract gap rather than a tuning one: that same cache
+    // is read by the colour-LOAD seed paths (`try_metal2vulkan_draw`,
+    // `metal_draw::seed_color_load`), neither of which consults the write
+    // witness. One boot held 397 entries over 105 MiB with 393/397 of their
+    // backing pages unmapped — serving pixels for guest pages that are gone.
+    // What the guest's statement of ownership is for a surface whose pages it
+    // has unmapped is not known.
     //
     // Guest-CPU-produced linear textures (wallpaper, glyph atlases) have no
     // host producer generation. Re-read the native rows and byte-compare
@@ -2926,27 +2905,19 @@ fn load_linear_from_host_caches<M: HostMemory + HostOps>(
         note_guest_rung_blank(state, "guest_memo", task_id, texture_ref, gva, w, h, &rgba);
         return Some((w, h, rgba, identity, byte_format));
     }
-    // There is no second guest rung under the memo, and this counter is what
-    // replaced it.
+    // There is deliberately no second guest rung under the memo. One used to
+    // re-read through `load_linear_texture_native_host` when the memo declined
+    // and never ran: every `None` the memo returns is a decode, geometry,
+    // bounds or guest-read failure that the re-read meets on the same
+    // descriptor and the same pages.
     //
-    // One used to sit here: a full re-read through `load_linear_texture_native_host`
-    // for the case the memo declined. It never ran. `lin_rung_guest_native`
-    // fires unconditionally on entry to `note_guest_rung_blank`, and it appears
-    // nowhere in the always-on log across every boot it holds, while its
-    // `guest_memo` sibling fires in the hundreds per boot. Every `None` the memo
-    // can return is a decode, geometry, bounds or guest-read failure that the
-    // re-read hits on the same descriptor and the same pages — so it was a
-    // fallback for conditions it could not itself survive.
-    //
-    // Losing it costs the memo's silence a witness, which is why the counter
-    // takes its place rather than nothing at all. `load_linear_guest_memoized`
-    // emits on none of its refusal paths, so the deleted rung's
-    // `linear_sample_miss` decline was the only line that ever named one. A
-    // sample refused here now falls to `load_sampled_rgba_static` and, failing
-    // that, to the caller's typed `DrawPreparationDecline::TextureResolveMissing`
-    // — visible, but without the memo's own reason. `lin_rung_memo_declined`
-    // against `lin_rung_guest_memo` is the denominator that says whether that
-    // gap is worth closing; while it reads zero, there is nothing to name.
+    // This counter takes its place because `load_linear_guest_memoized` emits
+    // on none of its refusal paths, so the deleted rung's decline was the only
+    // line that ever named one. A sample refused here falls to
+    // `load_sampled_rgba_static` and then to the caller's typed
+    // `TextureResolveMissing` — visible, but without the memo's own reason.
+    // `lin_rung_memo_declined` against `lin_rung_guest_memo` says whether that
+    // gap is worth closing; while it reads zero there is nothing to name.
     crate::runtime::drain::note_store_route("lin_rung_memo_declined");
     None
 }
@@ -4538,37 +4509,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // There is no cross-pass GVA resident-Load rung here, and its absence
-        // is measured rather than assumed.
-        //
-        // One used to sit between the chain gate above and the type-11 gate
-        // below: when a deferred GVA Store window covered this exact target, it
-        // set `chain_load_from_target` from the window's resident instead of
-        // taking a seed, and flushed the window early when it could not. A
-        // denominator placed in front of it (`df81115`) read, over two driven
-        // x86/Vulkan boots on different workloads:
-        //
-        //   xpass_c0_not_gva_load         4859 / 5616
-        //   xpass_c0_gva_load_no_window      0 /    0
-        //   xpass_c0_gva_load_window_open    0 /    0
-        //
-        // with `gva_deferred` at 2508 / 2605, so the window rail itself was
-        // busy throughout. No draw reaching that point has a colour0 that is a
-        // seedless LOAD'd GVA target: `req.chain_from_resident` is set on
-        // records 2.. of a serialized GVA pass, which sets
-        // `chain_load_from_target` above and skipped the rung entirely. The
-        // resident-chain rail carries the case in full.
-        //
-        // Two facts made the deletion safe rather than merely quiet. The `else`
-        // arm's `flush_gva_exact` was an *early* landing of the window, not
-        // this draw's seed — `target_seed_rgba` is decided when the request is
-        // built, so a flush here left the seed door at `none` regardless, and
-        // an unflushed window is landed later by `storage_flush` on its own
-        // triggers. And the consequence is visible without the rung: a LOAD
-        // that arrives with no seed emits `load_seed_lost_other` through the
-        // always-on path, which read 0 across three boots alongside
-        // `load_seed_ok` 984 / 1001 / 941 — every seed on record came through
-        // the `color_seed` or `mapping` door.
+        // A cross-pass GVA resident-Load rung used to sit here, taking colour0
+        // from an open deferred GVA Store window instead of a seed. Its
+        // denominator read `xpass_c0_gva_load_no_window` 0 and
+        // `xpass_c0_gva_load_window_open` 0 against `xpass_c0_not_gva_load`
+        // 4859/5616 over two driven boots, with the window rail itself busy
+        // (`gva_deferred` 2508/2605): no draw reaching here has a colour0 that
+        // is a seedless LOAD'd GVA target, because `req.chain_from_resident`
+        // sets `chain_load_from_target` above and skips it. The resident-chain
+        // rail carries the case in full, and a LOAD arriving with no seed
+        // still says so through `load_seed_lost_other`.
         // Type-11 composite Load: when the resident this record is about to
         // render into was stamped with the mapping's current
         // `surface_content_epoch`, its image already holds exactly the bytes
@@ -4917,28 +4867,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.skip_readback = true;
             surface_resident_store = true;
         }
-        // There is no first-failure classifier here for a composite Store that
-        // still reads back, and its four counters are gone.
-        //
-        // It answered "which of these conditions kept the readback" over the
-        // population `store_routes` could not split — the 256/s landing on
-        // `surface_deferred`. That population no longer exists. Its outer gate
-        // (`!skip_readback && store_is_store && writeback_guest` with
-        // `mapping_id != 0`) was never once true: none of
-        // `t11_keep_identity_taken`, `t11_keep_no_chain_identity`,
-        // `t11_keep_gpu_only_denied` or `t11_keep_not_defer_eligible` appears
-        // anywhere in the always-on log, across every boot it holds. Not even
-        // the `else` arm, which is what separates "the classifier ran and every
-        // Store was defer-eligible" from "the classifier never ran" — an
-        // ordered first-failure with an empty population reports the same
-        // silence as a broken one, and this one had no denominator to say
-        // which. Every type-11 Store either skips its readback or is not a
-        // writeback Store.
-        //
-        // `identity_taken_by_another_rail` went with it; it had no other
-        // reader, so the comparison it made ran once per draw for a counter
-        // nothing incremented. `renders_into_surface_identity` above is the
-        // live half and stays — it gates the readback skip itself.
+        // A first-failure classifier for a composite Store that still reads
+        // back used to sit here. Its outer gate was never once true — none of
+        // its four counters, nor its `else` arm, appears anywhere in the
+        // always-on log across every boot it holds. Every type-11 Store either
+        // skips its readback or is not a writeback Store.
         if chain_load_from_target {
             if resources.target_identity.is_none() {
                 // chain_from_resident implies a protocol target identity; a
@@ -4954,18 +4887,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             resources.load_from_target = true;
             resources.target_rgba8 = None;
         }
-        // Type-11 Load used to have a GPU rail here. When the Store was going
-        // to land by import, the attachment was a BGRA resident with no CPU
-        // seed, so a `LoadFromTarget` had to resolve which resident image held
-        // the frame the guest's compositor computes its damage against — the
-        // presented front's own resident, this target's, or the guest pages —
-        // and copy it resident-to-target on the GPU. Without that resolve the
-        // engine would Clear black and wipe the multi-pass layers.
-        //
-        // A Store now always reads back and always seeds from guest pages, so
-        // there is no resident-only attachment to reseed and nothing to
-        // resolve: the ~170 lines of front-frame retention policy that stood
-        // here were reachable only under `try_import`.
+        // Type-11 Load used to have a GPU rail here — ~170 lines of front-frame
+        // retention policy resolving which resident image held the frame the
+        // guest computes its damage against. It was reachable only under
+        // `try_import`. A Store now always reads back and always seeds from
+        // guest pages, so there is no resident-only attachment to reseed.
         // Metal path always passes color0 blend into the encoder. Linux/engine
         // previously left `resources.blend = None` → opaque replace for every
         // draw, so Load seeds (gray/wallpaper/logo bases) were wiped by sparse
