@@ -686,6 +686,23 @@ pub struct Type4Walk {
 /// So the comparison is a happens-before between the guest's last claim and the
 /// device's last publish, both stamped from [`DeviceState::next_validity_seq`].
 /// Causal, not a heuristic: whoever wrote last owns the bytes.
+///
+/// # What the four bools are for, now that the seqs decide
+///
+/// They are the **record** of what the guest said, and nothing reads them to
+/// decide anything. That is deliberate, and not the same as dropping them: the
+/// guest emits four distinct ops and this is where all four land, so a boot can
+/// be asked what it was told and not only what was done about it.
+///
+/// `set_host_valid` in particular drives nothing, because the device has a
+/// strictly better witness for the same fact — its own publish, made when it
+/// happens rather than one submission ahead. One boot measured the two agreeing
+/// on 19 135 of 19 135 stores. Keeping the guest's version as a second input to
+/// the same decision would be two spellings of one value with a way to disagree.
+///
+/// `guest_valid` / `guest_stated` are the only home for `clear_guest_valid` and
+/// `set_guest_valid`, which live traffic barely uses (17 and 0 in a measured
+/// boot).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceValidity {
     /// The device's copy holds the authoritative bytes.
