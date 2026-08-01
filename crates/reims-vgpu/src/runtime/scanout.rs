@@ -305,32 +305,22 @@ pub fn capture_present_frame(
             crate::model::PaintSrc::None => "guest_pages",
         }
     };
-    // The occupancy scan and the three lines it fed are diagnostic: each is an
-    // O(w*h) walk of the just-captured 8 MiB frame on the present drain, under
-    // the device lock, and the `peers` field walks every same-geometry host
-    // surface on top of that. The always-on alarm for a black console is
-    // `present_black`, which does its own scan at the drain boundary where the
-    // verdict is acted on.
+    // The occupancy scan is diagnostic: an O(w*h) walk of the just-captured
+    // 8 MiB frame, on the present drain and under the device lock. The
+    // always-on alarm for a black console is `present_black`, which does its
+    // own scan at the drain boundary where the verdict is acted on.
+    //
+    // A `peers` field used to ride along here, walking every same-geometry host
+    // surface — another O(w*h) each — and admitting one when its non-zero pixel
+    // count passed 10 000. That number had no derivation, and "which peer looks
+    // like it has real content" is a rule about observed content rather than
+    // about the contract. It is gone rather than re-tuned: a peer below the
+    // threshold was invisible, so the field could not answer the question it
+    // looked like it was answering.
     if crate::observe::draw_log_enabled() {
         let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
-        let mut peers = String::new();
-        for (&mid, e) in state.host_surfaces.iter() {
-            if mid == mapping_id || e.width != width || e.height != height || e.bgra.is_empty() {
-                continue;
-            }
-            let (pnz, pmax, _) = crate::observe::bgra_rgb_stats(&e.bgra);
-            if pmax > 0 && pnz > 10_000 {
-                if !peers.is_empty() {
-                    peers.push(',');
-                }
-                peers.push_str(&format!(
-                    "mid{mid}:rgb_nz={pnz}:max_rgb={pmax}:hgen={}",
-                    e.host_gen
-                ));
-            }
-        }
         crate::observe::line(format!(
-            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} last_store={} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={} peers=[{peers}]",
+            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} last_store={} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={}",
             from_last_store as u8,
             from_host_cache as u8,
             px0[0],

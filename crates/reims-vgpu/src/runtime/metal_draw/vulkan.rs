@@ -1950,9 +1950,28 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
 #[cfg(feature = "backend-vulkan")]
 const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 
-/// Zero-copy floor for draw-time vertex/storage buffer binds: below this the
-/// CPU staging read is cheaper than a page walk plus a recorded GPU gather.
-/// Performance threshold only — never a correctness gate.
+/// Zero-copy floor for draw-time vertex/storage buffer binds. Performance
+/// threshold only — never a correctness gate; below it the bind takes the CPU
+/// staging read instead.
+///
+/// **The number is not derived and the claim behind it is not measured.** Its
+/// sibling [`ZERO_COPY_SAMPLED_MIN_BYTES`] carries a census basis — 1 051
+/// sampled declines, 100 % of them this floor — and this one carries only an
+/// assertion that "the CPU staging read is cheaper", which nothing has
+/// compared. The comparison is also not directly observable: the cost of the
+/// gather this floor refuses is never paid, so there is no counterfactual in
+/// the log.
+///
+/// What *is* observable is the population it governs, and
+/// `zc_buffer_below_floor` against `zc_buffer_gathered` is it. **First reading:
+/// 19 218 declined against 126 693 gathered — 13 % of binds — on a driven
+/// x86/Vulkan boot** (Chess, Maps, the WebGL aquarium, Wikipedia, apple.com).
+///
+/// So the floor is not inert and cannot simply be dropped; it decides one bind
+/// in eight. That makes the unmeasured cost claim worth settling rather than
+/// worth ignoring, and the way to settle it is a boot with the floor at 0
+/// compared against this one on `draw_phase`. Until then the 16 KiB stands as
+/// what it is: a guess with a known blast radius.
 #[cfg(feature = "backend-vulkan")]
 const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 
@@ -2142,6 +2161,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     }
     let span = host_alloc_len(size - offset).filter(|&n| n > 0)? as u64;
     if span < ZERO_COPY_BUFFER_MIN_BYTES {
+        crate::runtime::drain::note_store_route("zc_buffer_below_floor");
         return None;
     }
     if !guest_run_alias_available(host) {
@@ -2162,6 +2182,7 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
     // and would refuse a bind whose allocation has an unmapped tail page even
     // though the bind itself resolves.
     let runs = task_gva_guest_runs(state, host, task_id, gva + offset, span)?;
+    crate::runtime::drain::note_store_route("zc_buffer_gathered");
     Some(engine::BufferContent::GuestRuns(engine::GuestRunSource {
         runs: std::sync::Arc::new(runs),
         total_len: span,
