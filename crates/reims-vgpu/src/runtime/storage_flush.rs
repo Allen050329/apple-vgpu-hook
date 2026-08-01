@@ -193,7 +193,7 @@ pub fn flush_intersecting_task_gva<M: HostMemory + HostOps>(
         }
     }
     let page = state.page_size();
-    let n_pages = ((gva % page) + span).div_ceil(page);
+    let n_pages = crate::runtime::gva_mem::pages_spanned(gva, span, page);
     let mut hits: Vec<u32> = Vec::new();
     let mut linear_hits: Vec<(crate::model::ComputeStorageResidencyKey, u32)> = Vec::new();
     let mut gva_hits: Vec<u64> = Vec::new();

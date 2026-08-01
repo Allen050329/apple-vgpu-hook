@@ -3232,115 +3232,6 @@ fn sync_store_allowed_pages<M: HostMemory>(
     sync_store_target_pages(state, host, task_id, color0?)
 }
 
-/// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
-/// actually found for it.
-///
-/// A LOAD says the guest is drawing **onto the content already in this
-/// attachment**. When no seed is produced the attachment starts undefined, so
-/// every texel this pass does not itself draw is lost — which is a rectangle
-/// of a compositing layer going blank while the freshly drawn geometry
-/// survives, held until something redraws the whole layer. That is a real loss
-/// of guest work and belongs in the failure log, not in silence.
-///
-/// `chain_load_from_target` (the resident target already carries the chain) is
-/// a different arm and never reaches here: it is a seed that does not need
-/// uploading, not a seed that is missing.
-/// Census: does this draw's scissor cover the target the pass declared?
-///
-/// The last surface left on the Finder icon class. Its sample returns content,
-/// the content is the bytes at the address the guest named, the retained image
-/// cache is not swapping it, and no Load seed is being lost — yet a broken cell
-/// is a small block of content inside an otherwise empty square. Whatever
-/// empties the rest of that square acts after the read, and a scissor smaller
-/// than the target is the one mechanism on this path that can leave a
-/// rectangle of an attachment untouched by construction.
-///
-/// A partial scissor is completely ordinary, so this is a rate with its
-/// denominator and not a refusal. What makes it readable is the identity line:
-/// it is latched per (target geometry, scissor rect), so a compositor issuing
-/// the same partial draw thousands of times a second reports once, and a
-/// scissor that covers a fraction of a small square target — the shape an icon
-/// would have — is greppable rather than buried in the count.
-///
-/// **The first boot carrying this found the shape.** Ten recomposites, two
-/// corrupt, x86 / Vulkan: `draw_scissor_full` 888 227, `draw_scissor_partial`
-/// 449 708 — and among the partial identities
-///
-/// ```text
-/// target=64x64 scissor=9x29+0+0
-/// target=64x64 scissor=7x9+0+0
-/// target=64x64 scissor=6x8+0+0
-/// ```
-///
-/// A draw covering 48 texels of a 4096-texel icon target, anchored at its
-/// top-left corner. That is the broken cell as seen on screen: a small block of
-/// content with an empty square around it.
-///
-/// It does not by itself say the scissor is *wrong*. A scissored draw is
-/// correct whenever the attachment already holds the rest of the picture, which
-/// on this rail happens two ways: a `MTLLoadActionLoad` whose CPU seed supplied
-/// it, or one taking the `chain_load_from_target` arm, where the engine
-/// resident already holds the prior frame and `LoadOp::LoadFromTarget`
-/// preserves it with no seed at all. Only the third case — LOAD, no chain, no
-/// seed — destroys what it did not draw.
-///
-/// That third case is also the only one `load_seed_lost` cannot see: it counts
-/// doors opened and found empty, and a pass that never enters the seed block
-/// never reaches it. 395 seed resolutions on a comparable boot (2870346)
-/// against a partial-draw population in the hundreds of thousands is the
-/// signature of a match arm being taken elsewhere, not of a rail that works.
-///
-/// # The scissor is not the icon defect, and the shape above was misread
-///
-/// Two later readings retire this lead. First, the rect is the guest's own: it
-/// is decoded verbatim from `OP_SET_SCISSOR` (`decode::render`, four u64 fields)
-/// and latched only when both extents are non-zero — this device computes,
-/// clamps and derives nothing, so a 12x40 scissor over a 64x64 icon is the
-/// compositor's damage rect faithfully carried. Second, `draw_partial_load_
-/// unseeded` measured **zero** over a full driven boot (233ba1c), so no partial
-/// draw on this rail destroys what it did not cover.
-///
-/// What retires it for good is a photograph of the defect at pixel scale. A
-/// 14-round recomposite reproduced it (rounds 3-6 corrupt, held — one cell never
-/// recovers), and the corrupt cell is **not** a small block of correct content
-/// in an empty square. Over the 11x25 screen rect the clean round of the same
-/// boot renders as the folder's light blue (`75D0FB`, `6AC7F4`, `BFDBE8`), the
-/// corrupt round is **greyscale end to end**: `FFFFFF` 133, `000000` 21,
-/// `FCFCFC` 14, `B0B0B0` 5, `505050` 5, `040404` 5, `424242`, `131313` — every
-/// dominant value has R == G == B. No blue survives anywhere in the cell.
-///
-/// So the cell was not partially drawn. A colour image was replaced by a black
-/// one, which means the question this census was built to ask — "what emptied
-/// the texels outside the scissor" — was the wrong question. Nothing was
-/// emptied; something wrote black over the whole cell.
-///
-/// # This defect is invisible to every counter this crate has
-///
-/// The same six rounds, scored per round, clean (1-2) against corrupt (3-6):
-///
-/// ```text
-/// lin_rung_guest_blank            0      0      0      0      0      0
-/// lin_rung_blank_with_host_entry  0      0      0      0      0      0
-/// lin_rung_guest_memo         39759  49930  42208  41145  45888  43339
-/// gvac_suspect                   31     55     47     53     57     45
-/// type11_seed_elided           8367   9851   8727   8345   8842   9010
-/// draw_partial_load_from_target 21473 27115  23017  22441  25099  23447
-/// ```
-///
-/// Every counter is proportional to round length; not one separates a corrupt
-/// round from a clean one. `lin_rung_guest_blank` is zero throughout, so on this
-/// reproduction no sampled bind returned an all-zero texture — which rules out
-/// the mechanism 61e6dce proposed and 2cc48d7 left open as the surviving lead,
-/// at least for this instance. The set of names in the census is identical
-/// across the break too: no decline fires on the round that breaks.
-///
-/// That is the finding to act on. A defect that is stable on screen for minutes
-/// and leaves no trace in a census this large is not going to be found by adding
-/// another counter to the same rails; the next instrument has to observe surface
-/// *content* across the transition, not the routes taken to produce it.
-///
-/// The census stays because the partition it prints is cheap and is the
-/// denominator any future claim about this rail needs. It is no longer a lead.
 /// How much surface a taken type-11 seed elision covered, in whole texels.
 ///
 /// Measured to price the repair for an unsound witness: the epoch could not see
@@ -3413,6 +3304,61 @@ fn note_type11_elision_extent(w: u32, h: u32) {
     crate::runtime::drain::note_store_route_n("t11elide_texels", texels);
 }
 
+/// Census: does this draw's scissor cover the target the pass declared, and if
+/// not, what happened to the texels outside it?
+///
+/// A partial scissor is completely ordinary, so this is a rate with its
+/// denominator and not a refusal. What makes it readable is the split by load
+/// action, because a partial draw is correct exactly when the attachment
+/// already holds the rest of the picture — by a LOAD whose CPU seed supplied
+/// it, or by one taking the `chain_load_from_target` arm where the engine
+/// resident already holds the prior frame. Only LOAD with neither destroys
+/// what it did not draw, and `load_seed_lost` cannot see that case: it counts
+/// doors opened and found empty, and such a pass never enters the seed block.
+///
+/// One driven boot of ten Finder recomposites, x86 / Vulkan:
+///
+/// ```text
+/// draw_scissor_full             1112576
+/// draw_scissor_partial           589283
+///   draw_partial_load_from_target 517247
+///   draw_partial_clear              48303
+///   draw_partial_dontcare           23728
+///   draw_partial_load_seeded             5
+///   draw_partial_load_unseeded           0
+/// ```
+///
+/// **Zero.** No partial draw on this pathway destroys what it did not cover.
+/// That is the invariant this census exists to hold, and the reason it stays
+/// on: it is one counter, per second, and it is the denominator any future
+/// claim about this rail needs.
+///
+/// # It is not a lead on the broken-cell class, and was once misread as one
+///
+/// The scissor was the last surviving suspect for the Finder icon defect —
+/// a broken cell is a small block of content inside an otherwise empty square,
+/// and a scissor smaller than the target is the one mechanism here that can
+/// leave part of an attachment untouched by construction. Two readings retire
+/// it. The rect is the guest's own, decoded verbatim from `OP_SET_SCISSOR`
+/// (`decode::render`, four u64 fields) and latched only when both extents are
+/// non-zero, so this device computes, clamps and derives nothing: a 12x40
+/// scissor over a 64x64 icon is the compositor's damage rect faithfully
+/// carried. And a photograph at pixel scale shows the corrupt cell is not
+/// partially drawn at all — over the 11x25 screen rect the clean round renders
+/// the folder's light blue (`75D0FB`, `6AC7F4`, `BFDBE8`) and the corrupt one
+/// is greyscale end to end (`FFFFFF` 133, `000000` 21, `FCFCFC` 14, `B0B0B0`
+/// 5, `505050` 5, `040404` 5), every dominant value R == G == B, no blue
+/// anywhere. Nothing was emptied. Something wrote black over the whole cell.
+///
+/// Scored per round across the break, no counter in this crate separates a
+/// corrupt round from a clean one — `lin_rung_guest_blank`,
+/// `lin_rung_blank_with_host_entry`, `lin_rung_guest_memo`, `gvac_suspect`,
+/// `type11_seed_elided` and `draw_partial_load_from_target` are all simply
+/// proportional to round length, and the set of decline names is identical on
+/// both sides. A defect that is stable on screen for minutes and leaves no
+/// trace in a census this large will not be found by adding another counter to
+/// these rails; the next instrument has to observe surface *content* across the
+/// transition, not the routes taken to produce it.
 #[cfg(feature = "backend-vulkan")]
 #[allow(
     clippy::too_many_arguments,
@@ -3438,10 +3384,6 @@ fn note_draw_coverage(
     if covers || target_w == 0 || target_h == 0 {
         return;
     }
-    // A partial draw is correct exactly when the attachment already holds the
-    // rest of the picture, so what matters is not that the scissor is small but
-    // what the pass did with the texels outside it.
-    //
     // `from_target` is load-bearing and was missing from the first version of
     // this census, which is why its first reading had to be discarded. A LOAD
     // whose prior content lives in the engine resident takes the
@@ -3450,32 +3392,12 @@ fn note_draw_coverage(
     // `target_rgba8.is_some()` alone put every one of those in the unseeded
     // bucket and produced a 519 715-strong "defect" that was the rail working.
     //
-    // Split properly, over a driven boot of ten Finder recomposites:
-    //
-    //   draw_scissor_full             1112576
-    //   draw_scissor_partial           589283
-    //     draw_partial_load_from_target 517247
-    //     draw_partial_clear              48303
-    //     draw_partial_dontcare           23728
-    //     draw_partial_load_seeded             5
-    //     draw_partial_load_unseeded           0
-    //
-    // **Zero.** Every `MTLLoadActionLoad` on this pathway arrives with its
-    // prior content, by resident or by seed. At icon geometry specifically, the
-    // 64x64 partial identities are 29 `from_target=1`, 48 `seeded=1`, and 2
-    // `load=Some(0)` — DONT_CARE, undefined outside the scissor by declaration.
-    // No LOAD is being downgraded to a CLEAR, so a partial draw is not how the
-    // rest of a broken icon gets emptied.
-    //
-    // Splitting it is the difference between the three cases:
-    //
-    //   load_seeded  — LOAD and a seed was resolved. The rest is the old frame.
-    //   load_unseeded— LOAD and no seed. Becomes a Vulkan CLEAR, so every texel
-    //                  outside the scissor is destroyed. This is the defect
-    //                  shape, and `load_seed_lost` cannot count it when the
-    //                  seed branch is never entered at all.
-    //   clear        — CLEAR was asked for. Destroying them is the contract.
-    //   dontcare     — undefined outside the scissor by declaration.
+    //   load_seeded   — LOAD and a seed was resolved. The rest is the old frame.
+    //   load_unseeded — LOAD and no seed. Becomes a Vulkan CLEAR, so every texel
+    //                   outside the scissor is destroyed. The one arm that is a
+    //                   defect, and the one `load_seed_lost` cannot count.
+    //   clear         — CLEAR was asked for. Destroying them is the contract.
+    //   dontcare      — undefined outside the scissor by declaration.
     crate::runtime::drain::note_store_route(match load_action {
         Some(PASS_LOAD_ACTION_LOAD) if from_target => "draw_partial_load_from_target",
         Some(PASS_LOAD_ACTION_LOAD) if seeded => "draw_partial_load_seeded",
@@ -3484,24 +3406,21 @@ fn note_draw_coverage(
         Some(PASS_LOAD_ACTION_DONT_CARE) => "draw_partial_dontcare",
         _ => "draw_partial_load_unknown",
     });
-    if crate::observe::first_sight(
-        "draw_scissor_partial",
-        (target_w as u64) << 48
-            ^ (target_h as u64) << 32
-            ^ (sw as u64) << 16
-            ^ sh as u64
-            ^ (x as u64) << 8
-            ^ y as u64,
-    ) {
-        crate::observe::off(format!(
-            "draw_scissor_partial target={target_w}x{target_h} scissor={sw}x{sh}+{x}+{y} \
-             load={load_action:?} seeded={} from_target={}",
-            u8::from(seeded),
-            u8::from(from_target)
-        ));
-    }
 }
 
+/// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
+/// actually found for it.
+///
+/// A LOAD says the guest is drawing **onto the content already in this
+/// attachment**. When no seed is produced the attachment starts undefined, so
+/// every texel this pass does not itself draw is lost — which is a rectangle
+/// of a compositing layer going blank while the freshly drawn geometry
+/// survives, held until something redraws the whole layer. That is a real loss
+/// of guest work and belongs in the failure log, not in silence.
+///
+/// `chain_load_from_target` (the resident target already carries the chain) is
+/// a different arm and never reaches here: it is a seed that does not need
+/// uploading, not a seed that is missing.
 #[cfg(feature = "backend-vulkan")]
 fn note_load_seed_outcome(
     door: &'static str,
