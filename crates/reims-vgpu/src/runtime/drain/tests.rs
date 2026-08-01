@@ -1806,7 +1806,9 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     state.display.display_index = 0;
     state.display.online_acked = true;
 
-    let base = 5_000;
+    // Microseconds: the base must exceed one grid interval from the zero the
+    // limiter starts at, or the very first claim is refused as too early.
+    let base = 5_000_000;
     signal_display_vbl_at(&mut state, &mut host, &last_ms, base);
     assert_eq!(host.actions.len(), 1);
     assert!(
@@ -1817,7 +1819,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
         &mut state,
         &mut host,
         &last_ms,
-        base + DISPLAY_VBL_MIN_INTERVAL_MS - 1,
+        base + DISPLAY_VBL_MIN_INTERVAL_US - 1,
     );
     assert_eq!(
         host.actions.len(),
@@ -1828,7 +1830,7 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
         &mut state,
         &mut host,
         &last_ms,
-        base + DISPLAY_VBL_MIN_INTERVAL_MS,
+        base + DISPLAY_VBL_MIN_INTERVAL_US,
     );
     assert_eq!(
         host.actions.len(),
@@ -1852,12 +1854,45 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
 
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
 /// cannot alias the delivered rate down to ~60 Hz (the boot-to-boot fps split).
+/// The VBL we deliver must be the refresh rate we advertise.
+///
+/// These are two different constants reaching the guest by two different
+/// routes: `DISPLAY_REFRESH_HZ` goes into the mode timing table it reads, and
+/// the limiter interval paces the interrupt it is actually woken by. The guest
+/// honours the interrupt — a driven Safari measured its own
+/// `requestAnimationFrame` at exactly the delivered rate — so when the two
+/// disagree, the timing table is a lie the guest never notices and we cannot
+/// see either.
+///
+/// They did disagree: the limiter was a hardcoded 8 ms, which is 125 Hz, while
+/// the table advertised 120. Asserting the identity rather than the value is
+/// deliberate — it stays true if the advertised rate ever changes, and it is
+/// the only form of this test that cannot itself go stale.
+#[test]
+fn delivered_vbl_cadence_equals_the_advertised_refresh_rate() {
+    let delivered_hz = 1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64;
+    assert!(
+        (delivered_hz - DISPLAY_REFRESH_HZ as f64).abs() < 0.5,
+        "advertising {DISPLAY_REFRESH_HZ} Hz but delivering {delivered_hz:.1} Hz \
+         (interval {DISPLAY_VBL_MIN_INTERVAL_US} us)"
+    );
+
+    // The millisecond grid this replaced could not express the answer at all:
+    // 120 Hz is 8333 us, and every whole-millisecond interval near it is wrong
+    // by at least 4%. That is why the units changed rather than the number.
+    assert_ne!(
+        DISPLAY_VBL_MIN_INTERVAL_US % 1000,
+        0,
+        "a whole-millisecond interval cannot express {DISPLAY_REFRESH_HZ} Hz"
+    );
+}
+
 /// Polls spaced just under the interval — the worst aliasing case — must still
 /// converge to roughly the grid rate, NOT halve.
 #[test]
 fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
     use std::sync::atomic::AtomicU64;
-    let interval = DISPLAY_VBL_MIN_INTERVAL_MS;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
     // Legacy "reset to now" behaviour would need two of these ~(interval-1)ms
     // polls per claim -> half rate. Phase-locking must claim on (nearly) every
     // poll once warmed up, because a late poll advances the grid by exactly one
@@ -1890,7 +1925,7 @@ fn claim_display_vbl_phase_locks_grid_under_jittery_polls() {
 #[test]
 fn claim_display_vbl_long_stall_resyncs_without_burst() {
     use std::sync::atomic::{AtomicU64, Ordering};
-    let interval = DISPLAY_VBL_MIN_INTERVAL_MS;
+    let interval = DISPLAY_VBL_MIN_INTERVAL_US;
     let last = AtomicU64::new(1_000);
     // A single poll after a 10*interval stall claims exactly once and lands the
     // grid at `now` (no accumulated catch-up credit).

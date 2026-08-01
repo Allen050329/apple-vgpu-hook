@@ -2935,13 +2935,23 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     }
 }
 
-/// Minimum wall-clock interval shared by both display VBL signal paths.
+/// Minimum wall-clock interval shared by both display VBL signal paths, in
+/// microseconds.
 ///
-/// The x86 QEMU heartbeat oversamples this interval every `REIMS_VGPU_PCI_HEARTBEAT_MS`
-/// (4 ms). The shared limiter caps heartbeat and active-console polls at
-/// approximately 120 Hz (8 ms) to match the advertised `DISPLAY_REFRESH_HZ`,
-/// without aliasing a heartbeat-only workload down to half rate.
-pub(crate) const DISPLAY_VBL_MIN_INTERVAL_MS: u64 = 8;
+/// The x86 QEMU heartbeat oversamples this interval every
+/// `REIMS_VGPU_PCI_HEARTBEAT_MS` (4 ms). The shared limiter caps heartbeat and
+/// active-console polls at the rate we advertise, without aliasing a
+/// heartbeat-only workload down to half rate.
+///
+/// **Derived from [`DISPLAY_REFRESH_HZ`], not written down.** This was a
+/// millisecond grid with a hardcoded `8`, which is 125 Hz — so the device
+/// advertised 120 Hz in its timing table and then delivered VBL 4.2% faster.
+/// The guest honours what is delivered, not what is advertised: a driven
+/// Safari measured its own `requestAnimationFrame` at exactly 125 Hz. 120 Hz is
+/// 8333 µs and is simply not expressible on an integer-millisecond grid, so the
+/// units are part of the fix rather than incidental to it.
+pub(crate) const DISPLAY_VBL_MIN_INTERVAL_US: u64 =
+    1_000_000 / crate::model::DISPLAY_REFRESH_HZ as u64;
 
 /// Atomically claim the next display VBL for either the locked or lock-free
 /// poll path. A single shared timestamp makes the cadence independent of device
@@ -2962,18 +2972,18 @@ pub(crate) const DISPLAY_VBL_MIN_INTERVAL_MS: u64 = 8;
 /// at rather than latching 60. A long stall (≥2 intervals, e.g. the drain worker
 /// held the lock) resyncs the phase to `now_ms` so we never unleash a burst of
 /// back-dated VBLs.
-pub(crate) fn claim_display_vbl(last_ms: &std::sync::atomic::AtomicU64, now_ms: u64) -> bool {
-    let last = last_ms.load(std::sync::atomic::Ordering::Acquire);
-    let gap = now_ms.saturating_sub(last);
-    if gap < DISPLAY_VBL_MIN_INTERVAL_MS {
+pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: u64) -> bool {
+    let last = last_us.load(std::sync::atomic::Ordering::Acquire);
+    let gap = now_us.saturating_sub(last);
+    if gap < DISPLAY_VBL_MIN_INTERVAL_US {
         return false;
     }
-    let next = if gap >= 2 * DISPLAY_VBL_MIN_INTERVAL_MS {
-        now_ms
+    let next = if gap >= 2 * DISPLAY_VBL_MIN_INTERVAL_US {
+        now_us
     } else {
-        last + DISPLAY_VBL_MIN_INTERVAL_MS
+        last + DISPLAY_VBL_MIN_INTERVAL_US
     };
-    last_ms
+    last_us
         .compare_exchange(
             last,
             next,
@@ -2993,9 +3003,9 @@ pub(crate) fn claim_display_vbl(last_ms: &std::sync::atomic::AtomicU64, now_ms: 
 pub fn signal_display_vbl<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
-    last_ms: &std::sync::atomic::AtomicU64,
+    last_us: &std::sync::atomic::AtomicU64,
 ) {
-    signal_display_vbl_at(state, host, last_ms, crate::observe::elapsed_ms() as u64);
+    signal_display_vbl_at(state, host, last_us, crate::observe::elapsed_us());
 }
 
 /// Delivered-VBL rate, reported from the branch that decides it.
@@ -3010,7 +3020,7 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
 /// The three arms are counted separately because a single "delivered" tally
 /// cannot tell the two silences apart, and they have opposite meanings:
 /// `not_online` is the display never having come up (no VBL is owed at all),
-/// while `not_claimed` is the 8 ms limiter doing its job at a healthy 125 Hz.
+/// while `not_claimed` is the limiter doing its job at the advertised rate.
 /// Reading a low delivered count without them would license both conclusions.
 ///
 /// One line per 1024 deliveries — about 8 s at the grid rate, and it costs three
@@ -3059,7 +3069,7 @@ impl VblCensus {
              grid_hz={:.1}",
             self.arms[VBL_NOT_CLAIMED].load(Relaxed),
             self.arms[VBL_NOT_ONLINE].load(Relaxed),
-            1000.0 / DISPLAY_VBL_MIN_INTERVAL_MS as f64,
+            1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64,
         ))
     }
 }
@@ -3565,14 +3575,18 @@ fn take_store_routes() -> Option<String> {
 fn signal_display_vbl_at<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
-    last_ms: &std::sync::atomic::AtomicU64,
-    now_ms: u64,
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
 ) {
+    // The limiter paces in microseconds because 120 Hz is not expressible in
+    // whole milliseconds; the census windows in milliseconds so its `t=` stays
+    // on the same scale as every other always-on line.
+    let now_ms = now_us / 1_000;
     if state.display.shared_gpa == 0 || !state.display.online_acked {
         note_vbl(VBL_NOT_ONLINE, now_ms);
         return;
     }
-    if !claim_display_vbl(last_ms, now_ms) {
+    if !claim_display_vbl(last_us, now_us) {
         note_vbl(VBL_NOT_CLAIMED, now_ms);
         return;
     }

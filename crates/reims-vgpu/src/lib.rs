@@ -239,7 +239,7 @@ struct BoundDevice {
     /// Wall-clock ms of the last VBL claimed by either the locked or contended
     /// poll path. One shared limiter keeps guest pacing independent of which
     /// path happens to win the device lock.
-    vbl_last_ms: AtomicU64,
+    vbl_last_us: AtomicU64,
     /// QEMU HostOps (GPA / clock / schedule worker). None in pure unit tests.
     ops: Option<ReimsVgpuHostOps>,
     /// Host-owned presentation window ([[host-window]]), once
@@ -362,7 +362,7 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             vbl_shared_gpa: AtomicU64::new(0),
             vbl_display_index: AtomicU32::new(0),
             vbl_online: AtomicBool::new(false),
-            vbl_last_ms: AtomicU64::new(0),
+            vbl_last_us: AtomicU64::new(0),
             ops,
             #[cfg(feature = "host-window")]
             window: Mutex::new(None),
@@ -1068,7 +1068,7 @@ pub fn device_poll(id: u64) -> bool {
     runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
     //. Missing VBL → clear-only dual-mid present thrash.
-    runtime::drain::signal_display_vbl(&mut device.state, &mut host, &slot.vbl_last_ms);
+    runtime::drain::signal_display_vbl(&mut device.state, &mut host, &slot.vbl_last_us);
     // Republish the lock-free VBL snapshot for the contended fast path above.
     // These change only at online-ack/reinit, but publishing every poll keeps
     // the snapshot fresh with no extra synchronization on the rare-change path.
@@ -1141,7 +1141,7 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     // Both poll paths share one limiter, so both have to report into one census
     // or the delivered rate reads low by whatever share of polls found the
     // device lock contended.
-    if !runtime::drain::claim_display_vbl(&slot.vbl_last_ms, now) {
+    if !runtime::drain::claim_display_vbl(&slot.vbl_last_us, crate::observe::elapsed_us()) {
         runtime::drain::note_vbl(runtime::drain::VBL_NOT_CLAIMED, now);
         return;
     }

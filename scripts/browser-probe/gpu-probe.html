@@ -85,6 +85,16 @@ async function probeWebGPU() {
 // used instead of the mean because it is the one estimator a burst of long
 // frames cannot drag with it.
 //
+// KNOWN LIMIT: browsers clamp `performance.now()` for fingerprinting reasons —
+// Safari to about 1 ms. A true 120 Hz interval is 8.333 ms and arrives as
+// 8/8/9/8/8/9, whose median is 8, so `refresh_hz` reports 125 on a display
+// genuinely running at 120. Anything at a non-integer millisecond period is
+// therefore reported as the nearest integer-millisecond rate, and this probe
+// CANNOT be used to tell 120 Hz from 125 Hz. Use the host-side
+// `display_vbl ... window_hz=` census for that question; it is measured on a
+// clock nothing clamps. `fps` over the whole run is unaffected by the clamp and
+// remains the honest rate.
+//
 // A "long" frame is one that consumed at least two refresh intervals, i.e. at
 // least one frame was not shown. The 1.5x threshold is the midpoint between one
 // interval and two, which is where a delta stops being jitter around the budget

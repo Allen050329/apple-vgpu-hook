@@ -82,11 +82,20 @@ pub(crate) fn draw_log_enabled() -> bool {
 /// window their counters on the same process-monotonic clock that stamps every
 /// line — no second time base to reconcile against `t=`.
 pub(crate) fn elapsed_ms() -> u128 {
-    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    T0.get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis()
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis()
 }
+
+/// The same process-monotonic clock in microseconds.
+///
+/// Millisecond resolution cannot express every cadence we owe the guest: a
+/// 120 Hz frame is 8333 µs, and rounding it to 8 ms delivers 125 Hz. Paths that
+/// pace something the guest measures need this one; `t=` stamps stay in
+/// milliseconds so line-class censuses keep working.
+pub(crate) fn elapsed_us() -> u64 {
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Sink paths. Test runs write per-process files instead of the product
 /// `/tmp/reims-vgpu-fail.log`: `cargo test` runs on the same machine as live product

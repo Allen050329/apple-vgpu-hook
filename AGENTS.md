@@ -202,6 +202,18 @@ about backgrounding; it fired whenever the surrounding command mentioned the
 process name. Check the log's mtime, not just its contents — a stale log from a
 previous boot reads exactly like a fresh failed one.
 
+A boot must also outlive the shell that starts it, or a driver with its own
+timeout takes the VM down mid-measurement — `boot-x86.sh` traps the signal and
+kills QEMU, so the run ends looking like a guest failure:
+
+```sh
+setsid nohup vm/boot-x86.sh --device reims-vgpu-pci --testing >/tmp/boot.log 2>&1 </dev/null &
+```
+
+Then poll `ssh macos-vm true` until it answers, and abort the wait if
+`pgrep -f 'qemu-system-x86_6[4]'` stops matching — otherwise a boot that died
+early is indistinguishable from one still coming up.
+
 ### Finding State Nothing Reads
 
 Do not grep for this. `reims-vgpu` is a staticlib whose types are almost all

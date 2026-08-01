@@ -244,8 +244,12 @@ pub const DISPLAY_HEIGHT_MM: u16 = 300;
 /// Advertised refresh of every timing element. macOS paces CoreAnimation /
 /// rAF to the display's advertised rate, so 60 here caps the guest at 60 fps
 /// regardless of how fast VBL is signalled. 120 requests ProMotion-class
-/// pacing; it must be matched by the VBL limiter (`DISPLAY_VBL_MIN_INTERVAL_MS`
-/// = 8) and enough poll opportunities (`REIMS_VGPU_PCI_HEARTBEAT_MS` = 4).
+/// pacing; it must be matched by the VBL limiter and enough poll opportunities
+/// (`REIMS_VGPU_PCI_HEARTBEAT_MS` = 4). The limiter now *derives* its interval
+/// from this constant (`DISPLAY_VBL_MIN_INTERVAL_US`) rather than restating it,
+/// because the two were allowed to drift apart: a hardcoded 8 ms delivered
+/// 125 Hz against the 120 advertised here, and the guest paces to what is
+/// delivered.
 pub const DISPLAY_REFRESH_HZ: u32 = 120;
 pub const DISPLAY_PRODUCT_NAME: &[u8] = b"QEMU display\0";
 /// Archive: ~30s of ONLINE asserts at ~200ms (poll_ctr % 50, 4ms poll).
