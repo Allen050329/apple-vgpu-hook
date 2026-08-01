@@ -2373,6 +2373,24 @@ pub(crate) unsafe fn execute_draw_inner(
     // A draw with no pixel readback (resident target, skip_readback) hands
     // the CPU nothing — skip the post-submit fence wait and return while the
     // GPU still runs on this ring slot.
+    //
+    // This is the whole population on a driven x86/Vulkan session. Summed over
+    // one — Safari's WebGL aquarium, Wikipedia and apple.com with page scrolls
+    // and title-bar drags — `render_post_wait_skips` and `draw_phase`'s own
+    // `draws` are the same number, 49 592, so every draw took this return and
+    // the wait/readback tail below ran zero times. Two counters incremented at
+    // two unrelated sites agreeing exactly is what makes that a proof;
+    // `draw_phase wait_us=0 readback_us=0` on its own cannot tell "never
+    // entered" from "entered and immeasurably fast".
+    //
+    // That is a reading about the workload and **not** a licence to delete the
+    // tail. `skip_readback` has to be decided before submit, and a Store that
+    // neither defer rail can take still has to land its pixels: a type-11 Store
+    // always defers (`metal_draw::vulkan` records why), but a GVA Store whose
+    // `row_stride` is short of the format's tight row bytes fails
+    // `gva_store_defer_eligible` and keeps its readback. Delete this and that
+    // Store loses its frame silently, which is the one outcome the ground rules
+    // forbid outright. What the equality licenses is not re-measuring it.
     let Some(ref rb) = readback else {
         counters
             .render_post_wait_skips

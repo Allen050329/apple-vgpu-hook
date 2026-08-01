@@ -863,6 +863,24 @@ fn try_sample_deferred_gva<M: HostMemory + HostOps>(
 /// to tell a rung that never fires from one the boot never reached — and quiet
 /// enough to talk someone into deleting it.
 ///
+/// A second driven session with a different drive — Chess, Maps, Safari on the
+/// WebGL aquarium, Wikipedia and apple.com, page scrolls and two title-bar
+/// drags — reproduced the shape on a smaller population:
+///
+///   t11rung_resident         15 992   64.5 %
+///   t11rung_host_cache        5 777   23.3 %
+///   t11rung_zero_copy         3 036   12.2 %
+///   t11rung_guest_memo           62    0.25 %
+///   t11rung_miss                  0
+///   t11rung_resident_refused      0
+///
+/// The order is the same and no rung is empty, so the two runs agree on which
+/// rungs carry load. The share does move with the drive — live 3D and a WebGL
+/// canvas push work down off the resident rung — so treat the percentages as a
+/// range and not as a constant of the design. The bottom rung is the one to
+/// keep watching: 150 binds in one session and 62 in the other is small enough
+/// to read as noise, and both are a fallback nothing below would correct.
+///
 /// Two facts to weigh before touching the order:
 ///
 /// - The host-cache rung is NOT a duplicate of the guest-page rungs below it.
