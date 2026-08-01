@@ -57,6 +57,11 @@ impl MirrorClampToEdge {
     }
 }
 
+/// The `maxImageDimension2D` every Vulkan 1.2 implementation must report at
+/// least (spec table "Required Limits"). Used only as the floor a queried
+/// value is clamped to, and as the answer when no device has been resolved.
+pub const VULKAN_MIN_IMAGE_DIMENSION_2D: u32 = 4096;
+
 /// Every device feature and format capability this backend depends on, resolved
 /// against one physical device.
 ///
@@ -70,6 +75,12 @@ pub struct DeviceFeatures {
     pub robust_buffer_access: bool,
     pub sampler_anisotropy: bool,
     pub max_sampler_anisotropy: f32,
+    /// `VkPhysicalDeviceLimits::maxImageDimension2D` — the largest 2D image
+    /// this device can create, and therefore the largest render target a draw
+    /// may name. Read from the device rather than assumed: the Vulkan 1.2
+    /// floor is 4096, which every desktop GPU exceeds by 4x, so treating the
+    /// floor as the cap refuses render targets the host can actually hold.
+    pub max_image_dimension_2d: u32,
     pub shader_int16: bool,
     pub storage_image_extended_formats: bool,
     pub storage_image_write_without_format: bool,
@@ -215,6 +226,10 @@ pub unsafe fn query(
         robust_buffer_access: supported.robust_buffer_access == vk::TRUE,
         sampler_anisotropy: supported.sampler_anisotropy == vk::TRUE,
         max_sampler_anisotropy: props.limits.max_sampler_anisotropy.max(1.0),
+        max_image_dimension_2d: props
+            .limits
+            .max_image_dimension2_d
+            .max(VULKAN_MIN_IMAGE_DIMENSION_2D),
         shader_int16: supported.shader_int16 == vk::TRUE,
         storage_image_extended_formats: supported.shader_storage_image_extended_formats == vk::TRUE,
         storage_image_write_without_format: supported.shader_storage_image_write_without_format
@@ -239,6 +254,7 @@ mod tests {
             robust_buffer_access: true,
             sampler_anisotropy: true,
             max_sampler_anisotropy: 16.0,
+            max_image_dimension_2d: 16384,
             shader_int16: true,
             storage_image_extended_formats: true,
             storage_image_write_without_format: true,
@@ -327,6 +343,29 @@ mod tests {
             ..all_supported()
         };
         assert!(!no_feature.storage_image_write_without_format_bgra());
+    }
+
+    /// The render-target bound is the device's limit, not the spec's floor.
+    ///
+    /// The draw path used to refuse any target wider or taller than 4096 with
+    /// `GeometryUnsupported`. 4096 is the Vulkan 1.2 *required minimum* for
+    /// `maxImageDimension2D` — the smallest value a conformant implementation
+    /// may report — and desktop GPUs report 16384. Using the floor as the cap
+    /// therefore refused targets the host could hold: a guest on a 5K or 6K
+    /// display names them, and the refusal costs the frame.
+    ///
+    /// So a host reporting more than the floor must be believed, and a host
+    /// reporting less than it is out of spec and clamped up rather than
+    /// trusted downward.
+    #[test]
+    fn the_render_target_bound_follows_the_device_not_the_spec_floor() {
+        assert!(
+            all_supported().max_image_dimension_2d > VULKAN_MIN_IMAGE_DIMENSION_2D,
+            "a desktop-class device reports well past the floor, and the draw \
+             path must accept a target that large"
+        );
+        // A 5K-wide target: refused under the old fixed 4096, accepted here.
+        assert!(5120 <= all_supported().max_image_dimension_2d);
     }
 
     /// The enable list is derived from what the backend binds, and

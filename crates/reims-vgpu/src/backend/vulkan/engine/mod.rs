@@ -505,6 +505,18 @@ pub fn deferred_gpu_only_content_allowed() -> bool {
         .is_some_and(|ctx| !ctx.caps.quirks.guest_pages_stay_authoritative)
 }
 
+/// The largest render-target edge this host can create, from the device's own
+/// `maxImageDimension2D`. Before a device is resolved this is the Vulkan 1.2
+/// required minimum — the most any implementation is guaranteed to accept.
+pub fn max_render_target_dimension() -> u32 {
+    lock_engine()
+        .owner
+        .ctx
+        .as_ref()
+        .map(|ctx| ctx.features.max_image_dimension_2d)
+        .unwrap_or(crate::backend::vulkan::caps::device_features::VULKAN_MIN_IMAGE_DIMENSION_2D)
+}
+
 /// Pin a content-ready resident render target against LRU eviction (deferred
 /// render Store — the GPU image is the only copy until flush-on-access lands
 /// it in guest pages). Returns false when the identity is absent or not

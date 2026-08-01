@@ -3906,7 +3906,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
         return Ok(M2vDrawSpan::None);
     };
-    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+    // The bound is the device's own `maxImageDimension2D`, not a fixed number:
+    // a guest driving a 5K or 6K display names render targets past the Vulkan
+    // 1.2 floor of 4096, and every desktop GPU reports 16384.
+    let max_dim = crate::backend::vulkan::engine::max_render_target_dimension();
+    if w == 0 || h == 0 || w > max_dim || h > max_dim {
         return Err(DrawError::DrawPreparation(
             DrawPreparationDecline::GeometryUnsupported {
                 width: w,
