@@ -1075,34 +1075,23 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
             // SetBuffer always carries at least one entry and there is no
             // single-entry wire form to fall back to.
-            for (i, &(buffer_ref, offset)) in cmd.buffer_binds.iter().enumerate() {
-                let index = cmd.first.saturating_add(i as u32);
-                if index >= MAX_BIND_SLOTS {
-                    break;
-                }
-                if buffer_ref == 0 {
-                    match cmd.stage {
-                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers).retain(|b| b.index != index),
-                        Stage::Fragment => {
-                            Arc::make_mut(&mut acc.fragment_buffers).retain(|b| b.index != index)
-                        }
-                        _ => {}
-                    }
-                    out.buffer_unbinds = out.buffer_unbinds.saturating_add(1);
-                    continue;
-                }
-                let bind = BufferBind {
-                    stage: cmd.stage,
-                    index,
-                    buffer_ref,
-                    offset,
-                };
-                match cmd.stage {
-                    Stage::Vertex => upsert_buffer(Arc::make_mut(&mut acc.vertex_buffers), bind),
-                    Stage::Fragment => upsert_buffer(Arc::make_mut(&mut acc.fragment_buffers), bind),
-                    _ => {}
-                }
-            }
+            let cleared = apply_binds(
+                &cmd.buffer_binds,
+                cmd.first,
+                cmd.stage,
+                &mut acc.vertex_buffers,
+                &mut acc.fragment_buffers,
+                |b| b.index,
+                |index, (buffer_ref, offset)| {
+                    (buffer_ref != 0).then_some(BufferBind {
+                        stage: cmd.stage,
+                        index,
+                        buffer_ref,
+                        offset,
+                    })
+                },
+            );
+            out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
         RenderKind::SetBufferOffset => {
             // Archive apply_buffer_offset: update offset on an already-bound slot.
@@ -1122,76 +1111,57 @@ fn handle_render_record<M: HostMemory + HostOps>(
         RenderKind::SetTexture => {
             // As for SetBuffer: `ref_binds` is never empty on a decoded record,
             // and the clone the removed fallback needed went with it.
-            for (i, &texture_ref) in cmd.ref_binds.iter().enumerate() {
-                let index = cmd.first.saturating_add(i as u32);
-                if index >= MAX_BIND_SLOTS {
-                    break;
-                }
-                if texture_ref == 0 {
-                    match cmd.stage {
-                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_textures).retain(|b| b.index != index),
-                        Stage::Fragment => {
-                            Arc::make_mut(&mut acc.fragment_textures).retain(|b| b.index != index)
+            let cleared = apply_binds(
+                &cmd.ref_binds,
+                cmd.first,
+                cmd.stage,
+                &mut acc.vertex_textures,
+                &mut acc.fragment_textures,
+                |b| b.index,
+                |index, texture_ref| {
+                    if texture_ref == 0 {
+                        return None;
+                    }
+                    if !out.texture_refs.contains(&texture_ref) {
+                        out.texture_refs.push(texture_ref);
+                    }
+                    if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref)
+                    {
+                        if !out.type11_mappings.contains(&m) {
+                            out.type11_mappings.push(m);
                         }
-                        _ => {}
+                    } else if objects::resolve_type4_surface(state, host, texture_ref) {
+                        // x86 type-4: object ref is surface_id / mapping_id.
+                        if !out.type11_mappings.contains(&texture_ref) {
+                            out.type11_mappings.push(texture_ref);
+                        }
                     }
-                    out.texture_unbinds = out.texture_unbinds.saturating_add(1);
-                    continue;
-                }
-                if !out.texture_refs.contains(&texture_ref) {
-                    out.texture_refs.push(texture_ref);
-                }
-                let bind = TextureBind {
-                    stage: cmd.stage,
-                    index,
-                    texture_ref,
-                };
-                match cmd.stage {
-                    Stage::Vertex => upsert_texture(Arc::make_mut(&mut acc.vertex_textures), bind),
-                    Stage::Fragment => upsert_texture(Arc::make_mut(&mut acc.fragment_textures), bind),
-                    _ => {}
-                }
-                if let Some(m) = objects::resolve_type11_ref(state, host, task_id, texture_ref) {
-                    if !out.type11_mappings.contains(&m) {
-                        out.type11_mappings.push(m);
-                    }
-                } else if objects::resolve_type4_surface(state, host, texture_ref) {
-                    // x86 type-4: object ref is surface_id / mapping_id.
-                    if !out.type11_mappings.contains(&texture_ref) {
-                        out.type11_mappings.push(texture_ref);
-                    }
-                }
-            }
+                    Some(TextureBind {
+                        stage: cmd.stage,
+                        index,
+                        texture_ref,
+                    })
+                },
+            );
+            out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
         RenderKind::SetSampler => {
-            let refs = &cmd.ref_binds;
-            for (i, &sampler_ref) in refs.iter().enumerate() {
-                let index = cmd.first.saturating_add(i as u32);
-                if index >= MAX_BIND_SLOTS {
-                    break;
-                }
-                if sampler_ref == 0 {
-                    match cmd.stage {
-                        Stage::Vertex => Arc::make_mut(&mut acc.vertex_samplers).retain(|b| b.index != index),
-                        Stage::Fragment => {
-                            Arc::make_mut(&mut acc.fragment_samplers).retain(|b| b.index != index)
-                        }
-                        _ => {}
-                    }
-                    out.sampler_unbinds = out.sampler_unbinds.saturating_add(1);
-                    continue;
-                }
-                let bind = SamplerBind {
-                    stage: cmd.stage,
-                    index,
-                    sampler_ref,
-                };
-                match cmd.stage {
-                    Stage::Vertex => upsert_sampler(Arc::make_mut(&mut acc.vertex_samplers), bind),
-                    Stage::Fragment => upsert_sampler(Arc::make_mut(&mut acc.fragment_samplers), bind),
-                    _ => {}
-                }
-            }
+            let cleared = apply_binds(
+                &cmd.ref_binds,
+                cmd.first,
+                cmd.stage,
+                &mut acc.vertex_samplers,
+                &mut acc.fragment_samplers,
+                |b| b.index,
+                |index, sampler_ref| {
+                    (sampler_ref != 0).then_some(SamplerBind {
+                        stage: cmd.stage,
+                        index,
+                        sampler_ref,
+                    })
+                },
+            );
+            out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
         RenderKind::SetViewport => {
             acc.viewport = Some(cmd.viewport);
@@ -1491,28 +1461,56 @@ fn reset_unimplemented_opcode_dedup_for_test() {
     }
 }
 
-fn upsert_buffer(list: &mut Vec<BufferBind>, bind: BufferBind) {
-    if let Some(slot) = list.iter_mut().find(|b| b.index == bind.index) {
-        *slot = bind;
-    } else {
-        list.push(bind);
+/// Apply one `Set{Buffer,Texture,Sampler}` record to a stage's bind table.
+///
+/// All three carry the same wire form: `count` consecutive slots starting at
+/// `first`, where a zero object ref clears the slot it names and any other ref
+/// replaces whatever occupied it. Slots at or past [`MAX_BIND_SLOTS`] are
+/// outside the encoder's table and end the walk. Only the vertex and fragment
+/// stages have tables here; a record for any other stage still counts its
+/// clears, because a slot the guest cleared is cleared whether or not we model
+/// the table it lived in.
+///
+/// `make` builds the bind for a live slot and returns `None` for the zero ref,
+/// which keeps the ref field's name — and any side registration, such as the
+/// texture arm's type-11 mapping list — with the caller. The clear count comes
+/// back as a return value rather than through an `&mut` counter so `make` can
+/// hold the rest of `ExecResult`.
+fn apply_binds<T: Copy, B: Clone>(
+    entries: &[T],
+    first: u32,
+    stage: Stage,
+    vertex: &mut BindTable<B>,
+    fragment: &mut BindTable<B>,
+    slot: impl Fn(&B) -> u32,
+    mut make: impl FnMut(u32, T) -> Option<B>,
+) -> u32 {
+    let mut cleared = 0u32;
+    for (i, entry) in entries.iter().copied().enumerate() {
+        let index = first.saturating_add(i as u32);
+        if index >= MAX_BIND_SLOTS {
+            break;
+        }
+        let bind = make(index, entry);
+        let list = match stage {
+            Stage::Vertex => Arc::make_mut(vertex),
+            Stage::Fragment => Arc::make_mut(fragment),
+            _ => {
+                cleared = cleared.saturating_add(bind.is_none() as u32);
+                continue;
+            }
+        };
+        let Some(bind) = bind else {
+            list.retain(|b| slot(b) != index);
+            cleared = cleared.saturating_add(1);
+            continue;
+        };
+        match list.iter_mut().find(|b| slot(b) == index) {
+            Some(occupant) => *occupant = bind,
+            None => list.push(bind),
+        }
     }
-}
-
-fn upsert_texture(list: &mut Vec<TextureBind>, bind: TextureBind) {
-    if let Some(slot) = list.iter_mut().find(|b| b.index == bind.index) {
-        *slot = bind;
-    } else {
-        list.push(bind);
-    }
-}
-
-fn upsert_sampler(list: &mut Vec<SamplerBind>, bind: SamplerBind) {
-    if let Some(slot) = list.iter_mut().find(|b| b.index == bind.index) {
-        *slot = bind;
-    } else {
-        list.push(bind);
-    }
+    cleared
 }
 
 /// Report what this stream's draw list cost, and anything it lost building it.
@@ -3102,13 +3100,20 @@ mod tests {
         };
         handle_render_record(&mut state, &host, 1, &command, &rec, &mut out, &mut acc);
 
-        upsert_buffer(
-            Arc::make_mut(&mut acc.vertex_buffers),
-            BufferBind {
-                stage: Stage::Vertex,
-                index: 0,
-                buffer_ref: 77,
-                offset: 0,
+        apply_binds(
+            &[(77u32, 0u64)],
+            0,
+            Stage::Vertex,
+            &mut acc.vertex_buffers,
+            &mut acc.fragment_buffers,
+            |b| b.index,
+            |index, (buffer_ref, offset)| {
+                Some(BufferBind {
+                    stage: Stage::Vertex,
+                    index,
+                    buffer_ref,
+                    offset,
+                })
             },
         );
 
