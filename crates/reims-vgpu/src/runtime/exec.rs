@@ -1097,9 +1097,10 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 let list = match cmd.stage {
                     Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
                     Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
-                    _ => {
-                        return;
-                    }
+                    // An offset update names a slot in a table; with no stage
+                    // there is no table, and inventing one would move somebody
+                    // else's binding.
+                    Stage::Unknown => return,
                 };
                 if let Some(b) = list.iter_mut().find(|b| b.index == cmd.first) {
                     b.offset = cmd.buffer_offset;
@@ -1489,7 +1490,9 @@ fn apply_binds<T: Copy, B: Clone>(
         let list = match stage {
             Stage::Vertex => Arc::make_mut(vertex),
             Stage::Fragment => Arc::make_mut(fragment),
-            _ => {
+            // No table to bind into, but a slot the guest cleared is still
+            // cleared: the count is what the record said, not what we modelled.
+            Stage::Unknown => {
                 cleared = cleared.saturating_add(bind.is_none() as u32);
                 continue;
             }

@@ -202,15 +202,25 @@ pub struct StencilAttachment {
     pub clear_stencil: u32,
 }
 
+/// Which encoder table a render bind record names.
+///
+/// Derived from the opcode, not from a wire field: `OP_SET_VERTEX_*` versus
+/// `OP_SET_FRAGMENT_*`. The render opcode set expresses no other stage, so
+/// there are no other variants — an object/mesh/tile bind reaches the device
+/// through the indirect-command-buffer path and carries
+/// [`crate::runtime::icb::IcbRenderBindStage`], which is a different vocabulary
+/// with a different wire encoding.
+///
+/// Keeping this exhaustive is the point. With unreachable variants present,
+/// every `match` over it needed a catch-all, and a catch-all is what would
+/// swallow a genuinely new stage in silence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Stage {
+    /// The record named no stage, or the opcode was not a stage-bearing one.
     #[default]
     Unknown,
     Vertex,
     Fragment,
-    Object,
-    Mesh,
-    Tile,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
