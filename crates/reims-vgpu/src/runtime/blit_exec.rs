@@ -2778,16 +2778,17 @@ pub(crate) fn blit_status_from_fence(status: FenceStatus) -> BlitStatus {
     }
 }
 
-/// Blit into a type-11 destination writes the guest pages directly, and no GPU
-/// object caches those bytes — content is coherent by construction, so there is
-/// nothing to invalidate.
-fn invalidate_type11_last_store(_state: &mut DeviceState, _dst: &TextureBacking) {}
-
 /// Execute a decoded blit command on the product path.
 ///
 /// Returns [`BlitStatus::Unsupported`] for resource/image/mipmap opcodes
 /// that other modules own or that are protocol no-ops (caller should not count
 /// those as copy/fill failures). Fences use [`execute_blit_fence`].
+///
+/// Nothing follows a successful copy. A blit into a type-11 destination writes
+/// the guest pages directly and no GPU object caches those bytes, so the
+/// content is coherent by construction and there is nothing to invalidate.
+/// Each arm resolved its own destination in order to write it, so a second
+/// resolve afterwards only repeats the page walk.
 pub fn execute_blit<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -2801,84 +2802,11 @@ pub fn execute_blit<M: HostMemory + HostOps>(
         Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
         Kind::Copy => match cmd.copy_kind {
             CopyKind::BufferToBuffer => exec_copy_buffer_to_buffer(state, host, task_id, cmd),
-            CopyKind::BufferToTexture => {
-                let st = exec_copy_buffer_to_texture(state, host, task_id, cmd);
-                if matches!(st, BlitStatus::Ok) {
-                    // Re-resolve dest for invalidate (exec already wrote).
-                    if let Ok(dst) = resolve_texture_backing(
-                        state,
-                        host,
-                        task_id,
-                        cmd.destination,
-                        cmd.destination_level,
-                        cmd.destination_slice,
-                    ) {
-                        invalidate_type11_last_store(state, &dst);
-                        if dst.is_type11() {
-                            crate::observe::line(format!(
-                                "blit buf→tex type11 dst_ref={} mid={} {}x{} ok",
-                                cmd.destination,
-                                match &dst {
-                                    TextureBacking::Type11(t) => t.mapping_id,
-                                    _ => 0,
-                                },
-                                dst.width(),
-                                dst.height()
-                            ));
-                        }
-                    }
-                }
-                st
-            }
+            CopyKind::BufferToTexture => exec_copy_buffer_to_texture(state, host, task_id, cmd),
             CopyKind::TextureToBuffer => exec_copy_texture_to_buffer(state, host, task_id, cmd),
-            CopyKind::TextureToTexture => {
-                let st = exec_copy_texture_to_texture(state, host, task_id, cmd);
-                if matches!(st, BlitStatus::Ok) {
-                    if let Ok(dst) = resolve_texture_backing(
-                        state,
-                        host,
-                        task_id,
-                        cmd.destination,
-                        cmd.destination_level,
-                        cmd.destination_slice,
-                    ) {
-                        invalidate_type11_last_store(state, &dst);
-                        if dst.is_type11() {
-                            crate::observe::line(format!(
-                                "blit tex→tex type11 src_ref={} dst_ref={} mid={} {}x{} origin=({},{}) size=({},{}) ok",
-                                cmd.source,
-                                cmd.destination,
-                                match &dst {
-                                    TextureBacking::Type11(t) => t.mapping_id,
-                                    _ => 0,
-                                },
-                                dst.width(),
-                                dst.height(),
-                                cmd.destination_origin.x,
-                                cmd.destination_origin.y,
-                                cmd.source_size.width,
-                                cmd.source_size.height
-                            ));
-                        }
-                    }
-                }
-                st
-            }
+            CopyKind::TextureToTexture => exec_copy_texture_to_texture(state, host, task_id, cmd),
             CopyKind::TextureToTextureSliceLevel => {
-                let st = exec_copy_texture_to_texture_slice_level(state, host, task_id, cmd);
-                if matches!(st, BlitStatus::Ok) {
-                    if let Ok(dst) = resolve_texture_backing(
-                        state,
-                        host,
-                        task_id,
-                        cmd.destination,
-                        cmd.destination_level,
-                        cmd.destination_slice,
-                    ) {
-                        invalidate_type11_last_store(state, &dst);
-                    }
-                }
-                st
+                exec_copy_texture_to_texture_slice_level(state, host, task_id, cmd)
             }
             CopyKind::None => br(BlitStatus::Unsupported, "copy_kind_none"),
         },
