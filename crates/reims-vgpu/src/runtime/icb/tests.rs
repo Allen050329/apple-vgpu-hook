@@ -30,8 +30,10 @@ use crate::runtime::host::FakeHost;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::mapping_write;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::decode::render::PASS_STORE_ACTION_STORE;
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::metal_draw::{
-    encode_icb_execute_and_writeback, BufferBind, DrawEncodeRequest, EncodeStatus,
+    encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
 };
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use std::path::PathBuf;
@@ -541,14 +543,19 @@ fn draw_request(mapping_id: u32) -> DrawEncodeRequest {
     DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 6,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            mapping_id,
+            width: 4,
+            height: 4,
+            format: crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
@@ -2155,16 +2162,20 @@ fn fill_render_draw_indexed_execute_oracle() {
     let req = DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 6,
-        color_texture_ref: 0,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
         first_vertex: 0,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            mapping_id,
+            width: 4,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            ..Default::default()
+        }],
         ..Default::default()
     };
     assert_eq!(
@@ -2258,16 +2269,20 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     let req = DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 6,
-        color_texture_ref: 0,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
         first_vertex: 0,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            mapping_id,
+            width: 4,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            ..Default::default()
+        }],
         ..Default::default()
     };
     assert_eq!(
@@ -3745,16 +3760,20 @@ fn inherit_buffers_encoder_fragment_color() {
     let req = DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 6,
-        color_texture_ref: 0,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
         first_vertex: 0,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            mapping_id,
+            width: 4,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            ..Default::default()
+        }],
         fragment_buffers: vec![BufferBind {
             index: 0,
             buffer_ref: 13,
@@ -3864,16 +3883,20 @@ fn inherit_pipeline_encoder_fragment_color() {
     let req = DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 6,
-        color_texture_ref: 0,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
         first_vertex: 0,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            mapping_id,
+            width: 4,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            ..Default::default()
+        }],
         viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
         ..Default::default()
     };
@@ -3999,16 +4022,20 @@ fn fill_render_stagein_draw_execute_oracle() {
     let req = DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 6,
-        color_texture_ref: 0,
-        mapping_id,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3,
         first_vertex: 0,
-        target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            mapping_id,
+            width: 4,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
+            ..Default::default()
+        }],
         ..Default::default()
     };
     assert_eq!(

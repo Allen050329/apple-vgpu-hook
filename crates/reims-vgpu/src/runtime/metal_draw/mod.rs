@@ -301,19 +301,14 @@ pub struct ColorRtRequest {
 pub struct DrawEncodeRequest {
     pub task_id: u32,
     pub pipeline_ref: u32,
-    /// Primary color0 (compat fields; also colors[0] when MRT).
-    pub color_texture_ref: u32,
-    pub mapping_id: u32,
-    pub width: u32,
-    pub height: u32,
-    pub format: u16,
     pub vertex_count: u32,
     pub instance_count: u32,
     pub primitive_type: u32,
     pub first_vertex: u32,
-    /// Optional seed/target RGBA8 for color0 (from clear/load).
-    pub target_seed_rgba: Option<Vec<u8>>,
-    /// All color RTs including slot 0 (MRT). Empty ⇒ fall back to color0 fields.
+    /// Every color RT the pass declared, slot 0 first. The sole statement of
+    /// what this draw renders into: geometry, format, target identity and Load
+    /// seed all live here and nowhere else, so no two fields of one request can
+    /// disagree about the attachment.
     pub colors: Vec<ColorRtRequest>,
     pub vertex_buffers: Vec<BufferBind>,
     pub fragment_buffers: Vec<BufferBind>,
@@ -419,7 +414,17 @@ fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::
     crate::observe::Emit::decline("linux_m2v_draw", error)
         .field("pipe", req.pipeline_ref)
         .field("task", req.task_id)
-        .field("geom", format!("{}x{}", req.width, req.height))
+        // color0's declared extent, which *is* the pass extent — there is no
+        // second geometry on the request for it to disagree with. A request
+        // carrying no attachment keeps the `WxH` shape so the field stays
+        // greppable.
+        .field(
+            "geom",
+            req.colors
+                .first()
+                .map(|c| format!("{}x{}", c.width, c.height))
+                .unwrap_or_else(|| "0x0".to_string()),
+        )
         .field("vtx", req.vertex_count)
         .field("inst", req.instance_count)
         .field("prim", req.primitive_type)
@@ -1148,40 +1153,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     use crate::backend::metal::render::{render_core_mrt, ColorRt};
     use crate::backend::metal::util::ErrOut;
 
+    if req.colors.is_empty() {
+        return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
+    }
     // Move multi-MiB Load seeds out **before** cloning color metadata so multi-draw
     // chain frames are not duplicated (clone of empty Option is cheap).
-    let mut color_seeds: Vec<Option<Vec<u8>>> = if !req.colors.is_empty() {
-        req.colors
-            .iter_mut()
-            .map(|c| c.target_seed_rgba.take())
-            .collect()
-    } else {
-        vec![req.target_seed_rgba.take()]
-    };
-    // Normalize color RT list: prefer req.colors; else single color0 fields.
-    let color_list: Vec<ColorRtRequest> = if !req.colors.is_empty() {
-        req.colors.clone()
-    } else if (req.mapping_id != 0 || req.width > 0) && req.width > 0 && req.height > 0 {
-        vec![ColorRtRequest {
-            slot: 0,
-            texture_ref: req.color_texture_ref,
-            mapping_id: req.mapping_id,
-            target_gva: 0,
-            row_stride: 0,
-            width: req.width,
-            height: req.height,
-            format: req.format,
-            load_action: 0,
-            store_action: PASS_STORE_ACTION_STORE,
-            clear_color: [0.0; 4],
-            target_seed_rgba: None,
-        }]
-    } else {
-        return (EncodeStatus::BadArgs("draw_mtl_no_color_target"), None);
-    };
-    if color_seeds.len() != color_list.len() {
-        color_seeds.resize_with(color_list.len(), || None);
-    }
+    let mut color_seeds: Vec<Option<Vec<u8>>> = req
+        .colors
+        .iter_mut()
+        .map(|c| c.target_seed_rgba.take())
+        .collect();
+    let color_list: Vec<ColorRtRequest> = req.colors.clone();
     let width = color_list[0].width;
     let height = color_list[0].height;
     if width == 0 || height == 0 {
@@ -1609,7 +1591,9 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             && (da.store_action == PASS_STORE_ACTION_DONT_CARE
                 || da.store_action == PASS_STORE_ACTION_STORE)
         {
-            let row = req.width.saturating_mul(4);
+            // The pass extent, same as every other attachment in it — the depth
+            // buffer's rows and its row count have to come from one geometry.
+            let row = width.saturating_mul(4);
             let depth_len = (row as usize).saturating_mul(height as usize);
             let mut buf = vec![0u8; depth_len];
             let mid =
@@ -3351,16 +3335,10 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     Some(DrawEncodeRequest {
         task_id,
         pipeline_ref,
-        color_texture_ref,
-        mapping_id,
-        width: w,
-        height: h,
-        format: fmt,
         vertex_count,
         instance_count,
         primitive_type,
         first_vertex,
-        target_seed_rgba: None,
         colors: vec![c0],
         ..Default::default()
     })
@@ -3473,20 +3451,13 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     if colors.is_empty() {
         return None;
     }
-    let c0 = &colors[0];
     Some(DrawEncodeRequest {
         task_id,
         pipeline_ref,
-        color_texture_ref: c0.texture_ref,
-        mapping_id: c0.mapping_id,
-        width: c0.width,
-        height: c0.height,
-        format: c0.format,
         vertex_count,
         instance_count,
         primitive_type,
         first_vertex,
-        target_seed_rgba: c0.target_seed_rgba.clone(),
         colors,
         ..Default::default()
     })

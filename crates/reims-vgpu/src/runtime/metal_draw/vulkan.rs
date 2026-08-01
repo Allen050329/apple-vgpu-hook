@@ -68,30 +68,9 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // ever reaches the pipeline scissor rect, never the Store extent.
     _force_full_store: bool,
 ) -> (EncodeStatus, Option<Vec<u8>>) {
-    let colors: Vec<ColorRtRequest> = if req.colors.is_empty() {
-        if req.color_texture_ref == 0 && req.mapping_id == 0 {
-            return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
-        }
-        vec![ColorRtRequest {
-            slot: 0,
-            texture_ref: req.color_texture_ref,
-            mapping_id: req.mapping_id,
-            target_gva: 0,
-            row_stride: 0,
-            width: req.width,
-            height: req.height,
-            format: if req.format != 0 {
-                req.format
-            } else {
-                MTL_FORMAT_BGRA8_UNORM
-            },
-            load_action: PASS_LOAD_ACTION_CLEAR,
-            store_action: PASS_STORE_ACTION_STORE,
-            clear_color: [0.0, 0.0, 0.0, 1.0],
-            target_seed_rgba: None,
-        }]
-    } else {
-        req.colors.clone()
+    let colors: Vec<ColorRtRequest> = req.colors.clone();
+    let Some((pass_w, pass_h)) = colors.first().map(|c0| (c0.width, c0.height)) else {
+        return (EncodeStatus::BadArgs("draw_vk_no_color_target"), None);
     };
 
     let mut any_store = false;
@@ -200,7 +179,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 draw_bgra = bgra;
                 crate::observe::line(format!(
                     "linux_m2v_draw ok pipe={} {}x{} vtx={}",
-                    req.pipeline_ref, req.width, req.height, req.vertex_count
+                    req.pipeline_ref, pass_w, pass_h, req.vertex_count
                 ));
             }
             Ok(M2vDrawSpan::ResidentChain) => {
@@ -208,8 +187,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 crate::observe::line(format!(
                     "linux_m2v_draw ok resident_chain pipe={} {}x{} mid={} gva={:#x}",
                     req.pipeline_ref,
-                    req.width,
-                    req.height,
+                    pass_w,
+                    pass_h,
                     req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
                     req.colors.first().map(|c| c.target_gva).unwrap_or(0)
                 ));
@@ -221,8 +200,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store pipe={} {}x{} gva={:#x}",
                         req.pipeline_ref,
-                        req.width,
-                        req.height,
+                        pass_w,
+                        pass_h,
                         req.colors.first().map(|c| c.target_gva).unwrap_or(0)
                     ));
                 } else {
@@ -234,8 +213,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     crate::observe::line(format!(
                         "linux_m2v_draw ok resident_gva_store_sync_fallback pipe={} {}x{} gva={:#x} rgba={}",
                         req.pipeline_ref,
-                        req.width,
-                        req.height,
+                        pass_w,
+                        pass_h,
                         req.colors.first().map(|c| c.target_gva).unwrap_or(0),
                         draw_rgba.is_some() as u8
                     ));
@@ -270,7 +249,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         surface_store_armed = true;
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store pipe={} {}x{} mid={mid} epoch={epoch}",
-                            req.pipeline_ref, req.width, req.height
+                            req.pipeline_ref, pass_w, pass_h
                         ));
                     }
                     _ => {
@@ -286,8 +265,8 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                         crate::observe::line(format!(
                             "linux_m2v_draw ok resident_surface_store_sync_fallback pipe={} {}x{} mid={} rgba={}",
                             req.pipeline_ref,
-                            req.width,
-                            req.height,
+                            pass_w,
+                            pass_h,
                             req.colors.first().map(|c| c.mapping_id).unwrap_or(0),
                             draw_rgba.is_some() as u8
                         ));
@@ -3453,14 +3432,14 @@ fn note_load_seed_outcome(
     // composited ten Finder windows.
     //
     // A second driven boot (Safari page load, title-bar drag, page-down) agrees
-    // and narrows it further: ok 295 = ok_color 152 + ok_mapping 143, with
-    // `req_seed` also at 0 both ways. `req_seed` keeps its arm — nothing argues
-    // it is unreachable, only that these two workloads did not reach it.
+    // and narrows it further: ok 295 = ok_color 152 + ok_mapping 143. A third
+    // door, `req_seed`, read a whole-request copy of the same seed the
+    // `color_seed` door reads and measured 0 in every boot; it was 0 because
+    // the request-level copy could only be `Some` when color0's already was,
+    // and the door sat behind color0's. It is gone with the copy.
     crate::runtime::drain::note_store_route(match (door, seeded) {
         ("color_seed", true) => "load_seed_ok_color",
         ("color_seed", false) => "load_seed_lost_color",
-        ("req_seed", true) => "load_seed_ok_req",
-        ("req_seed", false) => "load_seed_lost_req",
         ("mapping", true) => "load_seed_ok_mapping",
         ("mapping", false) => "load_seed_lost_mapping",
         (_, true) => "load_seed_ok_other",
@@ -3967,9 +3946,9 @@ fn dump_draw_handoff(
         "pipe={pipe}\nv_func_ref={vertex_func_ref}\nf_func_ref={fragment_func_ref}\n\
          geom={}x{} fmt={}\nvtx_count={} inst={} prim={} indexed={}\n\
          ftex_refs={ftex:?}\nfbuf_indices={fbuf:?}\ncolors={} depth={} stencil={}\n",
-        req.width,
-        req.height,
-        req.format,
+        req.colors.first().map(|c| c.width).unwrap_or(0),
+        req.colors.first().map(|c| c.height).unwrap_or(0),
+        req.colors.first().map(|c| c.format).unwrap_or(0),
         req.vertex_count,
         req.instance_count,
         req.primitive_type,
@@ -4128,11 +4107,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         ],
     );
 
-    let (w, h) = if req.width > 0 && req.height > 0 {
-        (req.width, req.height)
-    } else if let Some(c0) = req.colors.first() {
-        (c0.width, c0.height)
-    } else {
+    let Some((w, h)) = req.colors.first().map(|c0| (c0.width, c0.height)) else {
         return Ok(M2vDrawSpan::None);
     };
     if w == 0 || h == 0 || w > 4096 || h > 4096 {
@@ -4775,7 +4750,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     && c0.mapping_id == 0
                     && c0.target_gva != 0
                     && c0.target_seed_rgba.is_none()
-                    && req.target_seed_rgba.is_none()
                     && state.gva_deferred_flush.contains_key(&c0.target_gva)
                 {
                     let entry_geom = state
@@ -4989,11 +4963,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             // Black/transparent bytes are valid attachment data.
                             target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
                         }
-                    } else if let Some(seed) = req.target_seed_rgba.as_ref() {
-                        seed_door = "req_seed";
-                        if seed.len() == (w as usize) * (h as usize) * 4 {
-                            target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
-                        }
                     } else if c0.mapping_id != 0 {
                         seed_door = "mapping";
                         if let Some((bytes, order)) =
@@ -5003,23 +4972,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             seed_order = order;
                         }
                     }
-                    // There is no fourth door reading the texture_ref encode
-                    // cache. `color_target_request` calls `seed_color_load`
-                    // while building the request, and that is where the encode
-                    // cache is read — it is the `color_seed` door above. A
-                    // second lookup of the same map behind a stricter gate can
-                    // only be reached when the first has already declined,
-                    // which for a cached texture it cannot. Measured across
-                    // three independently driven x86/Vulkan boots: 1 558, 395
-                    // and 295 colour LOAD seed resolutions, and 0 serves plus
-                    // 0 misses at that door in every one.
+                    // Two doors, and there is no third. There is no separate
+                    // lookup of the texture_ref encode cache:
+                    // `color_target_request` calls `seed_color_load` while
+                    // building the request, and that is where the encode cache
+                    // is read — it is the `color_seed` door above. A second
+                    // lookup of the same map behind a stricter gate can only be
+                    // reached when the first has already declined, which for a
+                    // cached texture it cannot. Measured across three
+                    // independently driven x86/Vulkan boots: 1 558, 395 and 295
+                    // colour LOAD seed resolutions, and 0 serves plus 0 misses
+                    // at that door in every one.
                     note_load_seed_outcome(seed_door, target_rgba8.is_some(), c0, w, h);
                 }
                 _ => {}
-            }
-        } else if let Some(seed) = req.target_seed_rgba.as_ref() {
-            if seed.len() == (w as usize) * (h as usize) * 4 {
-                target_rgba8 = Some(std::sync::Arc::new(seed.clone()));
             }
         }
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
@@ -5834,11 +5800,7 @@ fn render_chain_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::backend::vulkan::engine::TargetIdentity> {
     let c0 = req.colors.first()?;
-    let (width, height) = if req.width > 0 && req.height > 0 {
-        (req.width, req.height)
-    } else {
-        (c0.width, c0.height)
-    };
+    let (width, height) = (c0.width, c0.height);
     if width == 0 || height == 0 {
         return None;
     }
@@ -5934,10 +5896,8 @@ fn type11_render_identity(
 /// it by RT provenance. Separate from the currency question so the two counters
 /// on the branch below divide candidates, not all draws.
 #[cfg(feature = "backend-vulkan")]
-fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest, req: &DrawEncodeRequest) -> bool {
-    c0.load_action == PASS_LOAD_ACTION_LOAD
-        && c0.target_seed_rgba.is_none()
-        && req.target_seed_rgba.is_none()
+fn type11_load_is_a_seed_candidate(c0: &ColorRtRequest) -> bool {
+    c0.load_action == PASS_LOAD_ACTION_LOAD && c0.target_seed_rgba.is_none()
 }
 
 /// The `(resident, mapping epoch)` pair a record's type-11 LOAD has to compare to
@@ -5960,7 +5920,7 @@ fn type11_load_currency_query(
     req: &DrawEncodeRequest,
 ) -> Option<(crate::backend::vulkan::engine::TargetIdentity, Option<u32>)> {
     let c0 = req.colors.first()?;
-    if !type11_load_is_a_seed_candidate(c0, req) {
+    if !type11_load_is_a_seed_candidate(c0) {
         return None;
     }
     let identity = type11_render_identity(state, req)?;
@@ -6422,11 +6382,7 @@ pub(crate) fn gva_chain_identity(
     if c0.mapping_id != 0 || c0.target_gva == 0 {
         return None;
     }
-    let (w, h) = if req.width > 0 && req.height > 0 {
-        (req.width, req.height)
-    } else {
-        (c0.width, c0.height)
-    };
+    let (w, h) = (c0.width, c0.height);
     if w == 0 || h == 0 {
         return None;
     }
@@ -6503,12 +6459,8 @@ fn surface_store_defer_eligible(
     if !deferred_gpu_only_content_allowed_for_surface() {
         return None;
     }
-    let (w, h) = if req.width > 0 && req.height > 0 {
-        (req.width, req.height)
-    } else {
-        (c0.width, c0.height)
-    };
-    if w == 0 || h == 0 || w != c0.width || h != c0.height {
+    let (w, h) = (c0.width, c0.height);
+    if w == 0 || h == 0 {
         return None;
     }
     let m = state.mappings.get(&c0.mapping_id)?;
@@ -6641,15 +6593,15 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
     let key = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)?;
     // The slot this arm pins and the slot the flush will look up have to be the
     // same slot, and until this check they were derived from two different
-    // spellings that are allowed to disagree. The arm's comes from
-    // `render_chain_identity`, which prefers the render extent
-    // (`req.width`/`req.height`) and falls back to the attachment's declared
-    // size; the flush rebuilds `TargetIdentity::Surface` from `key.width`/
-    // `key.height`, which are the attachment's size unconditionally. A record
-    // whose pass extent differs from its color0 geometry therefore pins one
-    // identity and hands the window another, and the flush finds no slot at all:
-    // the frame is lost and the pin — which nothing else drops, because eviction
-    // skips pinned slots — is leaked for the guest's lifetime.
+    // spellings that are allowed to disagree. The arm's came from
+    // `render_chain_identity`, which preferred a whole-request render extent and
+    // fell back to the attachment's declared size; the flush rebuilds
+    // `TargetIdentity::Surface` from `key.width`/`key.height`, which are the
+    // attachment's size unconditionally. A record whose pass extent differed
+    // from its color0 geometry therefore pinned one identity and handed the
+    // window another, and the flush found no slot at all: the frame is lost and
+    // the pin — which nothing else drops, because eviction skips pinned slots —
+    // is leaked for the guest's lifetime.
     //
     // That is the defect shape of `74748d2` and `021e64b` a third time, so it is
     // closed the same way: one spelling, checked, never two reconciled.
@@ -6662,7 +6614,7 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
         )
         .field("mid", mapping_id)
         .field("key_geom", format!("{}x{}", key.width, key.height))
-        .field("pass_geom", format!("{}x{}", req.width, req.height))
+        .field("pass_geom", format!("{width}x{height}"))
         .fail_once(u64::from(mapping_id));
         return None;
     }
@@ -7735,15 +7687,10 @@ mod vulkan_split_tests {
             load_action: PASS_LOAD_ACTION_LOAD,
             ..Default::default()
         };
-        let mut req = DrawEncodeRequest::default();
-        assert!(type11_load_is_a_seed_candidate(&c0, &req));
+        assert!(type11_load_is_a_seed_candidate(&c0));
 
         c0.target_seed_rgba = Some(vec![0u8; 4]);
-        assert!(!type11_load_is_a_seed_candidate(&c0, &req));
-
-        c0.target_seed_rgba = None;
-        req.target_seed_rgba = Some(vec![0u8; 4]);
-        assert!(!type11_load_is_a_seed_candidate(&c0, &req));
+        assert!(!type11_load_is_a_seed_candidate(&c0));
     }
 
     /// A CLEAR is not a LOAD. Eliding a seed there would replace the guest's
@@ -7754,10 +7701,7 @@ mod vulkan_split_tests {
             load_action: PASS_LOAD_ACTION_CLEAR,
             ..Default::default()
         };
-        assert!(!type11_load_is_a_seed_candidate(
-            &c0,
-            &DrawEncodeRequest::default()
-        ));
+        assert!(!type11_load_is_a_seed_candidate(&c0));
     }
 
     /// A type-11 `LOAD` whose host cache misses seeds from the surface's own

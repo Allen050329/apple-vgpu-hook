@@ -782,26 +782,10 @@ pub fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(
     if icb_ref == 0 {
         return EncodeStatus::BadArgs("icb_exec_ref_zero");
     }
-    let color_list: Vec<ColorRtRequest> = if !req.colors.is_empty() {
-        req.colors.clone()
-    } else if req.mapping_id != 0 && req.width > 0 && req.height > 0 {
-        vec![ColorRtRequest {
-            slot: 0,
-            texture_ref: req.color_texture_ref,
-            mapping_id: req.mapping_id,
-            target_gva: 0,
-            row_stride: 0,
-            width: req.width,
-            height: req.height,
-            format: req.format,
-            load_action: 0,
-            store_action: PASS_STORE_ACTION_STORE,
-            clear_color: [0.0; 4],
-            target_seed_rgba: req.target_seed_rgba.clone(),
-        }]
-    } else {
+    let color_list: Vec<ColorRtRequest> = req.colors.clone();
+    if color_list.is_empty() {
         return EncodeStatus::BadArgs("icb_exec_no_color_target");
-    };
+    }
     let width = color_list[0].width;
     let height = color_list[0].height;
     if width == 0

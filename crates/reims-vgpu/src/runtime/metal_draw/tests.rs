@@ -905,16 +905,13 @@ fn stage_in_buffer_read_as_ssbo_is_bound_as_storage() {
 }
 
 /// Resident GVA chain wiring: the identity is built only for GVA color0
-/// (never type-11), with req dims preferred over attachment dims.
+/// (never type-11), and its extent is color0's declared geometry — the one
+/// place a draw states what it renders into.
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn gva_chain_identity_rules() {
     use crate::backend::vulkan::engine::TargetIdentity;
-    let mut req = DrawEncodeRequest {
-        width: 64,
-        height: 32,
-        ..Default::default()
-    };
+    let mut req = DrawEncodeRequest::default();
     assert_eq!(gva_chain_identity(&req), None, "no colors → no identity");
     req.colors.push(ColorRtRequest {
         slot: 0,
@@ -929,19 +926,19 @@ fn gva_chain_identity_rules() {
         gva_chain_identity(&req),
         Some(TargetIdentity::Gva {
             gva: 0x1234_0000,
-            width: 64,
-            height: 32,
+            width: 16,
+            height: 16,
             generation: 0,
         }),
-        "req dims win when nonzero"
+        "color0 declares the extent"
     );
-    req.width = 0;
-    req.height = 0;
+    req.colors[0].width = 0;
     assert_eq!(
-        gva_chain_identity(&req).map(|i| (i.width(), i.height())),
-        Some((16, 16)),
-        "fallback to color0 dims"
+        gva_chain_identity(&req),
+        None,
+        "a zero-extent attachment has no identity"
     );
+    req.colors[0].width = 16;
     req.colors[0].mapping_id = 5;
     assert_eq!(
         gva_chain_identity(&req),
@@ -960,11 +957,7 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     assert!(state.map_surface(5));
-    let mut req = DrawEncodeRequest {
-        width: 64,
-        height: 32,
-        ..Default::default()
-    };
+    let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
         slot: 0,
         texture_ref: 9,
@@ -1012,11 +1005,7 @@ fn render_chain_identity_covers_type11_and_gva_targets() {
 fn a_chained_composite_store_names_the_resident_it_loads_from() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(7));
-    let mut req = DrawEncodeRequest {
-        width: 128,
-        height: 64,
-        ..Default::default()
-    };
+    let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
         slot: 0,
         texture_ref: 3,
@@ -1087,11 +1076,7 @@ fn a_chained_composite_store_names_the_resident_it_loads_from() {
 fn an_intermediate_record_can_still_ask_about_the_resident_it_renders_into() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     assert!(state.map_surface(7));
-    let mut req = DrawEncodeRequest {
-        width: 128,
-        height: 64,
-        ..Default::default()
-    };
+    let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
         slot: 0,
         texture_ref: 3,
@@ -1447,11 +1432,7 @@ fn a_host_that_cannot_observe_guest_writes_never_vouches() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn attachment_alias_resident_chain_selection() {
-    let mut req = DrawEncodeRequest {
-        width: 8,
-        height: 8,
-        ..Default::default()
-    };
+    let mut req = DrawEncodeRequest::default();
     req.colors.push(ColorRtRequest {
         slot: 0,
         texture_ref: 42,
@@ -1789,16 +1770,20 @@ fn missing_pipeline_is_soft() {
     let req = DrawEncodeRequest {
         task_id: 1,
         pipeline_ref: 99,
-        color_texture_ref: 1,
-        mapping_id: 3,
-        width: 4,
-        height: 4,
-        format: MTL_FORMAT_BGRA8_UNORM,
         vertex_count: 3,
         instance_count: 1,
         primitive_type: 3, // triangle
         first_vertex: 0,
-        target_seed_rgba: None,
+        colors: vec![ColorRtRequest {
+            slot: 0,
+            texture_ref: 1,
+            mapping_id: 3,
+            width: 4,
+            height: 4,
+            format: MTL_FORMAT_BGRA8_UNORM,
+            store_action: PASS_STORE_ACTION_STORE,
+            ..Default::default()
+        }],
         ..Default::default()
     };
     let mut req = req;
@@ -2053,12 +2038,7 @@ fn mrt_draw_request_load_seed_miss_still_encodes() {
     // drop the pass — that freezes lagging dual-mid on stale logo.
     let req = req.expect("Load seed miss must still encode (archive NULL seed)");
     assert!(
-        req.target_seed_rgba.is_none()
-            || req
-                .colors
-                .first()
-                .map(|c| c.target_seed_rgba.is_none())
-                .unwrap_or(true),
+        req.colors[0].target_seed_rgba.is_none(),
         "seed miss leaves seed None (Metal Clear invent, full Store)"
     );
     assert_eq!(req.colors[0].load_action, PASS_LOAD_ACTION_LOAD);

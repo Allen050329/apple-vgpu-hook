@@ -2020,11 +2020,6 @@ fn render_pass_attachment_template(
         .collect();
     metal_draw::DrawEncodeRequest {
         task_id: first.task_id,
-        color_texture_ref: first.color_texture_ref,
-        mapping_id: first.mapping_id,
-        width: first.width,
-        height: first.height,
-        format: first.format,
         colors,
         ..Default::default()
     }
@@ -3696,15 +3691,9 @@ mod tests {
         let first = metal_draw::DrawEncodeRequest {
             task_id: 1,
             pipeline_ref: 7,
-            color_texture_ref: 11,
-            mapping_id: 3,
-            width: 1920,
-            height: 1080,
-            format: 0x50,
             vertex_count: 3,
             instance_count: 1,
             primitive_type: 3,
-            target_seed_rgba: Some(vec![0xaa; 16]),
             colors: vec![metal_draw::ColorRtRequest {
                 slot: 0,
                 texture_ref: 11,
@@ -3722,11 +3711,13 @@ mod tests {
             ..Default::default()
         };
         let template = render_pass_attachment_template(&first);
-        assert!(template.target_seed_rgba.is_none());
         assert!(template.colors[0].target_seed_rgba.is_none());
         assert_eq!(template.colors[0].load_action, PASS_LOAD_ACTION_LOAD);
         assert_eq!(template.colors[0].mapping_id, 3);
-        assert_eq!((template.width, template.height), (1920, 1080));
+        assert_eq!(
+            (template.colors[0].width, template.colors[0].height),
+            (1920, 1080)
+        );
 
         let draw = PendingDraw {
             pipeline_ref: 42,
@@ -3746,7 +3737,6 @@ mod tests {
         );
         assert_eq!(req.colors.len(), 1);
         assert_eq!(req.colors[0].mapping_id, 3);
-        assert_eq!(first.target_seed_rgba.as_ref().map(Vec::len), Some(16));
         assert_eq!(
             first.colors[0].target_seed_rgba.as_ref().map(Vec::len),
             Some(16)
