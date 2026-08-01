@@ -626,8 +626,16 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
         if let Some((lo, hi)) = entry_gpa_span(&plan.entries, page_shift) {
             let key = (u64::from(mapping_id) << 40) ^ (lo >> page_shift) ^ (hi << 20);
             if crate::observe::first_sight("mapping_gpa_span", key) {
+                // `src=mapper` against the type-4 adoption site's `src=type4`.
+                // The field existed and only one of the two set it, so it named
+                // a distinction the log could not express: every
+                // `mapping_gpa_span` line in a boot read `src=type4`, and this
+                // emitter's silence was invisible rather than reported. The
+                // silence is the interesting part — on x86 this site has stayed
+                // quiet for whole boots while the type-4 one carried every span.
                 crate::observe::off(format!(
-                    "mapping_gpa_span mid={mapping_id} gen={} pages={} prev_pages={prev_pages} \
+                    "mapping_gpa_span mid={mapping_id} gen={} pages={} src=mapper \
+                     prev_pages={prev_pages} \
                      changed={} lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
                     m.map_generation,
                     plan.entries.len(),

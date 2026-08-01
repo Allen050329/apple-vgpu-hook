@@ -977,15 +977,23 @@ fn apply_type4_backing<M: HostMemory>(
         // a live x86 boot, the one that actually runs — the mapper's own
         // adoption stayed silent for whole boots while surfaces plainly had
         // 2040 pages each, because the page list arrives here.
+        //
+        // No `changed=` field, though `changed` is in scope and the mapper's
+        // peer emitter prints its own. Here it could only ever be 1: the dedup
+        // is `first_sight` on the span, and an unchanged plan has by definition
+        // the same span as the plan before it, so the unchanged case is filtered
+        // out before reaching this line. The one way to arrive here unchanged is
+        // the first visit for a surface, and there `prior` is empty, which makes
+        // `changed` true. The mapper's copy is not in that position — its
+        // reprieve path can repopulate an emptied entry list with no change.
         if let Some((lo, hi)) = crate::runtime::mapper::entry_gpa_span(&entries, state_page_shift) {
             let key = (u64::from(surface_id) << 40) ^ (lo >> state_page_shift) ^ (hi << 20);
             if crate::observe::first_sight("mapping_gpa_span", key) {
                 crate::observe::off(format!(
-                    "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 changed={} \
+                    "mapping_gpa_span mid={surface_id} gen={} pages={} src=type4 \
                      lo={lo:#x} hi={:#x} pn_lo={:#x} pn_hi={:#x}",
                     m.map_generation,
                     entries.len(),
-                    changed as u8,
                     hi + (1u64 << state_page_shift),
                     lo >> state_page_shift,
                     hi >> state_page_shift,

@@ -798,7 +798,20 @@ fn sampled_content_hash(bytes: &[u8]) -> u128 {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AllocSite {
     StorageImage,
-    ResidentColor,
+    /// An MRT secondary color attachment — *only* those, and the sole
+    /// constructor is the MRT secondary target path.
+    ///
+    /// It was called `ResidentColor`, which said something else entirely.
+    /// Resident color targets are allocated by `registry_ensure`, which binds
+    /// them through `bind_image_slab` and so counts under `SlabBlock`: one
+    /// driven boot read `slab_block=41:2568` (count:MiB) against
+    /// `resident_color=0:0`. A reader asking what resident color targets cost
+    /// was answered zero, four columns away from the real 2.5 GiB.
+    ///
+    /// Zero here means no draw ever carried a second color attachment. Same
+    /// boot: `mrt_draw_single=24579` with no `secondary_mrt_drop` at all — the
+    /// guest never asked for MRT, rather than asking and being degraded.
+    MrtSecondary,
     TransientDepth,
     Staging,
     Readback,
@@ -812,7 +825,7 @@ impl AllocSite {
     const fn idx(self) -> usize {
         match self {
             AllocSite::StorageImage => 0,
-            AllocSite::ResidentColor => 1,
+            AllocSite::MrtSecondary => 1,
             AllocSite::TransientDepth => 2,
             AllocSite::Staging => 3,
             AllocSite::Readback => 4,
@@ -824,7 +837,7 @@ impl AllocSite {
 
 const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "storage_image",
-    "resident_color",
+    "mrt_secondary",
     "transient_depth",
     "staging",
     "readback",

@@ -615,7 +615,7 @@ impl ResourcePools {
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(ireq.size)
                     .memory_type_index(imt),
-                AllocSite::ResidentColor,
+                AllocSite::MrtSecondary,
             )
             .map_err(|e| {
                 ctx.device.destroy_image(image, None);
