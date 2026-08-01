@@ -2425,17 +2425,6 @@ fn write_linear_texture_bulk<M: HostMemory + HostOps>(
     else {
         return false;
     };
-    // Reported, not refused: a MapMemory2 span is a notification the guest sends
-    // after installing the PTEs and using the memory, so it cannot authorise
-    // anything. The fresh walk below is the check that bounds this write.
-    crate::runtime::gva_mem::report_undeclared_write(
-        state,
-        host,
-        task_id,
-        gva,
-        span_len,
-        "write_linear_guest",
-    );
     // Fresh PT walk at write time — never a cached view (stale-view class) —
     // carrying `allowed` so a deferred window's bytes cannot reach a page
     // outside the set it was armed on, however the guest re-points the range
@@ -3796,20 +3785,10 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 let key = candidate.key;
                 state.disarm_linear_deferred_window(&key);
                 let span = key.span_end;
-                // The window is armed whatever the notification log says. Gating
-                // it on span coverage meant a compute result the guest had not
-                // yet notified an allocation for never got a flush obligation at
-                // all, so its writeback simply never happened. `pages` is the
-                // reading that matters here and it comes from the page tables:
-                // an empty index is a window over memory nothing resolves.
-                crate::runtime::gva_mem::report_undeclared_write(
-                    state,
-                    host,
-                    task_id,
-                    *gva,
-                    span,
-                    "compute_writeback_deferred",
-                );
+                // The window is armed whatever the guest has notified: `pages`
+                // is the reading that matters here and it comes from the page
+                // tables — an empty index is a window over memory nothing
+                // resolves.
                 let mut pages = std::collections::HashSet::new();
                 pages.extend(crate::runtime::gva_mem::task_gva_page_gpa_set(
                     host,

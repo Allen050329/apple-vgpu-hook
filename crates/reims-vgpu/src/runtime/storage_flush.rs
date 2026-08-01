@@ -1081,21 +1081,6 @@ pub fn flush_gva_one<M: HostMemory + HostOps>(
     crate::backend::vulkan::engine::unpin_resident_target(&identity);
     let mut guest = "skip";
     if guest_write {
-        // Reported, not skipped. This used to be `skip_uncovered`, which dropped
-        // the whole deferred window — a full compositing layer — whenever the
-        // guest had not yet notified the allocation, and it fired on live boots
-        // for 240x135 and 320x512 surfaces. `MapMemory2` arrives after the guest
-        // has installed the PTEs and used the memory; see `WriteGate`.
-        crate::runtime::gva_mem::report_undeclared_write(
-            state,
-            host,
-            entry.task_id,
-            gva,
-            entry.span(),
-            "gva_deferred_flush",
-        );
-    }
-    if guest_write {
         note_window_outlived_its_stamp(state, gva, entry, trigger);
     }
     if guest_write && !window_pages_still_ours(state, host, gva, entry, trigger, "guest=refused") {
@@ -1286,18 +1271,6 @@ pub fn flush_linear_one<M: HostMemory + HostOps>(
     let guest = if !still_ours {
         "skip_drift"
     } else {
-        // `skip_uncovered` used to live on this branch and discarded the whole
-        // linear writeback — up to 1.3 MiB of texture — when the guest had not
-        // yet notified the allocation. Reported and written now; see
-        // `report_undeclared_write`.
-        crate::runtime::gva_mem::report_undeclared_write(
-            state,
-            host,
-            task_id,
-            key.surface_offset,
-            key.span_end,
-            "linear_deferred_flush",
-        );
         // Same bound as the GVA rail: the armed page set travels into the
         // writer's own walk, so the decision `still_ours` reached above cannot be
         // invalidated by the guest between that walk and this one. `None` here

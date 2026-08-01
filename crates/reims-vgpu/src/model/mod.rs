@@ -20,7 +20,7 @@ pub use state::{
     PacketFault, PaintSrc,
     PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity,
     SurfaceWriteKind,
-    TaskEntry, TaskMapSpan, Type4Walk, WriteGate,
+    TaskEntry, Type4Walk,
 };
 
 use crate::backend::Backend;

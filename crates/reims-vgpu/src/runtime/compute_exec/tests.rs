@@ -1354,9 +1354,6 @@ fn linear_writeback_retains_cache_when_guest_gva_is_unmapped() {
     let task_id = 6u32;
     let texture_ref = 11u32;
     let gva = 0x101000u64;
-    // An unrelated live span makes the product bound audit authoritative;
-    // the texture range itself is intentionally outside it.
-    state.note_task_map(task_id, 0x200000, 0x1000);
     let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let staged = StagedTexture {
         binding: 32,

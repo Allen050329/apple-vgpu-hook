@@ -3471,34 +3471,22 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
 /// able to tell "the guest tore this target down" (`MemError::is_guest_teardown`)
 /// from a write that genuinely lost content.
 ///
-/// # This writer is deliberately not gated on MapMemory2 spans
+/// # MapMemory2 does not bound this writer, and nothing else may pretend to
 ///
-/// Its sibling [`crate::runtime::gva_mem::write_task_gva_product`] refuses
-/// `WriteGate::Outside`, and the obvious tidy-up is to make this one match. It
-/// was measured instead, report-only, over a driven x86/Vulkan boot, and the
-/// answer is no:
+/// `MapMemory2` is a notification the guest sends *after* installing its own
+/// PTEs and using the memory, so it cannot authorise anything — measured on the
+/// x86/Vulkan rail at 0-29 ms after the write it would have had to precede, and
+/// on one driven boot **44% of render-target Stores** (893 of 2048) sat outside
+/// every span the writing task had filed. It does not describe render targets at
+/// all: task 0 files a single 64 MiB span (`0x101000..0x4101000`) while the
+/// Stores sit at GVAs like `0x4692000`, past all of it.
 ///
-/// ```text
-/// rgba8_write_gate_totals exact=1155 no_spans=0 outside=893 total=2048
-/// ```
-///
-/// **44% of render-target Stores fall outside every span the writing task
-/// declared**, so refusing `Outside` here would drop nearly half of all Stores
-/// and blank the screen. `no_spans=0` says the gate always had a real registry
-/// to check against, so that is not an artefact of an empty one.
-///
-/// The reason is that MapMemory2 does not describe render targets. Enumerated on
-/// the same boot, task 0 files a single 64 MiB span (`0x101000..0x4101000`) and
-/// every other task files 128 KiB or 1 MiB spans in that same numeric range —
-/// while the refused Stores sit at GVAs like `0x4692000` and `0x5368000`, past
-/// all of them.
-///
-/// That also disposes of the tempting weaker gate, "allow when *some* task's
-/// span covers it". Every refused Store reported `owners=[0, …]`, which looks
-/// like corroboration and is not: `tasks_covering` compares GVAs numerically
-/// across **different address spaces**, and task 0's 64 MiB span numerically
-/// contains almost every other task's range. `owners` is not evidence that a
-/// range is legitimate and nothing may gate on it.
+/// The tempting weaker rule — "allow when *some* task's span covers it" — is
+/// worse, not better. A span filed by another task numerically containing this
+/// range says only that two address spaces both have something there; across
+/// 7 445 measured cases the two never once resolved to the same guest physical
+/// page. A virtual-address coincidence is not evidence that a range is
+/// legitimate.
 ///
 /// What does bound these writes: every Store carries the page set its target
 /// GVA resolved to *before* the GPU round trip and goes through

@@ -659,7 +659,6 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     let task_id = 6u32;
     let gva = 0x101000u64;
     let length = 0x4000u64;
-    state.note_task_map(task_id, gva, length);
     let mut payload = vec![0u8; 20];
     payload[0..4].copy_from_slice(&task_id.to_le_bytes());
     payload[4..12].copy_from_slice(&gva.to_le_bytes());
@@ -683,7 +682,6 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), 0);
     assert_eq!(host.get_u32(stamp_gpa + 4), 0);
-    assert_eq!(state.task_map_spans.len(), 1);
     assert_eq!(state.translation_order_hold_mask, sibling_bit);
     assert_eq!(state.translation_order_holds, 1, "poll retries coalesce");
 
@@ -699,7 +697,6 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     drain_pending(&mut state, &mut host);
     assert_eq!(host.get_u32(regs_gpa + CHILD_REG_HEAD), packet.len() as u32);
     assert_eq!(host.get_u32(stamp_gpa + 4), 0x55);
-    assert!(state.task_map_spans.is_empty());
     assert_eq!(state.translation_order_hold_mask, 0);
 }
 

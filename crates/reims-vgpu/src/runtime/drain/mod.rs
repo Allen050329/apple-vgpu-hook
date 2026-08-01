@@ -2141,32 +2141,6 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         "map_memory2"
                     };
                     crate::runtime::gva_view::log_retire(op, task_id, gva, length, n);
-                    // Registry for product GVA write bounds (notify ranges only).
-                    if packet.opcode == CHILD_OP_UNMAP_MEMORY {
-                        state.note_task_unmap(task_id, gva, length);
-                    } else {
-                        // Always-on, once per distinct key: the payload word this
-                        // opcode files the span under, unfiltered.
-                        //
-                        // `task_id` here IS the raw word — this opcode reads it
-                        // unshifted while `DefineTask2` halves its own, and the
-                        // write gate is observed permitting writes for task `n`
-                        // against spans filed under `n >> 1`. Deciding whether
-                        // that is the two decodes disagreeing or a real
-                        // parent/child ownership needs the *set* of keys this
-                        // registry holds, compared against the set of
-                        // `define_task root raw=…` words. The neighbouring
-                        // `map_memory2` retire line cannot answer it: that one
-                        // only prints when views were actually retired, so it
-                        // shows a filtered subset of the keys.
-                        if crate::observe::first_sight("map_memory2_key", u64::from(task_id)) {
-                            crate::observe::off(format!(
-                                "map_memory2_key word={task_id:#x} dec={task_id} \
-                                 gva={gva:#x} len={length:#x}"
-                            ));
-                        }
-                        state.note_task_map(task_id, gva, length);
-                    }
                 }
                 // Deferred GVA render-Store windows overlapping the notified
                 // VA range land **cache-only**: on Unmap the PTEs are already
