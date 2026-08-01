@@ -193,6 +193,24 @@ integration tests are separate crates, so it cannot be `#[cfg(test)]`. For
 everything else, deleting a hit means deleting its test; name the test in the
 commit so a dropped count is never silent.
 
+Neither mode can see a **local** that is computed and then thrown away, because
+`let _ = x;` counts as a use — to rustc and to both scripts alike. That is not a
+hypothetical: it hid four of them, one holding an unconditional `color_meta[0]`
+index that could have panicked.
+
+```sh
+grep -rn '^\s*let _ = [a-z_][a-z0-9_]*;' --include='*.rs' crates/reims-vgpu/src
+```
+
+Triage each by what the name binds. Suppressing an unused **parameter** is
+legitimate and usually means one cfg arm does not need it. Discarding a **local**
+means the computation above it is dead. Two shapes are neither: a `let _ = buf;`
+at the end of a scope can be a deliberate keep-alive for a retained backing
+buffer, and the binding may carry a load-bearing `?` — `let bpp =
+render_target_bpp(fmt)?;` refuses an unknown format, so the binding is dead but
+the call is not. Read the whole enclosing function before cutting; a local used
+only under one `#[cfg]` looks identical to a dead one on the other arm.
+
 ### Finding Measurements That Cannot Measure
 
 `dead-state.sh` answers "does anything read this?". It cannot answer "does this
