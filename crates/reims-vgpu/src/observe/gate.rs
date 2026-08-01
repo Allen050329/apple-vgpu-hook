@@ -514,6 +514,57 @@ fn metal_no_copy_buffers_alias_host_memory_and_nothing_else() {
     );
 }
 
+/// One place decides whether an engine resident may stand in for a guest read.
+///
+/// The three staging rails in `stage_texture_raw` — heap, type-11 mapping, and
+/// linear GVA — each hold a residency mirror and each must agree with the engine
+/// before skipping the guest read that would otherwise seed or sample the
+/// window. They once carried three byte-for-byte copies of that agreement, and a
+/// copy that drifts serves stale or wrongly-formatted content with no visible
+/// failure. `resident_serve` is now the only production caller of the engine's
+/// two residency queries.
+///
+/// The one documented exception is the reinterpret-sibling scan, which asks
+/// `compute_resident_sample_source` about a *different* key than the one the
+/// mirror was looked up under, and matches on row bytes rather than on format
+/// equality. It is a different contract, so it is named here rather than folded
+/// in. `mtl_to_engine_sampled` is the format-equality half of the sampled rule;
+/// a second use of it against `vk_format()` is the copy coming back.
+#[test]
+fn the_engine_residency_agreement_is_decided_in_one_place() {
+    const ENGINE: &str = "backend/vulkan/engine";
+    let root = crate_src();
+    let mut sites = Vec::new();
+    for path in production_files(&root) {
+        let name = rel(&path, &root);
+        if name.starts_with(ENGINE) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read Rust source");
+        let masked = production_source(&String::from_utf8_lossy(&mask_comments_and_literals(&src)));
+        for needle in [
+            "compute_resident_storage_generation(",
+            "compute_resident_sample_source(",
+        ] {
+            let n = masked.matches(needle).count();
+            if n > 0 {
+                sites.push(format!("{name} calls {needle} {n}x"));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "runtime/compute_exec/mod.rs calls compute_resident_sample_source( 2x".to_string(),
+            "runtime/compute_exec/mod.rs calls compute_resident_storage_generation( 1x".to_string(),
+        ],
+        "the mirror-vs-engine residency agreement moved or was copied; it belongs \
+         in compute_exec::resident_serve, whose only licensed peer is the \
+         reinterpret-sibling scan's cross-key sample lookup"
+    );
+}
+
 /// Free-text `Result` errors cannot return. A typed decline may preserve an
 /// external driver's prose as a field, but the error carrier itself must remain
 /// exhaustively matchable and registered.

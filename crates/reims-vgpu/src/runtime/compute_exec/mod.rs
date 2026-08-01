@@ -1243,6 +1243,48 @@ fn dump_kernel_buffers(pipe: u32, reason: &str, bufs: &[StagedBuffer]) {
     }
 }
 
+/// What an engine-resident copy of a window can serve one staged binding.
+///
+/// `Seed` means a storage binding's output is already GPU-resident at this
+/// generation, so the guest read that would seed it is unnecessary. `Sample`
+/// names the resident key a sampled binding reads directly instead.
+#[cfg(feature = "backend-vulkan")]
+#[derive(Clone, Copy)]
+pub(crate) enum ResidentServe {
+    Seed(u32),
+    Sample(crate::model::ComputeStorageResidencyKey, u32),
+}
+
+/// The gate every staging rail applies before falling back to a guest read.
+///
+/// `mirror_generation` is the runtime's residency mirror for `key`; the engine
+/// must agree with it, because the mirror can outlive an evicted resident. A
+/// sampled binding additionally needs the resident's vk format to equal the one
+/// the view will bind — the engine's resident-bind path guards that equality
+/// and would fail the whole request on mismatch.
+///
+/// `None` means the resident cannot serve this binding: the caller either reads
+/// the guest window or, where the resident is the only copy, names the loss.
+#[cfg(feature = "backend-vulkan")]
+pub(crate) fn resident_serve(
+    key: crate::model::ComputeStorageResidencyKey,
+    mirror_generation: u32,
+    is_storage: bool,
+    pixel_format: u16,
+) -> Option<ResidentServe> {
+    if is_storage {
+        return (crate::backend::vulkan::engine::compute_resident_storage_generation(&key)
+            == Some(mirror_generation))
+        .then_some(ResidentServe::Seed(mirror_generation));
+    }
+    let (engine_generation, engine_format) =
+        crate::backend::vulkan::engine::compute_resident_sample_source(&key)?;
+    (engine_generation == mirror_generation
+        && mtl_to_engine_sampled(pixel_format)
+            .is_some_and(|f| f.vk_format() == engine_format.vk_format()))
+    .then_some(ResidentServe::Sample(key, mirror_generation))
+}
+
 pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1432,62 +1474,31 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             height,
             format,
         );
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(
-                unused_mut,
-                reason = "the Vulkan resident-consumption block below assigns it"
-            )
-        )]
-        let mut seed_generation = 0;
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(
-                unused_mut,
-                reason = "the Vulkan resident-consumption block below assigns it"
-            )
-        )]
-        let mut seed_skipped = false;
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(
-                unused_mut,
-                reason = "the Vulkan resident-consumption block below assigns it"
-            )
-        )]
-        let mut sample_resident = None;
+        // A heap texture has no guest window to re-read: once the mirror claims
+        // a resident, the engine's copy is the only content, so a resident the
+        // engine can no longer serve is a loss, not a fallback.
         #[cfg(feature = "backend-vulkan")]
-        {
-            if let Some(&generation) = state.compute_storage_residency.get(&key) {
-                if is_storage
-                    && crate::backend::vulkan::engine::compute_resident_storage_generation(&key)
-                        == Some(generation)
-                {
-                    seed_generation = generation;
-                    seed_skipped = true;
-                } else if !is_storage {
-                    if let Some((engine_generation, engine_format)) =
-                        crate::backend::vulkan::engine::compute_resident_sample_source(&key)
-                    {
-                        if engine_generation == generation
-                            && mtl_to_engine_sampled(format)
-                                .is_some_and(|f| f.vk_format() == engine_format.vk_format())
-                        {
-                            sample_resident = Some((key, generation));
-                        }
+        let (seed_generation, seed_skipped, sample_resident) =
+            match state.compute_storage_residency.get(&key).copied() {
+                None => (0, false, None),
+                Some(generation) => match resident_serve(key, generation, is_storage, format) {
+                    Some(ResidentServe::Seed(generation)) => (generation, true, None),
+                    Some(ResidentServe::Sample(key, generation)) => {
+                        (0, false, Some((key, generation)))
                     }
-                }
-                if !seed_skipped && sample_resident.is_none() {
-                    crate::observe::fail(format!(
-                        "compute_stage_tex heap_fail reason=resident_lost ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} gen={generation} use_offset={} offset={offset:#x}",
-                        use_offset as u8
-                    ));
-                    return Err(ComputeStatus::MissingTexture(
-                        "compute_stage_tex_heap_resident_lost",
-                    ));
-                }
-            }
-        }
+                    None => {
+                        crate::observe::fail(format!(
+                            "compute_stage_tex heap_fail reason=resident_lost ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} gen={generation} use_offset={} offset={offset:#x}",
+                            use_offset as u8
+                        ));
+                        return Err(ComputeStatus::MissingTexture(
+                            "compute_stage_tex_heap_resident_lost",
+                        ));
+                    }
+                },
+            };
+        #[cfg(not(feature = "backend-vulkan"))]
+        let (seed_generation, seed_skipped, sample_resident) = (0, false, None);
         crate::observe::off(format!(
             "compute_stage_tex heap_ok ref={texture_ref} heap={heap_ref} fmt={format:#x} {width}x{height} storage={} seed_gen={seed_generation} resident_sample={} use_offset={} offset={offset:#x}",
             is_storage as u8,
@@ -1856,59 +1867,37 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
         // The zero placeholder is never seeded — the engine fails visibly
         // with `vk_compute_exec_resident_seed_generation_lost` if the resident
         // vanishes by acquire time.
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(unused_mut, reason = "the Vulkan resident-skip block below assigns it")
-        )]
-        let mut seed_skipped = false;
+        // Copy-on-sample is the same gate: a sampled input of a window whose
+        // current content the engine already holds GPU-resident (a prior
+        // dispatch's storage output — live class: the dispatch samples the very
+        // window it storage-writes) never needs the guest read either.
         #[cfg(feature = "backend-vulkan")]
-        if is_storage {
-            if let Some(&mirror_generation) = state.compute_storage_residency.get(&residency_key) {
-                if crate::backend::vulkan::engine::compute_resident_storage_generation(
-                    &residency_key,
-                ) == Some(mirror_generation)
-                {
-                    seed_skipped = true;
-                    seed_generation = mirror_generation;
-                    crate::observe::off(format!(
-                        "compute_stage_resident_skip mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={seed_generation} bytes={need}"
-                    ));
-                }
+        let (seed_skipped, mut sample_resident) = match state
+            .compute_storage_residency
+            .get(&residency_key)
+            .copied()
+            .and_then(|mirror_generation| {
+                resident_serve(residency_key, mirror_generation, is_storage, stage_fmt)
+            }) {
+            Some(ResidentServe::Seed(generation)) => {
+                seed_generation = generation;
+                crate::observe::off(format!(
+                    "compute_stage_resident_skip mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={seed_generation} bytes={need}"
+                ));
+                (true, None)
             }
-        }
-        // Copy-on-sample skip: a sampled input of a window whose current
-        // content the engine already holds GPU-resident (a prior dispatch's
-        // storage output — live class: the dispatch samples the very window it
-        // storage-writes) never needs the guest read. The same mirror↔engine
-        // generation gate as the storage skip applies, plus vk-format equality
-        // between the resident image and the sampled view the engine will
-        // create — the engine's resident-bind path guards it and would fail
-        // the whole request on mismatch.
-        #[cfg_attr(
-            not(feature = "backend-vulkan"),
-            allow(
-                unused_mut,
-                reason = "the Vulkan resident-sample block below assigns it"
-            )
-        )]
-        let mut sample_resident = None;
+            Some(ResidentServe::Sample(key, generation)) => {
+                crate::observe::off(format!(
+                    "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={generation} bytes={need}"
+                ));
+                (false, Some((key, generation)))
+            }
+            None => (false, None),
+        };
+        #[cfg(not(feature = "backend-vulkan"))]
+        let (seed_skipped, sample_resident) = (false, None);
         #[cfg(feature = "backend-vulkan")]
         if !is_storage {
-            if let Some(&mirror_generation) = state.compute_storage_residency.get(&residency_key) {
-                if let Some((resident_generation, resident_fmt)) =
-                    crate::backend::vulkan::engine::compute_resident_sample_source(&residency_key)
-                {
-                    if resident_generation == mirror_generation
-                        && mtl_to_engine_sampled(stage_fmt)
-                            .is_some_and(|f| f.vk_format() == resident_fmt.vk_format())
-                    {
-                        sample_resident = Some((residency_key, mirror_generation));
-                        crate::observe::off(format!(
-                            "compute_stage_resident_sample mapping={mapping_id} {width}x{height} fmt={stage_fmt:#x} gen={mirror_generation} bytes={need}"
-                        ));
-                    }
-                }
-            }
             // Reinterpret sibling: a resident of the SAME byte window (the
             // 5-field mapping/offset/bpr/span prefix orders the BTreeMap, so
             // the range touches only sibling views of this window) whose rows
@@ -2137,7 +2126,9 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // Linear-window residency identity — mirrors the host_linear_textures
     // entry exactly. Absent when the stride overflows the key field (no live
     // class; such a window simply stays on the bytes path).
+    #[cfg(feature = "backend-vulkan")]
     let span = layout.row_stride.saturating_mul(h as u64);
+    #[cfg(feature = "backend-vulkan")]
     let linear_key = (layout.row_stride <= u32::MAX as u64).then(|| {
         crate::model::ComputeStorageResidencyKey::linear(
             task_id,
@@ -2150,30 +2141,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             stage_format,
         )
     });
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan resident-window block below assigns it"
-        )
-    )]
-    let mut seed_skipped = false;
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan resident-window block below assigns it"
-        )
-    )]
-    let mut seed_generation = 0u32;
-    #[cfg_attr(
-        not(feature = "backend-vulkan"),
-        allow(
-            unused_mut,
-            reason = "the Vulkan resident-window block below assigns it"
-        )
-    )]
-    let mut sample_resident = None;
     let mut bytes = vec![0u8; need];
     #[cfg_attr(
         not(feature = "backend-vulkan"),
@@ -2188,7 +2155,7 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
     // entry first — falling through to the raw guest read would silently serve
     // the pre-chain seed pages.
     #[cfg(feature = "backend-vulkan")]
-    if let (Some(key), Some(resident_gen)) = (
+    let resident = match (
         linear_key,
         crate::runtime::surface_cache::linear_texture_resident_gen(
             state,
@@ -2201,35 +2168,33 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             layout.row_stride,
         ),
     ) {
-        let mut consumed = false;
-        if is_storage {
-            if crate::backend::vulkan::engine::compute_resident_storage_generation(&key)
-                == Some(resident_gen)
-            {
-                seed_skipped = true;
-                seed_generation = resident_gen;
-                consumed = true;
-                crate::observe::off(format!(
-                    "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={resident_gen}",
-                    tex.pixel_format
-                ));
-            }
-        } else if let Some((engine_gen, engine_fmt)) =
-            crate::backend::vulkan::engine::compute_resident_sample_source(&key)
-        {
-            if engine_gen == resident_gen
-                && mtl_to_engine_sampled(stage_format)
-                    .is_some_and(|f| f.vk_format() == engine_fmt.vk_format())
-            {
-                sample_resident = Some((key, resident_gen));
-                consumed = true;
-                crate::observe::off(format!(
-                    "compute_stage_linear_resident_sample task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={resident_gen}",
-                    stage_format
-                ));
-            }
+        (Some(key), Some(resident_gen)) => {
+            Some((key, resident_gen, resident_serve(key, resident_gen, is_storage, stage_format)))
         }
-        if !consumed {
+        _ => None,
+    };
+    #[cfg(feature = "backend-vulkan")]
+    let (seed_skipped, seed_generation, sample_resident) = match resident {
+        Some((_, _, Some(ResidentServe::Seed(generation)))) => {
+            crate::observe::off(format!(
+                "compute_stage_linear_resident_seed task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
+                tex.pixel_format
+            ));
+            (true, generation, None)
+        }
+        Some((_, _, Some(ResidentServe::Sample(key, generation)))) => {
+            crate::observe::off(format!(
+                "compute_stage_linear_resident_sample task={task_id} ref={texture_ref} gva={gva:#x} fmt={:#x} dims={w}x{h} gen={generation}",
+                stage_format
+            ));
+            (false, 0u32, Some((key, generation)))
+        }
+        _ => (false, 0u32, None),
+    };
+    #[cfg(not(feature = "backend-vulkan"))]
+    let (seed_skipped, sample_resident) = (false, None);
+    #[cfg(feature = "backend-vulkan")]
+    if let Some((key, resident_gen, None)) = resident {
             // A bytes consumer (format-mismatched view, non-vulkan reuse):
             // land the resident into the cache entry (and any owed guest
             // write) through the one flush path, then serve the bytes.
@@ -2264,7 +2229,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
                     e.resident_gen = 0;
                 }
             }
-        }
     }
     if seed_skipped || sample_resident.is_some() || have_bytes {
         // Engine resident serves this window; no cache/guest read.
@@ -2391,7 +2355,6 @@ pub(crate) fn stage_texture_raw<M: HostMemory + HostOps>(
             }
         }
     }
-    let _ = (linear_key, span, seed_generation);
     Ok(StagedTexture {
         binding,
         pixel_format: stage_format,
