@@ -5231,7 +5231,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     },
                 ));
             }
-            resources.load_op = Some(crate::backend::vulkan::engine::LoadOp::LoadFromTarget);
+            resources.load_from_target = true;
             resources.target_rgba8 = None;
         }
         // Type-11 Load used to have a GPU rail here. When the Store was going

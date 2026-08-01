@@ -12,7 +12,7 @@
 
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
-    self, BufferContent, DrawRequest, GuestRun, GuestRunSource, LoadOp, PrimitiveTopology,
+    self, BufferContent, DrawRequest, GuestRun, GuestRunSource, PrimitiveTopology,
     SampledImageResource, SampledSource, SamplerResource, ScissorResource, StorageBufferResource,
     TargetIdentity,
 };
@@ -86,7 +86,7 @@ fn batch_req(
     vert: &[u32],
     frag: &[u32],
     identity: &TargetIdentity,
-    load: LoadOp,
+    load_from_target: bool,
     scissor: ScissorResource,
 ) -> DrawRequest {
     DrawRequest {
@@ -101,7 +101,7 @@ fn batch_req(
         base_instance: 0,
         primitive_topology: PrimitiveTopology::Triangle,
         target_identity: Some(identity.clone()),
-        load_op: Some(load),
+        load_from_target,
         skip_readback: true,
         scissors: vec![scissor],
         ..Default::default()
@@ -137,7 +137,7 @@ fn batched_draws_compose_and_flush_on_read() {
         &vert,
         &frag,
         &identity,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
+        false,
         half_scissor(true),
     );
     match engine::execute_draw_request(&opener) {
@@ -155,7 +155,7 @@ fn batched_draws_compose_and_flush_on_read() {
         &vert,
         &frag,
         &identity,
-        LoadOp::LoadFromTarget,
+        true,
         half_scissor(false),
     );
     engine::execute_draw_request(&joiner).expect("joiner draw");
@@ -211,7 +211,7 @@ fn cross_target_draw_flushes_open_batch() {
         &vert,
         &frag,
         &a,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
+        false,
         half_scissor(true),
     );
     match engine::execute_draw_request(&opener) {
@@ -231,7 +231,7 @@ fn cross_target_draw_flushes_open_batch() {
         &vert,
         &frag,
         &b,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
+        false,
         half_scissor(false),
     );
     engine::execute_draw_request(&other).expect("cross-target draw");
@@ -276,7 +276,7 @@ fn prefetch_arm_flushes_open_batch() {
         &vert,
         &frag,
         &identity,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
+        false,
         half_scissor(true),
     );
     match engine::execute_draw_request(&opener) {
@@ -314,7 +314,7 @@ fn batch_length_cap_flushes_and_reopens() {
         &vert,
         &frag,
         &identity,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
+        false,
         half_scissor(true),
     );
     match engine::execute_draw_request(&opener) {
@@ -333,7 +333,7 @@ fn batch_length_cap_flushes_and_reopens() {
             &vert,
             &frag,
             &identity,
-            LoadOp::LoadFromTarget,
+            true,
             half_scissor(n % 2 == 0),
         );
         engine::execute_draw_request(&joiner).unwrap_or_else(|e| panic!("draw #{n}: {e}"));
@@ -376,7 +376,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
         &vert,
         &frag,
         &identity,
-        LoadOp::Clear([0.0, 0.0, 0.0, 0.0]),
+        false,
         half_scissor(true),
     );
     opener.storage_buffers.push(StorageBufferResource {
@@ -508,7 +508,6 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         instance_count: Some(1),
         primitive_topology: PrimitiveTopology::Triangle,
         target_identity: Some(identity.clone()),
-        load_op: Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0])),
         skip_readback: true,
         ..Default::default()
     };

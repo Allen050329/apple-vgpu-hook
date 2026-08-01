@@ -16,7 +16,7 @@ use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
 use super::pools::{BufferSlot, ResourcePools, SampledSlot, TargetKey};
 use super::types::{
-    BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, LoadOp, SampledSource,
+    BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
     ScissorResource, SeedOrder, VertexStepFunction, ViewportResource,
 };
 use super::vk_call::{VkCall, VkOp};
@@ -269,29 +269,18 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    if let Some(LoadOp::LoadSeed(seed)) = &req.load_op {
-        let expected = req.width as usize * req.height as usize * 4;
-        if seed.len() != expected {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::LoadSeedLength {
-                    actual: seed.len(),
-                    expected,
-                },
-            ));
-        }
-    }
     if let Some(seed_identity) = &req.seed_from_target {
         if req.target_identity.is_none() {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedMissingTargetIdentity,
             ));
         }
-        if req.target_rgba8.is_some() || matches!(req.load_op, Some(LoadOp::LoadSeed(_))) {
+        if req.target_rgba8.is_some() {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedConflictsCpuSeed,
             ));
         }
-        if matches!(req.load_op, Some(LoadOp::LoadFromTarget)) {
+        if req.load_from_target {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SeedConflictsLoadFromTarget,
             ));
@@ -824,7 +813,7 @@ pub(crate) unsafe fn execute_draw_inner(
         )
     });
     let joins = batch_eligible
-        && matches!(req.load_op, Some(LoadOp::LoadFromTarget))
+        && req.load_from_target
         && req.target_rgba8.is_none()
         && req.seed_from_target.is_none()
         && !samples_own_target
@@ -884,8 +873,8 @@ pub(crate) unsafe fn execute_draw_inner(
     let layout_key = LayoutKey {
         bindings: layout_bindings,
     };
-    // Resolve load action: explicit load_op > target_rgba8 > Clear.
-    let load_uses_gpu_content = matches!(req.load_op, Some(LoadOp::LoadFromTarget));
+    // Resolve load action: load_from_target > target_rgba8 > Clear black.
+    let load_uses_gpu_content = req.load_from_target;
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
@@ -898,10 +887,10 @@ pub(crate) unsafe fn execute_draw_inner(
     // the `output_bgra` arm could swizzle in place; that swizzle now happens
     // during the single copy into the mapped staging span
     // (`write_staging_rgba_as_bgra`), so the pixels are touched once either way.
-    let seed_bytes: Option<&[u8]> = match &req.load_op {
-        Some(LoadOp::LoadSeed(native)) => Some(native.as_slice()),
-        Some(_) => None,
-        None => req.target_rgba8.as_ref().map(|v| v.as_slice()),
+    let seed_bytes: Option<&[u8]> = if load_uses_gpu_content {
+        None
+    } else {
+        req.target_rgba8.as_ref().map(|v| v.as_slice())
     };
     let mut pass_key = PassKey::single(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),

@@ -234,9 +234,8 @@ pub struct DrawRequest {
     pub storage_buffers: Vec<StorageBufferResource>,
     pub sampled_images: Vec<SampledImageResource>,
     pub samplers: Vec<SamplerResource>,
-    /// CPU Load seed for the color target (None = clear black), in the order
-    /// [`DrawRequest::target_seed_order`] names. Preferred when `load_op` is not
-    /// set; still honored as `LoadOp::LoadSeed`.
+    /// CPU Load seed for the color target, in the order
+    /// [`DrawRequest::target_seed_order`] names.
     ///
     /// Shared rather than owned so a caller holding the frame behind an `Arc` —
     /// `surface_cache` does — can seed a draw with a refcount instead of a
@@ -260,9 +259,15 @@ pub struct DrawRequest {
     pub color_write_mask: ColorWriteMask,
     /// Protocol-derived target identity for GPU residency (workstream D).
     pub target_identity: Option<TargetIdentity>,
-    /// Explicit load action. When `None`, derived from `target_rgba8`
-    /// (`Some` → LoadSeed, `None` → Clear black).
-    pub load_op: Option<LoadOp>,
+    /// Load the live GPU image for [`DrawRequest::target_identity`] instead of
+    /// seeding the attachment from the CPU. Requires that resident to exist.
+    ///
+    /// This and `target_rgba8` are the whole load action, and they are ordered:
+    /// `load_from_target` wins, else a seed is uploaded, else the attachment
+    /// clears to transparent black. There is no third spelling — the primary
+    /// attachment's `VkClearValue` is `[0, 0, 0, 0]` unconditionally, so a
+    /// "clear to these floats" request could never have been honoured.
+    pub load_from_target: bool,
     /// When true, skip full-frame readback (non-Store / ticket path). Content
     /// remains on the GPU under `target_identity` when provided.
     pub skip_readback: bool,
@@ -1203,23 +1208,6 @@ pub enum SeedOrder {
     Rgba8,
     /// Guest scanout order — B, G, R, A in memory.
     Bgra8,
-}
-
-/// Color attachment load action for resident targets.
-#[derive(Debug)]
-pub enum LoadOp {
-    /// Clear to the given RGBA float values (or black if omitted).
-    Clear([f32; 4]),
-    /// Load the live GPU image for this identity (must already exist).
-    LoadFromTarget,
-    /// Upload semantic RGBA8 CPU seed bytes into the target (first-touch / guest-newer).
-    LoadSeed(Vec<u8>),
-}
-
-impl Default for LoadOp {
-    fn default() -> Self {
-        Self::Clear([0.0, 0.0, 0.0, 0.0])
-    }
 }
 
 /// Where a sampled image's content comes from.

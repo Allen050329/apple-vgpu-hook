@@ -359,7 +359,13 @@ const RENDER_PASS: &[FieldCoverage] = &[
     honored(
         "colorAttachments[n].clearColor",
         "ColorAttachment.clear_color",
-        "backend/vulkan/engine/exec.rs:LoadOp",
+        // The runtime, not the engine. A CLEAR attachment is materialized as a
+        // solid RGBA8 seed at the guest's colour and uploaded as the pass's
+        // LOAD seed; the engine's own `VkClearValue` for attachment 0 is
+        // `[0, 0, 0, 0]` unconditionally and never carried the guest's floats.
+        // This entry named the engine and was wrong about where the field is
+        // read.
+        "runtime/metal_draw/vulkan.rs:solid_rgba_local",
     ),
     honored(
         "colorAttachments[n].resolveTexture",

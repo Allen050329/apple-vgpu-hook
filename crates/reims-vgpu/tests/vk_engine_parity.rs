@@ -11,7 +11,7 @@
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BlendFactor, BlendOp, BlendStateResource, CullMode, DepthState, DrawRequest, IndexType,
-    IndexedDrawResource, LoadOp, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
+    IndexedDrawResource, PrimitiveTopology, SampledContentIdentity, SampledImageResource,
     SampledSource, SamplerCompareFunction, SamplerResource, ScissorResource, SecondaryColorTarget,
     StencilFaceOps, StencilOp, StencilState, StorageBufferResource, TargetIdentity,
     VertexAttributeFormat, VertexAttributeResource, VertexStepFunction, ViewportResource,
@@ -295,7 +295,6 @@ fn depth_test_honored_compare_and_clear_wired() {
     let variant = |compare: SamplerCompareFunction, clear: f32| -> Option<bool> {
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
-        req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
             content: encode_f32(&quad_z(0.5).into_iter().flatten().collect::<Vec<_>>()).into(),
@@ -421,7 +420,6 @@ fn depth_test_honored_on_resident_target_path() {
         req.target_identity = Some(identity.clone());
         req.output_bgra = true;
         req.skip_readback = true;
-        req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
             content: encode_f32(&quad_z(0.5).into_iter().flatten().collect::<Vec<_>>()).into(),
@@ -554,7 +552,6 @@ fn stencil_test_honored_compare_ref_and_clear_wired() {
         };
         let mut req = engine_req(&vert, &frag, w, h);
         req.vertex_count = 6;
-        req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
             content: encode_f32(&quad_z(0.5).into_iter().flatten().collect::<Vec<_>>()).into(),
@@ -916,7 +913,7 @@ fn resident_sample_bind_avoids_roundtrip_and_remains_loadable() {
 
     let mut load_again = engine_req(&v, &f, 16, 16);
     load_again.target_identity = Some(source.clone());
-    load_again.load_op = Some(LoadOp::LoadFromTarget);
+    load_again.load_from_target = true;
     let loaded = engine::execute_draw_request(&load_again).expect("load after direct sample");
     assert_fullscreen_fragment_color("resident_sample_reloaded", &semantic_rgba(&loaded), 16, 16);
 }
@@ -946,7 +943,7 @@ fn resident_sample_alias_uses_gpu_snapshot_without_roundtrip() {
 
     let mut alias = engine_req(&v, &f, 16, 16);
     alias.target_identity = Some(identity.clone());
-    alias.load_op = Some(LoadOp::LoadFromTarget);
+    alias.load_from_target = true;
     alias.sampled_images.push(SampledImageResource {
         binding: 1,
         width: 16,
@@ -1143,7 +1140,6 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     // Cold: seed import + draw with readback so we can verify content, mark ready.
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(identity.clone());
-    cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     cold.skip_readback = false;
     match engine::execute_draw_request(&cold) {
         Ok(o) => assert_fullscreen_fragment_color("resident_cold", &semantic_rgba(&o), 16, 16),
@@ -1156,7 +1152,7 @@ fn warm_non_store_zero_readback_seed_create_alloc() {
     // Warm non-Store: LoadFromTarget, skip readback.
     let mut warm = engine_req(&v, &f, 16, 16);
     warm.target_identity = Some(identity.clone());
-    warm.load_op = Some(LoadOp::LoadFromTarget);
+    warm.load_from_target = true;
     warm.skip_readback = true;
     // One warm-up under residency.
     engine::execute_draw_request(&warm).expect("resident warm-up");
@@ -1373,7 +1369,6 @@ fn a_bgra_resident_draw_reads_back_identically_twice() {
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     req.output_bgra = true;
     req.skip_readback = true;
     match engine::execute_draw_request(&req) {
@@ -1429,7 +1424,6 @@ fn a_skipped_draw_readback_and_a_resident_read_are_counted_apart() {
     };
     let mut req = engine_req(&v, &f, w, h);
     req.target_identity = Some(identity.clone());
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     req.skip_readback = true;
 
     let before_draw = engine::counter_snapshot();
@@ -1496,7 +1490,6 @@ fn sampled_rgba_upload_to_bgra_target_preserves_semantic_channels() {
     req.target_identity = Some(identity.clone());
     req.output_bgra = true;
     req.skip_readback = true;
-    req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
 
     let positions: [[f32; 4]; 6] = [
         [-1.0, -1.0, 0.0, 1.0],
@@ -1770,7 +1763,6 @@ fn sampled_bgra8_bytes_upload_matches_rgba8_semantic_color() {
         req.target_identity = Some(identity.clone());
         req.output_bgra = true;
         req.skip_readback = true;
-        req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
             content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
@@ -1892,7 +1884,6 @@ fn a_view_swizzle_is_performed_by_the_image_view_not_the_cpu() {
         req.target_identity = Some(identity.clone());
         req.output_bgra = true;
         req.skip_readback = true;
-        req.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         req.storage_buffers.push(StorageBufferResource {
             binding: 0,
             content: encode_f32(&positions.into_iter().flatten().collect::<Vec<_>>()).into(),
@@ -1975,7 +1966,7 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     req.target_identity = Some(identity.clone());
     req.output_bgra = true;
     req.skip_readback = true;
-    req.load_op = Some(LoadOp::LoadSeed(seed_rgba.repeat((w * h) as usize)));
+    req.target_rgba8 = Some(std::sync::Arc::new(seed_rgba.repeat((w * h) as usize)));
     req.scissors.push(ScissorResource {
         x: 0,
         y: 0,
@@ -2027,7 +2018,7 @@ fn an_alpha_only_write_mask_leaves_the_colour_channels_alone() {
     let seed = [17u8, 91, 203, 7];
 
     let mut req = engine_req(&vert, &frag, w, h);
-    req.load_op = Some(LoadOp::LoadSeed(seed.repeat((w * h) as usize)));
+    req.target_rgba8 = Some(std::sync::Arc::new(seed.repeat((w * h) as usize)));
     req.color_write_mask = ColorWriteMask::new(1).expect("MTLColorWriteMaskAlpha");
     let masked = match engine::execute_draw_request(&req) {
         Ok(out) => out.pixels,
@@ -2204,7 +2195,8 @@ fn premult_one_omsa_gpu_blend_matches_software_oracle() {
 /// Class A zero-copy wipe lock: after a skip_readback Store (no CPU pixels,
 /// host_cache would be empty/evicted), the next pass must LoadFromTarget so
 /// progressive multi-pass content stays on the resident image. Engine Clear
-/// (default when load_op/target_rgba8 are None) would black the target.
+/// (the default when neither `load_from_target` nor `target_rgba8` is set)
+/// would black the target.
 /// Product choice is also locked by `type11_load_ready_uses_resident_not_clear`.
 #[test]
 fn skip_readback_store_then_load_from_target_preserves_content() {
@@ -2220,7 +2212,6 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     // so no CPU pixels land in host_cache.
     let mut store1 = engine_req(&v, &f, 16, 16);
     store1.target_identity = Some(identity.clone());
-    store1.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     store1.skip_readback = true;
     match engine::execute_draw_request(&store1) {
         Ok(_) => {}
@@ -2237,7 +2228,7 @@ fn skip_readback_store_then_load_from_target_preserves_content() {
     // Pass 2: LOAD after host_cache miss — LoadFromTarget, no CPU seed.
     let mut store2 = engine_req(&v, &f, 16, 16);
     store2.target_identity = Some(identity.clone());
-    store2.load_op = Some(LoadOp::LoadFromTarget);
+    store2.load_from_target = true;
     store2.skip_readback = true;
     store2.target_rgba8 = None;
     engine::execute_draw_request(&store2).expect("store2 LoadFromTarget");
@@ -2314,7 +2305,7 @@ fn chain_load_from_target_byte_parity_vs_cpu_seed() {
     engine::execute_draw_request(&g1).expect("gpu chain d1");
     let mut g2 = engine_req(&v, &f, 16, 16);
     g2.target_identity = Some(identity.clone());
-    g2.load_op = Some(LoadOp::LoadFromTarget);
+    g2.load_from_target = true;
     g2.skip_readback = false; // read back for compare
     let p2_gpu = semantic_rgba(&engine::execute_draw_request(&g2).expect("gpu chain d2"));
     assert_eq!(
@@ -2365,7 +2356,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     // Arm A — the round trip this rail removes: seed from host bytes, draw a
     // corner, read back, re-upload those pixels as the next pass's seed.
     let mut d1 = engine_req(&v, &f, w, h);
-    d1.load_op = Some(LoadOp::LoadSeed(prior.clone()));
+    d1.target_rgba8 = Some(std::sync::Arc::new(prior.clone()));
     d1.scissors.push(dot(0, 0));
     let p1 = match engine::execute_draw_request(&d1) {
         Ok(o) => semantic_rgba(&o),
@@ -2376,7 +2367,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
         Err(e) => panic!("readback chain d1: {e}"),
     };
     let mut d2_cpu = engine_req(&v, &f, w, h);
-    d2_cpu.load_op = Some(LoadOp::LoadSeed(p1.clone()));
+    d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
     d2_cpu.scissors.push(dot(8, 8));
     let p2_cpu =
         semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
@@ -2401,7 +2392,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     };
     let mut g1 = engine_req(&v, &f, w, h);
     g1.target_identity = Some(identity.clone());
-    g1.load_op = Some(LoadOp::LoadSeed(prior));
+    g1.target_rgba8 = Some(std::sync::Arc::new(prior));
     g1.scissors.push(dot(0, 0));
     g1.skip_readback = false;
     let p1_resident =
@@ -2414,7 +2405,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
 
     let mut g2 = engine_req(&v, &f, w, h);
     g2.target_identity = Some(identity.clone());
-    g2.load_op = Some(LoadOp::LoadFromTarget);
+    g2.load_from_target = true;
     g2.target_rgba8 = None;
     g2.scissors.push(dot(8, 8));
     g2.skip_readback = false;
@@ -2472,12 +2463,12 @@ fn gva_chain_resident_single_readback_matches_cpu_seed_chain() {
     engine::execute_draw_request(&g1).expect("gva chain g1");
     let mut g2 = engine_req(&v, &f, 16, 16);
     g2.target_identity = Some(identity.clone());
-    g2.load_op = Some(LoadOp::LoadFromTarget);
+    g2.load_from_target = true;
     g2.skip_readback = true;
     engine::execute_draw_request(&g2).expect("gva chain g2");
     let mut g3 = engine_req(&v, &f, 16, 16);
     g3.target_identity = Some(identity.clone());
-    g3.load_op = Some(LoadOp::LoadFromTarget);
+    g3.load_from_target = true;
     g3.skip_readback = false; // final record: contract Store readback
     let p3_gpu = engine::execute_draw_request(&g3)
         .expect("gva chain g3")
@@ -2659,7 +2650,6 @@ fn ring_overlaps_in_flight_no_readback_draws() {
     for (label, identity) in [("ring_cold_a", &id_a), ("ring_cold_b", &id_b)] {
         let mut cold = engine_req(&v, &f, 16, 16);
         cold.target_identity = Some((*identity).clone());
-        cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
         match engine::execute_draw_request(&cold) {
             Ok(o) => assert_fullscreen_fragment_color(label, &semantic_rgba(&o), 16, 16),
             Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2673,7 +2663,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
     for identity in [&id_a, &id_b] {
         let mut warm = engine_req(&v, &f, 16, 16);
         warm.target_identity = Some((*identity).clone());
-        warm.load_op = Some(LoadOp::LoadFromTarget);
+        warm.load_from_target = true;
         warm.skip_readback = true;
         engine::execute_draw_request(&warm).expect("ring warm-up");
     }
@@ -2685,7 +2675,7 @@ fn ring_overlaps_in_flight_no_readback_draws() {
     for (n, identity) in [&id_a, &id_b, &id_a, &id_b].into_iter().enumerate() {
         let mut warm = engine_req(&v, &f, 16, 16);
         warm.target_identity = Some((*identity).clone());
-        warm.load_op = Some(LoadOp::LoadFromTarget);
+        warm.load_from_target = true;
         warm.skip_readback = true;
         engine::execute_draw_request(&warm).unwrap_or_else(|e| panic!("ring async #{n}: {e}"));
     }
@@ -2739,7 +2729,6 @@ fn seed_from_target_gpu_copies_front_frame() {
     // Render known content into the "front frame" resident.
     let mut cold = engine_req(&v, &f, 16, 16);
     cold.target_identity = Some(front.clone());
-    cold.load_op = Some(LoadOp::Clear([0.0, 0.0, 0.0, 0.0]));
     let front_pixels = match engine::execute_draw_request(&cold) {
         Ok(o) => {
             assert_fullscreen_fragment_color("gpu_seed_front", &semantic_rgba(&o), 16, 16);

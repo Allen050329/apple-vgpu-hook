@@ -48,7 +48,7 @@ pub use types::{
     ComputeBufferResource, ComputeOutput, ComputeRequest, ComputeResidentSampleBind,
     ComputeSampledImageResource, ComputeStorageImageResource, ComputeStorageResidency, CullMode,
     DepthState, DrawError, DrawOutput, DrawRequest, DrawTicket, GuestRun, GuestRunSource,
-    IndexType, IndexedDrawResource, LoadOp, PrimitiveTopology, SampledContentIdentity,
+    IndexType, IndexedDrawResource, PrimitiveTopology, SampledContentIdentity,
     SampledImageResource, SampledSource, SamplerAddressMode, SamplerBorderColor,
     SamplerCompareFunction, SamplerFilter, SamplerMipFilter, SamplerResource, ScissorResource,
     SecondaryColorTarget, SeedOrder, StencilFaceOps, StencilOp, StencilState,
