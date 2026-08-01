@@ -1052,7 +1052,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
             // on the `front_wb` / `present_order_hold` lines. Always update
             // here so a later writeback into the same mid refreshes the gen.
             state.present.early_front_mapping = mapping_id;
-            state.present.early_front_generation = gen;
         }
         return;
     }
@@ -1097,7 +1096,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
         crate::model::SurfaceWriteKind::Composite
     ) {
         state.present.early_front_mapping = mapping_id;
-        state.present.early_front_generation = gen;
     }
 
     crate::observe::line(format!(
@@ -1118,85 +1116,62 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
 /// same-geom paints and **CmdDisplaySwap** (HostAction) may change console
 /// size — matching archive same_geom + PG `modeChangeHandler` at present.
 ///
-/// # Known gap: the second candidate has no contract sentence
+/// # One source, and it is the guest's own statement
 ///
-/// This is the one resolver left on the present path that ranks two sources,
-/// and only the first of them can be justified from a decoded field:
+/// The pre-boundary console shows `early_front_mapping`: the mapping the guest
+/// most recently **composited** into (`SurfaceWriteKind::Composite`). That is a
+/// decoded fact with a sentence — the guest composited into M, so the console
+/// should show M — and it is the only source here.
 ///
-/// - `early_front_mapping` — the last mapping the guest **composited** into
-///   (`SurfaceWriteKind::Composite`). The sentence holds: the guest composited
-///   into M, so the pre-boundary console should show M.
-/// - `present_mapping` — pre-boundary this is the last writeback of *any* kind,
-///   including a ClearOnly buffer-setup flip. There is no sentence for it. It is
-///   a fallback for "no Composite writeback has happened yet", and what the
-///   guest meant in that state is exactly what we do not know.
+/// This used to rank a second candidate, `present_mapping`, which pre-boundary
+/// is the last writeback of *any* kind including a ClearOnly buffer-setup flip.
+/// It had no sentence; it stood in for "no Composite writeback has happened
+/// yet", which is a state whose meaning we do not know. Two instrumented x86 /
+/// Vulkan boots settled it: across 8 952 pre-boundary calls the composite front
+/// served 7 times and the fallback served **zero**, because in every one of the
+/// 8 952 calls where the composite front was unset the fallback was unset too.
+/// It never once had a value to contribute. The counters also never recorded a
+/// composite front rejected for ClearOnly, format, geometry or dimensions — the
+/// case the fallback and the first field's stickiness were both built for did
+/// not occur.
 ///
-/// The stickiness of the first field exists to survive the second being
-/// overwritten by ClearOnly flips, which is one mechanism compensating for
-/// another. The honest fix is to stop latching a console front from a ClearOnly
-/// writeback at all, leaving one field with one meaning — but that turns the
-/// unknown case into a blank early console rather than a guessed one, and
-/// deciding whether that is acceptable needs a two-boot A/B on the early-boot
-/// console handoff (capture during the first ~20 s against a control) that has
-/// not been run. Recorded rather than patched, per the operating loop: do not
-/// fill a contract gap with a heuristic, and do not remove one blind either.
-///
-/// Note the blast radius before spending a session here: this returns `None`
-/// once `frame_flush_seen`, so everything above is early boot only.
+/// Blast radius, for whoever revisits this: it returns `None` once
+/// `frame_flush_seen`, so all of it is early boot only.
 pub fn early_scanout_target(state: &DeviceState) -> Option<(u32, u32, u32, u32)> {
     if state.present.frame_flush_seen {
         return None;
     }
-    // Composite front first, then the last writeback of any kind — see the
-    // known-gap note above for why only the first of these is derivable.
-    let candidates = [
-        state.present.early_front_mapping,
-        state.present.present_mapping,
-    ];
-    for mapping_id in candidates {
-        if mapping_id == 0 {
-            continue;
-        }
-        // ClearOnly init without retain: skip (would feed solid black).
-        match state.surface_write_kind(mapping_id) {
-            crate::model::SurfaceWriteKind::ClearOnly if !state.present.frame_valid => {
-                continue;
-            }
-            _ => {}
-        }
-        let Some(m) = state.mappings.get(&mapping_id) else {
-            continue;
-        };
-        if !m.mapped {
-            continue;
-        }
-        if m.format != 0 && !is_front_buffer_format(m.format) {
-            continue;
-        }
-        let (w, h) = present_dims(state, mapping_id);
-        if w == 0 || h == 0 {
-            continue;
-        }
-        if state.present.valid
-            && state.present.width > 0
-            && state.present.height > 0
-            && (w != state.present.width || h != state.present.height)
-        {
-            continue;
-        }
-        let gen = if mapping_id == state.present.early_front_mapping
-            && state.present.early_front_generation != 0
-        {
-            state
-                .present
-                .early_front_generation
-                .max(m.content_generation)
-        } else {
-            m.content_generation
-        };
-        return Some((mapping_id, w, h, gen));
+    let mapping_id = state.present.early_front_mapping;
+    if mapping_id == 0 {
+        return None;
     }
-    None
+    // ClearOnly init without retain: refuse (would feed solid black).
+    if matches!(
+        state.surface_write_kind(mapping_id),
+        crate::model::SurfaceWriteKind::ClearOnly
+    ) && !state.present.frame_valid
+    {
+        return None;
+    }
+    let m = state.mappings.get(&mapping_id)?;
+    if !m.mapped {
+        return None;
+    }
+    if m.format != 0 && !is_front_buffer_format(m.format) {
+        return None;
+    }
+    let (w, h) = present_dims(state, mapping_id);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if state.present.valid
+        && state.present.width > 0
+        && state.present.height > 0
+        && (w != state.present.width || h != state.present.height)
+    {
+        return None;
+    }
+    Some((mapping_id, w, h, m.content_generation))
 }
 
 #[cfg(test)]
@@ -1428,7 +1403,7 @@ mod tests {
         state.present.valid = true;
         state.present.width = 1920;
         state.present.height = 1080;
-        state.present.present_mapping = 5;
+        state.present.early_front_mapping = 5;
         assert!(state.map_surface(5));
         {
             let m = state.mappings.get_mut(&5).unwrap();
@@ -1439,8 +1414,8 @@ mod tests {
             m.format = MTL_FORMAT_RGBA16_FLOAT;
             m.content_generation = 9;
         }
-        // present_mapping points at new mode FB, but early gfx_update must not
-        // resize — DisplaySwap owns modeChangeHandler sizeInPixels.
+        // The composite front points at a new mode FB, but early gfx_update
+        // must not resize — DisplaySwap owns modeChangeHandler sizeInPixels.
         assert!(early_scanout_target(&state).is_none());
 
         // Same geom re-pull still allowed.
@@ -1460,7 +1435,7 @@ mod tests {
         state.present.valid = true;
         state.present.width = 1920;
         state.present.height = 1080;
-        state.present.present_mapping = 2;
+        state.present.early_front_mapping = 2;
         state.present.frame_flush_seen = false;
         state.present.frame_valid = false;
         assert!(state.map_surface(2));
@@ -1481,6 +1456,52 @@ mod tests {
         let t = early_scanout_target(&state).expect("composite early target");
         assert_eq!(t.0, 2);
         assert_eq!((t.1, t.2), (1920, 1080));
+    }
+
+    /// `present_mapping` alone is not a console front, however good it looks.
+    ///
+    /// Mid 7 here is faultless by every other measure the resolver applies —
+    /// mapped, page-backed, a front-buffer format, console geometry, and
+    /// composited rather than cleared. The one thing it is not is the mapping
+    /// the guest most recently composited into, and that is the whole contract:
+    /// only `early_front_mapping` names the pre-boundary console. Ranking
+    /// `present_mapping` behind it, which is what this used to do, served the
+    /// last writeback of *any* kind with no sentence saying the guest meant it.
+    #[test]
+    fn early_scanout_ignores_a_present_mapping_that_is_not_the_composite_front() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        state.present.valid = true;
+        state.present.width = 1920;
+        state.present.height = 1080;
+        state.present.frame_flush_seen = false;
+        state.present.frame_valid = false;
+        assert!(state.map_surface(7));
+        {
+            let m = state.mappings.get_mut(&7).unwrap();
+            m.mapped = true;
+            m.has_geom = true;
+            m.width = 1920;
+            m.height = 1080;
+            m.format = MTL_FORMAT_BGRA8_UNORM;
+            m.content_generation = 4;
+            m.page_entries = vec![1];
+        }
+        state.note_surface_composite(7);
+        state.present.present_mapping = 7;
+        state.present.early_front_mapping = 0;
+        assert!(
+            early_scanout_target(&state).is_none(),
+            "the last writeback of any kind is not a statement that the guest \
+             composited into it"
+        );
+
+        // Naming it as the composited front is what licenses it.
+        state.present.early_front_mapping = 7;
+        assert_eq!(
+            early_scanout_target(&state),
+            Some((7, 1920, 1080, 4)),
+            "the composited front serves, at the mapping's own content generation"
+        );
     }
 
     /// Sticky early_front survives ClearOnly present_mapping thrash.
@@ -1506,7 +1527,6 @@ mod tests {
         }
         state.note_surface_composite(1);
         state.present.early_front_mapping = 1;
-        state.present.early_front_generation = 5;
         // Guest ClearOnly flip mid overwrites present_mapping (buffer setup).
         assert!(state.map_surface(2));
         {

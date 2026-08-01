@@ -318,7 +318,6 @@ fn clear_only_present_captures_the_surface_the_transaction_names() {
     assert!(write_bgra8(&mut state, &mut host, 1, &gray, stride, w, h));
     state.note_surface_composite(1);
     state.present.early_front_mapping = 1;
-    state.present.early_front_generation = 3;
     state.present.valid = true;
     state.present.width = w;
     state.present.height = h;

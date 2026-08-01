@@ -1410,7 +1410,6 @@ pub struct PresentState {
     /// ClearOnly mid 2/3 while Stores land on Composite mid 1/4/5, and naming
     /// the peer there is what makes that split visible in a boot log.
     pub early_front_mapping: u32,
-    pub early_front_generation: u32,
     /// Present/scanout evidence: mapping → latest geometry it was displayed
     /// at (a `capture_present_frame` action or a retained-frame re-show). The
     /// decoded display transaction naming this surface as plane 0 is the only
