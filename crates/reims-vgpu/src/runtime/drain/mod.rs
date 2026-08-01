@@ -456,6 +456,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
     count: u32,
     reply_pfn: u32,
     page_shift: u32,
+    version: u32,
 ) -> Result<(), MemError> {
     if reply_pfn == 0 {
         return Ok(());
@@ -471,20 +472,25 @@ fn reply_device_info<H: HostMemory + HostOps>(
         return Err(MemError::BadArgs);
     }
     let limits = device_info_limits();
-    let caps = crate::model::device_info_caps(&limits);
-    // Printed on every reply, not only when something is reduced. A host that
+    let caps = crate::model::device_info_caps(&limits, version);
+    // Printed on every reply, not only when something changed. A host that
     // already meets the table reduces nothing, and then silence would be
     // indistinguishable from the derivation never having run — which is exactly
     // the failure mode this line exists to rule out on a rig whose GPU exceeds
-    // every entry. `reduced` names what the guest was told to stop expecting.
-    let reduced: Vec<String> = caps
+    // every entry. `derived` names every key the guest was told something other
+    // than the table's value, whether the cause was the host GPU or the
+    // negotiated version; `version` is printed so key 12's answer can be
+    // checked against the rung without a second log line.
+    let derived: Vec<String> = caps
         .iter()
         .zip(DEVICE_INFO_CAPS)
         .filter(|((_, served), (_, table))| served != table)
         .map(|((key, served), (_, table))| format!("key{key}={served}(was {table})"))
         .collect();
     crate::observe::off(format!(
-        "device_info host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} reduced=[{}]",
+        "device_info version={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
+        version,
+        u8::from(crate::model::protocol_dual_plane_textures(version)),
         limits.max_sample_count,
         u8::from(limits.d24_stencil8),
         limits.max_threads_per_threadgroup[0],
@@ -492,7 +498,7 @@ fn reply_device_info<H: HostMemory + HostOps>(
         limits.max_threads_per_threadgroup[2],
         limits.max_threadgroup_memory_bytes,
         u8::from(limits.native_fp16),
-        reduced.join(" ")
+        derived.join(" ")
     ));
     let n = (caps.len() as u32).min(count).min(max_pairs);
     // When guest asks for more than one page of pairs, still write at most a
@@ -749,14 +755,14 @@ fn process_root_packet<H: HostMemory + HostOps>(
             if packet.payload.len() >= DEVICE_INFO_TAHOE_REPLY_PFN + 4 {
                 let count = ld32(&packet.payload[DEVICE_INFO_TAHOE_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_TAHOE_REPLY_PFN..]);
-                let _ = reply_device_info(host, count, pfn, state.page_shift);
+                let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
             }
         }
         ROOT_OP_DEVICE_INFO_MONTEREY => {
             if packet.payload.len() >= DEVICE_INFO_MONTEREY_REPLY_PFN + 4 {
                 let count = ld32(&packet.payload[DEVICE_INFO_MONTEREY_COUNT..]);
                 let pfn = ld32(&packet.payload[DEVICE_INFO_MONTEREY_REPLY_PFN..]);
-                let _ = reply_device_info(host, count, pfn, state.page_shift);
+                let _ = reply_device_info(host, count, pfn, state.page_shift, state.gfx.version);
             }
         }
         ROOT_OP_DEFINE_FIFO => {

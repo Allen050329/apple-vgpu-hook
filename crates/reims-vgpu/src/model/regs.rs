@@ -307,6 +307,32 @@ pub const DEVICE_INFO_KEY_MAX_THREADS_D: u32 = 5;
 pub const DEVICE_INFO_KEY_THREADGROUP_MEMORY: u32 = 6;
 pub const DEVICE_INFO_KEY_NATIVE_FP16: u32 = 9;
 
+/// Wire key 12 — whether the guest may build two-plane (biplanar YUV) textures.
+///
+/// Unlike its neighbours this is not a property of the host GPU. It is one of
+/// the feature bools the guest's own driver selects from the negotiated
+/// protocol version, echoed back over the wire; see
+/// [`protocol_dual_plane_textures`].
+pub const DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES: u32 = 12;
+
+/// Whether protocol `version` enables two-plane textures.
+///
+/// The guest driver switches the negotiated version into a feature struct, and
+/// this is the bool at offset 10 of it. The guest uses it **ungated**: a
+/// two-plane pixel format makes its texture object allocate three sub-resources
+/// and a doubled descriptor array instead of two. So answering a version that
+/// does not have the feature that it does is not cosmetic — it changes the
+/// shape of every biplanar video texture the guest builds.
+///
+/// The rung set is the guest's own switch, and it is **not monotonic**: the
+/// feature appears at 31, is explicitly turned back off at 40, and returns at
+/// 41. Both ends of the protocol encode that same gap, so it is a contract and
+/// not an accident. Do not rewrite this as `version >= 31`.
+#[inline]
+pub fn protocol_dual_plane_textures(version: u32) -> bool {
+    matches!(version, 31 | 41 | 42 | 43 | 60 | 61 | 62)
+}
+
 /// What the host GPU can actually do, for the keys above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceInfoLimits {
@@ -317,14 +343,21 @@ pub struct DeviceInfoLimits {
     pub native_fp16: bool,
 }
 
-/// The device-info reply for this host, with the GPU-dependent keys reduced to
-/// what `limits` says the host can execute.
+/// The device-info reply for this host: GPU-dependent keys reduced to what
+/// `limits` says the host can execute, and version-dependent keys answered from
+/// the negotiated protocol `version`.
 ///
-/// Reduction only. [`DEVICE_INFO_CAPS`] is the set of answers this pathway has
-/// been exercised at, so it stays the ceiling: a host that can do more is not a
-/// reason to promise the guest something no boot here has ever run, and a host
-/// that can do less must not be promised anything at all.
-pub fn device_info_caps(limits: &DeviceInfoLimits) -> Vec<(u32, u32)> {
+/// The GPU-dependent keys are reduction only. [`DEVICE_INFO_CAPS`] is the set of
+/// answers this pathway has been exercised at, so it stays the ceiling: a host
+/// that can do more is not a reason to promise the guest something no boot here
+/// has ever run, and a host that can do less must not be promised anything at
+/// all.
+///
+/// Key 12 is neither reduced nor served from the table. It is a protocol
+/// feature bit, so the only correct answer is the one the negotiated version
+/// selects — the table's fixed `1` is right for some versions and wrong for the
+/// rest.
+pub fn device_info_caps(limits: &DeviceInfoLimits, version: u32) -> Vec<(u32, u32)> {
     DEVICE_INFO_CAPS
         .iter()
         .map(|&(key, value)| {
@@ -336,6 +369,9 @@ pub fn device_info_caps(limits: &DeviceInfoLimits) -> Vec<(u32, u32)> {
                 DEVICE_INFO_KEY_MAX_THREADS_D => limits.max_threads_per_threadgroup[2],
                 DEVICE_INFO_KEY_THREADGROUP_MEMORY => limits.max_threadgroup_memory_bytes,
                 DEVICE_INFO_KEY_NATIVE_FP16 => u32::from(limits.native_fp16),
+                DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES => {
+                    return (key, u32::from(protocol_dual_plane_textures(version)));
+                }
                 _ => return (key, value),
             };
             (key, value.min(host))
@@ -458,6 +494,13 @@ mod tests {
     /// The table is the set of values this pathway has been exercised at. The
     /// derivation exists to stop over-promising a weak host, not to start
     /// promising a strong one something no boot here has run.
+    /// A version whose feature set matches the table, so only the host varies.
+    ///
+    /// 31 is the lowest rung with two-plane textures on, which is the table's
+    /// own value for key 12; using it keeps this test about the host reduction
+    /// and nothing else.
+    const VERSION_WITH_DUAL_PLANE: u32 = 31;
+
     #[test]
     fn a_more_capable_host_never_raises_a_device_info_answer() {
         let generous = DeviceInfoLimits {
@@ -467,7 +510,66 @@ mod tests {
             max_threadgroup_memory_bytes: 262_144,
             native_fp16: true,
         };
-        assert_eq!(device_info_caps(&generous), DEVICE_INFO_CAPS.to_vec());
+        assert_eq!(
+            device_info_caps(&generous, VERSION_WITH_DUAL_PLANE),
+            DEVICE_INFO_CAPS.to_vec()
+        );
+    }
+
+    /// Two-plane textures follow the negotiated version, not a constant.
+    ///
+    /// The guest acts on this ungated: a two-plane format allocates three
+    /// sub-resources rather than two when the bit is set. Serving a fixed 1
+    /// tells a version-4 guest that a feature its own driver has switched off
+    /// is available, and every biplanar video texture is then built to the
+    /// wrong shape.
+    #[test]
+    fn key_12_is_the_negotiated_dual_plane_bit_not_a_constant() {
+        let host = DeviceInfoLimits {
+            max_sample_count: 64,
+            d24_stencil8: true,
+            max_threads_per_threadgroup: [4096, 4096, 4096],
+            max_threadgroup_memory_bytes: 262_144,
+            native_fp16: true,
+        };
+        let key12 = |version: u32| -> u32 {
+            device_info_caps(&host, version)
+                .into_iter()
+                .find(|&(k, _)| k == DEVICE_INFO_KEY_DUAL_PLANE_TEXTURES)
+                .expect("key 12 is served")
+                .1
+        };
+
+        // What this guest actually negotiates. The table said 1; the guest's
+        // own driver says 0.
+        assert_eq!(key12(4), 0, "version 4 has no two-plane textures");
+        assert_eq!(key12(31), 1);
+        assert_eq!(key12(62), 1);
+    }
+
+    /// The rung set is the guest's switch, and that switch is not monotonic.
+    ///
+    /// Two-plane textures appear at 31, are turned back off at 40, and return
+    /// at 41. Both ends of the protocol encode the same gap. A future
+    /// simplification to `version >= 31` would answer 40 wrongly, so the gap is
+    /// asserted directly.
+    #[test]
+    fn dual_plane_textures_is_off_at_version_40() {
+        assert!(protocol_dual_plane_textures(31));
+        assert!(!protocol_dual_plane_textures(40), "40 explicitly clears it");
+        assert!(protocol_dual_plane_textures(41));
+
+        // Every rung, so the whole contract is pinned rather than three points
+        // of it. Versions that are not rungs land in the guest's default arm,
+        // which has all features off.
+        for version in 0..=PROTOCOL_VERSION_MAX {
+            let want = matches!(version, 31 | 41 | 42 | 43 | 60 | 61 | 62);
+            assert_eq!(
+                protocol_dual_plane_textures(version),
+                want,
+                "version {version}"
+            );
+        }
     }
 
     /// A host at the Vulkan floor is told to the guest as the floor.
@@ -487,7 +589,9 @@ mod tests {
             native_fp16: false,
         };
         let served: std::collections::BTreeMap<u32, u32> =
-            device_info_caps(&floor).into_iter().collect();
+            device_info_caps(&floor, VERSION_WITH_DUAL_PLANE)
+                .into_iter()
+                .collect();
         assert_eq!(served[&DEVICE_INFO_KEY_MAX_SAMPLE_COUNT], 1);
         assert_eq!(served[&DEVICE_INFO_KEY_D24_STENCIL8], 0);
         assert_eq!(served[&DEVICE_INFO_KEY_MAX_THREADS_W], 128);
