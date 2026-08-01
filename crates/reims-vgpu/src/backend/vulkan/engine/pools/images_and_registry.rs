@@ -739,12 +739,42 @@ impl ResourcePools {
     /// that makes this reading look better is deriving a constant from an
     /// observation, which the ground rules forbid, and it would pin one
     /// display-sized standalone allocation per unit of whatever number is
-    /// chosen. What has to be understood first is the graveyard's drain
-    /// granularity — how many depth attachments are outstanding between two
-    /// `in_flight == 0` moments, and whether that is itself a defect. The whole
-    /// experiment is reproducible from this doc; the pool itself was reverted
-    /// rather than shipped, because a mechanism that recovers 4 % of what it was
-    /// added for is more code for no measured benefit.
+    /// chosen. The whole experiment is reproducible from this doc; the pool
+    /// itself was reverted rather than shipped, because a mechanism that
+    /// recovers 4 % of what it was added for is more code for no measured
+    /// benefit.
+    ///
+    /// # Why the burst exists: two disposal paths, and `dispose` takes the coarse one
+    ///
+    /// This engine has two mechanisms for "destroy once the GPU is done with
+    /// it", and they have different granularity:
+    ///
+    /// - [`PendingGpuCleanup`] hangs off a **ring slot** and is drained by
+    ///   `drain_cleanup` when **that slot's own fence** retires. Staging,
+    ///   readback, descriptor sets, sampled and storage slots ride this one.
+    /// - `graveyard` is a **global** `Vec<DeferredHandle>` drained only when a
+    ///   retire leaves `gpu_work_open()` false — that is, when the *entire ring*
+    ///   is idle — with `GRAVEYARD_FORCE_DRAIN` (256) as a backstop that
+    ///   force-quiesces the ring if it never gets there on its own.
+    ///
+    /// `dispose` uses the second. So every `DeferredHandle::Recycle*` waits for
+    /// *every* in-flight fence, not for the one that could actually still be
+    /// reading it, and a slot whose owning entry retired twenty draws ago is
+    /// still sitting in the graveyard. The measured burst above — 2545 drops
+    /// against 120 admits, so bursts averaging roughly twenty per key — is that
+    /// gap, and it is well under the 256 backstop, which says the ring does
+    /// quiesce on its own and the force-drain is not what is firing.
+    ///
+    /// The bound that *is* derivable: a disposed handle is safe once the last
+    /// entry that could reference it has retired. That is the newest in-flight
+    /// entry at dispose time — one fence — not all of them. Under that
+    /// granularity the outstanding population is the ring depth, and a per-key
+    /// cap of ring-depth-plus-one is a contract-derived number rather than a
+    /// fitted one. The reason the graveyard is global today is presumably that a
+    /// handle can be referenced by more than one in-flight CB and no site tracks
+    /// which; that is the thing to establish before moving anything, and it is a
+    /// disposal-path change, not a depth change. Depth is just the loudest
+    /// witness to it.
     pub(crate) unsafe fn create_transient_depth(
         &mut self,
         ctx: &DeviceContext,
