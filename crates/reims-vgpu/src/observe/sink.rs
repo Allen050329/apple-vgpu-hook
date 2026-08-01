@@ -822,6 +822,32 @@ pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
 /// one action is what makes an arm and its control differ in the one thing being
 /// measured.
 ///
+/// # The `bump` pair, and why it did not settle anything
+///
+/// Two boots, x86 / Vulkan, six `icon-composite` rounds each:
+///
+/// ```text
+///           rounds      surface_flush   clobber   duty    us/draw   draws/win
+/// bump on   6/6 clean       25 766        575     0.897     547        693
+/// bump off  1/6 CORRUPT     11 242          0     0.441     320        343
+/// ```
+///
+/// **Not comparable, and the reason matters more than the numbers.** The armed
+/// boot did 2.3x the flushes and 2x the draws per window in the same wall clock,
+/// so it was busier rather than slower, and every per-draw and per-second figure
+/// above is confounded by that. A per-draw cost read off this pair would be read
+/// off two different workloads.
+///
+/// The one thing that survives the confound is the direction: the boot that did
+/// *more* work is the one with the bump on, which is the opposite of what a
+/// cache-invalidation cost predicts. And the corrupt round landed on the control
+/// arm, at n=1, which is a hint and not a result.
+///
+/// A clean pair needs the two arms driven to the same submission count rather
+/// than the same wall clock. Until then the bump stays on: it is the guest's own
+/// statement, and the evidence for turning it off is a confounded pair and one
+/// corrupt round pointing the other way.
+///
 /// `validity_windows_dropped` and `validity_wb_{licensed,superseded,unstated}`
 /// are counted whichever way this is set, on purpose: a control boot reports the
 /// same numbers the armed boot acts on, so the two differ only in whether those
