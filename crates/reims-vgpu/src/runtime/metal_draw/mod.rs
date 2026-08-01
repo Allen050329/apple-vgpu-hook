@@ -15,8 +15,6 @@ use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 use crate::observe::Decline;
 use crate::runtime::census::srgb_census;
-#[cfg(feature = "backend-vulkan")]
-use crate::runtime::census::t11_decline;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
 use crate::runtime::decode::render::{

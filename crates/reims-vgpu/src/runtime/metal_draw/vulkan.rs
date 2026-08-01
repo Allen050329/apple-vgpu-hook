@@ -1281,28 +1281,18 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // 2) Guest pages, which are what the surface *is*. Reached only
                 // when no host-side copy served the bind — no resident, or one
                 // the guest has written over — so the gather always runs and the
-                // guest bytes are taken unconditionally.
-                // Why the zero-copy gather declined this bind — recorded on the
-                // CPU t11_guest load below so a boot names the dominant lever
-                // (below_floor / stride / coverage / …).
+                // guest bytes are taken unconditionally. Declining the gather is
+                // expected control flow — the CPU byte loader below serves the
+                // same pixels — so it stays quiet, like the type-2/3 rail's.
                 #[cfg(feature = "backend-vulkan")]
-                let t11_zc_decline = match try_type11_sample_zero_copy(state, host, mid, w, h) {
-                    Ok(src) => {
-                        note_type11_sample_rung("t11rung_zero_copy", guest_write);
-                        return Some((w, h, mid, src));
-                    }
-                    Err(reason) => Some(reason),
-                };
-                // No gather on the Metal path, so there is no decline to name.
-                #[cfg(not(feature = "backend-vulkan"))]
-                let t11_zc_decline: Option<t11_decline::Reason> = None;
+                if let Some(src) = try_type11_sample_zero_copy(state, host, mid, w, h) {
+                    note_type11_sample_rung("t11rung_zero_copy", guest_write);
+                    return Some((w, h, mid, src));
+                }
                 // The memo skips the convert/alloc on unchanged content and
                 // returns a content identity so the engine skips re-hash+upload;
                 // its census (T11Memo hit / T11Guest fill) is emitted internally.
                 if let Some((rgba, identity)) = load_type11_rgba_memoized(state, host, mid) {
-                    if let Some(reason) = t11_zc_decline {
-                        t11_decline::note(reason, rgba.len());
-                    }
                     note_type11_sample_rung("t11rung_guest_memo", guest_write);
                     return Some((
                         w,
@@ -2052,27 +2042,26 @@ fn load_type5_view_rgba<M: HostMemory + HostOps>(
     ))
 }
 
-/// Type-2/3 sample: GVA encode cache → texture_ref cache (descriptor geom) → guest GVA.
-#[cfg(feature = "backend-vulkan")]
-/// Serve the memoized swizzled RGBA only when it matches the authoritative
-/// `host_gva_surfaces` entry on every axis (gva, generation, geometry) - a
-/// stale memo entry is skipped, never served.
 /// Zero-copy floor: below this the CPU byte path (one small read + memo) is
 /// cheaper than a cached-window import plus a recorded GPU gather. Performance
 /// threshold only — never a correctness gate.
 ///
-/// Set to 64 KiB from a video-playback census (`t11_zc_decline`): after the
-/// type-5 plane rail landed, the whole remaining CPU copy under video was
-/// `t11_guest` (~226 MB/session), and 100% of those declines were `below_floor`
-/// — per-frame-changing composite surfaces clustered at ~236 KiB, just under
-/// the old 256 KiB. No memo can help (content changes every frame), so the CPU
-/// path re-read + swizzled + double-SipHashed + re-uploaded ~236 KiB per frame
-/// for nothing the GPU gather couldn't do from an already-imported (cached)
-/// window. 64 KiB sits ~2× above the largest small-texture band that still
-/// legitimately prefers the CPU byte path (small-UI / gva_copy binds measured at
-/// ~21–34 KiB, and scroll glyphs at ~3.6 KiB served by the memo) and ~3.7×
-/// below the video surfaces, so the band it opens to zero-copy is exactly those
-/// per-frame video composites.
+/// Set to 64 KiB from a video-playback census: after the type-5 plane rail
+/// landed, the whole remaining CPU copy under video was `t11_guest`
+/// (~226 MB/session), and 100% of those declines were the floor —
+/// per-frame-changing composite surfaces clustered at ~236 KiB, just under the
+/// old 256 KiB. No memo can help (content changes every frame), so the CPU path
+/// re-read + swizzled + double-SipHashed + re-uploaded ~236 KiB per frame for
+/// nothing the GPU gather couldn't do from an already-imported (cached) window.
+/// 64 KiB sits ~2× above the largest small-texture band that still legitimately
+/// prefers the CPU byte path (small-UI / gva_copy binds measured at ~21–34 KiB,
+/// and scroll glyphs at ~3.6 KiB served by the memo) and ~3.7× below the video
+/// surfaces, so the band it opens to zero-copy is exactly those per-frame video
+/// composites.
+///
+/// The floor is also the *only* thing that has ever declined the type-11
+/// gather: over 1 051 sampled declines it was 100% of them, which is why the
+/// rail no longer carries a reason enum to distinguish the rest.
 #[cfg(feature = "backend-vulkan")]
 const ZERO_COPY_SAMPLED_MIN_BYTES: u64 = 64 * 1024;
 
@@ -2570,17 +2559,16 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
     mid: u32,
     w: u32,
     h: u32,
-) -> Result<SampledSourceRequest, t11_decline::Reason> {
+) -> Option<SampledSourceRequest> {
     use crate::backend::vulkan::engine;
     use crate::runtime::mapping_write::type11_sample_window;
-    use t11_decline::Reason;
     if w == 0 || h == 0 {
-        return Err(Reason::Unmapped);
+        return None;
     }
     let (native, base_off, bpr) = {
-        let m = state.mappings.get(&mid).ok_or(Reason::Unmapped)?;
+        let m = state.mappings.get(&mid)?;
         if !m.mapped || m.page_entries.is_empty() {
-            return Err(Reason::Unmapped);
+            return None;
         }
         let format = if m.format != 0 {
             m.format
@@ -2594,47 +2582,41 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
                 }
                 layout
             }
-            _ => return Err(Reason::BadFormat),
+            _ => return None,
         };
-        let (base_off, bpr_u32, _span_end) =
-            type11_sample_window(m, mid, w, h, format).ok_or(Reason::NoWindow)?;
+        let (base_off, bpr_u32, _span_end) = type11_sample_window(m, mid, w, h, format)?;
         (native, base_off, bpr_u32 as u64)
     };
-    let tight = (w as u64)
-        .checked_mul(RGBA8_BPP as u64)
-        .ok_or(Reason::Stride)?;
+    let tight = (w as u64).checked_mul(RGBA8_BPP as u64)?;
     if bpr < tight || bpr % RGBA8_BPP as u64 != 0 {
-        return Err(Reason::Stride);
+        return None;
     }
     let span = bpr
         .checked_mul((h - 1) as u64)
-        .and_then(|v| v.checked_add(tight))
-        .ok_or(Reason::Coverage)?;
+        .and_then(|v| v.checked_add(tight))?;
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
-        return Err(Reason::BelowFloor);
+        return None;
     }
     if !guest_run_alias_available(host) {
-        return Err(Reason::UnstableMap);
+        return None;
     }
     // Land any resident-authoritative deferred window before the GPU reads
     // the pages (same coherence rule as paint_mapping / the linear rail).
     {
         let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
     };
-    let gpas = { mapper::mapping_page_gpas(state, host, mid) }.ok_or(Reason::Coverage)?;
+    let gpas = { mapper::mapping_page_gpas(state, host, mid) }?;
     let page = state.page_size();
-    let window_end = base_off.checked_add(span).ok_or(Reason::Coverage)?;
+    let window_end = base_off.checked_add(span)?;
     if (gpas.len() as u64).saturating_mul(page) < window_end {
-        return Err(Reason::Coverage);
+        return None;
     }
     // Coalesce the pages covering [base_off, base_off+span) into packed host
     // runs (direct RAMBlock aliases from map_pages; unmap is a no-op).
     let first_page = (base_off / page) as usize;
     let head_off = base_off % page;
     let need_pages = (head_off + span).div_ceil(page) as usize;
-    let window = gpas
-        .get(first_page..first_page + need_pages)
-        .ok_or(Reason::Coverage)?;
+    let window = gpas.get(first_page..first_page + need_pages)?;
     let mut runs: Vec<engine::GuestRun> = Vec::new();
     let mut consumed = 0u64;
     let mut i = 0usize;
@@ -2643,8 +2625,7 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
             j += 1;
         }
-        let base =
-            { host.map_pages(&window[i..j], page as usize) }.ok_or(Reason::ImportFail)? as u64;
+        let base = { host.map_pages(&window[i..j], page as usize) }? as u64;
         let start_in_run = if i == 0 { head_off } else { 0 };
         let avail = ((j - i) as u64) * page - start_in_run;
         let len = avail.min(span - consumed);
@@ -2656,16 +2637,14 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         i = j;
     }
     if consumed != span {
-        return Err(Reason::ImportFail);
+        return None;
     }
     let row_length_texels = if bpr == tight {
         0
     } else {
-        u32::try_from(bpr / RGBA8_BPP as u64)
-            .ok()
-            .ok_or(Reason::Stride)?
+        u32::try_from(bpr / RGBA8_BPP as u64).ok()?
     };
-    Ok(SampledSourceRequest::GuestRuns(
+    Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
             total_len: span,

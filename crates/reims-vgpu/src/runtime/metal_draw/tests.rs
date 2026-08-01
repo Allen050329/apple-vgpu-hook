@@ -116,10 +116,7 @@ fn type11_zero_copy_declines_transient_host_mappings() {
     }
     assert!(state.set_mapping_geom(mid, width, height, MTL_FORMAT_BGRA8_UNORM));
 
-    assert!(matches!(
-        try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height),
-        Err(t11_decline::Reason::UnstableMap)
-    ));
+    assert!(try_type11_sample_zero_copy(&mut state, &mut host, mid, width, height).is_none());
     assert_eq!(
         host.map_pages_calls, 0,
         "transient hosts must decline before creating an importable view"
