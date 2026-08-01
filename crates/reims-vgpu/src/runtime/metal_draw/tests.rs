@@ -583,55 +583,6 @@ fn metal_state_decode_declines_delegate_the_exact_resource_decoder_reason() {
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 #[test]
-fn metal_icb_inheritance_preflight_rejects_invalid_explicit_binds_but_not_unbound_slots() {
-    let desc = crate::runtime::decode::resource::IndirectCommandBufferDescriptor {
-        inherit_pipeline_state: true,
-        ..Default::default()
-    };
-
-    let missing_parent_pipeline =
-        validate_icb_inheritance_bind_shape(&DrawEncodeRequest::default(), &desc)
-            .expect_err("inheritPipelineState requires a parent pipeline");
-    assert_eq!(
-        missing_parent_pipeline,
-        MetalIcbInheritanceDecline::PipelineRefZero
-    );
-
-    let req = DrawEncodeRequest {
-        pipeline_ref: 7,
-        vertex_buffers: vec![BufferBind {
-            index: MAX_BIND_SLOTS,
-            buffer_ref: 93,
-            ..BufferBind::default()
-        }],
-        ..DrawEncodeRequest::default()
-    };
-    assert_eq!(
-        validate_icb_inheritance_bind_shape(&req, &desc),
-        Err(MetalIcbInheritanceDecline::VertexBufferIndexOutOfRange {
-            buffer_ref: 93,
-            index: MAX_BIND_SLOTS,
-        })
-    );
-
-    let unbound = DrawEncodeRequest {
-        pipeline_ref: 7,
-        vertex_buffers: vec![BufferBind {
-            index: u32::MAX,
-            buffer_ref: 0,
-            ..BufferBind::default()
-        }],
-        ..DrawEncodeRequest::default()
-    };
-    assert_eq!(
-        validate_icb_inheritance_bind_shape(&unbound, &desc),
-        Ok(()),
-        "ref==0 is an unbound slot, not a refusal or a log event"
-    );
-}
-
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-#[test]
 fn every_metal_icb_inheritance_check_is_unique_namespaced_and_log_safe() {
     use crate::observe::Decline as _;
 

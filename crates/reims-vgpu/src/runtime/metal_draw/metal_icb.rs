@@ -262,75 +262,6 @@ impl crate::observe::Decline for MetalIcbInheritanceDecline {
     }
 }
 
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-fn validate_icb_inheritance_bind_shape(
-    req: &DrawEncodeRequest,
-    icb_desc: &crate::runtime::decode::resource::IndirectCommandBufferDescriptor,
-) -> Result<(), MetalIcbInheritanceDecline> {
-    if let Some(value) = req.cull_mode {
-        if value > 2 {
-            return Err(MetalIcbInheritanceDecline::CullModeUnsupported { value });
-        }
-    }
-    if let Some(value) = req.front_facing {
-        if value > 1 {
-            return Err(MetalIcbInheritanceDecline::FrontFacingUnsupported { value });
-        }
-    }
-    for bind in &req.vertex_buffers {
-        if bind.buffer_ref != 0 && bind.index >= MAX_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::VertexBufferIndexOutOfRange {
-                buffer_ref: bind.buffer_ref,
-                index: bind.index,
-            });
-        }
-    }
-    for bind in &req.fragment_buffers {
-        if bind.buffer_ref != 0 && bind.index >= MAX_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::FragmentBufferIndexOutOfRange {
-                buffer_ref: bind.buffer_ref,
-                index: bind.index,
-            });
-        }
-    }
-    for bind in &req.vertex_textures {
-        if bind.texture_ref != 0 && bind.index >= MAX_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::VertexTextureIndexOutOfRange {
-                texture_ref: bind.texture_ref,
-                index: bind.index,
-            });
-        }
-    }
-    for bind in &req.fragment_textures {
-        if bind.texture_ref != 0 && bind.index >= MAX_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::FragmentTextureIndexOutOfRange {
-                texture_ref: bind.texture_ref,
-                index: bind.index,
-            });
-        }
-    }
-    for bind in &req.vertex_samplers {
-        if bind.sampler_ref != 0 && bind.index >= MAX_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::VertexSamplerIndexOutOfRange {
-                sampler_ref: bind.sampler_ref,
-                index: bind.index,
-            });
-        }
-    }
-    for bind in &req.fragment_samplers {
-        if bind.sampler_ref != 0 && bind.index >= MAX_BIND_SLOTS {
-            return Err(MetalIcbInheritanceDecline::FragmentSamplerIndexOutOfRange {
-                sampler_ref: bind.sampler_ref,
-                index: bind.index,
-            });
-        }
-    }
-    if icb_desc.inherit_pipeline_state && req.pipeline_ref == 0 {
-        return Err(MetalIcbInheritanceDecline::PipelineRefZero);
-    }
-    Ok(())
-}
-
 /// Apply stream-accumulated state to the parent render encoder before
 /// `executeCommandsInBuffer`.
 ///
@@ -356,8 +287,6 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
     use crate::backend::metal::samplers::{make_default_sampler, make_explicit_sampler};
     use metal::*;
     use std::os::raw::c_char;
-
-    validate_icb_inheritance_bind_shape(req, icb_desc)?;
 
     // Viewport: stream absolute, or full pass when absent (Metal default is not
     // a full drawable — product sets an explicit full RT viewport when the
