@@ -187,13 +187,10 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // which of those a record hit depends on whether an identity resolved, and
     // that is not a condition the Store block can re-derive.
     let mut draw_bgra = false;
-    #[cfg(feature = "backend-vulkan")]
     // GVA Store landed as a deferred-writeback window (resident authoritative).
-    #[cfg(feature = "backend-vulkan")]
     let mut gva_store_armed = false;
     // Type-11 composite Store landed the same way: the pinned engine resident is
     // the only copy of the frame until a guest-side reader flushes the window.
-    #[cfg(feature = "backend-vulkan")]
     let mut surface_store_armed = false;
     if req.pipeline_ref != 0 && (req.vertex_count > 0 || req.indexed.is_some()) {
         req.chain_resident_established = false;
@@ -206,7 +203,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.pipeline_ref, req.width, req.height, req.vertex_count
                 ));
             }
-            #[cfg(feature = "backend-vulkan")]
             Ok(M2vDrawSpan::ResidentChain) => {
                 req.chain_resident_established = true;
                 crate::observe::line(format!(
@@ -218,7 +214,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     req.colors.first().map(|c| c.target_gva).unwrap_or(0)
                 ));
             }
-            #[cfg(feature = "backend-vulkan")]
             Ok(M2vDrawSpan::ResidentGvaStore) => {
                 if arm_gva_deferred_store(state, host, req) {
                     note_type11_store_route("gva_deferred");
@@ -246,7 +241,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     ));
                 }
             }
-            #[cfg(feature = "backend-vulkan")]
             Ok(M2vDrawSpan::ResidentSurfaceStore) => {
                 // Into the same `t11_store_us` bucket the synchronous and `Owned`
                 // routes report, because the whole claim of this rail is that the
@@ -324,14 +318,12 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
 
     // A resident render-pass chain intermediate: the exec loop reads
     // `chain_resident_established` and arms the next record's LoadFromTarget.
-    #[cfg(feature = "backend-vulkan")]
     if req.chain_resident_established {
         return (EncodeStatus::Ok, None);
     }
 
     // Deferred GVA Store: the window is armed and the resident holds the
     // authoritative pixels — the contract Store lands on first access.
-    #[cfg(feature = "backend-vulkan")]
     if gva_store_armed {
         return (EncodeStatus::Ok, None);
     }
@@ -340,7 +332,6 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     // the guest write lands on first access. `None`, not the frame, for the same
     // reason the `Owned` route returns `None` — `writeback_guest` is granted only
     // to the last record of a packet, so there is no record N+1 to seed.
-    #[cfg(feature = "backend-vulkan")]
     if surface_store_armed {
         return (EncodeStatus::Ok, None);
     }
@@ -682,12 +673,10 @@ enum SampledSourceRequest {
         Option<LinearSampleIdentity>,
         TexelLayout,
     ),
-    #[cfg(feature = "backend-vulkan")]
     Target(crate::backend::vulkan::engine::TargetIdentity),
     /// Zero-copy guest gather: the engine copies the texel bytes from
     /// imported guest RAM inside the draw CB — no CPU read, no memo, no
     /// hash. Carries the native texel layout the image is created with.
-    #[cfg(feature = "backend-vulkan")]
     GuestRuns(crate::backend::vulkan::engine::GuestRunSource, TexelLayout),
 }
 
@@ -736,7 +725,6 @@ enum AttachmentAliasSample<'a> {
     /// Records 2+ of a resident GVA chain: the prior record's content lives
     /// on the engine-resident target, not in a CPU seed. Bound as a resident
     /// sampled source (the engine snapshots on self-alias).
-    #[cfg(feature = "backend-vulkan")]
     ResidentChain,
 }
 
@@ -769,7 +757,6 @@ fn fragment_attachment_alias_sample<'a>(
             {
                 return Some((color.width, color.height, AttachmentAliasSample::Seed(seed)));
             }
-            #[cfg(feature = "backend-vulkan")]
             if req.chain_from_resident {
                 return Some((
                     color.width,
@@ -1090,7 +1077,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // it samples byte-identically (video NV12 R8/RG8, BGRA8/
                 // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
                 // upload the CPU loader below would pay every decoded frame.
-                #[cfg(feature = "backend-vulkan")]
                 if let Some(src) = try_type5_sample_zero_copy(state, host, mid, view) {
                     // Success path: a healthy video decodes ~2 planes/frame,
                     // so this fires per-bind (~99k lines/boot). The aggregate
@@ -1202,7 +1188,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // them into the guest's pages first — see
                 // [`merge_guest_writes_into_pages`] — and every rung below then
                 // reads a surface that holds both halves.
-                #[cfg(feature = "backend-vulkan")]
                 if resident_ready {
                     if !guest_replaced {
                         note_type11_sample_rung("t11rung_resident", guest_write);
@@ -1275,7 +1260,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // guest bytes are taken unconditionally. Declining the gather is
                 // expected control flow — the CPU byte loader below serves the
                 // same pixels — so it stays quiet, like the type-2/3 rail's.
-                #[cfg(feature = "backend-vulkan")]
                 if let Some(src) = try_type11_sample_zero_copy(state, host, mid, w, h) {
                     note_type11_sample_rung("t11rung_zero_copy", guest_write);
                     return Some((w, h, mid, src));
@@ -1320,7 +1304,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         // bind the resident target directly instead of flushing + re-uploading
         // (the gvadefer A/B showed 99% of windows were consumed by exactly this
         // sample path — readback relocation, not elimination).
-        #[cfg(feature = "backend-vulkan")]
         if let Some(v) = try_sample_deferred_gva(state, host, task_id, texture_ref) {
             return Some(v);
         }
@@ -1328,7 +1311,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         // this frame as an engine secondary resident, not a deferred-flush
         // window. Bind it directly so the material's alpha modulation reads the
         // real mask instead of zero (frosted-background pass-through).
-        #[cfg(feature = "backend-vulkan")]
         if let Some(v) = try_sample_mrt_secondary(state, host, task_id, texture_ref) {
             return Some(v);
         }
@@ -1351,7 +1333,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                     .and_then(|d| decode_texture_descriptor(&d).ok())
             }),
         ) {
-            #[cfg(feature = "backend-vulkan")]
             if let Some((w, h, src)) =
                 try_linear_sample_zero_copy(state, host, task_id, texture_ref, &tex)
             {
@@ -3751,14 +3732,12 @@ enum M2vDrawSpan {
     /// the protocol-keyed engine target (no CPU pixels, no fence wait, no guest
     /// Store this record). The final record reads back and performs the
     /// contract Store on portability devices.
-    #[cfg(feature = "backend-vulkan")]
     ResidentChain,
     /// Final/single record of a GVA render Store executed into the registry
     /// resident with `skip_readback`: the caller arms a deferred-writeback
     /// window (`DeviceState::gva_deferred_flush`) instead of the sync
     /// readback + guest write on the stamp path; guest bytes + encode caches
     /// land on first access (`storage_flush::flush_gva_one`).
-    #[cfg(feature = "backend-vulkan")]
     ResidentGvaStore,
     /// Type-11 composite Store executed into its registry resident with
     /// `skip_readback`: the caller arms a `RenderWindowSource::Resident` window
@@ -3772,7 +3751,6 @@ enum M2vDrawSpan {
     /// `gva_deferred_flush`. Distinct from [`Self::Pixels`] because there are no
     /// pixels — a caller that treated an empty frame as one would write a blank
     /// framebuffer into guest memory.
-    #[cfg(feature = "backend-vulkan")]
     ResidentSurfaceStore,
 }
 
@@ -4306,7 +4284,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     #[allow(unused_mut)]
     let mut f_words = f_shader.words.clone();
 
-    #[cfg(feature = "backend-vulkan")]
     {
         use crate::runtime::spirv_bind::{
             FRAG_BUFFER_BINDING_OFFSET, FRAG_SAMPLED_RESOURCE_BINDING_OFFSET, SAMPLER_BINDING_BASE,
@@ -4622,7 +4599,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                 TexelLayout::Rgba8,
                             ),
                         ),
-                        #[cfg(feature = "backend-vulkan")]
                         AttachmentAliasSample::ResidentChain => {
                             let identity = render_chain_identity(state, req).ok_or({
                                 DrawError::DrawPreparation(
@@ -4684,7 +4660,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         sampled_format = byte_format;
                         crate::backend::vulkan::engine::SampledSource::Bytes(rgba)
                     }
-                    #[cfg(feature = "backend-vulkan")]
                     SampledSourceRequest::Target(identity) => {
                         // A resident bound directly reuses the registry's own
                         // image view, which the engine creates once per target
@@ -4701,7 +4676,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         }
                         crate::backend::vulkan::engine::SampledSource::Target(identity)
                     }
-                    #[cfg(feature = "backend-vulkan")]
                     SampledSourceRequest::GuestRuns(src, native) => {
                         sampled_format = native;
                         crate::backend::vulkan::engine::SampledSource::GuestRuns(src)
@@ -4893,19 +4867,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // making this side materialize a converted frame.
         let mut target_rgba8: Option<std::sync::Arc<Vec<u8>>> = None;
         let mut seed_order = crate::backend::vulkan::engine::SeedOrder::Rgba8;
-        #[cfg(feature = "backend-vulkan")]
         let gpu_only_content_allowed =
             crate::backend::vulkan::engine::deferred_gpu_only_content_allowed();
         // Records 2+ of a resident render-pass chain load the prior record's
         // content directly from the engine target (no CPU seed, no re-upload).
-        #[cfg(feature = "backend-vulkan")]
         let mut chain_load_from_target = false;
         // Resolved once and read by both the Load gate below and the
         // `target_identity` assignment further down, so the record that loads
         // from a resident is by construction the record that renders into it.
-        #[cfg(feature = "backend-vulkan")]
         let type11_resident_target = type11_store_identity(state, req, writeback_guest);
-        #[cfg(feature = "backend-vulkan")]
         if req.chain_from_resident {
             if let Some(identity) = render_chain_identity(state, req) {
                 if crate::backend::vulkan::engine::resident_content_ready(&identity) {
@@ -4931,7 +4901,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // that registry identity, load directly from it (no CPU seed, no
         // flush); any mismatch lands the window first so the seeds below read
         // fresh bytes.
-        #[cfg(feature = "backend-vulkan")]
         if !chain_load_from_target && gpu_only_content_allowed {
             if let Some(c0) = req.colors.first() {
                 if c0.load_action == PASS_LOAD_ACTION_LOAD
@@ -5102,7 +5071,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // 41 389 against `type11_seed_uploaded` 242, at a mean 1.43 M texels per
         // elision, so revalidating by re-reading would move ~237 GB of guest
         // memory a session. The bitmap answers the same question in a word.
-        #[cfg(feature = "backend-vulkan")]
         if !chain_load_from_target {
             if let Some((identity, mapping_epoch)) = type11_load_currency_query(state, req) {
                 // Both arms counted, into the same one-second window as
@@ -5131,7 +5099,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         }
         if let Some(c0) = req.colors.first() {
             match c0.load_action {
-                #[cfg(feature = "backend-vulkan")]
                 x if x == PASS_LOAD_ACTION_LOAD && chain_load_from_target => {
                     // Resident target carries the chain; no CPU seed bytes.
                 }
@@ -5320,15 +5287,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // not leave guest-visible content GPU-only: portability devices read the
         // final record back and perform the normal synchronous guest Store.
         // Cross-pass deferred ownership remains gated below.
-        #[cfg(feature = "backend-vulkan")]
         let mut resident_render_chain = false;
         // Deferred GVA Store rail: the final/single record also stays on the
         // registry resident (skip_readback) — the caller arms a flush-on-
         // access window instead of the sync readback + guest write on the
         // stamp path (`arm_gva_deferred_store`).
-        #[cfg(feature = "backend-vulkan")]
         let mut gva_resident_store = false;
-        #[cfg(feature = "backend-vulkan")]
         if req.chain_from_resident || (store_is_store && !writeback_guest) {
             if let Some(identity) = render_chain_identity(state, req) {
                 resources.target_identity = Some(identity);
@@ -5338,7 +5302,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        #[cfg(feature = "backend-vulkan")]
         if gpu_only_content_allowed && store_is_store && writeback_guest {
             if let Some(identity) = gva_chain_identity(req) {
                 // Only the eligibility call can still vary here: the enclosing
@@ -5368,9 +5331,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // asks again after the draw and falls back to a materializing read on any
         // refusal, which is what makes a stale answer here cost a readback rather
         // than a lost frame.
-        #[cfg(feature = "backend-vulkan")]
         let mut surface_resident_store = false;
-        #[cfg(feature = "backend-vulkan")]
         if resources.target_identity.is_none() {
             resources.target_identity = type11_resident_target.clone();
         }
@@ -5388,10 +5349,8 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // requires `mapping_id == 0` and this one requires `mapping_id != 0` — so a
         // genuine mismatch means another namespace owns the attachment and the
         // frame this rail would vouch for is not in the slot it would pin.
-        #[cfg(feature = "backend-vulkan")]
         let renders_into_surface_identity =
             type11_resident_target.is_some() && resources.target_identity == type11_resident_target;
-        #[cfg(feature = "backend-vulkan")]
         let identity_taken_by_another_rail =
             resources.target_identity.is_some() && !renders_into_surface_identity;
         // `!skip_readback` is implied — a set flag means one of the rails above
@@ -5399,7 +5358,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `ResidentSurfaceStore` is reached, so a record that armed here as well
         // would skip its readback and never arm anything. Stated rather than
         // derived, because the derivation is a property of two other blocks.
-        #[cfg(feature = "backend-vulkan")]
         if renders_into_surface_identity
             && !resources.skip_readback
             && deferred_gpu_only_content_allowed_for_surface()
@@ -5424,7 +5382,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // two conditions that are the same fact, and `chain_from_resident` and
         // `identity_taken_by_another_rail` were both true on every one of those
         // Stores.
-        #[cfg(feature = "backend-vulkan")]
         if !resources.skip_readback && store_is_store && writeback_guest {
             if let Some(c0) = req.colors.first() {
                 if c0.mapping_id != 0 {
@@ -5443,7 +5400,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        #[cfg(feature = "backend-vulkan")]
         if chain_load_from_target {
             if resources.target_identity.is_none() {
                 // chain_from_resident implies a protocol target identity; a
@@ -5899,7 +5855,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // on a resident primary + resolvable secondaries (empty ⇒ single-RT,
         // byte-identical). Record each GVA-backed mask so the later sampling
         // draw binds the resident directly (see `try_sample_mrt_secondary`).
-        #[cfg(feature = "backend-vulkan")]
         if let Some(primary_id) = resources.target_identity.clone() {
             let secs = build_secondary_targets(
                 state,
@@ -5995,15 +5950,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // That span is unreachable without the import and its variant is gone.
         let pixels_bgra = out.pixels_bgra;
         let pixels = out.pixels;
-        #[cfg(feature = "backend-vulkan")]
         if resident_render_chain {
             return Ok(M2vDrawSpan::ResidentChain);
         }
-        #[cfg(feature = "backend-vulkan")]
         if gva_resident_store {
             return Ok(M2vDrawSpan::ResidentGvaStore);
         }
-        #[cfg(feature = "backend-vulkan")]
         if surface_resident_store {
             return Ok(M2vDrawSpan::ResidentSurfaceStore);
         }
@@ -7531,7 +7483,6 @@ mod vulkan_split_tests {
     /// look identical from the address alone, and must not call a re-render of
     /// the same buffer an aliased reuse — that would report the common case as
     /// the defect and make the counter useless.
-    #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_second_arm_is_aliased_only_when_the_guest_pages_changed() {
         use crate::runtime::drain::store_route_count;
@@ -7579,7 +7530,6 @@ mod vulkan_split_tests {
     /// One guest page-table entry pointing GVA page 1 at `pfn`, on a task the
     /// GVA walker will accept. Returns the state the walk reads its task from;
     /// the caller re-points the entry by calling this again on the same host.
-    #[cfg(feature = "backend-vulkan")]
     fn map_one_gva_page(host: &mut FakeHost, pfn: u32) {
         use crate::contract::endian::st32;
         use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
@@ -7600,7 +7550,6 @@ mod vulkan_split_tests {
     }
 
     /// A GVA render target whose color0 span is one guest page at GVA 0x1000.
-    #[cfg(feature = "backend-vulkan")]
     fn one_page_gva_request() -> DrawEncodeRequest {
         DrawEncodeRequest {
             task_id: 1,

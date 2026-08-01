@@ -701,7 +701,6 @@ fn dispatch_nometal_with_texture_binds() {
     };
     cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
     let st = execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
-    #[cfg(feature = "backend-vulkan")]
     assert!(
         matches!(
             st,

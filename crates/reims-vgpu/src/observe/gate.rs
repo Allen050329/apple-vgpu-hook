@@ -1059,16 +1059,22 @@ fn no_error_enum_carries_a_payload_free_unsupported() {
     );
 }
 
-/// The scanner must actually walk the crate; a broken walk would make every
-/// scan above vacuously green.
-/// The feature a `#[cfg(…)]` attribute line names, and whether it names it
-/// positively, or `None` when the line is not a single-feature `cfg`.
+/// What a `#[cfg(…)]` attribute line says about one feature, or `None` when it
+/// names no feature at all (`target_os` alone, `test`).
 ///
 /// `#[cfg(all(feature = "backend-metal", target_os = "macos"))]` reads as a
 /// positive gate on `backend-metal`, which is what it is: the item is absent
-/// without that feature. A `cfg` naming no feature at all (`target_os` alone,
-/// `test`) is not a feature gate and answers `None`.
-fn cfg_attr_feature(attr: &str) -> Option<(String, bool)> {
+/// without that feature. `sole` distinguishes it from the bare
+/// `#[cfg(feature = "backend-metal")]`, because only the bare form is
+/// *redundant* under an enclosing gate on the same feature — the `all` form
+/// still carries the `target_os` test.
+struct CfgFeature {
+    name: String,
+    positive: bool,
+    sole: bool,
+}
+
+fn cfg_attr_feature(attr: &str) -> Option<CfgFeature> {
     const KEY: &str = "feature = \"";
     let at = attr.find(KEY)?;
     let name: String = attr[at + KEY.len()..]
@@ -1078,17 +1084,35 @@ fn cfg_attr_feature(attr: &str) -> Option<(String, bool)> {
     if name.is_empty() {
         return None;
     }
-    let negated = attr[..at].ends_with("not(");
-    Some((name, !negated))
+    let positive = !attr[..at].ends_with("not(");
+    let sole = attr == format!("#[cfg(feature = \"{name}\")]");
+    Some(CfgFeature {
+        name,
+        positive,
+        sole,
+    })
 }
 
-/// Every `#[cfg(not(feature = "F"))]` in `src` that sits *inside* the body of an
-/// item already gated `#[cfg(feature = "F")]`, as `(1-based line, F)`.
+/// What is wrong with a `cfg` attribute nested under a gate on its own feature.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NestedCfg {
+    /// `#[cfg(not(feature = "F"))]` under `#[cfg(feature = "F")]`. No feature
+    /// combination compiles it.
+    Dead,
+    /// `#[cfg(feature = "F")]` under `#[cfg(feature = "F")]`. Compiles exactly
+    /// as if it were absent, and reads as if the scope were conditional.
+    Redundant,
+}
+
+/// Every `cfg` attribute in `src` that re-tests a feature an enclosing item has
+/// already gated on, as `(1-based line, feature, what is wrong)`.
 ///
-/// Such a block cannot be compiled by any feature combination: reaching it
-/// requires `F` on, and it asks for `F` off. Rust says nothing, because the
-/// tokens are discarded before name resolution — which is how a dead arm in
-/// `try_metal2vulkan_draw` came to reference four locals that do not exist.
+/// A [`NestedCfg::Dead`] block cannot be compiled by any feature combination:
+/// reaching it requires `F` on, and it asks for `F` off. Rust says nothing,
+/// because the tokens are discarded before name resolution — which is how a
+/// dead arm in `try_metal2vulkan_draw` came to reference four locals that do
+/// not exist. [`NestedCfg::Redundant`] is the harmless twin, worth removing
+/// because a reader cannot tell the two apart without walking outward.
 ///
 /// Brace depth is counted on [`mask_comments_and_literals`] output, so the
 /// `{}` in a `format!` string cannot desynchronise it; attribute *text* is read
@@ -1099,7 +1123,7 @@ fn cfg_attr_feature(attr: &str) -> Option<(String, bool)> {
 ///
 /// One shape is deliberately not handled: a `cfg` attribute broken across
 /// several lines. rustfmt keeps these on one line and the crate has none.
-fn nested_negated_feature_cfgs(src: &str) -> Vec<(usize, String)> {
+fn nested_feature_cfgs(src: &str) -> Vec<(usize, String, NestedCfg)> {
     let masked = mask_comments_and_literals(src);
     let masked = String::from_utf8_lossy(&masked);
     // (depth the gate's body sits at, feature, positive)
@@ -1118,15 +1142,18 @@ fn nested_negated_feature_cfgs(src: &str) -> Vec<(usize, String)> {
         let trimmed = raw.trim();
 
         if trimmed.starts_with("#[cfg(") {
-            if let Some((feature, positive)) = cfg_attr_feature(trimmed) {
-                if !positive
-                    && gates
-                        .iter()
-                        .any(|(_, gated_on, pos)| *pos && *gated_on == feature)
-                {
-                    found.push((i + 1, feature.clone()));
+            if let Some(cfg) = cfg_attr_feature(trimmed) {
+                let under_own_feature = gates
+                    .iter()
+                    .any(|(_, gated_on, pos)| *pos && *gated_on == cfg.name);
+                if under_own_feature {
+                    if !cfg.positive {
+                        found.push((i + 1, cfg.name.clone(), NestedCfg::Dead));
+                    } else if cfg.sole {
+                        found.push((i + 1, cfg.name.clone(), NestedCfg::Redundant));
+                    }
                 }
-                pending = Some((feature, positive));
+                pending = Some((cfg.name, cfg.positive));
             }
             continue;
         }
@@ -1156,28 +1183,33 @@ fn nested_negated_feature_cfgs(src: &str) -> Vec<(usize, String)> {
     found
 }
 
-/// A `cfg` arm that asks for a feature its own enclosing item forbids is code
-/// no build compiles, and no compiler will say so.
+/// A `cfg` that re-tests the feature its own enclosing item already gates on is
+/// either code no build compiles, or a condition that is not one. Neither is
+/// something a compiler will mention.
 #[test]
-fn no_cfg_arm_negates_the_feature_its_enclosing_item_requires() {
+fn no_cfg_re_tests_the_feature_its_enclosing_item_already_gates_on() {
     let root = crate_src();
-    let mut dead = Vec::new();
-    for path in production_files(&root) {
+    let mut findings = Vec::new();
+    for path in rust_files(&root) {
         let Ok(src) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for (line, feature) in nested_negated_feature_cfgs(&src) {
-            dead.push(format!(
-                "{}:{line} — #[cfg(not(feature = \"{feature}\"))] inside an item \
-                 already gated on \"{feature}\"",
-                rel(&path, &root)
-            ));
+        for (line, feature, kind) in nested_feature_cfgs(&src) {
+            let what = match kind {
+                NestedCfg::Dead => {
+                    format!("#[cfg(not(feature = \"{feature}\"))] — never compiles")
+                }
+                NestedCfg::Redundant => {
+                    format!("#[cfg(feature = \"{feature}\")] — already implied")
+                }
+            };
+            findings.push(format!("{}:{line} — {what}", rel(&path, &root)));
         }
     }
     assert!(
-        dead.is_empty(),
-        "unconditionally dead cfg arms — delete them, they never compile:\n  {}",
-        dead.join("\n  ")
+        findings.is_empty(),
+        "cfg attributes nested under a gate on their own feature — delete them:\n  {}",
+        findings.join("\n  ")
     );
 }
 
@@ -1198,7 +1230,7 @@ fn f() -> bool {
 }
 "#;
     assert!(
-        nested_negated_feature_cfgs(siblings).is_empty(),
+        nested_feature_cfgs(siblings).is_empty(),
         "sibling stubs are the correct pattern"
     );
 
@@ -1212,8 +1244,8 @@ fn f() -> bool {
 }
 "#;
     assert_eq!(
-        nested_negated_feature_cfgs(nested),
-        vec![(4, String::from("vk"))]
+        nested_feature_cfgs(nested),
+        vec![(4, String::from("vk"), NestedCfg::Dead)]
     );
 
     // A different feature nested inside is a real combination, not dead.
@@ -1226,7 +1258,7 @@ fn f() -> bool {
     }
 }
 "#;
-    assert!(nested_negated_feature_cfgs(other).is_empty());
+    assert!(nested_feature_cfgs(other).is_empty());
 
     // The gate must close with its item: a negation *after* the body is a
     // sibling even when it is only one line further on.
@@ -1239,7 +1271,7 @@ fn f() {
 fn f() {}
 "#;
     assert!(
-        nested_negated_feature_cfgs(after).is_empty(),
+        nested_feature_cfgs(after).is_empty(),
         "a brace inside a string literal must not hold the gate open"
     );
 
@@ -1259,8 +1291,8 @@ fn f<M: HostOps>(
 }
 "#;
     assert_eq!(
-        nested_negated_feature_cfgs(multiline_signature),
-        vec![(7, String::from("vk"))]
+        nested_feature_cfgs(multiline_signature),
+        vec![(7, String::from("vk"), NestedCfg::Dead)]
     );
 
     // Prose quoting the shape is not the shape.
@@ -1271,7 +1303,23 @@ fn f() {
     let x = 1;
 }
 "#;
-    assert!(nested_negated_feature_cfgs(prose).is_empty());
+    assert!(nested_feature_cfgs(prose).is_empty());
+
+    // A bare re-test of the enclosing feature is redundant; the same feature
+    // carrying an extra condition is not.
+    let repeated = r#"
+#[cfg(feature = "vk")]
+fn f() {
+    #[cfg(feature = "vk")]
+    let a = 1;
+    #[cfg(all(feature = "vk", target_os = "macos"))]
+    let b = 2;
+}
+"#;
+    assert_eq!(
+        nested_feature_cfgs(repeated),
+        vec![(4, String::from("vk"), NestedCfg::Redundant)]
+    );
 }
 
 #[test]
