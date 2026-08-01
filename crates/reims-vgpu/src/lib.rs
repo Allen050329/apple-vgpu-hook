@@ -604,7 +604,7 @@ fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceStat
         let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
             width,
             height,
-            candidates: vec![present_identity],
+            identity: present_identity,
         };
         let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
         crate::runtime::census::present_proxy::window_publish::note(published);

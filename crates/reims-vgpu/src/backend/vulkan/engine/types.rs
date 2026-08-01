@@ -1116,15 +1116,19 @@ pub enum TargetIdentity {
 
 pub type PresentRect = (u32, u32, u32, u32);
 
-/// Ordered resident candidates for a host-window present. The first
-/// content-ready BGRA candidate at `width`x`height` is authoritative; the list
-/// resolves the ONE surface the display transaction named, never a choice
-/// between surfaces.
+/// The resident a host-window present should blit from.
+///
+/// One identity, not a list. The display transaction names exactly one surface,
+/// and `present_identity::surface_identity` turns that name into exactly one
+/// identity — so there was never a second candidate to rank against the first.
+/// It stays a request rather than a resolved slot because only the engine, under
+/// its own lock, can say whether that identity is resident and presentable at
+/// `width`x`height`.
 #[derive(Clone, Debug)]
 pub struct WindowPresentSource {
     pub width: u32,
     pub height: u32,
-    pub candidates: Vec<TargetIdentity>,
+    pub identity: TargetIdentity,
 }
 
 impl Default for TargetIdentity {

@@ -145,7 +145,7 @@ impl crate::observe::Decline for StagingError {
     }
 }
 
-/// What the registry knows about one candidate identity, flattened so the
+/// What the registry knows about the identity a present named, flattened so the
 /// classification below is pure and testable without a GPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CandidateState {
@@ -157,34 +157,36 @@ pub(crate) struct CandidateState {
     pub height: u32,
 }
 
-/// Name why no candidate could be presented.
+/// Name why the resident the present named could not carry it.
 ///
-/// Reports the blocker closest to success: a resident that is ready and BGRA
-/// but the wrong size is a more actionable diagnosis than a sibling candidate
-/// that was never created. Ordering matters — collapsing these into one
-/// "no_resident" is the exact "N distinct checks share one status" trap the
-/// failure-logging rules call out.
+/// Each arm is a distinct blocker with a distinct remedy, checked in the order
+/// a slot progresses through them (created → content landed → correct format →
+/// correct size). Collapsing them into one "no_resident" is the exact "N
+/// distinct checks share one status" trap the failure-logging rules call out.
 pub(crate) fn classify_slate(
     source_present: bool,
     want: (u32, u32),
-    candidates: &[CandidateState],
+    state: CandidateState,
 ) -> SlateReason {
     if !source_present {
         return SlateReason::NoSource;
     }
-    let resident: Vec<_> = candidates.iter().filter(|c| c.resident).collect();
-    if resident.is_empty() {
+    if !state.resident {
         return SlateReason::NoResident;
     }
-    if resident
-        .iter()
-        .any(|c| c.content_ready && c.bgra && (c.width, c.height) != want)
-    {
-        return SlateReason::GeomMismatch;
+    if !state.content_ready {
+        return SlateReason::ContentNotReady;
     }
-    if resident.iter().any(|c| c.content_ready && !c.bgra) {
+    if !state.bgra {
         return SlateReason::NotBgra;
     }
+    if (state.width, state.height) != want {
+        return SlateReason::GeomMismatch;
+    }
+    // Resident, ready, BGRA and the right size — `slot_presentable` agreed with
+    // none of the blockers above, so the caller took the resident and never got
+    // here. Reaching this arm means the two disagree; report the residual class
+    // rather than inventing a sixth.
     SlateReason::ContentNotReady
 }
 
@@ -819,17 +821,15 @@ impl WindowPresenter {
 
         pools.batch_flush(ctx, counters)?;
         let selected = source.and_then(|source| {
-            source.candidates.iter().find_map(|identity| {
-                let slot = pools.registry_get(identity)?;
-                super::pools::slot_presentable(slot, source.width, source.height).then(|| {
-                    (
-                        identity.clone(),
-                        slot.image,
-                        slot.layout,
-                        slot.width,
-                        slot.height,
-                    )
-                })
+            let slot = pools.registry_get(&source.identity)?;
+            super::pools::slot_presentable(slot, source.width, source.height).then(|| {
+                (
+                    source.identity.clone(),
+                    slot.image,
+                    slot.layout,
+                    slot.width,
+                    slot.height,
+                )
             })
         });
         // Only reached when no resident carries this present: upload the CPU
@@ -838,33 +838,23 @@ impl WindowPresenter {
             self.note_slate_end();
             None
         } else {
-            // Failure path only: re-walk the candidates to name WHY the
-            // resident could not carry. Cheap because it never runs on a good
-            // frame.
-            let states: Vec<CandidateState> = source
-                .map(|source| {
-                    source
-                        .candidates
-                        .iter()
-                        .map(|identity| match pools.registry_get(identity) {
-                            Some(slot) => CandidateState {
-                                resident: true,
-                                content_ready: slot.content_ready,
-                                bgra: slot.bgra,
-                                width: slot.width,
-                                height: slot.height,
-                            },
-                            None => CandidateState::default(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Failure path only: re-read the slot to name WHY the resident could
+            // not carry. Cheap because it never runs on a good frame.
+            let state = source
+                .and_then(|source| pools.registry_get(&source.identity))
+                .map_or(CandidateState::default(), |slot| CandidateState {
+                    resident: true,
+                    content_ready: slot.content_ready,
+                    bgra: slot.bgra,
+                    width: slot.width,
+                    height: slot.height,
+                });
             let want = source.map_or((0, 0), |s| (s.width, s.height));
-            let reason = classify_slate(source.is_some(), want, &states);
+            let reason = classify_slate(source.is_some(), want, state);
             let staged = cpu
                 .filter(cpu_frame_complete)
                 .and_then(|frame| self.stage_cpu_frame(ctx, frame));
-            self.note_slate(reason, want, &states, staged.is_some());
+            self.note_slate(reason, want, state, staged.is_some());
             staged
         };
         let mut pinned = Vec::with_capacity(1);
@@ -1242,7 +1232,7 @@ impl WindowPresenter {
         &mut self,
         reason: SlateReason,
         want: (u32, u32),
-        states: &[CandidateState],
+        state: CandidateState,
         covered: bool,
     ) {
         if self.slate_reason == Some(reason) && self.slate_covered == covered {
@@ -1255,20 +1245,14 @@ impl WindowPresenter {
         self.slate_reason = Some(reason);
         self.slate_covered = covered;
         self.slate_run = 1;
-        let seen = states
-            .iter()
-            .map(|c| {
-                if c.resident {
-                    format!(
-                        "{}x{}/{}{}",
-                        c.width, c.height, c.content_ready as u8, c.bgra as u8
-                    )
-                } else {
-                    "absent".to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let seen = if state.resident {
+            format!(
+                "{}x{}/{}{}",
+                state.width, state.height, state.content_ready as u8, state.bgra as u8
+            )
+        } else {
+            "absent".to_string()
+        };
         let emit = crate::observe::Emit::decline(
             if covered {
                 "host_window_cpu_fallback"
@@ -1278,8 +1262,7 @@ impl WindowPresenter {
             &reason,
         )
         .field("want", format!("{}x{}", want.0, want.1))
-        .field("candidates", states.len())
-        .field("seen", format!("[{seen}]"));
+        .field("seen", seen);
         if covered {
             // The guest's frame IS on screen; what was lost is the direct
             // handoff, which costs host copies rather than pixels. Expected for
@@ -1677,9 +1660,12 @@ mod tests {
     /// distinguishable from a source whose residents are missing.
     #[test]
     fn slate_without_a_source_is_named_separately() {
-        assert_eq!(classify_slate(false, (0, 0), &[]), SlateReason::NoSource);
         assert_eq!(
-            classify_slate(true, (1440, 1080), &[CandidateState::default()]),
+            classify_slate(false, (0, 0), CandidateState::default()),
+            SlateReason::NoSource
+        );
+        assert_eq!(
+            classify_slate(true, (1440, 1080), CandidateState::default()),
             SlateReason::NoResident
         );
     }
@@ -1696,19 +1682,18 @@ mod tests {
             height: 1080,
         };
         assert_eq!(
-            classify_slate(true, (1440, 1080), &[pending]),
+            classify_slate(true, (1440, 1080), pending),
             SlateReason::ContentNotReady
         );
     }
 
-    /// The blocker CLOSEST to success wins: a ready BGRA resident at the wrong
-    /// geometry outranks a sibling that was never created, because the geometry
-    /// is the actionable fact.
+    /// A resident that is ready and BGRA but the wrong size is the geometry
+    /// class — the actionable fact is the size, and it must not be folded into
+    /// `ContentNotReady`, whose remedy (wait a frame) would never converge.
     #[test]
-    fn geometry_mismatch_outranks_a_missing_sibling() {
-        let states = [CandidateState::default(), ready(1920, 1080)];
+    fn a_ready_resident_at_the_wrong_size_is_the_geometry_class() {
         assert_eq!(
-            classify_slate(true, (1440, 1080), &states),
+            classify_slate(true, (1440, 1080), ready(1920, 1080)),
             SlateReason::GeomMismatch
         );
     }
@@ -1718,15 +1703,15 @@ mod tests {
     /// reader hunting the wrong bug.
     #[test]
     fn non_bgra_resident_is_its_own_reason() {
-        let states = [CandidateState {
+        let state = CandidateState {
             resident: true,
             content_ready: true,
             bgra: false,
             width: 1440,
             height: 1080,
-        }];
+        };
         assert_eq!(
-            classify_slate(true, (1440, 1080), &states),
+            classify_slate(true, (1440, 1080), state),
             SlateReason::NotBgra
         );
     }
@@ -1783,16 +1768,15 @@ mod tests {
         );
     }
 
-    /// A matching resident is never classified as slate — the classifier only
-    /// runs on the failure path, but a caller reordering that check must not
-    /// silently start reporting healthy frames.
+    /// A resident that clears every blocker still has to come back with *some*
+    /// reason, because the classifier only runs after `slot_presentable` already
+    /// refused. The two disagreeing is a defect in one of them, and the residual
+    /// class is what makes it visible instead of a panic or a sixth variant that
+    /// nothing else ever reads.
     #[test]
-    fn a_matching_ready_resident_still_reports_only_lesser_blockers() {
-        // With one perfect candidate and one absent sibling, no
-        // higher-severity reason fires; ContentNotReady is the residual.
-        let states = [ready(1440, 1080), CandidateState::default()];
+    fn a_resident_that_clears_every_blocker_falls_to_the_residual_class() {
         assert_eq!(
-            classify_slate(true, (1440, 1080), &states),
+            classify_slate(true, (1440, 1080), ready(1440, 1080)),
             SlateReason::ContentNotReady
         );
     }
