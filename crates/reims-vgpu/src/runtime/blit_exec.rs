@@ -2848,7 +2848,7 @@ mod tests {
     use crate::contract::endian::{st16, st32, st64};
     use crate::contract::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
     use crate::model::{DeviceId, FENCE_DOMAIN_BLIT, PAGE_SHIFT_ARM64E};
-    use crate::runtime::decode::blit::{self, OP_COPY_BUFFER_TO_BUFFER, OP_FILL_BUFFER};
+    use crate::runtime::decode::blit::{self, Point, Size, OP_COPY_BUFFER_TO_BUFFER, OP_FILL_BUFFER};
     use crate::runtime::decode::resource::{
         list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_MIN_LEN, LINEAR_DESC_SIZE,
         OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
@@ -2909,6 +2909,55 @@ mod tests {
         }
     }
 
+    /// A task-1 device with the arm64e page tables every blit fixture walks.
+    fn blit_device() -> (FakeHost, DeviceState) {
+        let mut host = FakeHost::new();
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        (host, state)
+    }
+
+    /// A copy command naming its two object refs. Every rectangular blit case
+    /// starts here and then sets the one field it is about.
+    fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
+        let mut cmd = Command::default();
+        cmd.kind = Kind::Copy;
+        cmd.copy_kind = copy_kind;
+        cmd.source = source;
+        cmd.destination = destination;
+        cmd
+    }
+
+    /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
+    /// This is the surface state every type-11 / type-5 install needs before it
+    /// can attach geometry or a descriptor.
+    fn map_one_page_surface(host: &mut FakeHost, state: &mut DeviceState, mapping_id: u32, pfn: u32) {
+        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x4000, 0);
+        state.map_surface(mapping_id);
+        let m = state.mappings.get_mut(&mapping_id).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 1;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+
+    /// Publish object-list entry `obj_ref`: type and descriptor length packed
+    /// into word 0, descriptor GVA in the following eight bytes.
+    fn write_list_entry(
+        host: &mut FakeHost,
+        state: &DeviceState,
+        obj_ref: u32,
+        object_type: u32,
+        desc_len: u32,
+        desc_gva: u64,
+    ) {
+        let off = list_object_entry_offset(obj_ref, 16).unwrap();
+        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+        st32(&mut entry[0..], object_type | (desc_len << 8));
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        write_task_gva_arm64e(host, &state.tasks[1], off, &entry);
+    }
+
     /// Install type-1 buffer: object-list at GVA 0, descriptor at GVA 0x100 + ref*0x20.
     fn install_buffer(
         host: &mut FakeHost,
@@ -2923,12 +2972,14 @@ mod tests {
         st64(&mut desc[LINEAR_DESC_HANDLE..], handle as u64);
         let desc_gva = 0x100u64 + (obj_ref as u64) * 0x20;
         write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
-        let off = list_object_entry_offset(obj_ref, 16).unwrap();
-        let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (OBJECT_TYPE_BUFFER as u32) | ((LINEAR_DESC_MIN_LEN as u32) << 8);
-        st32(&mut entry[0..], packed);
-        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        write_task_gva_arm64e(host, &state.tasks[1], off, &entry);
+        write_list_entry(
+            host,
+            state,
+            obj_ref,
+            OBJECT_TYPE_BUFFER as u32,
+            LINEAR_DESC_MIN_LEN as u32,
+            desc_gva,
+        );
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("entry");
         assert_eq!(e.object_type, OBJECT_TYPE_BUFFER);
     }
@@ -2996,11 +3047,7 @@ mod tests {
         let mut host = FakeHost::new();
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         rig(&mut host, &mut state);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToBuffer;
-        cmd.source = 7;
-        cmd.destination = 8;
+        let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 7, 8);
         cmd.size = LEN;
         let st = execute_blit(&mut state, &mut host, 1, &cmd);
         assert_eq!(
@@ -3096,9 +3143,7 @@ mod tests {
 
     #[test]
     fn fill_buffer_roundtrip() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 7, 1, 256);
         let mut cmd = Command::default();
         cmd.kind = Kind::FillBuffer;
@@ -3121,9 +3166,7 @@ mod tests {
     /// slug never leaks across blits, and stays empty after a successful blit.
     #[test]
     fn blit_fail_reason_names_distinct_causes_and_resets_per_command() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 7, 1, 256);
 
         // ref==0 → MissingResource, reason "buf_ref_zero".
@@ -3165,19 +3208,13 @@ mod tests {
 
     #[test]
     fn copy_buffer_to_buffer_roundtrip() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 256);
         install_buffer(&mut host, &mut state, 2, 2, 256);
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
         let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];
         write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva + 4, &pat);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToBuffer;
-        cmd.source = 1;
-        cmd.destination = 2;
+        let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 1, 2);
         cmd.source_offset = 4;
         cmd.destination_offset = 8;
         cmd.size = 8;
@@ -3197,15 +3234,9 @@ mod tests {
 
     #[test]
     fn copy_b2b_overlap_rejected() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 256);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToBuffer;
-        cmd.source = 1;
-        cmd.destination = 1;
+        let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 1, 1);
         cmd.source_offset = 0;
         cmd.destination_offset = 4;
         cmd.size = 16;
@@ -3217,13 +3248,7 @@ mod tests {
 
     #[test]
     fn copy_buffer_to_type11_roundtrip() {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::runtime::decode::resource::{
-            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_IOSURFACE,
-        };
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         // Buffer with 8 BGRA pixels (one row of 2 pixels for a 2x1 copy).
         install_buffer(&mut host, &mut state, 1, 1, 256);
         let pat = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
@@ -3232,47 +3257,13 @@ mod tests {
 
         // Type-11 object ref 3 → mapping 9, 2x2 BGRA.
         let mapping_id = 9u32;
-        let pfn = 0x20u32;
-        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(gpa, 0x4000, 0);
-        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        state.map_surface(mapping_id);
-        {
-            let m = state.mappings.get_mut(&mapping_id).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![entry];
-        }
-        assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_BGRA8_UNORM));
+        install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
 
-        assert!(state.set_object_list(1, 0, 16));
-        let mut desc = vec![0u8; 0x20];
-        st32(&mut desc[0..], mapping_id);
-        // format @0x16, width @0x18, height @0x1c (iosurface desc layout)
-        st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
-        st32(&mut desc[0x18..], 2);
-        st32(&mut desc[0x1c..], 2);
-        let desc_gva = 0x180u64;
-        write_task_gva_arm64e(&mut host, &state.tasks[1], desc_gva, &desc);
-        let off = list_object_entry_offset(3, 16).unwrap();
-        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (OBJECT_TYPE_IOSURFACE as u32) | (0x20u32 << 8);
-        st32(&mut list_entry[0..], packed);
-        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        write_task_gva_arm64e(&mut host, &state.tasks[1], off, &list_entry);
-
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 3;
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 3);
         cmd.source_offset = 0;
         cmd.source_bytes_per_row = 8;
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
-        cmd.destination_origin.x = 0;
-        cmd.destination_origin.y = 1;
+        cmd.source_size = Size { width: 2, height: 1, depth: 1 };
+        cmd.destination_origin = Point { x: 0, y: 1, z: 0 };
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
 
         // Read back the written row via mapping_write.
@@ -3290,9 +3281,7 @@ mod tests {
     /// type-11→type-11 copy lands source bytes in dest pages (unified content).
     #[test]
     fn copy_type11_to_type11_writes_dst_pages() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_type11(&mut host, &mut state, 3, 3, 0x20);
         install_type11(&mut host, &mut state, 4, 4, 0x21);
         // Seed source mid=3 pages with a known pattern.
@@ -3300,18 +3289,9 @@ mod tests {
         assert!(mapping_write::write_rect_raw(
             &mut state, &mut host, 3, 0, 0, 2, 2, &src_pat, 8
         ));
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 3;
-        cmd.destination = 4;
-        cmd.source_origin.x = 0;
-        cmd.source_origin.y = 0;
-        cmd.destination_origin.x = 0;
-        cmd.destination_origin.y = 0;
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 2;
-        cmd.source_size.depth = 1;
+        // Origins default to zero: this is the whole 2×2 surface.
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
+        cmd.source_size = Size { width: 2, height: 2, depth: 1 };
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
         let mut back = [0u8; 16];
         assert!(mapping_write::read_rect_raw(
@@ -3327,23 +3307,15 @@ mod tests {
     /// specific failing site rather than a bare coarse status.
     #[test]
     fn copy_executor_reason_slugs_name_distinct_sites() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_type11(&mut host, &mut state, 3, 3, 0x20); // 2×2 BGRA, mid 3
         install_type11(&mut host, &mut state, 4, 4, 0x21); // 2×2 BGRA, mid 4
         install_buffer(&mut host, &mut state, 5, 5, 4096);
 
         // texture→texture: destination origin past a 2×2 target → Bounds.
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 3;
-        cmd.destination = 4;
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
         cmd.destination_origin.x = 3; // > width 2
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Bounds
@@ -3352,15 +3324,9 @@ mod tests {
 
         // texture→texture: a type-11 endpoint with a non-zero z origin (type-11 is
         // 2D) → Unsupported, a DIFFERENT reason under the same executor.
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 3;
-        cmd.destination = 4;
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
         cmd.source_origin.z = 1;
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Unsupported
@@ -3368,15 +3334,9 @@ mod tests {
         assert_eq!(blit_fail_reason(), "t2t_t11_z");
 
         // texture→buffer: source origin past bounds → Bounds "t2b_origin_oob".
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToBuffer;
-        cmd.source = 3;
-        cmd.destination = 5;
+        let mut cmd = copy_cmd(CopyKind::TextureToBuffer, 3, 5);
         cmd.source_origin.x = 3; // > width 2
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Bounds
@@ -3384,15 +3344,9 @@ mod tests {
         assert_eq!(blit_fail_reason(), "t2b_origin_oob");
 
         // buffer→texture: destination origin past bounds → Bounds "b2t_origin_oob".
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 5;
-        cmd.destination = 3;
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 5, 3);
         cmd.destination_origin.x = 3; // > width 2
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Bounds
@@ -3401,14 +3355,8 @@ mod tests {
 
         // A full-target valid type-11→type-11 copy succeeds and resets the channel,
         // so no stale slug leaks into the next command's dispatch line.
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 3;
-        cmd.destination = 4;
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 2;
-        cmd.source_size.depth = 1;
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
+        cmd.source_size = Size { width: 2, height: 2, depth: 1 };
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
         assert_eq!(blit_fail_reason(), "");
     }
@@ -3421,35 +3369,9 @@ mod tests {
         mapping_id: u32,
         pfn: u32,
     ) {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::runtime::decode::resource::{
-            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_IOSURFACE,
-        };
-        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(gpa, 0x4000, 0);
-        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        state.map_surface(mapping_id);
-        {
-            let m = state.mappings.get_mut(&mapping_id).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![entry];
-        }
+        map_one_page_surface(host, state, mapping_id, pfn);
         assert!(state.set_mapping_geom(mapping_id, 2, 2, MTL_FORMAT_BGRA8_UNORM));
-        assert!(state.set_object_list(1, 0, 16));
-        let mut desc = vec![0u8; 0x20];
-        st32(&mut desc[0..], mapping_id);
-        st16(&mut desc[0x16..], MTL_FORMAT_BGRA8_UNORM);
-        st32(&mut desc[0x18..], 2);
-        st32(&mut desc[0x1c..], 2);
-        let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
-        write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
-        let off = list_object_entry_offset(obj_ref, 16).unwrap();
-        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (OBJECT_TYPE_IOSURFACE as u32) | (0x20u32 << 8);
-        st32(&mut list_entry[0..], packed);
-        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        install_type11_plane(host, state, obj_ref, mapping_id, MTL_FORMAT_BGRA8_UNORM, 2, 2);
     }
 
     /// Shared biplanar mapping: plane0 Y 4×2 R8 @512 bpr=64; plane1 UV 2×1 RG8 @1024 bpr=64.
@@ -3462,18 +3384,9 @@ mod tests {
         use crate::contract::iosurface_pages::{
             DEVICE_DESC_ALLOC_SIZE, DEVICE_DESC_LEN, DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT,
             DEVICE_PLANE_BPE, DEVICE_PLANE_BPR, DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS,
-            DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE, PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID,
+            DEVICE_PLANE_OFFSET, DEVICE_PLANE_SIZE,
         };
-        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(gpa, 0x4000, 0);
-        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        state.map_surface(mapping_id);
-        {
-            let m = state.mappings.get_mut(&mapping_id).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![entry];
-        }
+        map_one_page_surface(host, state, mapping_id, pfn);
         let mut device = vec![0u8; DEVICE_DESC_LEN];
         st32(&mut device[DEVICE_DESC_ALLOC_SIZE..], 0x2000);
         device[DEVICE_DESC_PLANE_COUNT] = 2;
@@ -3503,23 +3416,25 @@ mod tests {
         width: u32,
         height: u32,
     ) {
-        use crate::runtime::decode::resource::{
-            list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_IOSURFACE,
-        };
+        use crate::runtime::decode::resource::OBJECT_TYPE_IOSURFACE;
+        // iosurface desc layout: surfaceID @0, format @0x16, width @0x18, height @0x1c.
+        const DESC_LEN: usize = 0x20;
         assert!(state.set_object_list(1, 0, 16));
-        let mut desc = vec![0u8; 0x20];
+        let mut desc = vec![0u8; DESC_LEN];
         st32(&mut desc[0..], mapping_id);
         st16(&mut desc[0x16..], format);
         st32(&mut desc[0x18..], width);
         st32(&mut desc[0x1c..], height);
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
         write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
-        let off = list_object_entry_offset(obj_ref, 16).unwrap();
-        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (OBJECT_TYPE_IOSURFACE as u32) | (0x20u32 << 8);
-        st32(&mut list_entry[0..], packed);
-        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_list_entry(
+            host,
+            state,
+            obj_ref,
+            OBJECT_TYPE_IOSURFACE as u32,
+            DESC_LEN as u32,
+            desc_gva,
+        );
     }
 
     /// Install a type-5 RefTexture (object_type=5) that names an IOSurface
@@ -3537,19 +3452,8 @@ mod tests {
         width: u32,
         height: u32,
     ) {
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::runtime::decode::resource::{list_object_entry_offset, OBJECT_LIST_ENTRY_LEN};
         // Mapping (surfaceID == mapping_id): mapped, one data page, latched geom.
-        let gpa = (pfn as u64) << PAGE_SHIFT_ARM64E;
-        host.map_range(gpa, 0x4000, 0);
-        let entry = (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID;
-        state.map_surface(mapping_id);
-        {
-            let m = state.mappings.get_mut(&mapping_id).unwrap();
-            m.mapped = true;
-            m.mapping_internal = 1;
-            m.page_entries = vec![entry];
-        }
+        map_one_page_surface(host, state, mapping_id, pfn);
         assert!(state.set_mapping_geom(mapping_id, width, height, format));
         // Type-5 descriptor: 56-byte blob, 0x62 color-view record.
         assert!(state.set_object_list(1, 0, 16));
@@ -3567,12 +3471,14 @@ mod tests {
         st32(&mut desc[rec + objects::TYPE5_RECORD_DEPTH..], 1);
         let desc_gva = 0x180u64 + (obj_ref as u64) * 0x40;
         write_task_gva_arm64e(host, &state.tasks[1], desc_gva, &desc);
-        let off = list_object_entry_offset(obj_ref, 16).unwrap();
-        let mut list_entry = [0u8; OBJECT_LIST_ENTRY_LEN];
-        let packed = (objects::OBJECT_TYPE_REF_TEXTURE as u32) | ((desc_len as u32) << 8);
-        st32(&mut list_entry[0..], packed);
-        list_entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
-        write_task_gva_arm64e(host, &state.tasks[1], off, &list_entry);
+        write_list_entry(
+            host,
+            state,
+            obj_ref,
+            objects::OBJECT_TYPE_REF_TEXTURE as u32,
+            desc_len as u32,
+            desc_gva,
+        );
         let e = objects::lookup_list_entry(state, host, 1, obj_ref).expect("type5 entry");
         assert_eq!(e.object_type, objects::OBJECT_TYPE_REF_TEXTURE);
     }
@@ -3585,9 +3491,7 @@ mod tests {
     #[test]
     fn type5_ref_texture_resolves_as_type11_blit_backing() {
         use crate::contract::pixel_format::bytes_per_pixel;
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         let mapping_id = 34u32;
         let obj_ref = 12u32;
         let (w, h, fmt) = (2u32, 2u32, MTL_FORMAT_BGRA8_UNORM);
@@ -3611,9 +3515,7 @@ mod tests {
     /// blit branch must fail closed (`t5_view_decode`), never invent geometry.
     #[test]
     fn type5_unknown_record_tag_fails_closed() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         let (mapping_id, obj_ref) = (34u32, 12u32);
         install_type5(
             &mut host,
@@ -3643,9 +3545,7 @@ mod tests {
     #[test]
     fn biplanar_type11_y_and_uv_planes_distinct() {
         use crate::contract::pixel_format::{MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM};
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         let mapping_id = 7u32;
         install_biplanar_mapping(&mut host, &mut state, mapping_id, 0x30);
         // Y plane texture ref 10, UV plane texture ref 11 — same mapping_id.
@@ -3690,16 +3590,10 @@ mod tests {
             write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &y_pat);
         }
 
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 10; // Y
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 10); // Y
         cmd.source_offset = 0;
         cmd.source_bytes_per_row = 4;
-        cmd.source_size.width = 4;
-        cmd.source_size.height = 2;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 4, height: 2, depth: 1 };
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
 
         // Y plane base 512, bpr 64: rows at 512 and 576.
@@ -3746,8 +3640,7 @@ mod tests {
         }
         cmd.destination = 11;
         cmd.source_bytes_per_row = 4;
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 1;
+        cmd.source_size = Size { width: 2, height: 1, depth: 1 };
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
 
         let mut uv = [0u8; 4];
@@ -3839,9 +3732,7 @@ mod tests {
 
     #[test]
     fn copy_buffer_to_type8_view_of_type11() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 256);
         let mapping_id = 9u32;
         install_type11(&mut host, &mut state, 3, mapping_id, 0x20);
@@ -3850,16 +3741,10 @@ mod tests {
         let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
         write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 8; // type-8 view
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8); // type-8 view
         cmd.source_offset = 0;
         cmd.source_bytes_per_row = 8;
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 2, height: 1, depth: 1 };
         cmd.destination_origin.y = 0;
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
         let mut back = [0u8; 8];
@@ -3871,9 +3756,7 @@ mod tests {
 
     #[test]
     fn type8_swizzled_view_rejected_for_blit() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 256);
         install_type11(&mut host, &mut state, 3, 9, 0x20);
         // Non-identity swizzle BGRA order selectors.
@@ -3886,14 +3769,8 @@ mod tests {
             0,
             Some([4, 3, 2, 5]),
         );
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 8;
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         cmd.source_bytes_per_row = 4;
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
@@ -3904,9 +3781,7 @@ mod tests {
     #[test]
     fn type8_level_base_on_type11_rejected() {
         // Metal forbids mipmapped IOSurfaces; view level_base=1 fail-closes.
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 256);
         install_type11(&mut host, &mut state, 3, 9, 0x20);
         install_type8_view(
@@ -3918,14 +3793,8 @@ mod tests {
             1, // level_base
             None,
         );
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 8;
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         cmd.source_bytes_per_row = 4;
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
@@ -3974,9 +3843,7 @@ mod tests {
             TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE,
             TEXTURE_LEVEL_WIDTH,
         };
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 512);
 
         // Type-2 texture handle=2, 2 mips: L0 4x2, L1 2x1, RGBA8 (bpp=4).
@@ -4036,18 +3903,12 @@ mod tests {
         let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
         write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 8;
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
         cmd.source_level = 1; // relative → absolute L1
         cmd.destination_level = 1;
         cmd.source_offset = 0;
         cmd.source_bytes_per_row = 8;
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 2, height: 1, depth: 1 };
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
 
         // Read L1 from texture handle 2 GVA + 32.
@@ -4066,22 +3927,14 @@ mod tests {
 
     #[test]
     fn multilevel_view_relative_level_oob() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 1, 1, 64);
         install_type11(&mut host, &mut state, 3, 9, 0x20);
         // View over type-11 with level_count=1, level_base=0; command level 1 is OOB.
         install_type8_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::BufferToTexture;
-        cmd.source = 1;
-        cmd.destination = 8;
+        let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
         cmd.destination_level = 1; // relative 1 >= count 1
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 1;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 1, height: 1, depth: 1 };
         cmd.source_bytes_per_row = 4;
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
@@ -4138,14 +3991,8 @@ mod tests {
 
     #[test]
     fn slice_level_zero_counts_are_noop() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTextureSliceLevel;
-        cmd.source = 1;
-        cmd.destination = 2;
+        let (mut host, mut state) = blit_device();
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 1, 2);
         cmd.slice_count = 0;
         cmd.level_count = 1;
         assert_eq!(
@@ -4229,9 +4076,7 @@ mod tests {
         const READ: u64 = STRIDE as u64 + TIGHT;
         const EXACT: u64 = ONE_SLICE + READ;
 
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_linear_rgba(&mut host, &mut state, 2, 2, 4, 2, STRIDE);
         set_installed_allocation_size(&mut host, &state, 2, EXACT);
 
@@ -4265,9 +4110,7 @@ mod tests {
 
     #[test]
     fn whole_surface_0x13e_single_level_copy() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         // src handle=2 (4×2 RGBA, stride 16), dst handle=3
         install_linear_rgba(&mut host, &mut state, 2, 2, 4, 2, 16);
         install_linear_rgba(&mut host, &mut state, 3, 3, 4, 2, 16);
@@ -4280,11 +4123,7 @@ mod tests {
         }
         write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTextureSliceLevel;
-        cmd.source = 2;
-        cmd.destination = 3;
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
         cmd.source_slice = 0;
         cmd.source_level = 0;
         cmd.destination_slice = 0;
@@ -4315,9 +4154,7 @@ mod tests {
     /// the guest and dropped a copy it treats as complete).
     #[test]
     fn t2t_identity_self_copy_is_noop_ok() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         // One 4×2 RGBA texture (stride 16), ref==handle==2.
         install_linear_rgba(&mut host, &mut state, 2, 2, 4, 2, 16);
         let gva = 2u64 << RESOURCE_PAGE_SHIFT;
@@ -4327,14 +4164,8 @@ mod tests {
         }
         write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
 
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 2;
-        cmd.destination = 2; // same texture, same origin => identity
-        cmd.source_size.width = 4;
-        cmd.source_size.height = 2;
-        cmd.source_size.depth = 1;
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 2, 2); // same texture, same origin => identity
+        cmd.source_size = Size { width: 4, height: 2, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Ok,
@@ -4362,9 +4193,7 @@ mod tests {
     /// rectangle overlap (disjoint on x => no overlap).
     #[test]
     fn t2t_shifted_column_self_copy_moves_bytes() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         // 4×4 RGBA, stride 16, ref==handle==2.
         install_linear_rgba(&mut host, &mut state, 2, 2, 4, 4, 16);
         let gva = 2u64 << RESOURCE_PAGE_SHIFT;
@@ -4375,15 +4204,9 @@ mod tests {
         }
         write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
         // Copy column x=0 (4 rows) to column x=2 within the same texture.
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 2;
-        cmd.destination = 2;
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 2, 2);
         cmd.destination_origin.x = 2;
-        cmd.source_size.width = 1;
-        cmd.source_size.height = 4;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 1, height: 4, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Ok,
@@ -4413,21 +4236,13 @@ mod tests {
     /// rejected as Overlap, with the enrichment line emitted for diagnosis.
     #[test]
     fn t2t_overlapping_self_copy_still_rejected() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         // Unique ref (4) so the (task,src,dst) enrichment key is globally
         // distinct from the identity/shifted tests' probes.
         install_linear_rgba(&mut host, &mut state, 4, 4, 4, 4, 16);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTexture;
-        cmd.source = 4;
-        cmd.destination = 4;
+        let mut cmd = copy_cmd(CopyKind::TextureToTexture, 4, 4);
         cmd.destination_origin.x = 1; // src x[0,2), dst x[1,3) overlap at x=1
-        cmd.source_size.width = 2;
-        cmd.source_size.height = 4;
-        cmd.source_size.depth = 1;
+        cmd.source_size = Size { width: 2, height: 4, depth: 1 };
         assert_eq!(
             execute_blit(&mut state, &mut host, 1, &cmd),
             BlitStatus::Overlap,
@@ -4451,9 +4266,7 @@ mod tests {
             TEXTURE_LEVEL_OFFSET, TEXTURE_LEVEL_ROW_STRIDE, TEXTURE_LEVEL_SIZE,
             TEXTURE_LEVEL_WIDTH,
         };
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
 
         // Two textures, 2 mips: L0 4×2 stride16, L1 2×1 stride8.
         for (obj_ref, handle) in [(2u32, 2u32), (3u32, 3u32)] {
@@ -4498,11 +4311,7 @@ mod tests {
         write_task_gva_arm64e(&mut host, &state.tasks[1], base + 16, &l0_row1);
         write_task_gva_arm64e(&mut host, &state.tasks[1], base + 32, &l1);
 
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTextureSliceLevel;
-        cmd.source = 2;
-        cmd.destination = 3;
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
         cmd.slice_count = 1;
         cmd.level_count = 2;
         assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
@@ -4579,9 +4388,7 @@ mod tests {
 
     #[test]
     fn whole_surface_0x13e_volume_depth_planes() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         // 2×2×3 RGBA8, row_stride 8 → plane 16 B, volume 48 B.
         install_linear_rgba_volume(&mut host, &mut state, 2, 2, 2, 2, 3, 8);
         install_linear_rgba_volume(&mut host, &mut state, 3, 3, 2, 2, 3, 8);
@@ -4593,11 +4400,7 @@ mod tests {
         }
         write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &vol);
 
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTextureSliceLevel;
-        cmd.source = 2;
-        cmd.destination = 3;
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
         cmd.source_slice = 0;
         cmd.destination_slice = 0;
         cmd.slice_count = 1;
@@ -4618,16 +4421,10 @@ mod tests {
 
     #[test]
     fn whole_surface_0x13e_volume_rejects_multi_slice() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_linear_rgba_volume(&mut host, &mut state, 2, 2, 2, 2, 2, 8);
         install_linear_rgba_volume(&mut host, &mut state, 3, 3, 2, 2, 2, 8);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTextureSliceLevel;
-        cmd.source = 2;
-        cmd.destination = 3;
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
         cmd.slice_count = 2; // Metal: 3D requires sliceCount==1
         cmd.level_count = 1;
         assert_eq!(
@@ -4638,17 +4435,10 @@ mod tests {
 
     #[test]
     fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
-        let mut host = FakeHost::new();
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
+        let (mut host, mut state) = blit_device();
         install_linear_rgba_volume(&mut host, &mut state, 2, 2, 2, 2, 2, 8);
         install_linear_rgba_volume(&mut host, &mut state, 3, 3, 2, 2, 2, 8);
-        let mut cmd = Command::default();
-        cmd.kind = Kind::Copy;
-        cmd.copy_kind = CopyKind::TextureToTextureSliceLevel;
-        cmd.source = 2;
-        cmd.destination = 3;
-        // Non-zero slice on 3D whole-surface is fail-closed (Metal forbids).
+        let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3); // Non-zero slice on 3D whole-surface is fail-closed (Metal forbids).
         // Status may be Bounds (slice packing) or Unsupported (3D rule).
         cmd.source_slice = 1;
         cmd.slice_count = 1;
