@@ -800,6 +800,17 @@ pub fn flush_mapping_windows_before_fence<M: HostMemory + HostOps>(
     if state.compute_deferred_flush.is_empty() {
         return;
     }
+    // Once per fence that has anything to land, against `mapw_fence_flush`'s
+    // once per window. The ratio is how many windows are armed at the same
+    // time, which `surface_resident` and `surface_flush` cannot say — both are
+    // per-window rates and read 104/s whether that is 104 fences of one window
+    // or 52 of two.
+    //
+    // It decides the cost of submitting each window's readback at arm time
+    // instead of at the fence: that trades the fence's blocking wait for a
+    // staging buffer held per armed window, so a concurrency of one is nearly
+    // free and a concurrency near `SURFACE_DEFERRED_WINDOW_CAP` (16) is 133 MB.
+    crate::runtime::drain::note_store_route("mapw_fence_pass");
     // Snapshot first: landing one window consumes its overlapping siblings
     // through the fixpoint, so iterating the live map would borrow it across a
     // mutation. A key already consumed by an earlier pass is skipped rather than
