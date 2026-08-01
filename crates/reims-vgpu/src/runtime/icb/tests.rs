@@ -158,6 +158,38 @@ fn unit_mesh_threads_draw() -> IcbRenderDraw {
     }
 }
 
+/// The guest's `ExecuteCommandsInBuffer` (0xe4) over `[location, length)` of
+/// ICB object `icb_ref` — the command eight bodies build field by field on a
+/// `Default` before handing it to `ComputeSession::encode_icb`.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn execute_icb_command(
+    icb_ref: u32,
+    location: u64,
+    length: u64,
+) -> crate::runtime::decode::compute::Command {
+    use crate::runtime::decode::compute::{Command, Kind};
+    Command {
+        kind: Kind::ExecuteCommandsInBuffer,
+        indirect_command_buffer_ref: icb_ref,
+        indirect_command_range_location: location,
+        indirect_command_range_length: length,
+        ..Default::default()
+    }
+}
+
+/// The four little-endian `u32`s at task 1's `gva`, which is what every
+/// compute-writeback body in this file checks its kernel by. Panics rather than
+/// returning: a read that fails here is the fixture broken, not the assertion.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn read_u32x4(host: &FakeHost, state: &DeviceState, gva: u64) -> Vec<u32> {
+    let mut back = [0u8; 16];
+    gva_mem::read_task_gva(host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
+        .expect("readback");
+    back.chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
 /// Three UInt16 indices out of buffer ref 12 at its base, one instance, no base
 /// instance. `base_vertex` is the parameter because it is the only field the
 /// bodies using this vary — and one of them passes -1 deliberately, to prove
@@ -796,7 +828,6 @@ fn materialize_and_execute_empty_range() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_and_execute_mul3add1_writeback() {
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -859,11 +890,7 @@ fn fill_and_execute_mul3add1_writeback() {
 
     // Product execute 0xe4 range [0,1] on a compute session + writeback.
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
             &mut state,
@@ -879,19 +906,7 @@ fn fill_and_execute_mul3add1_writeback() {
         crate::runtime::compute_exec::ComputeStatus::Ok
     );
 
-    let mut back = [0u8; 16];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        buf_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let out: Vec<u32> = back
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let out = read_u32x4(&host, &state, buf_gva);
     assert_eq!(
         out,
         vec![4, 7, 10, 13],
@@ -1830,7 +1845,6 @@ fn decode_encode_command_slot_roundtrip() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn buffer_backed_fill_execute_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -1901,11 +1915,7 @@ fn buffer_backed_fill_execute_mul3add1() {
     assert_eq!(mem.byte_len, layout.command_size as u64);
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
             &mut state,
@@ -1921,19 +1931,7 @@ fn buffer_backed_fill_execute_mul3add1() {
         crate::runtime::compute_exec::ComputeStatus::Ok
     );
 
-    let mut back = [0u8; 16];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        buf_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let out: Vec<u32> = back
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let out = read_u32x4(&host, &state, buf_gva);
     assert_eq!(
         out,
         vec![4, 7, 10, 13],
@@ -4112,7 +4110,6 @@ fn decode_encode_barrier_and_threadgroup_memory() {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn fill_compute_barrier_and_tg_memory_execute() {
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
     use crate::runtime::decode::resource::compute_icb_layout;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4168,11 +4165,7 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     let _ = layout;
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
             &mut state,
@@ -4188,19 +4181,7 @@ fn fill_compute_barrier_and_tg_memory_execute() {
         crate::runtime::compute_exec::ComputeStatus::Ok
     );
 
-    let mut back = [0u8; 16];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        buf_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let out: Vec<u32> = back
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let out = read_u32x4(&host, &state, buf_gva);
     assert_eq!(out, vec![4, 7, 10, 13], "barrier+tg fill still mul3add1");
 }
 
@@ -4211,7 +4192,6 @@ fn fill_compute_barrier_and_tg_memory_execute() {
 fn inherit_buffers_encoder_kernel_mul3add1() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeBufferBind};
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4273,11 +4253,7 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     });
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
         crate::runtime::compute_exec::ComputeStatus::Ok,
@@ -4288,19 +4264,7 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
         crate::runtime::compute_exec::ComputeStatus::Ok
     );
 
-    let mut back = [0u8; 16];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        buf_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let out: Vec<u32> = back
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let out = read_u32x4(&host, &state, buf_gva);
     assert_eq!(
         out,
         vec![4, 7, 10, 13],
@@ -4315,7 +4279,6 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
 fn inherit_pipeline_encoder_kernel_mul3add1() {
     use crate::runtime::compute_exec::ComputeAccum;
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
     use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4370,11 +4333,7 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     acc.set_pipeline(6);
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
         crate::runtime::compute_exec::ComputeStatus::Ok,
@@ -4385,19 +4344,7 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
         crate::runtime::compute_exec::ComputeStatus::Ok
     );
 
-    let mut back = [0u8; 16];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        buf_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let out: Vec<u32> = back
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let out = read_u32x4(&host, &state, buf_gva);
     assert_eq!(
         out,
         vec![4, 7, 10, 13],
@@ -4490,7 +4437,6 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UNORM;
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4570,11 +4516,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     });
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
         crate::runtime::compute_exec::ComputeStatus::Ok,
@@ -4585,19 +4527,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
         crate::runtime::compute_exec::ComputeStatus::Ok
     );
 
-    let mut back = [0u8; 16];
-    assert!(gva_mem::read_task_gva(
-        &host,
-        &state.tasks[1],
-        buf_gva,
-        &mut back,
-        PAGE_SHIFT_ARM64E
-    )
-    .is_ok());
-    let out: Vec<u32> = back
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let out = read_u32x4(&host, &state, buf_gva);
     assert_eq!(
         out,
         vec![4, 7, 10, 13],
@@ -4631,7 +4561,6 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     use crate::contract::pixel_format::MTL_FORMAT_RGBA8_UINT;
     use crate::runtime::compute_exec::{ComputeAccum, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4694,11 +4623,7 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     });
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
         crate::runtime::compute_exec::ComputeStatus::Ok,
@@ -4738,7 +4663,6 @@ fn icb_argument_buffer_sample_and_write() {
     use crate::contract::pixel_format::{MTL_FORMAT_RGBA8_UINT, MTL_FORMAT_RGBA8_UNORM};
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
-    use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 
     let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_icb_cache();
@@ -4832,11 +4756,7 @@ fn icb_argument_buffer_sample_and_write() {
     });
 
     let mut session = ComputeSession::open(0).expect("session");
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
-    cmd.indirect_command_buffer_ref = 9;
-    cmd.indirect_command_range_location = 0;
-    cmd.indirect_command_range_length = 1;
+    let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
         crate::runtime::compute_exec::ComputeStatus::Ok,
