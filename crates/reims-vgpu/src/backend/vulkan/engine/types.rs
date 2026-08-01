@@ -965,16 +965,17 @@ pub struct ComputeBufferOutput {
 }
 
 /// Storage image for compute. Formats mirror the live `simg_u32_to_vk_storage` map.
+///
+/// Single-layer 2D only: a compute texture binding is staged from one type-11
+/// plane window or one linear GVA level, both of which are a flat `width ×
+/// height` rectangle. There is no decoded slice or depth axis on this rail, so
+/// the engine builds `TYPE_2D` unconditionally.
 #[derive(Debug)]
 pub struct ComputeStorageImageResource {
     pub binding: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    pub layers: u32,
-    pub one_dim: bool,
-    pub arrayed: bool,
-    pub volume: bool,
     pub bytes: Vec<u8>,
     /// Exact type-11 resource lifetime/view contract for persistent GPU
     /// storage. `None` keeps the conservative transient upload path.
@@ -1021,16 +1022,15 @@ pub struct ComputeStorageResidency {
 /// Read-only sampled image for compute. The format set is shared with storage
 /// images because both are derived from the same Metal pixel-format contract;
 /// descriptor access is carried separately by the request field.
+///
+/// Single-layer 2D only, for the same reason as
+/// [`ComputeStorageImageResource`].
 #[derive(Debug)]
 pub struct ComputeSampledImageResource {
     pub binding: u32,
     pub format: StorageImageFormat,
     pub width: u32,
     pub height: u32,
-    pub layers: u32,
-    pub one_dim: bool,
-    pub arrayed: bool,
-    pub volume: bool,
     pub bytes: Vec<u8>,
     /// When set, `bytes` is a zero placeholder: the engine seeds the sampled
     /// image with a device-local copy of the named resident storage image

@@ -2243,15 +2243,9 @@ mod recycle_tests {
             key: StorageImageKey {
                 width: w,
                 height: h,
-                layers: 1,
                 format: StorageImageFormat::default(),
-                one_dim: false,
-                arrayed: false,
-                volume: false,
                 sampled_only: false,
             },
-            array_layers: 1,
-            extent_depth: 1,
         }
     }
 

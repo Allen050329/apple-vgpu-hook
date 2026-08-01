@@ -28,15 +28,6 @@ pub enum ComputeValidationDecline {
         binding: u32,
         width: u32,
         height: u32,
-        layers: u32,
-    },
-    SampledOneDimHeight {
-        binding: u32,
-        height: u32,
-    },
-    SampledNonArrayLayers {
-        binding: u32,
-        layers: u32,
     },
     SampledBytesLength {
         binding: u32,
@@ -58,15 +49,6 @@ pub enum ComputeValidationDecline {
         binding: u32,
         width: u32,
         height: u32,
-        layers: u32,
-    },
-    StorageOneDimHeight {
-        binding: u32,
-        height: u32,
-    },
-    StorageNonArrayLayers {
-        binding: u32,
-        layers: u32,
     },
     StorageBytesLength {
         binding: u32,
@@ -90,8 +72,6 @@ impl Decline for ComputeValidationDecline {
                 "vk_compute_validate_duplicate_sampled_image_binding"
             }
             Self::SampledZeroGeometry { .. } => "vk_compute_validate_sampled_zero_geometry",
-            Self::SampledOneDimHeight { .. } => "vk_compute_validate_sampled_1d_height",
-            Self::SampledNonArrayLayers { .. } => "vk_compute_validate_sampled_nonarray_layers",
             Self::SampledBytesLength { .. } => "vk_compute_validate_sampled_bytes_length",
             Self::InvalidSamplerLod { .. } => "vk_compute_validate_invalid_sampler_lod",
             Self::DuplicateSamplerBinding { .. } => "vk_compute_validate_duplicate_sampler_binding",
@@ -99,8 +79,6 @@ impl Decline for ComputeValidationDecline {
                 "vk_compute_validate_duplicate_storage_image_binding"
             }
             Self::StorageZeroGeometry { .. } => "vk_compute_validate_storage_zero_geometry",
-            Self::StorageOneDimHeight { .. } => "vk_compute_validate_storage_1d_height",
-            Self::StorageNonArrayLayers { .. } => "vk_compute_validate_storage_nonarray_layers",
             Self::StorageBytesLength { .. } => "vk_compute_validate_storage_bytes_length",
         }
     }
@@ -123,28 +101,15 @@ impl Decline for ComputeValidationDecline {
                 binding,
                 width,
                 height,
-                layers,
             }
             | Self::StorageZeroGeometry {
                 binding,
                 width,
                 height,
-                layers,
             } => vec![
                 ("binding", binding.to_string()),
                 ("width", width.to_string()),
                 ("height", height.to_string()),
-                ("layers", layers.to_string()),
-            ],
-            Self::SampledOneDimHeight { binding, height }
-            | Self::StorageOneDimHeight { binding, height } => vec![
-                ("binding", binding.to_string()),
-                ("height", height.to_string()),
-            ],
-            Self::SampledNonArrayLayers { binding, layers }
-            | Self::StorageNonArrayLayers { binding, layers } => vec![
-                ("binding", binding.to_string()),
-                ("layers", layers.to_string()),
             ],
             Self::SampledBytesLength {
                 binding,
@@ -193,15 +158,6 @@ mod tests {
                 binding: 32,
                 width: 0,
                 height: 1,
-                layers: 1,
-            },
-            ComputeValidationDecline::SampledOneDimHeight {
-                binding: 32,
-                height: 2,
-            },
-            ComputeValidationDecline::SampledNonArrayLayers {
-                binding: 32,
-                layers: 2,
             },
             ComputeValidationDecline::SampledBytesLength {
                 binding: 32,
@@ -219,15 +175,6 @@ mod tests {
                 binding: 34,
                 width: 1,
                 height: 0,
-                layers: 1,
-            },
-            ComputeValidationDecline::StorageOneDimHeight {
-                binding: 34,
-                height: 2,
-            },
-            ComputeValidationDecline::StorageNonArrayLayers {
-                binding: 34,
-                layers: 2,
             },
             ComputeValidationDecline::StorageBytesLength {
                 binding: 34,
@@ -251,7 +198,11 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 18, "the compute validator's reason census moved");
+        // Down from 18: the four 1D/array-layer checks went out with the
+        // non-2D image shape. A compute texture binding is one flat plane
+        // window or one linear GVA level, so there is no slice or depth axis
+        // for a request to get wrong.
+        assert_eq!(before, 14, "the compute validator's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-validation slug");
     }
 

@@ -12,46 +12,24 @@ impl ResourcePools {
                     memory: slot.memory,
                     view: slot.view,
                     key: slot.key,
-                    array_layers: slot.array_layers,
-                    extent_depth: slot.extent_depth,
                 });
                 return Ok(slot);
             }
         }
         let format = key.format.vk_format();
-        let image_type = if key.one_dim {
-            vk::ImageType::TYPE_1D
-        } else if key.volume {
-            vk::ImageType::TYPE_3D
-        } else {
-            vk::ImageType::TYPE_2D
-        };
-        let view_type = if key.one_dim && key.arrayed {
-            vk::ImageViewType::TYPE_1D_ARRAY
-        } else if key.one_dim {
-            vk::ImageViewType::TYPE_1D
-        } else if key.volume {
-            vk::ImageViewType::TYPE_3D
-        } else if key.arrayed {
-            vk::ImageViewType::TYPE_2D_ARRAY
-        } else {
-            vk::ImageViewType::TYPE_2D
-        };
-        let extent_depth = if key.volume { key.layers } else { 1 };
-        let array_layers = if key.volume { 1 } else { key.layers.max(1) };
         let image = ctx
             .device
             .create_image(
                 &vk::ImageCreateInfo::default()
-                    .image_type(image_type)
+                    .image_type(vk::ImageType::TYPE_2D)
                     .format(format)
                     .extent(vk::Extent3D {
                         width: key.width.max(1),
                         height: key.height.max(1),
-                        depth: extent_depth,
+                        depth: 1,
                     })
                     .mip_levels(1)
-                    .array_layers(array_layers)
+                    .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
                     .usage(if key.sampled_only {
@@ -100,14 +78,14 @@ impl ResourcePools {
             .create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
-                    .view_type(view_type)
+                    .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
                         level_count: 1,
                         base_array_layer: 0,
-                        layer_count: array_layers,
+                        layer_count: 1,
                     }),
                 None,
             )
@@ -122,17 +100,8 @@ impl ResourcePools {
             memory,
             view,
             key,
-            array_layers,
-            extent_depth,
         };
-        self.storage_image_live.push(StorageImageSlot {
-            image: slot.image,
-            memory: slot.memory,
-            view: slot.view,
-            key: slot.key,
-            array_layers: slot.array_layers,
-            extent_depth: slot.extent_depth,
-        });
+        self.storage_image_live.push(slot);
         Ok(slot)
     }
 
@@ -222,11 +191,7 @@ impl ResourcePools {
                 identity,
                 width: key.width,
                 height: key.height,
-                layers: key.layers,
                 format: key.format,
-                one_dim: key.one_dim,
-                arrayed: key.arrayed,
-                volume: key.volume,
             })
         })?;
         debug_assert_eq!(live.image, slot.image);

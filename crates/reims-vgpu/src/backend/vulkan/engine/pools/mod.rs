@@ -432,16 +432,14 @@ struct ResidentSampledSlot {
     last_touch_ms: u64,
 }
 
-/// Geometry+format key for storage-image pool free lists.
+/// Geometry+format key for storage-image pool free lists. Compute images are
+/// single-layer 2D by contract (see [`crate::backend::vulkan::engine::ComputeStorageImageResource`]),
+/// so geometry is exactly width × height.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct StorageImageKey {
     pub width: u32,
     pub height: u32,
-    pub layers: u32,
     pub format: StorageImageFormat,
-    pub one_dim: bool,
-    pub arrayed: bool,
-    pub volume: bool,
     /// Read-only sampled descriptor instead of writable storage descriptor.
     pub sampled_only: bool,
 }
@@ -452,8 +450,6 @@ pub(crate) struct StorageImageSlot {
     pub memory: vk::DeviceMemory,
     pub view: vk::ImageView,
     pub key: StorageImageKey,
-    pub array_layers: u32,
-    pub extent_depth: u32,
 }
 
 pub(crate) struct ResidentStorageImageUse {

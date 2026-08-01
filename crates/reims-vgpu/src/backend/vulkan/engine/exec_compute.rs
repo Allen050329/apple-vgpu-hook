@@ -112,35 +112,17 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if img.width == 0 || img.height == 0 || img.layers == 0 {
+        if img.width == 0 || img.height == 0 {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::SampledZeroGeometry {
                     binding: img.binding,
                     width: img.width,
                     height: img.height,
-                    layers: img.layers,
-                },
-            ));
-        }
-        if img.one_dim && img.height != 1 {
-            return Err(DrawError::ComputeValidation(
-                ComputeValidationDecline::SampledOneDimHeight {
-                    binding: img.binding,
-                    height: img.height,
-                },
-            ));
-        }
-        if !img.arrayed && !img.volume && img.layers != 1 {
-            return Err(DrawError::ComputeValidation(
-                ComputeValidationDecline::SampledNonArrayLayers {
-                    binding: img.binding,
-                    layers: img.layers,
                 },
             ));
         }
         let expected = (img.width as usize)
             .saturating_mul(img.height as usize)
-            .saturating_mul(img.layers as usize)
             .saturating_mul(img.format.bytes_per_texel());
         if img.bytes.len() != expected {
             return Err(DrawError::ComputeValidation(
@@ -180,35 +162,17 @@ pub(crate) fn validate_compute(req: &ComputeRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if img.width == 0 || img.height == 0 || img.layers == 0 {
+        if img.width == 0 || img.height == 0 {
             return Err(DrawError::ComputeValidation(
                 ComputeValidationDecline::StorageZeroGeometry {
                     binding: img.binding,
                     width: img.width,
                     height: img.height,
-                    layers: img.layers,
-                },
-            ));
-        }
-        if img.one_dim && img.height != 1 {
-            return Err(DrawError::ComputeValidation(
-                ComputeValidationDecline::StorageOneDimHeight {
-                    binding: img.binding,
-                    height: img.height,
-                },
-            ));
-        }
-        if !img.arrayed && !img.volume && img.layers != 1 {
-            return Err(DrawError::ComputeValidation(
-                ComputeValidationDecline::StorageNonArrayLayers {
-                    binding: img.binding,
-                    layers: img.layers,
                 },
             ));
         }
         let expected = (img.width as usize)
             .saturating_mul(img.height as usize)
-            .saturating_mul(img.layers as usize)
             .saturating_mul(img.format.bytes_per_texel());
         if img.bytes.len() != expected {
             return Err(DrawError::ComputeValidation(
@@ -250,48 +214,6 @@ fn resident_sample_reinterpret(
                 resource_height: resource.height,
                 resource_format: resource.format,
                 resource_row_bytes,
-            },
-        ));
-    }
-    if src_key.layers != 1 {
-        return Err(DrawError::ComputeExecution(
-            ComputeExecutionDecline::ResidentSampleSourceLayersUnsupported {
-                binding: resource.binding,
-                identity: bind.identity,
-                layers: src_key.layers,
-            },
-        ));
-    }
-    if resource.layers != 1 {
-        return Err(DrawError::ComputeExecution(
-            ComputeExecutionDecline::ResidentSampleResourceLayersUnsupported {
-                binding: resource.binding,
-                identity: bind.identity,
-                layers: resource.layers,
-            },
-        ));
-    }
-    if resource.one_dim {
-        return Err(DrawError::ComputeExecution(
-            ComputeExecutionDecline::ResidentSampleOneDimUnsupported {
-                binding: resource.binding,
-                identity: bind.identity,
-            },
-        ));
-    }
-    if resource.arrayed {
-        return Err(DrawError::ComputeExecution(
-            ComputeExecutionDecline::ResidentSampleArrayedUnsupported {
-                binding: resource.binding,
-                identity: bind.identity,
-            },
-        ));
-    }
-    if resource.volume {
-        return Err(DrawError::ComputeExecution(
-            ComputeExecutionDecline::ResidentSampleVolumeUnsupported {
-                binding: resource.binding,
-                identity: bind.identity,
             },
         ));
     }
@@ -400,11 +322,7 @@ pub(crate) unsafe fn execute_compute_inner(
         let key = StorageImageKey {
             width: resource.width,
             height: resource.height,
-            layers: resource.layers,
             format: resource.format,
-            one_dim: resource.one_dim,
-            arrayed: resource.arrayed,
-            volume: resource.volume,
             sampled_only: true,
         };
         let img = pools.acquire_storage_image(ctx, key, counters)?;
@@ -491,11 +409,7 @@ pub(crate) unsafe fn execute_compute_inner(
         let key = StorageImageKey {
             width: resource.width,
             height: resource.height,
-            layers: resource.layers,
             format: resource.format,
-            one_dim: resource.one_dim,
-            arrayed: resource.arrayed,
-            volume: resource.volume,
             sampled_only: false,
         };
         let (img, initial_layout, generation_match) = if let Some(residency) = resource.residency {
@@ -674,7 +588,7 @@ pub(crate) unsafe fn execute_compute_inner(
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: img.array_layers,
+            layer_count: 1,
         };
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -698,12 +612,12 @@ pub(crate) unsafe fn execute_compute_inner(
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
-                    layer_count: img.array_layers,
+                    layer_count: 1,
                 })
                 .image_extent(vk::Extent3D {
                     width: prepared.width,
                     height: prepared.height,
-                    depth: img.extent_depth,
+                    depth: 1,
                 })];
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
@@ -875,7 +789,7 @@ pub(crate) unsafe fn execute_compute_inner(
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: img.array_layers,
+            layer_count: 1,
         };
         let (src_stage, src_access) = match prepared.initial_layout {
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
@@ -913,12 +827,12 @@ pub(crate) unsafe fn execute_compute_inner(
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     mip_level: 0,
                     base_array_layer: 0,
-                    layer_count: img.array_layers,
+                    layer_count: 1,
                 })
                 .image_extent(vk::Extent3D {
                     width: prepared.width,
                     height: prepared.height,
-                    depth: img.extent_depth,
+                    depth: 1,
                 })];
             ctx.device.cmd_copy_buffer_to_image(
                 cb,
@@ -954,7 +868,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: img.array_layers,
+                layer_count: 1,
             })];
         ctx.device.cmd_pipeline_barrier(
             cb,
@@ -1049,7 +963,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
-                layer_count: img.array_layers,
+                layer_count: 1,
             })];
         ctx.device.cmd_pipeline_barrier(
             cb,
@@ -1078,12 +992,12 @@ pub(crate) unsafe fn execute_compute_inner(
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
                 base_array_layer: 0,
-                layer_count: img.array_layers,
+                layer_count: 1,
             })
             .image_extent(vk::Extent3D {
                 width: prepared.width,
                 height: prepared.height,
-                depth: img.extent_depth,
+                depth: 1,
             })];
         ctx.device.cmd_copy_image_to_buffer(
             cb,
@@ -1286,10 +1200,6 @@ mod tests {
             format: StorageImageFormat::Rgba8Unorm,
             width: 1,
             height: 1,
-            layers: 1,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             bytes: vec![0; 4],
             resident_bind: Some(ComputeResidentSampleBind {
                 identity: residency_identity(),
@@ -1301,11 +1211,7 @@ mod tests {
         StorageImageKey {
             width: 1,
             height: 1,
-            layers: 1,
             format: StorageImageFormat::Rgba8Unorm,
-            one_dim: false,
-            arrayed: false,
-            volume: false,
             sampled_only: false,
         }
     }
@@ -1377,42 +1283,6 @@ mod tests {
             resident_sample_shape_slug(&byte_mismatch, resident_sample_key()),
             "vk_compute_exec_resident_sample_byte_shape_mismatch"
         );
-
-        let mut source_layers = resident_sample_key();
-        source_layers.layers = 2;
-        assert_eq!(
-            resident_sample_shape_slug(&resident_sample_resource(), source_layers),
-            "vk_compute_exec_resident_sample_source_layers_unsupported"
-        );
-
-        let mut resource_layers = resident_sample_resource();
-        resource_layers.layers = 2;
-        resource_layers.bytes.resize(8, 0);
-        assert_eq!(
-            resident_sample_shape_slug(&resource_layers, resident_sample_key()),
-            "vk_compute_exec_resident_sample_resource_layers_unsupported"
-        );
-
-        let mut one_dim = resident_sample_resource();
-        one_dim.one_dim = true;
-        assert_eq!(
-            resident_sample_shape_slug(&one_dim, resident_sample_key()),
-            "vk_compute_exec_resident_sample_1d_unsupported"
-        );
-
-        let mut arrayed = resident_sample_resource();
-        arrayed.arrayed = true;
-        assert_eq!(
-            resident_sample_shape_slug(&arrayed, resident_sample_key()),
-            "vk_compute_exec_resident_sample_arrayed_unsupported"
-        );
-
-        let mut volume = resident_sample_resource();
-        volume.volume = true;
-        assert_eq!(
-            resident_sample_shape_slug(&volume, resident_sample_key()),
-            "vk_compute_exec_resident_sample_volume_unsupported"
-        );
     }
 
     #[test]
@@ -1426,10 +1296,6 @@ mod tests {
                 format: StorageImageFormat::Rgba8Unorm,
                 width: 1,
                 height: 1,
-                layers: 1,
-                one_dim: false,
-                arrayed: false,
-                volume: false,
                 bytes: vec![0; 4],
                 resident_bind: None,
             }],
@@ -1439,10 +1305,6 @@ mod tests {
                 format: StorageImageFormat::Rgba8Uint,
                 width: 1,
                 height: 1,
-                layers: 1,
-                one_dim: false,
-                arrayed: false,
-                volume: false,
                 bytes: vec![0; 4],
                 residency: None,
                 seed_skipped: false,

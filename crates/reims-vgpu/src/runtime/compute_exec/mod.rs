@@ -3602,10 +3602,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: shader_fmt,
                 width: t.width,
                 height: t.height,
-                layers: 1,
-                one_dim: false,
-                arrayed: false,
-                volume: false,
                 bytes: std::mem::take(&mut t.bytes),
                 residency: t.residency.map(|candidate| {
                     crate::backend::vulkan::engine::ComputeStorageResidency {
@@ -3632,10 +3628,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
                 format: sampled_fmt,
                 width: t.width,
                 height: t.height,
-                layers: 1,
-                one_dim: false,
-                arrayed: false,
-                volume: false,
                 bytes: std::mem::take(&mut t.bytes),
                 resident_bind: t.sample_resident.map(|(identity, generation)| {
                     crate::backend::vulkan::engine::ComputeResidentSampleBind {
@@ -3949,7 +3941,7 @@ fn spawn_compute_engine_stall_watchdog(
     let image_geometry: Vec<_> = req
         .storage_images
         .iter()
-        .map(|img| (img.binding, img.width, img.height, img.layers))
+        .map(|img| (img.binding, img.width, img.height))
         .collect();
     std::thread::spawn(move || {
         std::thread::sleep(threshold);

@@ -36,28 +36,6 @@ pub enum ComputeExecutionDecline {
         resource_format: StorageImageFormat,
         resource_row_bytes: u64,
     },
-    ResidentSampleSourceLayersUnsupported {
-        binding: u32,
-        identity: ComputeStorageResidencyKey,
-        layers: u32,
-    },
-    ResidentSampleResourceLayersUnsupported {
-        binding: u32,
-        identity: ComputeStorageResidencyKey,
-        layers: u32,
-    },
-    ResidentSampleOneDimUnsupported {
-        binding: u32,
-        identity: ComputeStorageResidencyKey,
-    },
-    ResidentSampleArrayedUnsupported {
-        binding: u32,
-        identity: ComputeStorageResidencyKey,
-    },
-    ResidentSampleVolumeUnsupported {
-        binding: u32,
-        identity: ComputeStorageResidencyKey,
-    },
     SeedSkippedWithoutResidency {
         binding: u32,
         width: u32,
@@ -72,11 +50,7 @@ pub enum ComputeExecutionDecline {
         identity: ComputeStorageResidencyKey,
         width: u32,
         height: u32,
-        layers: u32,
         format: StorageImageFormat,
-        one_dim: bool,
-        arrayed: bool,
-        volume: bool,
     },
 }
 
@@ -89,21 +63,6 @@ impl Decline for ComputeExecutionDecline {
             }
             Self::ResidentSampleByteShapeMismatch { .. } => {
                 "vk_compute_exec_resident_sample_byte_shape_mismatch"
-            }
-            Self::ResidentSampleSourceLayersUnsupported { .. } => {
-                "vk_compute_exec_resident_sample_source_layers_unsupported"
-            }
-            Self::ResidentSampleResourceLayersUnsupported { .. } => {
-                "vk_compute_exec_resident_sample_resource_layers_unsupported"
-            }
-            Self::ResidentSampleOneDimUnsupported { .. } => {
-                "vk_compute_exec_resident_sample_1d_unsupported"
-            }
-            Self::ResidentSampleArrayedUnsupported { .. } => {
-                "vk_compute_exec_resident_sample_arrayed_unsupported"
-            }
-            Self::ResidentSampleVolumeUnsupported { .. } => {
-                "vk_compute_exec_resident_sample_volume_unsupported"
             }
             Self::SeedSkippedWithoutResidency { .. } => {
                 "vk_compute_exec_seed_skipped_without_residency"
@@ -170,25 +129,6 @@ impl Decline for ComputeExecutionDecline {
                 ]);
                 fields
             }
-            Self::ResidentSampleSourceLayersUnsupported {
-                binding,
-                identity,
-                layers,
-            }
-            | Self::ResidentSampleResourceLayersUnsupported {
-                binding,
-                identity,
-                layers,
-            } => {
-                let mut fields = binding_identity_fields(*binding, identity);
-                fields.push(("layers", layers.to_string()));
-                fields
-            }
-            Self::ResidentSampleOneDimUnsupported { binding, identity }
-            | Self::ResidentSampleArrayedUnsupported { binding, identity }
-            | Self::ResidentSampleVolumeUnsupported { binding, identity } => {
-                binding_identity_fields(*binding, identity)
-            }
             Self::SeedSkippedWithoutResidency {
                 binding,
                 width,
@@ -211,21 +151,13 @@ impl Decline for ComputeExecutionDecline {
                 identity,
                 width,
                 height,
-                layers,
                 format,
-                one_dim,
-                arrayed,
-                volume,
             } => {
                 let mut fields = residency_fields(identity);
                 fields.extend([
                     ("resource_width", width.to_string()),
                     ("resource_height", height.to_string()),
-                    ("layers", layers.to_string()),
                     ("format", format!("{format:?}")),
-                    ("one_dim", one_dim.to_string()),
-                    ("arrayed", arrayed.to_string()),
-                    ("volume", volume.to_string()),
                 ]);
                 fields
             }
@@ -310,28 +242,6 @@ mod tests {
                 resource_format: StorageImageFormat::Rgba8Unorm,
                 resource_row_bytes: 128,
             },
-            ComputeExecutionDecline::ResidentSampleSourceLayersUnsupported {
-                binding: 32,
-                identity: identity(),
-                layers: 2,
-            },
-            ComputeExecutionDecline::ResidentSampleResourceLayersUnsupported {
-                binding: 32,
-                identity: identity(),
-                layers: 2,
-            },
-            ComputeExecutionDecline::ResidentSampleOneDimUnsupported {
-                binding: 32,
-                identity: identity(),
-            },
-            ComputeExecutionDecline::ResidentSampleArrayedUnsupported {
-                binding: 32,
-                identity: identity(),
-            },
-            ComputeExecutionDecline::ResidentSampleVolumeUnsupported {
-                binding: 32,
-                identity: identity(),
-            },
             ComputeExecutionDecline::SeedSkippedWithoutResidency {
                 binding: 34,
                 width: 64,
@@ -346,11 +256,7 @@ mod tests {
                 identity: identity(),
                 width: 64,
                 height: 32,
-                layers: 1,
                 format: StorageImageFormat::Rgba8Unorm,
-                one_dim: false,
-                arrayed: false,
-                volume: false,
             },
         ]
     }
@@ -374,8 +280,10 @@ mod tests {
         // of a caller-supplied guest window the dispatch would DMA into —
         // alignment, row stride, offset, overflow, window length — and none of
         // them has anything left to validate now that the copy always lands in
-        // a pooled readback the runtime owns.
-        assert_eq!(before, 11, "the compute executor's reason census moved");
+        // a pooled readback the runtime owns. Five more went with the
+        // non-2D image shape: the compute rail stages one flat plane window
+        // per binding and has no slice or depth axis to refuse.
+        assert_eq!(before, 6, "the compute executor's reason census moved");
         assert_eq!(before, slugs.len(), "duplicate compute-execution slug");
     }
 
