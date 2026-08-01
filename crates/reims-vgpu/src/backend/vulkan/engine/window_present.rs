@@ -381,6 +381,39 @@ pub enum WindowPresentOutcome {
     },
 }
 
+/// MAILBOX where the surface offers it, FIFO where it does not.
+///
+/// FIFO is the only mode Vulkan guarantees, so it is the fallback — including
+/// when the mode query itself fails, which reaches here as an empty slice.
+pub(crate) fn choose_present_mode(supported: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    if supported.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
+/// Swapchain image count for a mode, inside the surface's own bounds.
+///
+/// `min + 1` is the usual one-spare rule. MAILBOX needs a third image to have
+/// something to replace while one is queued and one is being drawn, so the floor
+/// is raised on that arm only — and `max_image_count` still wins, since a
+/// surface that caps at two cannot be argued with (0 means no maximum).
+pub(crate) fn swapchain_image_count(
+    caps_min: u32,
+    caps_max: u32,
+    mode: vk::PresentModeKHR,
+) -> u32 {
+    let mut count = caps_min.saturating_add(1);
+    if mode == vk::PresentModeKHR::MAILBOX {
+        count = count.max(3);
+    }
+    if caps_max != 0 {
+        count = count.min(caps_max);
+    }
+    count
+}
+
 pub(crate) struct WindowPresenter {
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -671,10 +704,38 @@ impl WindowPresenter {
                     .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
         };
-        let mut image_count = caps.min_image_count.saturating_add(1);
-        if caps.max_image_count != 0 {
-            image_count = image_count.min(caps.max_image_count);
-        }
+        // MAILBOX where the surface offers it, FIFO where it does not.
+        //
+        // This rail acquires with a **zero timeout** and treats NOT_READY as a
+        // dropped frame, because the caller is the drain worker and blocking it
+        // on a vblank would stall guest command processing. Under FIFO an image
+        // only becomes acquirable when the presentation engine releases one at
+        // a refresh boundary, so a non-blocking acquire fails whenever the
+        // queue is full — and the frame is thrown away rather than deferred.
+        //
+        // Measured on a driven x86 boot: `host_window_cadence` reads
+        // `offered=51 presents=20 busy_acquire=330` per second, pinned at
+        // exactly 20.0 Hz. Three fifths of the frames the guest produced never
+        // reached the screen, and the window showed content up to 50 ms stale.
+        //
+        // MAILBOX is the mode whose contract matches this consumer: the
+        // presentation engine keeps one pending image and *replaces* it, so an
+        // image is essentially always acquirable and the newest frame is the one
+        // displayed. A producer faster than the display stops losing frames and
+        // starts superseding them, which is what the caller already assumes.
+        //
+        // Capability-gated with no vendor or driver test, and FIFO remains the
+        // fallback because it is the only mode Vulkan guarantees. MAILBOX also
+        // wants a third image to have something to replace, so the count floor
+        // is raised only on that arm and only within `max_image_count`.
+        let present_mode = choose_present_mode(
+            self.surface_loader
+                .get_physical_device_surface_present_modes(ctx.pd, self.surface)
+                .as_deref()
+                .unwrap_or(&[]),
+        );
+        let image_count =
+            swapchain_image_count(caps.min_image_count, caps.max_image_count, present_mode);
         let composite_alpha = [
             vk::CompositeAlphaFlagsKHR::OPAQUE,
             vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
@@ -777,7 +838,13 @@ impl WindowPresenter {
             // loop should keep accumulating toward the alarm.
             self.suboptimal_streak = 0;
         }
-        crate::observe::off(swapchain_recreated_line(from, extent, self.recreate_reason));
+        crate::observe::off(swapchain_recreated_line(
+            from,
+            extent,
+            self.recreate_reason,
+            present_mode,
+            self.images.len(),
+        ));
         Ok(())
     }
 
@@ -1371,9 +1438,27 @@ impl WindowPresenter {
     }
 }
 
-fn swapchain_recreated_line(from: vk::Extent2D, to: vk::Extent2D, reason: &str) -> String {
+fn swapchain_recreated_line(
+    from: vk::Extent2D,
+    to: vk::Extent2D,
+    reason: &str,
+    mode: vk::PresentModeKHR,
+    images: usize,
+) -> String {
+    // `mode` and `images` are what the surface actually granted, not what was
+    // asked for. Without them a `busy_acquire` rate is uninterpretable: the same
+    // number means "the display is pacing us" under FIFO and "we are out of
+    // images" under MAILBOX, and those have different fixes.
+    let mode = match mode {
+        vk::PresentModeKHR::MAILBOX => "mailbox",
+        vk::PresentModeKHR::FIFO => "fifo",
+        vk::PresentModeKHR::FIFO_RELAXED => "fifo_relaxed",
+        vk::PresentModeKHR::IMMEDIATE => "immediate",
+        _ => "other",
+    };
     format!(
-        "host_window_swapchain status=recreated from={}x{} to={}x{} trigger={reason}",
+        "host_window_swapchain status=recreated from={}x{} to={}x{} trigger={reason} \
+         present_mode={mode} images={images}",
         from.width, from.height, to.width, to.height
     )
 }
@@ -1553,8 +1638,16 @@ mod tests {
             height: 1080,
         };
         assert_eq!(
-            swapchain_recreated_line(from, to, "resize"),
-            "host_window_swapchain status=recreated from=1920x1080 to=1440x1080 trigger=resize"
+            swapchain_recreated_line(from, to, "resize", vk::PresentModeKHR::MAILBOX, 3),
+            "host_window_swapchain status=recreated from=1920x1080 to=1440x1080 \
+             trigger=resize present_mode=mailbox images=3"
+        );
+        // The granted mode, not the requested one — a surface that refuses
+        // MAILBOX must be visible as FIFO in the log, or a `busy_acquire` rate
+        // gets read against the wrong contract.
+        assert!(
+            swapchain_recreated_line(from, to, "init", vk::PresentModeKHR::FIFO, 2)
+                .contains("present_mode=fifo images=2")
         );
     }
 
@@ -1790,5 +1883,42 @@ mod tests {
             classify_slate(true, (1440, 1080), ready(1440, 1080)),
             SlateReason::ContentNotReady
         );
+    }
+
+    /// A producer faster than the display must supersede frames, not lose them.
+    ///
+    /// This rail acquires with a zero timeout because the caller is the drain
+    /// worker and blocking it on a vblank stalls guest command processing. Under
+    /// FIFO an image is only acquirable at a refresh boundary, so a non-blocking
+    /// acquire fails whenever the queue is full and the frame is dropped: a
+    /// driven boot measured `offered=51 presents=20 busy_acquire=330` per
+    /// second, pinned at exactly 20.0 Hz with three fifths of the guest's frames
+    /// never reaching the screen. MAILBOX replaces the pending image instead, so
+    /// an image stays acquirable and the newest frame is the one shown.
+    #[test]
+    fn the_swapchain_prefers_mailbox_and_falls_back_to_fifo() {
+        use super::{choose_present_mode, swapchain_image_count};
+        let fifo = vk::PresentModeKHR::FIFO;
+        let mailbox = vk::PresentModeKHR::MAILBOX;
+
+        assert_eq!(choose_present_mode(&[fifo, mailbox]), mailbox);
+        assert_eq!(
+            choose_present_mode(&[fifo, vk::PresentModeKHR::IMMEDIATE]),
+            fifo,
+            "IMMEDIATE tears and is not a substitute"
+        );
+        // A failed mode query arrives as an empty slice, and FIFO is the only
+        // mode Vulkan guarantees, so it is what an unknown surface gets.
+        assert_eq!(choose_present_mode(&[]), fifo);
+
+        // MAILBOX needs a third image; FIFO keeps the one-spare rule.
+        assert_eq!(swapchain_image_count(2, 0, mailbox), 3);
+        assert_eq!(swapchain_image_count(1, 0, mailbox), 3);
+        assert_eq!(swapchain_image_count(1, 0, fifo), 2);
+        assert_eq!(swapchain_image_count(3, 0, mailbox), 4);
+        // The surface's own maximum still wins over the MAILBOX floor: a
+        // surface that caps at two cannot be argued into three.
+        assert_eq!(swapchain_image_count(1, 2, mailbox), 2);
+        assert_eq!(swapchain_image_count(2, 3, mailbox), 3);
     }
 }

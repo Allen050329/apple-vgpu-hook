@@ -483,6 +483,24 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
       echo "boot-x86.sh:   direct_frac) is MEANINGLESS on this boot." >&2
     fi
   fi
+  # A display connection that *does* work is not the same as a surface anyone is
+  # looking at, and this warning does not cover the difference. A Wayland or X
+  # compositor throttles a surface that is occluded, minimised, or on another
+  # workspace — which is the normal state of a window opened by an agent-driven
+  # boot with no human at the seat. The result is a present rate pinned to
+  # whatever cadence the compositor grants, and it reads exactly like a device
+  # pacing defect.
+  #
+  # Measured: a boot with a live Wayland socket held `presents=20` per second
+  # exactly, against `offered=51` and `busy_acquire=330`, and was unchanged by
+  # switching the swapchain from FIFO to MAILBOX (`present_mode=mailbox
+  # images=3` confirmed granted in `host_window_swapchain`). A present mode
+  # cannot explain a rate it does not move, so treat a suspiciously round
+  # `present_hz` here as the compositor's number until a human-visible window
+  # says otherwise.
+  echo "boot-x86.sh: NOTE — host-window pacing needs a *visible* window." >&2
+  echo "boot-x86.sh:   An occluded or unfocused surface is throttled by the" >&2
+  echo "boot-x86.sh:   compositor, so host_window_cadence measures that, not us." >&2
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
