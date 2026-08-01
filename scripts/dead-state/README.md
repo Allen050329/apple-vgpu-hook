@@ -30,6 +30,27 @@ reach a scratch crate nobody depends on, so rustc reports exactly what no code
 path reads — and it does so with full knowledge of trait impls, macros, cfg
 arms and generics. The working tree is never modified.
 
+## What it is strong and weak at
+
+**Items — functions, methods, constants, enum variants, type aliases — are
+reliable.** Nothing masks them.
+
+**Fields are one-directional evidence.** A derived impl that is itself used
+counts as a read of every field it touches. `#[derive(Debug)]` is neutralised
+in the scratch tree (stub impls replace it) because `DeviceState` derives it
+and the fail log formats it, which alone kept the field report permanently
+empty. `Clone`, `PartialEq` and `Hash` cannot be neutralised the same way —
+removing them does not compile — so a field on a struct whose `clone()` is
+actually called will not be reported.
+
+So a field hit is strong evidence; an empty field report is not proof. The
+worked example: `PresentState::mapping_id`, written at five sites and read at
+none, was found by hand and never by this script, because `PresentState`
+derives `Clone` and `DeviceState` is cloned.
+`observe::gate::no_present_state_field_is_write_only` covers that one struct
+directly and has no such blind spot; extend that pattern to any other struct
+where this matters.
+
 ## Triage
 
 It is a report, not a gate. Three classes are legitimately unread from Rust and
@@ -45,13 +66,13 @@ Everything else is what this is for. A struct field written at five sites and
 read at none is not documentation — it is state that every author who reads the
 struct has to work out whether some other rail is expected to keep consistent.
 
-## Known limitation
+## Both arms, intersected
 
-Only the `backend-vulkan,host-window` arm is compiled, because that is the arm
-this host can build. An item live only on `backend-metal` will be reported as
-dead here. Check the Metal arm before deleting anything under
-`backend/metal/`:
+An item can be live on one backend and cfg'd out of the other. Every argument
+struct `execute_dispatch_metal` builds reads as dead from the Vulkan arm, and
+there are seventeen of those — enough to bury the real findings.
 
-```sh
-cargo check -p reims-vgpu --target aarch64-apple-darwin --all-targets --features backend-metal
-```
+So the script compiles both `backend-vulkan,host-window` and `backend-metal`
+(the latter cross-checked at `aarch64-apple-darwin`, which needs no Apple SDK
+and no Apple host) and reports only the intersection. It prints how many hits
+each arm suppressed, so a large asymmetry is visible rather than silent.
