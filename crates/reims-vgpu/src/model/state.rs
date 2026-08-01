@@ -1159,23 +1159,6 @@ pub struct HostSurface {
     /// only unique while the entry lives, and this map's entries are removed
     /// and re-created on the routine deferred-Store arm path.
     pub host_gen: u64,
-    /// The mapping incarnation these bytes were produced from, or 0 when this
-    /// entry's key is not a mapping id (the texture_ref and GVA namespaces).
-    ///
-    /// The surface_id namespace is keyed by mapping id alone, so an entry
-    /// outlives the page list it was read out of: nothing in
-    /// `invalidate_mapping_pages` — which clears `page_entries`, bumps
-    /// `map_generation` and retires the contig view and the guest-write token —
-    /// touches this cache. A surface the guest re-points therefore keeps serving
-    /// the previous incarnation's pixels to the present capture, the sampled
-    /// path and the type-11 Load seed, for as long as the geometry matches.
-    ///
-    /// This module's own header already states the failure for a *colliding*
-    /// id — "recycled refs return stale full-frame blacks as multi-bind
-    /// samples". A recycled *incarnation* of one id is the same hazard, and
-    /// `map_generation` is what names it. [`Self::backing`] gives the GVA
-    /// namespace this identity; this field is its peer for the surface rail.
-    pub map_generation_at_store: u32,
     /// Decoded object type that produced a GVA-keyed type-2/3 encode. Zero for
     /// surface/ref caches and for stores that did not record an owner.
     pub producer_object_type: u8,
