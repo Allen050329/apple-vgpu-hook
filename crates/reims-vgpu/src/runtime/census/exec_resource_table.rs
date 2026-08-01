@@ -66,6 +66,25 @@
 //! 3. **`clear_host_valid` arrives 15 423 times per boot.** That is the guest
 //!    saying "I CPU-wrote this resource", delivered once per write and never
 //!    resent, on a path that used to discard it.
+//!
+//! A later boot answered the id-space question the `as_*` split was added for,
+//! over 6 823 records:
+//!
+//! ```text
+//! as_obj 4 936 (72 %)   as_map 1 382 (20 %)   as_tex 0   unresolved 1 285 (19 %)
+//! ```
+//!
+//! **The table names the task's object refs, not mapping ids.** Most records
+//! are resources with no surface state to carry a validity quad — buffers,
+//! heaps, pipelines — which is why a consumer must count "no surface for this
+//! object" apart from "no registry knows this id". `texture_to_mapping`
+//! answered for none of them, so the ref → mapping indirection is not the
+//! bridge between the two spaces on this pathway.
+//!
+//! The overlap is where the meaning is: `as_map` (1 382) tracks `lic_stored`
+//! (1 380) almost exactly. The records that both license a resource and name a
+//! mapping this device holds are the render targets, and they are the ones the
+//! validity state is about.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;

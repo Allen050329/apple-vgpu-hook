@@ -2333,9 +2333,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
                                 miss = miss.saturating_add(1);
                             }
                         }
-                        if miss > 0 {
-                            note_store_route_n("validity_miss_inv", miss as u64);
-                        }
+                        // One counter here, two on the exec side: `pageBacking`
+                        // names mapping ids, so a record this device holds no
+                        // mapping for is already the surprising case. The exec
+                        // table names task object refs, most of which have no
+                        // surface state by construction.
+                        note_store_route_n("validity_miss_inv", miss as u64);
                         let rec0 = cmd.records.first();
                         let oid = rec0.map(|r| r.object_id).unwrap_or(0);
                         let flags = rec0.map(|r| r.flags).unwrap_or(0);

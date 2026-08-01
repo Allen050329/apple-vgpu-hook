@@ -355,25 +355,43 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 ///
 /// The table is the guest's own statement about who owns each resource's
 /// authoritative bytes, and `clear_host_valid` is its consume-once notification
-/// that it CPU-wrote one — delivered here and nowhere else. The refusal to
-/// resolve a record is fail-visible rather than silent, because a record the
-/// device cannot apply is guest authorisation it is about to ignore.
+/// that it CPU-wrote one — delivered here and nowhere else.
+///
+/// # What "did not apply" means, in two kinds
+///
+/// The table's ids are the **task's object-ref space**, not the mapping space.
+/// Measured over one boot's 6 823 records: 72 % are live object refs, 20 % are
+/// mappings, 19 % resolve nowhere, and `texture_to_mapping` answered for exactly
+/// none. So most records name resources that have no surface state to apply a
+/// validity quad to — buffers, heaps, pipelines — and that is the protocol
+/// working, not a loss.
+///
+/// The two are therefore counted apart. `validity_no_surface` is the expected
+/// majority; `validity_unknown_object` is a record naming an id no registry has
+/// heard of, which is the one that would mean the id space is not what the
+/// decode assumes. Merging them would bury the second under the first at roughly
+/// four to one.
 fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
-    let mut missed = 0u32;
+    let mut no_surface = 0u32;
+    let mut unknown = 0u32;
     for d in descs {
         let outcome = apply(state, task_id, d.object_id, d.ops, ValiditySite::ExecTable);
-        if outcome.missed {
-            missed = missed.saturating_add(1);
+        if !outcome.missed {
+            continue;
+        }
+        if state.objects.contains(&(task_id, d.object_id)) {
+            no_surface = no_surface.saturating_add(1);
+        } else {
+            unknown = unknown.saturating_add(1);
         }
     }
-    if missed > 0 {
-        // Rate-summarised on the same per-second window as the census, because
-        // ~5 % of records name resources this device holds no mapping for and a
-        // per-record line would bury the fail view. The census reports the same
-        // population by registry (`unresolved` / `as_map` / `as_tex` / `as_obj`).
-        crate::runtime::drain::note_store_route_n("validity_miss_exec", missed as u64);
-    }
+    // Rate-summarised on the same per-second window as the census: this is the
+    // hottest opcode in the device and a per-record line would bury the fail
+    // view. The census reports the same population by registry
+    // (`unresolved` / `as_map` / `as_tex` / `as_obj`).
+    crate::runtime::drain::note_store_route_n("validity_no_surface", no_surface as u64);
+    crate::runtime::drain::note_store_route_n("validity_unknown_object", unknown as u64);
 }
 
 /// Feed one submission's resource table to the per-window census, together with
