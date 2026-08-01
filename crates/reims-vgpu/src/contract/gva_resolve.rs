@@ -241,16 +241,6 @@ pub fn validate_geometry(geometry: &Geometry) -> ResolveStatus {
     ResolveStatus::Ok
 }
 
-fn pfn_to_gpa(geometry: &Geometry, pfn: u32) -> Option<u64> {
-    if geometry.page_shift >= 64 {
-        return None;
-    }
-    if (pfn as u64) > (u64::MAX >> geometry.page_shift) {
-        return None;
-    }
-    Some((pfn as u64) << geometry.page_shift)
-}
-
 fn read_u32_phys(reader: &dyn PhysReader, gpa: u64) -> Option<u32> {
     let mut bytes = [0u8; 4];
     if !reader.read_phys(gpa, &mut bytes) {
@@ -317,8 +307,7 @@ pub fn read_task_root(
     if task.directory_pfn == 0 {
         return Err(ResolveStatus::ErrNoDirectory);
     }
-    let dir_gpa =
-        pfn_to_gpa(geometry, task.directory_pfn).ok_or(ResolveStatus::ErrAddressOutOfRange)?;
+    let dir_gpa = pfn_to_gpa(task.directory_pfn, geometry.page_shift);
     let root_pfn = read_u32_phys(reader, dir_gpa + DIRECTORY_ROOT_PFN as u64)
         .ok_or(ResolveStatus::ErrDirectoryRead)?;
     let depth = read_u32_phys(reader, dir_gpa + DIRECTORY_DEPTH as u64)
@@ -374,10 +363,6 @@ pub fn translate_root(
         out.status = ResolveStatus::Ok;
         out.cache_status = CacheStatus::Hit;
         out.gpa_page = cached_gpa_page;
-        if u64::MAX - cached_gpa_page < page_off {
-            out.status = ResolveStatus::ErrAddressOutOfRange;
-            return out;
-        }
         out.gpa = cached_gpa_page + page_off;
         out.leaf_pfn = (cached_gpa_page >> geometry.page_shift) as u32;
         return out;
@@ -388,24 +373,17 @@ pub fn translate_root(
         CacheStatus::Miss
     };
 
+    // Every level reads one PTE the same way and descends into the PFN it
+    // names; the PFN the last level names is the leaf. `depth` is in `1..=4`
+    // here, so the loop always runs at least once and `current_pfn` after it is
+    // always a PFN some PTE supplied, never `root_pfn`.
     let page_index = out.gva_page_index;
     let mut current_pfn = root_pfn;
     for level in 0..depth {
         let shift = (depth - 1 - level) * geometry.index_bits;
         let entry_idx = ((page_index >> shift) & geometry.index_mask as u64) as u32;
-        let table_gpa = match pfn_to_gpa(geometry, current_pfn) {
-            Some(v) => v,
-            None => {
-                out.status = ResolveStatus::ErrAddressOutOfRange;
-                return out;
-            }
-        };
-        let entry_offset = (entry_idx as u64) * (geometry.pte_size as u64);
-        if u64::MAX - table_gpa < entry_offset {
-            out.status = ResolveStatus::ErrAddressOutOfRange;
-            return out;
-        }
-        let pte_gpa = table_gpa + entry_offset;
+        let table_gpa = pfn_to_gpa(current_pfn, geometry.page_shift);
+        let pte_gpa = table_gpa + (entry_idx as u64) * (geometry.pte_size as u64);
         out.level = level;
         out.entry_index = entry_idx;
         let pte = match read_u32_phys(reader, pte_gpa) {
@@ -425,31 +403,18 @@ pub fn translate_root(
             };
             return out;
         }
-        if level + 1 == depth {
-            let gpa_page = match pfn_to_gpa(geometry, next_pfn) {
-                Some(v) => v,
-                None => {
-                    out.status = ResolveStatus::ErrAddressOutOfRange;
-                    return out;
-                }
-            };
-            if u64::MAX - gpa_page < page_off {
-                out.status = ResolveStatus::ErrAddressOutOfRange;
-                return out;
-            }
-            out.status = ResolveStatus::Ok;
-            out.leaf_pfn = next_pfn;
-            out.gpa_page = gpa_page;
-            out.gpa = gpa_page + page_off;
-            if let Some(c) = cache {
-                cache_insert(c, geometry, root_pfn, depth, page_index, gpa_page);
-                out.cache_status = CacheStatus::MissInserted;
-            }
-            return out;
-        }
         current_pfn = next_pfn;
     }
-    out.status = ResolveStatus::ErrZeroDepth;
+
+    let gpa_page = pfn_to_gpa(current_pfn, geometry.page_shift);
+    out.status = ResolveStatus::Ok;
+    out.leaf_pfn = current_pfn;
+    out.gpa_page = gpa_page;
+    out.gpa = gpa_page + page_off;
+    if let Some(c) = cache {
+        cache_insert(c, geometry, root_pfn, depth, page_index, gpa_page);
+        out.cache_status = CacheStatus::MissInserted;
+    }
     out
 }
 
@@ -546,6 +511,83 @@ mod tests {
         let t2 = translate_root(&r, &ARM64E_GEOMETRY, 1, 1, 0x200, Some(&mut cache));
         assert_eq!(t2.cache_status, CacheStatus::Hit);
         assert_eq!(t2.gpa, ((5u64) << PAGE_SHIFT_ARM64E) + 0x200);
+    }
+
+    /// A full-depth walk descends every level and takes the leaf from the last
+    /// one.
+    ///
+    /// Every level of the walk reads its PTE identically, so the leaf is just
+    /// the PFN the final level named. Nothing tested a walk deeper than one
+    /// level before, which left that "just" unchecked: a walk that stopped one
+    /// level early, or that took the leaf from the table PFN instead of the
+    /// entry, resolves `depth == 1` correctly and every deeper `depth` wrong.
+    /// The four indices here are distinct so an off-by-one level lands on the
+    /// wrong table and reads nothing.
+    #[test]
+    fn a_four_level_walk_takes_its_leaf_from_the_deepest_entry() {
+        const IDX: [u64; 4] = [1, 2, 3, 4];
+        const TABLE_PFN: [u32; 4] = [10, 11, 12, 13];
+        const LEAF_PFN: u32 = 0x555;
+        const PAGE_OFF: u64 = 0x1234;
+
+        let g = ARM64E_GEOMETRY;
+        let page_index = (IDX[0] << 36) | (IDX[1] << 24) | (IDX[2] << 12) | IDX[3];
+
+        let mut r = MapReader::new();
+        for level in 0..4usize {
+            let next = if level == 3 {
+                // Flag bit set: the walk must mask it off, not fold it into the PFN.
+                PTE_FLAG_MASK | LEAF_PFN
+            } else {
+                TABLE_PFN[level + 1]
+            };
+            let tbl = (TABLE_PFN[level] as u64) << g.page_shift;
+            r.put_u32(tbl + IDX[level] * PTE_SIZE as u64, next);
+        }
+
+        let gva = (page_index << g.page_shift) | PAGE_OFF;
+        let t = translate_root(&r, &g, TABLE_PFN[0], 4, gva, None);
+
+        assert_eq!(t.status, ResolveStatus::Ok);
+        assert_eq!(t.leaf_pfn, LEAF_PFN);
+        assert_eq!(t.gpa, ((LEAF_PFN as u64) << g.page_shift) + PAGE_OFF);
+        assert_eq!(t.gpa_page, (LEAF_PFN as u64) << g.page_shift);
+        assert_eq!(t.level, 3, "the last level walked");
+        assert_eq!(t.entry_index as u64, IDX[3]);
+        assert_eq!(t.raw_pte, PTE_FLAG_MASK | LEAF_PFN);
+    }
+
+    /// No address a walk can form overflows, at any geometry `validate_geometry`
+    /// accepts.
+    ///
+    /// The walk used to carry five `u64::MAX - x < y` guards and a fallible
+    /// PFN-to-GPA helper, all of which were dead: a PFN is a `u32` and the
+    /// accepted page shifts are 12 and 14, so the widest address the walk can
+    /// name is under 2^46 and every addend is under 2^17. Those guards are gone,
+    /// which makes this the only thing holding the premise. It fails if a
+    /// geometry with a wider shift is ever accepted, which is exactly when the
+    /// guards would have needed to come back.
+    #[test]
+    fn accepted_geometries_cannot_form_an_address_that_overflows() {
+        for g in [ARM64E_GEOMETRY, X86_64_GEOMETRY] {
+            assert_eq!(validate_geometry(&g), ResolveStatus::Ok);
+            // The widest table or leaf base a `u32` PFN can name.
+            let max_base = pfn_to_gpa(u32::MAX, g.page_shift);
+            let max_entry_off = (g.index_mask as u64) * (g.pte_size as u64);
+            let max_page_off = g.page_offset_mask as u64;
+            assert!(max_base.checked_add(max_entry_off).is_some());
+            assert!(max_base.checked_add(max_page_off).is_some());
+        }
+
+        // And nothing wider is accepted. The shift alone decides this, so the
+        // rest of the geometry is left consistent-for-arm64e on purpose.
+        for shift in 0..64u32 {
+            let mut g = ARM64E_GEOMETRY;
+            g.page_shift = shift;
+            if validate_geometry(&g) == ResolveStatus::Ok {
+                assert_eq!(shift, PAGE_SHIFT_ARM64E, "unexpected page shift accepted");
+            }
+        }
     }
 
     #[test]
