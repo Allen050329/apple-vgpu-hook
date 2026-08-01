@@ -1984,6 +1984,85 @@ fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
     assert_eq!(landed, &frame[..], "the elided copy must change no byte");
 }
 
+/// A writeback whose caller owns the frame must publish it, not duplicate it.
+///
+/// Landing the frame in guest pages and publishing it to the host cache are two
+/// different obligations over the same bytes, and only the first one is a copy.
+/// The cache stores its frames behind an `Arc` so an entry and a deferred window
+/// can name one allocation; a caller arriving with one and still paying a
+/// whole-frame memcpy — 1.21 ms per flush on the composite, more than landing
+/// the bytes costs — is the copy this asserts is gone.
+///
+/// Pointer identity is the assertion because it is the only thing that
+/// distinguishes publishing from copying: the bytes are equal either way.
+#[test]
+fn an_owned_writeback_publishes_its_frame_to_the_cache_without_copying_it() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write::write_bgra8_owned;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let (w, h) = (64u32, 16u32);
+    let stride = w * 4;
+    let need = (stride as usize) * (h as usize);
+    let pfn = 0x480u32;
+    host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, 0x8000, 0);
+    assert!(state.map_surface(7));
+    {
+        let m = state.mappings.get_mut(&7).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 7;
+        m.page_entries = vec![(pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
+    }
+    assert!(state.set_mapping_geom(7, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+    let frame = std::sync::Arc::new((0..need).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+    assert!(write_bgra8_owned(
+        &mut state,
+        &mut host,
+        7,
+        &frame,
+        stride,
+        w,
+        h,
+        &[]
+    ));
+
+    let published = crate::runtime::surface_cache::get(&state, 7, w, h)
+        .expect("a non-skipping writeback publishes its frame");
+    assert_eq!(
+        published.as_ptr(),
+        frame.as_ptr(),
+        "the caller's allocation must be published, not duplicated"
+    );
+    assert_eq!(published, &frame[..], "and it must be the frame written");
+
+    // A pitch the cache's contract does not describe must not be shared: the
+    // entry promises a tight frame at its geometry, and handing a padded
+    // allocation to later readers as though it were one is the failure the
+    // guard exists for.
+    let padded_stride = stride + 4;
+    let padded = std::sync::Arc::new(vec![0x5Au8; (padded_stride as usize) * (h as usize)]);
+    assert!(write_bgra8_owned(
+        &mut state,
+        &mut host,
+        7,
+        &padded,
+        padded_stride,
+        w,
+        h,
+        &[]
+    ));
+    let repacked = crate::runtime::surface_cache::get(&state, 7, w, h).unwrap();
+    assert_ne!(
+        repacked.as_ptr(),
+        padded.as_ptr(),
+        "a padded frame must be repacked rather than shared"
+    );
+    assert!(repacked.iter().all(|&b| b == 0x5A), "and must be correct");
+}
+
 /// A cache entry that is replaced every frame must not be reallocated every
 /// frame.
 ///

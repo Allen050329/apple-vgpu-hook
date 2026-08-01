@@ -1799,10 +1799,15 @@ fn flush_render_one<M: HostMemory + HostOps>(
     // Set when the frame below came *out of* a resident image, so the write can
     // hand the currency witness back to it. See the re-stamp after the write.
     let mut flushed_from_resident: Option<crate::backend::vulkan::engine::TargetIdentity> = None;
-    let frame: std::borrow::Cow<'_, [u8]> = match source {
-        crate::model::RenderWindowSource::Owned(bytes) => {
-            std::borrow::Cow::Borrowed(bytes.as_slice())
-        }
+    // Owned rather than borrowed, and shared rather than owned outright: the
+    // writeback's tail publishes this frame to the surface cache, and a cache
+    // entry stores its frame behind an `Arc` precisely so that it and a window
+    // can name one allocation. Handing the frame down as an `Arc` therefore ends
+    // in one `Arc` clone where a borrow ended in a whole-frame copy — 1.21 ms of
+    // memcpy per flush on the composite, about 100 times a second. `Owned`
+    // already has one to clone; `Resident` wraps the readback it just took.
+    let frame: std::sync::Arc<Vec<u8>> = match source {
+        crate::model::RenderWindowSource::Owned(bytes) => bytes.clone(),
         crate::model::RenderWindowSource::Resident { epoch } => {
             use crate::backend::vulkan::engine::ResidentContent;
             // The close of the interval `note_resident_window_armed` opened at
@@ -1852,7 +1857,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
                     // scanout order. Reading the reported order rather than
                     // asserting one is what keeps a future format change from
                     // landing R and B exchanged in guest memory.
-                    std::borrow::Cow::Owned(rb.into_bgra8())
+                    std::sync::Arc::new(rb.into_bgra8())
                 }
                 Err(e) => {
                     crate::backend::vulkan::engine::unpin_resident_target(&identity);
@@ -1866,14 +1871,13 @@ fn flush_render_one<M: HostMemory + HostOps>(
             }
         }
     };
-    let bgra: &[u8] = frame.as_ref();
     let preserve = render_flush_guest_written_ranges(state, host, key);
     let write_started = std::time::Instant::now();
-    let ok = crate::runtime::mapping_write::write_bgra8_skipping(
+    let ok = crate::runtime::mapping_write::write_bgra8_owned(
         state,
         host,
         key.mapping_id,
-        bgra,
+        &frame,
         key.width.saturating_mul(4),
         key.width,
         key.height,
@@ -1930,7 +1934,7 @@ fn flush_render_one<M: HostMemory + HostOps>(
         key.height,
         key.pixel_format,
         ok as u8,
-        bgra.len(),
+        frame.len(),
         started.elapsed().as_micros()
     ));
     ok

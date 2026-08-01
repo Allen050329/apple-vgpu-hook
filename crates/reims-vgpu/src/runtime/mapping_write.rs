@@ -358,6 +358,71 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     height: u32,
     skip: SkipRanges<'_>,
 ) -> bool {
+    write_bgra8_inner(
+        state, host, mapping_id, src, None, src_stride, width, height, skip,
+    )
+}
+
+/// [`write_bgra8_skipping`] for a caller that owns its frame behind an `Arc`.
+///
+/// The tail of every non-skipping writeback publishes the frame to
+/// [`crate::runtime::surface_cache`], and a caller holding only a borrow has to
+/// build a second whole-frame buffer for it to keep. On the 8.29 MB composite
+/// that copy costs 1.21 ms about 100 times a second — more than landing the same
+/// bytes in the guest's own pages does. The cache already stores its frames
+/// behind an `Arc` so that an entry and a deferred window can name one
+/// allocation, so a caller that arrives holding one can publish it rather than
+/// duplicate it.
+///
+/// The sharing conditions are checked rather than assumed, because the cache's
+/// contract is a tight BGRA8 frame at the entry's geometry and an allocation that
+/// is not one would be handed to every later reader as though it were: the
+/// pointer has to be the one the rest of this write read from, the pitch has to
+/// be the packed row length, and the allocation has to cover the whole frame.
+/// Anything else takes the copying publish.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, plus the ranges its owner may not overwrite"
+)]
+pub fn write_bgra8_owned<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &std::sync::Arc<Vec<u8>>,
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
+    write_bgra8_inner(
+        state,
+        host,
+        mapping_id,
+        src.as_slice(),
+        Some(src),
+        src_stride,
+        width,
+        height,
+        skip,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the geometry the frame is in, its owner when it has one, plus the \
+              ranges that owner may not overwrite"
+)]
+fn write_bgra8_inner<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mapping_id: u32,
+    src: &[u8],
+    shared: Option<&std::sync::Arc<Vec<u8>>>,
+    src_stride: u32,
+    width: u32,
+    height: u32,
+    skip: SkipRanges<'_>,
+) -> bool {
     if width == 0
         || height == 0
         || width > MAX_SCANOUT_DIM
@@ -642,7 +707,19 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         return true;
     }
     let cache_started = std::time::Instant::now();
-    crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride);
+    let tight_frame = (mw as usize)
+        .saturating_mul(mh as usize)
+        .saturating_mul(RGBA8_BPP as usize);
+    match shared.filter(|owner| {
+        src_stride == mw.saturating_mul(RGBA8_BPP)
+            && owner.len() >= tight_frame
+            && std::ptr::eq(owner.as_ptr(), src.as_ptr())
+    }) {
+        Some(owner) => {
+            crate::runtime::surface_cache::store_shared(state, mapping_id, mw, mh, owner.clone())
+        }
+        None => crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride),
+    }
     note_surface_write_phase(
         SurfaceWritePhase::Cache,
         cache_started.elapsed().as_micros() as u64,
