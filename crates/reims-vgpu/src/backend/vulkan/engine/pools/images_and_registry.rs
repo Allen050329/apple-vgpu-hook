@@ -680,6 +680,32 @@ impl ResourcePools {
     /// must dispose it deferred (`DeferredHandle::Image`) after submit — the CB
     /// still references it until its fence signals. Depth is never read back, so
     /// no TRANSFER_SRC usage.
+    ///
+    /// # This is the one target that never recycles, and it allocates the most
+    ///
+    /// Every sibling allocator here reuses before allocating: `registry_ensure`
+    /// and the MRT secondary path both take a recycled image+memory+view of
+    /// identical geometry and format first, which their own comments call
+    /// collapsing "the per-frame realloc storm". Depth does not. `exec.rs`
+    /// creates one per draw that carries depth state and disposes it at the end
+    /// of that same draw, so the storm those comments describe is still running
+    /// on this path.
+    ///
+    /// One driven x86/Vulkan boot — Chess, Maps, the WebGL aquarium,
+    /// page-downs, a title-bar drag, apple.com — read `vk_alloc_sites
+    /// transient_depth=5374:21225`: 5374 `vkAllocateMemory` calls totalling
+    /// ~21 GiB, against `slab_block=41:2568` for every resident color target in
+    /// the same boot. Two orders of magnitude more allocations for the
+    /// attachment whose contents are thrown away.
+    ///
+    /// The shape is favourable: a depth image depends only on `(width, height,
+    /// with_stencil)` plus the device's chosen format, so a driven session has
+    /// one or two distinct configurations, not thousands. The reason to be
+    /// careful is that this engine already carries three separate recycle pools
+    /// — resident targets, sampled images, transient compute storage — and a
+    /// fourth would be more mechanism, not less. The change worth making is one
+    /// recycle discipline that the depth path also uses, not a depth pool
+    /// beside the others.
     pub(crate) unsafe fn create_transient_depth(
         &mut self,
         ctx: &DeviceContext,
