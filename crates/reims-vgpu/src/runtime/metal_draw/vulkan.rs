@@ -4656,12 +4656,45 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // fresh bytes.
         if !chain_load_from_target && gpu_only_content_allowed {
             if let Some(c0) = req.colors.first() {
-                if c0.load_action == PASS_LOAD_ACTION_LOAD
+                // Denominator, taken before the window test rather than inside
+                // it. Both slugs below sit past five conditions, so a zero on
+                // the pair cannot say whether the guest never issues this shape
+                // of draw or issues it and no deferred window is open at the
+                // time. Those are different facts and the pair alone cannot
+                // tell them apart — the same blindness `a522d05` found on the
+                // MRT rail. `xpass_c0_not_gva_load` proves this probe runs.
+                //
+                // First reading, driven x86/Vulkan boot:
+                //
+                //   xpass_c0_not_gva_load         4859
+                //   xpass_c0_gva_load_no_window      0
+                //   xpass_c0_gva_load_window_open    0
+                //
+                // (`gva_deferred` 2508 the same boot, so the window rail itself
+                // is busy.) Every draw that reaches this gate has a colour0 that
+                // is not a seedless LOAD'd GVA target — so the block is stopped
+                // one level above the window test, by the request shape. The
+                // reading is consistent with the resident-chain rail already
+                // owning this case: a serialized GVA pass sets
+                // `chain_from_resident` on records 2.., which sets
+                // `chain_load_from_target` and skips this gate entirely. If that
+                // holds on a second boot, this is a second mechanism for
+                // something the first carries in full, and the `else` flush
+                // below is the only part that would need a home.
+                let c0_is_seedless_gva_load = c0.load_action == PASS_LOAD_ACTION_LOAD
                     && c0.mapping_id == 0
                     && c0.target_gva != 0
-                    && c0.target_seed_rgba.is_none()
-                    && state.gva_deferred_flush.contains_key(&c0.target_gva)
-                {
+                    && c0.target_seed_rgba.is_none();
+                let window_open =
+                    c0_is_seedless_gva_load && state.gva_deferred_flush.contains_key(&c0.target_gva);
+                crate::runtime::drain::note_store_route(if !c0_is_seedless_gva_load {
+                    "xpass_c0_not_gva_load"
+                } else if !window_open {
+                    "xpass_c0_gva_load_no_window"
+                } else {
+                    "xpass_c0_gva_load_window_open"
+                });
+                if window_open {
                     let entry_geom = state
                         .gva_deferred_flush
                         .get(&c0.target_gva)
@@ -4694,15 +4727,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // sides of one window disagreeing about whether it still
                     // belongs to its address. Same question, same helper.
                     //
-                    // **Measured, and it never fires.** One 14-round Finder
-                    // recomposite boot: `gva_xpass_load_same_alloc` 3142,
-                    // `gva_xpass_load_realloc` **0**. So a deferred GVA window
-                    // whose address has been handed to another allocation is
-                    // not something this rail actually sees, and closing the
-                    // asymmetry changed no frame. It stays because the two
-                    // sides of one window disagreeing is a defect whether or
-                    // not the guest currently exercises it, and because a zero
-                    // with a denominator is the only way to say so.
+                    // **Unmeasured, and a previous comment here said otherwise.**
+                    // It claimed "one 14-round Finder recomposite boot:
+                    // `gva_xpass_load_same_alloc` 3142, `gva_xpass_load_realloc`
+                    // 0" and reasoned from it. Neither slug appears anywhere in
+                    // the always-on log, across every boot it holds, including
+                    // driven ones aimed at that same workload — and
+                    // `note_store_route` has no allowlist, so an absent slug was
+                    // never emitted. The 3142 cannot be reproduced; treat it as
+                    // withdrawn rather than as evidence.
+                    //
+                    // What is true is that the drift check costs nothing when it
+                    // never fires and that the two sides of one window
+                    // disagreeing about whether it still belongs to its address
+                    // is a defect whether or not the guest exercises it. The
+                    // denominator above is what will say which. Until it reads
+                    // non-zero, nothing here is measured.
                     let window_is_still_ours = state
                         .gva_deferred_flush
                         .get(&c0.target_gva)
