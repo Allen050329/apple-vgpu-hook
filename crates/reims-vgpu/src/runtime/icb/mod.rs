@@ -35,8 +35,9 @@ use crate::runtime::decode::resource::{
     ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS,
     ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED, ICB_CMD_TYPE_DRAW_INDEXED_PATCHES,
     ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS, ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES,
-    ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN, ICB_DRAW_PATCHES_ARGS_LEN,
-    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE, OBJECT_TYPE_TYPE7,
+    ICB_CONCURRENT_DISPATCH_ARGS_LEN, ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN,
+    ICB_DRAW_PATCHES_ARGS_LEN, ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE,
+    OBJECT_TYPE_TYPE7,
 }; // ICB_TG_MEMORY_STRIDE: object + kernel TG length tables
 #[cfg(test)]
 use crate::runtime::decode::resource::{
@@ -301,37 +302,60 @@ pub enum IcbRenderDraw {
         base_instance: u64,
         tessellation_factor: IcbTessellationFactor,
     },
-    /// command type `0x100` — drawMeshThreads.
-    ///
-    /// Wire: three MTLSize as 3×u64 each at `commandArgumentsOffset` (size
-    /// `0x48` from host `setupCommandLayout`). Field order matches Metal SPI
-    /// `MTLIndirectDrawMeshThreadsArguments`: threadsPerGrid @0, object TG
-    /// @0x18, mesh TG @0x30. Fill IMPs are stubs; layout is RE'd from
-    /// setupCommandLayout + concurrent-dispatch packing + SPI field order.
-    MeshThreads {
-        threads_x: u32,
-        threads_y: u32,
-        threads_z: u32,
-        object_tg_x: u32,
-        object_tg_y: u32,
-        object_tg_z: u32,
-        mesh_tg_x: u32,
-        mesh_tg_y: u32,
-        mesh_tg_z: u32,
-    },
-    /// command type `0x80` — drawMeshThreadgroups (same 0x48 args layout;
-    /// first MTLSize is threadgroupsPerGrid).
-    MeshThreadgroups {
-        threadgroups_x: u32,
-        threadgroups_y: u32,
-        threadgroups_z: u32,
-        object_tg_x: u32,
-        object_tg_y: u32,
-        object_tg_z: u32,
-        mesh_tg_x: u32,
-        mesh_tg_y: u32,
-        mesh_tg_z: u32,
-    },
+    /// command type `0x100` — drawMeshThreads. `grid` is threadsPerGrid.
+    MeshThreads(IcbMeshDraw),
+    /// command type `0x80` — drawMeshThreadgroups. `grid` is
+    /// threadgroupsPerGrid.
+    MeshThreadgroups(IcbMeshDraw),
+}
+
+/// The record both mesh draw commands serialize.
+///
+/// Wire: three MTLSize as 3×u64 each at `commandArgumentsOffset`, total
+/// [`ICB_DRAW_MESH_ARGS_LEN`] (`0x48` from host `setupCommandLayout`). Field
+/// order matches Metal SPI `MTLIndirectDrawMesh*Arguments` — grid @0, object TG
+/// @0x18, mesh TG @0x30. Fill IMPs are stubs; layout is RE'd from
+/// setupCommandLayout + concurrent-dispatch packing + SPI field order.
+///
+/// `drawMeshThreads` (`0x100`) and `drawMeshThreadgroups` (`0x80`) write byte-
+/// identical records; the only difference is what the first MTLSize counts,
+/// which the two [`IcbRenderDraw`] variants carry. One record, two meanings.
+#[derive(Clone, Copy, Debug)]
+pub struct IcbMeshDraw {
+    /// threadsPerGrid or threadgroupsPerGrid, per the owning variant.
+    pub grid: [u32; 3],
+    pub object_tg: [u32; 3],
+    pub mesh_tg: [u32; 3],
+}
+
+impl IcbMeshDraw {
+    /// Read the nine u64 dimensions at `args` within `slot`. The caller has
+    /// already proved `args + ICB_DRAW_MESH_ARGS_LEN <= slot.len()`.
+    fn decode(slot: &[u8], args: usize) -> Self {
+        let at = |off: usize| ld64(&slot[args + off..]) as u32;
+        Self {
+            grid: [at(0), at(8), at(0x10)],
+            object_tg: [at(0x18), at(0x20), at(0x28)],
+            mesh_tg: [at(0x30), at(0x38), at(0x40)],
+        }
+    }
+
+    /// Write the nine dimensions at `args` within `slot`. The caller has
+    /// already proved `args + ICB_DRAW_MESH_ARGS_LEN <= size`. Test-only, like
+    /// its only caller [`encode_render_command_slot`].
+    #[cfg(test)]
+    fn encode(&self, slot: &mut [u8], args: usize) {
+        use crate::contract::endian::st64;
+        for (i, v) in self
+            .grid
+            .iter()
+            .chain(&self.object_tg)
+            .chain(&self.mesh_tg)
+            .enumerate()
+        {
+            st64(&mut slot[args + i * 8..], u64::from(*v));
+        }
+    }
 }
 
 /// Arguments for product-path fill of one render command slot.
@@ -374,32 +398,39 @@ pub fn decode_compute_command_slot(
         return Ok(None);
     }
     let dispatch = match cmd_type {
-        ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS => {
+        ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS
+        | ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS => {
+            // Both commands serialize the same two MTLSize (grid, threadgroup)
+            // as 6xu64; only what the first counts differs.
+            let threadgroups = cmd_type == ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS;
             let args = layout.command_arguments_offset as usize;
-            if args + 0x30 > slot.len() {
-                return Err(IcbStatus::Args("icb_dcs_tg_args_oob"));
+            if args + ICB_CONCURRENT_DISPATCH_ARGS_LEN > slot.len() {
+                return Err(IcbStatus::Args(if threadgroups {
+                    "icb_dcs_tg_args_oob"
+                } else {
+                    "icb_dcs_threads_args_oob"
+                }));
             }
-            IcbFillDispatch::ConcurrentThreadgroups {
-                grid_x: ld64(&slot[args..]) as u32,
-                grid_y: ld64(&slot[args + 8..]) as u32,
-                grid_z: ld64(&slot[args + 16..]) as u32,
-                tg_x: ld64(&slot[args + 24..]) as u32,
-                tg_y: ld64(&slot[args + 32..]) as u32,
-                tg_z: ld64(&slot[args + 40..]) as u32,
-            }
-        }
-        ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS => {
-            let args = layout.command_arguments_offset as usize;
-            if args + 0x30 > slot.len() {
-                return Err(IcbStatus::Args("icb_dcs_threads_args_oob"));
-            }
-            IcbFillDispatch::ConcurrentThreads {
-                threads_x: ld64(&slot[args..]) as u32,
-                threads_y: ld64(&slot[args + 8..]) as u32,
-                threads_z: ld64(&slot[args + 16..]) as u32,
-                tg_x: ld64(&slot[args + 24..]) as u32,
-                tg_y: ld64(&slot[args + 32..]) as u32,
-                tg_z: ld64(&slot[args + 40..]) as u32,
+            let d = |off: usize| ld64(&slot[args + off..]) as u32;
+            let (x, y, z, tg_x, tg_y, tg_z) = (d(0), d(8), d(16), d(24), d(32), d(40));
+            if threadgroups {
+                IcbFillDispatch::ConcurrentThreadgroups {
+                    grid_x: x,
+                    grid_y: y,
+                    grid_z: z,
+                    tg_x,
+                    tg_y,
+                    tg_z,
+                }
+            } else {
+                IcbFillDispatch::ConcurrentThreads {
+                    threads_x: x,
+                    threads_y: y,
+                    threads_z: z,
+                    tg_x,
+                    tg_y,
+                    tg_z,
+                }
             }
         }
         _ => return Err(IcbStatus::Args("icb_dcs_unknown_command_type")),
@@ -694,37 +725,20 @@ pub fn decode_render_command_slot(
                 tessellation_factor,
             }
         }
-        ICB_CMD_TYPE_DRAW_MESH_THREADS => {
-            // Three MTLSize (3×u64): threadsPerGrid @0, object TG @0x18, mesh TG @0x30.
+        ICB_CMD_TYPE_DRAW_MESH_THREADS | ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS => {
+            let threads = cmd_type == ICB_CMD_TYPE_DRAW_MESH_THREADS;
             if args + ICB_DRAW_MESH_ARGS_LEN as usize > slot.len() {
-                return Err(IcbStatus::Args("icb_drs_mesh_threads_args_oob"));
+                return Err(IcbStatus::Args(if threads {
+                    "icb_drs_mesh_threads_args_oob"
+                } else {
+                    "icb_drs_mesh_threadgroups_args_oob"
+                }));
             }
-            IcbRenderDraw::MeshThreads {
-                threads_x: ld64(&slot[args..]) as u32,
-                threads_y: ld64(&slot[args + 8..]) as u32,
-                threads_z: ld64(&slot[args + 16..]) as u32,
-                object_tg_x: ld64(&slot[args + 0x18..]) as u32,
-                object_tg_y: ld64(&slot[args + 0x20..]) as u32,
-                object_tg_z: ld64(&slot[args + 0x28..]) as u32,
-                mesh_tg_x: ld64(&slot[args + 0x30..]) as u32,
-                mesh_tg_y: ld64(&slot[args + 0x38..]) as u32,
-                mesh_tg_z: ld64(&slot[args + 0x40..]) as u32,
-            }
-        }
-        ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS => {
-            if args + ICB_DRAW_MESH_ARGS_LEN as usize > slot.len() {
-                return Err(IcbStatus::Args("icb_drs_mesh_threadgroups_args_oob"));
-            }
-            IcbRenderDraw::MeshThreadgroups {
-                threadgroups_x: ld64(&slot[args..]) as u32,
-                threadgroups_y: ld64(&slot[args + 8..]) as u32,
-                threadgroups_z: ld64(&slot[args + 16..]) as u32,
-                object_tg_x: ld64(&slot[args + 0x18..]) as u32,
-                object_tg_y: ld64(&slot[args + 0x20..]) as u32,
-                object_tg_z: ld64(&slot[args + 0x28..]) as u32,
-                mesh_tg_x: ld64(&slot[args + 0x30..]) as u32,
-                mesh_tg_y: ld64(&slot[args + 0x38..]) as u32,
-                mesh_tg_z: ld64(&slot[args + 0x40..]) as u32,
+            let mesh = IcbMeshDraw::decode(slot, args);
+            if threads {
+                IcbRenderDraw::MeshThreads(mesh)
+            } else {
+                IcbRenderDraw::MeshThreadgroups(mesh)
             }
         }
         _ => return Err(IcbStatus::Args("icb_drs_unknown_command_type")),
@@ -969,55 +983,24 @@ pub fn encode_render_command_slot(
             st64(&mut slot[args + 0x42..], base_instance);
             write_tessellation_factor(layout, &mut slot, &tessellation_factor)?;
         }
-        IcbRenderDraw::MeshThreads {
-            threads_x,
-            threads_y,
-            threads_z,
-            object_tg_x,
-            object_tg_y,
-            object_tg_z,
-            mesh_tg_x,
-            mesh_tg_y,
-            mesh_tg_z,
-        } => {
+        IcbRenderDraw::MeshThreads(mesh) | IcbRenderDraw::MeshThreadgroups(mesh) => {
+            let threads = matches!(fill.draw, IcbRenderDraw::MeshThreads(_));
             if args + ICB_DRAW_MESH_ARGS_LEN as usize > size {
-                return Err(IcbStatus::Args("icb_ers_mesh_threads_args_oob"));
+                return Err(IcbStatus::Args(if threads {
+                    "icb_ers_mesh_threads_args_oob"
+                } else {
+                    "icb_ers_mesh_threadgroups_args_oob"
+                }));
             }
-            st32(&mut slot[type_off..], ICB_CMD_TYPE_DRAW_MESH_THREADS);
-            st64(&mut slot[args..], threads_x as u64);
-            st64(&mut slot[args + 8..], threads_y as u64);
-            st64(&mut slot[args + 16..], threads_z as u64);
-            st64(&mut slot[args + 0x18..], object_tg_x as u64);
-            st64(&mut slot[args + 0x20..], object_tg_y as u64);
-            st64(&mut slot[args + 0x28..], object_tg_z as u64);
-            st64(&mut slot[args + 0x30..], mesh_tg_x as u64);
-            st64(&mut slot[args + 0x38..], mesh_tg_y as u64);
-            st64(&mut slot[args + 0x40..], mesh_tg_z as u64);
-        }
-        IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x,
-            threadgroups_y,
-            threadgroups_z,
-            object_tg_x,
-            object_tg_y,
-            object_tg_z,
-            mesh_tg_x,
-            mesh_tg_y,
-            mesh_tg_z,
-        } => {
-            if args + ICB_DRAW_MESH_ARGS_LEN as usize > size {
-                return Err(IcbStatus::Args("icb_ers_mesh_threadgroups_args_oob"));
-            }
-            st32(&mut slot[type_off..], ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS);
-            st64(&mut slot[args..], threadgroups_x as u64);
-            st64(&mut slot[args + 8..], threadgroups_y as u64);
-            st64(&mut slot[args + 16..], threadgroups_z as u64);
-            st64(&mut slot[args + 0x18..], object_tg_x as u64);
-            st64(&mut slot[args + 0x20..], object_tg_y as u64);
-            st64(&mut slot[args + 0x28..], object_tg_z as u64);
-            st64(&mut slot[args + 0x30..], mesh_tg_x as u64);
-            st64(&mut slot[args + 0x38..], mesh_tg_y as u64);
-            st64(&mut slot[args + 0x40..], mesh_tg_z as u64);
+            st32(
+                &mut slot[type_off..],
+                if threads {
+                    ICB_CMD_TYPE_DRAW_MESH_THREADS
+                } else {
+                    ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS
+                },
+            );
+            mesh.encode(&mut slot, args);
         }
     }
     let _ = (
@@ -1118,7 +1101,7 @@ pub fn encode_compute_command_slot(
         st64(&mut slot[off..], tg.length);
     }
     let args = layout.command_arguments_offset as usize;
-    if args + 0x30 > size {
+    if args + ICB_CONCURRENT_DISPATCH_ARGS_LEN > size {
         return Err(IcbStatus::Args("icb_ecs_dispatch_args_oob"));
     }
     st64(&mut slot[args..], gx as u64);
@@ -1650,8 +1633,8 @@ pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
             }
         }
         IcbRenderDraw::Primitives { .. }
-        | IcbRenderDraw::MeshThreads { .. }
-        | IcbRenderDraw::MeshThreadgroups { .. } => {}
+        | IcbRenderDraw::MeshThreads(_)
+        | IcbRenderDraw::MeshThreadgroups(_) => {}
     }
     Ok(())
 }
@@ -1818,6 +1801,26 @@ pub(crate) fn metal_vertex_descriptor_from_attrs_for_draw(
     }
 }
 
+/// The five `MTLPrimitiveType` values the ICB wire encodes, by SDK ordinal.
+/// `slug` names the caller so a refused value still says which draw form it
+/// came from — the Draw and DrawIndexed arms shared this mapping verbatim and
+/// differed only in that slug.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn icb_primitive_type(
+    primitive_type: u16,
+    slug: &'static str,
+) -> Result<metal::MTLPrimitiveType, IcbStatus> {
+    use metal::MTLPrimitiveType;
+    match primitive_type {
+        0 => Ok(MTLPrimitiveType::Point),
+        1 => Ok(MTLPrimitiveType::Line),
+        2 => Ok(MTLPrimitiveType::LineStrip),
+        3 => Ok(MTLPrimitiveType::Triangle),
+        4 => Ok(MTLPrimitiveType::TriangleStrip),
+        _ => Err(IcbStatus::Args(slug)),
+    }
+}
+
 /// Fill one **render** command slot on a cached host ICB (Metal IndirectRenderCommand).
 ///
 /// Builds an ICB-capable render PSO from the type-7 render pipeline's vertex/
@@ -1840,8 +1843,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     };
     use crate::runtime::gva_mem;
     use metal::{
-        MTLIndexType, MTLPixelFormat, MTLPrimitiveType, MeshRenderPipelineDescriptor,
-        RenderPipelineDescriptor,
+        MTLIndexType, MTLPixelFormat, MeshRenderPipelineDescriptor, RenderPipelineDescriptor,
     };
 
     if icb_ref == 0 {
@@ -1864,7 +1866,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
     );
     let is_mesh = matches!(
         fill.draw,
-        IcbRenderDraw::MeshThreads { .. } | IcbRenderDraw::MeshThreadgroups { .. }
+        IcbRenderDraw::MeshThreads(_) | IcbRenderDraw::MeshThreadgroups(_)
     );
 
     // Pipeline is required on the ICB command unless inheritPipelineState.
@@ -2170,8 +2172,8 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         IcbRenderDraw::Primitives { .. }
         | IcbRenderDraw::Patches { .. }
         | IcbRenderDraw::IndexedPatches { .. }
-        | IcbRenderDraw::MeshThreads { .. }
-        | IcbRenderDraw::MeshThreadgroups { .. } => None,
+        | IcbRenderDraw::MeshThreads(_)
+        | IcbRenderDraw::MeshThreadgroups(_) => None,
     };
 
     // Optional patch-index buffer (nullable in Metal API).
@@ -2297,14 +2299,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             instance_count,
             base_instance,
         } => {
-            let prim = match primitive_type {
-                0 => MTLPrimitiveType::Point,
-                1 => MTLPrimitiveType::Line,
-                2 => MTLPrimitiveType::LineStrip,
-                3 => MTLPrimitiveType::Triangle,
-                4 => MTLPrimitiveType::TriangleStrip,
-                _ => return Err(IcbStatus::Args("icb_frc_draw_primitive_type")),
-            };
+            let prim = icb_primitive_type(primitive_type, "icb_frc_draw_primitive_type")?;
             cmd.draw_primitives(
                 prim,
                 vertex_start,
@@ -2323,14 +2318,7 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             base_instance,
             ..
         } => {
-            let prim = match primitive_type {
-                0 => MTLPrimitiveType::Point,
-                1 => MTLPrimitiveType::Line,
-                2 => MTLPrimitiveType::LineStrip,
-                3 => MTLPrimitiveType::Triangle,
-                4 => MTLPrimitiveType::TriangleStrip,
-                _ => return Err(IcbStatus::Args("icb_frc_indexed_primitive_type")),
-            };
+            let prim = icb_primitive_type(primitive_type, "icb_frc_indexed_primitive_type")?;
             let ity = match index_type {
                 0 => MTLIndexType::UInt16,
                 1 => MTLIndexType::UInt32,
@@ -2424,68 +2412,26 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
                 tessellation_factor.instance_stride,
             );
         }
-        IcbRenderDraw::MeshThreads {
-            threads_x,
-            threads_y,
-            threads_z,
-            object_tg_x,
-            object_tg_y,
-            object_tg_z,
-            mesh_tg_x,
-            mesh_tg_y,
-            mesh_tg_z,
-        } => {
-            if threads_x == 0 || mesh_tg_x == 0 {
-                return Err(IcbStatus::Args("icb_frc_mesh_threads_zero_dims"));
+        IcbRenderDraw::MeshThreads(mesh) | IcbRenderDraw::MeshThreadgroups(mesh) => {
+            use crate::backend::metal::raw_metal;
+            let threads = matches!(fill.draw, IcbRenderDraw::MeshThreads(_));
+            if mesh.grid[0] == 0 || mesh.mesh_tg[0] == 0 {
+                return Err(IcbStatus::Args(if threads {
+                    "icb_frc_mesh_threads_zero_dims"
+                } else {
+                    "icb_frc_mesh_threadgroups_zero_dims"
+                }));
             }
-            let threads = crate::backend::metal::raw_metal::mtl_size(
-                threads_x as u64,
-                threads_y as u64,
-                threads_z as u64,
-            );
+            let size = |d: [u32; 3]| raw_metal::mtl_size(d[0] as u64, d[1] as u64, d[2] as u64);
+            let grid = size(mesh.grid);
             // object TG size is still required by the selector when objectFunction is nil.
-            let obj_tg = crate::backend::metal::raw_metal::mtl_size(
-                object_tg_x.max(1) as u64,
-                object_tg_y.max(1) as u64,
-                object_tg_z.max(1) as u64,
-            );
-            let mesh_tg = crate::backend::metal::raw_metal::mtl_size(
-                mesh_tg_x as u64,
-                mesh_tg_y as u64,
-                mesh_tg_z as u64,
-            );
-            crate::backend::metal::raw_metal::icb_draw_mesh_threads(cmd, threads, obj_tg, mesh_tg);
-        }
-        IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x,
-            threadgroups_y,
-            threadgroups_z,
-            object_tg_x,
-            object_tg_y,
-            object_tg_z,
-            mesh_tg_x,
-            mesh_tg_y,
-            mesh_tg_z,
-        } => {
-            if threadgroups_x == 0 || mesh_tg_x == 0 {
-                return Err(IcbStatus::Args("icb_frc_mesh_threadgroups_zero_dims"));
+            let obj_tg = size(mesh.object_tg.map(|d| d.max(1)));
+            let mesh_tg = size(mesh.mesh_tg);
+            if threads {
+                raw_metal::icb_draw_mesh_threads(cmd, grid, obj_tg, mesh_tg);
+            } else {
+                raw_metal::icb_draw_mesh_threadgroups(cmd, grid, obj_tg, mesh_tg);
             }
-            let tgs = crate::backend::metal::raw_metal::mtl_size(
-                threadgroups_x as u64,
-                threadgroups_y as u64,
-                threadgroups_z as u64,
-            );
-            let obj_tg = crate::backend::metal::raw_metal::mtl_size(
-                object_tg_x.max(1) as u64,
-                object_tg_y.max(1) as u64,
-                object_tg_z.max(1) as u64,
-            );
-            let mesh_tg = crate::backend::metal::raw_metal::mtl_size(
-                mesh_tg_x as u64,
-                mesh_tg_y as u64,
-                mesh_tg_z as u64,
-            );
-            crate::backend::metal::raw_metal::icb_draw_mesh_threadgroups(cmd, tgs, obj_tg, mesh_tg);
         }
     }
     if let Some(pso) = pso {

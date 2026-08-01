@@ -130,32 +130,20 @@ fn setup_task(host: &mut FakeHost, state: &mut DeviceState) {
 /// about something else needs so the slot decodes, not a case in its own right.
 /// Twelve bodies wrote it out; the two that vary their counts still do.
 fn unit_mesh_draw() -> IcbRenderDraw {
-    IcbRenderDraw::MeshThreadgroups {
-        threadgroups_x: 1,
-        threadgroups_y: 1,
-        threadgroups_z: 1,
-        object_tg_x: 1,
-        object_tg_y: 1,
-        object_tg_z: 1,
-        mesh_tg_x: 1,
-        mesh_tg_y: 1,
-        mesh_tg_z: 1,
-    }
+    IcbRenderDraw::MeshThreadgroups(IcbMeshDraw {
+        grid: [1, 1, 1],
+        object_tg: [1, 1, 1],
+        mesh_tg: [1, 1, 1],
+    })
 }
 
 /// [`unit_mesh_draw`]'s threads-per-grid sibling, all nine counts at one.
 fn unit_mesh_threads_draw() -> IcbRenderDraw {
-    IcbRenderDraw::MeshThreads {
-        threads_x: 1,
-        threads_y: 1,
-        threads_z: 1,
-        object_tg_x: 1,
-        object_tg_y: 1,
-        object_tg_z: 1,
-        mesh_tg_x: 1,
-        mesh_tg_y: 1,
-        mesh_tg_z: 1,
-    }
+    IcbRenderDraw::MeshThreads(IcbMeshDraw {
+        grid: [1, 1, 1],
+        object_tg: [1, 1, 1],
+        mesh_tg: [1, 1, 1],
+    })
 }
 
 /// The shared opening of every `compute_mul3add1.mtlb` body: the encode lock,
@@ -1006,8 +994,8 @@ fn decode_encode_render_draw_slot_roundtrip() {
         IcbRenderDraw::Indexed { .. }
         | IcbRenderDraw::Patches { .. }
         | IcbRenderDraw::IndexedPatches { .. }
-        | IcbRenderDraw::MeshThreads { .. }
-        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Primitives"),
+        | IcbRenderDraw::MeshThreads(_)
+        | IcbRenderDraw::MeshThreadgroups(_) => panic!("expected Primitives"),
     }
 }
 
@@ -1075,8 +1063,8 @@ fn decode_encode_render_draw_indexed_slot_roundtrip() {
         IcbRenderDraw::Primitives { .. }
         | IcbRenderDraw::Patches { .. }
         | IcbRenderDraw::IndexedPatches { .. }
-        | IcbRenderDraw::MeshThreads { .. }
-        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Indexed"),
+        | IcbRenderDraw::MeshThreads(_)
+        | IcbRenderDraw::MeshThreadgroups(_) => panic!("expected Indexed"),
     }
 }
 
@@ -1505,17 +1493,11 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
         pipeline_ref: 6,
         buffers: vec![],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreads {
-            threads_x: 8,
-            threads_y: 1,
-            threads_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 4,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: IcbRenderDraw::MeshThreads(IcbMeshDraw {
+            grid: [8, 1, 1],
+            object_tg: [1, 1, 1],
+            mesh_tg: [4, 1, 1],
+        }),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh threads");
     assert_eq!(
@@ -1527,15 +1509,10 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
         .expect("filled");
     assert_eq!(decoded.pipeline_ref, 6);
     match decoded.draw {
-        IcbRenderDraw::MeshThreads {
-            threads_x,
-            mesh_tg_x,
-            object_tg_x,
-            ..
-        } => {
-            assert_eq!(threads_x, 8);
-            assert_eq!(mesh_tg_x, 4);
-            assert_eq!(object_tg_x, 1);
+        IcbRenderDraw::MeshThreads(mesh) => {
+            assert_eq!(mesh.grid[0], 8);
+            assert_eq!(mesh.mesh_tg[0], 4);
+            assert_eq!(mesh.object_tg[0], 1);
         }
         _ => panic!("expected MeshThreads"),
     }
@@ -1546,17 +1523,11 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
         pipeline_ref: 7,
         buffers: vec![],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x: 2,
-            threadgroups_y: 3,
-            threadgroups_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 32,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: IcbRenderDraw::MeshThreadgroups(IcbMeshDraw {
+            grid: [2, 3, 1],
+            object_tg: [1, 1, 1],
+            mesh_tg: [32, 1, 1],
+        }),
     };
     let slot_tg =
         encode_render_command_slot(&layout_tg, &fill_tg).expect("encode mesh threadgroups");
@@ -1568,15 +1539,10 @@ fn decode_encode_draw_mesh_slot_roundtrip() {
         .unwrap()
         .expect("filled");
     match d2.draw {
-        IcbRenderDraw::MeshThreadgroups {
-            threadgroups_x,
-            threadgroups_y,
-            mesh_tg_x,
-            ..
-        } => {
-            assert_eq!(threadgroups_x, 2);
-            assert_eq!(threadgroups_y, 3);
-            assert_eq!(mesh_tg_x, 32);
+        IcbRenderDraw::MeshThreadgroups(mesh) => {
+            assert_eq!(mesh.grid[0], 2);
+            assert_eq!(mesh.grid[1], 3);
+            assert_eq!(mesh.mesh_tg[0], 32);
         }
         _ => panic!("expected MeshThreadgroups"),
     }
@@ -1709,8 +1675,8 @@ fn decode_encode_signed_base_vertex() {
         IcbRenderDraw::Primitives { .. }
         | IcbRenderDraw::Patches { .. }
         | IcbRenderDraw::IndexedPatches { .. }
-        | IcbRenderDraw::MeshThreads { .. }
-        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Indexed"),
+        | IcbRenderDraw::MeshThreads(_)
+        | IcbRenderDraw::MeshThreadgroups(_) => panic!("expected Indexed"),
     }
 
     let fill2 = IcbRenderFill {
@@ -1746,8 +1712,8 @@ fn decode_encode_signed_base_vertex() {
         IcbRenderDraw::Primitives { .. }
         | IcbRenderDraw::Patches { .. }
         | IcbRenderDraw::IndexedPatches { .. }
-        | IcbRenderDraw::MeshThreads { .. }
-        | IcbRenderDraw::MeshThreadgroups { .. } => panic!("expected Indexed"),
+        | IcbRenderDraw::MeshThreads(_)
+        | IcbRenderDraw::MeshThreadgroups(_) => panic!("expected Indexed"),
     }
 }
 

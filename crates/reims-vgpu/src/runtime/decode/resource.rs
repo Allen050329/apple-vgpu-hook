@@ -140,6 +140,10 @@ pub const ICB_CMD_TYPE_DRAW_MESH_THREADS: u32 = 0x100;
 pub const ICB_BUFFER_BIND_STRIDE: usize = 0x14;
 /// Tessellation-factor table used size (u32 ref + 3×u64) at `tessellationFactorOffset`.
 pub const ICB_TESSELLATION_FACTOR_LEN: usize = 0x1c;
+/// Concurrent-dispatch args size: two `MTLSize`, grid then threadgroup, at
+/// 3xu64 each — 2 * 3 * 8 = 0x30. Matches the `ConcurrentDispatch` bit's
+/// allocation in host RE `setupCommandLayout:`.
+pub const ICB_CONCURRENT_DISPATCH_ARGS_LEN: usize = 0x30;
 /// DrawPatches args size: `setupCommandLayout` allocates 0x38, and the fill IMP
 /// writes through `baseInstance` — a u64 *starting* at 0x2e, so ending at 0x36.
 /// The two bytes between are the allocation's slack, exactly as
@@ -404,7 +408,6 @@ impl ColorWriteMask {
     pub fn bits(self) -> u32 {
         self.bits
     }
-
 }
 
 /// One pipeline color-attachment entry (format + blend) from the type-7 color section.
