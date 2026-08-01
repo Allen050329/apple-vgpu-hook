@@ -17,13 +17,16 @@ fn isolate_logs() {
 #[test]
 fn pixel_format_c_matrix_rows() {
     isolate_logs();
-    // IOSurface row expectations, from the deleted C pixel-format matrix.
+    // IOSurface row expectations, from the deleted C pixel-format matrix, read
+    // through the mapper rail's own row-bytes rule rather than a second copy of
+    // it that only this vector reached.
+    use reims_vgpu::contract::iosurface_pages::sample_window;
     assert_eq!(
-        pixel_format::iosurface_row_bytes(200, pixel_format::MTL_FORMAT_BGRA8_UNORM),
+        sample_window(0, pixel_format::MTL_FORMAT_BGRA8_UNORM, 200, 1).map(|(_, bpr, _)| bpr),
         Some(896)
     );
     assert_eq!(
-        pixel_format::iosurface_row_bytes(200, pixel_format::MTL_FORMAT_RGBA16_FLOAT),
+        sample_window(0, pixel_format::MTL_FORMAT_RGBA16_FLOAT, 200, 1).map(|(_, bpr, _)| bpr),
         Some(1664)
     );
 }
