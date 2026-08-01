@@ -44,10 +44,6 @@ impl<B: Backend> Device<B> {
         }
     }
 
-    pub fn id(&self) -> DeviceId {
-        self.state.id
-    }
-
     pub fn reset(&mut self) {
         self.backend.reset();
         self.state.reset();

@@ -352,17 +352,6 @@ pub fn decode_stencil_attachment(payload: &[u8]) -> StencilAttachment {
     out
 }
 
-pub fn stage_name(s: Stage) -> &'static str {
-    match s {
-        Stage::Vertex => "vertex",
-        Stage::Fragment => "fragment",
-        Stage::Object => "object",
-        Stage::Mesh => "mesh",
-        Stage::Tile => "tile",
-        Stage::Unknown => "unknown",
-    }
-}
-
 /// Transactional render command decode.
 pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
     if command.len() < HEADER_LEN {

@@ -73,7 +73,7 @@ pub use drain::{
     write_stamp, Packet, PacketError,
 };
 pub use host::{
-    read_u32, write_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
+    read_u32, FakeHost, HostAction, HostActionKind, HostMemory, HostOps, MemError,
 };
 
 #[cfg(test)]

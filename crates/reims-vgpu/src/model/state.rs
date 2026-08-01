@@ -285,12 +285,6 @@ pub struct IosfcRegs {
     pub consumer: u32,
 }
 
-impl IosfcRegs {
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
 /// Per-channel child ring cache (page list decoded from base_pfn).
 #[derive(Clone, Debug, Default)]
 pub struct ChannelRing {

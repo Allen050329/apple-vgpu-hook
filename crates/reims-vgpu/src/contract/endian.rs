@@ -37,12 +37,6 @@ pub fn st64(p: &mut [u8], v: u64) {
     p[..8].copy_from_slice(&b);
 }
 
-/// Read `T` at absolute offset if in bounds.
-#[inline]
-pub fn at(bytes: &[u8], off: usize, n: usize) -> Option<&[u8]> {
-    bytes.get(off..off.checked_add(n)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

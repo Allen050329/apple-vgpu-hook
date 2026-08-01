@@ -60,7 +60,8 @@ impl<K: Ord + Clone, V> LruBytesMemo<K, V> {
         self.map.len()
     }
 
-    /// Whether the memo currently holds no entries.
+    /// Kept because clippy requires it beside `len`, not because a caller
+    /// exists; `len_zero` is a hard error at `-D warnings` on this crate.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -110,14 +111,6 @@ impl<K: Ord + Clone, V> LruBytesMemo<K, V> {
             },
         );
         self.bytes += entry_bytes;
-    }
-
-    /// Drop every entry. Reserved for a genuine full invalidation (e.g. a guest
-    /// reset), NOT for cap enforcement — cap enforcement is [`Self::insert`]'s
-    /// incremental job, precisely so a cap crossing never dumps the hot set.
-    pub fn clear(&mut self) {
-        self.map.clear();
-        self.bytes = 0;
     }
 
     /// Evict least-recently-used entries until `incoming` bytes fit under the

@@ -667,21 +667,6 @@ impl FakeHost {
         }
     }
 
-    /// Leave the arming window: every set still at generation 0 becomes
-    /// readable at 1, which is what the shim's first post-window harvest does.
-    ///
-    /// Writes observed *during* the window are deliberately not reflected, for
-    /// the same reason the shim does not reflect them: inside the window the
-    /// honest answer is "cannot say", and a consumer must already be treating it
-    /// as written.
-    pub fn finish_guest_write_arming(&mut self) {
-        for set in self.guest_write_sets.values_mut() {
-            if set.gen_ == 0 {
-                set.gen_ = 1;
-            }
-        }
-    }
-
     /// Live [`HostOps::track_guest_writes`] registrations, so a test can prove
     /// a token was released rather than leaked.
     pub fn tracked_guest_write_sets(&self) -> usize {
@@ -1245,12 +1230,6 @@ pub fn read_u32<M: HostMemory>(mem: &M, gpa: u64) -> Result<u32, MemError> {
     let mut b = [0u8; 4];
     mem.read_gpa(gpa, &mut b)?;
     Ok(u32::from_le_bytes(b))
-}
-
-/// Direct `write_gpa` u32 helper — **tests / FakeHost only**.
-/// Product control-plane uses [`crate::runtime::gpa_map::write_u32`].
-pub fn write_u32<M: HostMemory>(mem: &mut M, gpa: u64, v: u32) -> Result<(), MemError> {
-    mem.write_gpa(gpa, &v.to_le_bytes())
 }
 
 #[cfg(test)]
