@@ -158,6 +158,32 @@ fn unit_mesh_threads_draw() -> IcbRenderDraw {
     }
 }
 
+/// The shared opening of every `compute_mul3add1.mtlb` body: the encode lock,
+/// a cleared ICB cache, the kernel blob, and a task-1 device with its page
+/// tables walked. Six bodies opened with these eleven lines; what they vary
+/// starts at the ICB descriptor, so that is where the fixture stops.
+///
+/// The guard is returned rather than taken inside, because it has to outlive
+/// the body — `clear_icb_cache` and the ICB cache it clears are process-global.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn mul3add1_fixture() -> (
+    std::sync::MutexGuard<'static, ()>,
+    Vec<u8>,
+    FakeHost,
+    DeviceState,
+) {
+    let guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_icb_cache();
+    let mtlb = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb"),
+    )
+    .expect("compute_mul3add1.mtlb fixture");
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task(&mut host, &mut state);
+    (guard, mtlb, host, state)
+}
+
 /// The guest's `ExecuteCommandsInBuffer` (0xe4) over `[location, length)` of
 /// ICB object `icb_ref` — the command eight bodies build field by field on a
 /// `Default` before handing it to `ComputeSession::encode_icb`.
@@ -829,18 +855,7 @@ fn materialize_and_execute_empty_range() {
 fn fill_and_execute_mul3add1_writeback() {
     use crate::runtime::compute_session::ComputeSession;
 
-    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    let mtlb_paths =
-        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
-    let mtlb = mtlb_paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .expect("compute_mul3add1.mtlb fixture");
-
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task(&mut host, &mut state);
+    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
     // ICB object ref 9: 1 command, maxKernel=1, no inherit (explicit fills).
     let icb_desc = make_icb_desc_bytes(1, 1, false);
@@ -1846,18 +1861,7 @@ fn decode_encode_command_slot_roundtrip() {
 fn buffer_backed_fill_execute_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
 
-    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    let mtlb_paths =
-        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
-    let mtlb = mtlb_paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .expect("compute_mul3add1.mtlb fixture");
-
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task(&mut host, &mut state);
+    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let layout = compute_only_icb_layout(1);
@@ -4112,18 +4116,7 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::resource::compute_icb_layout;
 
-    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    let mtlb_paths =
-        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
-    let mtlb = mtlb_paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .expect("compute_mul3add1.mtlb fixture");
-
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task(&mut host, &mut state);
+    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 1, 0);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
@@ -4193,18 +4186,7 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeBufferBind};
     use crate::runtime::compute_session::ComputeSession;
 
-    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    let mtlb_paths =
-        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
-    let mtlb = mtlb_paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .expect("compute_mul3add1.mtlb fixture");
-
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task(&mut host, &mut state);
+    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
     // inheritBuffers; maxKernel still advertises encoder bind capacity.
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_BUFFERS);
@@ -4281,18 +4263,7 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     use crate::runtime::compute_session::ComputeSession;
     use crate::runtime::decode::resource::ICB_FLAG_INHERIT_PIPELINE_STATE;
 
-    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    let mtlb_paths =
-        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
-    let mtlb = mtlb_paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .expect("compute_mul3add1.mtlb fixture");
-
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task(&mut host, &mut state);
+    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
     let icb_desc = make_icb_desc_bytes_tg(1, 1, 0, ICB_FLAG_INHERIT_PIPELINE_STATE);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
@@ -4438,18 +4409,7 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     use crate::runtime::compute_exec::{ComputeAccum, ComputeSamplerBind, ComputeTextureBind};
     use crate::runtime::compute_session::ComputeSession;
 
-    let _guard = ICB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    clear_icb_cache();
-    let mtlb_paths =
-        [PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compute_mul3add1.mtlb")];
-    let mtlb = mtlb_paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .expect("compute_mul3add1.mtlb");
-
-    let mut host = FakeHost::new();
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    setup_task(&mut host, &mut state);
+    let (_guard, mtlb, mut host, mut state) = mul3add1_fixture();
 
     let icb_desc = make_icb_desc_bytes(1, 1, false);
     let icb_gva = 1u64 << RESOURCE_PAGE_SHIFT;
