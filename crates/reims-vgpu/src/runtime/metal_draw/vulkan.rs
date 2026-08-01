@@ -5543,7 +5543,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         #[cfg(feature = "backend-vulkan")]
         if gpu_only_content_allowed && store_is_store && writeback_guest {
             if let Some(identity) = gva_chain_identity(req) {
-                if store_is_store && writeback_guest && gva_store_defer_eligible(req) {
+                // Only the eligibility call can still vary here: the enclosing
+                // `&&` already established `store_is_store && writeback_guest`.
+                // (The sibling rail above re-tests its pair for real, because
+                // its outer condition is an `||`.)
+                if gva_store_defer_eligible(req) {
                     resources.target_identity = Some(identity);
                     resources.skip_readback = true;
                     gva_resident_store = true;
