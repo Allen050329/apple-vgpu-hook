@@ -3232,6 +3232,80 @@ impl FlushRail {
     }
 }
 
+/// How long a resident-backed render window sits armed before its flush reads
+/// it, which is the only interval the readback's GPU round trip could hide in.
+///
+/// [`ReadbackPhase::Fence`] is 46% of the render rail and is paid at the flush,
+/// because that is where the copy is submitted. Submitting it at the arm instead
+/// — the guest's Store, where the window is created — would only shorten the
+/// wait by however much wall clock separates the two: if the flush follows the
+/// arm by less than the round trip, the fence still blocks and the move buys
+/// nothing but complexity in the path that publishes composited pixels.
+///
+/// So this measures that separation before anything is built on it, rather than
+/// assuming the GPU has idle time in between.
+///
+/// `multi` is not noise to be averaged away. The age of "the arm" is a single
+/// number only when exactly one window was armed since the last flush; a window
+/// that drifted out through one of `flush_render_one`'s refusals never reaches
+/// the flush site at all, so the count self-heals on the next arm rather than
+/// sticking at a wrong live population forever.
+#[derive(Default)]
+pub(crate) struct ResidentArmCensus {
+    /// Arms since the last flush read the counter. Reset to 0 on every read.
+    arms_since_flush: std::sync::atomic::AtomicU64,
+    /// [`crate::observe::elapsed_us`] at the most recent arm.
+    last_arm_us: std::sync::atomic::AtomicU64,
+    arms: std::sync::atomic::AtomicU64,
+    flushes: std::sync::atomic::AtomicU64,
+    aged: std::sync::atomic::AtomicU64,
+    age_us: std::sync::atomic::AtomicU64,
+    max_age_us: std::sync::atomic::AtomicU64,
+    /// Flushes reached with a count other than exactly one arm outstanding.
+    multi: std::sync::atomic::AtomicU64,
+}
+
+impl ResidentArmCensus {
+    fn note_arm(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.arms.fetch_add(1, Relaxed);
+        self.arms_since_flush.fetch_add(1, Relaxed);
+        self.last_arm_us.store(now_us, Relaxed);
+    }
+
+    fn note_flush(&self, now_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.flushes.fetch_add(1, Relaxed);
+        if self.arms_since_flush.swap(0, Relaxed) != 1 {
+            self.multi.fetch_add(1, Relaxed);
+            return;
+        }
+        let age = now_us.saturating_sub(self.last_arm_us.load(Relaxed));
+        self.aged.fetch_add(1, Relaxed);
+        self.age_us.fetch_add(age, Relaxed);
+        self.max_age_us.fetch_max(age, Relaxed);
+    }
+
+    /// The line for the window that just closed, or `None` when no resident
+    /// window was armed or flushed in it.
+    fn take(&self, win_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let arms = self.arms.swap(0, Relaxed);
+        let flushes = self.flushes.swap(0, Relaxed);
+        if arms == 0 && flushes == 0 {
+            return None;
+        }
+        let aged = self.aged.swap(0, Relaxed);
+        let total = self.age_us.swap(0, Relaxed);
+        let max = self.max_age_us.swap(0, Relaxed);
+        let multi = self.multi.swap(0, Relaxed);
+        Some(format!(
+            "resident_arm_age win_ms={win_ms} arms={arms} flushes={flushes} aged={aged} \
+             age_us={total} max_age_us={max} multi={multi}"
+        ))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DrainDutyCensus {
     tranches: std::sync::atomic::AtomicU64,
@@ -3349,6 +3423,13 @@ impl DrainDutyCensus {
             body.push_str(&format!(" {label}_us={us} {label}={n} {label}_max_us={max}"));
         }
         any.then(|| format!("readback_split win_ms={win_ms}{body}"))
+    }
+
+    /// The window length [`Self::note`] last reported over, so a census emitted
+    /// beside `drain_duty` states the same denominator rather than deriving a
+    /// second one from a clock that has moved since.
+    pub(crate) fn last_window_ms(&self) -> u64 {
+        self.last_win_ms.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn note_readback(&self, phase: ReadbackPhase, us: u64) {
@@ -3635,6 +3716,19 @@ pub fn note_vcpu_lock_wait(us: u64) {
 static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
     std::sync::LazyLock::new(DrainDutyCensus::default);
 
+static RESIDENT_ARM: std::sync::LazyLock<ResidentArmCensus> =
+    std::sync::LazyLock::new(ResidentArmCensus::default);
+
+/// Stamp one resident-backed render window as armed.
+pub fn note_resident_window_armed() {
+    RESIDENT_ARM.note_arm(crate::observe::elapsed_us());
+}
+
+/// Record that a flush reached a resident-backed window's readback.
+pub fn note_resident_window_flushed() {
+    RESIDENT_ARM.note_flush(crate::observe::elapsed_us());
+}
+
 /// Accumulate one completed drain tranche; emits at most once per second.
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
@@ -3647,6 +3741,11 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {
             crate::observe::off(split);
+        }
+        // Beside `readback_split`, because it is only readable against it: the
+        // question is whether `age_us/aged` leaves room for `fence_us/fence`.
+        if let Some(age) = RESIDENT_ARM.take(DRAIN_DUTY.last_window_ms()) {
+            crate::observe::off(age);
         }
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);

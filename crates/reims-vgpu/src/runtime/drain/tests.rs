@@ -1913,6 +1913,59 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(c.take_readback_split().is_none(), "the window must reset");
 }
 
+/// Whether the readback's fence wait has anywhere to hide is a measurement, and
+/// it is this one.
+///
+/// The proposal it exists to judge — submit the copy at the arm rather than at
+/// the flush — is worth its complexity only if wall clock separates the two. A
+/// census that attributed *every* flush to the newest arm would report a
+/// plausible age even when several windows were outstanding and the pairing was
+/// meaningless, so the ambiguous case is counted apart rather than averaged in.
+#[test]
+fn the_resident_arm_age_refuses_to_pair_a_flush_with_an_arm_it_cannot_name() {
+    use crate::runtime::drain::ResidentArmCensus;
+    let c = ResidentArmCensus::default();
+    assert!(
+        c.take(1_000).is_none(),
+        "a window with no resident traffic must stay silent"
+    );
+
+    // One arm, one flush 4 ms later: the pairing is unambiguous.
+    c.note_arm(100_000);
+    c.note_flush(104_000);
+    // A second, longer interval.
+    c.note_arm(200_000);
+    c.note_flush(211_000);
+    // Two arms before a flush: the age of "the arm" is not a number, so this
+    // one is counted as ambiguous instead of credited to the newer arm.
+    c.note_arm(300_000);
+    c.note_arm(300_500);
+    c.note_flush(309_000);
+
+    let line = c.take(1_000).expect("traffic must report");
+    assert!(line.contains("arms=4 flushes=3"), "{line}");
+    assert!(line.contains("aged=2"), "{line}");
+    assert!(line.contains("age_us=15000"), "{line}");
+    assert!(line.contains("max_age_us=11000"), "{line}");
+    assert!(line.contains("multi=1"), "{line}");
+
+    // A window refused before it reaches the flush site leaves its arm
+    // uncounted; the next arm makes the following flush ambiguous once, and
+    // then the pairing recovers on its own rather than sticking wrong forever.
+    c.note_arm(400_000);
+    // (no flush — the window drifted out through one of the refusals)
+    c.note_arm(500_000);
+    c.note_flush(505_000);
+    c.note_arm(600_000);
+    c.note_flush(607_000);
+    let line = c.take(1_000).expect("traffic must report");
+    assert!(line.contains("multi=1"), "the stale arm is ambiguous once: {line}");
+    assert!(
+        line.contains("aged=1") && line.contains("age_us=7000"),
+        "and the next pairing is exact again: {line}"
+    );
+}
+
 /// The vCPU's wait must be measured where the guest pays it.
 ///
 /// Every other figure about a long tranche is taken from the side that *holds*

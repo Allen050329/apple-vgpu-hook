@@ -6279,6 +6279,11 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
     // reaches `stamp_type11_resident`, and it is where nearly all type-11
     // Stores go.
     crate::runtime::mapper::stamp_guest_write_gen(state, host, mapping_id);
+    // Paired with `note_resident_window_flushed` at the readback. Stamped here
+    // rather than in `finish_surface_deferred_window`, which also serves the
+    // `Owned` route, whose frame is already in host memory and owes no round
+    // trip to time.
+    crate::runtime::drain::note_resident_window_armed();
     Some(finish_surface_deferred_window(
         state,
         req,

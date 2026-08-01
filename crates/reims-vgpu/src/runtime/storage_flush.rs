@@ -1805,6 +1805,11 @@ fn flush_render_one<M: HostMemory + HostOps>(
         }
         crate::model::RenderWindowSource::Resident { epoch } => {
             use crate::backend::vulkan::engine::ResidentContent;
+            // The close of the interval `note_resident_window_armed` opened at
+            // the Store. Taken before the epoch check, not after: a window that
+            // the check refuses still consumed the arm, and leaving it counted
+            // would make every later flush look like it had two outstanding.
+            crate::runtime::drain::note_resident_window_flushed();
             let identity = render_window_identity(key);
             // Three outcomes, not two, and the third used to hide inside the
             // second. `resident_content_epoch` answers `None` both for a slot a
