@@ -90,6 +90,70 @@ fn inc_comp_spirv() -> Option<Vec<u32>> {
 /// and keeps its own copy: R16f needs `OpCapability
 /// StorageImageExtendedFormats` and drops the `NonReadable` decoration, so it
 /// is a different kernel rather than a different format.
+/// The sampled-image fetch kernel: read texel (0,0) of a combined sampled image
+/// at descriptor 0/binding 0 and write it to the storage buffer at binding 1.
+///
+/// Three tests used byte-identical copies of this — 2587 characters each, not
+/// one token apart. It is one fixture, so it is one constant.
+const SAMPLED_IMAGE_FETCH_KERNEL: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %out %image_var
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %out DescriptorSet 0
+               OpDecorate %out Binding 0
+               OpDecorate %image_var DescriptorSet 0
+               OpDecorate %image_var Binding 32
+               OpDecorate %Out Block
+               OpMemberDecorate %Out 0 Offset 0
+               OpDecorate %OutWords ArrayStride 4
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+      %float = OpTypeFloat 32
+     %v3uint = OpTypeVector %uint 3
+     %v2uint = OpTypeVector %uint 2
+     %v4uint = OpTypeVector %uint 4
+    %v4float = OpTypeVector %float 4
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+   %OutWords = OpTypeRuntimeArray %uint
+        %Out = OpTypeStruct %OutWords
+%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
+%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
+        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
+      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
+  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+        %gid = OpVariable %_ptr_Input_v3uint Input
+    %fn_type = OpTypeFunction %void
+       %main = OpFunction %void None %fn_type
+      %entry = OpLabel
+    %gid_val = OpLoad %v3uint %gid
+          %x = OpCompositeExtract %uint %gid_val 0
+      %coord = OpCompositeConstruct %v2uint %x %uint_0
+    %image_v = OpLoad %Image %image_var
+      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
+       %bits = OpBitcast %v4uint %texel
+      %lane0 = OpCompositeExtract %uint %bits 0
+      %lane1 = OpCompositeExtract %uint %bits 1
+      %lane2 = OpCompositeExtract %uint %bits 2
+      %lane3 = OpCompositeExtract %uint %bits 3
+       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
+               OpStore %ptr0 %lane0
+       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
+               OpStore %ptr1 %lane1
+       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
+               OpStore %ptr2 %lane2
+       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
+               OpStore %ptr3 %lane3
+               OpReturn
+               OpFunctionEnd
+"#;
+
 fn storage_image_write_red_kernel(spirv_image_format: &str) -> String {
     KERNEL_TEMPLATE.replace("{FMT}", spirv_image_format)
 }
@@ -787,64 +851,7 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     // Same fetch-to-buffer kernel shape as
     // compute_sampled_image_fetch_preserves_float_bits (binding 32 sampled,
     // binding 0 storage buffer, fetches texel (0,0)).
-    let fetch_spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-    %v4float = OpTypeVector %float 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-      %coord = OpCompositeConstruct %v2uint %x %uint_0
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
-       %bits = OpBitcast %v4uint %texel
-      %lane0 = OpCompositeExtract %uint %bits 0
-      %lane1 = OpCompositeExtract %uint %bits 1
-      %lane2 = OpCompositeExtract %uint %bits 2
-      %lane3 = OpCompositeExtract %uint %bits 3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fetch_spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
     let Some(fill_words) = assemble_spvasm(fill_spvasm, "resident_sample_fill") else {
         return;
     };
@@ -971,64 +978,7 @@ fn compute_linear_resident_deferred_chain() {
     let _g = engine_test_session();
     // Same red-fill + fetch kernels as compute_sampled_resident_copy_and_lost_resident.
     let fill_spvasm = &storage_image_write_red_kernel("Rgba8");
-    let fetch_spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-    %v4float = OpTypeVector %float 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-      %coord = OpCompositeConstruct %v2uint %x %uint_0
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
-       %bits = OpBitcast %v4uint %texel
-      %lane0 = OpCompositeExtract %uint %bits 0
-      %lane1 = OpCompositeExtract %uint %bits 1
-      %lane2 = OpCompositeExtract %uint %bits 2
-      %lane3 = OpCompositeExtract %uint %bits 3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
+    let fetch_spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
     let Some(fill_words) = assemble_spvasm(fill_spvasm, "linear_resident_fill") else {
         return;
     };
@@ -1139,64 +1089,7 @@ fn compute_linear_resident_deferred_chain() {
 #[test]
 fn compute_sampled_image_fetch_preserves_float_bits() {
     let _g = engine_test_session();
-    let spvasm = r#"
-               OpCapability Shader
-               OpMemoryModel Logical GLSL450
-               OpEntryPoint GLCompute %main "main" %gid %out %image_var
-               OpExecutionMode %main LocalSize 1 1 1
-               OpDecorate %gid BuiltIn GlobalInvocationId
-               OpDecorate %out DescriptorSet 0
-               OpDecorate %out Binding 0
-               OpDecorate %image_var DescriptorSet 0
-               OpDecorate %image_var Binding 32
-               OpDecorate %Out Block
-               OpMemberDecorate %Out 0 Offset 0
-               OpDecorate %OutWords ArrayStride 4
-       %void = OpTypeVoid
-       %uint = OpTypeInt 32 0
-      %float = OpTypeFloat 32
-     %v3uint = OpTypeVector %uint 3
-     %v2uint = OpTypeVector %uint 2
-     %v4uint = OpTypeVector %uint 4
-    %v4float = OpTypeVector %float 4
-     %uint_0 = OpConstant %uint 0
-     %uint_1 = OpConstant %uint 1
-     %uint_2 = OpConstant %uint 2
-     %uint_3 = OpConstant %uint 3
-   %OutWords = OpTypeRuntimeArray %uint
-        %Out = OpTypeStruct %OutWords
-%_ptr_StorageBuffer_Out = OpTypePointer StorageBuffer %Out
-%_ptr_StorageBuffer_uint = OpTypePointer StorageBuffer %uint
-        %out = OpVariable %_ptr_StorageBuffer_Out StorageBuffer
-      %Image = OpTypeImage %float 2D 0 0 0 1 Unknown
-%_ptr_UniformConstant_Image = OpTypePointer UniformConstant %Image
-  %image_var = OpVariable %_ptr_UniformConstant_Image UniformConstant
-%_ptr_Input_v3uint = OpTypePointer Input %v3uint
-        %gid = OpVariable %_ptr_Input_v3uint Input
-    %fn_type = OpTypeFunction %void
-       %main = OpFunction %void None %fn_type
-      %entry = OpLabel
-    %gid_val = OpLoad %v3uint %gid
-          %x = OpCompositeExtract %uint %gid_val 0
-      %coord = OpCompositeConstruct %v2uint %x %uint_0
-    %image_v = OpLoad %Image %image_var
-      %texel = OpImageFetch %v4float %image_v %coord Lod %uint_0
-       %bits = OpBitcast %v4uint %texel
-      %lane0 = OpCompositeExtract %uint %bits 0
-      %lane1 = OpCompositeExtract %uint %bits 1
-      %lane2 = OpCompositeExtract %uint %bits 2
-      %lane3 = OpCompositeExtract %uint %bits 3
-       %ptr0 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_0
-               OpStore %ptr0 %lane0
-       %ptr1 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_1
-               OpStore %ptr1 %lane1
-       %ptr2 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_2
-               OpStore %ptr2 %lane2
-       %ptr3 = OpAccessChain %_ptr_StorageBuffer_uint %out %uint_0 %uint_3
-               OpStore %ptr3 %lane3
-               OpReturn
-               OpFunctionEnd
-"#;
+    let spvasm = SAMPLED_IMAGE_FETCH_KERNEL;
     let Some(words) = assemble_spvasm(spvasm, "sampled_image") else {
         return;
     };
