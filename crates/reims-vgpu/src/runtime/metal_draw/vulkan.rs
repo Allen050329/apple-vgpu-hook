@@ -984,12 +984,22 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         ));
     }
 
-    // Resolve type-5 RefTextureHandle → surface_id (type-4 object id).
-    let mut surface_candidates: Vec<u32> = Vec::new();
+    // The object list names exactly ONE surface for a sampled ref. Which one is
+    // decided by the entry's `object_type`, and the cases below are distinct
+    // values of that single u8 field, so they cannot both apply:
+    //
+    //   type-5 RefTextureHandle — carries the type-4 surface id in its
+    //                             descriptor, alongside the Metal texture view
+    //   type-4 Surface         — the ref *is* the surface id
+    //   type-11 IOSurface      — resolves to the mapping id it was created on
+    //
+    // `resolve_type11_ref` re-reads this same entry and returns `None` for every
+    // type but 11, so it can only ever fill a slot the classification above left
+    // empty. Hence an `Option`, not a list of candidates to choose between.
     let mut is_linear_tex = false;
     let mut is_type5 = false;
-    let mut type5_surface_id = 0u32;
     let mut type5_view: Option<objects::Type5TextureView> = None;
+    let mut surface: Option<u32> = None;
     let resolved_entry =
         entry.or_else(|| objects::lookup_list_entry(state, host, task_id, texture_ref));
     if let Some(entry) = resolved_entry {
@@ -999,15 +1009,14 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 if desc.len() >= objects::TYPE5_MIN_LEN {
                     let sid = crate::contract::endian::ld32(&desc[objects::TYPE5_SURFACE_ID..]);
                     if sid != 0 {
-                        type5_surface_id = sid;
                         type5_view = objects::decode_type5_texture_view(&desc);
-                        surface_candidates.push(sid);
+                        surface = Some(sid);
                     }
                 }
             }
         }
         if entry.object_type == objects::OBJECT_TYPE_SURFACE {
-            surface_candidates.push(texture_ref);
+            surface = Some(texture_ref);
         }
         if entry.object_type == OBJECT_TYPE_TEXTURE
             || entry.object_type == OBJECT_TYPE_TEXTURE_VARIANT
@@ -1016,15 +1025,14 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         }
     }
     if !is_type5 {
-        let resolved = objects::resolve_type11_ref(state, host, task_id, texture_ref);
-        if let Some(mid) = resolved {
-            surface_candidates.push(mid);
-        }
+        // Runs for the linear and unclassified types too, not only for the
+        // type-11 hit it can return: the resolve records the ref as live in the
+        // task's object set and reports a typed failure when the descriptor is
+        // unreadable. Both are wanted for any ref a draw sampled.
+        surface = surface.or(objects::resolve_type11_ref(state, host, task_id, texture_ref));
     }
-    surface_candidates.sort_unstable();
-    surface_candidates.dedup();
 
-    for mid in surface_candidates {
+    if let Some(mid) = surface {
         // Ensure type-4 pages exist for this surface id.
         let _ = objects::ensure_surface_for_present(state, host, mid);
         // A type-5 serialized record is the exact Metal texture view over the
@@ -1032,45 +1040,46 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
         // be inferred from) the base mapping. Exact base views keep the fast
         // resident/cache path below; an unknown 2-B/texel base FourCC exposed
         // as RG8 must instead use the serialized view's native interpretation.
-        if mid == type5_surface_id {
-            if let Some(view) = type5_view {
-                let needs_materialization = state
-                    .mappings
-                    .get(&mid)
-                    .map(|m| {
-                        type5_view_requires_materialization(
-                            m.has_geom, m.width, m.height, m.format, view,
-                        )
-                    })
-                    .unwrap_or(true);
-                if needs_materialization {
-                    // Zero-copy the decoded plane straight from guest pages when
-                    // it samples byte-identically (video NV12 R8/RG8, BGRA8/
-                    // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
-                    // upload the CPU loader below would pay every decoded frame.
-                    #[cfg(feature = "backend-vulkan")]
-                    if let Some(src) = try_type5_sample_zero_copy(state, host, mid, view) {
-                        // Success path: a healthy video decodes ~2 planes/frame,
-                        // so this fires per-bind (~99k lines/boot). The aggregate
-                        // lives in `sampled_branch_census` (`t5_zc=count:bytes`),
-                        // which is the always-on signal; keep the per-bind detail
-                        // for deep debugging behind REIMS_VGPU_DRAW_LOG (observe::line)
-                        // rather than flooding the always-on fail sink.
-                        crate::observe::line(format!(
-                            "type5_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
-                            view.width, view.height, view.pixel_format, view.plane_index
-                        ));
-                        return Some((view.width, view.height, mid, src));
-                    }
-                    let (w, h, rgba, identity, byte_format) =
-                        load_type5_view_rgba(state, host, task_id, texture_ref, mid, view)?;
-                    return Some((
-                        w,
-                        h,
-                        mid,
-                        SampledSourceRequest::Bytes(rgba, Some(identity), byte_format),
+        // `type5_view` is set only on the branch that also set `surface` to that
+        // view's own surface id, so reaching here with a view in hand already
+        // means `mid` is the surface it describes.
+        if let Some(view) = type5_view {
+            let needs_materialization = state
+                .mappings
+                .get(&mid)
+                .map(|m| {
+                    type5_view_requires_materialization(
+                        m.has_geom, m.width, m.height, m.format, view,
+                    )
+                })
+                .unwrap_or(true);
+            if needs_materialization {
+                // Zero-copy the decoded plane straight from guest pages when
+                // it samples byte-identically (video NV12 R8/RG8, BGRA8/
+                // RGBA8). This bypasses the ~1.5 MB/plane/frame CPU read +
+                // upload the CPU loader below would pay every decoded frame.
+                #[cfg(feature = "backend-vulkan")]
+                if let Some(src) = try_type5_sample_zero_copy(state, host, mid, view) {
+                    // Success path: a healthy video decodes ~2 planes/frame,
+                    // so this fires per-bind (~99k lines/boot). The aggregate
+                    // lives in `sampled_branch_census` (`t5_zc=count:bytes`),
+                    // which is the always-on signal; keep the per-bind detail
+                    // for deep debugging behind REIMS_VGPU_DRAW_LOG (observe::line)
+                    // rather than flooding the always-on fail sink.
+                    crate::observe::line(format!(
+                        "type5_view_zc ref={texture_ref} sid={mid} view={}x{} fmt={:#x} plane={}",
+                        view.width, view.height, view.pixel_format, view.plane_index
                     ));
+                    return Some((view.width, view.height, mid, src));
                 }
+                let (w, h, rgba, identity, byte_format) =
+                    load_type5_view_rgba(state, host, task_id, texture_ref, mid, view)?;
+                return Some((
+                    w,
+                    h,
+                    mid,
+                    SampledSourceRequest::Bytes(rgba, Some(identity), byte_format),
+                ));
             }
         }
         if let Some(m) = state.mappings.get(&mid) {
