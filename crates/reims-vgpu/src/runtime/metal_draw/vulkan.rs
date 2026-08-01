@@ -4989,8 +4989,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
         }
         let mut resources = crate::backend::vulkan::engine::DrawRequest {
-            // Metal NDC is Y-up; Vulkan is Y-down.
-            flip_viewport_y: true,
             // Honor the guest's face-culling state, its winding, and its
             // primitive type. All three come from `translate::raster`, and all
             // three fall back to a Metal default when the guest bound nothing —

@@ -160,14 +160,13 @@ pub(crate) struct PipelineKey {
     /// spelling below `VK_EXT_extended_dynamic_state3`.
     pub color_write_mask: [ColorWriteMask; 1 + MAX_SECONDARY_ATTACH],
     pub pass: PassKey,
-    pub flip_y: bool,
     /// Face culling. `None` (the 2D UI default) keeps the raster state at
     /// `CULL_NONE`, byte-identical to the pre-cull engine; the key still
     /// participates in hashing so a later culled draw with the same shaders gets
     /// its own pipeline rather than aliasing the no-cull one.
     pub cull_mode: CullMode,
-    /// Metal front-facing winding (`true` = counter-clockwise). Combined with
-    /// `flip_y` in [`metal_front_face`] to pick the Vulkan `FrontFace`.
+    /// Metal front-facing winding (`true` = counter-clockwise), mapped to a
+    /// Vulkan `FrontFace` by [`metal_front_face`].
     pub front_face_ccw: bool,
     /// Depth-test pipeline state. Meaningful only when `pass.depth.is_some()`;
     /// otherwise all-default (test/write off) and no depth-stencil state is
@@ -205,16 +204,15 @@ pub(crate) fn metal_cull_flags(mode: CullMode) -> vk::CullModeFlags {
 ///
 /// Metal evaluates winding in its window space (origin top-left, Y down) and its
 /// default front-facing winding is clockwise. We emulate Metal's Y-up NDC on
-/// Vulkan (Y-down NDC) with a negative-height viewport (`flip_y`), which makes
-/// the rasterized framebuffer image — and therefore the apparent triangle
-/// winding — match Metal's. In that case a Metal clockwise front maps directly
-/// to `FrontFace::CLOCKWISE`. Without the flip the framebuffer is vertically
-/// mirrored versus Metal, so the effective winding inverts and the mapping
-/// flips. Verified on-GPU by the `cull_*` parity tests.
-pub(crate) fn metal_front_face(front_face_ccw: bool, flip_y: bool) -> vk::FrontFace {
-    // `flip_y == false` mirrors the image vertically, reversing apparent winding.
-    let effective_ccw = front_face_ccw == flip_y;
-    if effective_ccw {
+/// Vulkan (Y-down NDC) with a negative-height viewport, which makes the
+/// rasterized framebuffer image — and therefore the apparent triangle winding —
+/// match Metal's. The mapping is therefore direct: a Metal clockwise front is
+/// `FrontFace::CLOCKWISE`. Every draw on this rail is emitted Y-flipped (the
+/// guest is always Metal), so there is no un-flipped case in which the
+/// framebuffer would mirror and invert the effective winding. Verified on-GPU
+/// by the `cull_*` parity tests.
+pub(crate) fn metal_front_face(front_face_ccw: bool) -> vk::FrontFace {
+    if front_face_ccw {
         vk::FrontFace::COUNTER_CLOCKWISE
     } else {
         vk::FrontFace::CLOCKWISE
@@ -981,7 +979,7 @@ impl ObjectCaches {
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(metal_cull_flags(key.cull_mode))
-            .front_face(metal_front_face(key.front_face_ccw, key.flip_y))
+            .front_face(metal_front_face(key.front_face_ccw))
             .line_width(1.0);
         // Likewise pinned rather than known: the pipeline sample count is not
         // on the wire, and every render target this backend allocates is
@@ -1257,25 +1255,19 @@ mod cull_mapping_tests {
 
     #[test]
     fn front_face_matches_metal_under_yflip() {
-        // Metal path (flip_y = true, negative-height viewport): the rasterized
-        // framebuffer winding matches Metal, so the mapping is direct — Metal's
-        // clockwise default front maps to FrontFace::CLOCKWISE, CCW to CCW.
+        // Every draw is emitted through a negative-height viewport, so the
+        // rasterized framebuffer winding matches Metal and the mapping is
+        // direct — Metal's clockwise default front maps to FrontFace::CLOCKWISE,
+        // CCW to CCW.
         assert_eq!(
-            metal_front_face(false, true),
+            metal_front_face(false),
             vk::FrontFace::CLOCKWISE,
             "Metal CW front under Y-flip"
         );
         assert_eq!(
-            metal_front_face(true, true),
+            metal_front_face(true),
             vk::FrontFace::COUNTER_CLOCKWISE,
             "Metal CCW front under Y-flip"
         );
-        // Without the flip the image mirrors vertically, so apparent winding
-        // inverts and the mapping flips.
-        assert_eq!(
-            metal_front_face(false, false),
-            vk::FrontFace::COUNTER_CLOCKWISE
-        );
-        assert_eq!(metal_front_face(true, false), vk::FrontFace::CLOCKWISE);
     }
 }

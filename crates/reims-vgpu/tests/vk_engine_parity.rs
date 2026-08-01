@@ -89,7 +89,6 @@ fn engine_req(vert: &[u32], frag: &[u32], w: u32, h: u32) -> DrawRequest {
         width: w,
         height: h,
         vertex_count: 3,
-        flip_viewport_y: true,
         first_vertex: 0,
         instance_count: Some(1),
         base_instance: 0,

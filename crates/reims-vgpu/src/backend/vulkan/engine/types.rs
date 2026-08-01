@@ -1,7 +1,7 @@
 //! Draw request surface for the internal Vulkan engine (v1 §1.2 surface).
 //!
 //! Field meanings match the historical Metal→Vulkan product draw seam
-//! (viewport flip, blend, Load seed, stage-in attributes, SSBOs, sampled images).
+//! (blend, Load seed, stage-in attributes, SSBOs, sampled images).
 
 use ash::vk;
 
@@ -221,7 +221,6 @@ pub struct DrawRequest {
     pub width: u32,
     pub height: u32,
     pub vertex_count: u32,
-    pub flip_viewport_y: bool,
     pub first_vertex: u32,
     pub instance_count: Option<u32>,
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
@@ -294,8 +293,8 @@ pub struct DrawRequest {
     pub secondary_targets: Vec<SecondaryColorTarget>,
     /// Face culling (Metal `MTLCullMode`). `None` (default) draws both faces —
     /// the 2D UI path. `Front`/`Back` reproduce Metal culling; which winding is
-    /// "front" is `front_face_ccw`, resolved against `flip_viewport_y` in the
-    /// pipeline builder (the Metal Y-flip reverses framebuffer winding).
+    /// "front" is `front_face_ccw`, mapped to a Vulkan winding by
+    /// [`crate::backend::vulkan::engine::caches::metal_front_face`].
     pub cull_mode: CullMode,
     /// Metal front-facing winding: `true` = counter-clockwise (`MTLWinding`
     /// CounterClockwise), `false` = the Metal default clockwise. Only affects

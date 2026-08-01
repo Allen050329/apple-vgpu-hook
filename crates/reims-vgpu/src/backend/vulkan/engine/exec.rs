@@ -979,7 +979,6 @@ pub(crate) unsafe fn execute_draw_inner(
             per_slot
         },
         pass: pass_key,
-        flip_y: req.flip_viewport_y,
         cull_mode: req.cull_mode,
         front_face_ccw: req.front_face_ccw,
         depth_test: req.depth.map(|d| d.test_enable).unwrap_or(false),
@@ -2100,7 +2099,9 @@ pub(crate) unsafe fn execute_draw_inner(
     ctx.device
         .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
-    // Dynamic viewport/scissor (Metal Y flip via negative height).
+    // Dynamic viewport/scissor. Metal NDC is Y-up and Vulkan's is Y-down, so
+    // every viewport is emitted flipped: origin at the bottom edge, negative
+    // height. This is a property of the two APIs, not of any guest state.
     let default_vp = ViewportResource {
         x: 0.0,
         y: 0.0,
@@ -2110,24 +2111,13 @@ pub(crate) unsafe fn execute_draw_inner(
         max_depth: 1.0,
     };
     let vp_src = req.viewports.first().copied().unwrap_or(default_vp);
-    let viewport = if req.flip_viewport_y {
-        vk::Viewport {
-            x: vp_src.x,
-            y: vp_src.y + vp_src.height,
-            width: vp_src.width,
-            height: -vp_src.height,
-            min_depth: vp_src.min_depth,
-            max_depth: vp_src.max_depth,
-        }
-    } else {
-        vk::Viewport {
-            x: vp_src.x,
-            y: vp_src.y,
-            width: vp_src.width,
-            height: vp_src.height,
-            min_depth: vp_src.min_depth,
-            max_depth: vp_src.max_depth,
-        }
+    let viewport = vk::Viewport {
+        x: vp_src.x,
+        y: vp_src.y + vp_src.height,
+        width: vp_src.width,
+        height: -vp_src.height,
+        min_depth: vp_src.min_depth,
+        max_depth: vp_src.max_depth,
     };
     ctx.device.cmd_set_viewport(cb, 0, &[viewport]);
     let default_sc = ScissorResource {
