@@ -668,13 +668,6 @@ impl EncodeStatus {
         }
     }
 
-    /// The registered slug this status carries, or `"ok"` when it is not a
-    /// refusal. For sites that render a `reason=` into a longer line of their own
-    /// rather than building one with [`crate::observe::Emit`].
-    pub fn reason(&self) -> &'static str {
-        use crate::observe::Refusal as _;
-        self.refusal().unwrap_or("ok")
-    }
 }
 
 /// Why an indexed draw's index bytes could not be resolved.

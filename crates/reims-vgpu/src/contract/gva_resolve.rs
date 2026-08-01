@@ -185,12 +185,6 @@ impl Default for Cache {
     }
 }
 
-impl Cache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 /// Callback: read `len` guest physical bytes at `gpa` into `dst`.
 pub trait PhysReader {
     fn read_phys(&self, gpa: u64, dst: &mut [u8]) -> bool;
@@ -546,7 +540,7 @@ mod tests {
         let mut r = MapReader::new();
         let table_gpa = (1u64) << PAGE_SHIFT_ARM64E;
         r.put_u32(table_gpa, 5);
-        let mut cache = Cache::new();
+        let mut cache = Cache::default();
         let t1 = translate_root(&r, &ARM64E_GEOMETRY, 1, 1, 0x100, Some(&mut cache));
         assert_eq!(t1.cache_status, CacheStatus::MissInserted);
         let t2 = translate_root(&r, &ARM64E_GEOMETRY, 1, 1, 0x200, Some(&mut cache));

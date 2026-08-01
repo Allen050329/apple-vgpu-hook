@@ -488,7 +488,6 @@ fn encode_status_renders_its_check_beside_the_class_it_collapsed_to() {
         "Ok is control flow and must not be representable as a line"
     );
     assert_eq!(EncodeStatus::Ok.refusal(), None);
-    assert_eq!(EncodeStatus::Ok.reason(), "ok");
     assert_eq!(EncodeStatus::Ok.class(), "ok");
 
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
