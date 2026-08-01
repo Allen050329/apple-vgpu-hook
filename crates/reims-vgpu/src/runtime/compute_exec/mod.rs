@@ -1004,47 +1004,6 @@ fn compute_defer_readback_allowed(
     deferred_gpu_only_content && has_residency && writeback_deferrable
 }
 
-fn storage_residency_opportunity(
-    state: &DeviceState,
-    textures: &[StagedTexture],
-) -> (usize, usize, u64, u64) {
-    let mut eligible = 0usize;
-    let mut hits = 0usize;
-    let mut eligible_bytes = 0u64;
-    let mut hit_bytes = 0u64;
-    for texture in textures.iter().filter(|texture| texture.is_storage) {
-        let Some(candidate) = texture.residency else {
-            continue;
-        };
-        if candidate.key.is_linear() {
-            continue;
-        }
-        let bytes = u64::try_from(texture.bytes.len()).unwrap_or(u64::MAX);
-        eligible += 1;
-        eligible_bytes = eligible_bytes.saturating_add(bytes);
-        if state.compute_storage_residency.get(&candidate.key) == Some(&candidate.seed_generation) {
-            hits += 1;
-            hit_bytes = hit_bytes.saturating_add(bytes);
-        }
-    }
-    (eligible, hits, eligible_bytes, hit_bytes)
-}
-
-fn log_storage_residency_opportunity(
-    pipe: u32,
-    eligible: usize,
-    hits: usize,
-    eligible_bytes: u64,
-    hit_bytes: u64,
-) {
-    if eligible == 0 {
-        return;
-    }
-    crate::observe::off(format!(
-        "compute_storage_residency reason=generation_match action=measure pipe={pipe} eligible={eligible} hits={hits} eligible_bytes={eligible_bytes} hit_bytes={hit_bytes}"
-    ));
-}
-
 /// Bound on mirror entries per mapping: a ping-pong canvas needs 2, planar
 /// layouts a few more; anything beyond is stale-key debris worth dropping.
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
@@ -3350,15 +3309,6 @@ fn execute_dispatch_linux<M: HostMemory + HostOps>(
             sampled_count += 1;
         }
     }
-    let (residency_eligible, residency_hits, residency_eligible_bytes, residency_hit_bytes) =
-        storage_residency_opportunity(state, &staged_tex);
-    log_storage_residency_opportunity(
-        acc.pipeline_ref,
-        residency_eligible,
-        residency_hits,
-        residency_eligible_bytes,
-        residency_hit_bytes,
-    );
     // A dispatch that staged its resources is expected control flow; the
     // refusals on this path each emit their own typed decline.
     crate::observe::line(format!(

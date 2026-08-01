@@ -405,14 +405,6 @@ impl Drop for FailCapture {
     }
 }
 
-/// Test predicate: `line` is exactly `marker` plus the always-appended
-/// trailing ` t=<ms>` field (see [`elapsed_ms`]).
-#[cfg(test)]
-pub(crate) fn line_is(line: &str, marker: &str) -> bool {
-    line.strip_prefix(marker)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(" t="))
-}
-
 pub fn line(msg: impl AsRef<str>) {
     if !enabled() {
         return;

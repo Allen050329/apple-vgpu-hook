@@ -732,12 +732,11 @@ fn type4_translate_fail_detail(
     page: u64,
     page_count: u64,
     gva: u64,
-    identity_ram: bool,
     walk: &str,
 ) -> String {
     format!(
         "type4_backing_fail reason=translate sid={surface_id} task={task_id} \
-         page={page}/{page_count} gva={gva:#x} identity_ram={identity_ram} walk=[{walk}] \
+         page={page}/{page_count} gva={gva:#x} walk=[{walk}] \
          (no translation in this task; not substituting the GVA)"
     )
 }
@@ -827,27 +826,9 @@ fn apply_type4_backing<M: HostMemory>(
     // has not been observed on the rig, where every attach resolves on task 0.
     let mut entries = Vec::with_capacity(page_count as usize);
     let mut gva_hits = 0u32;
-    let mut id_hits = 0u32;
     for i in 0..page_count {
         let gva = ((surf.backing_pfn as u64) + i) << page_shift;
-        let walked = gva_mem::translate_task_gva(host, task, gva, page_shift);
-        let gpa = match walked {
-            Some(g) => {
-                gva_hits = gva_hits.saturating_add(1);
-                Some(g)
-            }
-            None => {
-                // Still counted, so the refusal reports how many pages the old
-                // identity guess would have fabricated a backing for.
-                let mut probe = [0u8; 1];
-                if host.read_gpa(gva, &mut probe).is_ok() {
-                    id_hits = id_hits.saturating_add(1);
-                }
-                None
-            }
-        };
-        let Some(gpa) = gpa else {
-            crate::runtime::drain::note_store_route_n("type4_identity_pages", id_hits as u64);
+        let Some(gpa) = gva_mem::translate_task_gva(host, task, gva, page_shift) else {
             crate::runtime::drain::note_store_route("type4_translate_refused");
             note_type4_fail(
                 surface_id,
@@ -858,12 +839,12 @@ fn apply_type4_backing<M: HostMemory>(
                     i,
                     page_count,
                     gva,
-                    id_hits > 0,
                     &gva_mem::diagnose_task_slot(host, task, task_id, gva, page_shift),
                 ),
             );
             return false;
         };
+        gva_hits = gva_hits.saturating_add(1);
         let pfn = gpa >> page_shift;
         if pfn > u32::MAX as u64 {
             note_type4_fail(
@@ -885,10 +866,6 @@ fn apply_type4_backing<M: HostMemory>(
         }
         entries.push(entry);
     }
-    // Every page reaching here translated, so `id_hits` is necessarily 0 by this
-    // point: it only advances on the branch that refuses above. The count that
-    // means something is the one on that refusal.
-    //
     // Bring-up probe once per surface_id (first attach).
     let first_attach = state
         .mappings
@@ -941,7 +918,7 @@ fn apply_type4_backing<M: HostMemory>(
         // later" can be a different surface wearing the same id.
         let gva0 = (surf.backing_pfn as u64) << page_shift;
         crate::observe::off(format!(
-            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} id_hits={id_hits} gva0={gva0:#x} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
+            "type4 pages sid={surface_id} task={task_id} n={page_count} gva_hits={gva_hits} gva0={gva0:#x} gpa0={g0:#x} gpa1={g1:#x} gpa2={g2:#x} sample0_nz={snz}/16 w={} h={} bpr={} len={:#x} plane0_bytes={plane0_bytes} fmt={:#x} planes={} multi={}",
             surf.width,
             surf.height,
             surf.bytes_per_row,
@@ -1789,11 +1766,10 @@ mod tests {
             "the refusal must name where in the walk it stopped, got {walk:?}"
         );
 
-        let line = type4_translate_fail_detail(202, 1, 0, 640, gva, true, &walk);
+        let line = type4_translate_fail_detail(202, 1, 0, 640, gva, &walk);
         assert!(line.contains("reason=translate"), "{line}");
         assert!(line.contains("sid=202"), "{line}");
         assert!(line.contains("page=0/640"), "{line}");
-        assert!(line.contains("identity_ram=true"), "{line}");
         assert!(
             line.contains(&format!("walk=[{walk}]")),
             "the refusal must carry the walk diagnosis verbatim, got {line}"
