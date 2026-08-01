@@ -885,11 +885,10 @@ fn apply_type4_backing<M: HostMemory>(
         }
         entries.push(entry);
     }
-    // Reached only with the guard off, since every page the walk could not
-    // translate refuses above. Counted here too so the control arm reports the
-    // same quantity the guarded arm refuses on, unconditioned by `first_attach`
-    // — the `type4 pages` line below is gated on it and therefore undercounts.
-    crate::runtime::drain::note_store_route_n("type4_identity_pages", id_hits as u64);
+    // Every page reaching here translated, so `id_hits` is necessarily 0 by this
+    // point: it only advances on the branch that refuses above. The count that
+    // means something is the one on that refusal.
+    //
     // Bring-up probe once per surface_id (first attach).
     let first_attach = state
         .mappings

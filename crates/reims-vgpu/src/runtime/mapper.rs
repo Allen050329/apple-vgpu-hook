@@ -1209,45 +1209,16 @@ pub fn type4_pages_witness<H: HostMemory>(
             return Type4Witness::Drifted;
         };
         if cached != Some(live) {
-            // Which of the two disagreements this is decides who is at fault, and
-            // the wrong answer sends the next reader looking for a guest that
-            // re-points surfaces silently.
-            //
-            // An entry equal to its own GVA is one `apply_type4_backing` never
-            // walked: it is the identity substitution, which only the control arm
-            // can still produce. There the live walk has not moved anything, it
-            // has simply answered the question the device gave up on — so the
-            // disagreement is between a guess and the truth, not between two
-            // truths at different times.
-            //
-            // Measured on one control boot: a 1225x512 WebKit tile (mid=62,
-            // gva0=0xb9d9000) walked cleanly to 0x2cd26c000 at t=41150, was
-            // fabricated at its own GVA at t=104620 when the walk transiently
-            // failed, and drifted at t=120824 against a live value of
-            // 0x2cd26c000 — byte for byte the address the first walk returned.
-            // The surface had not moved in 80 s. Reported as `translation_moved`,
-            // that reads as a guest bug; it is this device's own guess coming
-            // back. Pre-guard sessions logged 7 of 9 drifts this way.
-            //
-            // A real translation that happens to equal its GVA would be labelled
-            // this way too. That needs an identity-mapped page at exactly the
-            // right address, and the counter above (`id_hits`) is the
-            // cross-check, so the ambiguity is named rather than hidden.
-            let (reason, gloss) = if cached == Some(gva) {
-                (
-                    "identity_entry_corrected",
-                    "this entry was never walked — it is the identity substitution, \
-                     and the live walk is the answer the device gave up on",
-                )
-            } else {
-                (
-                    "translation_moved",
-                    "the guest re-pointed this surface and no packet said so",
-                )
-            };
+            // Every entry in this list came from a `translate_task_gva` that
+            // succeeded: `apply_type4_backing` refuses the whole surface on the
+            // first page it cannot walk, so it cannot leave a fabricated one
+            // behind. A disagreement here is therefore between two real
+            // translations taken at different times, which is the guest having
+            // re-pointed the surface without saying so.
             crate::observe::fail(format!(
                 "mapping_page_drift mid={mapping_id} task={} page={i}/{} gva={gva:#x} \
-                 cached={cached:?} live={:?} reason={reason} ({gloss})",
+                 cached={cached:?} live={:?} reason=translation_moved \
+                 (the guest re-pointed this surface and no packet said so)",
                 walk.task_id,
                 m.page_entries.len(),
                 Some(live)
@@ -3188,110 +3159,6 @@ mod tests {
         assert!(
             !fresh.iter().any(|l| l.contains("reason=translation_moved")),
             "nothing moved — blaming the guest here is the bug: {fresh:?}"
-        );
-    }
-
-    /// An entry equal to its own GVA is the identity substitution coming back,
-    /// not the guest moving a surface, and the refusal has to say which.
-    ///
-    /// Both disagreements refuse the write, so this costs nothing in safety and
-    /// everything in diagnosis: `translation_moved` reads as "the guest
-    /// re-points surfaces silently", which sends the next reader after a guest
-    /// bug that is not there. Traced on one control boot — a 1225x512 WebKit
-    /// tile walked to 0x2cd26c000, was fabricated at its own GVA 80 s later when
-    /// the walk transiently failed, and then "drifted" against a live value of
-    /// 0x2cd26c000: the same address the first walk returned.
-    ///
-    /// The two arms differ only in the cached entry, so the control is the test.
-    #[test]
-    fn an_identity_entry_is_not_reported_as_a_move() {
-        use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-        use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-        use crate::model::{DeviceId, Type4Walk, PAGE_SHIFT_X86};
-        use crate::runtime::host::{FakeHost, HostMemory};
-
-        crate::observe::redirect_logs_for_tests();
-        let page = 1u64 << PAGE_SHIFT_X86;
-        let st32 = |b: &mut [u8], v: u32| b[..4].copy_from_slice(&v.to_le_bytes());
-
-        // The surface's backing GVA is page 9, so an entry whose PFN is also 9
-        // is the identity substitution. The live walk sends it somewhere else.
-        const BACKING_PFN: u32 = 9;
-
-        // `cached` is the only thing that differs between the two arms.
-        let refuse_with = |cached_pfn: u32| -> Vec<String> {
-            let mut host = FakeHost::new();
-            let dir_gpa = 2u64 << PAGE_SHIFT_X86;
-            let root_gpa = 3u64 << PAGE_SHIFT_X86;
-            let data0 = 4u64 << PAGE_SHIFT_X86;
-            for gpa in [dir_gpa, root_gpa, data0] {
-                host.map_range(gpa, page as usize, 0);
-            }
-            let mut d = [0u8; 8];
-            st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
-            st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-            host.write_gpa(dir_gpa, &d).unwrap();
-            // Depth-1 table: the PTE for GVA page 9 is the tenth word.
-            let mut pte = [0u8; 4];
-            st32(&mut pte, (data0 >> PAGE_SHIFT_X86) as u32);
-            host.write_gpa(root_gpa + u64::from(BACKING_PFN) * 4, &pte)
-                .unwrap();
-
-            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-            assert!(state.define_task(1, page, 2));
-            state.map_surface(6);
-            {
-                let m = state.mappings.get_mut(&6).unwrap();
-                m.mapped = true;
-                m.page_entries = vec![(cached_pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID];
-                m.type4_walk = Some(Type4Walk {
-                    task_id: 1,
-                    backing_pfn: BACKING_PFN,
-                    map_generation: m.map_generation,
-                });
-            }
-            let at = std::fs::read_to_string(crate::observe::fail_log_path())
-                .unwrap_or_default()
-                .len();
-            assert!(
-                super::type4_pages_witness(&state, &host, 6) == super::Type4Witness::Drifted,
-                "an entry that disagrees with the live walk must refuse"
-            );
-            let body = std::fs::read_to_string(crate::observe::fail_log_path()).unwrap_or_default();
-            body[at.min(body.len())..]
-                .lines()
-                .filter(|l| l.starts_with("mapping_page_drift "))
-                .map(str::to_owned)
-                .collect()
-        };
-
-        let identity = refuse_with(BACKING_PFN);
-        assert!(
-            identity
-                .iter()
-                .any(|l| l.contains("reason=identity_entry_corrected")),
-            "an entry equal to its own GVA is this device's guess, not a move: {identity:?}"
-        );
-        assert!(
-            !identity
-                .iter()
-                .any(|l| l.contains("reason=translation_moved")),
-            "nothing moved — blaming the guest here is the bug: {identity:?}"
-        );
-
-        // Control: a cached entry that is a real address and really disagrees.
-        // Without it this test would pass on a build that labelled every drift
-        // `identity_entry_corrected`.
-        let moved = refuse_with(0x77);
-        assert!(
-            moved.iter().any(|l| l.contains("reason=translation_moved")),
-            "a real entry that disagrees is still a move: {moved:?}"
-        );
-        assert!(
-            !moved
-                .iter()
-                .any(|l| l.contains("reason=identity_entry_corrected")),
-            "only an entry equal to its GVA is the substitution: {moved:?}"
         );
     }
 
