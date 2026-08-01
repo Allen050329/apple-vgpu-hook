@@ -493,11 +493,16 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # explain a rate it does not change. So the 20.0 Hz ceiling is the presentation
   # engine releasing images at that cadence, not this device pacing them.
   #
-  # What it is remains open. The obvious guess is compositor throttling of a
-  # surface nobody is looking at, but that guess has counter-evidence: KWin
-  # reported the window `minimized=false active=<itself>` while this was
-  # happening, so it was focused and visible. Do not repeat the occlusion story
-  # as though it were established.
+  # What it is remains open, and two innocent explanations are already ruled out.
+  # The host panel was in a 120 Hz mode at the time, so 20 Hz is a six-fold
+  # deficit rather than the display's own rate. And KWin reported the window
+  # `minimized=false active=<itself>`, so it was focused and visible — do not
+  # repeat the "occluded surface" story as though it were established.
+  #
+  # Untested leads, in order: the swapchain is 1921x1079 while the window on
+  # screen was 1011x596 on a 3840x2400 output, so every present is a compositor
+  # rescale; and `busy_fence` stays near zero while `busy_acquire` is ~330/s,
+  # which puts the stall in image release rather than in our own queue.
   #
   # The practical rule is unchanged: treat a suspiciously round `present_hz` on
   # an agent-driven boot as the host's number until it has been reproduced on a
