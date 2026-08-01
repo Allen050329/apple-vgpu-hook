@@ -3767,23 +3767,24 @@ mod tests {
     /// The window and the resident it pinned must be the same slot, and the two
     /// spellings that name it must agree by construction.
     ///
-    /// `arm_surface_resident_store` pins `render_chain_identity`, which prefers
-    /// the render-pass extent (`req.width`/`req.height`) and falls back to
-    /// color0's declared geometry. `flush_render_one` rebuilds
-    /// `render_window_identity` from `key.width`/`key.height`, which is color0's
-    /// geometry unconditionally. When a record's pass extent differs from its
-    /// attachment, those are different `TargetIdentity::Surface` values: the arm
-    /// pins one slot, the flush looks up another, `registry_get` misses, and the
-    /// frame is lost — reported as `live=Absent` — while the pin is leaked,
-    /// because eviction skips pinned slots by design.
+    /// `arm_surface_resident_store` pins `render_chain_identity`;
+    /// `flush_render_one` rebuilds `render_window_identity` from
+    /// `key.width`/`key.height`. Both now read color0's declared geometry —
+    /// the draw request has only that one — so the geometry axis is closed by
+    /// construction rather than by this check. It was not: the arm's spelling
+    /// preferred a whole-request pass extent, and a record whose extent
+    /// differed from its attachment produced two different
+    /// `TargetIdentity::Surface` values. The arm pinned one slot, the flush
+    /// looked up another, `registry_get` missed, and the frame was lost —
+    /// reported as `live=Absent` — while the pin leaked, because eviction skips
+    /// pinned slots by design. One measured boot lost ~135 frames at 1920x1080
+    /// with `live=None`, the whole desktop compositing layer keeping pre-Store
+    /// bytes in guest memory.
     ///
-    /// One measured boot lost ~135 frames a boot at 1920x1080 with `live=None`,
-    /// which is the whole desktop compositing layer keeping pre-Store bytes in
-    /// guest memory. This asserts the property that makes that impossible:
-    /// geometry is part of the identity, so the arm must not proceed unless the
-    /// two spellings are equal. `arm_surface_resident_store` checks exactly that
-    /// and declines to the synchronous route, which costs a readback and loses
-    /// nothing.
+    /// The first two assertions hold that closure: with one geometry the two
+    /// spellings are the same value, and a different extent is a different slot
+    /// that must never be pinned on a window's behalf. The third is the axis
+    /// still live at runtime, and the reason the equality check stays.
     #[cfg(feature = "backend-vulkan")]
     #[test]
     fn a_window_and_the_resident_it_pins_cannot_be_named_at_two_geometries() {

@@ -6592,16 +6592,17 @@ fn arm_surface_resident_store<M: HostMemory + HostOps>(
     let identity = type11_store_identity(state, req, true)?;
     let key = prepare_surface_deferred_window(state, host, req, mapping_id, width, height)?;
     // The slot this arm pins and the slot the flush will look up have to be the
-    // same slot, and until this check they were derived from two different
-    // spellings that are allowed to disagree. The arm's came from
-    // `render_chain_identity`, which preferred a whole-request render extent and
-    // fell back to the attachment's declared size; the flush rebuilds
-    // `TargetIdentity::Surface` from `key.width`/`key.height`, which are the
-    // attachment's size unconditionally. A record whose pass extent differed
-    // from its color0 geometry therefore pinned one identity and handed the
-    // window another, and the flush found no slot at all: the frame is lost and
-    // the pin — which nothing else drops, because eviction skips pinned slots —
-    // is leaked for the guest's lifetime.
+    // same slot. Geometry no longer separates them: both spellings read color0's
+    // declared extent, because that is the only extent a draw request carries.
+    // It used to carry a second one, and a record whose pass extent differed
+    // from its attachment pinned one identity and handed the window another —
+    // the flush found no slot, the frame was lost, and the pin leaked for the
+    // guest's lifetime because eviction skips pinned slots.
+    //
+    // `map_generation` is the axis still live here, and it can move *inside* the
+    // arm: `prepare_surface_deferred_window` below lands intersecting windows,
+    // and a writeback re-resolves the mapping. Taking the identity before that
+    // step and the key after it is what this compares.
     //
     // That is the defect shape of `74748d2` and `021e64b` a third time, so it is
     // closed the same way: one spelling, checked, never two reconciled.
