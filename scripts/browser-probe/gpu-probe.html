@@ -6,7 +6,11 @@
 <canvas id="c" width="512" height="512" style="width:256px;height:256px"></canvas>
 <script>
 // Reports which of WebGL1 / WebGL2 / WebGPU actually come up, what renderer is
-// behind each, and how many frames a trivial animated draw sustains.
+// behind each, and how evenly a trivial animated draw is paced.
+//
+// Pacing is reported as a distribution, not a mean: the question these probes
+// exist to answer is whether frames are dropped *occasionally*, and a mean frame
+// rate is blind to that by construction. `?seconds=N` widens the window.
 //
 // The result is written to document.title as well as to the page, because Safari
 // exposes no debugging protocol here: AppleScript can read a document's name
@@ -70,24 +74,102 @@ async function probeWebGPU() {
   } catch (e) { return 'THREW: ' + e.message; }
 }
 
+// A mean frame rate cannot answer the question we actually have. "120 fps with
+// occasional hitches" and "120 fps, perfectly even" produce the same mean, and
+// a single worst-frame number cannot tell one 40 ms stall apart from forty of
+// them. So keep every frame delta and report the distribution.
+//
+// The refresh interval is taken as the MEDIAN observed delta rather than a
+// hardcoded 1/120: this rig's guest display has run at 60 and at 120, and a
+// fixed budget would misreport every frame on the other one. The median is
+// used instead of the mean because it is the one estimator a burst of long
+// frames cannot drag with it.
+//
+// A "long" frame is one that consumed at least two refresh intervals, i.e. at
+// least one frame was not shown. The 1.5x threshold is the midpoint between one
+// interval and two, which is where a delta stops being jitter around the budget
+// and starts being a skipped vblank.
+const LONG_FRAME_INTERVALS = 1.5;
+
+function quantile(sorted, q) {
+  if (!sorted.length) return 0;
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+// Pure: no DOM, no timers. Kept separate from the rAF loop so the statistics
+// can be exercised against synthetic frame streams with a known answer — a
+// summariser that miscounts hitches would otherwise be indistinguishable from a
+// guest that has none.
+function summarizeDeltas(deltas, elapsedSeconds, frames) {
+  const sorted = deltas.slice().sort((a, b) => a - b);
+  const median = quantile(sorted, 0.5);
+  const budget = median * LONG_FRAME_INTERVALS;
+  let longFrames = 0, worstRun = 0, run = 0, dropped = 0;
+  for (const d of deltas) {
+    if (d > budget) {
+      longFrames++;
+      // How many refreshes went unshown. A delta of exactly two intervals
+      // skipped one.
+      dropped += Math.max(1, Math.round(d / median) - 1);
+      run++;
+      if (run > worstRun) worstRun = run;
+    } else {
+      run = 0;
+    }
+  }
+  // Histogram in units of refresh intervals, so it reads the same at 60 and at
+  // 120 Hz. Bucket i counts frames that took i+1 intervals; the last bucket is
+  // everything at or beyond 6.
+  const hist = [0, 0, 0, 0, 0, 0];
+  for (const d of deltas) {
+    hist[Math.min(hist.length - 1, Math.max(0, Math.round(d / median) - 1))]++;
+  }
+  return {
+    fps: +(frames / elapsedSeconds).toFixed(1),
+    // Retained under its original name: existing callers and the page title
+    // read this key.
+    worst_frame_ms: +(sorted.length ? sorted[sorted.length - 1] : 0).toFixed(1),
+    frames,
+    seconds: +elapsedSeconds.toFixed(1),
+    refresh_hz: +(1000 / median).toFixed(1),
+    median_ms: +median.toFixed(2),
+    p95_ms: +quantile(sorted, 0.95).toFixed(2),
+    p99_ms: +quantile(sorted, 0.99).toFixed(2),
+    long_frames: longFrames,
+    long_frame_pct: +(100 * longFrames / (deltas.length || 1)).toFixed(2),
+    dropped_refreshes: dropped,
+    worst_hitch_frames: worstRun,
+    hist_intervals: hist,
+  };
+}
+
 function measureFps(seconds) {
   return new Promise((resolve) => {
     const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
-    let frames = 0, worst = 0, last = performance.now();
+    // Frame deltas, in order. Order matters: a hitch is a RUN of long frames,
+    // and a sorted summary alone would report ten scattered stalls and one
+    // ten-frame freeze identically, though only the second is visible as a jerk.
+    const deltas = [];
+    let frames = 0, last = performance.now();
     const t0 = last;
     const step = () => {
       const now = performance.now();
       const dt = now - last; last = now;
-      if (frames > 2) worst = Math.max(worst, dt);
+      // The first frames carry context setup and first-draw compilation, which
+      // is real cost but not a pacing defect; excluding them keeps the tail
+      // statistics about steady-state pacing.
+      if (frames > 2) deltas.push(dt);
       frames++;
       if (gl) {
         gl.viewport(0, 0, canvas.width, canvas.height);
         gl.clearColor((frames % 60) / 60, 0.2, 0.6, 1);
         gl.clear(gl.COLOR_BUFFER_BIT);
       }
-      if (now - t0 < seconds * 1000) requestAnimationFrame(step);
-      else resolve({ fps: +(frames / ((now - t0) / 1000)).toFixed(1),
-                     worst_frame_ms: +worst.toFixed(1), frames });
+      if (now - t0 < seconds * 1000) { requestAnimationFrame(step); return; }
+      resolve(summarizeDeltas(deltas, (now - t0) / 1000, frames));
     };
     requestAnimationFrame(step);
   });
@@ -96,13 +178,18 @@ function measureFps(seconds) {
 (async () => {
   results.webgpu = await probeWebGPU();
   say('webgpu:  ' + JSON.stringify(results.webgpu));
-  results.fps = await measureFps(5);
+  // Five seconds is enough to establish a mean but not to see an *occasional*
+  // hitch; `?seconds=N` buys a longer window when the tail is the question.
+  const want = +new URLSearchParams(location.search).get('seconds');
+  results.fps = await measureFps(want > 0 ? want : 5);
   say('fps:     ' + JSON.stringify(results.fps));
   const r1 = results.webgl1 && results.webgl1.renderer ? results.webgl1.renderer : String(results.webgl1);
   const wg = typeof results.webgpu === 'string' ? results.webgpu : 'OK';
   document.title = 'probe: gl=' + r1 + ' | hw=' + results.noCaveat +
                    ' | webgpu=' + wg + ' | fps=' + results.fps.fps +
-                   ' | worst=' + results.fps.worst_frame_ms + 'ms';
+                   ' | worst=' + results.fps.worst_frame_ms + 'ms' +
+                   ' | long=' + results.fps.long_frames +
+                   ' | hitch=' + results.fps.worst_hitch_frames;
   window.__probe = results;
   // Safari exposes no debugging protocol and AppleScript automation needs a
   // consent click, so the page posts its own result back to the server that
