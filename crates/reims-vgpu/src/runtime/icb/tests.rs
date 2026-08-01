@@ -7,6 +7,8 @@ use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
 use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
 use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E};
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+use crate::runtime::decode::render::PASS_STORE_ACTION_STORE;
 use crate::runtime::decode::resource::{
     compute_only_icb_layout, encode_icb_command_layout, list_object_entry_offset,
     render_icb_layout, ICB_DESC_FLAGS, ICB_DESC_LAYOUT, ICB_DESC_LEN, ICB_DESC_MAX_COMMAND_COUNT,
@@ -29,8 +31,6 @@ use crate::runtime::host::FakeHost;
 /// test needs this same set; it was spelled inside 29 test bodies before.
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::mapping_write;
-#[cfg(all(feature = "backend-metal", target_os = "macos"))]
-use crate::runtime::decode::render::PASS_STORE_ACTION_STORE;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::metal_draw::{
     encode_icb_execute_and_writeback, BufferBind, ColorRtRequest, DrawEncodeRequest, EncodeStatus,
@@ -206,6 +206,31 @@ fn read_fixture(name: &str) -> Vec<u8> {
         .join("tests/fixtures")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// [`fill_render_command`] against the fixture every render body in this file
+/// builds: task 1, ICB object ref 9.
+///
+/// Both are constant across every caller — they are what `icb_device` and
+/// `mul3add1_fixture` set up — so they were four lines of noise in front of the
+/// `IcbRenderFill` that is the actual subject of each test.
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_render(
+    state: &DeviceState,
+    host: &FakeHost,
+    fill: &IcbRenderFill,
+) -> Result<(), IcbStatus> {
+    fill_render_command(state, host, 1, 9, fill)
+}
+
+/// [`fill_compute_command`] against the same fixture. See [`fill_render`].
+#[cfg(all(feature = "backend-metal", target_os = "macos"))]
+fn fill_compute(
+    state: &DeviceState,
+    host: &FakeHost,
+    fill: &IcbComputeFill,
+) -> Result<(), IcbStatus> {
+    fill_compute_command(state, host, 1, 9, fill)
 }
 
 /// The guest's `ExecuteCommandsInBuffer` (0xe4) over `[location, length)` of
@@ -419,8 +444,7 @@ fn load_oracle_mtlb() -> (Vec<u8>, Vec<u8>) {
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 fn load_stagein_mtlb() -> (Vec<u8>, Vec<u8>) {
     let vtx = read_fixture("render_stagein_vtx.mtlb");
-    let frag =
-        read_fixture("render_stagein_frag.mtlb");
+    let frag = read_fixture("render_stagein_frag.mtlb");
     (vtx, frag)
 }
 
@@ -896,11 +920,9 @@ fn fill_and_execute_mul3add1_writeback() {
     put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, bdesc_gva, &bdesc);
 
     // Host fill of command slot 0 (no stream fill opcode yet).
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -997,10 +1019,7 @@ fn decode_encode_render_draw_indexed_slot_roundtrip() {
     let fill = IcbRenderFill {
         command_index: 0,
         pipeline_ref: 11,
-        buffers: vec![
-            render_bind(0, 8, false),
-            render_bind(0, 13, true),
-        ],
+        buffers: vec![render_bind(0, 8, false), render_bind(0, 13, true)],
         object_threadgroup_memory: vec![],
         draw: IcbRenderDraw::Indexed {
             primitive_type: 3,
@@ -1178,10 +1197,8 @@ fn fill_render_draw_patches_tessellation_oracle() {
 
     let _guard = icb_test_guard();
 
-    let vert_mtlb =
-        read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb =
-        read_fixture("icb_tess_frag.metallib");
+    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
+    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -1218,11 +1235,9 @@ fn fill_render_draw_patches_tessellation_oracle() {
     ];
     put_type1_buffer(&mut host, &mut state, 12, 5, &tess_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -1274,10 +1289,8 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
 
     let _guard = icb_test_guard();
 
-    let vert_mtlb =
-        read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb =
-        read_fixture("icb_tess_frag.metallib");
+    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
+    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -1313,11 +1326,9 @@ fn fill_render_draw_indexed_patches_tessellation_oracle() {
     let tess_bytes: [u8; 8] = [0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c, 0x00, 0x3c];
     put_type1_buffer(&mut host, &mut state, 12, 6, &tess_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -1581,8 +1592,7 @@ fn fill_render_draw_mesh_threads_oracle() {
     let _guard = icb_test_guard();
 
     let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -1600,11 +1610,9 @@ fn fill_render_draw_mesh_threads_oracle() {
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -1636,8 +1644,7 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
     let _guard = icb_test_guard();
 
     let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -1652,11 +1659,9 @@ fn fill_render_draw_mesh_threadgroups_oracle() {
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -1790,18 +1795,13 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
     put_type1_buffer(&mut host, &mut state, 13, 6, &color_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![
-                render_bind(0, 11, false),
-                render_bind(0, 13, true),
-            ],
+            buffers: vec![render_bind(0, 11, false), render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
             draw: indexed_draw(-1),
         },
@@ -2049,11 +2049,9 @@ fn fill_render_draw_indexed_execute_oracle() {
     // Mapping for color writeback (4×4 BGRA).
     let mapping_id = map_draw_target(&mut host, &mut state, 0x30);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -2160,10 +2158,8 @@ fn wire_backed_draw_patches_tessellation_e2e() {
 
     let _guard = icb_test_guard();
 
-    let vert_mtlb =
-        read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb =
-        read_fixture("icb_tess_frag.metallib");
+    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
+    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2263,10 +2259,8 @@ fn wire_backed_draw_indexed_patches_tessellation_e2e() {
 
     let _guard = icb_test_guard();
 
-    let vert_mtlb =
-        read_fixture("icb_tess_vtx.metallib");
-    let frag_mtlb =
-        read_fixture("icb_tess_frag.metallib");
+    let vert_mtlb = read_fixture("icb_tess_vtx.metallib");
+    let frag_mtlb = read_fixture("icb_tess_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2376,10 +2370,8 @@ fn fill_render_object_mesh_threadgroups_oracle() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_mesh.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_mesh.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2408,11 +2400,9 @@ fn fill_render_object_mesh_threadgroups_oracle() {
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -2450,10 +2440,8 @@ fn wire_backed_dual_export_object_mesh_e2e() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_mesh.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_mesh.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2521,11 +2509,9 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
 
     let _guard = icb_test_guard();
 
-    let obj_mtlb =
-        read_fixture("icb_object_stage.metallib");
+    let obj_mtlb = read_fixture("icb_object_stage.metallib");
     let mesh_mtlb = read_fixture("icb_mesh_with_payload.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2560,11 +2546,9 @@ fn fill_render_separate_object_mesh_func_refs_oracle() {
     assert_eq!(decoded.vertex_func_ref, 0);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x280, &pdesc);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -2605,11 +2589,9 @@ fn wire_backed_mesh_spi_pipeline_e2e() {
 
     let _guard = icb_test_guard();
 
-    let obj_mtlb =
-        read_fixture("icb_object_stage.metallib");
+    let obj_mtlb = read_fixture("icb_object_stage.metallib");
     let mesh_mtlb = read_fixture("icb_mesh_with_payload.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2673,10 +2655,8 @@ fn fill_render_mesh_buffer_bind_oracle() {
 
     let _guard = icb_test_guard();
 
-    let mesh_mtlb =
-        read_fixture("icb_mesh_buf.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let mesh_mtlb = read_fixture("icb_mesh_buf.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2697,11 +2677,9 @@ fn fill_render_mesh_buffer_bind_oracle() {
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -2741,10 +2719,8 @@ fn fill_render_object_buffer_bind_oracle() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_buf.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_buf.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2764,11 +2740,9 @@ fn fill_render_object_buffer_bind_oracle() {
     let scale_bytes = 1.0f32.to_le_bytes();
     put_type1_buffer(&mut host, &state, 7, 4, &scale_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -2812,10 +2786,8 @@ fn wire_backed_mesh_buffer_bind_e2e() {
 
     let _guard = icb_test_guard();
 
-    let mesh_mtlb =
-        read_fixture("icb_mesh_buf.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let mesh_mtlb = read_fixture("icb_mesh_buf.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -2890,10 +2862,8 @@ fn wire_backed_object_buffer_bind_e2e() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_buf.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_buf.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -3010,10 +2980,8 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_tg.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_tg.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, state) = icb_device();
 
@@ -3046,11 +3014,9 @@ fn fill_render_object_tg_memory_bad_length_rejected() {
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
-    let err = fill_render_command(
+    let err = fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -3077,10 +3043,8 @@ fn fill_render_object_tg_memory_oracle() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_tg.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_tg.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -3113,11 +3077,9 @@ fn fill_render_object_tg_memory_oracle() {
     let pdesc = make_stagein_render_pipeline_desc(2, 3);
     put_object(&mut host, &state, 6, OBJECT_TYPE_TYPE7, 0x240, &pdesc);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -3154,10 +3116,8 @@ fn wire_backed_object_tg_memory_e2e() {
 
     let _guard = icb_test_guard();
 
-    let om_mtlb =
-        read_fixture("icb_object_tg.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let om_mtlb = read_fixture("icb_object_tg.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -3220,8 +3180,7 @@ fn wire_backed_mesh_threads_e2e() {
     let _guard = icb_test_guard();
 
     let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -3280,8 +3239,7 @@ fn wire_backed_mesh_threadgroups_e2e() {
     let _guard = icb_test_guard();
 
     let mesh_mtlb = read_fixture("icb_mesh.metallib");
-    let frag_mtlb =
-        read_fixture("icb_mesh_frag.metallib");
+    let frag_mtlb = read_fixture("icb_mesh_frag.metallib");
 
     let (mut host, mut state) = icb_device();
 
@@ -3371,11 +3329,9 @@ fn inherit_buffers_encoder_fragment_color() {
     put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
 
     // Fill: pipeline + draw only — no fragment buffer in the ICB slot.
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -3456,11 +3412,9 @@ fn inherit_pipeline_encoder_fragment_color() {
     put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
 
     // Fill: buffers + draw only — pipeline_ref 0 (inherited from parent).
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 0,
@@ -3550,18 +3504,13 @@ fn fill_render_stagein_draw_execute_oracle() {
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
     put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
-            buffers: vec![
-                render_bind(0, 11, false),
-                render_bind(0, 13, true),
-            ],
+            buffers: vec![render_bind(0, 11, false), render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
             draw: IcbRenderDraw::Primitives {
                 primitive_type: 3,
@@ -3816,11 +3765,9 @@ fn fill_render_attribute_stride_stagein_execute() {
     let color_bytes: Vec<u8> = color.iter().flat_map(|f| f.to_le_bytes()).collect();
     put_type1_buffer(&mut host, &mut state, 13, 5, &color_bytes);
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -4044,11 +3991,9 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     let layout = compute_icb_layout(1, 1);
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -4115,11 +4060,9 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
     put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     // Fill: pipeline + dispatch only — no kernel buffer in the ICB slot.
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -4191,11 +4134,9 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     put_object(&mut host, &state, 7, OBJECT_TYPE_BUFFER, 0x180, &bdesc);
 
     // Fill: buffers + dispatch only — pipeline_ref 0 (inherited).
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 0,
@@ -4351,11 +4292,9 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
     );
     put_type7_sampler(&mut host, &state, 14, true);
 
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -4463,11 +4402,9 @@ fn icb_argument_buffer_storage_texture_xyplane() {
     );
 
     // Fill: pipeline + dispatch only (AB buffer patched at execute).
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -4581,11 +4518,9 @@ fn icb_argument_buffer_sample_and_write() {
     );
     put_type7_sampler(&mut host, &state, 14, true);
 
-    fill_compute_command(
+    fill_compute(
         &state,
         &host,
-        1,
-        9,
         &IcbComputeFill {
             command_index: 0,
             pipeline_ref: 6,
@@ -4709,11 +4644,9 @@ fn fill_render_nonzero_bind_offset_oracle() {
     put_type1_buffer(&mut host, &mut state, 13, 5, &color_buf);
     let color_base = (5u64) << RESOURCE_PAGE_SHIFT;
 
-    fill_render_command(
+    fill_render(
         &state,
         &host,
-        1,
-        9,
         &IcbRenderFill {
             command_index: 0,
             pipeline_ref: 6,
