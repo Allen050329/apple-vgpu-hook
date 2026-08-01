@@ -6468,11 +6468,24 @@ fn render_window_count(state: &DeviceState) -> usize {
 /// returns the same stuck window forever, which is the bug this replaced.
 #[cfg(feature = "backend-vulkan")]
 fn evict_render_windows_to_cap<M: HostMemory + HostOps>(state: &mut DeviceState, host: &mut M) {
+    crate::runtime::census::deferred_windows::note_population(
+        crate::runtime::census::deferred_windows::Rail::Surface,
+        render_window_count(state),
+        SURFACE_DEFERRED_WINDOW_CAP,
+    );
     for (mid, lo, hi) in render_windows_oldest_first(state) {
-        if render_window_count(state) < SURFACE_DEFERRED_WINDOW_CAP {
+        let before = render_window_count(state);
+        if before < SURFACE_DEFERRED_WINDOW_CAP {
             return;
         }
         crate::runtime::storage_flush::flush_intersecting(state, host, mid, lo, hi);
+        // The fixpoint drags in siblings overlapping the same guest bytes, so
+        // one pass can land more than the window it was aimed at. Count what
+        // actually left rather than one per pass.
+        crate::runtime::census::deferred_windows::note_evicted(
+            crate::runtime::census::deferred_windows::Rail::Surface,
+            before.saturating_sub(render_window_count(state)),
+        );
     }
 }
 
@@ -6718,10 +6731,12 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
     if !crate::backend::vulkan::engine::pin_resident_target(&identity) {
         return false;
     }
+    let mut cap_evicted = 0usize;
     while state.gva_deferred_flush.len() >= GVA_DEFERRED_WINDOW_CAP {
         let Some((old_gva, old_entry)) = state.take_oldest_gva_deferred_window() else {
             break;
         };
+        cap_evicted += 1;
         let _ = crate::runtime::storage_flush::flush_gva_one(
             state,
             host,
@@ -6731,6 +6746,14 @@ fn arm_gva_deferred_store<M: HostMemory + HostOps>(
             "window_cap",
         );
     }
+    crate::runtime::census::deferred_windows::note_evicted(crate::runtime::census::deferred_windows::Rail::Gva, cap_evicted);
+    // Counted after the cap has been applied and including the window about to
+    // be armed below, so `peak` is the population the guest actually held.
+    crate::runtime::census::deferred_windows::note_population(
+        crate::runtime::census::deferred_windows::Rail::Gva,
+        state.gva_deferred_flush.len() + 1,
+        GVA_DEFERRED_WINDOW_CAP,
+    );
     let producer_object_type = objects::lookup_list_entry(state, host, req.task_id, c0.texture_ref)
         .map(|entry| entry.object_type)
         .unwrap_or(0);

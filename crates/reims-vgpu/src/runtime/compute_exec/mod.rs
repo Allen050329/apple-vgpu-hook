@@ -1064,10 +1064,19 @@ fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTex
         .filter(|key| key.mapping_id == mapping_id && **key != candidate.key)
         .cloned()
         .collect();
-    for victim in siblings
-        .iter()
-        .take((siblings.len() + 1).saturating_sub(STORAGE_RESIDENCY_WINDOWS_PER_MAPPING))
-    {
+    // Including the window inserted below, so `peak` is the population this
+    // mapping actually holds.
+    let over_cap = (siblings.len() + 1).saturating_sub(STORAGE_RESIDENCY_WINDOWS_PER_MAPPING);
+    crate::runtime::census::deferred_windows::note_population(
+        crate::runtime::census::deferred_windows::Rail::Storage,
+        siblings.len() + 1,
+        STORAGE_RESIDENCY_WINDOWS_PER_MAPPING,
+    );
+    crate::runtime::census::deferred_windows::note_evicted(
+        crate::runtime::census::deferred_windows::Rail::Storage,
+        over_cap.min(siblings.len()),
+    );
+    for victim in siblings.iter().take(over_cap) {
         state.compute_storage_residency.remove(victim);
         // Dropping a mirror entry costs the next read of that window its
         // resident and sends it back to guest pages. That is safe, but it is

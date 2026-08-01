@@ -3161,6 +3161,9 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         for line in crate::observe::footprint::census_lines(crate::observe::elapsed_ms() as u64) {
             crate::observe::off(line);
         }
+        if let Some(line) = crate::runtime::census::deferred_windows::census_line() {
+            crate::observe::off(line);
+        }
         emit_engine_delta();
     }
 }

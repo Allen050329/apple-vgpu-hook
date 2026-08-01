@@ -68,6 +68,7 @@
 //! The test to apply: name the reading the next window could produce that the
 //! last thousand did not. If there isn't one, the census has become a probe.
 
+pub mod deferred_windows;
 pub mod present_proxy;
 pub mod srgb_census;
 pub mod view_swizzle_census;
