@@ -3400,10 +3400,11 @@ static STORE_ROUTES: std::sync::Mutex<Option<std::collections::BTreeMap<&'static
 ///
 /// What would have power is a *screen-to-resource join*: name the 64x64 target
 /// backing the cell that is blank in the capture, then dump that one target's
-/// history. [`crate::observe::content_summary`] is the existing half of it — a
+/// history. A distinct-texel content summary would be one half of it — a
 /// correct icon carries hundreds of distinct texels and a blank one collapses
-/// to one — and the missing half is the mapping from a screen rectangle to a
-/// target identity.
+/// to one — and the other half is the mapping from a screen rectangle to a
+/// target identity. Neither exists today; `observe::bgra_present_stats` is the
+/// nearest thing and it summarises a whole frame, not one target.
 ///
 /// Settled by the same three boots, so nobody re-runs it: the Vulkan
 /// synchronization repairs are not the producer either. Corruption rates were

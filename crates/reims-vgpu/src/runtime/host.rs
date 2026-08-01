@@ -534,7 +534,7 @@ pub struct FakeHost {
     /// the tracking contract rather than the fallback.
     pub guest_writes_unobservable: bool,
     /// Model the product shim's arming window: a freshly tracked set answers
-    /// "generation unreadable" until [`FakeHost::finish_guest_write_arming`].
+    /// "generation unreadable" until the arming window closes.
     ///
     /// Default `false`, which is the fixture's historical behaviour — a set is
     /// readable the instant it is tracked. That default is *wrong* about the
@@ -1000,7 +1000,7 @@ impl HostOps for FakeHost {
                 // must not read back a matching generation from a live set.
                 // Under `guest_write_startup_window` it starts at 0 instead,
                 // which is what the product shim does, and stays there until
-                // `finish_guest_write_arming`.
+                // the arming window closes.
                 gen_: u64::from(!self.guest_write_startup_window),
                 page_gen,
             },

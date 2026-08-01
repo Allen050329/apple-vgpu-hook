@@ -8,7 +8,7 @@
 //! Namespace split (2026-07-13 live x86):
 //! - [`store`] / [`get`] — **type-4 surface_id / mapping_id** only (`host_surfaces`)
 //! - [`store_texture`] / [`get_texture`] — type-2/3 color targets by object ref
-//! - [`store_gva`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
+//! - [`store_gva_owned`] / [`get_gva`] — type-2/3 by target GVA (survives ref rebinding)
 //!
 //! Never put texture_ref into `host_surfaces`: list ids collide with mids and
 //! recycled refs return stale full-frame blacks as multi-bind samples.
@@ -764,7 +764,7 @@ fn get_gva_with_gen(
 }
 
 /// Explicit drop (tests / object delete). Unmap does **not** come through here;
-/// see [`store_gva`] for why the map is retained across it.
+/// see [`store_gva_owned`] for why the map is retained across it.
 pub fn evict_gva(state: &mut DeviceState, gva: u64) {
     if let Some(entry) = state.host_gva_surfaces.remove(&gva) {
         // The other site that changes this map's byte total; see

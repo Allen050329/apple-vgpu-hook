@@ -295,7 +295,7 @@ fn latch_key(task_id: u32, other: u32, loc: &std::panic::Location<'_>) -> u64 {
 /// Product GVA write: HostOps `map_pages` only (no `write_gpa` walk).
 ///
 /// Full-span packed view when possible; otherwise **multi-import** maximal
-/// packed GPA runs ([`crate::runtime::gva_view::write_span`]). Fails closed when
+/// packed GPA runs ([`crate::runtime::gva_view::write_span_within`]). Fails closed when
 /// any page is unmapped or a run cannot be mapped — that walk is the whole
 /// bound on this write. Always-on: `gva_write fail reason=…`, carrying the
 /// check `write_span` actually refused on rather than a reason chosen here.
@@ -384,7 +384,7 @@ pub fn write_task_gva_product_within<H: HostMemory + crate::runtime::host::HostO
 
 /// Resolve pages of `[gva, gva + span)` under the task the guest named — the
 /// same selection as [`read_task_gva_by_id`] and
-/// [`crate::runtime::gva_view::write_span`]'s resolver — and call `visit` with
+/// [`crate::runtime::gva_view::write_span_within`]'s resolver — and call `visit` with
 /// each page-aligned GPA. Stops early when `visit` returns `false`.
 /// `stride_pages` visits every Nth page plus always the last (1 = every page);
 /// callers trade probe density against walk cost.

@@ -1311,7 +1311,7 @@ pub const GUEST_LINEAR_MEMO_BYTE_CAP: usize = 128 << 20;
 
 /// Byte cap for the GVA-keyed type-2/3 encode cache
 /// ([`DeviceState::host_gva_surfaces`]). Same basis and same value as
-/// [`LINEAR_SAMPLED_MEMO_BYTE_CAP`], which bounds the sibling cache holding the
+/// [`GUEST_LINEAR_MEMO_BYTE_CAP`], which bounds the sibling cache holding the
 /// same class of content.
 ///
 /// A byte cap rather than an entry count for the reason that constant already

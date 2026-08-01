@@ -181,7 +181,7 @@ pub struct ColorAttachment {
     pub level: u32,
     pub load_action: u16,
     pub store_action: u16,
-    /// MTLClearColor as RGBA doubles in [0,1].
+    /// MTLClearColor as RGBA doubles in `[0,1]`.
     pub clear_color: [f64; 4],
 }
 

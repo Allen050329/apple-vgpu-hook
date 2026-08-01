@@ -1,6 +1,6 @@
 //! Persistent Vulkan draw + compute engine for the Linux metal2vulkan product path.
 //!
-//! Facade: [`execute_draw`] / [`execute_draw_request`] / [`execute_compute`] /
+//! Facade: [`execute_draw_request`] / [`execute_compute_request`] /
 //! [`read_target`]. Caches L2–L7 + Lc + memory pools so a warm
 //! identical static key performs zero `vkCreate*` and zero `vkAllocateMemory` on
 //! the product path.
@@ -302,7 +302,7 @@ pub fn window_present_detach() {
     }
 }
 
-/// Borrow form of [`execute_draw`].
+/// Execute one draw against the persistent engine.
 pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
@@ -358,7 +358,7 @@ pub fn flush_batched_draws() {
     }
 }
 
-/// Borrow form of [`execute_compute`].
+/// Execute one compute dispatch against the persistent engine.
 pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
     let mut guard = lock_engine();
     let EngineState {
@@ -430,7 +430,7 @@ pub fn resident_content_ready(identity: &TargetIdentity) -> bool {
 /// Compared by the type-11 LOAD against
 /// [`crate::model::MappingEntry::surface_content_epoch`]: equal means the
 /// resident already holds exactly the bytes a CPU seed would upload, so the
-/// pass may take [`LoadOp::LoadFromTarget`] and skip the upload. Every way the
+/// pass may load straight from the resident and skip the upload. Every way the
 /// answer can be unknown — no slot, recycled image, a draw since the stamp —
 /// resolves to `None` and therefore to the seed.
 pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
