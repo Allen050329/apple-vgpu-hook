@@ -1250,6 +1250,12 @@ struct IcbWriteback {
     gva: u64,
     /// Host staging length (GPU result copied here after execute, then to GVA).
     len: usize,
+    /// The staging walk's page set, carried from the [`StagedBuffer`] this slot
+    /// was recorded from. A cached ICB replays long after the stage, so the
+    /// writeback has to be bounded by where the buffer resolved *then*; a walk
+    /// taken at replay time answers where the GVA points now, which is the
+    /// question that lets a recycled page take the write.
+    pages: std::collections::HashSet<u64>,
     mtl: metal::Buffer,
 }
 
@@ -2557,6 +2563,7 @@ pub fn export_icb_writeback_job(
             bind: w.bind.clone(),
             gva: w.gva,
             bytes: vec![0u8; w.len],
+            pages: w.pages.clone(),
         });
         mtl.push(w.mtl.clone());
     }
@@ -2787,6 +2794,7 @@ pub fn fill_compute_command<M: HostMemory + HostOps>(
             bind: staged.bind.clone(),
             gva: staged.gva,
             len: staged.bytes.len(),
+            pages: staged.pages.clone(),
             mtl: mtl.clone(),
         });
         entry.retained_buffers.push(mtl);
