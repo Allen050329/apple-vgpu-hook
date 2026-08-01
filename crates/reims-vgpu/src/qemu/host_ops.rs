@@ -107,6 +107,39 @@ pub struct ReimsVgpuHostOps {
 unsafe impl Send for ReimsVgpuHostOps {}
 unsafe impl Sync for ReimsVgpuHostOps {}
 
+#[cfg(test)]
+impl ReimsVgpuHostOps {
+    /// A correctly-versioned table with every callback absent.
+    ///
+    /// Tests that exercise the missing-callback declines start here and fill in
+    /// only the callback under test. It lives beside the struct because it
+    /// names every field: two test modules each kept an identical copy of this
+    /// list, so a new field in the C ABI had to be written out in three places
+    /// that agreed.
+    pub(crate) fn null() -> Self {
+        Self {
+            abi_version: crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
+            struct_size: std::mem::size_of::<Self>() as u32,
+            ctx: std::ptr::null_mut(),
+            read_gpa: None,
+            write_gpa: None,
+            mono_ns: None,
+            schedule_bh: None,
+            read_kva: None,
+            read_xreg: None,
+            map_pages: None,
+            unmap_pages: None,
+            map_pages_stable: 0,
+            track_guest_writes: None,
+            untrack_guest_writes: None,
+            guest_write_gen: None,
+            guest_written_pages: None,
+            is_ram_gpa: None,
+            notify_actions: None,
+        }
+    }
+}
+
 /// Failures in the QEMU service adapter that cannot ride a fallible HostOps
 /// return value.
 ///
@@ -696,32 +729,10 @@ mod tests {
         0
     }
 
-    fn null_ops() -> ReimsVgpuHostOps {
-        ReimsVgpuHostOps {
-            abi_version: crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
-            struct_size: std::mem::size_of::<ReimsVgpuHostOps>() as u32,
-            ctx: std::ptr::null_mut(),
-            read_gpa: None,
-            write_gpa: None,
-            mono_ns: None,
-            schedule_bh: None,
-            read_kva: None,
-            read_xreg: None,
-            map_pages: None,
-            unmap_pages: None,
-            map_pages_stable: 0,
-            track_guest_writes: None,
-            untrack_guest_writes: None,
-            guest_write_gen: None,
-            guest_written_pages: None,
-            is_ram_gpa: None,
-            notify_actions: None,
-        }
-    }
 
     #[test]
     fn enqueue_routes_prompt_kinds_to_prompt_queue() {
-        let ops = null_ops();
+        let ops = ReimsVgpuHostOps::null();
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
@@ -746,7 +757,7 @@ mod tests {
 
     #[test]
     fn missing_qemu_memory_callbacks_are_exact() {
-        let ops = null_ops();
+        let ops = ReimsVgpuHostOps::null();
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);
@@ -770,7 +781,7 @@ mod tests {
 
     #[test]
     fn qemu_callback_return_codes_keep_their_operation_and_value() {
-        let mut ops = null_ops();
+        let mut ops = ReimsVgpuHostOps::null();
         ops.read_gpa = Some(fail_read_gpa);
         ops.write_gpa = Some(fail_write_gpa);
         ops.read_kva = Some(no_cpu_read_kva);
@@ -860,7 +871,7 @@ mod tests {
 
     #[test]
     fn map_pages_distinguishes_missing_failed_and_null_callbacks() {
-        let mut ops = null_ops();
+        let mut ops = ReimsVgpuHostOps::null();
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
         let mut host = QemuHost::new(&ops, &mut actions, &prompt);

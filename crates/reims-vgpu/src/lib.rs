@@ -1438,28 +1438,6 @@ mod tests {
     use super::*;
     use crate::model::PAGE_SHIFT_ARM64E;
 
-    fn null_host_ops() -> ReimsVgpuHostOps {
-        ReimsVgpuHostOps {
-            abi_version: crate::qemu::abi::REIMS_VGPU_QEMU_ABI_VERSION,
-            struct_size: std::mem::size_of::<ReimsVgpuHostOps>() as u32,
-            ctx: std::ptr::null_mut(),
-            read_gpa: None,
-            write_gpa: None,
-            mono_ns: None,
-            schedule_bh: None,
-            read_kva: None,
-            read_xreg: None,
-            map_pages: None,
-            unmap_pages: None,
-            map_pages_stable: 0,
-            track_guest_writes: None,
-            untrack_guest_writes: None,
-            guest_write_gen: None,
-            guest_written_pages: None,
-            is_ram_gpa: None,
-            notify_actions: None,
-        }
-    }
 
     #[test]
     fn lifecycle() {
@@ -1710,7 +1688,7 @@ mod tests {
         // production present path no longer depends on it: `device_drain` acks
         // each present itself after publishing to the host window, since no
         // per-present `ScanoutUpdate` is enqueued for QEMU to apply.
-        let id = device_create(Some(null_host_ops()), PAGE_SHIFT_ARM64E).expect("create");
+        let id = device_create(Some(ReimsVgpuHostOps::null()), PAGE_SHIFT_ARM64E).expect("create");
         let slot = device_slot(id).expect("device");
         {
             let mut inner = slot.inner.lock();
