@@ -1594,6 +1594,34 @@ fn finish_stream<M: HostMemory + HostOps>(
     // and the whole rail reads as "never runs". This says how often the decoded
     // stream asks for one at all, which is the denominator `runtime/icb`
     // (2818 product lines) has never had.
+    //
+    // # Measured absent on three driven x86 / Vulkan boots
+    //
+    // The third is the one that carries the weight, because the first two were
+    // compositing-only and could not tell "the guest does not use ICB" from
+    // "this workload never reaches Metal":
+    //
+    //   1. Wikipedia + apple.com + System Settings, three title-bar drags.
+    //   2. apple.com, four page-downs.
+    //   3. Chess (SceneKit 3D) + Maps + the WebGL aquarium rendering live —
+    //      **66 512 draws** and 74.9 ms of `compute_us` across the boot.
+    //
+    // `icb_exec_seen`, `compute_icb_seen` and `compute_ctrl_seen` are all absent
+    // from every one. Across the whole accumulated fail log the subsystem has
+    // never emitted a line of its own either (every "icb" string in it is a
+    // field *name* on an `exec_summary` line).
+    //
+    // **This is still not a licence to delete `runtime/icb`, and the precedent
+    // that settles it is `ffe31d4`**: `mrt_draw_multi` also measured zero, and
+    // that session kept MRT *rendering* because it is decoded contract, cutting
+    // only the speculative sampling side-map built around it.
+    // `ExecuteCommandsInBuffer` is likewise a real Metal opcode in the decoded
+    // stream — a guest that issues one against a decoder we deleted loses work
+    // silently, which is the one outcome the ground rules forbid outright. What
+    // the reading does license is scrutiny of any layer built *around* the
+    // decode on speculation rather than on decoded fields.
+    //
+    // arm64 is unmeasured; these are x86 / Vulkan readings only.
     if acc.execute_icb.is_some() {
         crate::runtime::drain::note_store_route("icb_exec_seen");
     }
