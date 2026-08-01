@@ -3403,6 +3403,47 @@ impl Drop for StoreCostSpan {
     }
 }
 
+/// Name which of the six routes a type-11 Store took: counted every time, and
+/// fail-logged once per route per process so a boot's route *set* is readable
+/// without the draw log.
+///
+/// # Four of the six read zero, and deleting them would break the support matrix
+///
+/// Across the whole accumulated fail log — 39 boots — exactly two routes have
+/// ever been taken, and both are taken in every single boot:
+///
+/// ```text
+/// surface_resident       39   gva_deferred_sync       0
+/// gva_deferred           39   surface_resident_sync   0
+///                             surface_deferred        0
+///                             cpu_portability         0
+/// ```
+///
+/// A live denominator with four dead arms is normally the strongest deletion
+/// signal this crate has. Here it is a trap, for two separate reasons, and both
+/// have to be answered before touching any of them.
+///
+/// **The `_sync` pair is arm-refusal recovery.** Each fires when its arm gate
+/// declines, and then reads the resident back and lands the frame synchronously.
+/// Zero means the arms have never refused on this host — not that refusal is
+/// impossible. They are the reason a refusal costs a readback instead of a lost
+/// frame.
+///
+/// **`surface_deferred` and `cpu_portability` are host-class cells, not
+/// workload outcomes.** They sit in the synchronous CPU-readback block that the
+/// `_sync` routes fall through to, and which of the two runs is decided by
+/// [`deferred_gpu_only_content_allowed_for_surface`] — a **capability** gate,
+/// held back by the `guest_pages_stay_authoritative` driver quirk. On a host
+/// where that quirk applies, deferral is off, `surface_deferred` cannot be taken
+/// and `cpu_portability` carries every Store. That is the "guest pages stay
+/// authoritative" cell of the support matrix in `AGENTS.md`, which also requires
+/// the discrete-GPU and no-DMA cells this same block serves.
+///
+/// So these zeros say only: *this* host is in the class where deferral is
+/// permitted and the arms succeed. `AGENTS.md` forbids generalising from one
+/// host GPU class to another, and this is exactly that boundary. Measuring these
+/// four needs a host whose quirk set turns deferral off, or one where the pin
+/// refuses — not another boot here.
 #[cfg(feature = "backend-vulkan")]
 fn note_type11_store_route(route: &'static str) {
     use std::sync::Mutex;
