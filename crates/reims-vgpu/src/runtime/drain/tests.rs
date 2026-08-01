@@ -1008,7 +1008,7 @@ fn child_drain_yields_after_present_for_display_consumer() {
     assert!(state.map_surface(4));
     assert!(state.set_mapping_geom(4, 2, 2, MTL_FORMAT_BGRA8_UNORM));
 
-    let mut payload = vec![0u8; PRESENT_X86_MIN_LEN];
+    let mut payload = vec![0u8; display_txn_trailer_len(CHILD_OP_PRESENT_X86)];
     payload[PRESENT_X86_SURFACE_ID..PRESENT_X86_SURFACE_ID + 4]
         .copy_from_slice(&4u32.to_le_bytes());
     let first = packet_bytes(CHILD_OP_PRESENT_X86, 21, &payload);

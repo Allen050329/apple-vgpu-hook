@@ -79,10 +79,17 @@ pub const MAX_TASKS: usize = 256;
 pub const MAX_MAPPINGS: usize = 4096;
 pub const MAX_SCANOUT_DIM: u32 = 8192;
 
-// Single source of truth: `contract::gva::{PAGE_SHIFT_*, PAGE_SIZE_*}`.
-// There is **no** bare `PAGE_SIZE` / `PAGE_SHIFT` — those names defaulted to
-// arm16K and caused x86 wild writes (stamp slots). Product code uses
-// `state.page_size()` / `state.page_shift`; fixtures pick an arch-qualified name.
+// Single source of truth for the shifts: `contract::gva::PAGE_SHIFT_*`,
+// re-exported rather than restated. There is **no** bare `PAGE_SIZE` /
+// `PAGE_SHIFT` — those names defaulted to arm16K and caused x86 wild writes
+// (stamp slots). Product code uses `state.page_size()` / `state.page_shift`;
+// fixtures pick an arch-qualified name.
+//
+// The two `PAGE_SIZE_*` below are NOT the `contract::gva` constants of the same
+// name: those are `u32` for page-offset masking, these are the `u64` widening
+// the device's address arithmetic and its fixtures want. Both derive from the
+// one re-exported shift, so they cannot disagree in value — but the names do
+// collide, so import from one module or the other on purpose.
 pub use crate::contract::gva::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, pfn_to_gpa};
 pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
 pub const PAGE_SIZE_X86: u64 = 1u64 << PAGE_SHIFT_X86;
@@ -148,7 +155,6 @@ pub const PRESENT_X86_SURFACE_ID: usize = 0x04;
 /// The gamma variant (op 7) trailer is `[pipe][task][surface][gamma…]`, so its
 /// surface and task words are swapped relative to op 6's.
 pub const PRESENT_GAMMA_X86_SURFACE_ID: usize = 0x08;
-pub const PRESENT_X86_MIN_LEN: usize = 12;
 
 pub const CHILD_REG_BLOCK_OFFSET: u64 = 0x400;
 pub const CHILD_REG_BLOCK_STRIDE: u64 = 0x14;
