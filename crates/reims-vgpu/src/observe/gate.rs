@@ -221,7 +221,13 @@ fn mask_comments_and_literals(src: &str) -> Vec<u8> {
             }
             State::String if bytes[i] == b'\\' && i + 1 < bytes.len() => {
                 masked[i] = b' ';
-                masked[i + 1] = b' ';
+                // The escaped byte may be the newline of a `\`-continued
+                // literal, which this crate writes in almost every multi-line
+                // fail message. Blanking it merges two source lines into one
+                // and every line number after it in the file is wrong.
+                if bytes[i + 1] != b'\n' {
+                    masked[i + 1] = b' ';
+                }
                 i += 2;
                 State::String
             }
@@ -255,7 +261,9 @@ fn mask_comments_and_literals(src: &str) -> Vec<u8> {
             }
             State::Char if bytes[i] == b'\\' && i + 1 < bytes.len() => {
                 masked[i] = b' ';
-                masked[i + 1] = b' ';
+                if bytes[i + 1] != b'\n' {
+                    masked[i + 1] = b' ';
+                }
                 i += 2;
                 State::Char
             }
@@ -274,6 +282,33 @@ fn mask_comments_and_literals(src: &str) -> Vec<u8> {
         };
     }
     masked
+}
+
+/// The mask must be line-preserving, because gates report line numbers off it.
+///
+/// The case that broke it is the one this crate writes most: a fail message
+/// continued across lines with a trailing `\`. The escape branch blanked both
+/// bytes, and when the second was the newline the masked text had one fewer
+/// line than the source — so every gate reading masked lines was, from that
+/// point in the file onward, describing the wrong line. It also silently
+/// merged the following line's braces into the string's line, which is how a
+/// brace-depth scan can conclude a function has already ended.
+#[test]
+fn the_mask_keeps_every_line_including_escaped_newlines() {
+    let src = "let a = \"one \\\n     two\";\nfn f() {\n}\n";
+    let masked = mask_comments_and_literals(src);
+    let masked = String::from_utf8(masked).expect("mask is byte-for-byte");
+    assert_eq!(
+        masked.lines().count(),
+        src.lines().count(),
+        "mask dropped a line:\n{masked:?}"
+    );
+    assert_eq!(masked.len(), src.len(), "mask is not byte-for-byte");
+    for (m, s) in masked.lines().zip(src.lines()) {
+        assert_eq!(m.len(), s.len(), "line lengths diverged");
+    }
+    // And the literal really is masked, not merely preserved.
+    assert!(!masked.contains("two"));
 }
 
 /// Byte offsets of `Result<Success, String>` spellings in Rust code.
@@ -1026,6 +1061,219 @@ fn no_error_enum_carries_a_payload_free_unsupported() {
 
 /// The scanner must actually walk the crate; a broken walk would make every
 /// scan above vacuously green.
+/// The feature a `#[cfg(…)]` attribute line names, and whether it names it
+/// positively, or `None` when the line is not a single-feature `cfg`.
+///
+/// `#[cfg(all(feature = "backend-metal", target_os = "macos"))]` reads as a
+/// positive gate on `backend-metal`, which is what it is: the item is absent
+/// without that feature. A `cfg` naming no feature at all (`target_os` alone,
+/// `test`) is not a feature gate and answers `None`.
+fn cfg_attr_feature(attr: &str) -> Option<(String, bool)> {
+    const KEY: &str = "feature = \"";
+    let at = attr.find(KEY)?;
+    let name: String = attr[at + KEY.len()..]
+        .chars()
+        .take_while(|c| *c != '"')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let negated = attr[..at].ends_with("not(");
+    Some((name, !negated))
+}
+
+/// Every `#[cfg(not(feature = "F"))]` in `src` that sits *inside* the body of an
+/// item already gated `#[cfg(feature = "F")]`, as `(1-based line, F)`.
+///
+/// Such a block cannot be compiled by any feature combination: reaching it
+/// requires `F` on, and it asks for `F` off. Rust says nothing, because the
+/// tokens are discarded before name resolution — which is how a dead arm in
+/// `try_metal2vulkan_draw` came to reference four locals that do not exist.
+///
+/// Brace depth is counted on [`mask_comments_and_literals`] output, so the
+/// `{}` in a `format!` string cannot desynchronise it; attribute *text* is read
+/// off the raw line, because masking blanks the feature name out of the
+/// attribute's own string literal. A line the mask reduced to blanks was
+/// entirely comment and is skipped, which is what keeps prose quoting the
+/// forbidden shape — including this doc comment — from registering.
+///
+/// One shape is deliberately not handled: a `cfg` attribute broken across
+/// several lines. rustfmt keeps these on one line and the crate has none.
+fn nested_negated_feature_cfgs(src: &str) -> Vec<(usize, String)> {
+    let masked = mask_comments_and_literals(src);
+    let masked = String::from_utf8_lossy(&masked);
+    // (depth the gate's body sits at, feature, positive)
+    let mut gates: Vec<(i32, String, bool)> = Vec::new();
+    let mut pending: Option<(String, bool)> = None;
+    let mut depth = 0i32;
+    let mut parens = 0i32;
+    let mut found = Vec::new();
+
+    for (i, (raw, masked_line)) in src.lines().zip(masked.lines()).enumerate() {
+        if masked_line.trim().is_empty() {
+            continue;
+        }
+        let count = |c: u8| masked_line.bytes().filter(|b| *b == c).count() as i32;
+        let (opens, closes) = (count(b'{'), count(b'}'));
+        let trimmed = raw.trim();
+
+        if trimmed.starts_with("#[cfg(") {
+            if let Some((feature, positive)) = cfg_attr_feature(trimmed) {
+                if !positive
+                    && gates
+                        .iter()
+                        .any(|(_, gated_on, pos)| *pos && *gated_on == feature)
+                {
+                    found.push((i + 1, feature.clone()));
+                }
+                pending = Some((feature, positive));
+            }
+            continue;
+        }
+
+        // The attributed item. A body opens a scope the gate governs; a `use`,
+        // a `let` or a body-less item consumes the attribute where it ends.
+        // Neither may be decided while a parameter list is still open: a
+        // generic `fn` signature runs for many lines, each ending in a comma
+        // and opening no brace, and reading any of them as the whole item is
+        // how this scanner first reported the crate clean while two dead arms
+        // sat inside such functions.
+        // Measured at end of line, not start: the line that closes a parameter
+        // list is the same line that opens the body.
+        parens += count(b'(') - count(b')');
+        if parens == 0 {
+            if opens > closes {
+                if let Some((feature, positive)) = pending.take() {
+                    gates.push((depth + 1, feature, positive));
+                }
+            } else if trimmed.ends_with(';') || trimmed.ends_with(',') {
+                pending = None;
+            }
+        }
+        depth += opens - closes;
+        gates.retain(|(body_depth, _, _)| *body_depth <= depth);
+    }
+    found
+}
+
+/// A `cfg` arm that asks for a feature its own enclosing item forbids is code
+/// no build compiles, and no compiler will say so.
+#[test]
+fn no_cfg_arm_negates_the_feature_its_enclosing_item_requires() {
+    let root = crate_src();
+    let mut dead = Vec::new();
+    for path in production_files(&root) {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line, feature) in nested_negated_feature_cfgs(&src) {
+            dead.push(format!(
+                "{}:{line} — #[cfg(not(feature = \"{feature}\"))] inside an item \
+                 already gated on \"{feature}\"",
+                rel(&path, &root)
+            ));
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "unconditionally dead cfg arms — delete them, they never compile:\n  {}",
+        dead.join("\n  ")
+    );
+}
+
+/// The scanner must separate the two shapes that look alike in a grep: sibling
+/// stubs, which are the correct way to write a per-feature pair, and a negation
+/// nested inside its own feature, which is dead. A scanner that failed to tell
+/// them apart would either flag every stub in the crate or flag nothing.
+#[test]
+fn the_nested_cfg_scanner_reads_bodies_and_not_siblings() {
+    let siblings = r#"
+#[cfg(feature = "vk")]
+fn f() -> bool {
+    true
+}
+#[cfg(not(feature = "vk"))]
+fn f() -> bool {
+    false
+}
+"#;
+    assert!(
+        nested_negated_feature_cfgs(siblings).is_empty(),
+        "sibling stubs are the correct pattern"
+    );
+
+    let nested = r#"
+#[cfg(feature = "vk")]
+fn f() -> bool {
+    #[cfg(not(feature = "vk"))]
+    {
+        false
+    }
+}
+"#;
+    assert_eq!(
+        nested_negated_feature_cfgs(nested),
+        vec![(4, String::from("vk"))]
+    );
+
+    // A different feature nested inside is a real combination, not dead.
+    let other = r#"
+#[cfg(feature = "vk")]
+fn f() -> bool {
+    #[cfg(not(feature = "window"))]
+    {
+        false
+    }
+}
+"#;
+    assert!(nested_negated_feature_cfgs(other).is_empty());
+
+    // The gate must close with its item: a negation *after* the body is a
+    // sibling even when it is only one line further on.
+    let after = r#"
+#[cfg(feature = "vk")]
+fn f() {
+    let s = "}{";
+}
+#[cfg(not(feature = "vk"))]
+fn f() {}
+"#;
+    assert!(
+        nested_negated_feature_cfgs(after).is_empty(),
+        "a brace inside a string literal must not hold the gate open"
+    );
+
+    // The shape both dead arms in this crate actually had: the gated item is a
+    // generic `fn` whose signature runs for several lines before its body
+    // opens. Missing this reported the crate clean.
+    let multiline_signature = r#"
+#[cfg(feature = "vk")]
+fn f<M: HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+) -> Result<(), Error> {
+    #[cfg(not(feature = "vk"))]
+    {
+        return Err(Error);
+    }
+}
+"#;
+    assert_eq!(
+        nested_negated_feature_cfgs(multiline_signature),
+        vec![(7, String::from("vk"))]
+    );
+
+    // Prose quoting the shape is not the shape.
+    let prose = r#"
+#[cfg(feature = "vk")]
+fn f() {
+    // #[cfg(not(feature = "vk"))]
+    let x = 1;
+}
+"#;
+    assert!(nested_negated_feature_cfgs(prose).is_empty());
+}
+
 #[test]
 fn the_scanner_walks_the_whole_crate() {
     let files = rust_files(&crate_src());

@@ -1127,7 +1127,6 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // global dedup mutex and does an output-group lookup; this bind
                 // resolves the same (mid, w, h), so recomputing it per resident
                 // sample (the census shows ~29k/session) is pure waste.
-                #[cfg(feature = "backend-vulkan")]
                 let resident_id =
                     crate::runtime::present_identity::surface_identity(state, mid, w, h);
                 // `content_ready` only. The obvious strengthening — also require
@@ -1145,16 +1144,8 @@ fn resolve_sampled_source<M: HostMemory + HostOps>(
                 // change. What guards this rung today is the guest-write witness
                 // below, which is the witness the LOAD elision's epoch pair
                 // cannot supply anyway.
-                let resident_ready = {
-                    #[cfg(feature = "backend-vulkan")]
-                    {
-                        crate::backend::vulkan::engine::resident_content_ready(&resident_id)
-                    }
-                    #[cfg(not(feature = "backend-vulkan"))]
-                    {
-                        false
-                    }
-                };
+                let resident_ready =
+                    crate::backend::vulkan::engine::resident_content_ready(&resident_id);
 
                 // What the hypervisor can say about the guest's own stores into
                 // this surface since the Store that produced our copies of it.
@@ -4585,7 +4576,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         let mut images: Vec<crate::backend::vulkan::engine::SampledImageResource> = Vec::new();
         let mut samplers: Vec<crate::backend::vulkan::engine::SamplerResource> = Vec::new();
         let mut sampler_binds: std::collections::BTreeSet<u32> = Default::default();
-        let mut display_sample_mids: std::collections::BTreeSet<u32> = Default::default();
         {
             let mut push_tex = |index: u32,
                                 texture_ref: u32,
@@ -4612,13 +4602,11 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 let attachment_alias = frag_stage
                     .then(|| fragment_attachment_alias_sample(req, index, texture_ref))
                     .flatten();
-                let (tw, th, sampled_mid, loaded) = if let Some((aw, ah, alias)) = attachment_alias
-                {
+                let (tw, th, loaded) = if let Some((aw, ah, alias)) = attachment_alias {
                     match alias {
                         AttachmentAliasSample::Clear(clear) => (
                             aw,
                             ah,
-                            0,
                             SampledSourceRequest::Bytes(
                                 std::sync::Arc::new(solid_rgba_local(aw, ah, &clear)),
                                 None,
@@ -4628,7 +4616,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         AttachmentAliasSample::Seed(seed) => (
                             aw,
                             ah,
-                            0,
                             SampledSourceRequest::Bytes(
                                 std::sync::Arc::new(seed.to_vec()),
                                 None,
@@ -4658,7 +4645,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             (
                                 identity.width(),
                                 identity.height(),
-                                0,
                                 SampledSourceRequest::Target(identity),
                             )
                         }
@@ -4681,11 +4667,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                             },
                         ));
                     };
-                    loaded
+                    let (rw, rh, _mid, src) = loaded;
+                    (rw, rh, src)
                 };
-                if sampled_mid != 0 && tw == w && th == h {
-                    display_sample_mids.insert(sampled_mid);
-                }
                 let mut bytes_identity = None;
                 // Byte layout of a CPU-origin bind. Default RGBA8; a native
                 // single/dual-channel plane keeps its footprint. The RGBA8-shaped
@@ -5725,8 +5709,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        // Sum of per-bind rgb_nz over Bytes sources, accumulated in the bind
-        // loop (resident Target binds contribute no CPU bytes, as before).
         if census_verbose || fixed_gap_first {
             // O(seed pixels), and the line below is its only reader.
             let seed_rgb = resources
@@ -5738,7 +5720,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         .count()
                 })
                 .unwrap_or(0);
-            let tex_rgb: usize = 0;
             let idx_count = resources
                 .indexed
                 .as_ref()
@@ -5872,7 +5853,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // interaction.
             {
                 let record = format!(
-                    "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} seed_rgb={} tex_rgb={} idx={} idx_n={} attr0={} a0hex={} v0col={} idxhex={} frag0hex={} vtx1hex={} frag1hex={} frag4hex={} mat2=[{mat_f}] meta=[{}] ssbo=[{}] sampler=[{}]",
+                    "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} seed_rgb={} idx={} idx_n={} attr0={} a0hex={} v0col={} idxhex={} frag0hex={} vtx1hex={} frag1hex={} frag4hex={} mat2=[{mat_f}] meta=[{}] ssbo=[{}] sampler=[{}]",
                     req.pipeline_ref,
                     w,
                     h,
@@ -5886,7 +5867,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     fixed_state_gap,
                     resources.target_rgba8.is_some() as u8,
                     seed_rgb,
-                    tex_rgb,
                     resources.indexed.is_some() as u8,
                     idx_count,
                     attr0_len,
@@ -6031,14 +6011,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             bytes: pixels,
             bgra: pixels_bgra,
         })
-    }
-    #[cfg(not(feature = "backend-vulkan"))]
-    {
-        let _ = (
-            v_words, f_words, w, h, pd, state, host, req, t_setup, load_us, m2v_us, t_total,
-        );
-        // Metal feature build on Linux: translation succeeds; raster needs --backend vulkan.
-        Err("vk_engine not linked (rebuild with --backend vulkan)".into())
     }
 }
 
