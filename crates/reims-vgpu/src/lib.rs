@@ -934,9 +934,30 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     true
 }
 
+/// Take the device lock from the vCPU thread, measuring the wait.
+///
+/// The guest's MMIO access is stopped for exactly as long as this blocks, and
+/// the drain worker holds this same lock across a full-surface readback. Every
+/// other figure about that stall is taken from the holder's side, which makes
+/// the step to "the guest missed a frame" an inference; this measures it where
+/// it is actually paid.
+///
+/// The uncontended path takes `try_lock` and never reads the clock, so a fast
+/// access pays nothing for the instrument.
+fn lock_device_for_vcpu(slot: &BoundDevice) -> impl std::ops::DerefMut<Target = DeviceInner> + '_ {
+    if let Some(guard) = slot.inner.try_lock() {
+        runtime::drain::note_vcpu_lock_free();
+        return guard;
+    }
+    let waited = std::time::Instant::now();
+    let guard = slot.inner.lock();
+    runtime::drain::note_vcpu_lock_wait(waited.elapsed().as_micros() as u64);
+    guard
+}
+
 pub fn device_iosfc_read(id: u64, offset: u64, size: u32) -> Option<u64> {
     let slot = device_slot(id)?;
-    let d = slot.inner.lock();
+    let d = lock_device_for_vcpu(&slot);
     Some(d.device.iosfc_read(offset, size))
 }
 
@@ -944,7 +965,7 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let mut d = slot.inner.lock();
+    let mut d = lock_device_for_vcpu(&slot);
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
         let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);

@@ -1833,6 +1833,43 @@ fn the_drain_duty_census_separates_a_flush_tail_from_a_flush_mean() {
     assert!(line.contains("slow_us=8333"), "{line}");
 }
 
+/// The vCPU's wait must be measured where the guest pays it.
+///
+/// Every other figure about a long tranche is taken from the side that *holds*
+/// the device lock, which leaves "the drain held it 38 ms" and "the guest
+/// missed a frame" joined by an inference. This census measures the blocked
+/// side: how long the guest's MMIO access was actually stopped.
+///
+/// `uncontended` is counted separately and deliberately. A window with a large
+/// `max_wait_us` and a huge `uncontended` count is a rare collision; the same
+/// max with few uncontended acquisitions is a worker that owns the lock. Those
+/// are opposite diagnoses and a wait-only counter cannot tell them apart.
+#[test]
+fn the_vcpu_lock_census_reports_the_blocked_side_and_separates_free_acquisitions() {
+    use crate::runtime::drain::VcpuLockCensus;
+    let c = VcpuLockCensus::default();
+    assert!(c.note_wait(1, 5_000).is_none(), "first call arms only");
+
+    for _ in 0..500 {
+        c.note_uncontended();
+    }
+    // Two waits shorter than a frame, one longer.
+    c.note_wait(200, 5_100);
+    c.note_wait(900, 5_200);
+    c.note_wait(30_000, 5_300);
+    let line = c.note_wait(50, 6_100).expect("a full window must report");
+
+    assert!(line.contains("max_wait_us=30000"), "{line}");
+    assert!(line.contains("uncontended=500"), "{line}");
+    // Only the 30 ms wait cost the guest a whole frame; the sub-millisecond
+    // ones are collisions the guest would never notice.
+    assert!(line.contains("frame_waits=1"), "{line}");
+    // Five, not three: the call that arms the window and the call that closes
+    // it are both real waits and are counted in the window they bound.
+    assert!(line.contains("waits=5"), "{line}");
+    assert!(line.contains("wait_us=31151"), "{line}");
+}
+
 
 /// A guest display reinit (SETUP_SHARED_STATE while already ONLINE) that
 /// arrives *after* boot-convergence self-labels with one correlated

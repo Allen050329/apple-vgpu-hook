@@ -3235,6 +3235,80 @@ impl DrainDutyCensus {
     }
 }
 
+/// How long the vCPU thread waited for the device lock, measured where it waits.
+///
+/// Every other figure about tranche length is taken from the side that *holds*
+/// the lock, so the step from "the drain held it 38 ms" to "the guest missed a
+/// frame" was an inference. This measures the stall from the side that suffers
+/// it: the guest's MMIO access is stopped for exactly this long, on the vCPU
+/// thread, inside `device_iosfc_read`/`device_iosfc_write`.
+///
+/// Only the contended path is timed. The uncontended path takes `try_lock` and
+/// never reads the clock, so a fast access pays nothing for this.
+#[derive(Default)]
+pub(crate) struct VcpuLockCensus {
+    waits: std::sync::atomic::AtomicU64,
+    wait_us: std::sync::atomic::AtomicU64,
+    max_wait_us: std::sync::atomic::AtomicU64,
+    /// Waits that cost the guest at least a whole frame interval.
+    frame_waits: std::sync::atomic::AtomicU64,
+    uncontended: std::sync::atomic::AtomicU64,
+    last_report_ms: std::sync::atomic::AtomicU64,
+}
+
+impl VcpuLockCensus {
+    pub(crate) fn note_uncontended(&self) {
+        self.uncontended
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one contended wait and return the line when a report is due.
+    pub(crate) fn note_wait(&self, us: u64, now_ms: u64) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.waits.fetch_add(1, Relaxed);
+        self.wait_us.fetch_add(us, Relaxed);
+        self.max_wait_us.fetch_max(us, Relaxed);
+        if us >= DRAIN_TRANCHE_SLOW_US {
+            self.frame_waits.fetch_add(1, Relaxed);
+        }
+        let last = self.last_report_ms.load(Relaxed);
+        if last == 0 {
+            self.last_report_ms.store(now_ms, Relaxed);
+            return None;
+        }
+        let win_ms = now_ms.saturating_sub(last);
+        if win_ms < DRAIN_DUTY_REPORT_MS {
+            return None;
+        }
+        self.last_report_ms.store(now_ms, Relaxed);
+        let waits = self.waits.swap(0, Relaxed);
+        let total = self.wait_us.swap(0, Relaxed);
+        let max = self.max_wait_us.swap(0, Relaxed);
+        let frames = self.frame_waits.swap(0, Relaxed);
+        let free = self.uncontended.swap(0, Relaxed);
+        Some(format!(
+            "vcpu_lock_wait win_ms={win_ms} waits={waits} uncontended={free} \
+             wait_us={total} max_wait_us={max} frame_waits={frames} slow_us={DRAIN_TRANCHE_SLOW_US}"
+        ))
+    }
+}
+
+static VCPU_LOCK: std::sync::LazyLock<VcpuLockCensus> =
+    std::sync::LazyLock::new(VcpuLockCensus::default);
+
+/// Count one uncontended device-lock acquisition from the vCPU thread.
+pub fn note_vcpu_lock_free() {
+    VCPU_LOCK.note_uncontended();
+}
+
+/// Record one contended device-lock wait from the vCPU thread; emits at most
+/// once per second.
+pub fn note_vcpu_lock_wait(us: u64) {
+    if let Some(line) = VCPU_LOCK.note_wait(us, crate::observe::elapsed_ms() as u64) {
+        crate::observe::off(line);
+    }
+}
+
 static DRAIN_DUTY: std::sync::LazyLock<DrainDutyCensus> =
     std::sync::LazyLock::new(DrainDutyCensus::default);
 
