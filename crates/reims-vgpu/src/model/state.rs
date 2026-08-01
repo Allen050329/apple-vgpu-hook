@@ -1382,7 +1382,6 @@ pub enum PaintSrc {
 #[derive(Clone, Debug, Default)]
 pub struct PresentState {
     pub valid: bool,
-    pub mapping_id: u32,
     pub width: u32,
     pub height: u32,
     /// Content generation observed at last DisplaySwap enqueue.

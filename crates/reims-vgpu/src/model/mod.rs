@@ -390,7 +390,6 @@ mod tests {
         let mut d = dev();
         d.state.present.width = 1440;
         d.state.present.height = 900;
-        d.state.present.mapping_id = 3;
         d.state.cursor.show = true;
         d.state.cursor.hot_x = 1;
         d.state.cursor.hot_y = 2;

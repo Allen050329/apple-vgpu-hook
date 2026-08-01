@@ -477,7 +477,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
                 ));
             }
             state.present.valid = true;
-            state.present.mapping_id = shown_mid;
             state.present.width = width;
             state.present.height = height;
             state.present.generation = shown_gen;
@@ -548,7 +547,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
             mapping_id, width, height, expected_generation, nz, maxb
         ));
         state.present.valid = true;
-        state.present.mapping_id = mapping_id;
         state.present.width = width;
         state.present.height = height;
         state.present.generation = expected_generation;
@@ -562,7 +560,6 @@ pub fn copy_to_bgra8<M: HostMemory + crate::runtime::host::HostOps>(
         // while the console still held EFI text.
         crate::observe::line(format!("scanout paint_efi ok {}x{}", width, height));
         state.present.valid = true;
-        state.present.mapping_id = mapping_id;
         state.present.width = width;
         state.present.height = height;
         state.present.generation = expected_generation;
@@ -1084,7 +1081,6 @@ pub fn note_front_buffer_writeback<M: HostMemory + crate::runtime::host::HostOps
     // is sequential; our async HostAction queue needs the latch here).
     state.present.present_mapping = mapping_id;
     state.present.valid = true;
-    state.present.mapping_id = mapping_id;
     state.present.width = paint_w;
     state.present.height = paint_h;
     state.present.generation = gen;
@@ -1556,7 +1552,6 @@ mod tests {
         state.present.frame_flush_seen = true;
         state.present.present_mapping = 3;
         state.present.host_mapping = 3;
-        state.present.mapping_id = 3;
         state.present.valid = true;
         state.present.width = 1440;
         state.present.height = 1080;

@@ -514,6 +514,96 @@ fn metal_no_copy_buffers_alias_host_memory_and_nothing_else() {
     );
 }
 
+/// Every field of `PresentState` is read by something.
+///
+/// `PresentState` is the present path's bookkeeping, and the operating loop
+/// ranks "fewer pieces of state that must agree" above "fewer lines". It
+/// already carries five separate mapping ids — `present_mapping`,
+/// `painted_mapping`, `host_mapping`, `frame_mapping`, `early_front_mapping` —
+/// each meaning something slightly different, and a sixth (`mapping_id`) sat
+/// there for a long time being assigned at five sites and read by nothing. A
+/// write-only field on this struct is worse than dead weight: it reads like a
+/// sixth meaning that some other rail must be kept consistent with, so every
+/// author who touches the present path pays to understand it.
+///
+/// A field counts as read if `present.<name>` appears in production source in a
+/// position that is not the left side of a plain `=`. Compound assignment,
+/// comparison, method call, or use as a value all count, so this cannot flag a
+/// field that is genuinely read; it can only miss one, which is the right way
+/// round for a source assertion.
+///
+/// The `present.` prefix is load-bearing and the first version of this test did
+/// not have it. Every access to this struct spells it — `state.present.x`,
+/// `d.state.present.x`, and `present.x` inside `window_frame_key`, whose
+/// parameter is named `present`. Matching bare `.<name>` instead looks
+/// equivalent and is not: field names here are ordinary words, and `.mapping_id`
+/// alone matches `MappingEntry`, `ComputeStorageResidencyKey` and a dozen other
+/// types, so the scan reported every field as read and passed against a tree
+/// with a known write-only field in it. Re-check that this test can still fail
+/// before trusting a green run from it.
+#[test]
+fn no_present_state_field_is_write_only() {
+    let root = crate_src();
+    let state_src = std::fs::read_to_string(root.join("model/state.rs")).expect("read state.rs");
+    let decl = block_after(&state_src, "pub struct PresentState {").expect("PresentState struct");
+    let fields: Vec<String> = decl
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("pub ")?;
+            let name = rest.split(':').next()?.trim();
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                .then(|| name.to_string())
+        })
+        .collect();
+    assert!(
+        fields.len() > 20,
+        "PresentState field scan found only {} fields; the struct or the parse moved",
+        fields.len()
+    );
+
+    let mut body = String::new();
+    for path in production_files(&root) {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        body.push_str(&production_source(&String::from_utf8_lossy(
+            &mask_comments_and_literals(&src),
+        )));
+        body.push('\n');
+    }
+
+    let write_only: Vec<&String> = fields
+        .iter()
+        .filter(|name| {
+            let needle = format!("present.{name}");
+            !body.lines().any(|line| {
+                let Some(at) = line.find(&needle) else {
+                    return false;
+                };
+                let after = line[at + needle.len()..].trim_start();
+                // A bare `= …` is the one use that is not a read. `==` and the
+                // compound forms (`+=`, `|=`, …) both leave a non-`=` byte
+                // before the space-stripped `=`, so check the raw tail.
+                let raw = &line[at + needle.len()..];
+                let assign = raw.trim_start().starts_with('=') && !after.starts_with("==");
+                let boundary = raw
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                boundary && !assign
+            })
+        })
+        .collect();
+
+    assert!(
+        write_only.is_empty(),
+        "PresentState fields written but never read: {write_only:?}. Delete them, \
+         or if one is about to gain a reader, land the reader in the same change."
+    );
+}
+
 /// One place decides whether an engine resident may stand in for a guest read.
 ///
 /// The three staging rails in `stage_texture_raw` — heap, type-11 mapping, and

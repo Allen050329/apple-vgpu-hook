@@ -1474,7 +1474,6 @@ fn present_named_mapping<H: HostMemory + HostOps>(
 
     state.present.present_mapping = mapping;
     state.present.host_mapping = mapping;
-    state.present.mapping_id = mapping;
     state.present.valid = true;
     // x86: present surface_id → type-4 object-list slot (heap index =
     // IOSurface getSurfaceID). Arm: MappingInternal page-table resolve.
