@@ -3336,93 +3336,6 @@ fn sync_store_allowed_pages<M: HostMemory>(
     sync_store_target_pages(state, host, task_id, color0?)
 }
 
-/// Score a GVA-keyed cache hit against the guest pages it was produced from,
-/// and answer whether the entry may be served.
-///
-/// `false` **only** for `BackingVerdict::Moved`: the guest remapped this span
-/// and it now resolves to different pages, so the address the cache is keyed by
-/// no longer names the allocation the bytes are of. Serving them paints one
-/// resource's pixels under another's name. The reader falls through to its next
-/// rung — the texture_ref cache, then the guest's own pages — each keyed by
-/// something this remap did not invalidate.
-///
-/// Every other verdict serves. `Unchanged` means no notify has touched the
-/// span. `Confirmed` means the mapping churned and the same pages came back,
-/// which is precisely the retained wallpaper class the Unmap retain exists for.
-/// `Unrecorded` means there is nothing to compare against, and a cache that
-/// cannot answer the question is left alone rather than thrown away on
-/// suspicion.
-///
-/// `gvac_hit` is the denominator — every read this census sees — and the four
-/// verdict counters partition it. `site` names the read that asked, the sampled
-/// texture path or the Load seed, so a rate can be attributed to its rail.
-///
-/// **This refusal did not close the icon class, and what survives it is held.**
-/// x86/Vulkan, six Finder recomposites under load, each sampled fourteen times
-/// over 65 s with nothing driven in between: two rounds were wrong at the first
-/// sample and identically wrong at the last (5 of 7 icons, and 6 of 7), four
-/// rounds were clean at every sample, and **no round recovered**. So the
-/// remainder is another wrong-content state that holds, not a frame that
-/// arrives late — an important distinction, because a defect that heals itself
-/// would have to be chased in the present path and this one cannot be.
-///
-/// Two things the same run rules out as its cause. `gvac_moved` was *higher* on
-/// all four clean rounds (4, 4, 8) than on the corrupt one (2), so falling
-/// through this refusal is not what breaks an icon. And the corrupt rounds
-/// carried zero `deferred_window_page_drift` refusals and zero
-/// `linear_sample_miss` declines, so neither the guest-memory bounds nor a
-/// declining loader is starving them — whatever serves those icons believes it
-/// succeeded.
-///
-/// **The "geometry defect" that used to close this comment was wrong, and the
-/// magnification that suggested it is why the rule against eyeballing one
-/// exists.** Enumerating the colours over a broken cell says something else
-/// entirely: the cell holds a small *greyscale* mark and nothing else — in one
-/// captured round a clearly legible 11x11 magnifying glass sitting where the
-/// Pictures folder belongs, in another a 7x18 black bar, in a third nothing at
-/// all — while every other icon in the same window and every text label,
-/// including the broken cell's own, renders perfectly. A cell is not losing a
-/// layer or being drawn at the wrong size. It is being served **another
-/// resource's picture** at the same geometry.
-///
-/// That is what this verdict cannot catch and was never able to: it asks
-/// whether the GVA still *names* these pages, and the answer is yes right up
-/// until the guest CPU rewrites them in place. See
-/// [`crate::runtime::surface_cache::gva_guest_wrote_since_store`], which asks
-/// the other half.
-#[cfg(feature = "backend-vulkan")]
-#[must_use]
-fn note_gva_backing_verdict(
-    verdict: crate::runtime::surface_cache::BackingVerdict,
-    site: &'static str,
-    task_id: u32,
-    gva: u64,
-    width: u32,
-    height: u32,
-) -> bool {
-    use crate::runtime::surface_cache::BackingVerdict as V;
-    crate::runtime::drain::note_store_route("gvac_hit");
-    crate::runtime::drain::note_store_route(match verdict {
-        V::Unchanged => "gvac_unchanged",
-        V::Confirmed => "gvac_confirmed",
-        V::Moved => "gvac_moved",
-        V::Unrecorded => "gvac_unrecorded",
-    });
-    // A rate without identities cannot be acted on: it does not say which
-    // resource class is affected or how big the victims are. Deduplicated per
-    // (site, gva, geometry) so a compositor asking hundreds of times a second
-    // reports the span once.
-    if verdict != V::Moved {
-        return true;
-    }
-    if crate::observe::first_sight(site, gva ^ ((width as u64) << 32) ^ (height as u64)) {
-        crate::observe::off(format!(
-            "gva_cache_backing_moved site={site} task={task_id} gva={gva:#x} {width}x{height}"
-        ));
-    }
-    false
-}
-
 /// Score a `MTLLoadActionLoad` colour attachment against whether a seed was
 /// actually found for it.
 ///
@@ -5295,76 +5208,22 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                         seed_door = "gva_or_ref";
                         // GVA type-2/3 Load: texture_ref encode cache (separate
                         // from surface_id mid map). Prefer GVA key when present.
-                        let gva_hit = if c0.target_gva != 0 {
-                            // Same census as the sampled read: a Load seed
-                            // served for a GVA the guest has re-pointed paints
-                            // another allocation's pixels into this pass.
-                            let names_these_pages =
-                                !crate::runtime::surface_cache::has_gva(state, c0.target_gva, w, h)
-                                    || note_gva_backing_verdict(
-                                        crate::runtime::surface_cache::revalidate_gva_backing(
-                                            state,
-                                            host,
-                                            req.task_id,
-                                            c0.target_gva,
-                                        ),
-                                        "load_seed",
-                                        req.task_id,
-                                        c0.target_gva,
-                                        w,
-                                        h,
-                                    );
-                            if names_these_pages {
-                                // Recency for the encode cache's byte cap; a
-                                // Load seed served from here is a use.
-                                crate::runtime::surface_cache::touch_gva(
-                                    state,
-                                    c0.target_gva,
-                                    w,
-                                    h,
-                                );
-                            }
-                            let served = names_these_pages
-                                .then(|| {
-                                    crate::runtime::surface_cache::get_gva(
-                                        state,
-                                        c0.target_gva,
-                                        w,
-                                        h,
-                                    )
-                                })
-                                .flatten()
-                                .map(|b| b.to_vec());
-                            // Unlike the sibling in `seed_color_load`, which
-                            // serves every colour LOAD seed the device produces,
-                            // this door read **0 serve and 0 miss** over a driven
-                            // x86/Vulkan window that carried 1 558 of them — so
-                            // the enclosing `target_gva != 0` block did not
-                            // execute at all. The seed is already resolved by
-                            // then: `color_target_request` calls `seed_color_load`
-                            // while building the request, so `target_rgba8` is
-                            // supplied before this arm is consulted.
-                            //
-                            // Zero over one window is thinner evidence than the
-                            // 286 800 that convicted the sampled rung, and this
-                            // is a branch rather than a rail, so the counters
-                            // stay for one more driven boot. A second window at
-                            // 0/0 retires this whole arm, and with it the last
-                            // caller of `note_gva_backing_verdict` and
-                            // `revalidate_gva_backing`.
-                            crate::runtime::drain::note_store_route(if served.is_some() {
-                                "gvac_seed_vk_serve"
-                            } else {
-                                "gvac_seed_vk_miss"
-                            });
-                            served
-                        } else {
-                            None
-                        };
-                        if let Some(bgra) = gva_hit {
-                            target_rgba8 = Some(std::sync::Arc::new(bgra));
-                            seed_order = crate::backend::vulkan::engine::SeedOrder::Bgra8;
-                        } else if let Some(bgra) =
+                        // A GVA-keyed lookup of the encode cache used to sit
+                        // here, ahead of the texture_ref one below, with its own
+                        // backing revalidation. It never ran: two independent
+                        // driven x86/Vulkan windows carrying 1 558 and 637
+                        // colour LOAD seeds recorded 0 serve and 0 miss at it,
+                        // so the enclosing `target_gva != 0` test never held.
+                        //
+                        // It cannot hold. `color_target_request` calls
+                        // `seed_color_load` while building the request, and that
+                        // is where the GVA encode cache is actually read — it
+                        // served all 1 558 of the first window's colour seeds.
+                        // By the time this arm is reached the seed is already in
+                        // `req.target_seed_rgba`, so this was a second lookup of
+                        // the same map, behind a stricter gate, for a case the
+                        // first lookup had already handled.
+                        if let Some(bgra) =
                             crate::runtime::surface_cache::get_texture(state, c0.texture_ref, w, h)
                         {
                             target_rgba8 = Some(std::sync::Arc::new(bgra.to_vec()));

@@ -119,13 +119,19 @@ pub fn retire_gva_views_overlapping(
     state
         .flush_nohit_memo
         .retain(|&(t, g, s), _| !(task_matches(t, task_id) && ranges_overlap(g, s, gva, length)));
-    // The GVA-keyed encode cache survives this, but its key does not survive it
-    // unexamined: a remap can leave the same virtual address naming a different
-    // allocation. Exact task id — `task_matches`' aliased arm would mark
-    // another address space's entries on a coincidence.
-    let suspect =
-        crate::runtime::surface_cache::mark_gva_backing_suspect(state, task_id, gva, length);
-    crate::runtime::drain::note_store_route_n("gvac_suspect", suspect as u64);
+    // The GVA-keyed encode cache survives this deliberately — a mapping that
+    // churns and comes back must not black out the wallpaper — and its entries
+    // used to be marked "suspect" here so the next reader would re-walk and
+    // prove the address still named the same allocation. Nothing does that
+    // re-walk any more: the only reader that asked for the proof never ran, so
+    // the mark, the flag and the revalidation went with it.
+    //
+    // What that leaves open is stated where the cache lives: a remap can leave
+    // the same virtual address naming a different allocation, and nothing on
+    // this rail can currently tell. It is a contract question — what the guest's
+    // statement of ownership is for a surface whose pages it has re-pointed —
+    // and `gva_backing_moved` in the `cache_levels` line still counts how often
+    // the condition arises.
     n
 }
 

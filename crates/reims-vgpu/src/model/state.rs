@@ -1311,11 +1311,6 @@ pub struct HostSurface {
     /// `None` on the surface_id/texture_ref caches (their key is not a guest
     /// virtual address) and on any GVA store whose walk did not resolve.
     pub backing: Option<GvaBacking>,
-    /// The guest changed a page-table mapping overlapping this entry's span
-    /// since [`Self::backing`] was recorded, so the recorded pages may no
-    /// longer be the ones the GVA names. Cleared by the next lookup that
-    /// re-walks and confirms them.
-    pub backing_suspect: bool,
     // No guest-CPU-write witness sits here, and that is a known gap rather
     // than an omission. `backing_suspect` answers whether this GVA still
     // *names* these pages; nothing answers whether the guest CPU *wrote* them.
