@@ -286,7 +286,7 @@ fn publish_present_boundary(slot: &BoundDevice, frame_flush_seen: bool) {
 
 fn apply_gfx_write(inner: &mut DeviceInner, slot: &BoundDevice, write: QueuedGfxWrite) {
     if let Some(ops) = slot.ops {
-        let mut host = QemuHost::with_prompt(&ops, &mut inner.actions, &slot.prompt_actions);
+        let mut host = QemuHost::new(&ops, &mut inner.actions, &slot.prompt_actions);
         inner
             .device
             .gfx_write(&mut host, write.offset, write.data, write.size);
@@ -391,7 +391,7 @@ pub fn device_reset(id: u64) -> bool {
         let boundary = state.present.frame_flush_seen;
         let views = if let Some(ops) = slot.ops {
             let DeviceInner { device, actions } = &mut *d;
-            let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+            let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
             device.reset_with_host(&mut host)
         } else {
             d.device.reset();
@@ -947,7 +947,7 @@ pub fn device_iosfc_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
     let mut d = slot.inner.lock();
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
-        let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
         device.iosfc_write(&mut host, offset, data, size);
     } else {
         let mut host = NullHost;
@@ -974,7 +974,7 @@ pub fn device_drain(id: u64) -> bool {
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
-    let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+    let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
     // Presentation-path selector for this tranche: with a live host window the
     // drain publishes frames + self-acks; without one every present must
     // enqueue the CPU `ScanoutUpdate` and the ack belongs to the console paint
@@ -1063,7 +1063,7 @@ pub fn device_poll(id: u64) -> bool {
         return true;
     };
     let DeviceInner { device, actions } = &mut *d;
-    let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+    let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
     runtime::drain::publish_stranded_fifos(&mut device.state, &mut host);
     runtime::drain::try_display_online(&mut device.state, &mut host);
     // After ONLINE, pulse VBL so the guest compositor has a display time base
@@ -1147,7 +1147,7 @@ fn vbl_contended_pulse(slot: &BoundDevice) {
     }
     runtime::drain::note_vbl(runtime::drain::VBL_DELIVERED, now);
     let mut scratch = VecDeque::new();
-    let mut host = QemuHost::with_prompt(&ops, &mut scratch, &slot.prompt_actions);
+    let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
     let mut buf = [0u8; 4];
     if host
         .read_gpa(gpa + model::DISPLAY_SHARED_PENDING, &mut buf)
@@ -1250,7 +1250,7 @@ pub fn device_efi_console_copy(
     }
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
-        let host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+        let host = QemuHost::new(&ops, actions, &slot.prompt_actions);
         if runtime::scanout::paint_efi_console(&device.state, &host, dst, dst_stride, width, height)
         {
             let stride = if device.state.gfx.efi_fb_stride != 0 {
@@ -1296,7 +1296,7 @@ pub fn device_scanout_copy(
     };
     if let Some(ops) = slot.ops {
         let DeviceInner { device, actions } = &mut *d;
-        let mut host = QemuHost::with_prompt(&ops, actions, &slot.prompt_actions);
+        let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
         // `frame_encode_pending` also means a valid +0x188 snapshot was just
         // installed and must be blitted once. `copy_to_bgra8` distinguishes
         // that case from capture-fail retry without draining guest commands in

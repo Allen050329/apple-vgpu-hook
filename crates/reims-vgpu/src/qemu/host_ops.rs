@@ -258,22 +258,20 @@ impl From<HostAction> for ReimsVgpuHostAction {
 ///   the slot-level queue and `notify_actions`-scheduled immediately, so a
 ///   guest ISR sees its stamp-completion MSI while the drain worker is still
 ///   rendering later packets (ack fast / render async).
+///
+/// Both rails are always present. There was a second constructor that left
+/// `prompt` unset, so that `enqueue` fell through to the single lock-owning
+/// queue; no product site ever called it, which made the `None` arm — and the
+/// "IRQ pulses wait for the drain tranche" behaviour behind it — reachable
+/// only from the test written to describe it.
 pub struct QemuHost<'a> {
     ops: &'a ReimsVgpuHostOps,
     actions: &'a mut VecDeque<HostAction>,
-    prompt: Option<&'a parking_lot::Mutex<VecDeque<HostAction>>>,
+    prompt: &'a parking_lot::Mutex<VecDeque<HostAction>>,
 }
 
 impl<'a> QemuHost<'a> {
-    pub fn new(ops: &'a ReimsVgpuHostOps, actions: &'a mut VecDeque<HostAction>) -> Self {
-        Self {
-            ops,
-            actions,
-            prompt: None,
-        }
-    }
-
-    pub fn with_prompt(
+    pub fn new(
         ops: &'a ReimsVgpuHostOps,
         actions: &'a mut VecDeque<HostAction>,
         prompt: &'a parking_lot::Mutex<VecDeque<HostAction>>,
@@ -281,7 +279,7 @@ impl<'a> QemuHost<'a> {
         Self {
             ops,
             actions,
-            prompt: Some(prompt),
+            prompt,
         }
     }
 
@@ -381,44 +379,43 @@ impl HostOps for QemuHost<'_> {
         // Prompt rail: IRQ pulses and cursor moves carry no device state and
         // must not wait for the drain tranche to finish. Push to the slot
         // queue (poppable without the device lock) and wake the delivery BH.
-        if let Some(prompt) = self.prompt {
-            match action.kind {
-                HostActionKind::IrqGfxPulse | HostActionKind::IrqIosfcPulse => {
-                    let mut q = prompt.lock();
-                    // Coalesce: an undelivered pulse of the same kind already
-                    // covers this one (status bits accumulate in the r2c regs).
-                    if !q.iter().any(|a| a.kind == action.kind) {
-                        q.push_back(action);
-                    }
-                    drop(q);
-                    self.notify_actions();
-                    return;
-                }
-                HostActionKind::CursorUpdate => {
-                    let mut q = prompt.lock();
-                    q.retain(|a| a.kind != HostActionKind::CursorUpdate);
+        let prompt = self.prompt;
+        match action.kind {
+            HostActionKind::IrqGfxPulse | HostActionKind::IrqIosfcPulse => {
+                let mut q = prompt.lock();
+                // Coalesce: an undelivered pulse of the same kind already
+                // covers this one (status bits accumulate in the r2c regs).
+                if !q.iter().any(|a| a.kind == action.kind) {
                     q.push_back(action);
-                    drop(q);
-                    self.notify_actions();
-                    return;
                 }
-                HostActionKind::InputKey
-                | HostActionKind::InputPointerMove
-                | HostActionKind::InputPointerButton
-                | HostActionKind::WindowClosed => {
-                    // Host-window input + the window-closed signal: ordered and
-                    // lossless. Unlike cursor moves and IRQ pulses these must NOT
-                    // coalesce — a dropped key-up sticks a modifier, a reordered
-                    // move+click lands the click at the wrong spot, and a dropped
-                    // WindowClosed would leave the VM running headless. Push in
-                    // arrival order and wake the delivery BH so the guest (or the
-                    // shutdown path) sees it without waiting for a drain tranche.
-                    prompt.lock().push_back(action);
-                    self.notify_actions();
-                    return;
-                }
-                _ => {}
+                drop(q);
+                self.notify_actions();
+                return;
             }
+            HostActionKind::CursorUpdate => {
+                let mut q = prompt.lock();
+                q.retain(|a| a.kind != HostActionKind::CursorUpdate);
+                q.push_back(action);
+                drop(q);
+                self.notify_actions();
+                return;
+            }
+            HostActionKind::InputKey
+            | HostActionKind::InputPointerMove
+            | HostActionKind::InputPointerButton
+            | HostActionKind::WindowClosed => {
+                // Host-window input + the window-closed signal: ordered and
+                // lossless. Unlike cursor moves and IRQ pulses these must NOT
+                // coalesce — a dropped key-up sticks a modifier, a reordered
+                // move+click lands the click at the wrong spot, and a dropped
+                // WindowClosed would leave the VM running headless. Push in
+                // arrival order and wake the delivery BH so the guest (or the
+                // shutdown path) sees it without waiting for a drain tranche.
+                prompt.lock().push_back(action);
+                self.notify_actions();
+                return;
+            }
+            _ => {}
         }
         // apple-gfx new_frame_handler_bh: drop frames when guest gets too far
         // ahead of encode (pending_frames >= 2). Product: coalesce pending
@@ -727,7 +724,7 @@ mod tests {
         let ops = null_ops();
         let mut actions = VecDeque::new();
         let prompt = parking_lot::Mutex::new(VecDeque::new());
-        let mut host = QemuHost::with_prompt(&ops, &mut actions, &prompt);
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
 
         host.enqueue(HA::irq_gfx());
         host.enqueue(HA::irq_gfx()); // coalesced: one undelivered pulse covers both
@@ -748,20 +745,11 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_without_prompt_keeps_legacy_single_queue() {
-        let ops = null_ops();
-        let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
-        host.enqueue(HA::irq_gfx());
-        host.enqueue(HA::scanout_gen(1, 640, 480, 1));
-        assert_eq!(actions.len(), 2);
-    }
-
-    #[test]
     fn missing_qemu_memory_callbacks_are_exact() {
         let ops = null_ops();
         let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(
             host.read_gpa(0x1000, &mut [0; 1]),
             Err(MemError::QemuReadGpaCallbackMissing)
@@ -788,7 +776,8 @@ mod tests {
         ops.read_kva = Some(no_cpu_read_kva);
         ops.read_xreg = Some(fail_read_xreg);
         let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(
             host.read_gpa(0x1000, &mut [0; 1]),
             Err(MemError::QemuReadGpaCallbackFailed(-7))
@@ -873,15 +862,18 @@ mod tests {
     fn map_pages_distinguishes_missing_failed_and_null_callbacks() {
         let mut ops = null_ops();
         let mut actions = VecDeque::new();
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0x4000], 0x4000), None);
 
         ops.map_pages = Some(fail_map_pages);
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0x8000], 0x4000), None);
 
         ops.map_pages = Some(null_map_pages);
-        let mut host = QemuHost::new(&ops, &mut actions);
+        let prompt = parking_lot::Mutex::new(VecDeque::new());
+        let mut host = QemuHost::new(&ops, &mut actions, &prompt);
         assert_eq!(host.map_pages(&[0xc000], 0x4000), None);
     }
 
