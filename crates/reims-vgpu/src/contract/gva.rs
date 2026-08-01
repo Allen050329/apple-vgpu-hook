@@ -31,15 +31,15 @@ pub const X86_64_MAX_DEPTH: u32 = MAX_DEPTH;
 // cross-arch bugs. Use the arch-prefixed name or the device `page_shift`.
 pub const CACHE_WAYS: usize = 8;
 
-/// PFN → GPA at an explicit guest page shift (12 or 14).
+/// PFN → GPA at an explicit guest page shift (12 or 14). No default.
+///
+/// `model::regs` re-exports this rather than restating it. It had its own copy
+/// with the same body and the same doc, and the ring drains reached that one
+/// while this one was reached by nothing but the round-trip test below — two
+/// definitions of one shift, either of which could have been changed alone.
 #[inline]
 pub fn pfn_to_gpa(pfn: u32, page_shift: u32) -> u64 {
     (pfn as u64) << page_shift
-}
-
-#[inline]
-pub fn page_index(address: u64, page_shift: u32) -> u64 {
-    address >> page_shift
 }
 
 
@@ -61,11 +61,18 @@ mod tests {
         assert_ne!(PAGE_SIZE_ARM64E, PAGE_SIZE_X86);
     }
 
+    /// A PFN shifted to a GPA still names its own page at any offset inside it.
+    ///
+    /// Stated at both shifts because that is the whole reason `pfn_to_gpa` takes
+    /// one: a helper that assumed 14 is what put x86 stamp writes on the wrong
+    /// page. The inverse is written out rather than called, because no product
+    /// path wanted a named `page_index` helper and an unused one is a second
+    /// place this shift could be changed.
     #[test]
-    fn explicit_shift_helpers_round_trip_pfn_and_page_index() {
+    fn a_pfn_shifted_to_a_gpa_names_its_own_page_at_either_shift() {
         for shift in [PAGE_SHIFT_X86, PAGE_SHIFT_ARM64E] {
             let gpa = pfn_to_gpa(0x1234, shift);
-            assert_eq!(page_index(gpa + 0x321, shift), 0x1234);
+            assert_eq!((gpa + 0x321) >> shift, 0x1234);
         }
     }
 }

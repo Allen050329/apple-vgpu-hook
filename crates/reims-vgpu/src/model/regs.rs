@@ -83,7 +83,7 @@ pub const MAX_SCANOUT_DIM: u32 = 8192;
 // There is **no** bare `PAGE_SIZE` / `PAGE_SHIFT` — those names defaulted to
 // arm16K and caused x86 wild writes (stamp slots). Product code uses
 // `state.page_size()` / `state.page_shift`; fixtures pick an arch-qualified name.
-pub use crate::contract::gva::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub use crate::contract::gva::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, pfn_to_gpa};
 pub const PAGE_SIZE_ARM64E: u64 = 1u64 << PAGE_SHIFT_ARM64E;
 pub const PAGE_SIZE_X86: u64 = 1u64 << PAGE_SHIFT_X86;
 
@@ -296,12 +296,6 @@ pub const DEVICE_INFO_CAPS: &[(u32, u32)] = &[
     (42, 2),
     (44, 127),
 ];
-
-/// PFN → GPA at an explicit guest page shift (12 or 14). No default.
-#[inline]
-pub fn pfn_to_gpa(pfn: u32, page_shift: u32) -> u64 {
-    (pfn as u64) << page_shift
-}
 
 #[inline]
 pub fn child_reg_block_offset(channel_id: u32) -> Option<u64> {

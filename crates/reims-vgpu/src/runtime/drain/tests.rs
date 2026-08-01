@@ -13,7 +13,6 @@ fn a_partial_packet_is_control_flow_and_never_a_logged_fault() {
     assert_eq!(PacketError::ShortHeader.fault(), None);
     assert_eq!(PacketError::Incomplete.fault(), None);
     assert_eq!(PacketError::BadSize.fault(), Some(PacketFault::BadSize));
-    assert_eq!(PacketError::Desynced.fault(), Some(PacketFault::Desynced));
 }
 
 #[test]

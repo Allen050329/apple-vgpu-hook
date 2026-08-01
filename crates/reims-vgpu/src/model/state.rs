@@ -27,8 +27,6 @@ pub enum PacketFault {
     DesyncedHeadTail,
     /// `total_size` outside `[header, ring]`, or short of its stamp list.
     BadSize,
-    /// The decoder classified the ring position as desynced.
-    Desynced,
     /// Guest read failed: root packet header.
     RootHeaderRead,
     /// Guest read failed: root packet snapshot.
@@ -56,7 +54,6 @@ impl PacketFault {
         match self {
             Self::DesyncedHeadTail => "packet_desynced_head_tail",
             Self::BadSize => "packet_bad_size",
-            Self::Desynced => "packet_desynced",
             Self::RootHeaderRead => "packet_root_header_read",
             Self::RootSnapRead => "packet_root_snap_read",
             Self::RootStampWriteback => "packet_root_stamp_writeback",
@@ -3757,16 +3754,15 @@ mod fail_vocabulary_tests {
         assert_eq!(child, "fail_event reason=packet_bad_size ch=2 head=4096");
     }
 
-    /// Thirteen distinct malformed-packet checks used to be thirteen hyphenated
-    /// string literals passed by hand. They are now variants, and no two may
-    /// answer with the same slug — otherwise a child tail read and a child head
-    /// writeback look identical in the log.
+    /// The malformed-packet checks used to be hyphenated string literals passed
+    /// by hand. They are now variants, and no two may answer with the same slug
+    /// — otherwise a child tail read and a child head writeback look identical
+    /// in the log.
     #[test]
-    fn the_thirteen_packet_faults_all_differ() {
+    fn the_packet_faults_all_differ() {
         const ALL: &[PacketFault] = &[
             PacketFault::DesyncedHeadTail,
             PacketFault::BadSize,
-            PacketFault::Desynced,
             PacketFault::RootHeaderRead,
             PacketFault::RootSnapRead,
             PacketFault::RootStampWriteback,

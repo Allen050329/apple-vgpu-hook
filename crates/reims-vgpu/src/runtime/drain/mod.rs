@@ -223,7 +223,6 @@ pub enum PacketError {
     ShortHeader,
     BadSize,
     Incomplete,
-    Desynced,
 }
 
 impl PacketError {
@@ -235,12 +234,12 @@ impl PacketError {
     /// drain loop breaks and comes back. Logging it would flood the always-on
     /// sink on every healthy boot, which is why `ShortHeader` and `Incomplete`
     /// answer `None` here — and why a future variant cannot be added without its
-    /// author deciding which side of that line it falls on.
+    /// author deciding which side of that line it falls on. Both drain loops
+    /// go through it, so that decision is made once rather than per ring.
     pub fn fault(self) -> Option<PacketFault> {
         match self {
             Self::ShortHeader | Self::Incomplete => None,
             Self::BadSize => Some(PacketFault::BadSize),
-            Self::Desynced => Some(PacketFault::Desynced),
         }
     }
 }
@@ -832,25 +831,19 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                     }
                 }
             }
-            Err(PacketError::Incomplete) | Err(PacketError::ShortHeader) => break,
-            Err(PacketError::BadSize) => {
-                state.record_fail(FailEvent::MalformedRootPacket {
-                    fault: PacketFault::BadSize,
-                    head: state
-                        .gfx
-                        .fifo_read
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
-                break;
-            }
-            Err(PacketError::Desynced) => {
-                state.record_fail(FailEvent::MalformedRootPacket {
-                    fault: PacketFault::Desynced,
-                    head: state
-                        .gfx
-                        .fifo_read
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
+            Err(err) => {
+                // `fault()` decides which errors reach the log: a packet the
+                // producer is still writing is ring control flow and answers
+                // `None`. Either way the drain stops here and comes back.
+                if let Some(fault) = err.fault() {
+                    state.record_fail(FailEvent::MalformedRootPacket {
+                        fault,
+                        head: state
+                            .gfx
+                            .fifo_read
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    });
+                }
                 break;
             }
         }
@@ -2693,21 +2686,14 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     break;
                 }
             }
-            Err(PacketError::Incomplete) | Err(PacketError::ShortHeader) => break,
-            Err(PacketError::BadSize) => {
-                state.record_fail(FailEvent::MalformedChildPacket {
-                    channel: channel_id,
-                    fault: PacketFault::BadSize,
-                    head,
-                });
-                break;
-            }
-            Err(PacketError::Desynced) => {
-                state.record_fail(FailEvent::MalformedChildPacket {
-                    channel: channel_id,
-                    fault: PacketFault::Desynced,
-                    head,
-                });
+            Err(err) => {
+                if let Some(fault) = err.fault() {
+                    state.record_fail(FailEvent::MalformedChildPacket {
+                        channel: channel_id,
+                        fault,
+                        head,
+                    });
+                }
                 break;
             }
         }
