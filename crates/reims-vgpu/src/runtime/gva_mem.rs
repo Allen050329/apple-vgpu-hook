@@ -682,41 +682,10 @@ pub fn task_gva_page_gpa_set<M: HostMemory>(
     out
 }
 
-/// Dense per-page leaf GPAs for `[gva, gva+span)`, `0` where a page does not resolve.
-///
-/// [`visit_task_gva_page_gpas`] drops unresolved pages, which is right for a
-/// lookup but wrong for an identity: two different mappings whose holes sit in
-/// different places would collapse to the same list. Callers recording *which
-/// pages these bytes came from* need one slot per page, in GVA order, with the
-/// holes still in them.
-pub fn task_gva_page_gpas_dense<M: HostMemory>(
-    host: &M,
-    tasks: &[TaskEntry],
-    task_id: u32,
-    gva: u64,
-    span: u64,
-    page_shift: u32,
-) -> Vec<u64> {
-    let mut out = Vec::new();
-    visit_task_gva_pages(
-        host,
-        tasks,
-        task_id,
-        gva,
-        span,
-        page_shift,
-        1,
-        &mut |gpa| {
-            out.push(gpa.unwrap_or(0));
-            true
-        },
-    );
-    out
-}
-
-/// Shared page-table walk behind [`visit_task_gva_page_gpas`] and
-/// [`task_gva_page_gpas_dense`]: one root read and one walk cache for the whole
-/// range, visiting every `stride_pages`-th page plus the exact last page.
+/// Shared page-table walk behind [`visit_task_gva_page_gpas`]: one root read and
+/// one walk cache for the whole range, visiting every `stride_pages`-th page
+/// plus the exact last page. Reports an unresolved page as `None` rather than
+/// dropping it, which is what a caller recording *which* pages it read needs.
 #[allow(
     clippy::too_many_arguments,
     reason = "the visitor API exposes task, span, page geometry, and callback state explicitly"

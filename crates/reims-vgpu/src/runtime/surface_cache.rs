@@ -589,11 +589,15 @@ pub fn store_gva(state: &mut DeviceState, gva: u64, width: u32, height: u32, bgr
     store_gva_owned(state, gva, width, height, bgra, 0, None);
 }
 
-/// Guest pages currently backing `[gva, gva + width*height*4)` under `task_id`.
+/// The guest page currently backing `gva` under `task_id`, page-aligned.
 ///
-/// Returns `None` when the walk cannot name the backing at all — no task
-/// directory, an unsupported page shift, or a geometry that overflows. A `None`
-/// backing means the entry is simply not validatable, never that it is fresh.
+/// Returns `None` when the walk cannot name the backing at all — a zero or
+/// degenerate geometry, a dead task, or an address that does not translate. A
+/// `None` backing means the entry is simply not validatable, never that it is
+/// fresh.
+///
+/// The same call [`gva_backing_state`] makes to check the entry later, so the
+/// producer and the consumer cannot disagree about what names an allocation.
 pub fn gva_backing<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -602,31 +606,24 @@ pub fn gva_backing<M: HostMemory>(
     width: u32,
     height: u32,
 ) -> Option<GvaBacking> {
-    if gva == 0 {
+    if gva == 0 || width == 0 || height == 0 {
         return None;
     }
-    let span = (width as u64)
-        .checked_mul(height as u64)?
-        .checked_mul(RGBA8_BPP as u64)?;
-    if span == 0 {
-        return None;
-    }
-    let gpas = crate::runtime::gva_mem::task_gva_page_gpas_dense(
-        host,
-        &state.tasks,
-        task_id,
-        gva,
-        span,
-        state.page_shift,
-    );
-    if gpas.is_empty() {
-        return None;
-    }
+    // Resolved by slot index, which is what the dense walk this replaced did
+    // (`visit_task_gva_pages`) and what `gva_backing_state` does when it
+    // re-asks. `translate_task_gva` applies the `active`/`directory_pfn` test
+    // itself.
+    let task = state.tasks.get(task_id as usize)?;
+    let gpa = crate::runtime::gva_mem::translate_task_gva(host, task, gva, state.page_shift)?;
     Some(GvaBacking {
         task_id,
-        span,
-        gpas,
+        first_gpa: gpa & page_mask(state.page_shift),
     })
+}
+
+/// Mask that clears the page offset for this guest page geometry.
+const fn page_mask(page_shift: u32) -> u64 {
+    !((1u64 << page_shift) - 1)
 }
 
 /// Store a GVA encode with the decoded object identity that produced it.
@@ -930,8 +927,8 @@ pub fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel)
     )
 }
 
-/// Why the GVA-keyed entries could not be served, and what their page lists
-/// cost. Returns `(dead_task, no_backing, backing_bytes)`.
+/// Why the GVA-keyed entries could not be served. Returns
+/// `(dead_task, no_backing)`.
 ///
 /// [`cache_levels`] answers "how big"; this answers "how much of it is dead",
 /// which is the question an eviction rule has to be designed against. Splitting
@@ -949,22 +946,20 @@ pub fn cache_levels(state: &DeviceState) -> (CacheLevel, CacheLevel, CacheLevel)
 ///   into either side: an unknown is not a confirmed-dead, and a gauge that
 ///   guessed would be the failure direction that reads as a finding.
 ///
-/// `backing_bytes` is the page lists themselves (`gpas`, one `u64` per guest
-/// page). [`cache_levels`] counts only pixel bytes, so it understates the map by
-/// this much — a 4K surface carries ~2 025 pages, about 16 KiB of list per
-/// entry, which is small per entry and not small across hundreds of them.
+/// A third figure used to ride along here: the bytes the recorded page lists
+/// themselves cost, ~16 KiB per 4K entry. It is gone with the lists — a gauge
+/// whose subject was its own overhead, reporting on state kept for no other
+/// reader. See [`crate::model::GvaBacking`].
 ///
 /// Measure-only, like everything else here.
-pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64, u64) {
+pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64) {
     let mut dead_task = 0;
     let mut no_backing = 0;
-    let mut backing_bytes = 0;
     for entry in state.host_gva_surfaces.values() {
         let Some(backing) = entry.backing.as_ref() else {
             no_backing += 1;
             continue;
         };
-        backing_bytes += (backing.gpas.len() * std::mem::size_of::<u64>()) as u64;
         // Same liveness test `type4_pages_witness` applies before trusting a
         // walk: present in the table AND flagged active.
         let live = state
@@ -975,7 +970,7 @@ pub fn gva_cache_staleness(state: &DeviceState) -> (u64, u64, u64) {
             dead_task += 1;
         }
     }
-    (dead_task, no_backing, backing_bytes)
+    (dead_task, no_backing)
 }
 
 /// GVA-keyed entries whose key no longer translates to the backing the pixels
@@ -1067,16 +1062,13 @@ pub fn gva_backing_state<H: HostMemory>(
     gva: u64,
 ) -> GvaBackingState {
     let page_shift = state.page_shift;
-    let page_mask = !((1u64 << page_shift) - 1);
     let Some(entry) = state.host_gva_surfaces.get(&gva) else {
         return GvaBackingState::Unrecorded;
     };
     let Some(backing) = entry.backing.as_ref() else {
         return GvaBackingState::Unrecorded;
     };
-    let Some(&recorded) = backing.gpas.first() else {
-        return GvaBackingState::Unrecorded;
-    };
+    let recorded = backing.first_gpa;
     // Same liveness test the walk itself applies: present in the table AND
     // flagged active. A dead task's page table cannot answer the question.
     let Some(task) = state
@@ -1088,7 +1080,7 @@ pub fn gva_backing_state<H: HostMemory>(
     };
     match crate::runtime::gva_mem::translate_task_gva(host, task, gva, page_shift) {
         None => GvaBackingState::Unmapped,
-        Some(live) if (live & page_mask) != (recorded & page_mask) => GvaBackingState::Moved,
+        Some(live) if (live & page_mask(page_shift)) != recorded => GvaBackingState::Moved,
         Some(_) => GvaBackingState::Same,
     }
 }
@@ -1118,7 +1110,7 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
     {
         return;
     }
-    let (dead_task, no_backing, backing_bytes) = gva_cache_staleness(state);
+    let (dead_task, no_backing) = gva_cache_staleness(state);
     let (moved, unmapped, checked) = gva_backing_moved(state, host);
     // `gva_cap_*` are the only running totals on this line — the eviction
     // witness accumulates for the life of the device, where every other field
@@ -1135,7 +1127,6 @@ pub fn note_cache_levels<H: HostMemory>(state: &DeviceState, host: &H) {
          surfaces={} surface_bytes={} surface_largest={} \
          gva={} gva_bytes={} gva_largest={} \
          gva_dead_task={dead_task} gva_no_backing={no_backing} \
-         gva_backing_bytes={backing_bytes} \
          gva_backing_moved={moved} gva_backing_unmapped={unmapped} \
          gva_backing_checked={checked} \
          gva_cap_bytes={} gva_cap_drift={cap_drift} \
@@ -1183,8 +1174,7 @@ mod tests {
             store_gva(&mut st, gva, 2, 2, vec![0u8; 2 * 2 * 4]);
             st.host_gva_surfaces.get_mut(&gva).unwrap().backing = Some(GvaBacking {
                 task_id: 1,
-                span: 1 << PAGE_SHIFT_ARM64E,
-                gpas: vec![((4 + i) as u64) << PAGE_SHIFT_ARM64E],
+                first_gpa: ((4 + i) as u64) << PAGE_SHIFT_ARM64E,
             });
         }
 
@@ -1227,23 +1217,18 @@ mod tests {
         store_gva(&mut st, 0x2000, 2, 2, vec![0u8; 2 * 2 * 4]);
         st.host_gva_surfaces.get_mut(&0x2000).unwrap().backing = Some(GvaBacking {
             task_id: 3,
-            span: 0x1000,
-            gpas: vec![0xaa000, 0xbb000],
+            first_gpa: 0xaa000,
         });
         // Entry backed by task 4, which is not active.
         store_gva(&mut st, 0x3000, 2, 2, vec![0u8; 2 * 2 * 4]);
         st.host_gva_surfaces.get_mut(&0x3000).unwrap().backing = Some(GvaBacking {
             task_id: 4,
-            span: 0x1000,
-            gpas: vec![0xcc000],
+            first_gpa: 0xcc000,
         });
 
-        let (dead_task, no_backing, backing_bytes) = gva_cache_staleness(&st);
+        let (dead_task, no_backing) = gva_cache_staleness(&st);
         assert_eq!(dead_task, 1, "only the inactive-task entry is dead");
         assert_eq!(no_backing, 1, "the unbacked entry is unknown, not dead");
-        // Three GPAs across the two backed entries, 8 bytes each — the cost
-        // `cache_levels` does not count.
-        assert_eq!(backing_bytes, 3 * 8);
     }
 
     /// The gauge has to separate the two shapes a growing cache can take, or it
@@ -1836,25 +1821,40 @@ mod tests {
 
 
 
-    /// An unresolved page is part of the identity, not a gap to be closed over.
+    /// An address that does not resolve records no backing, rather than a
+    /// backing of zero.
+    ///
+    /// This is the shape the dense page list used to guard, carried over to the
+    /// first-page identity that replaced it. The list kept a `0` slot where a
+    /// page did not resolve so two mappings with holes in different places
+    /// could not read as the same one. A single recorded GPA has the sharper
+    /// version of that hazard: store `0` for an unresolvable page and every
+    /// unresolvable page compares equal to every other, so a later `Moved`
+    /// check answers `Same` for two unrelated allocations. `None` is the only
+    /// honest answer, and `gva_backing_state` reads it as `Unrecorded`.
     #[test]
-    fn dense_page_walk_keeps_holes_in_place() {
+    fn an_address_that_does_not_resolve_records_no_backing() {
         let mut host = FakeHost::new();
         let mut st = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         let root_gpa = setup_depth1_task(&mut host, &mut st);
         let page = 1u64 << PAGE_SHIFT_ARM64E;
-        // Three pages: 64x192 BGRA8 = 48 KiB.
-        let (w, h) = (64u32, 192u32);
+        let (w, h) = (64u32, 64u32);
         let gva = page;
-        let full = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
-        assert_eq!(full.gpas.len(), 3);
+        let pte_index = gva >> PAGE_SHIFT_ARM64E;
 
-        // Punt the middle page's PTE to an invalid PFN.
-        repoint_pte(&mut host, root_gpa, 2, 0);
-        let holed = gva_backing(&st, &host, 1, gva, w, h).expect("walk still names the span");
-        assert_eq!(holed.gpas.len(), 3, "one slot per page, holes included");
-        assert_eq!(holed.gpas[1], 0, "the hole sits where the page is");
-        assert_ne!(holed.gpas, full.gpas);
+        let full = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
+        assert_ne!(full.first_gpa, 0, "a resolved page is not the hole value");
+
+        // Punt this page's PTE to an invalid PFN.
+        repoint_pte(&mut host, root_gpa, pte_index, 0);
+        assert!(
+            gva_backing(&st, &host, 1, gva, w, h).is_none(),
+            "an unresolvable address must yield no backing, never first_gpa=0"
+        );
+
+        // A zero geometry cannot name a span either.
+        assert!(gva_backing(&st, &host, 1, gva, 0, h).is_none());
+        assert!(gva_backing(&st, &host, 1, 0, w, h).is_none());
     }
 
     /// "Cannot tell" is its own answer, and the serve site is where conflating
@@ -1879,7 +1879,6 @@ mod tests {
         let gva = page;
 
         let backing = gva_backing(&st, &host, 1, gva, w, h).expect("walk resolves");
-        assert_eq!(backing.gpas.len(), 1);
         store_gva_owned(
             &mut st,
             gva,

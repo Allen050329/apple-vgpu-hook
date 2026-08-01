@@ -1113,18 +1113,29 @@ pub struct GvaHostView {
 /// now. The guest recycles those names hard — the deferred-window drift census
 /// routinely reports every page of a GVA moving between arm and flush — so
 /// "same gva, same geometry" does not mean "same allocation". This records the
-/// physical backing the pixels were produced from, exactly, so a later lookup
-/// can tell a mapping that churned and came back (the retained wallpaper class)
-/// from a name the guest handed to a different resource.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// physical backing the pixels were produced from, so a later lookup can tell a
+/// mapping that churned and came back (the retained wallpaper class) from a name
+/// the guest handed to a different resource.
+///
+/// The first page, not the whole list. This held a dense `Vec<u64>` — one slot
+/// per guest page, holes included, so a permutation could not read as the same
+/// mapping — and the store walked the entire span to fill it. Nothing ever read
+/// past element 0. `surface_cache::gva_backing_state`, the one consumer that
+/// decides anything, compares the first page and says so in its own doc; the
+/// only reader of `len()` was the gauge reporting how many bytes the lists cost,
+/// which is a measurement of its own overhead. `span` had no reader at all.
+///
+/// So the store now takes one `translate_task_gva`, exactly the call the check
+/// makes, and a 4K entry costs one walk instead of ~2 025. Producer and consumer
+/// ask the identical question, which is the property the dense list was reaching
+/// for and did not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GvaBacking {
     /// Task whose page table the walk used.
     pub task_id: u32,
-    /// Byte span the GPA list covers, from the stored geometry.
-    pub span: u64,
-    /// Page-aligned leaf GPAs in GVA order. Order is part of the identity: a
-    /// permutation is a different mapping, not the same one.
-    pub gpas: Vec<u64>,
+    /// Page-aligned leaf GPA of the span's first page when the pixels were
+    /// stored.
+    pub first_gpa: u64,
 }
 
 /// Host-owned BGRA8 frame for a surface_id (Linux/Vulkan render-cache, §8.5).
