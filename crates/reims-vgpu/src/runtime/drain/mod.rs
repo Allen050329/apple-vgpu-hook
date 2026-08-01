@@ -72,6 +72,48 @@ const DISPLAY_TXN_PAYLOAD_SAMPLES: u32 = 4;
 /// pathological length without truncating the interesting case.
 const DISPLAY_TXN_PAYLOAD_DUMP_MAX: usize = 128;
 
+/// Install a `DefineTask2` payload and record the page-table identity it
+/// resolved to.
+///
+/// The root ring and every child channel carry the same opcode with the same
+/// payload layout. `site` names which ring so the two populations stay
+/// separable on the census line; nothing else about them differs, and they
+/// used to be two copies that could drift — the child arm reading a
+/// four-byte length where the root read eight is exactly that having happened.
+///
+/// A short payload drops the task definition, and every later draw or resolve
+/// on that task then fails downstream with no root cause. The child ring named
+/// that; the root ring did not, and dropped silently. Both name it now.
+fn apply_define_task2<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    payload: &[u8],
+    site: &str,
+) {
+    if payload.len() < DEFINE_TASK_LEN {
+        crate::observe::fail(format!(
+            "packet_short reason=define_task2_short site={site} plen={} need={DEFINE_TASK_LEN}",
+            payload.len()
+        ));
+        return;
+    }
+    let raw_id = ld32(&payload[DEFINE_TASK_RAW_ID..]);
+    let length = define_task_length(payload);
+    let dir = ld32(&payload[DEFINE_TASK_DIRECTORY_PFN..]);
+    let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
+    if !state.define_task(task_id, length, dir) || task_id as usize >= state.tasks.len() {
+        return;
+    }
+    // Capture directory + root/depth so one boot shows the page-table identity.
+    let slot = &state.tasks[task_id as usize];
+    let walk =
+        crate::runtime::gva_mem::diagnose_task_slot(host, slot, task_id, 0, state.page_shift);
+    crate::observe::off(format!(
+        "define_task {site} raw={raw_id:#x} task={task_id} len={length:#x} dir={dir:#x} page_shift={} {walk}",
+        state.page_shift
+    ));
+}
+
 /// The task's address-space length from a `DefineTask2` payload.
 ///
 /// The field is 64 bits wide, and the payload layout says so: it sits at
@@ -666,30 +708,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 }
             }
         }
-        ROOT_OP_DEFINE_TASK2 => {
-            if packet.payload.len() >= DEFINE_TASK_LEN {
-                let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
-                let length = define_task_length(&packet.payload);
-                let dir = ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]);
-                let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
-                let ok = state.define_task(task_id, length, dir);
-                // Measure: capture directory + root/depth so one boot shows PT identity.
-                if ok && (task_id as usize) < state.tasks.len() {
-                    let slot = &state.tasks[task_id as usize];
-                    let walk = crate::runtime::gva_mem::diagnose_task_slot(
-                        host,
-                        slot,
-                        task_id,
-                        0,
-                        state.page_shift,
-                    );
-                    crate::observe::off(format!(
-                        "define_task root raw={raw_id:#x} task={task_id} len={length:#x} dir={dir:#x} page_shift={} {walk}",
-                        state.page_shift
-                    ));
-                }
-            }
-        }
+        ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, "root"),
         ROOT_OP_SET_OBJECT_LIST => {
             if packet.payload.len() >= SET_OBJECT_LIST_LEN {
                 let task_id = ld32(&packet.payload[SET_OBJECT_LIST_TASK_ID..]);
@@ -1779,35 +1798,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
 ) -> ChildPacketDisposition {
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
-            if packet.payload.len() >= DEFINE_TASK_LEN {
-                let raw_id = ld32(&packet.payload[DEFINE_TASK_RAW_ID..]);
-                let length = define_task_length(&packet.payload);
-                let dir = ld32(&packet.payload[DEFINE_TASK_DIRECTORY_PFN..]);
-                let task_id = raw_id >> DEFINE_TASK_ID_SHIFT;
-                let ok = state.define_task(task_id, length, dir);
-                if ok && (task_id as usize) < state.tasks.len() {
-                    let slot = &state.tasks[task_id as usize];
-                    let walk = crate::runtime::gva_mem::diagnose_task_slot(
-                        host,
-                        slot,
-                        task_id,
-                        0,
-                        state.page_shift,
-                    );
-                    crate::observe::off(format!(
-                        "define_task child ch={channel_id} raw={raw_id:#x} task={task_id} len={length:#x} dir={dir:#x} page_shift={} {walk}",
-                        state.page_shift
-                    ));
-                }
-            } else {
-                // A short DEFINE_TASK2 silently drops the task definition — every
-                // subsequent draw/resolve on that task then fails downstream with
-                // no root cause. Never happens on a well-formed boot.
-                crate::observe::fail(format!(
-                    "child_packet_short reason=define_task2_short ch={channel_id} plen={} need={DEFINE_TASK_LEN}",
-                    packet.payload.len()
-                ));
-            }
+            apply_define_task2(state, host, &packet.payload, &format!("child ch={channel_id}"));
         }
         CHILD_OP_SET_OBJECT_LIST => {
             if packet.payload.len() >= SET_OBJECT_LIST_LEN {
