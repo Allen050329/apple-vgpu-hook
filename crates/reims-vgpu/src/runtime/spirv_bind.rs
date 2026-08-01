@@ -259,14 +259,24 @@ pub enum BufferAccess {
     AmbiguousBinding,
 }
 
-/// Reflect whether a storage-buffer descriptor can be written by the module.
+/// The one descriptor variable declaring `wanted_binding` in `storage_class`,
+/// with the module's id bound.
 ///
-/// Pointer provenance follows the SPIR-V operations that can preserve a buffer
-/// pointer (`AccessChain`, `CopyObject`, `Select`, and `Phi`). Stores, copy
-/// destinations, and atomics make the binding writable. Pointer calls/returns
-/// fail closed as unknown; this deliberately avoids inferring mutability from
-/// debug names, guest object ids, or corpus-specific function names.
-pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
+/// `OpDecorate Binding` and `OpVariable` are the only two declarations either
+/// provenance question in this module needs, and both ask for exactly one
+/// match: two variables sharing a binding means neither can be reflected, which
+/// is `Root::Ambiguous`.
+///
+/// `None` is a module this reflector cannot parse at all — a header shorter
+/// than `HEADER_WORDS`, a zero id bound, an instruction whose word count is
+/// zero or runs past the end, or no variable on that binding. Every one of
+/// those must fail closed rather than reflect a guess.
+enum Root {
+    One { id: usize, bound: usize },
+    Ambiguous,
+}
+
+fn descriptor_root(words: &[u32], wanted_binding: u32, storage_class: u32) -> Option<Root> {
     let bound = *words.get(3)? as usize;
     if words.len() < HEADER_WORDS || bound == 0 {
         return None;
@@ -275,9 +285,8 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
     let mut storage = vec![None; bound];
     let mut i = HEADER_WORDS;
     while i < words.len() {
-        let word0 = words[i];
-        let word_count = (word0 >> 16) as usize;
-        let opcode = (word0 & 0xffff) as u16;
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xffff) as u16;
         if word_count == 0 || i + word_count > words.len() {
             return None;
         }
@@ -299,46 +308,57 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
         i += word_count;
     }
     let mut roots = bindings.iter().enumerate().filter_map(|(id, binding)| {
-        (*binding == Some(wanted_binding) && storage[id] == Some(STORAGE_CLASS_STORAGE_BUFFER))
-            .then_some(id)
+        (*binding == Some(wanted_binding) && storage[id] == Some(storage_class)).then_some(id)
     });
-    let root = roots.next()?;
-    if roots.next().is_some() {
-        return Some(BufferAccess::AmbiguousBinding);
-    }
+    let id = roots.next()?;
+    Some(if roots.next().is_some() {
+        Root::Ambiguous
+    } else {
+        Root::One { id, bound }
+    })
+}
 
+/// Mark every id whose value derives from an already-marked id, to a fixpoint.
+///
+/// Both provenance questions here have the same shape — seed a set of ids, then
+/// re-walk the instruction stream marking any result built from a marked
+/// operand, until a pass changes nothing — and differ only in which opcodes
+/// propagate. `propagates` is that difference: given an instruction, it answers
+/// whether that instruction's result derives from something already marked.
+///
+/// The opcodes handled here are the ones that merge or rename an SSA value
+/// without regard to what kind of value it is: `OpCopyObject` renames,
+/// `OpSelect` and `OpPhi` merge. Provenance flows through all three for a
+/// pointer and for an image alike, so they are not the caller's business.
+///
+/// The `word_count >= 3` guard is what makes a result id exist to mark; an
+/// instruction shorter than that has no result operand.
+fn propagate_derived(
+    words: &[u32],
+    bound: usize,
+    seed: Option<usize>,
+    propagates: impl Fn(u16, usize, usize, &[bool]) -> bool,
+) -> Vec<bool> {
     let mut derived = vec![false; bound];
-    derived[root] = true;
+    if let Some(root) = seed {
+        derived[root] = true;
+    }
     loop {
         let mut changed = false;
         let mut i = HEADER_WORDS;
         while i < words.len() {
             let word_count = (words[i] >> 16) as usize;
             let opcode = (words[i] & 0xffff) as u16;
+            let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
             let result_from = match opcode {
-                OP_ACCESS_CHAIN
-                | OP_IN_BOUNDS_ACCESS_CHAIN
-                | OP_PTR_ACCESS_CHAIN
-                | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
-                    if word_count >= 4 =>
-                {
-                    derived.get(words[i + 3] as usize).copied() == Some(true)
+                OP_COPY_OBJECT if word_count >= 4 => marked(words[i + 3]),
+                OP_SELECT if word_count >= 6 => {
+                    marked(words[i + 4]) || marked(words[i + 5])
                 }
-                OP_COPY_OBJECT
-                | OP_PTR_CAST_TO_GENERIC
-                | OP_GENERIC_CAST_TO_PTR
-                | OP_GENERIC_CAST_TO_PTR_EXPLICIT
-                    if word_count >= 4 =>
-                {
-                    derived.get(words[i + 3] as usize).copied() == Some(true)
-                }
-                OP_SELECT if word_count >= 6 => [words[i + 4], words[i + 5]]
-                    .iter()
-                    .any(|id| derived.get(*id as usize).copied() == Some(true)),
                 OP_PHI if word_count >= 5 => (i + 3..i + word_count)
                     .step_by(2)
-                    .any(|at| derived.get(words[at] as usize).copied() == Some(true)),
-                _ => false,
+                    .any(|at| marked(words[at])),
+                _ => propagates(opcode, word_count, i, &derived),
             };
             if result_from && word_count >= 3 {
                 let result = words[i + 2] as usize;
@@ -353,6 +373,46 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
             break;
         }
     }
+    derived
+}
+
+/// Reflect whether a storage-buffer descriptor can be written by the module.
+///
+/// Pointer provenance follows the SPIR-V operations that can preserve a buffer
+/// pointer (`AccessChain`, `CopyObject`, `Select`, and `Phi`). Stores, copy
+/// destinations, and atomics make the binding writable. Pointer calls/returns
+/// fail closed as unknown; this deliberately avoids inferring mutability from
+/// debug names, guest object ids, or corpus-specific function names.
+///
+/// The root pointer is seeded directly, which is safe here only because the
+/// escape scan below enumerates the opcodes it cares about. `storage_image_access`
+/// cannot seed its root for exactly that reason — see the note there.
+pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess> {
+    let (root, bound) =
+        match descriptor_root(words, wanted_binding, STORAGE_CLASS_STORAGE_BUFFER)? {
+            Root::One { id, bound } => (id, bound),
+            Root::Ambiguous => return Some(BufferAccess::AmbiguousBinding),
+        };
+
+    let derived = propagate_derived(words, bound, Some(root), |opcode, word_count, i, derived| {
+        let marked = |id: u32| derived.get(id as usize).copied() == Some(true);
+        match opcode {
+            // Both families take the base pointer at operand 3 and yield another
+            // pointer to the same buffer.
+            OP_ACCESS_CHAIN
+            | OP_IN_BOUNDS_ACCESS_CHAIN
+            | OP_PTR_ACCESS_CHAIN
+            | OP_IN_BOUNDS_PTR_ACCESS_CHAIN
+            | OP_PTR_CAST_TO_GENERIC
+            | OP_GENERIC_CAST_TO_PTR
+            | OP_GENERIC_CAST_TO_PTR_EXPLICIT
+                if word_count >= 4 =>
+            {
+                marked(words[i + 3])
+            }
+            _ => false,
+        }
+    });
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut unknown = false;
@@ -418,79 +478,23 @@ pub fn buffer_access(words: &[u32], wanted_binding: u32) -> Option<BufferAccess>
 /// operations that preserve identity. `OpImageRead` and `OpImageWrite` then
 /// provide the content-access contract. Queries do not consume texels;
 /// pointer/image escapes fail closed as [`StorageImageAccess::Unknown`].
+/// The tracked set is image *values*, so the root variable is deliberately not
+/// seeded: `OpLoad` from it is what produces the first image value. Seeding the
+/// variable id would also be unsound here, because the escape scan below ends in
+/// a catch-all — `OpDecorate root Binding N` and `OpEntryPoint`'s interface list
+/// both name the variable, and either would then read as an escape and force
+/// every storage image to `Unknown`. `buffer_access` seeds its root only because
+/// its scan enumerates instead.
 pub fn storage_image_access(words: &[u32], wanted_binding: u32) -> Option<StorageImageAccess> {
-    let bound = *words.get(3)? as usize;
-    if words.len() < HEADER_WORDS || bound == 0 {
-        return None;
-    }
-    let mut bindings = vec![None; bound];
-    let mut storage = vec![None; bound];
-    let mut i = HEADER_WORDS;
-    while i < words.len() {
-        let word_count = (words[i] >> 16) as usize;
-        let opcode = (words[i] & 0xffff) as u16;
-        if word_count == 0 || i + word_count > words.len() {
-            return None;
-        }
-        match opcode {
-            OP_DECORATE if word_count >= 4 && words[i + 2] == DECORATION_BINDING => {
-                let id = words[i + 1] as usize;
-                if id < bound {
-                    bindings[id] = Some(words[i + 3]);
-                }
-            }
-            OP_VARIABLE if word_count >= 4 => {
-                let id = words[i + 2] as usize;
-                if id < bound {
-                    storage[id] = Some(words[i + 3]);
-                }
-            }
-            _ => {}
-        }
-        i += word_count;
-    }
-    let mut roots = bindings.iter().enumerate().filter_map(|(id, binding)| {
-        (*binding == Some(wanted_binding) && storage[id] == Some(STORAGE_CLASS_UNIFORM_CONSTANT))
-            .then_some(id)
-    });
-    let root = roots.next()?;
-    if roots.next().is_some() {
-        return Some(StorageImageAccess::AmbiguousBinding);
-    }
+    let (root, bound) =
+        match descriptor_root(words, wanted_binding, STORAGE_CLASS_UNIFORM_CONSTANT)? {
+            Root::One { id, bound } => (id, bound),
+            Root::Ambiguous => return Some(StorageImageAccess::AmbiguousBinding),
+        };
 
-    let mut derived = vec![false; bound];
-    loop {
-        let mut changed = false;
-        let mut i = HEADER_WORDS;
-        while i < words.len() {
-            let word_count = (words[i] >> 16) as usize;
-            let opcode = (words[i] & 0xffff) as u16;
-            let result_from = match opcode {
-                OP_LOAD if word_count >= 4 => words[i + 3] as usize == root,
-                OP_COPY_OBJECT if word_count >= 4 => {
-                    derived.get(words[i + 3] as usize).copied() == Some(true)
-                }
-                OP_SELECT if word_count >= 6 => [words[i + 4], words[i + 5]]
-                    .iter()
-                    .any(|id| derived.get(*id as usize).copied() == Some(true)),
-                OP_PHI if word_count >= 5 => (i + 3..i + word_count)
-                    .step_by(2)
-                    .any(|at| derived.get(words[at] as usize).copied() == Some(true)),
-                _ => false,
-            };
-            if result_from && word_count >= 3 {
-                let result = words[i + 2] as usize;
-                if result < bound && !derived[result] {
-                    derived[result] = true;
-                    changed = true;
-                }
-            }
-            i += word_count;
-        }
-        if !changed {
-            break;
-        }
-    }
+    let derived = propagate_derived(words, bound, None, |opcode, word_count, i, _derived| {
+        opcode == OP_LOAD && word_count >= 4 && words[i + 3] as usize == root
+    });
 
     let is_derived = |id: u32| derived.get(id as usize).copied() == Some(true);
     let mut read = false;
@@ -1738,6 +1742,59 @@ mod tests {
         assert_eq!(
             storage_image_access(&words, 34),
             Some(StorageImageAccess::AmbiguousBinding)
+        );
+    }
+
+    /// The two reflectors share `propagate_derived` but seed it differently, and
+    /// the difference is not cosmetic.
+    ///
+    /// `buffer_access` tracks pointers and seeds the descriptor variable itself;
+    /// its escape scan enumerates the opcodes it cares about, so naming the
+    /// variable elsewhere is harmless. `storage_image_access` tracks image
+    /// *values* and must not seed the variable, because its escape scan ends in a
+    /// catch-all that treats any instruction mentioning a tracked id as an
+    /// escape. `OpDecorate` names the variable in every real module, so a seeded
+    /// root would make every storage image reflect `Unknown` — silently, and in
+    /// the direction that looks like caution.
+    ///
+    /// This module is the ordinary read/write case plus the `OpEntryPoint`
+    /// interface list, which is the second place a variable id appears.
+    #[test]
+    fn storage_image_root_is_not_seeded_so_naming_the_variable_is_not_an_escape() {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 6, 0];
+        words.extend([
+            (9u32 << 16) | OP_TYPE_IMAGE as u32,
+            1,
+            99,
+            1,
+            0,
+            0,
+            0,
+            2,
+            32,
+        ]);
+        words.extend([
+            (4u32 << 16) | OP_TYPE_POINTER as u32,
+            2,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+            1,
+        ]);
+        words.extend([
+            (4u32 << 16) | OP_VARIABLE as u32,
+            2,
+            3,
+            STORAGE_CLASS_UNIFORM_CONSTANT,
+        ]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 34]);
+        // OpEntryPoint's interface list names every module-scope variable.
+        words.extend([(5u32 << 16) | 15u32, 5, 100, 0, 3]);
+        words.extend([(4u32 << 16) | OP_LOAD as u32, 1, 4, 3]);
+        words.extend([(5u32 << 16) | OP_IMAGE_READ as u32, 92, 5, 4, 90]);
+        words.extend([(4u32 << 16) | OP_IMAGE_WRITE as u32, 4, 90, 91]);
+        assert_eq!(
+            storage_image_access(&words, 34),
+            Some(StorageImageAccess::ReadWrite),
+            "the variable being decorated and listed as an interface is not an escape"
         );
     }
 
