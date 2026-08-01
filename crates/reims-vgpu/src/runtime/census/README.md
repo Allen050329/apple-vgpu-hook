@@ -1,6 +1,6 @@
 # `runtime/census/` — declines that cannot be written where they happen
 
-Four modules, each naming a class of loss that is otherwise invisible. They are not a measurement
+Three modules, each naming a class of loss that is otherwise invisible. They are not a measurement
 tier: every one of them ends in an `observe::fail` or an `observe::Emit::decline(...).fail()`. What
 puts them in their own directory is that the *reason* needs state the raising site does not hold —
 a dedup set that spans draws, or a slug vocabulary shared by several call sites — so the line is
@@ -27,7 +27,7 @@ has stopped being a proxy and become a content heuristic, which the ground rules
 They write to `/tmp/reims-vgpu-fail.log`. Every line here is deduplicated on the identity of the
 thing that failed — `(reason, texture ref)`, `(site, format)`, `(reason, geometry)` — so the line
 count measures *distinct* losses and never the frame rate. Zero lines is the healthy reading for all
-four.
+three.
 
 ## Adding one
 
