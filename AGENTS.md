@@ -217,6 +217,31 @@ and so is a host capability constant. The shape that convicts is a bucket
 downstream of another bucket that is *itself* always zero, or a counterfactual
 for code already deleted. See the script's README.
 
+One caveat the script's own header does not give you: run it on a **single
+driven boot** when you mean to act on a result. The accumulated log spans
+builds, so a field that is constant there may only be code that has since
+changed.
+
+### Counting A Deduped Family Does Not Give You A Rate
+
+Fourteen log families are emitted behind `observe::first_sight`, which fires
+once per distinct key for the life of the boot. Grepping one of those counts
+**distinct instances, not occurrences**, and the two can differ by more than an
+order of magnitude: `lin_rung_blank_with_host_entry` read 15 lines and 360
+occurrences on the same boot. A class can triple in rate with a flat line count.
+
+That matters because the flat line count is what usually gets recorded. Before
+carrying any "family X was N" forward — from a doc, a commit body, or a handoff
+— check whether X is deduped, and say which quantity you mean. Two sections of
+`note_guest_rung_blank`'s doc record a `0` that is a line count, next to prose
+reading as though the class had stopped happening.
+
+`lin_rung_blank_with_host_entry` is currently the only family carrying both a
+deduped line and an unconditional `note_store_route` counter, so it is the only
+one where a rate is available at all. For the other thirteen the occurrence rate
+is not measured, and "the counts are stable across boots" is a statement about
+distinct instances only.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple
