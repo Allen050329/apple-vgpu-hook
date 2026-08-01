@@ -905,6 +905,12 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::ControlStartIf
         | ComputeKind::ControlStartElse
         | ComputeKind::ControlEndIf => {
+            // Denominator in front of the call, for the same reason as
+            // `icb_exec_seen`: `compute_control_fail` only ever reaches the
+            // always-on sink on a packet that already failed, so a control
+            // record that works is unobservable and the rail reads as dead
+            // whether it is dead or perfect.
+            crate::runtime::drain::note_store_route("compute_ctrl_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 None | Some(ComputeStatus::Ok) => {}
@@ -915,6 +921,7 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             }
         }
         ComputeKind::ExecuteCommandsInBuffer | ComputeKind::ExecuteCommandsInBufferIndirect => {
+            crate::runtime::drain::note_store_route("compute_icb_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
             match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
                 None | Some(ComputeStatus::Ok) => {}
