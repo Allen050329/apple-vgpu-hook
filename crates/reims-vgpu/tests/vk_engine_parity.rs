@@ -168,7 +168,7 @@ fn viewport_scissor_known_color() {
     let _g = engine_test_session();
     let (v, f) = triangle_spirv();
     let mut req = engine_req(&v, &f, 32, 32);
-    req.viewports.push(ViewportResource {
+    req.viewport = Some(ViewportResource {
         x: 0.0,
         y: 0.0,
         width: 32.0,
@@ -176,7 +176,7 @@ fn viewport_scissor_known_color() {
         min_depth: 0.0,
         max_depth: 1.0,
     });
-    req.scissors.push(ScissorResource {
+    req.scissor = Some(ScissorResource {
         x: 0,
         y: 0,
         width: 32,
@@ -1966,7 +1966,7 @@ fn partial_draw_preserves_rgba_seed_on_bgra_target() {
     req.output_bgra = true;
     req.skip_readback = true;
     req.target_rgba8 = Some(std::sync::Arc::new(seed_rgba.repeat((w * h) as usize)));
-    req.scissors.push(ScissorResource {
+    req.scissor = Some(ScissorResource {
         x: 0,
         y: 0,
         width: 1,
@@ -2098,7 +2098,7 @@ fn a_bgra_ordered_seed_lands_the_same_pixels_as_the_rgba_ordered_one() {
         req.skip_readback = true;
         req.target_rgba8 = Some(std::sync::Arc::new(bytes.repeat((w * h) as usize)));
         req.target_seed_order = order;
-        req.scissors.push(ScissorResource {
+        req.scissor = Some(ScissorResource {
             x: 0,
             y: 0,
             width: 1,
@@ -2356,7 +2356,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     // corner, read back, re-upload those pixels as the next pass's seed.
     let mut d1 = engine_req(&v, &f, w, h);
     d1.target_rgba8 = Some(std::sync::Arc::new(prior.clone()));
-    d1.scissors.push(dot(0, 0));
+    d1.scissor = Some(dot(0, 0));
     let p1 = match engine::execute_draw_request(&d1) {
         Ok(o) => semantic_rgba(&o),
         Err(e) if skip_if_no_gpu(&e.to_string()) => {
@@ -2367,7 +2367,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     };
     let mut d2_cpu = engine_req(&v, &f, w, h);
     d2_cpu.target_rgba8 = Some(std::sync::Arc::new(p1.clone()));
-    d2_cpu.scissors.push(dot(8, 8));
+    d2_cpu.scissor = Some(dot(8, 8));
     let p2_cpu =
         semantic_rgba(&engine::execute_draw_request(&d2_cpu).expect("cpu seed after readback"));
 
@@ -2392,7 +2392,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     let mut g1 = engine_req(&v, &f, w, h);
     g1.target_identity = Some(identity.clone());
     g1.target_rgba8 = Some(std::sync::Arc::new(prior));
-    g1.scissors.push(dot(0, 0));
+    g1.scissor = Some(dot(0, 0));
     g1.skip_readback = false;
     let p1_resident =
         semantic_rgba(&engine::execute_draw_request(&g1).expect("resident store with readback"));
@@ -2406,7 +2406,7 @@ fn load_from_target_after_a_readback_matches_the_cpu_seed_chain() {
     g2.target_identity = Some(identity.clone());
     g2.load_from_target = true;
     g2.target_rgba8 = None;
-    g2.scissors.push(dot(8, 8));
+    g2.scissor = Some(dot(8, 8));
     g2.skip_readback = false;
     let p2_gpu = semantic_rgba(
         &engine::execute_draw_request(&g2).expect("load from a target that was read back"),

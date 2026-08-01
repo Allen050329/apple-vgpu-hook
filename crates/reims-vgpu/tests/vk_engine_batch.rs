@@ -102,7 +102,7 @@ fn batch_req(
         target_identity: Some(identity.clone()),
         load_from_target,
         skip_readback: true,
-        scissors: vec![scissor],
+        scissor: Some(scissor),
         ..Default::default()
     }
 }

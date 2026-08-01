@@ -5022,10 +5022,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             ),
             ..crate::backend::vulkan::engine::DrawRequest::default()
         };
-        if let Some(vp) = req.viewport {
-            resources
-                .viewports
-                .push(crate::backend::vulkan::engine::ViewportResource {
+        resources.viewport =
+            req.viewport
+                .map(|vp| crate::backend::vulkan::engine::ViewportResource {
                     x: vp[0] as f32,
                     y: vp[1] as f32,
                     width: vp[2] as f32,
@@ -5033,7 +5032,6 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     min_depth: vp[4] as f32,
                     max_depth: vp[5] as f32,
                 });
-        }
         if let Some((x, y, sw, sh)) = req.scissor {
             note_draw_coverage(
                 x,
@@ -5046,14 +5044,12 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 target_rgba8.is_some(),
                 chain_load_from_target,
             );
-            resources
-                .scissors
-                .push(crate::backend::vulkan::engine::ScissorResource {
-                    x,
-                    y,
-                    width: sw,
-                    height: sh,
-                });
+            resources.scissor = Some(crate::backend::vulkan::engine::ScissorResource {
+                x,
+                y,
+                width: sw,
+                height: sh,
+            });
         }
         if let Some(idx) = req.indexed.as_ref() {
             let index_type = translate::raster::index_type(idx.index_type).ok_or({

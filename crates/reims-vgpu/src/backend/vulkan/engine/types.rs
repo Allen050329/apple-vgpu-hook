@@ -226,8 +226,14 @@ pub struct DrawRequest {
     /// Metal baseInstance / Vulkan firstInstance. Constant step-function shift uses this.
     pub base_instance: u32,
     pub primitive_topology: PrimitiveTopology,
-    pub viewports: Vec<ViewportResource>,
-    pub scissors: Vec<ScissorResource>,
+    /// The guest's viewport, when it bound one. At most one: Metal's
+    /// `setViewports:` array reaches us as a single decoded viewport per draw,
+    /// and the engine binds exactly `cmd_set_viewport(.., &[one])`. `None`
+    /// takes the full-target default.
+    pub viewport: Option<ViewportResource>,
+    /// The guest's scissor rect, when it bound one, on the same terms as
+    /// [`Self::viewport`].
+    pub scissor: Option<ScissorResource>,
     pub indexed: Option<IndexedDrawResource>,
     pub vertex_attributes: Vec<VertexAttributeResource>,
     pub storage_buffers: Vec<StorageBufferResource>,

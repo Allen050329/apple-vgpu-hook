@@ -223,14 +223,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             DrawValidationDecline::EmptyFragmentSpirv,
         ));
     }
-    if req.viewports.len() > 1 || req.scissors.len() > 1 {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::MultiViewportArray {
-                count: req.viewports.len().max(req.scissors.len()),
-            },
-        ));
-    }
-    for vp in &req.viewports {
+    if let Some(vp) = &req.viewport {
         if !vp.x.is_finite()
             || !vp.y.is_finite()
             || !vp.width.is_finite()
@@ -2110,7 +2103,7 @@ pub(crate) unsafe fn execute_draw_inner(
         min_depth: 0.0,
         max_depth: 1.0,
     };
-    let vp_src = req.viewports.first().copied().unwrap_or(default_vp);
+    let vp_src = req.viewport.unwrap_or(default_vp);
     let viewport = vk::Viewport {
         x: vp_src.x,
         y: vp_src.y + vp_src.height,
@@ -2126,7 +2119,7 @@ pub(crate) unsafe fn execute_draw_inner(
         width: req.width,
         height: req.height,
     };
-    let sc_src = req.scissors.first().copied().unwrap_or(default_sc);
+    let sc_src = req.scissor.unwrap_or(default_sc);
     let x = sc_src.x.min(req.width);
     let y = sc_src.y.min(req.height);
     let scissor = vk::Rect2D {

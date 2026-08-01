@@ -332,30 +332,32 @@ mod tests {
     /// The enable list is derived from what the backend binds, and
     /// `multi_viewport` is the case that proves it.
     ///
-    /// It used to be enabled wherever supported while `engine::exec` declines
-    /// any draw carrying more than one viewport. Harmless in itself, but it
-    /// meant the list was a wish rather than a derivation — and a list that is
-    /// not derived cannot be checked. Asserted against the produced struct, not
-    /// the source text: a source scan for the setter would match this test's
-    /// own assertion.
+    /// It used to be enabled wherever supported while nothing could ever bind a
+    /// second viewport. Harmless in itself, but it meant the list was a wish
+    /// rather than a derivation — and a list that is not derived cannot be
+    /// checked. `DrawRequest::viewport` is an `Option`, so "at most one" is now
+    /// a property of the type rather than a runtime check this test has to go
+    /// looking for.
     #[test]
-    fn multi_viewport_is_not_enabled_while_the_engine_declines_it() {
+    fn multi_viewport_is_not_enabled_because_no_draw_can_bind_a_second() {
         let enabled = all_supported().enabled_features();
         assert_eq!(
             enabled.multi_viewport,
             vk::FALSE,
             "no draw can use a second viewport, so nothing should request one"
         );
-
-        let exec = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/backend/vulkan/engine/exec.rs"),
-        )
-        .expect("read exec.rs");
-        assert!(
-            exec.contains("req.viewports.len() > 1"),
-            "engine::exec no longer declines multi-viewport draws — if it now \
-             binds several, the enable list here has to follow"
-        );
+        // There is no second slot to fill; the field holds one viewport or none.
+        let req = crate::backend::vulkan::engine::DrawRequest {
+            viewport: Some(crate::backend::vulkan::engine::ViewportResource {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }),
+            ..Default::default()
+        };
+        assert!(req.viewport.is_some());
     }
 }
