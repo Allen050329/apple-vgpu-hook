@@ -368,9 +368,17 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 ///
 /// The two are therefore counted apart. `validity_no_surface` is the expected
 /// majority; `validity_unknown_object` is a record naming an id no registry has
-/// heard of, which is the one that would mean the id space is not what the
-/// decode assumes. Merging them would bury the second under the first at roughly
-/// four to one.
+/// heard of. Merging them would bury the second under the first at roughly four
+/// to one.
+///
+/// `validity_unknown_object` is **not** by itself a defect either, and a reader
+/// scoring it needs to know why: `DeviceState::objects` is populated lazily, by
+/// `objects::resolve_type11_ref` and `resolve_type4_surface_ex` at the moment a
+/// decoded command names a ref. A resource the guest has created in its own
+/// object list but has not yet named in an executed stream is absent from the
+/// set by construction. The table names the submission's whole residency list,
+/// which is a superset of what its command buffers reference. What *would* be
+/// the finding is this count staying high for ids that later do execute.
 fn consume_resource_table(state: &mut DeviceState, task_id: u32, descs: &[ExecResourceDesc]) {
     use crate::runtime::resource_validity::{apply, ValiditySite};
     let mut no_surface = 0u32;
