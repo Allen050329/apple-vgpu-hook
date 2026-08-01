@@ -102,8 +102,8 @@ fn maybe_log_capture_sampling(state: &DeviceState) {
 /// Fill `buf` from the mapping's GPU resident, without any guest-page scatter.
 ///
 /// Returns whether the resident supplied the whole frame. On `true` `buf` holds
-/// tight BGRA8 and `last_paint_src` is [`crate::model::PaintSrc::Resident`]; on
-/// `false` `buf` is untouched and the caller takes the guest-page path. A miss
+/// tight BGRA8; on `false` `buf` is untouched and the capture fails
+/// (keep-prior) — there is no guest-page path left for the caller to take. A miss
 /// is an expected steady-state condition (cold mid / no resident yet), so it is
 /// counted in the `capture_source` census rather than logged per present.
 #[cfg(feature = "backend-vulkan")]
@@ -123,7 +123,6 @@ fn try_capture_from_resident(
     debug_assert_eq!(bgra.len(), need);
     // Move (not copy) the readback in; the untouched scratch returns to the pool.
     state.present.capture_scratch = std::mem::replace(buf, bgra);
-    state.present.last_paint_src = crate::model::PaintSrc::Resident;
     true
 }
 
@@ -244,7 +243,9 @@ pub fn capture_present_frame(
     buf.clear();
     buf.resize(need, 0);
     // Prefer host render-cache when encode/clear wrote it (Linux discrete GPU
-    // path — kb tahoe-x86-host-reims_vgpu §8.5). Fall back to guest type-4 pages.
+    // path — kb tahoe-x86-host-reims_vgpu §8.5); otherwise the resident below.
+    // There is no guest-page fallback any more — see the note at the resident
+    // capture for why it was deleted rather than kept as a second vein.
     let from_host_cache = if let Some(cached) =
         crate::runtime::surface_cache::get(state, mapping_id, width, height)
     {
@@ -289,21 +290,19 @@ pub fn capture_present_frame(
         state.present.capture_scratch = buf;
         return false;
     }
-    let from_last_store = from_host_cache;
-    // Accurate present-capture provenance. `from_host_cache` reports the type-4
-    // surface_cache hit; when it misses, `paint_mapping` records which of its
-    // sub-paths actually filled the frame so the `paint_us` cost is attributable
-    // (a deferred-flush reuse is cheap; a cold fragmented read is the ~12 ms path).
+    // Capture provenance, and there are only two sources to name: the type-4
+    // surface_cache hit, or the resident. Reaching here with `!from_host_cache`
+    // means `try_capture_from_resident` returned true above, and it returns true
+    // and there is no third source. This used to read a `last_paint_src`
+    // provenance field through a five-arm match whose other four arms named
+    // `paint_mapping` sub-paths — left over from when this function had a
+    // guest-page capture fallback. It no longer calls `paint_mapping` at all, so
+    // those arms had become a way for one call path's state to be reported as
+    // another's provenance. The field is gone with them.
     let src = if from_host_cache {
         "host_cache"
     } else {
-        match state.present.last_paint_src {
-            crate::model::PaintSrc::Resident => "resident",
-            crate::model::PaintSrc::ReuseStore => "reuse_store",
-            crate::model::PaintSrc::GuestPagesContig => "guest_pages_contig",
-            crate::model::PaintSrc::GuestPagesFragmented => "guest_pages_frag",
-            crate::model::PaintSrc::None => "guest_pages",
-        }
+        "resident"
     };
     // The occupancy scan is diagnostic: an O(w*h) walk of the just-captured
     // 8 MiB frame, on the present drain and under the device lock. The
@@ -320,8 +319,7 @@ pub fn capture_present_frame(
     if crate::observe::draw_log_enabled() {
         let (nz, maxb, rgb_nz, max_rgb, px0) = crate::observe::bgra_present_stats(&buf);
         crate::observe::line(format!(
-            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} last_store={} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={}",
-            from_last_store as u8,
+            "present_capture mid={mapping_id} {width}x{height} gen={generation} src={src} host_cache={} rgb_nz={rgb_nz} max_rgb={max_rgb} byte_nz={nz} byte_max={maxb} px0=[{},{},{},{}] present_mapping={} frame_mapping={} frame_flush={}",
             from_host_cache as u8,
             px0[0],
             px0[1],
@@ -874,14 +872,6 @@ fn paint_mapping<M: HostMemory + crate::runtime::host::HostOps>(
         Some(bytes)
     } else {
         None
-    };
-
-    // Measure-only provenance: a contiguous host-span read vs the cold fragmented
-    // multi-import (the ~12 ms/present path). `base` is Some only for a packed view.
-    state.present.last_paint_src = if base.is_some() {
-        crate::model::PaintSrc::GuestPagesContig
-    } else {
-        crate::model::PaintSrc::GuestPagesFragmented
     };
 
     let mut src_row = vec![0u8; tight as usize];
@@ -1603,11 +1593,13 @@ mod tests {
             "fragmented paint must multi-import, not not_contig"
         );
         assert_eq!(&dst[..], &frame[..]);
-        // Provenance: a non-contiguous page list is the cold fragmented read path,
-        // not a deferred-flush reuse — the `src=` on the capture line must say so.
-        assert_eq!(
-            state.present.last_paint_src,
-            crate::model::PaintSrc::GuestPagesFragmented
+        // The fixture must still be fragmented, or this stops testing the
+        // multi-import path and silently passes through the packed-view branch.
+        // Asserted on the thing `paint_mapping` actually branches on, rather than
+        // on a provenance field it used to set as a side effect.
+        assert!(
+            crate::runtime::mapper::ensure_contig_view(&mut state, &mut host, mid).is_none(),
+            "fixture stopped being fragmented"
         );
     }
 

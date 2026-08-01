@@ -1097,33 +1097,6 @@ pub struct HostLinearTexture {
     pub resident_gen: u32,
 }
 
-/// Which sub-path `paint_mapping` used to fill the present frame.
-///
-/// Measure-only provenance for the per-present `paint_us` cost: a deferred-Store
-/// flush reuse and a cold fragmented guest-page read are indistinguishable from
-/// `capture_present_frame` (both leave `from_host_cache == false`), yet the reuse
-/// is a cheap memcpy of an in-hand readback while the cold read is the ~12 ms/
-/// present fragmented multi-import. Collapsing both to `src=guest_pages` hid that
-/// the fast path already covers the overwhelming majority of captures.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PaintSrc {
-    /// No `paint_mapping` provenance recorded (host_cache path, or not yet run).
-    #[default]
-    None,
-    /// Reused the byte-identical readback the deferred Store flush just scattered
-    /// into the guest pages during this capture's own `flush_intersecting`.
-    ReuseStore,
-    /// Read straight out of the GPU resident (`read_resident_bgra`) with **no**
-    /// guest-page scatter — the oracle frame source. Nothing is owed to the
-    /// guest pages by this read: a type-11 Store writes them on its own path
-    /// (`mapping_write::write_rgba8_image_changed`).
-    Resident,
-    /// Contiguous HostOps view read (packed mapping — one host span).
-    GuestPagesContig,
-    /// Multi-import fragmented guest-page read (the cold ~12 ms/present path).
-    GuestPagesFragmented,
-}
-
 /// Present / scanout model state.
 #[derive(Clone, Debug, Default)]
 pub struct PresentState {
@@ -1228,8 +1201,6 @@ pub struct PresentState {
     pub backpressure_hold_head: u32,
     /// Always-on diagnostic counter for distinct pending-frames hold episodes.
     pub backpressure_hold_count: u64,
-    /// Sub-path the most recent `paint_mapping` used (measure-only provenance).
-    pub last_paint_src: PaintSrc,
     /// Recycled scratch for the present-capture frame buffer.
     ///
     /// `capture_present_frame` previously did `vec![0u8; need]` on **every**

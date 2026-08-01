@@ -17,7 +17,7 @@ pub use state::{
     GvaEvictionWitness, HostLinearTexture, HostSurface, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
     IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry,
-    PacketFault, PaintSrc,
+    PacketFault,
     PendingWork, PresentBacking, PresentState, RenderWindowSource, ResourceValidity,
     SurfaceWriteKind,
     TaskEntry, Type4Walk,
