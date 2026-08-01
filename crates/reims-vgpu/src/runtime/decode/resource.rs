@@ -62,20 +62,10 @@ impl crate::observe::Decline for DecodeStatus {
 }
 
 /// Live object-list type tags (`reims_vgpu_resource_decode.h` / arm contract).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ObjectType {
-    Buffer = 1,
-    Texture = 2,
-    /// Same geometry prefix as type-2 (WindowServer composite/glyph sources).
-    TextureVariant = 3,
-    Function = 6,
-    /// Type-7 container: sampler / depth-stencil / render|compute pipeline.
-    Type7 = 7,
-    TextureView = 8,
-    IOSurfaceTexture = 11,
-}
-
+///
+/// Type 3 carries the same geometry prefix as type 2 (WindowServer composite
+/// and glyph sources); type 7 is the container for sampler, depth-stencil and
+/// render/compute pipeline descriptors.
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
@@ -171,29 +161,6 @@ pub const MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS: u32 = 1 << 6;
 /// Mesh create bits (SDK). Wire args size from setupCommandLayout; fill IMPs stubbed.
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS: u32 = 1 << 7;
 pub const MTL_INDIRECT_CMD_DRAW_MESH_THREADS: u32 = 1 << 8;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DescriptorKind {
-    Unknown = 0,
-    Buffer,
-    Texture,
-    Sampler,
-    Function,
-    RenderPipeline,
-    ComputePipeline,
-    DepthStencil,
-    TextureView,
-    IOSurfaceTexture,
-    IndirectCommandBuffer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProducerCoverage {
-    Unknown = 0,
-    Emitted,
-    Rejected,
-    HostOnly,
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ObjectEntry {

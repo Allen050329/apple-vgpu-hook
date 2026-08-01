@@ -1288,9 +1288,6 @@ pub const DECODE_ENUMS: &[&str] = &[
     "render::Kind",
     "render::Stage",
     "resource::DecodeStatus",
-    "resource::ObjectType",
-    "resource::DescriptorKind",
-    "resource::ProducerCoverage",
     "resource::Descriptor",
     "stream::DecodeStatus",
     "stream::SegmentDisposition",
@@ -1638,9 +1635,9 @@ mod tests {
         );
         assert_eq!(
             (structs.len(), actual_enums.len()),
-            (44, 21),
+            (44, 18),
             "the public decode type census moved; keep the 44-struct field \
-             manifest and 21-enum inventory exhaustive, then update this pin"
+             manifest and 18-enum inventory exhaustive, then update this pin"
         );
     }
 
