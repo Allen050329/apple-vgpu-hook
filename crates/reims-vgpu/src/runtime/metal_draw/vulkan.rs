@@ -695,6 +695,7 @@ enum SampledSourceRequest {
 /// texture's authoritative GVA (`host_gva_surfaces` keyspace) and `generation`
 /// that cache entry's generation, so equal identity implies equal bytes under
 /// the same coherence model the cache itself already relies on.
+#[cfg(feature = "backend-vulkan")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinearSampleIdentity {
     key: u64,

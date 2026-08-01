@@ -15,6 +15,7 @@ use crate::model::DeviceState;
 // `Decline::slug` on typed draw, coverage, and translation reasons.
 use crate::observe::Decline;
 use crate::runtime::census::srgb_census;
+#[cfg(feature = "backend-vulkan")]
 use crate::runtime::census::t11_decline;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 use crate::runtime::decode::render::PASS_STORE_ACTION_DONT_CARE;
@@ -27,13 +28,16 @@ use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_function_descriptor, decode_render_pipeline_descriptor, decode_sampler_descriptor,
     decode_texture_descriptor, texture_type8_opcode, BufferTextureDescriptor, DecodeStatus,
-    FunctionDescriptor, RenderPipelineDescriptor, TextureDescriptor, OBJECT_TYPE_BUFFER,
+    FunctionDescriptor, RenderPipelineDescriptor, OBJECT_TYPE_BUFFER,
     OBJECT_TYPE_FUNCTION, OBJECT_TYPE_IOSURFACE, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_VARIANT,
     OBJECT_TYPE_TEXTURE_VIEW, OBJECT_TYPE_TYPE7, TEXTURE_VIEW_OPCODE_BUFFER_TEXTURE,
 };
+#[cfg(feature = "backend-vulkan")]
+use crate::runtime::decode::resource::TextureDescriptor;
 use crate::runtime::gva_mem;
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mapper;
+#[cfg(feature = "backend-vulkan")]
 use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
@@ -96,6 +100,7 @@ fn swap_rb_channels(src: &[u8]) -> Vec<u8> {
 /// The exchange is an involution, so one routine serves both directions. Trailing
 /// bytes that do not fill a whole pixel pass through untouched, matching
 /// [`swap_rb_channels`].
+#[cfg(feature = "backend-vulkan")]
 #[inline]
 fn reorder_rb_in_place(px: &mut [u8], have_bgra: bool, want_bgra: bool) {
     if have_bgra == want_bgra {
@@ -141,6 +146,7 @@ fn vertex_buffer_needs_storage_binding(v_words: &[u32], idx: u32, is_stage_in: b
 /// Membership is by caller-supplied predicates so the hot (all-bound) path
 /// allocates nothing — both returned `Vec`s stay empty (no heap) unless a genuine
 /// gap exists, which is near-never on a healthy boot.
+#[cfg(feature = "backend-vulkan")]
 fn frag_unbound_scan(
     bindings: &[metal2vulkan::reflect::ResourceBinding],
     has_buf: impl Fn(u32) -> bool,
@@ -197,6 +203,7 @@ fn reflected_sampled_binding_collision(
 /// compositing binds no depth-stencil at all (0 of 455k draws in a live boot); this
 /// only bites 3D content (WebGL / 3D-CSS). `MTLCompareFunctionAlways = 7` is the
 /// Metal API contract value (Never=0, Less=1, …, GreaterEqual=6, Always=7).
+#[cfg(feature = "backend-vulkan")]
 fn depth_stencil_descriptor_is_trivial(
     d: &crate::runtime::decode::resource::DepthStencilDescriptor,
 ) -> bool {
@@ -351,6 +358,7 @@ pub struct DrawEncodeRequest {
 /// This records only decoded render-pass state. It deliberately does not rank
 /// targets by dimensions, ids, or content; the point is to expose when the
 /// shader/pass contract names more attachments than the backend executes.
+#[cfg(feature = "backend-vulkan")]
 fn color_target_diag(colors: &[ColorRtRequest]) -> String {
     colors
         .iter()
@@ -372,6 +380,7 @@ fn color_target_diag(colors: &[ColorRtRequest]) -> String {
         .join(",")
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn texture_bind_diag(textures: &[TextureBind]) -> String {
     textures
         .iter()
@@ -381,6 +390,7 @@ fn texture_bind_diag(textures: &[TextureBind]) -> String {
         .join(",")
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn buffer_bind_diag(buffers: &[BufferBind]) -> String {
     buffers
         .iter()
@@ -438,6 +448,7 @@ fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::
         )
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn hex_prefix(bytes: &[u8], limit: usize) -> String {
     bytes
         .iter()
@@ -4073,12 +4084,14 @@ fn load_type11_rgba_static<M: HostMemory + HostOps>(
 /// not write it, so it is zeroed here. A recycled buffer must not carry a
 /// previous surface's tail into the memo comparison, where it would manufacture a
 /// miss and cost a full conversion.
+#[cfg(feature = "backend-vulkan")]
 fn prepare_memo_scratch(scratch: &mut Vec<u8>, span: usize, filled: usize) {
     let filled = filled.min(span);
     scratch.resize(span, 0);
     scratch[filled..].fill(0);
 }
 
+#[cfg(feature = "backend-vulkan")]
 fn load_type11_rgba_memoized<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -4174,7 +4187,7 @@ include!("texture_view.rs");
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-vulkan"))]
 mod memo_scratch_tests {
     use super::prepare_memo_scratch;
 

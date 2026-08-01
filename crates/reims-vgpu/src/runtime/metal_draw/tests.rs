@@ -26,6 +26,7 @@ fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
 
 /// One reflection binding of `kind` at `metal_index` for the
 /// `frag_declared_unbound` guard tests. Only kind + index are load-bearing.
+#[cfg(feature = "backend-vulkan")]
 fn rb(
     kind: metal2vulkan::reflect::ResourceKind,
     metal_index: u32,
@@ -163,6 +164,7 @@ fn cpu_portability_store_publishes_composite() {
     assert_eq!(state.present.early_front_mapping, mid);
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn frag_unbound_scan_reports_missing_standard_kinds_and_embedded_textures() {
     use metal2vulkan::reflect::ResourceKind as K;
@@ -295,6 +297,7 @@ fn reflected_sampled_collision_includes_sampler_band_only() {
     assert!(!reflected_sampled_binding_collision(&vertex, &fragment));
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn depth_stencil_triviality_matches_no_op_state() {
     use crate::runtime::decode::resource::DepthStencilDescriptor;
@@ -730,6 +733,7 @@ fn metal_icb_inheritance_line_keeps_pipeline_and_sanitized_driver_detail() {
 
 /// A vertex reflection that trips the shader-pull coverage gate: writes
 /// Position, reads VertexIndex, binds a Buffer at each of `bindings`.
+#[cfg(feature = "backend-vulkan")]
 fn shader_pull_reflection(bindings: &[u32]) -> metal2vulkan::reflect::ShaderReflection {
     use metal2vulkan::reflect::{
         DescriptorLocation, ResourceBinding, ResourceKind, ShaderReflection, ShaderStage,
@@ -835,6 +839,7 @@ fn swap_rb_channels_matches_two_pass_and_preserves_tail() {
 /// the call that used to be a 776 us whole-frame pass and is now a compare. A
 /// future edit that made it exchange unconditionally would restore that cost
 /// silently — the pixels would still be right.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn reorder_rb_in_place_is_a_no_op_when_the_orders_already_agree() {
     for len in [0usize, 4, 8, 5, 260, 263] {
@@ -1235,6 +1240,7 @@ fn a_guest_write_since_the_store_refuses_the_resident() {
 /// every frame" produce the same refusal and mean opposite things. The sampled
 /// ladder's `t11rung_host_cache_gw_*` counters exist to tell them apart, so a
 /// verdict that pooled them would make that reading a lie.
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn the_guest_write_verdict_separates_its_refusals() {
     use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
@@ -1727,6 +1733,7 @@ fn the_cpu_upload_rails_count_every_srgb_downgrade() {
     srgb_census::reset_for_tests();
 }
 
+#[cfg(feature = "backend-vulkan")]
 #[test]
 fn color_target_diag_names_every_mrt_slot() {
     let colors = vec![

@@ -487,6 +487,7 @@ fn load_linear_texture_rgba_host<M: HostMemory + HostOps>(
 /// and the CPU never runs the per-pixel channel swap. Used by the Safari-scroll
 /// fallback hot path (`lin_guest_fb`), which is padded-stride BGRA8 glyph/tile
 /// textures. Non-BGRA8 sources still report `Rgba8` (converted as before).
+#[cfg(feature = "backend-vulkan")]
 fn load_linear_texture_native_host<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
