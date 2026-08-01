@@ -274,6 +274,25 @@ Then poll `ssh macos-vm true` until it answers, and abort the wait if
 `pgrep -f 'qemu-system-x86_6[4]'` stops matching — otherwise a boot that died
 early is indistinguishable from one still coming up.
 
+**SSH answering is not the guest being ready, and the difference is not
+subtle.** sshd comes up well before the desktop settles, and a frame-pacing
+probe started in that window scores the guest's own startup work. One measured
+run reported **12.2 fps with a 35.8-second frame**, while `drain_duty` sat at
+`duty=0.001` with `max_tranche_us` in the tens of microseconds for the whole
+probe — the device had nothing to do, because the guest was not compositing
+yet. The same build, re-probed on the same boot once `uptime` reported a load
+average under 2, measured **119.2 fps**.
+
+So gate the probe on the guest being quiet, not on the port being open:
+
+```sh
+ssh macos-vm "uptime"      # poll until the 1-minute load average settles
+```
+
+A pacing number taken from an unsettled guest is not a slow result, it is a
+result about something else, and it will read as a catastrophic regression in
+whatever change happens to be in the tree.
+
 ### Finding State Nothing Reads
 
 Do not grep for this. `reims-vgpu` is a staticlib whose types are almost all

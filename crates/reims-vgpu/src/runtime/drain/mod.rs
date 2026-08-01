@@ -3165,6 +3165,19 @@ pub enum FlushRail {
 /// would not touch it; a cost in [`Map`](Self::Map) or [`Write`](Self::Write)
 /// is bytes and a dirty rect would. Guessing between them is how the last
 /// attempt picked its target.
+///
+/// Splitting it paid, and the record of what it bought belongs here rather than
+/// only in a commit body. [`Write`](Self::Write) turned out to be the largest
+/// phase and to be three whole-frame passes sharing one counter — see
+/// [`SurfaceWritePhase`], which divides it again. Removing the two that were not
+/// the guest's bytes took the render flush from **7.98 ms to 3.95 ms** and the
+/// guest's own Safari `requestAnimationFrame` from **59.1 fps to 119.2 fps**
+/// (two independent boots), with the drain worker's duty falling from 0.915 to
+/// ~0.72 and its worst tranche from 46.5 ms to 18.5 ms.
+///
+/// The phase left holding the flush is [`Fence`](Self::Fence), and it is the
+/// GPU rendering the frame rather than latency to reschedule — that is measured,
+/// not assumed; see [`ResidentArmCensus`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadbackPhase {
     /// Record the copy command buffer and submit it. No GPU wait.
