@@ -1732,6 +1732,11 @@ pub struct DeviceState {
     pub present: PresentState,
     pub cursor: CursorState,
     pub display: DisplayHandshake,
+    /// Every `FailEvent` also reached the always-on log through `record_fail`;
+    /// this vec is only how an in-crate test reads them back. It is
+    /// `#[cfg(test)]` because in a product boot nothing ever read it, so it grew
+    /// for the life of the guest holding the one copy of nothing.
+    #[cfg(test)]
     pub fails: Vec<FailEvent>,
     /// Last successful directed mapper capture (consumed on matching MAP/UNMAP).
     pub mapper_capture: Option<MapperCapture>,
@@ -1918,6 +1923,7 @@ impl DeviceState {
             mapper_capture: None,
             mapper_device_kva: 0,
             display: DisplayHandshake::default(),
+            #[cfg(test)]
             fails: Vec::new(),
             fence_generations: BTreeMap::new(),
             draining_channel: 0,
@@ -3118,6 +3124,7 @@ impl DeviceState {
         // "bad-packet-size", head: 4096 }`, which is neither `reason=<slug>` nor
         // greppable by the vocabulary every other subsystem uses.
         crate::observe::Emit::decline("fail_event", &ev).fail();
+        #[cfg(test)]
         self.fails.push(ev);
     }
 }

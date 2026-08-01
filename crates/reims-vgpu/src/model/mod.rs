@@ -100,6 +100,7 @@ impl<B: Backend> Device<B> {
         runtime::drain::drain_pending(&mut self.state, host);
     }
 
+    #[cfg(test)]
     pub fn fails(&self) -> &[FailEvent] {
         &self.state.fails
     }
