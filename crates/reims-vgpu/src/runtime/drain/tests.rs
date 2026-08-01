@@ -1382,7 +1382,7 @@ fn display_swap_capture_fail_keeps_prior_retain() {
         // Bump gen so HostAction is distinct; guest would still name mid 5.
         m.content_generation = gen_ok + 1;
     }
-    crate::runtime::surface_cache::evict(&mut state, 5);
+    crate::runtime::surface_cache::forget(&mut state, 5);
     swap(&mut state, &mut host, 5);
     assert!(
         state.present.frame_encode_pending,

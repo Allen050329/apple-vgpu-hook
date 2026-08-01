@@ -860,11 +860,6 @@ pub fn evict_gva(state: &mut DeviceState, gva: u64) {
     }
 }
 
-/// Drop host-cache entry (unmap / delete surface).
-pub fn evict(state: &mut DeviceState, surface_id: u32) {
-    state.host_surfaces.remove(&surface_id);
-}
-
 /// Entry count and resident bytes of one host-side pixel cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheLevel {
@@ -1219,7 +1214,7 @@ mod tests {
 
         // Eviction is visible, which is what makes an unbounded map detectable:
         // a gauge that only ever rose could not tell growth from churn.
-        evict(&mut st, 3);
+        forget(&mut st, 3);
         let (after, _, _) = cache_levels(&st);
         assert_eq!(after.entries, 2);
         assert_eq!(after.bytes, (4 * 4 + 2 * 2) * 4);
@@ -1485,7 +1480,7 @@ mod tests {
         assert_eq!(got[0], 0x11);
         assert_eq!(got[3], 0xff);
         assert!(get(&st, 7, 8, 8).is_none());
-        evict(&mut st, 7);
+        forget(&mut st, 7);
         assert!(get(&st, 7, w, h).is_none());
         let _ = HostSurface::default();
     }

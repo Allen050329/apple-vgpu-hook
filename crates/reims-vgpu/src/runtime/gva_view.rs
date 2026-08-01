@@ -367,7 +367,7 @@ pub fn contig_run_count(gpas: &[u64], page_size: u64) -> usize {
 /// Walks the task page table (PPNs already installed by the guest before MapMemory2),
 /// then [`HostOps::map_pages`]. Returns `(ptr, host_len)`. On Linux, map_pages requires
 /// a **packed** sequential host-VA run — fragmented GVA spans return `None` here;
-/// use [`write_span`] / [`read_span`] which multi-import maximal runs. Does not invent
+/// use [`write_span_within`] / [`read_span`] which multi-import maximal runs. Does not invent
 /// PTEs.
 pub fn ensure_gva_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -447,7 +447,7 @@ pub fn ensure_gva_view<H: HostMemory + HostOps>(
     }
     // Full-span packed view only (single map_pages). Fragmented → None, and
     // asking `map_pages` for a view it cannot build is not a failure to log:
-    // `write_span` / `read_span` import the maximal runs instead.
+    // `write_span_within` / `read_span` import the maximal runs instead.
     let runs = contig_run_count(&gpas, state.page_size());
     if runs != 1 {
         if crate::observe::first_sight(
@@ -581,16 +581,6 @@ pub fn host_ptr_for_span<H: HostMemory + HostOps>(
 /// it lands in whatever now owns those host pages (guest heap corruption:
 /// the 2026-07-19 WindowServer SIGSEGV class). Every write walks the PT at
 /// write time: packed spans map once, fragmented spans multi-import per run.
-pub fn write_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    task_id: u32,
-    gva: u64,
-    buf: &[u8],
-) -> Result<(), MemError> {
-    write_span_within(state, host, task_id, gva, buf, None)
-}
-
 /// Pages a deferred write is allowed to reach, or `None` for a write whose
 /// authorisation is the command that issued it.
 pub type WindowPages<'a> = Option<&'a std::collections::HashSet<u64>>;
@@ -614,7 +604,8 @@ fn span_within_window(gpas: &[u64], allowed: WindowPages<'_>) -> bool {
     }
 }
 
-/// [`write_span`] bounded to the pages a deferred window was armed on.
+/// Write `buf` into guest `[gva, gva+buf.len())`, bounded to the pages a
+/// deferred window was armed on.
 pub fn write_span_within<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -631,7 +622,7 @@ pub fn write_span_within<H: HostMemory + HostOps>(
 
 /// Ephemeral fresh-walk host mapping of `[gva, gva+length)` for guest writes.
 ///
-/// Same write-freshness rule as [`write_span`]: walks the task PT at call
+/// Same write-freshness rule as [`write_span_within`]: walks the task PT at call
 /// time and maps the packed span without consulting or registering
 /// `gva_host_views`. The caller must release it with [`unmap_fresh_span`]
 /// (product Linux unmap is a no-op alias; Darwin unmaps a real region).
@@ -646,18 +637,8 @@ pub struct FreshSpan {
     map_len: usize,
 }
 
-/// Build a [`FreshSpan`] over `[gva, gva+length)` — fresh PT walk, packed map.
-pub fn map_fresh_span<H: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut H,
-    task_id: u32,
-    gva: u64,
-    length: u64,
-) -> Option<FreshSpan> {
-    map_fresh_span_within(state, host, task_id, gva, length, None)
-}
-
-/// [`map_fresh_span`] bounded to the pages a deferred window was armed on.
+/// Build a [`FreshSpan`] over `[gva, gva+length)` — fresh PT walk, packed map,
+/// bounded to the pages a deferred window was armed on.
 ///
 /// See [`span_within_window`]: the check sits on this walk because this walk is
 /// what the returned pointer aliases.
@@ -689,7 +670,7 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     // view. Asking anyway spends an FFI call to be refused, and the refusal
     // lands in the always-on failure log as `qemu_map_pages_callback_failed`.
     // Decline here — quietly — so the caller takes its documented per-run
-    // multi-import fallback (the rgba8 store / `write_span`). A genuine
+    // multi-import fallback (the rgba8 store / `write_span_within`). A genuine
     // `map_pages` refusal over a *packed* list below stays fail-visible. Mirrors
     // the same pre-check `ensure_gva_view` already applies.
     let runs = contig_run_count(&gpas, page_size);
@@ -699,7 +680,7 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
             fragmented_span_key(task_id, gva, gpas.len(), runs),
         ) {
             crate::observe::off(format!(
-                "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span)",
+                "gva_view_fragmented task={task_id} gva={gva:#x} pages={} runs={runs} (map_fresh_span_within)",
                 gpas.len(),
             ));
         }
@@ -741,7 +722,7 @@ pub fn map_fresh_span_within<H: HostMemory + HostOps>(
     })
 }
 
-/// Release a [`map_fresh_span`] mapping.
+/// Release a [`map_fresh_span_within`] mapping.
 pub fn unmap_fresh_span<H: HostOps>(host: &mut H, span: FreshSpan) {
     host.unmap_pages(span.map_base, span.map_len);
 }
@@ -1262,7 +1243,7 @@ mod tests {
         assert!(state.define_task(1, page, 2));
 
         let gva = 0x100u64;
-        write_span(&mut state, &mut host, 1, gva, &[0x7Eu8; 64]).expect("the walk resolves");
+        write_span_within(&mut state, &mut host, 1, gva, &[0x7Eu8; 64], None).expect("the walk resolves");
 
         assert!(
             footprint::wrote_gpa(data0),
@@ -1335,7 +1316,7 @@ mod tests {
         // Unbounded callers are unaffected: a synchronous Store's authorisation
         // is the page table at the moment it runs, and it passes `None`.
         assert!(
-            write_span(&mut state, &mut host, 1, 8, &[0xbb; 4]).is_ok(),
+            write_span_within(&mut state, &mut host, 1, 8, &[0xbb; 4], None).is_ok(),
             "an unbounded write must keep following the live page table"
         );
         host.read_gpa(data1 + 8, &mut back).unwrap();
@@ -1419,7 +1400,7 @@ mod tests {
         assert!(state.define_task(4, page, 2));
         assert!(state.define_task(9, page, 2));
         let before = log_mark();
-        assert!(write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4]).is_ok());
+        assert!(write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None).is_ok());
         let tail = log_tail(before);
         let line = tail
             .lines()
@@ -1453,7 +1434,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(4, page, 2));
         let before = log_mark();
-        let err = write_span(&mut state, &mut host, 9, 8, &[1, 2, 3, 4])
+        let err = write_span_within(&mut state, &mut host, 9, 8, &[1, 2, 3, 4], None)
             .expect_err("slot 9 is not live, so this write has no address space");
         assert_eq!(err, MemError::NoSuchTask);
         let tail = log_tail(before);
@@ -1473,7 +1454,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         let gva = 8u64;
-        assert!(write_span(&mut state, &mut host, 1, gva, &[1, 2, 3, 4]).is_ok());
+        assert!(write_span_within(&mut state, &mut host, 1, gva, &[1, 2, 3, 4], None).is_ok());
         let mut back = [0u8; 4];
         host.read_gpa(data0 + gva, &mut back).unwrap();
         assert_eq!(back, [1, 2, 3, 4]);
@@ -1486,7 +1467,7 @@ mod tests {
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
 
-        assert!(write_span(&mut state, &mut host, 1, gva, &[5, 6, 7, 8]).is_ok());
+        assert!(write_span_within(&mut state, &mut host, 1, gva, &[5, 6, 7, 8], None).is_ok());
         host.read_gpa(data1 + gva, &mut back).unwrap();
         assert_eq!(back, [5, 6, 7, 8], "write must follow the live PT");
         host.read_gpa(data0 + gva, &mut back).unwrap();
@@ -1576,12 +1557,13 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         assert!(
-            write_span(
+            write_span_within(
                 &mut state,
                 &mut host,
                 1,
                 page - 4,
-                &[1, 2, 3, 4, 5, 6, 7, 8]
+                &[1, 2, 3, 4, 5, 6, 7, 8],
+                None
             )
             .is_ok(),
             "the multi-import path exists to write a gapped span"
@@ -1611,7 +1593,7 @@ mod tests {
 
         let before = host.map_pages_calls;
         assert!(
-            map_fresh_span(&mut state, &mut host, 1, page - 4, 8).is_none(),
+            map_fresh_span_within(&mut state, &mut host, 1, page - 4, 8, None).is_none(),
             "a gapped span has no packed whole-span view"
         );
         assert_eq!(
@@ -1621,7 +1603,7 @@ mod tests {
 
         // The packed case still goes to the host and still resolves.
         let before = host.map_pages_calls;
-        let s = map_fresh_span(&mut state, &mut host, 1, 8, 4).expect("packed span maps");
+        let s = map_fresh_span_within(&mut state, &mut host, 1, 8, 4, None).expect("packed span maps");
         assert!(s.avail >= 4);
         unmap_fresh_span(&mut host, s);
         assert_eq!(host.map_pages_calls, before + 1);
@@ -1636,7 +1618,7 @@ mod tests {
         let mut state = state_x86();
         assert!(state.define_task(1, page, 2));
         let gva = 8u64;
-        let s = map_fresh_span(&mut state, &mut host, 1, gva, 16).unwrap();
+        let s = map_fresh_span_within(&mut state, &mut host, 1, gva, 16, None).unwrap();
         assert!(s.avail >= 16);
         // SAFETY: map_fresh_span guarantees ≥16 writable bytes at ptr.
         unsafe { std::ptr::copy_nonoverlapping([0xaau8; 4].as_ptr(), s.ptr, 4) };
@@ -1648,7 +1630,7 @@ mod tests {
         let mut pte = [0u8; 4];
         st32(&mut pte, 10);
         host.write_gpa(root_gpa, &pte).unwrap();
-        let s = map_fresh_span(&mut state, &mut host, 1, gva, 16).unwrap();
+        let s = map_fresh_span_within(&mut state, &mut host, 1, gva, 16, None).unwrap();
         // SAFETY: as above.
         unsafe { std::ptr::copy_nonoverlapping([0xbbu8; 4].as_ptr(), s.ptr, 4) };
         unmap_fresh_span(&mut host, s);

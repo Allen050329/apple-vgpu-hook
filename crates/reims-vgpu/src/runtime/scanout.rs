@@ -1942,7 +1942,7 @@ mod tests {
             let m = state.mappings.get_mut(&mid).unwrap();
             m.page_entries.clear();
         }
-        crate::runtime::surface_cache::evict(&mut state, mid);
+        crate::runtime::surface_cache::forget(&mut state, mid);
         assert!(!capture_present_frame(&mut state, mid, 2, 2, gen + 1));
     }
 

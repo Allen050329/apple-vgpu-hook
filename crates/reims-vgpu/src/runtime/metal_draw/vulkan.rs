@@ -7819,7 +7819,7 @@ mod vulkan_split_tests {
         // the cache holds nothing, which is what every one of the 121 measured
         // lines was (`hostgen=0`) — a first-ever LOAD, or a mapping whose remap
         // made `unmap_surface` evict the entry.
-        crate::runtime::surface_cache::evict(&mut state, mid);
+        crate::runtime::surface_cache::forget(&mut state, mid);
         assert!(
             crate::runtime::surface_cache::get(&state, mid, w, h).is_none(),
             "the cache must be cold: this test is about the miss path"

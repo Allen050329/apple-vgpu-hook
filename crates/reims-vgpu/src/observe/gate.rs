@@ -1571,10 +1571,15 @@ fn every_permanent_exemption_names_a_live_file_and_a_reason() {
 ///
 /// So the needle is the *pointer*, not one of its sources. Anything that hands
 /// back a writable alias belongs here.
+///
+/// Needles are matched as plain substrings, so one that is a suffix of another
+/// name over-counts. `"map_fresh_span("` was such a needle: it matched every
+/// `unmap_fresh_span(` too, which is the *release* of a span and acquires
+/// nothing. Three files carried a count inflated by their release calls. A
+/// needle here must name an acquisition and nothing else.
 const GUEST_RAM_POINTER_SOURCES: &[&str] = &[
     ".map_pages(",
     "ensure_contig_view(",
-    "map_fresh_span(",
     "map_fresh_span_within(",
     "contig_for_span(",
     "contig_for_write(",
@@ -1618,7 +1623,7 @@ const MAP_PAGES_SITES: &[(&str, usize, Marks, &str)] = &[
     ),
     (
         "runtime/gva_view.rs",
-        5,
+        4,
         Marks::Here,
         "the raw-GVA rails, and the pointer source for the two files below. \
          `write_span_multi` marks each packed run's exact destination; \
@@ -1646,14 +1651,14 @@ const MAP_PAGES_SITES: &[(&str, usize, Marks, &str)] = &[
     ),
     (
         "runtime/metal_draw/mod.rs",
-        4,
+        2,
         Marks::BySource,
         "`write_gva_rgba8_within` and its peer write rows through a `FreshSpan`; \
          `gva_view::map_fresh_span_within` marks the span when it resolves it",
     ),
     (
         "runtime/compute_exec/mod.rs",
-        2,
+        1,
         Marks::BySource,
         "`write_linear_texture_bulk` writes rows through a `FreshSpan`; marked by \
          `gva_view::map_fresh_span_within` as above",
