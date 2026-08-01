@@ -393,6 +393,35 @@ pub(crate) fn choose_present_mode(supported: &[vk::PresentModeKHR]) -> vk::Prese
     }
 }
 
+/// The two swapchain decisions that have to be made together, returned together.
+///
+/// They were computed separately and only one of them reached
+/// `vkCreateSwapchainKHR`: the mode was chosen, handed to
+/// [`swapchain_image_count`], and then dropped in favour of a literal `FIFO` in
+/// the create info. The census printed the *chosen* mode, so a log read
+/// `present_mode=mailbox` beside a swapchain that was FIFO, and the change that
+/// introduced the choice measured "no effect" because it never reached the
+/// driver. One value carried in one struct is what stops that shape: the count
+/// is derived from the very mode the create info is given.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SwapchainPlan {
+    pub present_mode: vk::PresentModeKHR,
+    pub image_count: u32,
+}
+
+/// The mode the surface offers and the image count that mode needs.
+pub(crate) fn swapchain_plan(
+    caps_min: u32,
+    caps_max: u32,
+    supported: &[vk::PresentModeKHR],
+) -> SwapchainPlan {
+    let present_mode = choose_present_mode(supported);
+    SwapchainPlan {
+        present_mode,
+        image_count: swapchain_image_count(caps_min, caps_max, present_mode),
+    }
+}
+
 /// Swapchain image count for a mode, inside the surface's own bounds.
 ///
 /// `min + 1` is the usual one-spare rule. MAILBOX needs a third image to have
@@ -728,14 +757,14 @@ impl WindowPresenter {
         // fallback because it is the only mode Vulkan guarantees. MAILBOX also
         // wants a third image to have something to replace, so the count floor
         // is raised only on that arm and only within `max_image_count`.
-        let present_mode = choose_present_mode(
+        let plan = swapchain_plan(
+            caps.min_image_count,
+            caps.max_image_count,
             self.surface_loader
                 .get_physical_device_surface_present_modes(ctx.pd, self.surface)
                 .as_deref()
                 .unwrap_or(&[]),
         );
-        let image_count =
-            swapchain_image_count(caps.min_image_count, caps.max_image_count, present_mode);
         let composite_alpha = [
             vk::CompositeAlphaFlagsKHR::OPAQUE,
             vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
@@ -771,7 +800,7 @@ impl WindowPresenter {
             .create_swapchain(
                 &vk::SwapchainCreateInfoKHR::default()
                     .surface(self.surface)
-                    .min_image_count(image_count)
+                    .min_image_count(plan.image_count)
                     .image_format(format.format)
                     .image_color_space(format.color_space)
                     .image_extent(extent)
@@ -780,7 +809,7 @@ impl WindowPresenter {
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(caps.current_transform)
                     .composite_alpha(composite_alpha)
-                    .present_mode(vk::PresentModeKHR::FIFO)
+                    .present_mode(plan.present_mode)
                     .clipped(true),
                 None,
             )
@@ -842,7 +871,7 @@ impl WindowPresenter {
             from,
             extent,
             self.recreate_reason,
-            present_mode,
+            plan.present_mode,
             self.images.len(),
         ));
         Ok(())
@@ -1445,10 +1474,16 @@ fn swapchain_recreated_line(
     mode: vk::PresentModeKHR,
     images: usize,
 ) -> String {
-    // `mode` and `images` are what the surface actually granted, not what was
-    // asked for. Without them a `busy_acquire` rate is uninterpretable: the same
-    // number means "the display is pacing us" under FIFO and "we are out of
-    // images" under MAILBOX, and those have different fixes.
+    // Without these a `busy_acquire` rate is uninterpretable: the same number
+    // means "the display is pacing us" under FIFO and "we are out of images"
+    // under MAILBOX, and those have different fixes.
+    //
+    // `images` is what `vkGetSwapchainImagesKHR` returned. `mode` is the one the
+    // create info was given — which `vkCreateSwapchainKHR` either honours or
+    // fails on, so there is no third answer to report. It comes from the same
+    // [`SwapchainPlan`] the create info reads, because when the two were spelled
+    // separately this line printed `present_mode=mailbox` for a swapchain
+    // created FIFO, and a whole session's measurement was read against it.
     let mode = match mode {
         vk::PresentModeKHR::MAILBOX => "mailbox",
         vk::PresentModeKHR::FIFO => "fifo",
@@ -1920,5 +1955,46 @@ mod tests {
         // surface that caps at two cannot be argued into three.
         assert_eq!(swapchain_image_count(1, 2, mailbox), 2);
         assert_eq!(swapchain_image_count(2, 3, mailbox), 3);
+    }
+
+    /// The mode that sizes the image count must be the mode the swapchain gets.
+    ///
+    /// It was not. `choose_present_mode` picked MAILBOX, the count was raised to
+    /// three on that basis, and the create info was then handed a literal
+    /// `FIFO` — while the census printed the *chosen* mode, so a live log read
+    /// `present_mode=mailbox images=3` for a swapchain that was FIFO. The
+    /// session that introduced the choice measured "no effect on presents" and
+    /// recorded that MAILBOX does not help, because the driver never saw it.
+    ///
+    /// The test the old shape could pass is the one above: both halves were
+    /// correct in isolation and only their pairing was not. So this asserts the
+    /// pairing — one plan, whose count is derived from the very mode the create
+    /// info reads.
+    #[test]
+    fn the_swapchain_plan_sizes_its_images_for_the_mode_it_will_actually_ask_for() {
+        use super::swapchain_plan;
+        let fifo = vk::PresentModeKHR::FIFO;
+        let mailbox = vk::PresentModeKHR::MAILBOX;
+
+        let offered = swapchain_plan(2, 0, &[fifo, mailbox]);
+        assert_eq!(offered.present_mode, mailbox);
+        assert_eq!(
+            offered.image_count, 3,
+            "a three-image count is only justified by the mode that needs it"
+        );
+
+        let bare = swapchain_plan(2, 0, &[fifo]);
+        assert_eq!(bare.present_mode, fifo);
+        assert_eq!(
+            bare.image_count, 3,
+            "min+1 with caps_min=2 is three under either mode"
+        );
+        assert_eq!(swapchain_plan(1, 0, &[fifo]).image_count, 2);
+
+        // A surface that caps at two forces FIFO's count onto a MAILBOX plan;
+        // the mode is still MAILBOX, because the cap is about images.
+        let capped = swapchain_plan(1, 2, &[fifo, mailbox]);
+        assert_eq!(capped.present_mode, mailbox);
+        assert_eq!(capped.image_count, 2);
     }
 }
