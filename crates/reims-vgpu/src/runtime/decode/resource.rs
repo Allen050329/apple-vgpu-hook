@@ -1641,18 +1641,93 @@ fn parse_one_color_entry(
     out
 }
 
+/// A color-attachment section that named more entries than it delivered.
+///
+/// The section is `[count:u32][entry_offset:u32 × count]`, each offset relative
+/// to the section start. `count` above [`MAX_COLOR_ATTACHMENTS`], an offset word
+/// running past the descriptor, or an entry offset resolving outside it, all
+/// mean the same thing: the pixel format and blend state the guest serialized
+/// for a slot never reaches the pipeline, and that slot silently takes
+/// `parse_one_color_entry`'s defaults — opaque `ONE`/`ZERO`, blending off.
+///
+/// Named because the alternative is indistinguishable downstream from a guest
+/// that declared fewer attachments, which is the shape a wrong blend or a
+/// missing render target would arrive in.
+struct ColorAttachTableTruncated {
+    /// `None` when the section header itself did not fit, so the count was never
+    /// readable and an unknown number of attachments were lost.
+    declared: Option<usize>,
+    decoded: usize,
+}
+
+impl crate::observe::Decline for ColorAttachTableTruncated {
+    fn slug(&self) -> &'static str {
+        "color_attachment_table_truncated"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "declared",
+                self.declared
+                    .map_or_else(|| "unreadable".to_string(), |d| d.to_string()),
+            ),
+            ("decoded", self.decoded.to_string()),
+        ]
+    }
+}
+
+/// Report a color-attachment table that lost entries. Deduped per distinct
+/// (declared, decoded) pair — a malformed descriptor replayed every frame would
+/// otherwise flood the log with one line per draw.
+fn note_color_table_truncated(
+    declared: Option<usize>,
+    decoded: usize,
+    section_off: usize,
+    len: usize,
+) {
+    let disc = ((declared.unwrap_or(usize::MAX) as u64) << 32) | decoded as u64;
+    if !crate::observe::first_sight("color_attachment_table_truncated", disc) {
+        return;
+    }
+    crate::observe::Emit::decline(
+        "type7_color_attach",
+        &ColorAttachTableTruncated { declared, decoded },
+    )
+    .field("section_off", section_off)
+    .field("desc_len", len)
+    .fail();
+}
+
+/// `MTLRenderPipelineDescriptor.colorAttachments` is an eight-slot array, so a
+/// section naming more than eight is malformed rather than something we chose
+/// not to read. Same bound as `render::PASS_MAX_COLOR_ATTACHMENTS`, stated here
+/// because this is the pipeline-descriptor side of the same Metal limit.
+const MAX_COLOR_ATTACHMENTS: usize = 8;
+
 /// Parse all color-attachment entries (slot = entry index in the section).
+///
+/// `section_off == 0` is the descriptor saying it has no color section at all —
+/// expected control flow, and quiet. Every other early exit is a loss and says
+/// so through [`ColorAttachTableTruncated`].
 pub fn parse_color_attachments(
     bytes: &[u8],
     len: usize,
     section_off: usize,
 ) -> Vec<PipelineColorAttachment> {
     let mut out = Vec::new();
-    if section_off == 0 || section_off + 8 > len {
+    if section_off == 0 {
         return out;
     }
-    let count = ld32(&bytes[section_off..]) as usize;
-    for i in 0..count.min(8) {
+    // The header is the count plus the first entry's offset word. A section the
+    // descriptor cannot contain loses an unreadable number of attachments, which
+    // the count mismatch below cannot see, so it is reported here.
+    if section_off + 8 > len {
+        note_color_table_truncated(None, 0, section_off, len);
+        return out;
+    }
+    let declared = ld32(&bytes[section_off..]) as usize;
+    for i in 0..declared.min(MAX_COLOR_ATTACHMENTS) {
         let offloc = section_off + 4 + i * 4;
         if offloc + 4 > len {
             break;
@@ -1663,6 +1738,9 @@ pub fn parse_color_attachments(
             _ => break,
         };
         out.push(parse_one_color_entry(bytes, len, entry, i as u32));
+    }
+    if out.len() != declared {
+        note_color_table_truncated(Some(declared), out.len(), section_off, len);
     }
     out
 }
@@ -2804,6 +2882,51 @@ mod tests {
         assert_eq!(c.slot, 0);
         let all = parse_color_attachments(&buf, buf.len(), off);
         assert_eq!(all.len(), 1);
+    }
+
+    /// A section that declares three attachments and delivers one is a pipeline
+    /// whose other two slots take opaque `ONE`/`ZERO` defaults, which downstream
+    /// cannot tell from a guest that declared one. The loss has to say so.
+    ///
+    /// The entry offset for slot 1 points past the descriptor, so the walk stops
+    /// after slot 0 — the same `break` the truncated-offset-word and
+    /// out-of-range-entry cases take.
+    #[test]
+    fn a_colour_attachment_table_that_loses_entries_says_how_many() {
+        use crate::contract::endian::st32;
+        use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        let off = 16usize;
+        // Header (count + 3 offset words) then one entry: one tag, 6 bytes.
+        let mut buf = vec![0u8; off + 4 + 3 * 4 + 1 + 6];
+        st32(&mut buf[off..], 3);
+        st32(&mut buf[off + 4..], 16); // slot 0: entry at off+16, in range
+        st32(&mut buf[off + 8..], 0xffff); // slot 1: resolves past the descriptor
+        st32(&mut buf[off + 12..], 0xffff); // slot 2: never reached
+        let entry = off + 16;
+        buf[entry] = 1;
+        buf[entry + 1] = COLOR_ATTACHMENT_TAG_PIXEL_FORMAT;
+        buf[entry + 2] = 4;
+        st32(&mut buf[entry + 3..], MTL_FORMAT_BGRA8_UNORM as u32);
+
+        let cap = crate::observe::FailCapture::start();
+        let all = parse_color_attachments(&buf, buf.len(), off);
+        let lines = cap.lines();
+        assert_eq!(all.len(), 1, "only slot 0's entry is in range");
+
+        let truncated: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("reason=color_attachment_table_truncated"))
+            .collect();
+        assert_eq!(
+            truncated.len(),
+            1,
+            "one decline for the truncated table: {lines:?}"
+        );
+        assert!(
+            truncated[0].contains("declared=3") && truncated[0].contains("decoded=1"),
+            "the decline names how many were promised and how many arrived: {}",
+            truncated[0]
+        );
     }
 
     /// A colour-attachment field this decoder does not read is guest intent
