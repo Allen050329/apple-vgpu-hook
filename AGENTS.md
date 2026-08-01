@@ -99,6 +99,33 @@ State exactly what you verified. A single green boot does not prove an entire cl
 claims such as "zero-copy everywhere" or "no fallback remains" require an audit of every place that
 could falsify them.
 
+## What The Guest Driver Puts Out Of Reach
+
+Some capabilities cannot be delivered from the host at all, because they are decided by constants
+inside Apple's guest-side driver and userland plugin. Record them here rather than rediscovering
+them: each of these has already cost a session.
+
+**Chrome cannot be GPU-accelerated on the macOS guest.** ANGLE's Metal backend gates display
+creation on `[MTLCreateSystemDefaultDevice() supportsFamily:MTLGPUFamilyMac2]`, and the guest's
+Metal device answers NO — it reports Mac1, Common1 and Common2 only. The check runs *before* the
+EGL display object exists, so no ANGLE feature override, EGL attribute or Chrome flag can reach it,
+and it returns `EGL_NO_DISPLAY` with `EGL_SUCCESS` and no message, which is why it reads as an
+unexplained failure. The family comes from a `featureProfile` constant hardcoded in Apple's
+`AppleParavirtGPUMetal.bundle`, not from any value this host sends. Chrome's remaining path is
+ANGLE-GL on Apple's software renderer, which is what it already uses by default. Do not spend
+another session on Chrome flag combinations.
+
+**Hardware OpenGL does not exist in the guest.** Apple's Metal plugin returns `supportsOpenGL = 0`
+unconditionally and the kext's `Info.plist` declares no `IOGLBundleName`, so the guest's only CGL
+renderer is the software one. Anything whose acceleration route is OpenGL — Firefox's compositor
+among them — has no hardware path without shipping a guest driver, which this project does not do.
+
+Safari is unaffected: it uses Metal directly rather than through ANGLE, and Mac1 is sufficient for
+it. Treat Safari as the browser where browser-facing GPU goals are actually measurable.
+
+Verify claims of this kind against the binaries before adding one, and say which constant decides
+it. "The guest cannot do X" is exactly the sort of broad claim `Keep Claims Narrow` is about.
+
 ## Support Matrix
 
 arm64 and x86 are both first-class. Metal and Vulkan are both first-class where the host supports
@@ -155,6 +182,25 @@ Before and after long Rust test runs, sweep orphaned test binaries:
 ```sh
 pkill -9 -f 'target/debug/deps/reims_vgp[u]-'
 ```
+
+The bracket is not decoration, and it is needed for QEMU too:
+
+```sh
+pkill -f 'qemu-system-x86_6[4]'    # not 'qemu-system-x86_64'
+```
+
+`pkill -f` matches against whole command lines, **including the command line of
+the shell running the `pkill`**. Spelled without the bracket, the pattern occurs
+in that shell's own arguments, so the sweep kills its own shell and everything
+sequenced after it — the boot never starts. The bracketed class matches the real
+process (whose argv contains `...x86_64`) but not the literal text
+`...x86_6[4]` in the invoking command line.
+
+This is what produced the long-standing "backgrounding a boot intermittently
+exits 144 and silently does not start". It was never intermittent and never
+about backgrounding; it fired whenever the surrounding command mentioned the
+process name. Check the log's mtime, not just its contents — a stale log from a
+previous boot reads exactly like a fresh failed one.
 
 ### Finding State Nothing Reads
 
