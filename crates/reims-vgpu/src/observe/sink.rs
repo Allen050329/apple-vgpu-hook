@@ -807,11 +807,20 @@ pub fn fence_flush_disabled(rail: FenceFlushRail) -> bool {
 ///   a mapping the guest has since declared it owns. Separate from the producer
 ///   rails because it is the only one that can *withhold a frame*, and a boot
 ///   read for missing pixels needs to arm exactly that.
+/// - `bump` — the `content_generation` advance on `clear_host_valid`. Its own
+///   rail because it is the only part of this family with a *performance* cost
+///   rather than a correctness effect: it invalidates every content cache keyed
+///   on that generation, at ~14 000 events per boot from the exec producer that
+///   did not exist before. Whether the caches need it is a live question — the
+///   crate also consults the hypervisor's own guest-write tracking, which is
+///   precise where this is only a statement, but which frequently has no answer
+///   at all (`gvac_gw_no_baseline`, `*_gw_no_stamp`). `validity_gen_bump` counts
+///   the population either way, so an arm and its control are one binary apart.
 ///
-/// What no rail gates: the `content_generation` bump and the recorded validity
-/// state. The bump is what the invalidate producer has always done, and the
-/// state is inert bookkeeping. Narrowing each knob to one action is what makes
-/// an arm and its control differ in the one thing being measured.
+/// What no rail gates: the recorded validity state and the ordering stamps.
+/// Those are inert bookkeeping and cost a field write. Narrowing each knob to
+/// one action is what makes an arm and its control differ in the one thing being
+/// measured.
 ///
 /// `validity_windows_dropped` and `validity_wb_{licensed,superseded,unstated}`
 /// are counted whichever way this is set, on purpose: a control boot reports the
@@ -1389,7 +1398,13 @@ mod tests {
         }
         for spec in ["1", "all"] {
             assert!(resource_validity_spec_arms(Some(spec), "writeback"));
+            assert!(resource_validity_spec_arms(Some(spec), "bump"));
         }
+        // The perf rail must be armable without giving back either correctness
+        // rail, which is the whole reason it is separate.
+        assert!(resource_validity_spec_arms(Some("bump"), "bump"));
+        assert!(!resource_validity_spec_arms(Some("bump"), "exec"));
+        assert!(!resource_validity_spec_arms(Some("bump"), "writeback"));
         assert!(resource_validity_spec_arms(Some("exec"), "exec"));
         assert!(!resource_validity_spec_arms(Some("exec"), "inv"));
         assert!(!resource_validity_spec_arms(Some("exec"), "writeback"));

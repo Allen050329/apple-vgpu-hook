@@ -123,13 +123,17 @@ pub fn apply(
                 .windows_dropped
                 .saturating_add(drop_stale_windows(state, id, site));
             let seq = state.next_validity_seq();
+            let bump = !crate::observe::resource_validity_disabled("bump");
             if let Some(m) = state.mappings.get_mut(&id) {
-                m.content_generation = m.content_generation.saturating_add(1);
+                if bump {
+                    m.content_generation = m.content_generation.saturating_add(1);
+                }
                 // Stamped rather than latched: the claim is about this moment,
                 // and the device's next publish into this surface supersedes it.
                 m.validity.host_cleared_seq = seq;
                 out.bumped = out.bumped.saturating_add(1);
             }
+            crate::runtime::drain::note_store_route("validity_gen_bump");
         }
         let Some(m) = state.mappings.get_mut(&id) else {
             continue;
