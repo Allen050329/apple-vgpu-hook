@@ -2047,6 +2047,14 @@ fn claim_display_vbl_long_stall_resyncs_without_burst() {
 fn acked_stale_online_bit_is_suppressed_not_redelivered() {
     let _proxy = crate::runtime::census::present_proxy::test_exclusive();
     crate::runtime::census::present_proxy::reset_for_test();
+    // Per-process fail log under `cfg(test)`, so a delta is exact.
+    let logged = || {
+        std::fs::read_to_string(crate::observe::fail_log_path())
+            .unwrap_or_default()
+            .matches("stale_online_pending src=")
+            .count()
+    };
+    let before = logged();
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -2079,9 +2087,9 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
         "a stale acked ONLINE bit must be suppressed, not re-delivered"
     );
     assert_eq!(
-        crate::runtime::census::present_proxy::counters().stale_online_pending,
-        1,
-        "the suppressed stale online must still be measured"
+        logged(),
+        before + 1,
+        "the suppressed stale online must still be named on the always-on log"
     );
 }
 

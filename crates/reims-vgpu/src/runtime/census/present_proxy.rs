@@ -27,12 +27,15 @@ struct ThrashState {
     /// pass-through class). Bounded by the small set of
     /// (reason, geometry) combinations a boot produces.
     secondary_mrt_drop_seen: std::collections::BTreeSet<(u8, u32, u32)>,
-    /// Post-**ack** display IRQs raised while the shared-page ONLINE bit (bit2)
-    /// was still pending — the guest re-reads it and re-runs `process_online` →
-    /// `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17).
-    /// The host-driven strobe source the RE named ("re-signals bit2 every frame").
-    stale_online_pending: u64,
     /// Latch so the (per-VBL, ~60 Hz) stale-online line fires once per boot.
+    ///
+    /// A post-**ack** display IRQ raised while the shared-page ONLINE bit (bit2)
+    /// was still pending makes the guest re-read it and re-run `process_online`
+    /// → `connectionChange` → boot-progress overlay rebuild (x86 RE 2026-07-17)
+    /// — the host-driven strobe source the RE named ("re-signals bit2 every
+    /// frame"). This is a first-occurrence alarm, not a rate: the line says the
+    /// class happened at all, which is the whole question, and it has never
+    /// fired on any recorded boot.
     stale_online_logged: bool,
 }
 
@@ -84,7 +87,6 @@ impl ThrashState {
     const fn new() -> Self {
         Self {
             secondary_mrt_drop_seen: std::collections::BTreeSet::new(),
-            stale_online_pending: 0,
             stale_online_logged: false,
         }
     }
@@ -314,37 +316,22 @@ pub mod window_publish {
     }
 }
 
-/// Snapshot counters (tests / external poll).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ThrashCounters {
-    /// Post-converge display IRQs raised with the ONLINE bit still pending.
-    pub stale_online_pending: u64,
-}
-
 /// Record that a post-ack display IRQ (`src` = vbl|present) was raised while the
 /// shared-page ONLINE bit (bit2) was still pending — meaning the guest will
 /// re-dispatch `process_online` → `connectionChange` and re-composite the
 /// boot-progress overlay (x86 RE 2026-07-17: the host-driven strobe source).
-/// Counts every occurrence; emits an always-on `stale_online_pending` line only
-/// the **first** time per boot (VBL runs ~60 Hz — a per-call line would flood).
-/// Measure-only; never gates the IRQ.
+///
+/// Emits an always-on line the **first** time per boot and stays silent
+/// afterwards: VBL runs ~60 Hz, so a per-call line would flood. Measure-only;
+/// never gates the IRQ.
 pub fn note_stale_online_pending(src: &str, pending: u32) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.stale_online_pending = st.stale_online_pending.saturating_add(1);
     if !st.stale_online_logged {
         st.stale_online_logged = true;
-        let n = st.stale_online_pending;
         drop(st);
         observe::fail(format!(
-            "stale_online_pending src={src} pending={pending:#x} count={n}"
+            "stale_online_pending src={src} pending={pending:#x}"
         ));
-    }
-}
-
-pub fn counters() -> ThrashCounters {
-    let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    ThrashCounters {
-        stale_online_pending: st.stale_online_pending,
     }
 }
 
@@ -365,26 +352,40 @@ mod tests {
         test_exclusive()
     }
 
-    /// `note_stale_online_pending` counts every post-converge stale-ONLINE IRQ but
-    /// logs its always-on line only once per boot (VBL is ~60 Hz — a per-call line
-    /// would flood). The count keeps climbing after the latched line.
+    /// `note_stale_online_pending` names the class the first time it happens and
+    /// stays silent afterwards: VBL is ~60 Hz, so a per-call line would flood.
+    ///
+    /// The latch is the whole mechanism, so the log is the only place to assert
+    /// it — which is also the only place production ever reads it from.
     #[test]
-    fn stale_online_pending_counts_all_logs_once() {
+    fn stale_online_pending_logs_once_per_boot() {
         let _g = test_lock();
         reset_for_test();
         use crate::model::DISPLAY_ONLINE_EVENT_MASK;
+        // The fail log does not exist until something logs, and under
+        // `cfg(test)` it is per-process — so a delta over this test's own calls
+        // is exact.
+        let count = || {
+            std::fs::read_to_string(observe::fail_log_path())
+                .unwrap_or_default()
+                .matches("stale_online_pending src=")
+                .count()
+        };
+        let before = count();
         note_stale_online_pending("vbl", DISPLAY_ONLINE_EVENT_MASK);
+        let after_first = count();
+        assert_eq!(
+            after_first,
+            before + 1,
+            "first stale-online must log the always-on line"
+        );
         note_stale_online_pending("vbl", DISPLAY_ONLINE_EVENT_MASK);
         note_stale_online_pending("present", DISPLAY_ONLINE_EVENT_MASK);
-        assert_eq!(
-            counters().stale_online_pending,
-            3,
-            "every stale-online IRQ must be counted"
-        );
+        assert_eq!(count(), after_first, "later IRQs must not re-log");
         let log = std::fs::read_to_string(observe::fail_log_path()).expect("fail log");
         assert!(
-            log.contains("stale_online_pending src=vbl pending=0x4 count=1"),
-            "first stale-online must log the always-on line"
+            log.contains("stale_online_pending src=vbl pending=0x4"),
+            "the line must name the source and the pending mask"
         );
     }
 
