@@ -399,10 +399,6 @@ impl ColorWriteMask {
         self.bits
     }
 
-    /// Whether every channel is written, i.e. whether the mask is inert.
-    pub fn is_all(self) -> bool {
-        self.bits == MTL_COLOR_WRITE_MASK_ALL
-    }
 }
 
 /// One pipeline color-attachment entry (format + blend) from the type-7 color section.
@@ -2905,14 +2901,14 @@ mod tests {
             masked.first().map(|c| c.write_mask),
             Some(ColorWriteMask::new(MTL_COLOR_WRITE_MASK_ALPHA).unwrap())
         );
-        assert!(!masked[0].write_mask.is_all());
+        assert_ne!(masked[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
 
         // Same entry with the tag dropped: `all`, not `none`. This is the arm
         // a derived `Default` on a bare `u32` would have made a black
         // attachment, and every pipeline in the tree takes it.
         buf[entry] = 1;
         let plain = parse_color_attachments(&buf, buf.len(), off);
-        assert!(plain[0].write_mask.is_all());
+        assert_eq!(plain[0].write_mask.bits, MTL_COLOR_WRITE_MASK_ALL);
         assert_eq!(plain[0].write_mask, ColorWriteMask::default());
     }
 
@@ -2936,7 +2932,7 @@ mod tests {
         let cap = crate::observe::FailCapture::start();
         let all = parse_color_attachments(&buf, buf.len(), off);
         assert!(
-            all[0].write_mask.is_all(),
+            all[0].write_mask.bits == MTL_COLOR_WRITE_MASK_ALL,
             "a refused mask leaves the attachment writing every channel, \
              which is the pre-decode behaviour rather than a new failure"
         );

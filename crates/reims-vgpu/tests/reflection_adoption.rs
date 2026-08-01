@@ -95,11 +95,18 @@ fn reflection_is_wellformed_and_complete_for_every_texture_binding() {
             // a writable (storage) texture is expected to be `Unsupported` for the
             // sampled render path, so only assert completeness for sampled ones.
             if !shape.writable {
-                assert_eq!(
-                    spirv_bind::reflected_sampled_kind(&reflection, binding),
-                    ReflectedSampledKind::Kind(
-                        spirv_bind::sampled_image_kind_from_reflection(&reflection, binding)
-                            .expect("sampled texture must have a representable kind"),
+                // The claim is that the classification lands on `Kind`, not on
+                // `Absent` (binding missing from reflection) or `Unsupported`
+                // (a shape the sampled path cannot express). This used to be
+                // written as `reflected_sampled_kind(..) ==
+                // Kind(sampled_image_kind_from_reflection(..).expect(..))`,
+                // where the right-hand side was a projection of the left and
+                // the `expect` carried the whole assertion — it could not fail
+                // for any reason the equality would then catch.
+                assert!(
+                    matches!(
+                        spirv_bind::reflected_sampled_kind(&reflection, binding),
+                        ReflectedSampledKind::Kind(_)
                     ),
                     "{name} ({stage:?}): sampled texture at binding {binding} \
                      (metal_index {}, shape {shape:?}) did not classify to a kind",

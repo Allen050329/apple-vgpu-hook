@@ -996,16 +996,6 @@ fn texture_shape_for_binding(reflection: &ShaderReflection, binding: u32) -> Opt
     })
 }
 
-/// Read the texture dimensionality for descriptor `binding` from the translator's
-/// reflection — the single source of truth. `binding` is the un-relocated
-/// descriptor number (`TEXTURE_BINDING_BASE + metal_index`).
-pub fn sampled_image_kind_from_reflection(
-    reflection: &ShaderReflection,
-    binding: u32,
-) -> Option<SampledImageKind> {
-    sampled_image_kind_from_shape(texture_shape_for_binding(reflection, binding)?)
-}
-
 /// How reflection describes descriptor `binding` for the sampled render path.
 /// Lets the call site log a genuine gap fail-visibly while staying silent on the
 /// expected "bound but not sampled by this shader" case.
@@ -1390,8 +1380,8 @@ mod tests {
             r.bindings
                 .push(texture_binding(bind, shape(dim, arrayed, false)));
             assert_eq!(
-                sampled_image_kind_from_reflection(&r, bind),
-                want,
+                reflected_sampled_kind(&r, bind),
+                want.map_or(ReflectedSampledKind::Unsupported, ReflectedSampledKind::Kind),
                 "dim={dim:?} arrayed={arrayed}"
             );
         }
@@ -1421,9 +1411,11 @@ mod tests {
             image_access_from_reflection(&r, TEXTURE_BINDING_BASE + 9),
             None
         );
+        // Absent, not Unsupported: the binding is not in the reflection at all,
+        // and only `reflected_sampled_kind` can tell those apart.
         assert_eq!(
-            sampled_image_kind_from_reflection(&r, TEXTURE_BINDING_BASE + 9),
-            None
+            reflected_sampled_kind(&r, TEXTURE_BINDING_BASE + 9),
+            ReflectedSampledKind::Absent
         );
     }
 
