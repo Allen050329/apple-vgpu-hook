@@ -1025,6 +1025,13 @@ fn compute_defer_readback_allowed(
 /// that is the only bound on this map. What would be: the same zero across a
 /// boot that drives multiplanar video and several ping-pong canvases at once,
 /// which is the case the "planar layouts a few more" guess was aimed at.
+///
+/// `deferred_windows storage_peak` answers the question the eviction count
+/// could not — how close the population came — and reads **2** on the same
+/// workload. That is exactly the ping-pong canvas this doc predicted needs 2,
+/// so the shape of the guess is confirmed while the number is not: 8 is 4x the
+/// observed high-water mark, and nothing has yet produced the "planar layouts a
+/// few more" case that chose it.
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
