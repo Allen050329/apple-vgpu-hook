@@ -4034,6 +4034,24 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
 
 /// The engine's own counters, over the window `drain_duty` just reported.
 ///
+/// Two of them were tallied and never reported, and they are the two that price
+/// the largest phase of a draw. `draw_phase` puts **70% of all timed draw work
+/// in `Acquire`** — 193 µs per draw, 130 ms of a driven second — while
+/// `creates=74 allocs=0` rules out the allocation churn that phase's own doc
+/// names as its cost. What is left in there and scales with content is
+/// [`crate::backend::vulkan::engine::pools`]'s sampled-cache lookup, which
+/// fingerprints the **whole** incoming blob with two SipHash passes on every
+/// call that does not take the identity fast path.
+///
+/// `sampled_cache_hit_bytes` is exactly the byte count fed to that fingerprint
+/// on the hit path, and `sampled_identity_hits` is the count that skipped it
+/// entirely. Together they turn "the cache is working, hits=122 misses=0" —
+/// which is what the line said, and which reads as nothing to fix — into a
+/// GB/s figure that can be compared against SipHash's throughput. Neither can
+/// be derived from the counts alone: 122 hits over 4 KiB blobs and 122 over
+/// 8 MiB blobs are three orders of magnitude apart and the line printed the
+/// same number for both.
+///
 /// `drain_duty` established that 96-99% of the saturated drain second is
 /// `draw_us`, at 1.5-7 ms per draw — orders of magnitude more than a draw's CPU
 /// encode should cost. Which of the engine's per-draw costs that is was already
@@ -4136,7 +4154,8 @@ fn emit_engine_delta() {
          batch_flush_draws={} readbacks={} readback_bytes={} render_post_wait_skips={} \
          target_reads={} target_read_bytes={} pipeline_misses={} \
          shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
-         sampled_cache_hits={} sampled_cache_misses={} sampled_reuploads={} \
+         sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
+         sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
@@ -4156,6 +4175,8 @@ fn emit_engine_delta() {
         d.layout_misses,
         d.sampler_misses,
         d.sampled_cache_hits,
+        d.sampled_identity_hits,
+        d.sampled_cache_hit_bytes,
         d.sampled_cache_misses,
         d.sampled_reuploads,
         d.sampled_reupload_bytes,
