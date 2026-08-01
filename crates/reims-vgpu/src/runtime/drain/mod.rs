@@ -1686,6 +1686,22 @@ enum ChildPacketDisposition {
     Deferred,
 }
 
+/// One line per `ExecIndirect2` packet, naming everything the packet executed.
+///
+/// # Do not read these counters as a census
+///
+/// On the always-on sink this line is **failure-selected**: the caller emits it
+/// through `observe::fail` only when `packet_failed`, and sends healthy packets
+/// to the verbose-gated `observe::line` instead. So every copy of this line in
+/// `/tmp/reims-vgpu-fail.log` is, by construction, a packet that failed a draw
+/// or an ICB — which is why the accumulated log shows `draws_ok=0 draws_fail=1`
+/// on all 414 of them. That ratio is the filter, not the draw path.
+///
+/// The same trap hides the ICB rail. `icb_ok=0` across those lines does **not**
+/// mean the guest never runs indirect command buffers; a packet whose ICBs all
+/// succeeded is exactly a packet that did not fail, so it never reached this
+/// sink. Answering "does ICB run at all?" needs `REIMS_VGPU_DRAW_LOG`, or a
+/// `note_store_route` counter that is not conditioned on failure.
 fn exec_summary(channel_id: u32, result: &crate::runtime::exec::ExecResult, plen: usize) -> String {
     format!(
         "exec_indirect2 ch={channel_id} task={} streams={} saw_draw={} clears={} draws_ok={} draws_fail={} rt_resolves={} guest_stores={} icb_ok={} icb_fail={} compute_ctrl_fail={} compute_icb_fail={} render_unbinds={}/{}/{} total_us={} plen={plen}",
