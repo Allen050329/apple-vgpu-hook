@@ -545,25 +545,7 @@ pub fn run(
     stop: StopFlag,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
-    let mut app = App {
-        config,
-        on_input,
-        frames,
-        stop,
-        closed_sent: false,
-        window: None,
-        vk: None,
-        cursor: (0, 0),
-        engine_attached: false,
-        first_engine_present_logged: false,
-        first_engine_guest_logged: false,
-        engine_error_logged: false,
-        next_engine_redraw: std::time::Instant::now(),
-        last_engine_seq: None,
-        engine_redraw_required: true,
-        guest_extent: None,
-        pending_guest_resize: None,
-    };
+    let mut app = App::new(config, on_input, frames, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -608,25 +590,7 @@ pub fn start_main_thread(
             };
         }
         let event_loop = build_event_loop()?;
-        let app = App {
-            config,
-            on_input,
-            frames,
-            stop,
-            closed_sent: false,
-            window: None,
-            vk: None,
-            cursor: (0, 0),
-            engine_attached: false,
-            first_engine_present_logged: false,
-            first_engine_guest_logged: false,
-            engine_error_logged: false,
-            next_engine_redraw: std::time::Instant::now(),
-            last_engine_seq: None,
-            engine_redraw_required: true,
-            guest_extent: None,
-            pending_guest_resize: None,
-        };
+        let app = App::new(config, on_input, frames, stop);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -923,17 +887,6 @@ impl ApplicationHandler for App {
         // while the guest was producing 4.5-8 frames/s. FIFO does not throttle
         // it, and every one of those presents produced the picture already on
         // screen.
-        #[cfg(not(target_os = "macos"))]
-        if let Some(window) = self.window.as_ref() {
-            let now = std::time::Instant::now();
-            if now >= self.next_engine_redraw {
-                window.request_redraw();
-                self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
-            }
-            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                self.next_engine_redraw,
-            ));
-        }
         if let Some(window) = self.window.as_ref() {
             if let Some(pending) = self.pending_guest_resize.as_ref() {
                 if pending.requested_at.elapsed() >= GUEST_RESIZE_WARN_AFTER {
@@ -962,6 +915,34 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// A window that has not opened yet.
+    ///
+    /// Both entry points build one — [`run`] on the calling thread and
+    /// `start_main_thread` on macOS's main thread — and every field but the
+    /// four they are given is fixed. Written out at each site, a field added
+    /// to the struct could be initialised in one and missed in the other.
+    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+        Self {
+            config,
+            on_input,
+            frames,
+            stop,
+            closed_sent: false,
+            window: None,
+            vk: None,
+            cursor: (0, 0),
+            engine_attached: false,
+            first_engine_present_logged: false,
+            first_engine_guest_logged: false,
+            engine_error_logged: false,
+            next_engine_redraw: std::time::Instant::now(),
+            last_engine_seq: None,
+            engine_redraw_required: true,
+            guest_extent: None,
+            pending_guest_resize: None,
+        }
+    }
+
     fn request_shutdown(&mut self) {
         if !self.closed_sent {
             (self.on_input)(HostAction::window_closed());

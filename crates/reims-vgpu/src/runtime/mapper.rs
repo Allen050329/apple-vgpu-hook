@@ -716,15 +716,7 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
             // closed: name it, drop deferred writes, and invalidate the page
             // plan. Runs only on reprieve-with-armed-windows (rare), on the drain
             // worker.
-            if let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) {
-                let mine_pages = state
-                    .mappings
-                    .get(&mapping_id)
-                    .map(|m| m.page_entries.len())
-                    .unwrap_or(0);
-                fail_closed_surface_page_collision(
-                    state, mapping_id, gpa, owner, mine_pages, "reprieve",
-                );
+            if !surface_pages_are_exclusively_owned(state, mapping_id, "reprieve") {
                 return false;
             }
         }
@@ -741,16 +733,8 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     // violation, so fail closed: name it, drop deferred writes, invalidate the
     // adopted plan, and make this resolve fail. Runs only on a genuine rewire
     // (`pages_changed`), on the drain worker.
-    if pages_changed {
-        if let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) {
-            let mine_pages = state
-                .mappings
-                .get(&mapping_id)
-                .map(|m| m.page_entries.len())
-                .unwrap_or(0);
-            fail_closed_surface_page_collision(state, mapping_id, gpa, owner, mine_pages, "rewire");
-            return false;
-        }
+    if pages_changed && !surface_pages_are_exclusively_owned(state, mapping_id, "rewire") {
+        return false;
     }
     // Resolved: re-arm the fail latch so a later genuine failure (a re-map that
     // goes bad, a corrupted descriptor) is logged again rather than swallowed.
@@ -758,13 +742,47 @@ pub fn resolve_mapping_backing<H: HostMemory + HostOps>(
     true
 }
 
+/// Whether `mapping_id`'s adopted page plan is free of cross-surface aliasing.
+///
+/// Two distinct live IOSurface mappings backing the same guest physical page
+/// means one holds a stale PFN, and a pixel writeback through it scribbles the
+/// other surface — or, if the page was recycled to userspace, guest heap. So a
+/// detection is a proven ownership violation and this fails closed: it names
+/// the collision, drops the deferred writes and invalidates the plan, and the
+/// caller must fail its resolve.
+///
+/// `site` names which rewire reached here (`reprieve` or `rewire`) so the two
+/// populations stay separable in the log.
+fn surface_pages_are_exclusively_owned(
+    state: &mut DeviceState,
+    mapping_id: u32,
+    site: &str,
+) -> bool {
+    let Some((gpa, owner)) = first_surface_page_collision(state, mapping_id) else {
+        return true;
+    };
+    let mine_pages = state
+        .mappings
+        .get(&mapping_id)
+        .map(|m| m.page_entries.len())
+        .unwrap_or(0);
+    fail_closed_surface_page_collision(state, mapping_id, gpa, owner, mine_pages, site);
+    false
+}
+
 /// Detect the wrong-PFN rewire-race corruption vector: the mapping `mapping_id`
 /// just adopted a fresh page plan whose page base is also owned by a
 /// *different* currently-live surface mapping. Two distinct live IOSurface
 /// mappings must never back the same guest physical page; if they do, one holds
 /// a stale/wrong PFN and a writeback through it corrupts memory it does not own
-/// (see the WindowServer heap-corruption class). Measure-only — never gates a
-/// write. Cost O(this_pages + Σ other live pages); called only on a rewire.
+/// (see the WindowServer heap-corruption class).
+///
+/// A detection **fails the resolve closed** — see
+/// [`surface_pages_are_exclusively_owned`], which is how both call sites reach
+/// this. It is not measure-only; the doc said so for a while and was wrong,
+/// which is the worse way round for a detector on the guest-corruption rail.
+///
+/// Cost O(this_pages + Σ other live pages); called only on a rewire.
 fn first_surface_page_collision(state: &DeviceState, mapping_id: u32) -> Option<(u64, u32)> {
     let page_shift = state.page_shift;
     let page = state.page_size();
@@ -842,14 +860,6 @@ fn fail_closed_surface_page_collision(
     let _ = state.invalidate_mapping_pages(mapping_id);
 }
 
-/// Incarnation decision when adopting a freshly resolved page plan into a
-/// mapping slot. `condemned` is the fingerprint a trailing
-/// `DeleteIOSurfaceBacking2` stashed (None when the slot is not condemned).
-/// Returns `(pages_changed, incarnation_changed, reprieved)`:
-/// `incarnation_changed` = the condemned backing really died and the id now
-/// carries different pages (drop the old windows); `reprieved` = the delete
-/// was stale — the plan matches the fingerprint, the same incarnation lives
-/// on (keep generation, resident, deferred windows).
 /// Lowest and highest page-aligned GPA a page-entry list resolves to.
 ///
 /// Invalid entries are skipped rather than failing the span: the span is a
@@ -871,6 +881,15 @@ pub(crate) fn entry_gpa_span(entries: &[u32], page_shift: u32) -> Option<(u64, u
     (lo != u64::MAX).then_some((lo, hi))
 }
 
+/// Incarnation decision when adopting a freshly resolved page plan into a
+/// mapping slot. `condemned` is the fingerprint a trailing
+/// `DeleteIOSurfaceBacking2` stashed (None when the slot is not condemned).
+///
+/// Returns `(pages_changed, incarnation_changed, reprieved)`:
+/// `incarnation_changed` = the condemned backing really died and the id now
+/// carries different pages (drop the old windows); `reprieved` = the delete
+/// was stale — the plan matches the fingerprint, the same incarnation lives
+/// on (keep generation, resident, deferred windows).
 pub(crate) fn plan_adoption_decision(
     condemned: Option<&[u32]>,
     current: &[u32],
@@ -1758,6 +1777,13 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
     None
 }
 
+/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
+/// whether the verdict was derived or served from `contig_fragmented_gen`.
+/// Reported as `served=` on every `contig_view_fragmented` line so the
+/// magnitude the old per-call line carried survives its deduplication.
+static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Contiguous host-VA view over the mapping's guest pages (unified memory).
 ///
 /// Builds the view on first use via [`HostOps::map_pages`] (mach_vm_remap of
@@ -1771,13 +1797,6 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
 /// On Linux, only a **packed** sequential host run succeeds. Fragmented
 /// IOSurface page lists must use [`write_mapping_bytes`] / [`read_mapping_bytes`]
 /// or multi-run import-present.
-/// Device-wide count of [`ensure_contig_view`] calls answered "fragmented",
-/// whether the verdict was derived or served from `contig_fragmented_gen`.
-/// Reported as `served=` on every `contig_view_fragmented` line so the
-/// magnitude the old per-call line carried survives its deduplication.
-static CONTIG_FRAGMENTED_SERVED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 pub fn ensure_contig_view<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -1835,15 +1854,6 @@ pub fn ensure_contig_view<H: HostMemory + HostOps>(
     Some((ptr, len))
 }
 
-/// Write `buf` into mapping linear offset `off` via packed map_pages runs.
-///
-/// Covers fragmented page lists (Linux product): split GPAs into maximal packed
-/// runs, map each, poke, unmap. No `write_gpa`. Returns false if revalidate /
-/// map fails.
-///
-/// `vouched` is the caller's proof that the page list still names the surface's
-/// guest memory ([`vouch_mapping_pages`]); it is a parameter rather than a call
-/// here because two callers write a row at a time and the walk is per page.
 /// Record the guest frames a mapping-rail write of `[off, off+len)` lands in.
 ///
 /// Resolved through the mapping's own page list rather than over the span's
@@ -1894,6 +1904,15 @@ pub(crate) fn note_mapping_write_footprint(
     }
 }
 
+/// Write `buf` into mapping linear offset `off` via packed map_pages runs.
+///
+/// Covers fragmented page lists (Linux product): split GPAs into maximal packed
+/// runs, map each, poke, unmap. No `write_gpa`. Returns false if revalidate /
+/// map fails.
+///
+/// `vouched` is the caller's proof that the page list still names the surface's
+/// guest memory ([`vouch_mapping_pages`]); it is a parameter rather than a call
+/// here because two callers write a row at a time and the walk is per page.
 pub fn write_mapping_bytes<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,

@@ -1015,9 +1015,16 @@ fn compute_defer_readback_allowed(
 /// than a bound. Which of those it is has never been measured, because the
 /// eviction was silent.
 ///
-/// `compute_mirror_evicted` is that measurement. Reading zero across a driven
-/// boot says the cap never binds and can go; reading non-zero says a live
-/// window is being dropped and names the mapping to go look at.
+/// `compute_mirror_evicted` is that measurement, and its **first reading is
+/// zero**: one driven x86/Vulkan boot — Chess, Maps, the WebGL aquarium,
+/// Wikipedia and apple.com, with page-downs and title-bar drags — evicted
+/// nothing. So the cap does not bind on this workload and is a runaway guard,
+/// not a working policy.
+///
+/// That is one boot and one workload, which is not enough to delete a guard
+/// that is the only bound on this map. What would be: the same zero across a
+/// boot that drives multiplanar video and several ping-pong canvases at once,
+/// which is the case the "planar layouts a few more" guess was aimed at.
 const STORAGE_RESIDENCY_WINDOWS_PER_MAPPING: usize = 8;
 
 fn note_storage_residency_writeback(state: &mut DeviceState, texture: &StagedTexture) {
