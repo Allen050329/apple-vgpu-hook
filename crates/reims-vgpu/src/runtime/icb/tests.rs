@@ -143,6 +143,39 @@ fn unit_mesh_draw() -> IcbRenderDraw {
     }
 }
 
+/// [`unit_mesh_draw`]'s threads-per-grid sibling, all nine counts at one.
+fn unit_mesh_threads_draw() -> IcbRenderDraw {
+    IcbRenderDraw::MeshThreads {
+        threads_x: 1,
+        threads_y: 1,
+        threads_z: 1,
+        object_tg_x: 1,
+        object_tg_y: 1,
+        object_tg_z: 1,
+        mesh_tg_x: 1,
+        mesh_tg_y: 1,
+        mesh_tg_z: 1,
+    }
+}
+
+/// Three UInt16 indices out of buffer ref 12 at its base, one instance, no base
+/// instance. `base_vertex` is the parameter because it is the only field the
+/// bodies using this vary — and one of them passes -1 deliberately, to prove
+/// the sign survives the wire.
+fn indexed_draw(base_vertex: i64) -> IcbRenderDraw {
+    IcbRenderDraw::Indexed {
+        primitive_type: 3,
+        index_type: 0,
+        index_buffer_ref: 12,
+        index_count: 3,
+        index_buffer_offset: 0,
+        index_wire_va: 0,
+        instance_count: 1,
+        base_vertex,
+        base_instance: 0,
+    }
+}
+
 /// A one-threadgroup concurrent dispatch of `tg_x` x `tg_y` x `tg_z` threads.
 /// Every fill test in this file uses grid 1x1x1 and varies only the
 /// threadgroup, so the grid is not a parameter.
@@ -1364,17 +1397,7 @@ fn decode_encode_mesh_object_buffer_binds() {
             },
         ],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreads {
-            threads_x: 1,
-            threads_y: 1,
-            threads_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_threads_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh binds");
     assert_eq!(
@@ -1553,17 +1576,7 @@ fn fill_render_draw_mesh_threads_oracle() {
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreads {
-                threads_x: 1,
-                threads_y: 1,
-                threads_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_threads_draw(),
         },
     )
     .expect("fill DrawMeshThreads");
@@ -1645,17 +1658,7 @@ fn decode_encode_signed_base_vertex() {
         pipeline_ref: 11,
         buffers: vec![],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::Indexed {
-            primitive_type: 3,
-            index_type: 0,
-            index_buffer_ref: 12,
-            index_count: 3,
-            index_buffer_offset: 0,
-            index_wire_va: 0,
-            instance_count: 1,
-            base_vertex: -1,
-            base_instance: 0,
-        },
+        draw: indexed_draw(-1),
     };
     let slot = encode_render_command_slot(&layout, &fill).unwrap();
     let args = layout.command_arguments_offset as usize;
@@ -1773,17 +1776,7 @@ fn fill_render_negative_base_vertex_stagein_oracle() {
                 render_bind(0, 13, true),
             ],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 0,
-                index_wire_va: 0,
-                instance_count: 1,
-                base_vertex: -1,
-                base_instance: 0,
-            },
+            draw: indexed_draw(-1),
         },
     )
     .expect("fill DrawIndexed baseVertex=-1");
@@ -2074,40 +2067,12 @@ fn fill_render_draw_indexed_execute_oracle() {
             pipeline_ref: 6,
             buffers: vec![render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 0,
-                index_wire_va: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
+            draw: indexed_draw(0),
         },
     )
     .expect("fill_render DrawIndexed");
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        first_vertex: 0,
-        colors: vec![ColorRtRequest {
-            slot: 0,
-            mapping_id,
-            width: 4,
-            height: 4,
-            format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
@@ -2167,17 +2132,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
             pipeline_ref: 6,
             buffers: vec![render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 0,
-                index_wire_va: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
+            draw: indexed_draw(0),
         },
     )
     .unwrap();
@@ -2187,25 +2142,7 @@ fn buffer_backed_render_draw_indexed_fill_execute() {
     let mapping_id = map_draw_target(&mut host, &mut state, 0x31);
 
     // Execute path re-fills from command memory (DrawIndexed + fragment bind).
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        first_vertex: 0,
-        colors: vec![ColorRtRequest {
-            slot: 0,
-            mapping_id,
-            width: 4,
-            height: 4,
-            format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok
@@ -2820,17 +2757,7 @@ fn fill_render_mesh_buffer_bind_oracle() {
                 stage: IcbRenderBindStage::Mesh,
             }],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreads {
-                threads_x: 1,
-                threads_y: 1,
-                threads_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_threads_draw(),
         },
     )
     .expect("fill mesh buffer bind");
@@ -2974,17 +2901,7 @@ fn wire_backed_mesh_buffer_bind_e2e() {
             stage: IcbRenderBindStage::Mesh,
         }],
         object_threadgroup_memory: vec![],
-        draw: IcbRenderDraw::MeshThreads {
-            threads_x: 1,
-            threads_y: 1,
-            threads_z: 1,
-            object_tg_x: 1,
-            object_tg_y: 1,
-            object_tg_z: 1,
-            mesh_tg_x: 1,
-            mesh_tg_y: 1,
-            mesh_tg_z: 1,
-        },
+        draw: unit_mesh_threads_draw(),
     };
     let slot = encode_render_command_slot(&layout, &fill).expect("encode mesh bind slot");
 
@@ -3396,17 +3313,7 @@ fn wire_backed_mesh_threads_e2e() {
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::MeshThreads {
-                threads_x: 1,
-                threads_y: 1,
-                threads_z: 1,
-                object_tg_x: 1,
-                object_tg_y: 1,
-                object_tg_z: 1,
-                mesh_tg_x: 1,
-                mesh_tg_y: 1,
-                mesh_tg_z: 1,
-            },
+            draw: unit_mesh_threads_draw(),
         },
     )
     .expect("encode MeshThreads slot");
@@ -3550,17 +3457,7 @@ fn inherit_buffers_encoder_fragment_color() {
             pipeline_ref: 6,
             buffers: vec![],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 0,
-                index_wire_va: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
+            draw: indexed_draw(0),
         },
     )
     .expect("fill inherit draw");
@@ -3569,29 +3466,13 @@ fn inherit_buffers_encoder_fragment_color() {
 
     // Stream-style fragment bind on the encode request (parent encoder).
     let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        first_vertex: 0,
-        colors: vec![ColorRtRequest {
-            slot: 0,
-            mapping_id,
-            width: 4,
-            height: 4,
-            format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-            ..Default::default()
-        }],
         fragment_buffers: vec![BufferBind {
             index: 0,
             buffer_ref: 13,
             offset: 0,
         }],
         viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
-        ..Default::default()
+        ..draw_request(mapping_id)
     };
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
@@ -3664,17 +3545,7 @@ fn inherit_pipeline_encoder_fragment_color() {
             pipeline_ref: 0,
             buffers: vec![render_bind(0, 13, true)],
             object_threadgroup_memory: vec![],
-            draw: IcbRenderDraw::Indexed {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer_ref: 12,
-                index_count: 3,
-                index_buffer_offset: 0,
-                index_wire_va: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
+            draw: indexed_draw(0),
         },
     )
     .expect("fill inheritPipeline draw");
@@ -3683,24 +3554,8 @@ fn inherit_pipeline_encoder_fragment_color() {
 
     // Stream-style pipeline on the encode request (parent encoder).
     let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        first_vertex: 0,
-        colors: vec![ColorRtRequest {
-            slot: 0,
-            mapping_id,
-            width: 4,
-            height: 4,
-            format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-            ..Default::default()
-        }],
         viewport: Some([0.0, 0.0, 4.0, 4.0, 0.0, 1.0]),
-        ..Default::default()
+        ..draw_request(mapping_id)
     };
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
@@ -3803,25 +3658,7 @@ fn fill_render_stagein_draw_execute_oracle() {
 
     let mapping_id = map_draw_target(&mut host, &mut state, 0x33);
 
-    let req = DrawEncodeRequest {
-        task_id: 1,
-        pipeline_ref: 6,
-        vertex_count: 3,
-        instance_count: 1,
-        primitive_type: 3,
-        first_vertex: 0,
-        colors: vec![ColorRtRequest {
-            slot: 0,
-            mapping_id,
-            width: 4,
-            height: 4,
-            format: MTL_FORMAT_BGRA8_UNORM,
-            store_action: PASS_STORE_ACTION_STORE,
-            target_seed_rgba: Some(vec![0u8; 4 * 4 * 4]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let req = draw_request(mapping_id);
     assert_eq!(
         encode_icb_execute_and_writeback(&mut state, &mut host, &req, 9, 0, 1),
         EncodeStatus::Ok,
