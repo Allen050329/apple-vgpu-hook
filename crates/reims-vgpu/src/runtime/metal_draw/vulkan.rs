@@ -5324,7 +5324,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     h,
                                 );
                             }
-                            names_these_pages
+                            let served = names_these_pages
                                 .then(|| {
                                     crate::runtime::surface_cache::get_gva(
                                         state,
@@ -5334,7 +5334,20 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                                     )
                                 })
                                 .flatten()
-                                .map(|b| b.to_vec())
+                                .map(|b| b.to_vec());
+                            // See `seed_color_load`'s sibling count: this is the
+                            // other surviving reader of the GVA encode cache and
+                            // its serve rate is what decides whether that map,
+                            // its byte cap and its backing revalidation are worth
+                            // keeping. `names_these_pages` is already scored by
+                            // `gvac_*`; what has never been counted is how often
+                            // a lookup that passes it actually finds bytes.
+                            crate::runtime::drain::note_store_route(if served.is_some() {
+                                "gvac_seed_vk_serve"
+                            } else {
+                                "gvac_seed_vk_miss"
+                            });
+                            served
                         } else {
                             None
                         };

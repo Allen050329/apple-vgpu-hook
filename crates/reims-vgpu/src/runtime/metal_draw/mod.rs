@@ -3965,12 +3965,25 @@ fn seed_color_load<M: HostMemory + HostOps>(
             // stored-once-sampled-forever entry warm.
             crate::runtime::surface_cache::touch_gva(state, target_gva, width, height);
         }
-        let cached = if target_gva != 0 {
+        // How often this reader takes the GVA encode cache, counted apart from
+        // the texture_ref cache it falls back to. The sampled reader of the same
+        // map was deleted after its counters showed it served 0 times in 286 800
+        // attempts; this one and the sibling in `try_metal2vulkan_draw` are the
+        // two that remain, and neither has ever had a serve rate. Whether the
+        // map is worth its 128 MiB cap, its LRU and its backing revalidation
+        // turns on that number, and it is not derivable from anything logged
+        // today. Pure count; nothing reads it back.
+        let from_gva = if target_gva != 0 {
             crate::runtime::surface_cache::get_gva(state, target_gva, width, height)
         } else {
             None
-        }
-        .or_else(|| {
+        };
+        crate::runtime::drain::note_store_route(if from_gva.is_some() {
+            "gvac_seed_cpu_serve"
+        } else {
+            "gvac_seed_cpu_miss"
+        });
+        let cached = from_gva.or_else(|| {
             (texture_ref != 0)
                 .then(|| {
                     crate::runtime::surface_cache::get_texture(state, texture_ref, width, height)
