@@ -395,20 +395,20 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     // 0.93-0.99. Nothing on the host-window present path reads
                     // those pages, so most of that work is owed to a guest reader
                     // that may never come.
-                    let deferred = if deferred_gpu_only_content_allowed_for_surface() {
-                        arm_surface_deferred_store_with(
-                            state,
-                            host,
-                            req,
-                            c0.mapping_id,
-                            c0.width,
-                            c0.height,
-                            bgra,
-                        )
-                    } else {
-                        Err(bgra)
-                    };
-                    match deferred {
+                    //
+                    // The capability gate lives in `surface_store_defer_eligible`,
+                    // which this reaches through `prepare_surface_deferred_window`;
+                    // a denial arrives here as the `Err(bgra)` the sync route below
+                    // needs anyway.
+                    match arm_surface_deferred_store_with(
+                        state,
+                        host,
+                        req,
+                        c0.mapping_id,
+                        c0.width,
+                        c0.height,
+                        bgra,
+                    ) {
                         Ok(epoch) => {
                             note_type11_store_route("surface_deferred");
                             {
@@ -3451,7 +3451,7 @@ impl Drop for StoreCostSpan {
 /// **`surface_deferred` and `cpu_portability` are host-class cells, not
 /// workload outcomes.** They sit in the synchronous CPU-readback block that the
 /// `_sync` routes fall through to, and which of the two runs is decided by
-/// [`deferred_gpu_only_content_allowed_for_surface`] — a **capability** gate,
+/// [`crate::backend::vulkan::engine::deferred_gpu_only_content_allowed`] — a **capability** gate,
 /// held back by the `guest_pages_stay_authoritative` driver quirk. On a host
 /// where that quirk applies, deferral is off, `surface_deferred` cannot be taken
 /// and `cpu_portability` carries every Store. That is the "guest pages stay
@@ -4904,9 +4904,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // `ResidentSurfaceStore` is reached, so a record that armed here as well
         // would skip its readback and never arm anything. Stated rather than
         // derived, because the derivation is a property of two other blocks.
+        // `surface_store_defer_eligible` asks the capability gate itself, so it
+        // is not repeated here.
         if renders_into_surface_identity
             && !resources.skip_readback
-            && deferred_gpu_only_content_allowed_for_surface()
             && surface_store_defer_eligible(state, req).is_some()
         {
             resources.skip_readback = true;
@@ -5199,36 +5200,30 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 }
             }
         }
-        if census_verbose || fixed_gap_first {
-            // O(seed pixels), and the line below is its only reader.
-            let seed_rgb = resources
-                .target_rgba8
-                .as_ref()
-                .map(|s| {
-                    s.chunks_exact(4)
-                        .filter(|p| p[0] | p[1] | p[2] != 0)
-                        .count()
-                })
-                .unwrap_or(0);
-            let idx_count = resources
-                .indexed
-                .as_ref()
-                .map(|i| i.index_count)
-                .unwrap_or(0);
-            let attr0_len = resources
-                .vertex_attributes
-                .first()
-                .map(|a| a.content.len())
-                .unwrap_or(0);
-            // Bring-up: bounded resource prefixes for black-frame RE. Fragment
-            // buffer(0) is commonly a shader configuration record; keep its bytes
-            // explicit instead of hiding the decisive fields after the 16-byte
-            // generic SSBO prefix.
-            let attr0_hex = resources
-                .vertex_attributes
-                .first()
-                .map(|a| hex_prefix(&a.content.cpu_bytes(), 16))
-                .unwrap_or_default();
+        // The `fixed_gap` anomaly — decoded fixed-function state the Vulkan
+        // request cannot represent — is the one thing here the always-on log
+        // wants. It is deduped per (pipe, w, h, gap) so recurring depth/stencil
+        // shadow draws cannot flood: an active compositor emitted 80k+ of these
+        // per interaction before the dedup.
+        if fixed_gap_first {
+            crate::observe::off(format!(
+                "linux_m2v_resources pipe={} {}x{} fixed_gap=[{}] attrs={} ssbo={} img={} smp={} rt_n={}",
+                req.pipeline_ref,
+                w,
+                h,
+                fixed_state_gap,
+                resources.vertex_attributes.len(),
+                resources.storage_buffers.len(),
+                resources.sampled_images.len(),
+                resources.samplers.len(),
+                req.colors.len(),
+            ));
+        }
+        // The per-draw resource census describes the *decoded* request — vertex
+        // attribute declarations, storage-buffer bindings, sampler state, colour
+        // targets. It is verbose-gated (REIMS_VGPU_DRAW_LOG →
+        // /tmp/reims-vgpu-draw.log) because it costs a `format!` per binding.
+        if census_verbose {
             let attr_meta: String = resources
                 .vertex_attributes
                 .iter()
@@ -5249,42 +5244,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let ssbo_meta: String = resources
                 .storage_buffers
                 .iter()
-                .map(|b| {
-                    format!(
-                        "b{}:n={}:h={}",
-                        b.binding,
-                        b.content.len(),
-                        hex_prefix(&b.content.cpu_bytes(), 16)
-                    )
-                })
+                .map(|b| format!("b{}:n={}", b.binding, b.content.len()))
                 .collect::<Vec<_>>()
                 .join(";");
-            let frag0_hex = binding_hex_prefix(&frag_storage, 0, 52);
-            // Generated compositor shaders source their six vertices from vertex
-            // buffer(1) (48 bytes each) and keep image/blend uniforms in fragment
-            // buffer(1). Capture those complete declared prefixes only for the
-            // structurally complex multi-image/no-stage-in class.
-            let complex_bind_diag =
-                resources.vertex_attributes.is_empty() && resources.sampled_images.len() >= 4;
-            let vtx1_hex = if complex_bind_diag {
-                binding_hex_prefix(&vtx_storage, 1, 6 * 48)
-            } else {
-                Default::default()
-            };
-            let frag1_hex = if complex_bind_diag {
-                binding_hex_prefix(&frag_storage, 1, 112)
-            } else {
-                Default::default()
-            };
-            // AIR reflection names fragment buffer(4) `colorP`; the generated
-            // compositor fragment consumes it while applying color opcode 1.
-            // Capture the complete 4x4-float-sized prefix so the matrix/vector ABI
-            // can be compared against the shader without guessing from 16 bytes.
-            let frag4_hex = if complex_bind_diag {
-                binding_hex_prefix(&frag_storage, 4, 64)
-            } else {
-                Default::default()
-            };
             let sampler_meta: String = resources
                 .samplers
                 .iter()
@@ -5303,80 +5265,26 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 })
                 .collect::<Vec<_>>()
                 .join(";");
-            let color_target_meta = color_target_diag(&req.colors);
-            // Matrix (binding 2) first 4 cols as floats + first vertex color + indices.
-            let mat_f: String = resources
-                .storage_buffers
-                .iter()
-                .find(|b| b.binding == 2)
-                .map(|b| {
-                    b.content
-                        .cpu_bytes()
-                        .chunks_exact(4)
-                        .take(16)
-                        .map(|c| format!("{:.6}", f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default();
-            let v0_color: String = resources
-                .vertex_attributes
-                .iter()
-                .find(|a| a.location == 3)
-                .and_then(|a| {
-                    let bytes = a.content.cpu_bytes();
-                    bytes
-                        .get(a.offset as usize..a.offset as usize + 4)
-                        .map(|c| format!("{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3]))
-                })
-                .unwrap_or_default();
-            let idx_hex: String = resources
-                .indexed
-                .as_ref()
-                .map(|i| hex_prefix(&i.indices, 16))
-                .unwrap_or_default();
-            // The full ~1KB per-draw resource census is verbose-gated (REIMS_VGPU_DRAW_LOG →
-            // /tmp/reims-vgpu-draw.log). The always-on log keeps ONLY the `fixed_gap` anomaly
-            // (decoded fixed-function state the Vulkan request cannot represent), deduped
-            // per (pipe, w, h, gap) so recurring depth/stencil shadow draws don't flood —
-            // an active compositor otherwise emitted 80k+ of these ~1KB lines per
-            // interaction.
-            {
-                let record = format!(
-                    "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} seed_rgb={} idx={} idx_n={} attr0={} a0hex={} v0col={} idxhex={} frag0hex={} vtx1hex={} frag1hex={} frag4hex={} mat2=[{mat_f}] meta=[{}] ssbo=[{}] sampler=[{}]",
-                    req.pipeline_ref,
-                    w,
-                    h,
-                    vertex_count,
-                    resources.vertex_attributes.len(),
-                    resources.storage_buffers.len(),
-                    resources.sampled_images.len(),
-                    resources.samplers.len(),
-                    req.colors.len(),
-                    color_target_meta,
-                    fixed_state_gap,
-                    resources.target_rgba8.is_some() as u8,
-                    seed_rgb,
-                    resources.indexed.is_some() as u8,
-                    idx_count,
-                    attr0_len,
-                    attr0_hex,
-                    v0_color,
-                    idx_hex,
-                    frag0_hex,
-                    vtx1_hex,
-                    frag1_hex,
-                    frag4_hex,
-                    attr_meta,
-                    ssbo_meta,
-                    sampler_meta
-                );
-                if census_verbose {
-                    crate::observe::line(record);
-                } else {
-                    crate::observe::off(record);
-                }
-            }
+            crate::observe::line(format!(
+                "linux_m2v_resources pipe={} {}x{} vtx={} attrs={} ssbo={} img={} smp={} rt_n={} rt=[{}] fixed_gap=[{}] seed={} idx={} idx_n={} meta=[{}] ssbo=[{}] sampler=[{}]",
+                req.pipeline_ref,
+                w,
+                h,
+                vertex_count,
+                resources.vertex_attributes.len(),
+                resources.storage_buffers.len(),
+                resources.sampled_images.len(),
+                resources.samplers.len(),
+                req.colors.len(),
+                color_target_diag(&req.colors),
+                fixed_state_gap,
+                resources.target_rgba8.is_some() as u8,
+                resources.indexed.is_some() as u8,
+                resources.indexed.as_ref().map(|i| i.index_count).unwrap_or(0),
+                attr_meta,
+                ssbo_meta,
+                sampler_meta
+            ));
         }
 
         resources.vert_spirv = v_words;
@@ -6188,7 +6096,9 @@ fn surface_store_defer_eligible(
     if c0.mapping_id == 0 {
         return None;
     }
-    if !deferred_gpu_only_content_allowed_for_surface() {
+    // The engine-level gate every deferred-writeback rail asks, so one switch
+    // turns them all off together.
+    if !crate::backend::vulkan::engine::deferred_gpu_only_content_allowed() {
         return None;
     }
     let (w, h) = (c0.width, c0.height);
@@ -6560,14 +6470,6 @@ fn finish_surface_deferred_window(
         resident as u8,
     ));
     published_epoch
-}
-
-/// Whether the type-11 writeback may be deferred at all. Same engine-level
-/// gate the GVA rail asks, so one switch turns every deferred-writeback rail
-/// off together.
-#[cfg(feature = "backend-vulkan")]
-fn deferred_gpu_only_content_allowed_for_surface() -> bool {
-    crate::backend::vulkan::engine::deferred_gpu_only_content_allowed()
 }
 
 /// Live [`crate::model::DeferredOwner::Render`] windows, for the population cap.

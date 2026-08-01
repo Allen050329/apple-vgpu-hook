@@ -1742,19 +1742,6 @@ s2:r17:mid0:gva=0x12345000:960x540:fmt=0x73:l2:s1"
     );
 }
 
-/// Vulkan-arm only: `binding_hex_prefix` is a `backend-vulkan` fn.
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn binding_hex_prefix_selects_binding_and_bounds_output() {
-    let storage = vec![
-        (1, vec![0xaa; 3].into()),
-        (4, (0u8..80).collect::<Vec<u8>>().into()),
-    ];
-    assert_eq!(binding_hex_prefix(&storage, 4, 4), "00010203");
-    assert_eq!(binding_hex_prefix(&storage, 1, 64), "aaaaaa");
-    assert_eq!(binding_hex_prefix(&storage, 9, 64), "");
-}
-
 #[test]
 fn missing_pipeline_is_soft() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);

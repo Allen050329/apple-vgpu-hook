@@ -457,33 +457,6 @@ fn linux_m2v_draw_failure(error: &DrawError, req: &DrawEncodeRequest) -> crate::
         )
 }
 
-#[cfg(feature = "backend-vulkan")]
-fn hex_prefix(bytes: &[u8], limit: usize) -> String {
-    bytes
-        .iter()
-        .take(limit)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-/// Return a bounded byte prefix for one decoded stage-buffer binding.
-///
-/// This is a diagnostic of explicit guest bind state only. Callers choose a
-/// binding from shader ABI evidence; no render behavior depends on the bytes.
-#[cfg(feature = "backend-vulkan")]
-fn binding_hex_prefix(
-    storage: &[(u32, crate::backend::vulkan::engine::BufferContent)],
-    index: u32,
-    limit: usize,
-) -> String {
-    storage
-        .iter()
-        .find(|(binding, _)| *binding == index)
-        .map(|(_, content)| hex_prefix(&content.cpu_bytes(), limit))
-        .unwrap_or_default()
-}
-
 /// Fixed-function state decoded by the product request but not yet represented
 /// by the Linux Vulkan engine request. This is an always-on diagnostic field;
 /// it never changes draw execution.
