@@ -109,10 +109,13 @@ pub const SCISSOR_PAYLOAD_LEN: usize = 0x20;
 
 // Supported window is the full C-accepted encoder range 0x00..=0x98 minus rejected.
 
+/// Why the render decoder refused a command.
+///
+/// No `Ok` and no `ErrArgs`, for the reason recorded on `blit::DecodeStatus`:
+/// success is the result's own `Ok`, and a bad argument here is a payload
+/// shorter than the field, which `ErrShort` already names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
-    Ok,
-    ErrArgs,
     ErrShort,
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
@@ -127,8 +130,6 @@ impl crate::observe::Refusal for DecodeStatus {
     /// from any other's.
     fn refusal(&self) -> Option<&'static str> {
         Some(match self {
-            Self::Ok => return None,
-            Self::ErrArgs => "render_decode_args",
             Self::ErrShort => "render_decode_short",
             Self::ErrUnknownOpcode => "render_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "render_decode_unsupported_opcode",
@@ -773,16 +774,14 @@ mod tests {
     /// work. Each check names itself now, `Ok` still produces nothing, and the
     /// prefix keeps them apart from the six sibling `DecodeStatus` enums.
     #[test]
-    fn every_render_decode_failure_but_ok_names_its_own_check() {
+    fn every_render_decode_failure_names_its_own_check() {
         use crate::observe::Refusal;
         const ERRS: &[DecodeStatus] = &[
-            DecodeStatus::ErrArgs,
             DecodeStatus::ErrShort,
             DecodeStatus::ErrUnknownOpcode,
             DecodeStatus::ErrUnsupportedOpcode,
             DecodeStatus::ErrBadLength,
         ];
-        assert_eq!(DecodeStatus::Ok.refusal(), None, "Ok is not a refusal");
         let mut slugs: Vec<&str> = ERRS.iter().filter_map(|s| s.refusal()).collect();
         assert_eq!(slugs.len(), ERRS.len(), "every error variant refuses");
         assert!(slugs.iter().all(|s| s.starts_with("render_decode_")));

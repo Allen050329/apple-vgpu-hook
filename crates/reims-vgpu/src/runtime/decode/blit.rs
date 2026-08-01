@@ -154,10 +154,15 @@ const IMAGE_LEN: usize = 0x10;
 const FENCE_REF: usize = 0;
 const FENCE_LEN: usize = 0x0c;
 
+/// Why the blit decoder refused a command.
+///
+/// There is deliberately no `Ok`: `decode` returns `Result<Command, _>`, so
+/// success is the `Ok` arm of the result and not a variant here. `ErrArgs` went
+/// with it — every argument this decoder rejects is a payload too short for the
+/// field it was about to read, which is `ErrShort`. Both were constructed only
+/// by the test that listed them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeStatus {
-    Ok = 0,
-    ErrArgs,
     ErrShort,
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
@@ -172,8 +177,6 @@ impl crate::observe::Refusal for DecodeStatus {
     /// the collapse the crate-wide uniqueness gate exists to refuse.
     fn refusal(&self) -> Option<&'static str> {
         Some(match self {
-            Self::Ok => return None,
-            Self::ErrArgs => "blit_decode_args",
             Self::ErrShort => "blit_decode_short",
             Self::ErrUnknownOpcode => "blit_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "blit_decode_unsupported_opcode",
@@ -484,21 +487,18 @@ mod tests {
     /// carrying no blit work. Each of the four checks now names itself, and `Ok`
     /// still produces no line.
     #[test]
-    fn every_blit_decode_failure_but_ok_names_its_own_check() {
+    fn every_blit_decode_failure_names_its_own_check() {
         use crate::observe::{Decline, Refusal};
         const ALL: &[DecodeStatus] = &[
-            DecodeStatus::Ok,
-            DecodeStatus::ErrArgs,
             DecodeStatus::ErrShort,
             DecodeStatus::ErrUnknownOpcode,
             DecodeStatus::ErrUnsupportedOpcode,
         ];
-        assert_eq!(DecodeStatus::Ok.refusal(), None);
         let mut slugs: Vec<&str> = ALL.iter().filter_map(|s| s.refusal()).collect();
-        assert_eq!(slugs.len(), 4);
+        assert_eq!(slugs.len(), ALL.len(), "every variant refuses");
         slugs.sort_unstable();
         slugs.dedup();
-        assert_eq!(slugs.len(), 4, "two blit decode checks share a slug");
+        assert_eq!(slugs.len(), ALL.len(), "two blit decode checks share a slug");
         // The prefix is load-bearing: seven modules define a `DecodeStatus` and
         // five of them have an `ErrShort` meaning a different read.
         assert!(slugs.iter().all(|s| s.starts_with("blit_decode_")));
