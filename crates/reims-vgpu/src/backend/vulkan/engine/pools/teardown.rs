@@ -57,17 +57,13 @@ impl ResourcePools {
         // + view handles here, but their memory belongs to shared blocks freed
         // once by `self.slab.destroy_all(device)` at the end — never a per-image
         // `vkFreeMemory` (that would double-free a block many images share).
-        for list in self.sampled_free.values_mut() {
-            for s in list.drain(..) {
-                device.destroy_image_view(s.view, None);
-                device.destroy_image(s.image, None);
-            }
+        for s in self.sampled_free.drain() {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
         }
-        for list in self.target_free.values_mut() {
-            for img in list.drain(..) {
-                device.destroy_image_view(img.view, None);
-                device.destroy_image(img.image, None);
-            }
+        for img in self.target_free.drain() {
+            device.destroy_image_view(img.view, None);
+            device.destroy_image(img.image, None);
         }
         for s in self.sampled_live.drain(..) {
             device.destroy_image_view(s.view, None);
@@ -78,12 +74,10 @@ impl ResourcePools {
             device.destroy_image(s.slot.image, None);
         }
         self.sampled_cache_bytes = 0;
-        for list in self.storage_image_free.values_mut() {
-            for s in list.drain(..) {
-                device.destroy_image_view(s.view, None);
-                device.destroy_image(s.image, None);
-                device.free_memory(s.memory, None);
-            }
+        for s in self.storage_image_free.drain() {
+            device.destroy_image_view(s.view, None);
+            device.destroy_image(s.image, None);
+            device.free_memory(s.memory, None);
         }
         for s in self.storage_image_live.drain(..) {
             device.destroy_image_view(s.view, None);

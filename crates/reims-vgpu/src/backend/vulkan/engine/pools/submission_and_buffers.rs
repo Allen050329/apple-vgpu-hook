@@ -1,15 +1,8 @@
 impl ResourcePools {
     pub(crate) fn guest_reset_counts(&self) -> (usize, usize, usize, usize) {
-        let sampled = self.sampled_live.len()
-            + self.sampled_free.values().map(Vec::len).sum::<usize>()
-            + self.sampled_cache.len();
-        let storage = self.storage_image_live.len()
-            + self
-                .storage_image_free
-                .values()
-                .map(Vec::len)
-                .sum::<usize>()
-            + self.compute_storage_registry.len();
+        let sampled = self.sampled_live.len() + self.sampled_free.len() + self.sampled_cache.len();
+        let storage =
+            self.storage_image_live.len() + self.storage_image_free.len() + self.compute_storage_registry.len();
         (self.registry.len(), self.targets.len(), sampled, storage)
     }
 
@@ -27,11 +20,14 @@ impl ResourcePools {
             readback_free: HashMap::new(),
             readback_live: None,
             readback_multi_live: Vec::new(),
-            sampled_free: HashMap::new(),
+            sampled_free: FreePool::new(SAMPLED_FREE_CAP_PER_KEY, SAMPLED_FREE_CAP_TOTAL),
             sampled_live: Vec::new(),
             sampled_cache: Vec::new(),
             sampled_cache_bytes: 0,
-            storage_image_free: HashMap::new(),
+            storage_image_free: FreePool::new(
+                STORAGE_IMAGE_FREE_CAP_PER_KEY,
+                STORAGE_IMAGE_FREE_CAP_TOTAL,
+            ),
             storage_image_live: Vec::new(),
             compute_storage_registry: HashMap::new(),
             compute_storage_order: VecDeque::new(),
@@ -46,17 +42,7 @@ impl ResourcePools {
             cur: 0,
             in_flight: 0,
             graveyard: Vec::new(),
-            sampled_free_hits: 0,
-            sampled_free_allocs: 0,
-            sampled_recycle_admits: 0,
-            sampled_recycle_cap_drops: 0,
-            target_free: HashMap::new(),
-            target_free_hits: 0,
-            target_free_allocs: 0,
-            target_recycle_admits: 0,
-            target_recycle_cap_drops: 0,
-            storage_recycle_admits: 0,
-            storage_recycle_cap_drops: 0,
+            target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
             slab: super::slab::SlabPool::new(),
             initialized: false,
@@ -142,14 +128,14 @@ impl ResourcePools {
     ) -> usize {
         let mut trimmed = 0;
         while trimmed < max {
-            let Some(slot) = pop_any_pool_entry(&mut self.sampled_free) else {
+            let Some(slot) = self.sampled_free.pop_any() else {
                 break;
             };
             self.destroy_deferred_handle(device, DeferredHandle::RecycleSampled(slot));
             trimmed += 1;
         }
         while trimmed < max {
-            let Some(img) = pop_any_pool_entry(&mut self.target_free) else {
+            let Some(img) = self.target_free.pop_any() else {
                 break;
             };
             self.destroy_deferred_handle(
@@ -192,7 +178,7 @@ impl ResourcePools {
             // budget so it never starves the buffer trim.
             let mut storage_trimmed = 0;
             while storage_trimmed < max {
-                let Some(slot) = pop_any_pool_entry(&mut self.storage_image_free) else {
+                let Some(slot) = self.storage_image_free.pop_any() else {
                     break;
                 };
                 self.destroy_deferred_handle(
@@ -534,12 +520,7 @@ impl ResourcePools {
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     /// Merged into `CounterSnapshot` by `engine::counter_snapshot`.
     pub(crate) fn recycle_stats(&self) -> (u64, u64, u64, u64) {
-        (
-            self.sampled_free_hits,
-            self.sampled_free_allocs,
-            self.sampled_recycle_admits,
-            self.sampled_recycle_cap_drops,
-        )
+        self.sampled_free.stats()
     }
 
     pub(crate) unsafe fn ensure_init(
@@ -726,84 +707,25 @@ impl ResourcePools {
 
     /// Return an evicted sampled slot to `sampled_free` for reuse by a later
     /// same-geometry `acquire_sampled`. `None` means it was recycled; `Some(slot)`
-    /// means the per-key cap is full and the caller must destroy it. Device-free
-    /// so the cap/routing is unit-testable without a GPU.
+    /// means a cap was full and the caller must destroy it.
     fn try_recycle_sampled(&mut self, slot: SampledSlot) -> Option<SampledSlot> {
-        // Global cap first: a diverse burst (hundreds of distinct sampled keys,
-        // each ≤ the per-key cap) would otherwise fill the pool unboundedly and
-        // pin every slab block. Past the global cap the slot is destroyed.
-        if self.sampled_free.values().map(Vec::len).sum::<usize>() >= SAMPLED_FREE_CAP_TOTAL {
-            self.sampled_recycle_cap_drops += 1;
-            return Some(slot);
-        }
-        let list = self.sampled_free.entry(slot.key()).or_default();
-        if list.len() < SAMPLED_FREE_CAP_PER_KEY {
-            list.push(slot);
-            self.sampled_recycle_admits += 1;
-            None
-        } else {
-            // Per-key cap full: this evicted slot is destroyed, not reused. A
-            // high count here (with high sampled_free_allocs) means the cap is
-            // the recycle limiter.
-            self.sampled_recycle_cap_drops += 1;
-            Some(slot)
-        }
+        self.sampled_free.admit(slot.key(), slot)
     }
 
     /// Return a displaced resident-target image to `target_free` for reuse by a
     /// later same-(geometry, format) `registry_ensure`/`registry_ensure_color`
-    /// create. `None` means it was recycled; `Some(img)` means the per-key cap
-    /// is full and the caller must destroy it. Device-free so the cap/routing is
-    /// unit-testable without a GPU (mirrors [`Self::try_recycle_sampled`]).
+    /// create. `None` means it was recycled; `Some(img)` means a cap was full and
+    /// the caller must destroy it.
     fn try_recycle_target(&mut self, img: FreeTargetImage) -> Option<FreeTargetImage> {
-        // Global cap first (mirrors try_recycle_sampled): bound a diverse burst.
-        if self.target_free.values().map(Vec::len).sum::<usize>() >= TARGET_FREE_CAP_TOTAL {
-            self.target_recycle_cap_drops += 1;
-            return Some(img);
-        }
-        let list = self.target_free.entry(img.key()).or_default();
-        if list.len() < TARGET_FREE_CAP_PER_KEY {
-            list.push(img);
-            self.target_recycle_admits += 1;
-            None
-        } else {
-            // Per-key cap full: this displaced image is destroyed, not reused. A
-            // high count here (with high target_free_allocs) means the cap is
-            // the recycle limiter.
-            self.target_recycle_cap_drops += 1;
-            Some(img)
-        }
+        self.target_free.admit(img.key(), img)
     }
 
     /// Return a retired transient compute-storage image to `storage_image_free`
-    /// for reuse by a later same-geometry `acquire_storage_image`. `None` means
-    /// it was recycled; `Some(slot)` means a per-key or the global cap is full and
-    /// the caller must destroy it (freeing its standalone `VkDeviceMemory`).
-    /// Device-free so the cap/routing is unit-testable without a GPU (mirrors
-    /// [`Self::try_recycle_sampled`] / [`Self::try_recycle_target`]).
+    /// for reuse by a later same-geometry `acquire_storage_image`. `None` means it
+    /// was recycled; `Some(slot)` means a cap was full and the caller must destroy
+    /// it, freeing its standalone `VkDeviceMemory` (these are not slab-backed).
     fn try_recycle_storage_image(&mut self, slot: StorageImageSlot) -> Option<StorageImageSlot> {
-        // Global cap first (mirrors try_recycle_sampled): bound a diverse burst so
-        // an all-new-geometry compute workload cannot leak unbounded standalone
-        // device allocations.
-        if self
-            .storage_image_free
-            .values()
-            .map(Vec::len)
-            .sum::<usize>()
-            >= STORAGE_IMAGE_FREE_CAP_TOTAL
-        {
-            self.storage_recycle_cap_drops += 1;
-            return Some(slot);
-        }
-        let list = self.storage_image_free.entry(slot.key).or_default();
-        if list.len() < STORAGE_IMAGE_FREE_CAP_PER_KEY {
-            list.push(slot);
-            self.storage_recycle_admits += 1;
-            None
-        } else {
-            self.storage_recycle_cap_drops += 1;
-            Some(slot)
-        }
+        self.storage_image_free.admit(slot.key, slot)
     }
 
     /// Pop a recycled resident-target image for `(width, height, format)` if one
@@ -821,24 +743,13 @@ impl ResourcePools {
             height,
             format,
         };
-        let img = self.target_free.get_mut(&key).and_then(Vec::pop);
-        if img.is_some() {
-            self.target_free_hits += 1;
-        } else {
-            self.target_free_allocs += 1;
-        }
-        img
+        self.target_free.take(&key)
     }
 
     /// Cumulative resident-target recycle diagnostics:
     /// `(free_hits, free_allocs, recycle_admits, recycle_cap_drops)`.
     pub(crate) fn target_recycle_stats(&self) -> (u64, u64, u64, u64) {
-        (
-            self.target_free_hits,
-            self.target_free_allocs,
-            self.target_recycle_admits,
-            self.target_recycle_cap_drops,
-        )
+        self.target_free.stats()
     }
 
     /// Cumulative compute-storage recycle diagnostics: `(admits, cap_drops)`.
@@ -847,7 +758,8 @@ impl ResourcePools {
     /// surfaced as `st_drop` on the `vram` census.
     #[cfg(test)]
     pub(crate) fn storage_recycle_stats(&self) -> (u64, u64) {
-        (self.storage_recycle_admits, self.storage_recycle_cap_drops)
+        let (_, _, admits, cap_drops) = self.storage_image_free.stats();
+        (admits, cap_drops)
     }
 
     unsafe fn drain_graveyard(&mut self, device: &ash::Device) {
@@ -1827,14 +1739,14 @@ impl ResourcePools {
             format,
             swizzle,
         };
-        if let Some(list) = self.sampled_free.get_mut(&sk) {
-            if let Some(slot) = list.pop() {
-                let handles = slot.handles();
-                self.sampled_live.push(slot);
-                // Reused a recycled slot — no vkAllocateMemory this acquire.
-                self.sampled_free_hits += 1;
-                return Ok(handles);
-            }
+        // A hit reuses a recycled slot — no vkAllocateMemory this acquire. A miss
+        // is counted here, at the empty free list, rather than after the create
+        // succeeds: the census question is whether the pool had one, not whether
+        // the fallback worked.
+        if let Some(slot) = self.sampled_free.take(&sk) {
+            let handles = slot.handles();
+            self.sampled_live.push(slot);
+            return Ok(handles);
         }
         let image_type = if one_dim {
             vk::ImageType::TYPE_1D
@@ -1887,11 +1799,6 @@ impl ResourcePools {
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateSampledImage, e)))?;
         counters.note_create();
         let req = ctx.device.get_image_memory_requirements(image);
-        // Cold acquire: the per-geometry free list was empty so we pay a fresh
-        // sub-allocation (a block alloc only when no block has room). This is
-        // the lag-tail driver; recycling aims to keep it low relative to
-        // sampled_free_hits.
-        self.sampled_free_allocs += 1;
         let memory = match self.bind_image_slab(ctx, image, &req, VkOp::PoolsBindSampled, counters)
         {
             Ok(m) => m,
@@ -2083,7 +1990,7 @@ impl ResourcePools {
     pub(crate) fn recycle_sampled(&mut self) {
         for slot in self.sampled_live.drain(..) {
             let sk = slot.key();
-            self.sampled_free.entry(sk).or_default().push(slot);
+            self.sampled_free.push_uncapped(sk, slot);
         }
     }
 }
@@ -2200,7 +2107,7 @@ mod recycle_tests {
             "global cap bounds the diverse burst"
         );
         assert_eq!(
-            pools.sampled_free.values().map(Vec::len).sum::<usize>(),
+            pools.sampled_free.len(),
             SAMPLED_FREE_CAP_TOTAL,
             "pool total pinned at the global cap"
         );
@@ -2265,11 +2172,7 @@ mod recycle_tests {
             "global cap bounds the diverse burst"
         );
         assert_eq!(
-            pools
-                .storage_image_free
-                .values()
-                .map(Vec::len)
-                .sum::<usize>(),
+            pools.storage_image_free.len(),
             STORAGE_IMAGE_FREE_CAP_TOTAL,
             "pool total pinned at the global cap"
         );
@@ -2292,8 +2195,8 @@ mod recycle_tests {
             );
         }
         assert_eq!(
-            pools.storage_image_free.get(&key).map(Vec::len),
-            Some(STORAGE_IMAGE_FREE_CAP_PER_KEY)
+            pools.storage_image_free.count_for(&key),
+            STORAGE_IMAGE_FREE_CAP_PER_KEY
         );
         assert!(
             pools
@@ -2340,8 +2243,8 @@ mod recycle_tests {
             );
         }
         assert_eq!(
-            pools.sampled_free.get(&hd).map(Vec::len),
-            Some(SAMPLED_FREE_CAP_PER_KEY)
+            pools.sampled_free.count_for(&hd),
+            SAMPLED_FREE_CAP_PER_KEY
         );
 
         // Over the cap: caller must destroy (returns the slot); free list is
@@ -2351,14 +2254,14 @@ mod recycle_tests {
             "over-cap eviction must not recycle"
         );
         assert_eq!(
-            pools.sampled_free.get(&hd).map(Vec::len),
-            Some(SAMPLED_FREE_CAP_PER_KEY)
+            pools.sampled_free.count_for(&hd),
+            SAMPLED_FREE_CAP_PER_KEY
         );
 
         // A different geometry has an independent cap.
         let small = null_slot(64, 64).key();
         assert!(pools.try_recycle_sampled(null_slot(64, 64)).is_none());
-        assert_eq!(pools.sampled_free.get(&small).map(Vec::len), Some(1));
+        assert_eq!(pools.sampled_free.count_for(&small), 1);
     }
 
     /// The idle sampled-cache trim reclaims only entries idle past
@@ -2533,8 +2436,8 @@ mod recycle_tests {
             );
         }
         assert_eq!(
-            pools.target_free.get(&key).map(Vec::len),
-            Some(TARGET_FREE_CAP_PER_KEY)
+            pools.target_free.count_for(&key),
+            TARGET_FREE_CAP_PER_KEY
         );
 
         assert!(
@@ -2544,8 +2447,8 @@ mod recycle_tests {
             "over-cap displacement must not recycle"
         );
         assert_eq!(
-            pools.target_free.get(&key).map(Vec::len),
-            Some(TARGET_FREE_CAP_PER_KEY)
+            pools.target_free.count_for(&key),
+            TARGET_FREE_CAP_PER_KEY
         );
 
         // A different format is an independent bucket (an RGBA image cannot back
@@ -2558,7 +2461,7 @@ mod recycle_tests {
                 translate::pixel::RESIDENT_RGBA_FORMAT
             ))
             .is_none());
-        assert_eq!(pools.target_free.get(&rgba).map(Vec::len), Some(1));
+        assert_eq!(pools.target_free.count_for(&rgba), 1);
     }
 
     /// The exact video regression this pool fixes: a per-frame *generation* bump

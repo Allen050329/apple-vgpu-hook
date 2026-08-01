@@ -5,16 +5,14 @@ impl ResourcePools {
         key: StorageImageKey,
         counters: &EngineCounters,
     ) -> Result<StorageImageSlot, DrawError> {
-        if let Some(list) = self.storage_image_free.get_mut(&key) {
-            if let Some(slot) = list.pop() {
-                self.storage_image_live.push(StorageImageSlot {
-                    image: slot.image,
-                    memory: slot.memory,
-                    view: slot.view,
-                    key: slot.key,
-                });
-                return Ok(slot);
-            }
+        if let Some(slot) = self.storage_image_free.take(&key) {
+            self.storage_image_live.push(StorageImageSlot {
+                image: slot.image,
+                memory: slot.memory,
+                view: slot.view,
+                key: slot.key,
+            });
+            return Ok(slot);
         }
         let format = key.format.vk_format();
         let image = ctx
@@ -101,10 +99,7 @@ impl ResourcePools {
 
     pub(crate) fn recycle_storage_images(&mut self) {
         for slot in self.storage_image_live.drain(..) {
-            self.storage_image_free
-                .entry(slot.key)
-                .or_default()
-                .push(slot);
+            self.storage_image_free.push_uncapped(slot.key, slot);
         }
     }
 

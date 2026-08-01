@@ -85,14 +85,14 @@ pub(crate) struct ResourcePools {
     /// Extra live readbacks (compute multi-image / multi-buffer).
     readback_multi_live: Vec<BufferSlot>,
     /// Transient sampled-image pool, keyed by exact image and view geometry.
-    sampled_free: HashMap<SampledKey, Vec<SampledSlot>>,
+    sampled_free: FreePool<SampledKey, SampledSlot>,
     sampled_live: Vec<SampledSlot>,
     /// Exact-content sampled images retained across draw calls. Hash narrows
     /// candidates only; a hit always requires full byte equality.
     sampled_cache: Vec<ResidentSampledSlot>,
     sampled_cache_bytes: usize,
     /// Storage-image pool for compute.
-    storage_image_free: HashMap<StorageImageKey, Vec<StorageImageSlot>>,
+    storage_image_free: FreePool<StorageImageKey, StorageImageSlot>,
     storage_image_live: Vec<StorageImageSlot>,
     /// Protocol-identity keyed compute storage images retained across calls.
     compute_storage_registry: HashMap<ComputeStorageResidencyKey, ResidentStorageImageSlot>,
@@ -145,31 +145,12 @@ pub(crate) struct ResourcePools {
     /// Handles displaced (cache eviction, registry replace) while a CB was in
     /// flight; destroyed once in_flight returns to 0.
     graveyard: Vec<DeferredHandle>,
-    /// Cumulative sampled-cache recycle diagnostics (surfaced via
-    /// `recycle_stats` into `CounterSnapshot`; see there for semantics).
-    /// Plain u64 — `ResourcePools` is only ever touched under the engine lock.
-    sampled_free_hits: u64,
-    sampled_free_allocs: u64,
-    sampled_recycle_admits: u64,
-    sampled_recycle_cap_drops: u64,
     /// Resident-target recycle pool: images displaced from the identity registry
     /// (generation bump / geometry change / LRU), held by (geometry, format) for
     /// reuse instead of destroyed. Kills the per-frame `vkCreateImage`+
     /// `vkAllocateMemory` storm a per-frame-generation target (video) would
     /// otherwise pay (see [`TargetRecycleKey`]). Bounded per key.
-    target_free: HashMap<TargetRecycleKey, Vec<FreeTargetImage>>,
-    /// Cumulative resident-target recycle diagnostics (plain u64 — touched only
-    /// under the engine lock; surfaced via `target_recycle_stats`).
-    target_free_hits: u64,
-    target_free_allocs: u64,
-    target_recycle_admits: u64,
-    target_recycle_cap_drops: u64,
-    /// Transient compute-storage recycle pool diagnostics (plain u64 — touched
-    /// only under the engine lock). `admits` counts slots returned to
-    /// `storage_image_free` for reuse; `cap_drops` counts slots destroyed because
-    /// a per-key or the global cap was full (an all-new-geometry compute burst).
-    storage_recycle_admits: u64,
-    storage_recycle_cap_drops: u64,
+    target_free: FreePool<TargetRecycleKey, FreeTargetImage>,
     /// Open draw batch: a ring slot whose CB is still recording deferred
     /// same-target draws (submit pending). While `Some`, that CB references
     /// live GPU objects exactly like an in-flight CB, so dispose/graveyard
@@ -676,6 +657,139 @@ const STORAGE_IMAGE_FREE_CAP_PER_KEY: usize = 4;
 /// the pool without bound. Past the cap the displaced slot is destroyed, freeing
 /// its VkDeviceMemory.
 const STORAGE_IMAGE_FREE_CAP_TOTAL: usize = 16;
+/// A bounded per-key free list of reusable GPU objects, with the census that
+/// says whether its own caps are what is limiting reuse.
+///
+/// # One discipline, three pools
+///
+/// Resident targets, sampled images and transient compute storage all want the
+/// same thing: hand a retired object back keyed by the geometry that makes it
+/// reusable, take one back on the next create of that geometry, and bound the
+/// hoard two ways. That policy used to be written out three times, once per
+/// pool, each with its own four counters — a shape whose own doc comments said
+/// "mirrors `try_recycle_sampled`". It is written once here, and the pools
+/// differ only in their key type and their two caps.
+///
+/// It is also where a fourth pool joins. `create_transient_depth` is the one
+/// render target in this engine that never recycles, and it allocates the most
+/// by two orders of magnitude; its doc asks for exactly this — one discipline
+/// the depth path also uses, not a fourth pool beside the others.
+///
+/// # The two caps
+///
+/// `total` is tested first and it is the one that matters. The per-key cap
+/// alone does not bound a *diverse* burst: hundreds of distinct keys, each on
+/// its own well under `per_key`, filled `sampled_free` to ~593 images (measured
+/// `vram sfree=593`), every one pinning a slab sub-allocation so no block could
+/// ever empty. `per_key` is the second bound, for one geometry churning.
+///
+/// A high `cap_drops` beside a high `allocs` is the reading that says a cap,
+/// rather than the workload, is what stopped the reuse.
+struct FreePool<K, V> {
+    free: HashMap<K, Vec<V>>,
+    per_key: usize,
+    total: usize,
+    /// A take that found an entry to reuse.
+    hits: u64,
+    /// A take that found none, so the caller had to create.
+    allocs: u64,
+    /// Entries admitted for reuse.
+    admits: u64,
+    /// Entries handed back for destruction because a cap was full.
+    cap_drops: u64,
+}
+
+impl<K: std::hash::Hash + Eq, V> FreePool<K, V> {
+    fn new(per_key: usize, total: usize) -> Self {
+        Self {
+            free: HashMap::new(),
+            per_key,
+            total,
+            hits: 0,
+            allocs: 0,
+            admits: 0,
+            cap_drops: 0,
+        }
+    }
+
+    /// Retained entries across every key.
+    fn len(&self) -> usize {
+        self.free.values().map(Vec::len).sum()
+    }
+
+    /// Offer a retired entry for reuse. `None` means it was admitted; `Some(v)`
+    /// hands it back because a cap was full and the caller must destroy it.
+    /// Device-free, so the routing is unit-testable without a GPU.
+    fn admit(&mut self, key: K, entry: V) -> Option<V> {
+        if self.len() >= self.total {
+            self.cap_drops += 1;
+            return Some(entry);
+        }
+        let list = self.free.entry(key).or_default();
+        if list.len() < self.per_key {
+            list.push(entry);
+            self.admits += 1;
+            None
+        } else {
+            self.cap_drops += 1;
+            Some(entry)
+        }
+    }
+
+    /// Return an entry with **no cap check**.
+    ///
+    /// For the two end-of-submit drains — `recycle_sampled` and
+    /// `recycle_storage_images` — which return every live slot at once and whose
+    /// signatures carry no `ash::Device`, so they cannot destroy an entry a cap
+    /// would reject. The caps therefore bound only the deferred
+    /// `DeferredHandle::Recycle*` route; what bounds this one is
+    /// `trim_recycle_pools` on the idle drain. That asymmetry is real and was
+    /// measured: one 4x4K video session held `sfree=203` against a `total` of 64.
+    fn push_uncapped(&mut self, key: K, entry: V) {
+        self.free.entry(key).or_default().push(entry);
+    }
+
+    /// Take a reusable entry for `key`, splitting the reuse/fresh-create census
+    /// so a boot can prove a per-frame realloc storm collapsed (`allocs` ≈ 0).
+    fn take(&mut self, key: &K) -> Option<V> {
+        let got = self.free.get_mut(key).and_then(Vec::pop);
+        if got.is_some() {
+            self.hits += 1;
+        } else {
+            self.allocs += 1;
+        }
+        got
+    }
+
+    /// Take any retained entry, for the idle trim that drains the pool toward
+    /// empty. Not a reuse, so it does not move the hit/alloc split.
+    fn pop_any(&mut self) -> Option<V>
+    where
+        K: Clone,
+    {
+        pop_any_pool_entry(&mut self.free)
+    }
+
+    /// Empty the pool, yielding every retained entry for the caller to destroy.
+    /// The census is cumulative and survives, so a teardown does not erase what
+    /// the boot measured.
+    fn drain(&mut self) -> impl Iterator<Item = V> + '_ {
+        self.free.drain().flat_map(|(_, list)| list)
+    }
+
+    /// Retained entries under one key — what the per-key cap bounds. Only the
+    /// cap tests ask this; production code never needs a single key's depth.
+    #[cfg(test)]
+    fn count_for(&self, key: &K) -> usize {
+        self.free.get(key).map_or(0, Vec::len)
+    }
+
+    /// `(hits, allocs, admits, cap_drops)` for the counter snapshot.
+    fn stats(&self) -> (u64, u64, u64, u64) {
+        (self.hits, self.allocs, self.admits, self.cap_drops)
+    }
+}
+
 /// Images destroyed from the recycle pools per idle-drain pass. The recycle pools
 /// exist for *active* per-frame reuse; at idle (the drain only fires after
 /// `IDLE_TARGET_AGE_MS` of no touch) they are pure retained VRAM, so each pass
