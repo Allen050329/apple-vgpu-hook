@@ -414,6 +414,23 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
     } else {
         Some(vec![0u8; (mw as usize) * (RGBA8_BPP as usize)])
     };
+    // Whether a row can go straight from `src` to the guest without passing
+    // through `row`.
+    //
+    // `row` is the *conversion* destination: when the mapping's format is
+    // already BGRA8 there is nothing to convert, and staging through it copied
+    // every byte of the frame a second time. On the composite surface that is a
+    // whole extra 8 MB memcpy per flush, ~106 times a second — measured at
+    // 0.83 ms of a 2.68 ms guest-page write, against 0.83 ms for the identical
+    // number of bytes on the readback's own memcpy.
+    //
+    // Only sound while the row is byte-identical, which is why `tight` is
+    // compared rather than assumed: `tight_row_bytes` is the format's own
+    // packed row length, and if it ever disagrees with the source's `mw * 4`
+    // the staged path still runs. That also keeps `row`'s reuse across rows
+    // safe — a short source row would otherwise leave the previous row's bytes
+    // in its tail.
+    let direct_rows = rgba.is_none() && tight == (mw as usize) * (RGBA8_BPP as usize);
 
     // Fast path: one packed view, poke rows in place.
     if let Some((ptr, _)) = contig_for_write(state, host, mapping_id, span_end, &vouched, src) {
@@ -426,17 +443,22 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
                 return false;
             }
             let src_row = &src[src_off..src_off + src_row_len];
-            if let Some(ref mut rgba_row) = rgba {
-                if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                    return false;
-                }
-                if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                    return false;
-                }
+            let row_bytes: &[u8] = if direct_rows {
+                &src_row[..tight]
             } else {
-                let n = src_row_len.min(row.len());
-                row[..n].copy_from_slice(&src_row[..n]);
-            }
+                if let Some(ref mut rgba_row) = rgba {
+                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
+                        return false;
+                    }
+                    if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
+                        return false;
+                    }
+                } else {
+                    let n = src_row_len.min(row.len());
+                    row[..n].copy_from_slice(&src_row[..n]);
+                }
+                &row
+            };
             // The row's destination in mapping-offset space, so the skip list —
             // which is in that space — is subtracted before any pointer exists.
             let row_off = base_off.saturating_add((y as u64).saturating_mul(bpr as u64));
@@ -444,10 +466,10 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
                 let within = (lo - row_off) as usize;
                 let len = (hi - lo) as usize;
                 let dst = unsafe { base.add((y as usize).saturating_mul(bpr) + within) };
-                // SAFETY: `within + len <= tight`, and the view covers span_end
-                // which is at or past this row's last byte.
+                // SAFETY: `within + len <= tight <= row_bytes.len()`, and the
+                // view covers span_end which is at or past this row's last byte.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(row.as_ptr().add(within), dst, len);
+                    std::ptr::copy_nonoverlapping(row_bytes.as_ptr().add(within), dst, len);
                 }
             }
         }
@@ -471,22 +493,27 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
                 return false;
             }
             let src_row = &src[src_off..src_off + src_row_len];
-            if let Some(ref mut rgba_row) = rgba {
-                if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                    return false;
-                }
-                if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                    return false;
-                }
+            let row_bytes: &[u8] = if direct_rows {
+                &src_row[..tight]
             } else {
-                let n = src_row_len.min(row.len());
-                row[..n].copy_from_slice(&src_row[..n]);
-            }
+                if let Some(ref mut rgba_row) = rgba {
+                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
+                        return false;
+                    }
+                    if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
+                        return false;
+                    }
+                } else {
+                    let n = src_row_len.min(row.len());
+                    row[..n].copy_from_slice(&src_row[..n]);
+                }
+                &row
+            };
             let dst_off = (y as usize).saturating_mul(bpr);
             if dst_off + tight > frame.len() {
                 return false;
             }
-            frame[dst_off..dst_off + tight].copy_from_slice(&row[..tight]);
+            frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
         }
         // One call per surviving run rather than one for the whole frame: the
         // mapper writes the bytes it is handed, so a skipped page has to be
@@ -1441,6 +1468,81 @@ mod tests {
             unskipped(10, 30, &[(5, 12), (16, 18), (28, 35)]),
             vec![(12, 16), (18, 28)]
         );
+    }
+
+    /// Every row must land at its own offset, with content that can tell rows
+    /// apart.
+    ///
+    /// The skip test below fills the frame with one repeated byte, so it proves
+    /// which *pages* were written and nothing at all about which row went
+    /// where: a writeback that repeated row 0 sixty-four times, or that shifted
+    /// every row by one, passes it unchanged. That is not hypothetical — a
+    /// BGRA8 row no longer passes through the conversion scratch buffer on its
+    /// way to the guest, so the source offset, the tight row length and the
+    /// destination stride are now read from three places that used to be two.
+    ///
+    /// Both storage shapes, because they place rows by different means, and a
+    /// non-BGRA format so the staged path is exercised beside the direct one.
+    #[test]
+    fn a_writeback_lands_every_row_at_its_own_offset() {
+        use crate::model::PAGE_SHIFT_X86;
+        const PAGE: u64 = 1 << PAGE_SHIFT_X86;
+        const W: u32 = 64;
+        const H: u32 = 64;
+        const BPR: usize = (W * 4) as usize;
+
+        for packed in [true, false] {
+            for format in [MTL_FORMAT_BGRA8_UNORM, pixel_format::MTL_FORMAT_RGBA8_UNORM] {
+                let mut state = DeviceState::new(DeviceId(2), PAGE_SHIFT_X86);
+                let mut host = FakeHost::new();
+                host.strict_linux_map = !packed;
+                let base_pfn = 0x40u32;
+                host.map_range((base_pfn as u64) << PAGE_SHIFT_X86, 8 * PAGE as usize, 0);
+                let order: Vec<u32> = if packed {
+                    (0..4).collect()
+                } else {
+                    vec![3, 2, 1, 0]
+                };
+                let entries: Vec<u32> = order
+                    .iter()
+                    .map(|i| ((base_pfn + i) << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID)
+                    .collect();
+                state.map_surface(4);
+                state.attach_mapping_internal(4, 0);
+                let m = state.mappings.get_mut(&4).unwrap();
+                m.mapping_internal = 1;
+                m.page_entries = entries;
+                assert!(state.set_mapping_geom(4, W, H, format));
+
+                // Row y is filled with the byte y in every channel, so a row
+                // that lands at the wrong offset is visible as the wrong value
+                // and a duplicated row is visible as a repeat. Channel order
+                // does not matter to that, which is what lets one frame test
+                // both formats.
+                let mut frame = vec![0u8; (W * H * 4) as usize];
+                for y in 0..H as usize {
+                    frame[y * BPR..(y + 1) * BPR].fill(y as u8);
+                }
+                assert!(write_bgra8_skipping(
+                    &mut state, &mut host, 4, &frame, W * 4, W, H, &[]
+                ));
+
+                for y in 0..H as usize {
+                    // Which guest page this row's first byte lives in, and where
+                    // in it, walking the same page list the mapping declares.
+                    let off = y * BPR;
+                    let gpa = ((base_pfn as u64 + order[off / PAGE as usize] as u64)
+                        << PAGE_SHIFT_X86)
+                        + (off as u64 % PAGE);
+                    let mut got = [0u8; 4];
+                    host.read_gpa(gpa, &mut got).unwrap();
+                    assert!(
+                        got.iter().all(|b| *b == y as u8),
+                        "packed={packed} fmt={format:#x} row {y} must read {y:#x}, got {got:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A writeback told to skip a page leaves that page exactly as the guest
