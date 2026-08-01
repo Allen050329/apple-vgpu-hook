@@ -1519,12 +1519,14 @@ const MAP_PAGES_SITES: &[(&str, usize, Marks, &str)] = &[
     ),
     (
         "runtime/metal_draw/vulkan.rs",
-        3,
+        1,
         Marks::ReadOnly,
-        "`task_gva_guest_runs`, `try_type11_sample_zero_copy` and \
-         `try_type5_sample_zero_copy` build `engine::GuestRun` spans the engine \
-         reads *out of* — vertex, storage and sampled sources uploaded to the \
-         GPU. Nothing writes back through them, and the GPU cannot: \
+        "`coalesce_pages_to_runs` — the single import for every guest-pages \
+         rail (`task_gva_guest_runs` for task-GVA windows, \
+         `mapping_window_guest_runs` for the type-11 and type-5 mapping \
+         windows). It builds `engine::GuestRun` spans the engine reads *out \
+         of* — vertex, storage and sampled sources uploaded to the GPU. \
+         Nothing writes back through them, and the GPU cannot: \
          `the_host_pointer_import_extension_is_never_requested` holds that the \
          one extension which would let it is never requested",
     ),

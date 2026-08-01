@@ -90,6 +90,37 @@ fn sampled_zero_copy_floor_separates_video_from_small_binds() {
     assert!(ZERO_COPY_BUFFER_MIN_BYTES < ZERO_COPY_SAMPLED_MIN_BYTES);
 }
 
+/// The window math the three sampled zero-copy rails now share.
+///
+/// Each rail used to carry its own copy, so each could have drifted alone. The
+/// two refusals are the ones that matter: a stride narrower than one tight row
+/// describes an image the rows do not fit in, and a stride that is not a whole
+/// number of texels has no `bufferRowLength` — that field counts texels, not
+/// bytes, so the copy would stride to the wrong place.
+#[test]
+#[cfg(feature = "backend-vulkan")]
+fn strided_window_extent_measures_padded_rows_and_refuses_unrepresentable_strides() {
+    // Tight rows: the extent is exactly the image, and no row length is needed.
+    assert_eq!(strided_window_extent(64, 32, 4, 256), Some((256 * 32, 0)));
+    // Padded rows: the extent stops after the last row's texels, because the
+    // trailing padding of the final row may not be mapped.
+    assert_eq!(
+        strided_window_extent(64, 32, 4, 320),
+        Some((320 * 31 + 256, 80))
+    );
+    // A single row has no padding to skip, whatever the stride says.
+    assert_eq!(strided_window_extent(64, 1, 4, 320), Some((256, 80)));
+    // Narrower than one tight row.
+    assert_eq!(strided_window_extent(64, 32, 4, 255), None);
+    // Not a whole number of texels.
+    assert_eq!(strided_window_extent(64, 32, 4, 258), None);
+    // Zero height has no last row to measure to.
+    assert_eq!(strided_window_extent(64, 0, 4, 256), None);
+    // Single-byte texels (the type-5 NV12 luma plane) take every stride.
+    assert_eq!(strided_window_extent(64, 4, 1, 64), Some((256, 0)));
+    assert_eq!(strided_window_extent(64, 4, 1, 96), Some((96 * 3 + 64, 96)));
+}
+
 #[test]
 #[cfg(feature = "backend-vulkan")]
 fn type11_zero_copy_declines_transient_host_mappings() {

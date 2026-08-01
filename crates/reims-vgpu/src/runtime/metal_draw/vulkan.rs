@@ -2090,7 +2090,6 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
     gva: u64,
     span: u64,
 ) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
-    use crate::backend::vulkan::engine;
     if !guest_run_alias_available(host) {
         return None;
     }
@@ -2113,16 +2112,38 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
     if gpas.len() as u64 != expect {
         return None;
     }
-    let head_off = gva % page;
+    coalesce_pages_to_runs(host, &gpas, page, gva % page, span)
+}
+
+/// Coalesce GPA-contiguous stretches of `window` into packed host-VA runs
+/// covering `span` bytes from `head_off` into the first page.
+///
+/// The single implementation of the walk every guest-pages rail needs: pick the
+/// longest stretch whose GPAs ascend by exactly one page, import it once, and
+/// take from it until `span` is met. `map_pages` hands back a direct RAMBlock
+/// alias, so the import is a lookup and `unmap` is a no-op.
+///
+/// `None` if any stretch fails to import, or if the window runs out before
+/// `span` — a partial gather would hand the GPU a short buffer, which is a
+/// wrong frame rather than a slow one.
+#[cfg(feature = "backend-vulkan")]
+fn coalesce_pages_to_runs<M: HostOps>(
+    host: &mut M,
+    window: &[u64],
+    page: u64,
+    head_off: u64,
+    span: u64,
+) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+    use crate::backend::vulkan::engine;
     let mut runs: Vec<engine::GuestRun> = Vec::new();
     let mut consumed = 0u64;
     let mut i = 0usize;
-    while i < gpas.len() && consumed < span {
+    while i < window.len() && consumed < span {
         let mut j = i + 1;
-        while j < gpas.len() && gpas[j] == gpas[i] + ((j - i) as u64) * page {
+        while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
             j += 1;
         }
-        let base = host.map_pages(&gpas[i..j], page as usize)? as u64;
+        let base = host.map_pages(&window[i..j], page as usize)? as u64;
         let start_in_run = if i == 0 { head_off } else { 0 };
         let avail = ((j - i) as u64) * page - start_in_run;
         let len = avail.min(span - consumed);
@@ -2133,10 +2154,64 @@ fn task_gva_guest_runs<M: HostMemory + HostOps>(
         consumed += len;
         i = j;
     }
-    if consumed != span {
+    (consumed == span).then_some(runs)
+}
+
+/// The byte extent of a `w × h` image at `bpr` bytes per row and `bpp` bytes per
+/// texel, and the `bufferRowLength` in texels the copy needs to stride the
+/// padding (0 when rows are tight).
+///
+/// `None` when the stride cannot describe the image: narrower than one tight
+/// row, or not a whole number of texels — `bufferRowLength` is a texel count, so
+/// a byte-granular stride has no representation. Padded strides otherwise ride
+/// the same rail. The extent stops after the last row's texels because trailing
+/// padding may not be mapped.
+#[cfg(feature = "backend-vulkan")]
+fn strided_window_extent(w: u32, h: u32, bpp: u64, bpr: u64) -> Option<(u64, u32)> {
+    let tight = (w as u64).checked_mul(bpp)?;
+    if bpr < tight || bpp == 0 || !bpr.is_multiple_of(bpp) {
         return None;
     }
-    Some(runs)
+    let span = bpr
+        .checked_mul(h.checked_sub(1)? as u64)?
+        .checked_add(tight)?;
+    let row_length_texels = if bpr == tight {
+        0
+    } else {
+        u32::try_from(bpr / bpp).ok()?
+    };
+    Some((span, row_length_texels))
+}
+
+/// Gather `span` bytes from `base_off` into mapping `mid`'s guest pages as host
+/// runs, landing any deferred writeback that aliases them first.
+///
+/// Shared by the type-11 and type-5 sampled rails, which reach the same pages
+/// through different window math. The flush is the coherence rule the CPU
+/// loaders obey: a resident-authoritative window covering this mapping must
+/// land before the GPU reads, or the gather sees the pre-Store bytes.
+#[cfg(feature = "backend-vulkan")]
+fn mapping_window_guest_runs<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    mid: u32,
+    base_off: u64,
+    span: u64,
+) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+    if !guest_run_alias_available(host) {
+        return None;
+    }
+    let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
+    let gpas = mapper::mapping_page_gpas(state, host, mid)?;
+    let page = state.page_size();
+    if (gpas.len() as u64).saturating_mul(page) < base_off.checked_add(span)? {
+        return None;
+    }
+    let first_page = (base_off / page) as usize;
+    let head_off = base_off % page;
+    let need_pages = (head_off + span).div_ceil(page) as usize;
+    let window = gpas.get(first_page..first_page + need_pages)?;
+    coalesce_pages_to_runs(host, window, page, head_off, span)
 }
 
 /// Cap on [`DeviceState::guest_run_memo`] entries (FIFO evict). Entries are a
@@ -2461,18 +2536,7 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if w == 0 || h == 0 {
         return None;
     }
-    let bpr = layout.row_stride;
-    let tight = (w as u64).checked_mul(bpp as u64)?;
-    // Padded strides ride the same rail: the buffer→image copy strides over
-    // the padding via `bufferRowLength` (texel units, so bpr must be a texel
-    // multiple). The window ends after the last row's texels — trailing
-    // padding may not be mapped.
-    if bpr < tight || bpr % bpp as u64 != 0 {
-        return None;
-    }
-    let span = bpr
-        .checked_mul(h.checked_sub(1)? as u64)?
-        .checked_add(tight)?;
+    let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, layout.row_stride)?;
     // The min-byte floor keeps small four-byte textures on the cheaper CPU
     // memo/cache path. Single-channel float LUTs have no CPU loader arm
     // (`texel_to_rgba8` returns `None`), so this native gather is their only
@@ -2484,11 +2548,6 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     if !guest_run_alias_available(host) {
         return None;
     }
-    let row_length_texels = if bpr == tight {
-        0
-    } else {
-        u32::try_from(bpr / bpp as u64).ok()?
-    };
     if tex.allocation_size != 0 && layout.offset.saturating_add(span) > tex.allocation_size {
         return None;
     }
@@ -2559,63 +2618,11 @@ fn try_type11_sample_zero_copy<M: HostMemory + HostOps>(
         let (base_off, bpr_u32, _span_end) = type11_sample_window(m, mid, w, h, format)?;
         (native, base_off, bpr_u32 as u64)
     };
-    let tight = (w as u64).checked_mul(RGBA8_BPP as u64)?;
-    if bpr < tight || bpr % RGBA8_BPP as u64 != 0 {
-        return None;
-    }
-    let span = bpr
-        .checked_mul((h - 1) as u64)
-        .and_then(|v| v.checked_add(tight))?;
+    let (span, row_length_texels) = strided_window_extent(w, h, RGBA8_BPP as u64, bpr)?;
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
-    if !guest_run_alias_available(host) {
-        return None;
-    }
-    // Land any resident-authoritative deferred window before the GPU reads
-    // the pages (same coherence rule as paint_mapping / the linear rail).
-    {
-        let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
-    };
-    let gpas = { mapper::mapping_page_gpas(state, host, mid) }?;
-    let page = state.page_size();
-    let window_end = base_off.checked_add(span)?;
-    if (gpas.len() as u64).saturating_mul(page) < window_end {
-        return None;
-    }
-    // Coalesce the pages covering [base_off, base_off+span) into packed host
-    // runs (direct RAMBlock aliases from map_pages; unmap is a no-op).
-    let first_page = (base_off / page) as usize;
-    let head_off = base_off % page;
-    let need_pages = (head_off + span).div_ceil(page) as usize;
-    let window = gpas.get(first_page..first_page + need_pages)?;
-    let mut runs: Vec<engine::GuestRun> = Vec::new();
-    let mut consumed = 0u64;
-    let mut i = 0usize;
-    while i < window.len() && consumed < span {
-        let mut j = i + 1;
-        while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
-            j += 1;
-        }
-        let base = { host.map_pages(&window[i..j], page as usize) }? as u64;
-        let start_in_run = if i == 0 { head_off } else { 0 };
-        let avail = ((j - i) as u64) * page - start_in_run;
-        let len = avail.min(span - consumed);
-        runs.push(engine::GuestRun {
-            host_ptr: (base + start_in_run) as usize,
-            len,
-        });
-        consumed += len;
-        i = j;
-    }
-    if consumed != span {
-        return None;
-    }
-    let row_length_texels = if bpr == tight {
-        0
-    } else {
-        u32::try_from(bpr / RGBA8_BPP as u64).ok()?
-    };
+    let runs = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
@@ -2684,59 +2691,11 @@ fn try_type5_sample_zero_copy<M: HostMemory + HostOps>(
         }
         (native, bpp, base_off, bpr_u32 as u64)
     };
-    let tight = (w as u64).checked_mul(bpp as u64)?;
-    if bpr < tight || bpr % bpp as u64 != 0 {
-        return None;
-    }
-    let span = bpr.checked_mul((h - 1) as u64)?.checked_add(tight)?;
+    let (span, row_length_texels) = strided_window_extent(w, h, bpp as u64, bpr)?;
     if span < ZERO_COPY_SAMPLED_MIN_BYTES {
         return None;
     }
-    if !guest_run_alias_available(host) {
-        return None;
-    }
-    // Land any resident-authoritative deferred window before the GPU reads the
-    // pages (same coherence rule as the CPU loader / the type-11 rail).
-    let _ = crate::runtime::storage_flush::flush_intersecting(state, host, mid, 0, u64::MAX);
-    let gpas = mapper::mapping_page_gpas(state, host, mid)?;
-    let page = state.page_size();
-    let window_end = base_off.checked_add(span)?;
-    if (gpas.len() as u64).saturating_mul(page) < window_end {
-        return None;
-    }
-    // Coalesce the pages covering [base_off, base_off+span) into packed host
-    // runs (direct RAMBlock aliases from map_pages; unmap is a no-op).
-    let first_page = (base_off / page) as usize;
-    let head_off = base_off % page;
-    let need_pages = (head_off + span).div_ceil(page) as usize;
-    let window = gpas.get(first_page..first_page + need_pages)?;
-    let mut runs: Vec<engine::GuestRun> = Vec::new();
-    let mut consumed = 0u64;
-    let mut i = 0usize;
-    while i < window.len() && consumed < span {
-        let mut j = i + 1;
-        while j < window.len() && window[j] == window[i] + ((j - i) as u64) * page {
-            j += 1;
-        }
-        let base = host.map_pages(&window[i..j], page as usize)? as u64;
-        let start_in_run = if i == 0 { head_off } else { 0 };
-        let avail = ((j - i) as u64) * page - start_in_run;
-        let len = avail.min(span - consumed);
-        runs.push(engine::GuestRun {
-            host_ptr: (base + start_in_run) as usize,
-            len,
-        });
-        consumed += len;
-        i = j;
-    }
-    if consumed != span {
-        return None;
-    }
-    let row_length_texels = if bpr == tight {
-        0
-    } else {
-        u32::try_from(bpr / bpp as u64).ok()?
-    };
+    let runs = mapping_window_guest_runs(state, host, mid, base_off, span)?;
     Some(SampledSourceRequest::GuestRuns(
         engine::GuestRunSource {
             runs: std::sync::Arc::new(runs),
