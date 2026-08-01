@@ -511,40 +511,64 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         else {
             return false;
         };
-        let mut frame = vec![0u8; frame_len];
-        for y in 0..mh {
-            let src_off = (y as usize) * (src_stride as usize);
-            let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
-            if src_off + src_row_len > src.len() {
-                return false;
-            }
-            let src_row = &src[src_off..src_off + src_row_len];
-            let row_bytes: &[u8] = if direct_rows {
-                &src_row[..tight]
-            } else {
-                if let Some(ref mut rgba_row) = rgba {
-                    if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
-                        return false;
-                    }
-                    if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
-                        return false;
-                    }
-                } else {
-                    let n = src_row_len.min(row.len());
-                    row[..n].copy_from_slice(&src_row[..n]);
+        // The staged buffer is `src` itself whenever the layout it would be
+        // built into is the layout `src` already has: no conversion (the rows go
+        // through untouched), the mapping's row pitch equal to the packed row
+        // length (so there is no inter-row padding to zero-fill), and a source
+        // pitch equal to it too (so the rows are already consecutive). Under all
+        // three, byte `i` of the staged frame is byte `i` of `src` for every
+        // `i < frame_len`, and building it copies 8 MB to produce a slice we are
+        // holding.
+        //
+        // Each condition is load-bearing rather than defensive. Drop the pitch
+        // equality and the gaps between rows — which the guest's allocator may
+        // have given to something else — stop being zeroed and start carrying
+        // whatever `src` has at those offsets. Drop `direct_rows` and the rows
+        // are supposed to be converted on the way through.
+        let staged: std::borrow::Cow<'_, [u8]> = if direct_rows
+            && bpr == tight
+            && src_stride as usize == tight
+            && src.len() >= frame_len
+        {
+            std::borrow::Cow::Borrowed(&src[..frame_len])
+        } else {
+            let mut frame = vec![0u8; frame_len];
+            for y in 0..mh {
+                let src_off = (y as usize) * (src_stride as usize);
+                let src_row_len = (mw as usize) * (RGBA8_BPP as usize);
+                if src_off + src_row_len > src.len() {
+                    return false;
                 }
-                &row
-            };
-            let dst_off = (y as usize).saturating_mul(bpr);
-            if dst_off + tight > frame.len() {
-                return false;
+                let src_row = &src[src_off..src_off + src_row_len];
+                let row_bytes: &[u8] = if direct_rows {
+                    &src_row[..tight]
+                } else {
+                    if let Some(ref mut rgba_row) = rgba {
+                        if !convert_row_to_rgba8(MTL_FORMAT_BGRA8_UNORM, src_row, mw, rgba_row) {
+                            return false;
+                        }
+                        if !convert_rgba8_to_row(format, rgba_row, mw, &mut row) {
+                            return false;
+                        }
+                    } else {
+                        let n = src_row_len.min(row.len());
+                        row[..n].copy_from_slice(&src_row[..n]);
+                    }
+                    &row
+                };
+                let dst_off = (y as usize).saturating_mul(bpr);
+                if dst_off + tight > frame.len() {
+                    return false;
+                }
+                frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
             }
-            frame[dst_off..dst_off + tight].copy_from_slice(&row_bytes[..tight]);
-        }
-        note_surface_write_phase(
-            SurfaceWritePhase::Stage,
-            stage_started.elapsed().as_micros() as u64,
-        );
+            note_surface_write_phase(
+                SurfaceWritePhase::Stage,
+                stage_started.elapsed().as_micros() as u64,
+            );
+            std::borrow::Cow::Owned(frame)
+        };
+        let frame: &[u8] = staged.as_ref();
         let land_started = std::time::Instant::now();
         // One call per surviving run rather than one for the whole frame: the
         // mapper writes the bytes it is handed, so a skipped page has to be
@@ -618,16 +642,7 @@ pub fn write_bgra8_skipping<M: HostMemory + HostOps>(
         return true;
     }
     let cache_started = std::time::Instant::now();
-    let mut cache = vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
-    let row_src = width.saturating_mul(RGBA8_BPP) as usize;
-    for y in 0..mh as usize {
-        let so = y * (src_stride as usize);
-        let doff = y * row_src;
-        if so + row_src <= src.len() && doff + row_src <= cache.len() {
-            cache[doff..doff + row_src].copy_from_slice(&src[so..so + row_src]);
-        }
-    }
-    crate::runtime::surface_cache::store(state, mapping_id, mw, mh, cache);
+    crate::runtime::surface_cache::store_rows(state, mapping_id, mw, mh, src, src_stride);
     note_surface_write_phase(
         SurfaceWritePhase::Cache,
         cache_started.elapsed().as_micros() as u64,

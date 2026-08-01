@@ -1913,6 +1913,123 @@ fn the_readback_split_divides_a_round_trip_from_the_bytes_it_carried() {
     assert!(c.take_readback_split().is_none(), "the window must reset");
 }
 
+/// A writeback must not copy a frame in order to hand back the frame it copied.
+///
+/// The fragmented landing path staged every row into a whole-frame buffer before
+/// handing runs to the mapper. When the mapping's row pitch is the packed row
+/// length and no conversion is owed, that buffer is byte-for-byte the source it
+/// was built from — an 8.29 MB allocation and copy, 95 times a second on the
+/// composite surface, to produce a slice already in hand.
+///
+/// Both halves are asserted, because eliding a copy is only correct if the bytes
+/// are the same: the census must show a fragmented landing with no staging pass,
+/// **and** the guest's pages must hold exactly what was written.
+#[test]
+fn a_fragmented_writeback_stages_nothing_when_the_staged_frame_is_the_source() {
+    use crate::contract::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+    use crate::contract::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    use crate::runtime::mapping_write::write_bgra8;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    // Large enough to span several guest pages: a frame that fits in one page is
+    // contiguous by construction and would never reach the path under test.
+    let (w, h) = (256u32, 64u32);
+    let stride = w * 4;
+    let need = (stride as usize) * (h as usize);
+    let page_size = 1u64 << PAGE_SHIFT_ARM64E;
+    let pages = (need as u64).div_ceil(page_size) as usize;
+    // Deliberately non-consecutive guest frames, so the mapping cannot resolve
+    // to one packed host run and the fragmented path is the one under test.
+    let mut entries = Vec::with_capacity(pages);
+    for i in 0..pages {
+        let pfn = 0x300u32 + (i as u32) * 4;
+        host.map_range((pfn as u64) << PAGE_SHIFT_ARM64E, page_size as usize, 0);
+        entries.push((pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID);
+    }
+    assert!(state.map_surface(9));
+    {
+        let m = state.mappings.get_mut(&9).unwrap();
+        m.mapped = true;
+        m.mapping_internal = 9;
+        m.page_entries = entries;
+    }
+    assert!(state.set_mapping_geom(9, w, h, MTL_FORMAT_BGRA8_UNORM));
+
+    // A gradient rather than a constant: a staging bug that lands the wrong row
+    // is invisible against a frame of identical bytes.
+    let frame: Vec<u8> = (0..need).map(|i| (i % 251) as u8).collect();
+    // Drain whatever earlier tests in this binary left in the shared census.
+    let _ = super::SURFACE_WRITE.take(0);
+    assert!(write_bgra8(&mut state, &mut host, 9, &frame, stride, w, h));
+
+    let line = super::SURFACE_WRITE
+        .take(1_000)
+        .expect("a writeback must report");
+    assert!(
+        line.contains("contig=0 frag=1"),
+        "the fragmented path is the one under test: {line}"
+    );
+    assert!(
+        line.contains("stage_us=0 stage=0"),
+        "a staged frame identical to its source must not be built: {line}"
+    );
+    assert!(
+        line.contains("land=1"),
+        "the bytes must still reach the guest: {line}"
+    );
+
+    let landed = crate::runtime::surface_cache::get(&state, 9, w, h)
+        .expect("the writeback publishes its own frame");
+    assert_eq!(landed, &frame[..], "the elided copy must change no byte");
+}
+
+/// A cache entry that is replaced every frame must not be reallocated every
+/// frame.
+///
+/// The host-side duplicate is a fresh multi-megabyte `Vec` per writeback, and
+/// the allocation is the expensive half rather than the copy: the pages come
+/// back untouched and the fill faults every one of them in, then the buffer is
+/// dropped and the next flush repeats it. Measured at 1.21 ms per flush against
+/// 0.72 ms for landing the whole frame in the guest's pages.
+///
+/// The second assertion is the one that makes reuse safe rather than merely
+/// cheap. The `Arc` exists so a deferred window can hold the exact frame it
+/// armed on; writing through it would rewrite that window's pixels underneath
+/// it, which is a frame landing in the wrong layer.
+#[test]
+fn the_surface_cache_reuses_its_buffer_but_never_one_someone_else_is_holding() {
+    use crate::runtime::surface_cache;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (w, h) = (16u32, 8u32);
+    let need = (w as usize) * (h as usize) * 4;
+
+    surface_cache::store_rows(&mut state, 4, w, h, &vec![0x11u8; need], w * 4);
+    let first = surface_cache::get(&state, 4, w, h).unwrap().as_ptr();
+
+    // Nothing else holds the frame: the entry's own allocation is rewritten.
+    surface_cache::store_rows(&mut state, 4, w, h, &vec![0x22u8; need], w * 4);
+    let second = surface_cache::get(&state, 4, w, h).unwrap();
+    assert_eq!(second.as_ptr(), first, "an unheld buffer must be reused");
+    assert_eq!(second[0], 0x22, "and must hold the new frame");
+
+    // A window armed on this allocation is exactly what the `Arc` is for.
+    let held = state.host_surfaces.get(&4).unwrap().bgra.clone();
+    surface_cache::store_rows(&mut state, 4, w, h, &vec![0x33u8; need], w * 4);
+    assert_eq!(
+        held[0], 0x22,
+        "a frame someone else is holding must not be rewritten"
+    );
+    let third = surface_cache::get(&state, 4, w, h).unwrap();
+    assert_eq!(third[0], 0x33, "and the entry must still take the new frame");
+    assert_ne!(
+        third.as_ptr(),
+        held.as_ptr(),
+        "which means it had to allocate"
+    );
+}
+
 /// The largest phase of the largest rail is three full-frame passes under one
 /// name, and a total cannot say which of them it is.
 ///
