@@ -1871,6 +1871,22 @@ fn finish_stream<M: HostMemory + HostOps>(
                         // break so we do not composite later draws on a missing seed.
                         out.metal_draws_ok += 1;
                         if !do_writeback && !unified {
+                            // Every draw after this one is dropped, so say so.
+                            // The two sibling break arms below report through
+                            // `note_draw_encode_fail`; this one encoded `Ok` and
+                            // so has no `EncodeStatus` to carry a reason, which
+                            // is exactly how it stayed silent while losing the
+                            // rest of the packet.
+                            crate::observe::Emit::decline(
+                                "draw_chain_abandon",
+                                &ChainAbandonDecline {
+                                    index: di,
+                                    total: draw_list.len(),
+                                    pipeline_ref: pd.pipeline_ref,
+                                },
+                            )
+                            .field("task", task_id)
+                            .fail_once(pd.pipeline_ref as u64);
                             // Land any earlier chain image before abandoning —
                             // same as the hard-fail path below. Dropping the
                             // chain left dual-mid pages black while gen advanced.
@@ -1947,6 +1963,38 @@ fn finish_stream<M: HostMemory + HostOps>(
         }
     }
 }
+
+/// Why a draw list stopped early while every draw in it had encoded `Ok`.
+///
+/// This is the one abandon path that no counter can see. `metal_draws_fail`
+/// stays 0, so `packet_failed` is false and even the packet-level
+/// `exec_indirect2` line is suppressed; the draws after this point are dropped
+/// with the packet still reported as successful.
+#[derive(Debug)]
+struct ChainAbandonDecline {
+    /// Index of the record that returned no chain image, and the list length.
+    /// A break at 0 of 8 loses a whole composite; a break at 7 of 8 loses one
+    /// draw, and the two are not the same defect.
+    index: usize,
+    total: usize,
+    pipeline_ref: u32,
+}
+
+impl crate::observe::Decline for ChainAbandonDecline {
+    fn slug(&self) -> &'static str {
+        "draw_chain_abandoned_without_color0"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("di", format!("{}/{}", self.index, self.total)),
+            ("lost", (self.total - self.index - 1).to_string()),
+            ("pipe", self.pipeline_ref.to_string()),
+        ]
+    }
+}
+
+crate::observe::decline_display!(ChainAbandonDecline);
 
 /// One-shot (per `pipeline_ref` x reason) always-on line for a failed draw
 /// encode. `exec_indirect2 draws_fail=N` collapses every cause into one
@@ -2248,6 +2296,42 @@ mod tests {
         PASS_COLOR_ATTACH_STRIDE, PASS_LOAD_ACTION_CLEAR, PASS_STORE_ACTION_STORE,
     };
     use crate::runtime::host::FakeHost;
+
+    /// The abandon line must say how much guest work it dropped.
+    ///
+    /// This break was silent, and the counter that would have caught it
+    /// (`metal_draws_fail`) stays 0 on this path because the draw encoded
+    /// `Ok` — so `packet_failed` is false and the packet-level line is
+    /// suppressed too. The whole value of the line is the amount lost:
+    /// breaking at 0 of 8 drops a whole composite, breaking at 7 of 8 drops
+    /// one draw, and `di` alone does not distinguish them at a glance.
+    #[test]
+    fn chain_abandon_reports_how_many_draws_were_lost() {
+        let render = |index, total| {
+            crate::observe::Emit::decline(
+                "draw_chain_abandon",
+                &ChainAbandonDecline {
+                    index,
+                    total,
+                    pipeline_ref: 0x41,
+                },
+            )
+            .render()
+        };
+
+        let first_of_eight = render(0, 8);
+        assert!(
+            first_of_eight.contains("reason=draw_chain_abandoned_without_color0"),
+            "{first_of_eight}"
+        );
+        assert!(first_of_eight.contains("di=0/8"), "{first_of_eight}");
+        assert!(first_of_eight.contains("lost=7"), "{first_of_eight}");
+        assert!(first_of_eight.contains("pipe=65"), "{first_of_eight}");
+
+        // The last record of a list abandons nothing after it. Reporting a
+        // loss here would send a reader hunting for draws that never existed.
+        assert!(render(7, 8).contains("lost=0"), "{}", render(7, 8));
+    }
 
     #[test]
     fn short_payload_noop() {
