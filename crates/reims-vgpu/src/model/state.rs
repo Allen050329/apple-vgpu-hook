@@ -1607,50 +1607,19 @@ pub struct GuestLinearMemo {
 /// stalls) and blocks QEMU's main loop (delayed host display refresh). The
 /// opaque `drain_tranche_us` outlier is attributed here so a hitch can be read as
 /// compile/convert/wait/readback-bound without fragile per-draw log correlation.
-/// Counters for the two content memos whose only observable effect is a
-/// skipped re-read: the guest-run signature memo (`run_memo_*`) and the
-/// zero-copy flush signature memo (`zc_flush_*`).
+/// Counters for the zero-copy flush signature memo (`zc_flush_*`), whose only
+/// observable effect is a skipped re-read.
 ///
 /// These name product behavior, not cost: a memo that stops hitting silently
-/// doubles the work per bind, and `stale` is the memo serving bytes the guest
-/// has since rewritten. The tests for both paths assert on these.
+/// doubles the work per bind. The tests for that path assert on these.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MemoCounters {
-    pub run_memo_hit: u64,
-    pub run_memo_miss: u64,
-    pub run_memo_stale: u64,
     /// Deferred windows a flush-signature check found already landed.
     pub zc_flush_hits: u64,
     /// Binds the signature memo answered without walking the window map.
     pub zc_flush_skip: u64,
     /// Memo answers invalidated by an intervening arm/disarm.
     pub zc_flush_stale: u64,
-}
-
-/// One host-VA run of a memoized guest span (model mirror of the engine's
-/// `GuestRun` so [`DeviceState`] stays backend-independent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestRunSpan {
-    pub host_ptr: usize,
-    pub len: u64,
-}
-
-/// Memoized task-GVA→host-run resolution for draw-time zero-copy binds.
-///
-/// The per-draw page-table walk (`task_gva_guest_runs`) was the dominant
-/// setup cost (~68 µs/draw under Safari scroll — walking ~60 PT leaves per
-/// 260 KB buffer bind, ~5 binds/draw). The resolved runs are stable until the
-/// guest changes the task page table, so they carry **exactly the
-/// `gva_host_views` invalidation contract**: retired on UnmapMemory /
-/// MapMemory2 overlap, task redefine, and task delete. Entries own no OS
-/// resources (product-Linux `map_pages` is a RAMBlock alias), so retirement
-/// is a plain drop.
-#[derive(Debug, Clone)]
-pub struct GuestRunMemoEntry {
-    pub task_id: u32,
-    pub gva: u64,
-    pub length: u64,
-    pub runs: Arc<Vec<GuestRunSpan>>,
 }
 
 /// A map of deferred writeback windows whose page sets feed the union index
@@ -1965,12 +1934,6 @@ pub struct DeviceState {
     pub retired_gva_windows: Vec<(u64, GvaDeferredEntry)>,
     /// Content-memo hit/miss/stale counters. See [`MemoCounters`].
     pub tranche: MemoCounters,
-    /// Draw-time zero-copy run memo. See [`GuestRunMemoEntry`] for the
-    /// invalidation contract (mirrors `gva_host_views` exactly). A `VecDeque`
-    /// so the FIFO cap evict is an O(1) `pop_front` rather than a `Vec`
-    /// `remove(0)` that shifts all `GUEST_RUN_MEMO_CAP` (512) entries on every
-    /// miss once full.
-    pub guest_run_memo: std::collections::VecDeque<GuestRunMemoEntry>,
     /// Total stale views the reuse verify caught (fail-logged as
     /// `gva_view_stale`; the view self-heals via retire + rebuild).
     pub view_stale_reads: u64,
@@ -1983,8 +1946,8 @@ pub struct DeviceState {
     /// the cached `gpa_pages` against the current deferred windows **without a PT
     /// walk** (the FFI page translate is the expensive part) — only a real
     /// intersection falls back to the full walk. The pages stay valid until the
-    /// task PT remaps the gva range, which invalidates the entry exactly where
-    /// `guest_run_memo` is. A 1-in-64 sampled full walk ([`flush_verify_ctr`])
+    /// task PT remaps the gva range, which is where the entry is invalidated.
+    /// A 1-in-64 sampled full walk ([`flush_verify_ctr`])
     /// self-heals a missed PT remap. Only fully-probed spans are cached (a
     /// strided walk's page set is incomplete, so it is never stored).
     pub flush_nohit_memo: std::collections::HashMap<(u32, u64, u64), (u64, Vec<u64>)>,
@@ -2094,7 +2057,6 @@ impl DeviceState {
             type11_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             tranche: MemoCounters::default(),
-            guest_run_memo: std::collections::VecDeque::new(),
             view_stale_reads: 0,
             flush_nohit_memo: std::collections::HashMap::new(),
             flush_verify_ctr: 0,
@@ -2281,7 +2243,6 @@ impl DeviceState {
         views.extend(self.gva_host_views.drain(..).filter_map(|view| {
             (view.ptr != 0 && view.ptr_len != 0).then_some((view.ptr, view.ptr_len))
         }));
-        self.guest_run_memo.clear();
         self.flush_nohit_memo.clear();
         views
     }
@@ -2603,7 +2564,6 @@ impl DeviceState {
                 i += 1;
             }
         }
-        self.guest_run_memo.retain(|e| e.task_id != task_id);
         self.flush_nohit_memo.retain(|&(t, _, _), _| t != task_id);
     }
 

@@ -4046,194 +4046,56 @@ fn texture_ref_cache_geom_mismatch_does_not_hit_get_texture() {
     assert!(crate::runtime::surface_cache::get(&state, tex_ref, 1920, 1152).is_none());
 }
 
-/// Slicing memoized whole-backing runs must honor offsets that skip whole
-/// runs, split within a run, and cross run boundaries; an over-long slice
-/// fails closed.
-#[test]
-#[cfg(feature = "backend-vulkan")]
-fn slice_runs_to_engine_crosses_run_boundaries() {
-    use crate::model::GuestRunSpan;
-    let spans = [
-        GuestRunSpan {
-            host_ptr: 0x1000,
-            len: 0x100,
-        },
-        GuestRunSpan {
-            host_ptr: 0x9000,
-            len: 0x80,
-        },
-        GuestRunSpan {
-            host_ptr: 0x2_0000,
-            len: 0x200,
-        },
-    ];
-    // Slice inside the first run.
-    let s = slice_runs_to_engine(&spans, 0x10, 0x20).unwrap();
-    assert_eq!(s.len(), 1);
-    assert_eq!((s[0].host_ptr, s[0].len), (0x1010, 0x20));
-    // Slice crossing run 1 → run 2 → into run 3.
-    let s = slice_runs_to_engine(&spans, 0xf0, 0x100).unwrap();
-    assert_eq!(s.len(), 3);
-    assert_eq!((s[0].host_ptr, s[0].len), (0x10f0, 0x10));
-    assert_eq!((s[1].host_ptr, s[1].len), (0x9000, 0x80));
-    assert_eq!((s[2].host_ptr, s[2].len), (0x2_0000, 0x70));
-    // Offset skipping the first two runs entirely.
-    let s = slice_runs_to_engine(&spans, 0x180, 0x200).unwrap();
-    assert_eq!(s.len(), 1);
-    assert_eq!((s[0].host_ptr, s[0].len), (0x2_0000, 0x200));
-    // Over-long slice fails closed.
-    assert!(slice_runs_to_engine(&spans, 0x180, 0x201).is_none());
-    assert!(slice_runs_to_engine(&spans, 0, 0).is_none());
-}
-
-/// A memo entry whose range no longer walks is never served, and the
-/// Unmap-overlap retirement drops exactly the aliasing entry.
-///
-/// This test used to assert the opposite of its first half — that a hit
-/// returns the cached Arc "without walking the page table", demonstrated by
-/// giving the fixture a task with **no page table at all** and requiring the
-/// cached runs back anyway. That is precisely the state in which the cached
-/// host pointers must not be handed to the GPU: there is no longer anything at
-/// that address, so the pointers alias whatever the host reused. The property
-/// is now stated the other way round, and the fixture keeps its
-/// page-table-less task because that is the case worth pinning.
-#[test]
-#[cfg(feature = "backend-vulkan")]
-fn guest_run_memo_never_serves_an_entry_whose_range_no_longer_walks() {
-    use crate::model::{GuestRunMemoEntry, GuestRunSpan};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    host.stable_map_pages = true;
-    let runs = std::sync::Arc::new(vec![GuestRunSpan {
-        host_ptr: 0xabc000,
-        len: 0x40000,
-    }]);
-    state.guest_run_memo.push_back(GuestRunMemoEntry {
-        task_id: 3,
-        gva: 0x50_0000,
-        length: 0x40000,
-        runs: runs.clone(),
-    });
-    // Task 3 has no page table, so the verify walk finds nothing. The entry is
-    // retired rather than served, and the caller falls back to the CPU loader.
-    assert!(guest_runs_memoized(&mut state, &mut host, 3, 0x50_0000, 0x40000).is_none());
-    assert_eq!(state.tranche.run_memo_hit, 1);
-    assert_eq!(state.tranche.run_memo_stale, 1);
-    assert!(state.guest_run_memo.is_empty());
-
-    // Re-file it and check the retirement contract independently of the verify.
-    state.guest_run_memo.push_back(GuestRunMemoEntry {
-        task_id: 3,
-        gva: 0x50_0000,
-        length: 0x40000,
-        runs,
-    });
-    crate::runtime::gva_view::retire_gva_views_overlapping(&mut state, 3, 0x60_0000, 0x1000);
-    assert_eq!(
-        state.guest_run_memo.len(),
-        1,
-        "a disjoint unmap must not retire this entry"
-    );
-    crate::runtime::gva_view::retire_gva_views_overlapping(&mut state, 3, 0x52_0000, 0x1000);
-    assert!(state.guest_run_memo.is_empty());
-}
-
-/// A cached guest-run host pointer is only valid when the host has declared
+/// A guest-run host pointer is only valid when the host has declared
 /// `map_pages` views stable. Arm64 MMIO remap views are transient, so the
-/// runtime must decline before using even a memoized span.
-#[test]
-#[cfg(feature = "backend-vulkan")]
-fn guest_run_memo_declines_on_unstable_host_mappings() {
-    use crate::model::{GuestRunMemoEntry, GuestRunSpan};
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    state.guest_run_memo.push_back(GuestRunMemoEntry {
-        task_id: 3,
-        gva: 0x50_0000,
-        length: 0x40000,
-        runs: std::sync::Arc::new(vec![GuestRunSpan {
-            host_ptr: 0xabc000,
-            len: 0x40000,
-        }]),
-    });
-
-    assert!(guest_runs_memoized(&mut state, &mut host, 3, 0x50_0000, 0x40000).is_none());
-    assert_eq!(state.tranche.run_memo_hit, 0);
-    assert_eq!(state.tranche.run_memo_miss, 0);
-}
-
-/// The staleness verify runs on EVERY hit: a PT rewire the notify hooks missed
-/// is detected on the very next bind, fail-logged, self-heals the entry to the
-/// fresh runs, and counts as `rmemo_stale`; a dead span (walk no longer
-/// resolves) retires the entry.
+/// runtime must decline to produce runs at all rather than hand the engine a
+/// pointer whose view can be released before the submission gathers from it.
 ///
-/// The counter manipulation this test used to need — `run_memo_hit = 63` to
-/// land the next hit on a multiple of 64 — is gone with the sampling, and its
-/// absence is the assertion: the rewire is caught on the first bind after it
-/// happens, not up to sixty-four binds later.
+/// The two arms differ **only** in `stable_map_pages`, so the walkable arm is
+/// the control: without it this would pass on a build that declined every span
+/// for some unrelated reason, which is exactly how a decline test goes hollow.
 #[test]
 #[cfg(feature = "backend-vulkan")]
-fn guest_run_memo_stale_probe_detects_pt_rewire() {
+fn guest_runs_decline_on_unstable_host_mappings() {
     use crate::contract::endian::st32;
     use crate::contract::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
     let page_shift = crate::model::PAGE_SHIFT_X86;
     let page = 1u64 << page_shift;
-    let mut host = FakeHost::new();
-    host.strict_linux_map = true;
-    host.stable_map_pages = true;
-    let dir_gpa = 2u64 << page_shift;
-    let root_gpa = 3u64 << page_shift;
-    let data0 = 4u64 << page_shift;
-    let data1 = 10u64 << page_shift;
-    host.map_range(dir_gpa, page as usize, 0);
-    host.map_range(root_gpa, page as usize, 0);
-    host.map_range(data0, page as usize, 0);
-    host.map_range(data1, page as usize, 0);
-    let mut d = [0u8; 8];
-    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
-    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
-    host.write_gpa(dir_gpa, &d).unwrap();
-    let mut pte = [0u8; 4];
-    st32(&mut pte, 4);
-    host.write_gpa(root_gpa, &pte).unwrap();
-
-    let mut state = DeviceState::new(DeviceId(1), page_shift);
-    assert!(state.define_task(1, page, 2));
     let gva = 8u64;
-    // Miss → walk → entry memoized against data0.
-    let first = guest_runs_memoized(&mut state, &mut host, 1, gva, 16).unwrap();
-    assert_eq!(state.tranche.run_memo_miss, 1);
-    let ptr0 = host.map_pages(&[data0], page as usize).unwrap() + gva as usize;
-    assert_eq!(first[0].host_ptr, ptr0);
 
-    // Rewire the PTE to data1 with no Unmap notify. The very next bind must
-    // catch it — no counter is nudged to make the verify happen.
-    st32(&mut pte, 10);
-    host.write_gpa(root_gpa, &pte).unwrap();
-    let healed = guest_runs_memoized(&mut state, &mut host, 1, gva, 16).unwrap();
-    assert_eq!(
-        state.tranche.run_memo_stale, 1,
-        "probe must flag the rewire"
-    );
-    let ptr1 = host.map_pages(&[data1], page as usize).unwrap() + gva as usize;
-    assert_eq!(
-        healed[0].host_ptr, ptr1,
-        "entry must self-heal to fresh runs"
-    );
-    // A healed entry whose range has not moved since keeps serving the same
-    // Arc, so the verify is a check and not a rebuild.
-    let again = guest_runs_memoized(&mut state, &mut host, 1, gva, 16).unwrap();
-    assert!(std::sync::Arc::ptr_eq(&again, &healed));
+    // A task whose page table really does resolve `[gva, gva+16)` onto `data0`.
+    let walkable = |stable: bool| -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
+        let mut host = FakeHost::new();
+        host.strict_linux_map = true;
+        host.stable_map_pages = stable;
+        let (dir_gpa, root_gpa, data0) = (2u64 << page_shift, 3u64 << page_shift, 4u64 << page_shift);
+        for gpa in [dir_gpa, root_gpa, data0] {
+            host.map_range(gpa, page as usize, 0);
+        }
+        let mut d = [0u8; 8];
+        st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+        st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(dir_gpa, &d).unwrap();
+        let mut pte = [0u8; 4];
+        st32(&mut pte, 4);
+        host.write_gpa(root_gpa, &pte).unwrap();
 
-    // Dead span: PTE cleared to an unmapped page → the verify walks None →
-    // entry retired, caller falls back.
-    st32(&mut pte, 0x7fff);
-    host.write_gpa(root_gpa, &pte).unwrap();
-    assert!(guest_runs_memoized(&mut state, &mut host, 1, gva, 16).is_none());
-    assert_eq!(state.tranche.run_memo_stale, 2);
-    assert!(state.guest_run_memo.is_empty());
+        let mut state = DeviceState::new(DeviceId(1), page_shift);
+        assert!(state.define_task(1, page, 2));
+        task_gva_guest_runs(&state, &mut host, 1, gva, 16)
+    };
+
+    assert!(
+        walkable(true).is_some_and(|runs| !runs.is_empty()),
+        "control: a host promising a stable alias resolves this span"
+    );
+    assert!(
+        walkable(false).is_none(),
+        "the same span must yield no runs when the host will not promise the \
+         alias outlives the submission that gathers from it"
+    );
 }
-
 
 /// The synchronous GVA Store's write must be bounded to the pages the command
 /// named, and that set has to be taken before the GPU round trip.

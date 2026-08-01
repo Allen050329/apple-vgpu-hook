@@ -108,10 +108,6 @@ pub fn retire_gva_views_overlapping(
             i += 1;
         }
     }
-    // The draw-time guest-run memo aliases the same task PT — same lifecycle.
-    state.guest_run_memo.retain(|e| {
-        !(task_matches(e.task_id, task_id) && ranges_overlap(e.gva, e.length, gva, length))
-    });
     // The flush no-intersection memo is keyed by the same (task, gva, span) and
     // caches a PT-dependent walk result — drop entries whose gva range this
     // remap invalidates (else a bind could skip the flush after its pages moved

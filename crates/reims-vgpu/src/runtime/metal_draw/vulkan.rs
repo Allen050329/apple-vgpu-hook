@@ -1934,9 +1934,10 @@ const ZERO_COPY_BUFFER_MIN_BYTES: u64 = 16 * 1024;
 /// Does this host promise a guest-page alias that stays valid indefinitely?
 ///
 /// Every guest-run producer below needs that promise, and needs it for a reason
-/// that survived the removal of the host-pointer import: the runs are memoized
-/// in `DeviceState::guest_run_memo` and reused by *later* draws, so a pointer
-/// with a bounded lifetime would be read after its view was released.
+/// that survived the removal of the host-pointer import: the engine gathers from
+/// these pointers when the submission it armed them for reaches the GPU, which is
+/// after this call returns, so a pointer with a bounded lifetime would be read
+/// after its view was released.
 ///
 /// A `false` is expected control flow — the caller falls through to the CPU
 /// byte loader and the guest gets correct pixels — so it is not a decline. But
@@ -2088,179 +2089,6 @@ fn mapping_window_guest_runs<M: HostMemory + HostOps>(
     coalesce_pages_to_runs(host, window, page, head_off, span)
 }
 
-/// Cap on [`DeviceState::guest_run_memo`] entries (FIFO evict). Entries are a
-/// few dozen bytes each; the cap only bounds pathological churn.
-#[cfg(feature = "backend-vulkan")]
-const GUEST_RUN_MEMO_CAP: usize = 512;
-
-/// Memoized [`task_gva_guest_runs`]: resolve `[gva, gva+span)` under the task
-/// PT to host-VA runs, caching the result in `state.guest_run_memo`. The walk
-/// was the dominant per-draw setup cost (~60 PT-leaf translations per 260 KB
-/// bind); a hit skips it entirely. Invalidation contract = `gva_host_views`
-/// (retired on Unmap/Map overlap, task redefine/delete — see gva_view.rs).
-#[cfg(feature = "backend-vulkan")]
-fn guest_runs_memoized<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    task_id: u32,
-    gva: u64,
-    span: u64,
-) -> Option<std::sync::Arc<Vec<crate::model::GuestRunSpan>>> {
-    if !guest_run_alias_available(host) {
-        return None;
-    }
-    if let Some(pos) = state.guest_run_memo.iter().position(|e| {
-        crate::runtime::gva_view::task_matches(e.task_id, task_id)
-            && e.gva == gva
-            && e.length == span
-    }) {
-        state.tranche.run_memo_hit = state.tranche.run_memo_hit.saturating_add(1);
-        crate::runtime::drain::note_store_route("rmemo_hit");
-        // Staleness verify on EVERY hit. These runs are raw host pointers
-        // aliasing guest RAM that the GPU gathers from, and their validity rests
-        // entirely on the invalidation contract below them (Unmap/Map2 overlap,
-        // task redefine/delete). That contract is a set of guest
-        // *notifications*, and this device has measured that the guest re-points
-        // GPU-mapped ranges without one arriving first — `MapMemory2` is sent
-        // after the PTEs are installed and used, and the deferred-window drift
-        // detector finds every page of a live window moved several dozen times a
-        // boot. A cache whose correctness rests on a contract that has been
-        // measured not to hold is not made correct by checking it one time in
-        // sixty-four; that only bounds the damage to 64 stale draws per entry,
-        // and 64 stale draws is a wrong icon that persists for a second.
-        //
-        // The walk this repeats is what the memo exists to skip, so the memo is
-        // now worth only its allocation — `rmemo_verify_us` measures what that
-        // costs, against `rmemo_hit`, so the trade is a reading rather than an
-        // assumption.
-        //
-        // **Measured, and the contract held.** One 245 s driven boot verified
-        // 1 639 738 hits in full and found **zero** stale entries, at a median
-        // 5 358 hits and 32.6 ms of verify per second — 3.3 % of wall clock,
-        // peaking at 11 %. So this is a soundness change and not a bug fix, and
-        // saying otherwise would be the broad claim the ground rules forbid: the
-        // memo was not the source of any observed wrong-texture defect, and the
-        // sampled check it replaces was never going to catch one either.
-        //
-        // It stays exhaustive anyway, for a reason the measurement supports
-        // rather than undermines. What the boot established is that the
-        // notification contract holds *for the code as it stands*; the sampling
-        // established nothing either way, and a reader could not tell those
-        // apart, because `rmemo_stale=0` with no denominator is not a reading.
-        // Now the denominator is in the same line.
-        {
-            let verify_started = std::time::Instant::now();
-            let fresh = task_gva_guest_runs(state, host, task_id, gva, span);
-            crate::runtime::drain::note_store_route_us(
-                "rmemo_verify_us",
-                verify_started.elapsed().as_micros() as u64,
-            );
-            match fresh {
-                Some(fresh) => {
-                    let memo = state.guest_run_memo[pos].runs.clone();
-                    let same = fresh.len() == memo.len()
-                        && fresh
-                            .iter()
-                            .zip(memo.iter())
-                            .all(|(f, m)| f.host_ptr == m.host_ptr && f.len == m.len);
-                    if !same {
-                        state.tranche.run_memo_stale =
-                            state.tranche.run_memo_stale.saturating_add(1);
-                        crate::runtime::drain::note_store_route("rmemo_stale");
-                        crate::observe::fail(format!(
-                            "rmemo_stale task={task_id} gva={gva:#x} span={span:#x} memo_runs={} fresh_runs={}",
-                            memo.len(),
-                            fresh.len()
-                        ));
-                        let spans: std::sync::Arc<Vec<crate::model::GuestRunSpan>> =
-                            std::sync::Arc::new(
-                                fresh
-                                    .iter()
-                                    .map(|r| crate::model::GuestRunSpan {
-                                        host_ptr: r.host_ptr,
-                                        len: r.len,
-                                    })
-                                    .collect(),
-                            );
-                        state.guest_run_memo[pos].runs = spans.clone();
-                        return Some(spans);
-                    }
-                }
-                None => {
-                    // The span no longer walks — the entry outlived its
-                    // mapping. Retire it and make the caller fall back.
-                    state.tranche.run_memo_stale = state.tranche.run_memo_stale.saturating_add(1);
-                    crate::runtime::drain::note_store_route("rmemo_stale_walk_gone");
-                    crate::observe::fail(format!(
-                        "rmemo_stale task={task_id} gva={gva:#x} span={span:#x} reason=walk_gone"
-                    ));
-                    state.guest_run_memo.remove(pos);
-                    return None;
-                }
-            }
-        }
-        return Some(state.guest_run_memo[pos].runs.clone());
-    }
-    let runs = task_gva_guest_runs(state, host, task_id, gva, span)?;
-    let spans: std::sync::Arc<Vec<crate::model::GuestRunSpan>> = std::sync::Arc::new(
-        runs.iter()
-            .map(|r| crate::model::GuestRunSpan {
-                host_ptr: r.host_ptr,
-                len: r.len,
-            })
-            .collect(),
-    );
-    if state.guest_run_memo.len() >= GUEST_RUN_MEMO_CAP {
-        state.guest_run_memo.pop_front();
-    }
-    state
-        .guest_run_memo
-        .push_back(crate::model::GuestRunMemoEntry {
-            task_id,
-            gva,
-            length: span,
-            runs: spans.clone(),
-        });
-    state.tranche.run_memo_miss = state.tranche.run_memo_miss.saturating_add(1);
-    Some(spans)
-}
-
-/// Slice memoized whole-span runs to the engine runs for `[offset, offset+span)`.
-/// `None` when the slice exceeds the memoized extent (caller falls back).
-#[cfg(feature = "backend-vulkan")]
-fn slice_runs_to_engine(
-    spans: &[crate::model::GuestRunSpan],
-    offset: u64,
-    span: u64,
-) -> Option<Vec<crate::backend::vulkan::engine::GuestRun>> {
-    use crate::backend::vulkan::engine;
-    if span == 0 {
-        return None;
-    }
-    let mut out: Vec<engine::GuestRun> = Vec::new();
-    let mut skip = offset;
-    let mut need = span;
-    for r in spans {
-        if need == 0 {
-            break;
-        }
-        if skip >= r.len {
-            skip -= r.len;
-            continue;
-        }
-        let take = (r.len - skip).min(need);
-        out.push(engine::GuestRun {
-            host_ptr: r.host_ptr.checked_add(usize::try_from(skip).ok()?)?,
-            len: take,
-        });
-        need -= take;
-        skip = 0;
-    }
-    if need != 0 {
-        return None;
-    }
-    Some(out)
-}
 
 /// Zero-copy draw-time buffer bind: resolve a type-1 buffer object's backing
 /// span (from `offset`) to guest-RAM runs and hand the engine a
@@ -2304,18 +2132,11 @@ fn try_buffer_zero_copy_resolved<M: HostMemory + HostOps>(
         gva + offset,
         span,
     );
-    // Resolve via the whole-backing memo (bind offsets slide within the same
-    // buffer allocation, so one memo entry serves every offset). Fall back to
-    // the direct span walk when the whole backing does not resolve (e.g. an
-    // unmapped tail page beyond the bound span).
-    let runs = match host_alloc_len(size)
-        .map(|n| n as u64)
-        .and_then(|whole| guest_runs_memoized(state, host, task_id, gva, whole))
-        .and_then(|spans| slice_runs_to_engine(&spans, offset, span))
-    {
-        Some(runs) => runs,
-        None => task_gva_guest_runs(state, host, task_id, gva + offset, span)?,
-    };
+    // Walk exactly the bound range. Resolving the whole backing and slicing out
+    // the bind would translate every page of the allocation to serve one bind,
+    // and would refuse a bind whose allocation has an unmapped tail page even
+    // though the bind itself resolves.
+    let runs = task_gva_guest_runs(state, host, task_id, gva + offset, span)?;
     Some(engine::BufferContent::GuestRuns(engine::GuestRunSource {
         runs: std::sync::Arc::new(runs),
         total_len: span,
@@ -2429,13 +2250,8 @@ fn try_linear_sample_zero_copy<M: HostMemory + HostOps>(
     // writeback aliasing the span before the GPU reads the pages (the CPU
     // flush completes before this draw's submit).
     crate::runtime::storage_flush::flush_intersecting_task_gva(state, host, task_id, gva, span);
-    // Fixed per-texture window — memoized directly (no offset slicing).
-    let runs = match guest_runs_memoized(state, host, task_id, gva, span)
-        .and_then(|spans| slice_runs_to_engine(&spans, 0, span))
-    {
-        Some(runs) => runs,
-        None => task_gva_guest_runs(state, host, task_id, gva, span)?,
-    };
+    // Fixed per-texture window: the walk covers exactly the bound span.
+    let runs = task_gva_guest_runs(state, host, task_id, gva, span)?;
     Some((
         w,
         h,

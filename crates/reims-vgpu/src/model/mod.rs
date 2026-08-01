@@ -13,7 +13,7 @@ pub use state::{
     ChannelRing, ComputeStorageResidencyKey, CursorState, DeferredOwner, DeviceId,
     DeviceState, DisplayHandshake, ExecFault, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE,
     FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, FailEvent, GfxRegs, GuestLinearMemo,
-    GuestRunMemoEntry, GuestRunSpan, GvaBacking, GvaDeferredEntry, GvaHostView,
+    GvaBacking, GvaDeferredEntry, GvaHostView,
     GvaEvictionWitness, HostLinearTexture, HostSurface, GVA_ENCODE_CACHE_BYTE_CAP,
     GVA_EVICTION_WITNESS_KEYS,
     IosfcRegs, LinearDeferredEntry, MapperCapture, MappingEntry,
