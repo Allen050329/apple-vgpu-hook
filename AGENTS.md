@@ -178,6 +178,21 @@ tables (register maps, SDK enum mirrors, wire field offsets), error variants
 only a future decode path constructs, and the `qemu/abi.rs` C surface QEMU
 calls. A field written at five sites and read at none is not one of them.
 
+Counting a test as a use is deliberate — it is what stops the report calling
+`tests/`-only engine hooks dead — but it hides the opposite mistake: a product
+mechanism whose only caller is the test written to prove it works.
+
+```sh
+scripts/dead-state/dead-state.sh --test-only
+```
+
+This compiles each arm a second time as a plain `--lib`, with `cfg(test)` off,
+and reports what is dead there and live with tests. Test *infrastructure*
+(`FakeHost`, the log redirectors) lands in this report and belongs there — the
+integration tests are separate crates, so it cannot be `#[cfg(test)]`. For
+everything else, deleting a hit means deleting its test; name the test in the
+commit so a dropped count is never silent.
+
 ## Commit Guidelines
 
 Commit only work you wrote. Never commit third-party code or intellectual property, including Apple

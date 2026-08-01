@@ -54,17 +54,27 @@
 #
 # Everything else — a struct field written at five sites and read at none, a
 # subsystem whose entry point only tests call — is what this is for.
+#
+# `--test-only` reports that last class, which the default cannot see. Rule 2
+# above deliberately makes a test count as a use, because a helper only
+# `tests/vk_engine_*.rs` calls is live code. The cost is that a product function
+# whose *sole* caller is the unit test written to prove it works also reads as
+# live — and that is not live code. It is a mechanism the product does not use,
+# plus a test keeping it compiling. To separate the two, each arm is compiled a
+# second time with cfg(test) off; an item dead in that build and live in the
+# other is reached only from test code.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRATCH="${TMPDIR:-/tmp}/reims-dead-state.$$"
 CRATE="$SCRATCH/crates/reims-vgpu"
 FIELDS_ONLY=0
+TEST_ONLY=0
 KEEP=0
 
 usage() {
   cat <<'EOF'
-usage: scripts/dead-state/dead-state.sh [--fields-only] [--keep]
+usage: scripts/dead-state/dead-state.sh [--fields-only|--test-only] [--keep]
 
 Reports reims-vgpu items and struct fields that no code path reads, by
 compiling a `pub`-downgraded copy of the crate so rustc's dead-code pass can
@@ -74,6 +84,9 @@ reported. The working tree is never modified.
   --fields-only  Report only never-read struct fields. Highest signal: an
                  unread field is state some other rail may be expected to keep
                  consistent, which costs every author who reads the struct.
+  --test-only    Report items the product never reaches and only test code
+                 uses. These do not appear in the default report, which counts
+                 a test as a use on purpose. Costs two extra compiles.
   --keep         Leave the scratch tree in place for inspection.
 
 Exits 0 with a report, or non-zero if an arm failed to compile. It is a report,
@@ -85,6 +98,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --fields-only) FIELDS_ONLY=1 ;;
+    --test-only) TEST_ONLY=1 ;;
     --keep) KEEP=1 ;;
     -h | --help)
       usage
@@ -98,6 +112,11 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$FIELDS_ONLY" -eq 1 ] && [ "$TEST_ONLY" -eq 1 ]; then
+  echo "dead-state: --fields-only and --test-only select different reports" >&2
+  exit 2
+fi
 
 cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$SCRATCH"; }
 trap cleanup EXIT
@@ -191,13 +210,16 @@ PY
 fi
 
 # 3. Compile both arms. `--tests` is what turns on cfg(test), which is what
-#    makes the pulled-in integration tests count.
+#    makes the pulled-in integration tests count. `--test-only` also compiles
+#    each arm as a plain lib, where cfg(test) is off and no test — unit or
+#    pulled-in integration — exists to count as a use.
 run_arm() {
-  local label="$1" out="$2"
-  shift 2
+  local label="$1" out="$2" targets="$3"
+  shift 3
   echo "[dead-state] compiling arm: $label"
   local log="$SCRATCH/log.$(echo "$label" | tr -c 'a-z0-9' '_')"
-  if ! (cd "$SCRATCH" && cargo check -p reims-vgpu --tests "$@" --message-format short) >"$log" 2>&1; then
+  # shellcheck disable=SC2086 # $targets is a deliberate word-split flag list.
+  if ! (cd "$SCRATCH" && cargo check -p reims-vgpu $targets "$@" --message-format short) >"$log" 2>&1; then
     echo "[dead-state] FAILED to compile arm: $label" >&2
     grep -E ': error' "$log" | head -20 >&2
     echo "[dead-state] Reporting nothing: a null result from an instrument that" >&2
@@ -209,17 +231,33 @@ run_arm() {
     sort -u >"$out"
 }
 
-run_arm 'vulkan,host-window' "$SCRATCH/hits.vulkan" \
-  --no-default-features --features backend-vulkan,host-window
-run_arm 'metal / aarch64-apple-darwin' "$SCRATCH/hits.metal" \
-  --target aarch64-apple-darwin --features backend-metal
+VULKAN_ARM=(--no-default-features --features backend-vulkan,host-window)
+METAL_ARM=(--target aarch64-apple-darwin --features backend-metal)
+
+run_arm 'vulkan,host-window' "$SCRATCH/hits.vulkan" --tests "${VULKAN_ARM[@]}"
+run_arm 'metal / aarch64-apple-darwin' "$SCRATCH/hits.metal" --tests "${METAL_ARM[@]}"
 
 comm -12 "$SCRATCH/hits.vulkan" "$SCRATCH/hits.metal" >"$SCRATCH/hits.both"
+
+if [ "$TEST_ONLY" -eq 1 ]; then
+  run_arm 'vulkan,host-window (lib only)' "$SCRATCH/lib.vulkan" --lib "${VULKAN_ARM[@]}"
+  run_arm 'metal / aarch64-apple-darwin (lib only)' "$SCRATCH/lib.metal" --lib "${METAL_ARM[@]}"
+  comm -12 "$SCRATCH/lib.vulkan" "$SCRATCH/lib.metal" >"$SCRATCH/lib.both"
+  # Dead without tests, live with them: the only thing reaching it is a test.
+  comm -23 "$SCRATCH/lib.both" "$SCRATCH/hits.both" >"$SCRATCH/testonly.both"
+fi
 
 echo
 if [ "$FIELDS_ONLY" -eq 1 ]; then
   echo "[dead-state] never-read struct fields, dead on BOTH arms:"
   grep -E 'field' "$SCRATCH/hits.both" || echo "  none"
+elif [ "$TEST_ONLY" -eq 1 ]; then
+  echo "[dead-state] reached only from test code, on BOTH arms:"
+  grep . "$SCRATCH/testonly.both" || echo "  none"
+  echo
+  echo "[dead-state] Each of these is a product mechanism no product caller"
+  echo "[dead-state] uses, plus the test that keeps it compiling. Deleting one"
+  echo "[dead-state] means deleting its test too — say so in the commit."
 else
   echo "[dead-state] never read / never used / never constructed, on BOTH arms:"
   grep . "$SCRATCH/hits.both" || echo "  none"

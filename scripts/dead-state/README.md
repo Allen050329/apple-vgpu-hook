@@ -5,6 +5,7 @@ Reports `reims-vgpu` items and struct fields that no code path reads.
 ```sh
 scripts/dead-state/dead-state.sh              # items and fields
 scripts/dead-state/dead-state.sh --fields-only
+scripts/dead-state/dead-state.sh --test-only  # product never reaches it; a test does
 ```
 
 ## Why a script and not a grep
@@ -50,6 +51,30 @@ derives `Clone` and `DeviceState` is cloned.
 `observe::gate::no_present_state_field_is_write_only` covers that one struct
 directly and has no such blind spot; extend that pattern to any other struct
 where this matters.
+
+## Reached only from tests
+
+Counting a test as a use is deliberate: a helper only `tests/vk_engine_*.rs`
+calls is live code, and the grep that missed that called seven engine hooks
+dead. But the same rule hides the opposite mistake — a product function whose
+*sole* caller is the unit test written to prove it works reads as live, and it
+is not. It is a mechanism the product does not use, plus a test keeping it
+compiling.
+
+`--test-only` separates them by compiling each arm a second time as a plain
+`--lib`, where `cfg(test)` is off and neither the unit tests nor the pulled-in
+integration tests exist. An item dead there and live in the `--tests` build is
+reached only from test code.
+
+Two caveats before deleting a hit:
+
+- **Test *infrastructure* lands here and belongs here.** `FakeHost` and
+  `observe::sink::redirect_logs_for_tests` exist to be called by tests, and the
+  integration tests are separate crates, so they cannot be `#[cfg(test)]`.
+  The question is not "does only a test call it" but "is being called by a test
+  the point of it".
+- **Deleting a hit means deleting its test.** Say so in the commit, with the
+  test's name, so a dropped test count is never silent.
 
 ## Triage
 
