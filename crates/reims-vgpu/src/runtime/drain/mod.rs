@@ -4259,6 +4259,35 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
 }
 
 /// Run all pending drains (BH body).
+///
+/// # This runs to completion on purpose, and a wall-clock budget was tried
+///
+/// This holds the device lock for its whole duration, and on x86 the vCPU does
+/// not block on that lock — `device_gfx_write` takes it with `try_lock` and on
+/// failure queues the write, so the guest's store retires while the work it rang
+/// for does not start until this returns. A driven boot measures tranches of
+/// 18-43 ms and ~105 doorbells a second applied at least one whole frame late
+/// (`gfx_doorbell_delay`), so capping the tranche is an obvious thing to reach
+/// for. It was reached for, measured, and reverted.
+///
+/// A budget of one frame interval, checked between child channels using the same
+/// requeue the translation-hold and `host_action_yield` arms below already use,
+/// **made the delay worse**: mean doorbell age 19.0 ms against 10.8 ms before,
+/// and `max_tranche_us` 34-37 ms against 18-22 ms. It fired only ~22 times a
+/// second against ~200 tranches, because the cost is not spread across channels
+/// — a single channel's flush run holds the lock for tens of milliseconds and a
+/// between-channel check cannot reach inside it.
+///
+/// It also introduced a stall. Returning with `child_mask` still set leaves work
+/// that nothing re-arms: a doorbell would, but the guest has no reason to ring
+/// one for work it already submitted, and the 4 ms poll publishes *producer*
+/// state rather than noticing an already-set mask. One boot froze for 29 s with
+/// the census silent and the guest reporting a single 30 263 ms frame. The same
+/// gap exists in principle for the translation-hold arm below, which has never
+/// been observed to hit it — worth knowing if one ever does.
+///
+/// The cost is inside the render flush, not in the scheduling around it. See
+/// [`crate::runtime::storage_flush::flush_mapping_windows_before_fence`].
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
