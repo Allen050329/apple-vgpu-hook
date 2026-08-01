@@ -1406,6 +1406,23 @@ pub const GVA_EVICTION_WITNESS_KEYS: usize = 4096;
 /// Read `wanted` only together with `evicted`: zero harm and zero evictions is
 /// a cap that never engaged, not a cap that engaged safely, and the two must
 /// not be confused.
+///
+/// # The reading, x86/Vulkan, 40 boots
+///
+/// `evicted=186  wanted=0  forgotten=0`, taken as the per-boot maxima of
+/// `host_cache_levels gva_cap_*` over a 59 MB always-on log. The cap **has**
+/// engaged, so this is the safe-engagement case its own rule above asks for and
+/// not the never-engaged one. `forgotten=0` matters as much as `wanted=0`: the
+/// ring never overflowed, so `wanted` is an exact count and not a lower bound.
+///
+/// That is the whole question this struct exists to answer, and it is answered.
+/// Keep it anyway — it is the standing alarm on a policy `AGENTS.md` treats as a
+/// smell (an eviction rule over storage that may hold the only copy of guest
+/// content), it costs one `BTreeSet` insert per eviction and there have been
+/// 186, and the reading is a property of this workload rather than of the code.
+/// A future session that finds `wanted > 0` is looking at a real regression.
+///
+/// Corrects a standing claim that this cap "never evicts". It does.
 #[derive(Debug, Default)]
 pub struct GvaEvictionWitness {
     /// Evicted identities still remembered, for the miss test.
