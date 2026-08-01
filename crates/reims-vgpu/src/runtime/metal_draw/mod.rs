@@ -1880,7 +1880,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
     // or type-2/3 GVA — archive write_type11_rgba / write_gva_rgba).
     // Multi-draw intermediate records skip guest store (archive one writeback).
     let mut any_write = false;
-    let mut all_write = true;
     if !writeback_guest {
         // Still log + early paint latch only when storing; chain returns RGBA.
         return (EncodeStatus::Ok, color_outs.first().cloned());
@@ -1977,7 +1976,6 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
                 );
             }
         } else {
-            all_write = false;
             let (nz, maxb) = crate::observe::nonzero_stats(out_rgba);
             crate::observe::fail(format!(
                 "metal_draw writeback fail mid={} gva={:#x} fmt={:#x} {}x{} rgba_nz={} max={}",
@@ -1985,13 +1983,15 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             ));
         }
     }
+    // Only a total writeback failure is an error: a partial MRT writeback is Ok
+    // if at least one RT landed, and each RT that did not has already emitted its
+    // own `metal_draw writeback fail` line above.
     if !any_write {
         return (
             EncodeStatus::WritebackFailed("draw_mtl_writeback_none"),
             None,
         );
     }
-    let _ = all_write; // partial MRT writeback still Ok if ≥1 RT landed
 
     // Optional depth/stencil store writeback into type-11 mappings.
     if let (Some(da), Some(buf)) = (&req.depth_attach, &depth_storage) {
@@ -3335,7 +3335,8 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     }
     let base_fmt = tex.pixel_format;
     let fmt = effective_view_sample_format(base_fmt, view_fmt_override).unwrap_or(base_fmt);
-    let bpp = pixel_format::render_target_bpp(fmt)?;
+    // Refuses a format with no known bytes-per-texel; the value is not needed.
+    pixel_format::render_target_bpp(fmt)?;
     // Mip>0 view of a linear texture: the RT is that level's plane inside the
     // base allocation (archive collapses view mip into linear geometry —
     // compositor blur/backdrop pyramids render into successive levels).
@@ -3380,7 +3381,6 @@ fn lookup_render_target<M: HostMemory + HostOps>(
     if bpr < tight || w == 0 || h == 0 {
         return None;
     }
-    let _ = bpp;
     Some((0, gva, w, h, bpr, fmt))
 }
 

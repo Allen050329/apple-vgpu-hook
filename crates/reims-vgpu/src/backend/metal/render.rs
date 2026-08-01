@@ -1561,9 +1561,6 @@ pub fn render_core_mrt(
         }
         color_meta.push((c.slot, fmt, bpp, pixel_format_from_u32(fmt)));
     }
-    // First RT bpp for legacy paths that still reference a single bpp (draw gates).
-    let color_bpp = color_meta[0].2;
-    let _ = color_bpp;
 
     if primitive_indirect.is_none() && !indexed_indirect && vertex_count == 0 {
         set_err(err, "invalid render dimensions or draw count");

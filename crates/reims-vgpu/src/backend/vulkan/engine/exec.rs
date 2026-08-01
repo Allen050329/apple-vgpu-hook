@@ -1125,8 +1125,6 @@ pub(crate) unsafe fn execute_draw_inner(
         None
     };
 
-    // Prefer identity-keyed resident target when provided; else geometry pool.
-    let use_registry = req.target_identity.is_some();
     // A secondary MRT attachment is bound + rendered as attachment N of an
     // ad-hoc framebuffer built here. The primary slot 0 keeps its own single-RT
     // framebuffer (consistent with single-RT draws to the same target), so the
@@ -1517,7 +1515,6 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    let _ = use_registry;
 
     phase.enter(super::draw_phase::Phase::Descriptors);
     // Descriptor set
